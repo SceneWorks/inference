@@ -16,6 +16,9 @@
 //! SC15791_REPEATS=3                                     optional; timing samples per window size
 //! SC15791_RACE_TOKENS=4096 SC15791_RACE_REPEATS=64      optional; depth of the Q3 race queue
 //! SC15791_RACE_CLAIM_MIB=256                            optional; bytes re-claimed in the Q3b probe
+//! SC16096_Q4=<...>/q4/transformer/model.safetensors     SC-16096 before/after (required together)
+//! SC16096_Q8=<...>/q8/transformer/model.safetensors     SC-16096 before/after (required together)
+//! SC16096_REPEATS=3                                     SC-16096 samples (minimum three)
 //! cargo test -p candle-gen --features cuda --release --test rung4_block_streaming_spike \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
@@ -34,6 +37,7 @@
 //! | `release_semantics` | Q2 does VRAM come back / need a sync; Q3 must `release` be non-trivial |
 //! | `packed_quant_per_block` | Q4 the packed-quant triple, per block, bit-exact |
 //! | `q8_tier_cost` | whether SC-15744's "q8 ≈ 2× q4" carries to Candle |
+//! | `device_format_sidecars_before_after` | SC-16096 q4/q8 cost, parity, host memory, and load-bearing window bound |
 //! | `constrained_budget_sweep` | the small-card disclosure |
 //!
 //! Throwaway measurement code by the story's own terms — the answer is the deliverable. Kept as an
@@ -54,12 +58,16 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::quant::{dequant_mlx_q4_reference, lin, QLinear, MLX_GROUP_SIZE};
+use candle_gen::quant::{
+    dequant_mlx_q4_reference, lin, repack_packed_weight, PackedConfig, PackedWeightSidecars,
+    QLinear, MLX_GROUP_SIZE,
+};
 
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -178,6 +186,141 @@ mod pool {
             unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) == sys::CUresult::CUDA_SUCCESS };
         assert!(ok, "cuMemGetInfo_v2 failed");
         (free as u64, total as u64)
+    }
+}
+
+// Windows process-memory probe used by SC-16096. `WorkingSetSize` includes mapped/file-backed pages;
+// `PrivateUsage` is private commit and exposes the q8 dense-grid transient the CUDA pool cannot see.
+#[cfg(windows)]
+mod host_memory {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            size: u32,
+        ) -> i32;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Peak {
+        pub working_set_start: u64,
+        pub working_set_peak: u64,
+        pub working_set_end: u64,
+        pub private_start: u64,
+        pub private_peak: u64,
+        pub private_end: u64,
+    }
+
+    fn counters() -> (u64, u64) {
+        let mut counters = ProcessMemoryCountersEx {
+            cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            page_fault_count: 0,
+            peak_working_set_size: 0,
+            working_set_size: 0,
+            quota_peak_paged_pool_usage: 0,
+            quota_paged_pool_usage: 0,
+            quota_peak_non_paged_pool_usage: 0,
+            quota_non_paged_pool_usage: 0,
+            pagefile_usage: 0,
+            peak_pagefile_usage: 0,
+            private_usage: 0,
+        };
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "K32GetProcessMemoryInfo failed");
+        (
+            counters.working_set_size as u64,
+            counters.private_usage as u64,
+        )
+    }
+
+    fn update_max(max: &AtomicU64, value: u64) {
+        let mut old = max.load(Ordering::Relaxed);
+        while value > old {
+            match max.compare_exchange_weak(old, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    pub fn sample<T>(f: impl FnOnce() -> T) -> (T, Peak) {
+        let (working_set_start, private_start) = counters();
+        let stop = Arc::new(AtomicBool::new(false));
+        let working_set_peak = Arc::new(AtomicU64::new(working_set_start));
+        let private_peak = Arc::new(AtomicU64::new(private_start));
+        let sampler = {
+            let stop = Arc::clone(&stop);
+            let working_set_peak = Arc::clone(&working_set_peak);
+            let private_peak = Arc::clone(&private_peak);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let (working_set, private) = counters();
+                    update_max(&working_set_peak, working_set);
+                    update_max(&private_peak, private);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let value = f();
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().expect("host-memory sampler");
+        let (working_set_end, private_end) = counters();
+        (
+            value,
+            Peak {
+                working_set_start,
+                working_set_peak: working_set_peak.load(Ordering::Relaxed),
+                working_set_end,
+                private_start,
+                private_peak: private_peak.load(Ordering::Relaxed),
+                private_end,
+            },
+        )
+    }
+}
+
+#[cfg(not(windows))]
+mod host_memory {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Peak {
+        pub working_set_start: u64,
+        pub working_set_peak: u64,
+        pub working_set_end: u64,
+        pub private_start: u64,
+        pub private_peak: u64,
+        pub private_end: u64,
+    }
+
+    pub fn sample<T>(f: impl FnOnce() -> T) -> (T, Peak) {
+        (f(), Peak::default())
     }
 }
 
@@ -320,11 +463,9 @@ impl Block {
 /// Materialize `range` through the **production** packed loader (`candle_gen::quant::lin`) onto the
 /// view's device — what a naive `BlockWindowBackend` would do.
 ///
-/// NOTE the round trip this incurs when the view is on CUDA: `lin_gs` loads `wq`/`scales`/`biases`
-/// onto the view's device (`quant/mod.rs:973-975`), then `repack::q4_parts` immediately pulls all
-/// three back with `to_device(&Cpu)` (`repack.rs:133-144`) to do the host repack, then uploads the
-/// Q4_1 bytes. So the raw triple crosses PCIe up and back down for nothing. `materialize_host_repack`
-/// below is the corrected path, and the gap between them is measured in `window_sweep_cost`.
+/// Since SC-16096, `lin_gs` reads its source triple directly on CPU, so this path no longer includes
+/// the historical CUDA→CPU round trip. It still performs the invariant format conversion on every
+/// call; [`materialize_sidecars`] is the no-conversion shipping window path.
 fn materialize(tier: &Tier, view: &VarBuilder, range: Range<usize>) -> Result<Vec<Block>> {
     let mut out = Vec::with_capacity(range.len());
     for b in range {
@@ -346,13 +487,9 @@ fn materialize(tier: &Tier, view: &VarBuilder, range: Range<usize>) -> Result<Ve
     Ok(out)
 }
 
-/// The **corrected** materialization: read the packed triple straight to the host, repack on the
-/// host, and upload only the resulting `Q4_1` blocks. Identical arithmetic to [`materialize`] — it
-/// calls the same `QLinear::from_packed_gs` the production loader ends up in — but it never sends the
-/// raw triple to the device only to pull it back.
-///
-/// This is the floor a rung-4 implementation can actually reach without changing any numerics, so it
-/// is measured rather than derived.
+/// Manual raw-mmap twin of the current production loader: read the packed triple on the host, repack
+/// there, and upload only the resulting device-format blocks. It remains in the older SC-15791
+/// decomposition as a cross-check; it is not SC-16096's final path because it still converts per call.
 fn materialize_host_repack(
     tier: &Tier,
     raw: &MmapedSafetensors,
@@ -370,6 +507,68 @@ fn materialize_host_repack(
             let biases = raw.load(&format!("{base}.biases"), &cpu)?;
             let ql = QLinear::from_packed_gs(&wq, &scales, &biases, None, MLX_GROUP_SIZE, dev)?;
             lins.push((base.clone(), ql, in_dim));
+        }
+        let mut dense = Vec::with_capacity(tier.dense[b].len());
+        for key in &tier.dense[b] {
+            dense.push(raw.load(key, dev)?.to_dtype(DType::F32)?);
+        }
+        out.push(Block { lins, dense });
+    }
+    Ok(out)
+}
+
+/// Reconstruct the exact pre-SC-16096 Krea packed path for the before measurement: source tensors
+/// first load on CUDA, then `from_packed_gs` pulls them back to CPU for repacking.
+fn materialize_prechange(
+    tier: &Tier,
+    raw: &MmapedSafetensors,
+    dev: &Device,
+    range: Range<usize>,
+) -> Result<Vec<Block>> {
+    let mut out = Vec::with_capacity(range.len());
+    for b in range {
+        let mut lins = Vec::with_capacity(tier.packed[b].len());
+        for base in &tier.packed[b] {
+            let (_, in_dim) = tier.dims[base];
+            let wq = raw.load(&format!("{base}.weight"), dev)?;
+            let scales = raw
+                .load(&format!("{base}.scales"), dev)?
+                .to_dtype(DType::F32)?;
+            let biases = raw
+                .load(&format!("{base}.biases"), dev)?
+                .to_dtype(DType::F32)?;
+            let ql = QLinear::from_packed_gs(&wq, &scales, &biases, None, MLX_GROUP_SIZE, dev)?;
+            lins.push((base.clone(), ql, in_dim));
+        }
+        let mut dense = Vec::with_capacity(tier.dense[b].len());
+        for key in &tier.dense[b] {
+            dense.push(raw.load(key, dev)?.to_dtype(DType::F32)?);
+        }
+        out.push(Block { lins, dense });
+    }
+    Ok(out)
+}
+
+/// SC-16096's shipping window path: map already-GGML bytes and transfer them to the target device.
+/// The API deliberately accepts neither the MLX source nor quantization parameters.
+fn materialize_sidecars(
+    tier: &Tier,
+    sidecars: &PackedWeightSidecars,
+    raw: &MmapedSafetensors,
+    dev: &Device,
+    range: Range<usize>,
+) -> Result<Vec<Block>> {
+    let mut out = Vec::with_capacity(range.len());
+    for b in range {
+        let mut lins = Vec::with_capacity(tier.packed[b].len());
+        for base in &tier.packed[b] {
+            let (_, in_dim) = tier.dims[base];
+            let weight = sidecars.load(base, dev)?;
+            lins.push((
+                base.clone(),
+                QLinear::from_qtensor_dequant(Arc::new(weight), None),
+                in_dim,
+            ));
         }
         let mut dense = Vec::with_capacity(tier.dense[b].len());
         for key in &tier.dense[b] {
@@ -461,9 +660,8 @@ fn windows(n_blocks: usize, window: usize) -> impl Iterator<Item = Range<usize>>
     })
 }
 
-/// Least-squares fit of `peak ≈ a·window + b` over the sweep, in MiB. `b` is the per-window fixed
-/// overhead — on the production loader it is the device-side staging of the raw triple that
-/// [`materialize_host_repack`] avoids.
+/// Least-squares fit of `peak ≈ a·window + b` over the sweep, in MiB. `b` is fixed allocator/loader
+/// overhead that does not scale with the window width.
 fn linear_fit(points: &[(usize, f64)]) -> (f64, f64) {
     let n = points.len() as f64;
     let sx: f64 = points.iter().map(|(w, _)| *w as f64).sum();
@@ -619,14 +817,13 @@ fn window_sweep_cost() -> Result<()> {
     );
     println!(
         "  peak(window) ≈ {slope:.1}·w + {intercept:.1} MiB. The {intercept:.1} MiB intercept is \
-         per-window overhead, NOT block weight: it is the raw triple staged on the device by \
-         `lin` before `q4_parts` pulls it back to the host. At the {slope:.1} MiB/block slope alone \
+         fixed allocator/loader overhead, not block weight. At the {slope:.1} MiB/block slope alone \
          the reduction would be {:.1}x.",
         resident_used as f64 / MIB / slope
     );
 
-    // ── Where the time goes. The production loader vs the corrected host-repack loader — a measured
-    // floor, not an arithmetic one. Also the CPU-only leg, to separate read+repack from all transfer.
+    // ── Where the time goes. The current production loader vs its raw-mmap host-repack twin, plus
+    // the CPU-only leg to separate read+repack from all transfer.
     // All three legs run on the SAME block (0) and are interleaved, so neither page-cache state nor
     // block-to-block variation is charged to one leg. More repeats than the sweep, because the
     // quantities being differenced here are close to the noise floor.
@@ -677,7 +874,7 @@ fn window_sweep_cost() -> Result<()> {
     let block_mib = tier.bytes[0] as f64 / MIB;
     println!(
         "  host read+repack only (CPU target)  {h:8.1} ms  (spread {:.1})\n  \
-         corrected host-repack loader         {c:8.1} ms  (spread {:.1})  ⇒ one step = {:.2} s\n  \
+         raw-mmap host-repack twin            {c:8.1} ms  (spread {:.1})  ⇒ one step = {:.2} s\n  \
          production loader (`quant::lin`)     {p:8.1} ms  (spread {:.1})  ⇒ one step = {:.2} s",
         spread(&host_only),
         spread(&corrected),
@@ -688,11 +885,11 @@ fn window_sweep_cost() -> Result<()> {
     println!(
         "  ⇒ uploading the repacked {block_mib:.1} MiB block costs {:.1} ms, which is {} the \
          ±{noise:.1} ms noise floor.\n  \
-         ⇒ the production loader's wasted round trip (raw triple to the device and straight back for \
-         `q4_parts`) costs {:.1} ms/block = {:.2} s/step — real, but NOT the dominant term.\n  \
-         ⇒ **the host read+repack is {:.0}% of the corrected path.** The story's premise that \"PCIe \
+         ⇒ the production VarBuilder seam differs from the raw-mmap twin by {:.1} ms/block = {:.2} \
+         s/step; this is loader/framework overhead, not the historical device round trip.\n  \
+         ⇒ **the host read+repack is {:.0}% of the raw-mmap path.** The story's premise that \"PCIe \
          bandwidth is the analogous bound here\" is NOT supported on this backend: transfer is a \
-         rounding error next to the format conversion, and fixing the round trip alone still leaves \
+         rounding error next to the format conversion, and removing only the round trip still leaves \
          {:.2} s/step.",
         c - h,
         if (c - h).abs() < noise { "BELOW (i.e. unresolvable against)" } else { "above" },
@@ -1295,6 +1492,216 @@ fn q8_tier_cost() -> Result<()> {
          is the real q8 risk (~225 MiB of host f32 for a 3840x15360 projection) and nothing above \
          watches host RSS. Treat q8 host memory as UNVERIFIED."
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
+// SC-16096 — content-addressed device-format windows, before/after, host memory, and bound mutation
+// ---------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs CUDA plus SC16096_Q4 and SC16096_Q8 real packed tiers"]
+fn device_format_sidecars_before_after() -> Result<()> {
+    let repeats = env_usize("SC16096_REPEATS", 3).max(3);
+    let dev = Device::new_cuda(0)?;
+    let pool = pool::Pool::open(0).expect("default mempool");
+    disclose_host(&pool);
+
+    for (label, path, bits) in [
+        ("q4", env_path_req("SC16096_Q4"), 4i32),
+        ("q8", env_path_req("SC16096_Q8"), 8i32),
+    ] {
+        let tier = Tier::open(&path, MLX_GROUP_SIZE)?;
+        let raw = tier.open_raw()?;
+        let component_dir = path.parent().expect("tier file has a component directory");
+        println!(
+            "\n[sc-16096] {label}: {} | {:.2} GiB source mmap, {} blocks, {} packed projections/block",
+            path.display(),
+            tier.file_bytes as f64 / GIB,
+            tier.n_blocks(),
+            tier.packed[0].len()
+        );
+
+        let prepare_started = Instant::now();
+        let (prepared, build_host) = host_memory::sample(|| {
+            PackedWeightSidecars::prepare(
+                &raw,
+                component_dir,
+                PackedConfig {
+                    bits,
+                    group_size: MLX_GROUP_SIZE as i32,
+                },
+                &dev,
+            )
+        });
+        let sidecars = prepared?;
+        dev.synchronize()?;
+        println!(
+            "  prepare once: {:.3} s | created {} reused {} | source hashed {:.1} MiB | \
+             sidecars {:.1} MiB | host working-set peak Δ {:.1} MiB, private-commit peak Δ {:.1} \
+             MiB (end Δ {:.1}/{:.1} MiB)",
+            prepare_started.elapsed().as_secs_f64(),
+            sidecars.created_count(),
+            sidecars.reused_count(),
+            sidecars.source_bytes_hashed() as f64 / MIB,
+            sidecars.sidecar_bytes() as f64 / MIB,
+            build_host
+                .working_set_peak
+                .saturating_sub(build_host.working_set_start) as f64
+                / MIB,
+            build_host
+                .private_peak
+                .saturating_sub(build_host.private_start) as f64
+                / MIB,
+            build_host
+                .working_set_end
+                .saturating_sub(build_host.working_set_start) as f64
+                / MIB,
+            build_host
+                .private_end
+                .saturating_sub(build_host.private_start) as f64
+                / MIB,
+        );
+
+        // Every projection in one real block must preserve the exact GGML bytes produced by the old
+        // CUDA-target conversion. Q8 is especially important: its target-device quantizer, not a CPU
+        // approximation, defines the pre-change bytes.
+        let mut checked_bytes = 0usize;
+        let mut checked_outputs = 0usize;
+        for base in &tier.packed[0] {
+            let (_, in_dim) = tier.dims[base];
+            let wq = raw.load(&format!("{base}.weight"), &dev)?;
+            let scales = raw
+                .load(&format!("{base}.scales"), &dev)?
+                .to_dtype(DType::F32)?;
+            let biases = raw
+                .load(&format!("{base}.biases"), &dev)?
+                .to_dtype(DType::F32)?;
+            let old = repack_packed_weight(&wq, &scales, &biases, MLX_GROUP_SIZE, &dev)?;
+            let new = sidecars.load(base, &dev)?;
+            let old_bytes = old.data()?.into_owned();
+            let new_bytes = new.data()?.into_owned();
+            assert_eq!(
+                old_bytes, new_bytes,
+                "{label} {base}: sidecar bytes differ from the pre-change CUDA path"
+            );
+            checked_bytes += old_bytes.len();
+
+            // Drive the exact shared QLinear compute seam used by Krea on both weights. Unchanged
+            // bytes alone already imply an unchanged forward, but this makes that implication an
+            // executable real-CUDA output assertion for every projection in the sampled block.
+            let input = Tensor::ones((1, in_dim), DType::F32, &dev)?;
+            let old_output = QLinear::from_qtensor_dequant(Arc::new(old), None).forward(&input)?;
+            let new_output = QLinear::from_qtensor_dequant(Arc::new(new), None).forward(&input)?;
+            assert_eq!(
+                old_output.to_device(&Device::Cpu)?.to_vec2::<f32>()?,
+                new_output.to_device(&Device::Cpu)?.to_vec2::<f32>()?,
+                "{label} {base}: sidecar-backed QLinear output differs from pre-change"
+            );
+            checked_outputs += 1;
+        }
+        println!(
+            "  parity: {} real projections / {:.1} MiB and {} real QLinear CUDA forwards are \
+             BIT-EXACT to pre-change",
+            tier.packed[0].len(),
+            checked_bytes as f64 / MIB,
+            checked_outputs,
+        );
+
+        let measure =
+            |after: bool, range: Range<usize>| -> Result<(f64, u64, u64, host_memory::Peak)> {
+                quiesce_and_reset(&dev, &pool)?;
+                let base = pool.used();
+                let started = Instant::now();
+                let (materialized, host) = host_memory::sample(|| {
+                    if after {
+                        materialize_sidecars(&tier, &sidecars, &raw, &dev, range)
+                    } else {
+                        materialize_prechange(&tier, &raw, &dev, range)
+                    }
+                });
+                let blocks = materialized?;
+                dev.synchronize()?;
+                let elapsed = started.elapsed().as_secs_f64();
+                let used = pool.used_high().saturating_sub(base);
+                let reserved = pool.reserved_high();
+                drop(blocks);
+                dev.synchronize()?;
+                pool.trim();
+                Ok((elapsed, used, reserved, host))
+            };
+
+        for (name, after) in [("before", false), ("after", true)] {
+            let mut times = Vec::with_capacity(repeats);
+            let mut vram_peak = 0u64;
+            let mut host_ws_peak = 0u64;
+            let mut host_private_peak = 0u64;
+            let mut host_ws_end = 0u64;
+            let mut host_private_end = 0u64;
+            for _ in 0..repeats {
+                let (secs, used, _, host) = measure(after, 0..1)?;
+                times.push(secs);
+                vram_peak = vram_peak.max(used);
+                host_ws_peak =
+                    host_ws_peak.max(host.working_set_peak.saturating_sub(host.working_set_start));
+                host_private_peak =
+                    host_private_peak.max(host.private_peak.saturating_sub(host.private_start));
+                host_ws_end =
+                    host_ws_end.max(host.working_set_end.saturating_sub(host.working_set_start));
+                host_private_end =
+                    host_private_end.max(host.private_end.saturating_sub(host.private_start));
+            }
+            let med = median(times.clone());
+            let lo = times.iter().copied().fold(f64::MAX, f64::min);
+            let hi = times.iter().copied().fold(0.0, f64::max);
+            println!(
+                "  {name:>6} window-1: median {med:.4} s/block, spread {lo:.4}-{hi:.4} s | \
+                 VRAM live peak {:.1} MiB | host WS/private peak Δ {:.1}/{:.1} MiB, end Δ \
+                 {:.1}/{:.1} MiB",
+                vram_peak as f64 / MIB,
+                host_ws_peak as f64 / MIB,
+                host_private_peak as f64 / MIB,
+                host_ws_end as f64 / MIB,
+                host_private_end as f64 / MIB,
+            );
+        }
+
+        // Peak-by-window remeasurement. Mutating only the window width must raise the live CUDA
+        // peak; otherwise the purported bound is decorative rather than load-bearing.
+        let mut bound = Vec::new();
+        for window in [1usize, 2, 4] {
+            let width = window.min(tier.n_blocks());
+            let (secs, used, reserved, host) = measure(true, 0..width)?;
+            let mapped_peak = tier.packed[0]
+                .iter()
+                .filter_map(|base| sidecars.path_for(base))
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .max()
+                .unwrap_or(0);
+            println!(
+                "  bound mutation window {width}: {secs:.4} s | live {:.1} MiB, reserved {:.1} MiB | \
+                 host WS/private peak Δ {:.1}/{:.1} MiB | at most one {:.1} MiB sidecar mapping \
+                 held (file-backed/reclaimable; 0 retained after transfer)",
+                used as f64 / MIB,
+                reserved as f64 / MIB,
+                host.working_set_peak.saturating_sub(host.working_set_start) as f64 / MIB,
+                host.private_peak.saturating_sub(host.private_start) as f64 / MIB,
+                mapped_peak as f64 / MIB,
+            );
+            bound.push((width, used));
+        }
+        for pair in bound.windows(2) {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "{label}: mutating window {} -> {} did not increase the live CUDA peak ({} -> {})",
+                pair[0].0,
+                pair[1].0,
+                pair[0].1,
+                pair[1].1
+            );
+        }
+    }
     Ok(())
 }
 
