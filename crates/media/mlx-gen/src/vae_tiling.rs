@@ -19,6 +19,33 @@ use crate::tiling::{TilePlan, MAX_WRITABLE_ELEMS};
 use crate::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, divide, maximum, multiply, pad};
 use mlx_rs::Array;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Count of tiles [`tiled_decode`] has finished, process-wide, since the last [`reset_tiles_decoded`].
+///
+/// **Why a global counter and not a callback.** A harness that needs to know whether a decode tiled
+/// *in execution* — not merely in configuration — usually cannot ask afterwards, because the
+/// interesting failures kill the process mid-decode (an iOS jetsam per-process-limit kill, for one).
+/// The observer therefore has to be a concurrent sampler, and a sampler cannot be handed a borrowed
+/// callback. A relaxed atomic is readable from any thread at any instant, costs one increment per
+/// tile against a decode that just did a full VAE forward, and — unlike a signature change — reaches
+/// every existing caller without touching one of them.
+///
+/// This distinguishes the three ways a "bounded" decode goes wrong, which are otherwise identical
+/// from outside: **0** tiles means the tiling never engaged (or died before the first tile), **1**
+/// means the geometry collapsed to a single tile the size of the whole image, and **N** with a
+/// rising footprint means the tiles are not being released between iterations.
+static TILES_DECODED: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the [`TILES_DECODED`] counter. Safe to call from a sampling thread mid-decode.
+pub fn tiles_decoded() -> usize {
+    TILES_DECODED.load(Ordering::Relaxed)
+}
+
+/// Zero the [`TILES_DECODED`] counter — call before the decode being measured.
+pub fn reset_tiles_decoded() {
+    TILES_DECODED.store(0, Ordering::Relaxed);
+}
 
 /// Refuse — with a catchable error — building an over-[`MAX_WRITABLE_ELEMS`] array **from a host
 /// buffer via `from_slice`** (the one write path still `i32`-capped on this pin). `full_elems` is the
@@ -149,6 +176,10 @@ pub fn tiled_decode(
                 // Bound the lazy graph + peak memory (the reference's per-tile `mx.eval`).
                 output.as_ref().unwrap().eval()?;
                 weights.as_ref().unwrap().eval()?;
+                // Published only after the `eval`s, so the count means "tiles actually materialized"
+                // rather than "tiles enqueued" — under a lazy graph those differ, and it is the
+                // materialized count that a memory trace needs to line up against a footprint curve.
+                TILES_DECODED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

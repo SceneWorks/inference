@@ -22,7 +22,7 @@ media = ["runtime-ios/media", "dep:image"]
 # architectural decision, not a way to run an experiment. This crate is excluded from the workspace,
 # so a dep here reaches neither `EXPECTED_MEMBER_COUNT` nor the catalog's ordered surface test.
 # If z-image earns a place on iOS, THAT is when the catalog changes.
-zimage = ["dep:mlx-gen-z-image", "dep:image"]
+zimage = ["dep:mlx-gen-z-image", "dep:mlx-gen", "dep:image"]
 
 [dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "c0e5c4a4350ec4989e5dc130158dee7757eae785" }
@@ -43,3 +43,7 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # Z-Image-Turbo, for the go/no-go above. Carries the full memory ladder (rungs 0-4) already, which
 # is why it is the cheapest second model to try.
 mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", optional = true }
+# For `vae_tiling`'s tiles-decoded counter — the only way to tell a decode that never tiled from one
+# that tiled and never released, which footprint alone cannot separate. Same path crate the provider
+# already links, so this adds no code to the binary, only a name to read it by.
+mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }

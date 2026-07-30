@@ -459,6 +459,7 @@ dependencies = [
  "core-llm-testkit",
  "image",
  "libc",
+ "mlx-gen",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "runtime-ios",

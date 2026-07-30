@@ -552,6 +552,20 @@ pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Opt
     })
 }
 
+/// The decode geometry this request will **actually** run at: `Some((edge, overlap))` when the decode
+/// tiles, `None` when it decodes whole-image. Pure — it consults exactly the functions the pipeline
+/// consults, so it cannot drift from the decision it reports on.
+///
+/// **Why this is public.** A caller can set `tile_vae_decode` and a `decode_tile_edge` and still
+/// decode whole-image — a mis-parsed knob resolves to `None` and silently selects the provider
+/// default, and on this VAE the untiled 1024² transient is ~14 GiB, which on a memory-capped device
+/// is the difference between a render and a kill. Reading the *configuration* back does not catch
+/// that; only the resolved decision does. Exposing it lets a harness record what the pipeline
+/// decided rather than what it was asked for.
+pub fn resolved_decode_plan(req: &GenerationRequest, is_sequential: bool) -> Option<(u32, u32)> {
+    decode_tiling(req, is_sequential).map(|_| decode_tile_geometry(req))
+}
+
 /// The (edge, overlap) a request decodes at: the selection's values when it names them, else the
 /// provider default. Pure, so the ladder's plumbing is unit-testable without a VAE.
 pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {

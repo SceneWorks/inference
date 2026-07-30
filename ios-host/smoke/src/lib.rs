@@ -766,7 +766,11 @@ fn dirs_documents() -> Option<std::path::PathBuf> {
 ///
 /// Best-effort by design: this is diagnostic breadcrumbing for a process that may be killed without
 /// warning, so a failure to write it must never fail the check it is instrumenting.
-#[cfg(feature = "media")]
+// Both image lanes write breadcrumbs, so this cannot be gated on `media` alone: `--features zimage`
+// by itself failed to compile because of it. That combination had never been built — every device run
+// so far passed BOTH features — which is precisely why it went unnoticed, and why the z-image lane
+// could not be exercised in isolation to rule the SANA graph out of a z-image failure.
+#[cfg(any(feature = "media", feature = "zimage"))]
 fn append_breadcrumb(name: &str, line: &str) {
     use std::io::Write;
     let Some(docs) = dirs_documents() else { return };
@@ -1154,6 +1158,81 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             }),
             ..Default::default()
         };
+
+        // What the pipeline DECIDED, not what it was asked for.
+        //
+        // The 1024px kill happens inside a decode entered with 6007 MiB free, while the identical
+        // request on the host peaks at 3102 MiB for the whole run. A >6 GB delta in one phase is not
+        // a bounded decode overrunning; it is the shape of this VAE's ~14 GiB untiled 1024²
+        // transient. The cheapest explanation is that the bounded configuration never engaged --
+        // an unset or unparseable `IOS_SMOKE_ZIMAGE_TILE` resolves to `None`, and twice today a knob
+        // that read correctly in source was not the knob the run used. Reading the request back
+        // would only restate what was just constructed, so this asks the provider instead.
+        append_breadcrumb(
+            "zimage-progress.txt",
+            &format!(
+                "  [{edge}px] decode plan — IOS_SMOKE_ZIMAGE_TILE={:?}, resolved {}",
+                std::env::var("IOS_SMOKE_ZIMAGE_TILE").ok(),
+                match mlx_gen_z_image::pipeline::resolved_decode_plan(&request, true) {
+                    Some((e, o)) => format!("TILED edge={e} overlap={o}"),
+                    None => "UNTILED (whole-image) -- ~14 GiB at 1024², expect jetsam".to_string(),
+                }
+            ),
+        );
+
+        // A concurrent sampler, because the interesting failure kills the process mid-decode.
+        //
+        // Every breadcrumb so far is written by the progress callback, which fires on phase CHANGE --
+        // so a phase that dies partway through reports only the headroom it STARTED with, and the
+        // trajectory that would explain the death is exactly the part never written. `Decoding` at
+        // 6007 MiB free is not evidence the decode is cheap; it is the last thing observed before a
+        // 6 GB excursion nobody sampled.
+        //
+        // 100 ms is chosen against the failure, not the runtime: the host decodes in ~3 s, so a kill
+        // partway leaves tens of samples, while the cost is a `writeln` + flush per sample against a
+        // phase doing full VAE forwards. Tiles-decoded rides along because footprint alone cannot
+        // separate "never tiled" from "tiled and never released" -- the count does.
+        mlx_gen::vae_tiling::reset_tiles_decoded();
+        let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sampler = {
+            let sampling = std::sync::Arc::clone(&sampling);
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                    append_breadcrumb(
+                        "zimage-progress.txt",
+                        &format!(
+                            "    t={:>6.2}s avail={:>6} MiB active={:>6.0} MiB peak={:>6.0} MiB tiles={}",
+                            t0.elapsed().as_secs_f64(),
+                            available_memory_mib()
+                                .map(|m| format!("{m:.0}"))
+                                .unwrap_or_else(|| "n/a".to_string()),
+                            mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0),
+                            mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0),
+                            mlx_gen::vae_tiling::tiles_decoded(),
+                        ),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        // Stop AND join the sampler on EVERY exit from the generate, including the `?` paths below.
+        // Joining rather than detaching matters for the file: a detached sampler can append one more
+        // line after the render's own summary, and a breadcrumb file whose tail is out of order is
+        // the kind of artifact that gets read as evidence of a phase that never happened.
+        struct StopOnDrop(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            Option<std::thread::JoinHandle<()>>,
+        );
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Some(h) = self.1.take() {
+                    let _ = h.join();
+                }
+            }
+        }
+        let _stop = StopOnDrop(std::sync::Arc::clone(&sampling), Some(sampler));
 
         // Phase-level breadcrumbs, because the coarse one is not localizing the kill.
         //
