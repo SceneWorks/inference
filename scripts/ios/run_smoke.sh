@@ -186,7 +186,12 @@ fi
 # this an on-device run can only ever exercise the default configuration, which is why the
 # image-only attribution experiment (IOS_SMOKE_IMAGE_ONLY) had no way to reach the device.
 LAUNCH_ENV="{}"
-for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+# A knob missing from this list does not fail — it silently runs the DEFAULT configuration and
+# reports it under whatever label the caller believed. `IOS_SMOKE_ZIMAGE_RUNG4=0` was absent here and
+# produced a 216.3 s "rung 4 disabled" run whose MLX peak (2901 MiB) was byte-identical to the
+# rung-4-ENABLED run, when the host A/B moves that peak by 1662 MiB. The measurement was a no-op
+# wearing the name of an experiment. If you add a knob to the harness, add it here in the same edit.
+for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
   val=$(printenv "$var" || true)
   if [ -n "$val" ]; then
     LAUNCH_ENV=$(python3 -c "

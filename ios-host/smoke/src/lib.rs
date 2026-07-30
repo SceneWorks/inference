@@ -1192,7 +1192,26 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 chunk_attention: true,
-                stream_transformer_blocks: true,
+                // Rung 4 is a knob now, because on device it is the prime suspect for a ~2x latency
+                // penalty and it is no longer needed for admission.
+                //
+                // z-image renders at 229 s on device against 15.9 s on an M5 Max — 14.4x. SANA
+                // through the same harness is 5.5-8.1x, which is the honest iPhone-vs-M5-Max GPU
+                // ratio, so z-image carries an extra ~2x that SANA does not.
+                //
+                // Rung 4 is where they differ. Widening the window cannot help — the family's block
+                // loop materializes one block, runs it and drops it before advancing, so residency
+                // is per-BLOCK by construction and `TRANSFORMER_WINDOW_SIZES` is deliberately `[1]`
+                // (memory_strategy.rs:99: windows 2, 4, 8, 15 and 30 all land on the same 1.832
+                // GiB). That means ~30 blocks x 4 steps of materialize-and-drop per render, each
+                // rebuilt from a 3.23 GB snapshot. On a host with the file in page cache that is
+                // free; on device it is real work every time.
+                //
+                // Turning it OFF is only affordable because bounding MLX's cache gave the headroom
+                // back — this exact experiment would have been a guaranteed jetsam kill this morning.
+                stream_transformer_blocks: std::env::var("IOS_SMOKE_ZIMAGE_RUNG4")
+                    .map(|v| v != "0")
+                    .unwrap_or(true),
                 transformer_window_size: Some(1),
                 // The decode tile edge, and the reason it is a knob.
                 //
@@ -1333,10 +1352,35 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
         //
         // Written on phase CHANGE, not per step: a 4-step denoise would otherwise write four
         // identical lines and a 30-block window sweep far more.
+        // Steps get their own line, unlike every other phase.
+        //
+        // The collapse-on-change rule exists so a 30-block window sweep does not write hundreds of
+        // identical lines, and for z-image it costs nothing to exempt Step: there are four of them.
+        // What it buys is the split between the FIRST step and the rest. If the extra ~2x is block
+        // materialization from the snapshot, every step pays it and the four are alike; if it is
+        // one-time setup (Metal pipeline compilation, a cold read warming the file), step 1 is an
+        // outlier and steps 2-4 are fast. Those two have different fixes, and a single aggregate
+        // denoise time cannot tell them apart.
+        let mut step_n = 0u32;
+        let mut last_step_at = Instant::now();
         let mut last_phase = String::new();
         let mut on_progress = |pr: Progress| {
             let phase = match pr {
-                Progress::Step { .. } => "Step".to_string(),
+                Progress::Step { .. } => {
+                    step_n += 1;
+                    let dt = last_step_at.elapsed().as_secs_f64();
+                    last_step_at = Instant::now();
+                    append_breadcrumb(
+                        "zimage-progress.txt",
+                        &format!(
+                            "  [{edge}px] step {step_n} — {dt:.1}s since previous, {} MiB avail",
+                            available_memory_mib()
+                                .map(|m| format!("{m:.0}"))
+                                .unwrap_or_else(|| "n/a".into())
+                        ),
+                    );
+                    "Step".to_string()
+                }
                 other => format!("{other:?}"),
             };
             if phase != last_phase {
@@ -1404,8 +1448,20 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
         let headroom = available_memory_mib()
             .map(|m| format!(", {m:.0} MiB still available"))
             .unwrap_or_default();
+        // The rung-4 state is READ BACK from the request, never asserted by the label. This string
+        // said "rung 4 w=1" unconditionally, so a run with rung 4 disabled reported itself as a
+        // rung-4 run — and since the knob was also not being forwarded to the device, the label was
+        // the only thing claiming an experiment had happened. A summary that describes the
+        // configuration it was asked for rather than the one it ran is worse than no summary.
+        let rung4 = match request.memory.and_then(|m| {
+            m.stream_transformer_blocks.then_some(m.transformer_window_size)
+        }) {
+            Some(Some(w)) => format!("rung 4 w={w}"),
+            Some(None) => "rung 4 default w".to_string(),
+            None => "rung 4 OFF".to_string(),
+        };
         let line = format!(
-            "{edge}px full ladder (rung 4 w=1): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
+            "{edge}px full ladder ({rung4}): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
              process RSS peak {:.0} MiB{headroom}, pixel range {lo}..{hi} \
              [host predicted 4468 MiB] | cache {cache_before:.0}->{cache_after:.0} MiB, \
              active {active_before:.0}->{active_after:.0} MiB after clear_cache",
