@@ -474,6 +474,47 @@ days**, against an unknown-size trunk port.
 512px from 6678 → ~5.8 GB, i.e. 512px on a 12 GB device — a real improvement over 256px, and
 still not an 8 GB device.
 
+### Implemented the embedding fix — it works, and it barely helps (2026-07-30)
+
+Quantizing `embed_tokens` to Q4 does exactly what the arithmetic said on disk: **1.18 GB → 0.33 GB**,
+and `mlx-gen-pid`'s Gemma-2 now packed-detects it (`mlx_gen::quant::embedding`, the same shared
+`TokenEmbedding` FLUX.2 and Z-Image already use — worth noting I started writing a duplicate before
+finding it). All 40 PiD/SANA parity tests pass, so the dense path is unchanged.
+
+**The peak barely moved:**
+
+| Config (6144 MiB budget) | Before | After | Saved |
+|---|---|---|---|
+| 512px sequential | 6678 MiB | 6679 MiB | **0** |
+| 256px sequential | 5049 MiB | 4890 MiB | 159 MiB |
+
+Predicted ~850 MiB. Got 0–159. **The disk saving is real; the peak saving is not**, because peak is
+set by whichever phase allocates most, and the encoder is *already dropped* before denoise under
+`Sequential`. Shrinking a component that was not the peak does not lower the peak — I reasoned
+about total weight size when I should have reasoned about per-phase maxima, and the measurement
+caught it.
+
+**Where the peak actually is.** `load_components` builds **both** DC-AE halves:
+
+```rust
+let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;   // 0.61 GB
+let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;   // 0.64 GB
+```
+
+Text-to-image never encodes an image — the `DcAeEncoder` is dead weight in the heavy bundle, held
+through the phase that *is* the peak. That is ~0.61 GB against a 512px gap of ~535 MiB, i.e. it
+alone could be the difference.
+
+**Revised order of levers**, now that the phase structure is measured rather than assumed:
+
+1. **Skip `DcAeEncoder` for text-to-image** (~0.61 GB off the peak phase). Small, targeted, and it
+   removes weight that is never used rather than making used weight smaller.
+2. **DC-AE decoder tiling** (~0.64 GB, the other half of the peak phase).
+3. **Trunk quantization** — 2.0 GB, the largest single item in the heavy bundle, but the 2-bit
+   Clark-Labs port is genuinely unported work of unknown size.
+4. ~~Embedding quantization~~ — **done, keep it** (it is free and real on disk), but it is not the
+   lever.
+
 **What would actually move the number**, in order of expected effect:
 
 1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component

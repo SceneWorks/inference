@@ -20,7 +20,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::gelu_tanh;
+use mlx_gen::nn::{gelu_tanh, TokenEmbedding};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -262,7 +262,11 @@ impl Layer {
 
 /// The Gemma-2 decoder (caption encoder).
 pub struct Gemma2 {
-    embed: Array, // [vocab, hidden]
+    embed: TokenEmbedding, // [vocab, hidden]
+    /// The dtype the embedding produced before it could be packed. `TokenEmbedding::forward`
+    /// always returns f32, so this is kept to restore the checkpoint dtype and leave the dense
+    /// path bit-identical.
+    embed_dtype: Dtype,
     layers: Vec<Layer>,
     norm: Array,
     cfg: Gemma2Config,
@@ -279,7 +283,26 @@ impl Gemma2 {
             &scalar(1.0).as_dtype(w.require(&format!("{prefix}norm.weight"))?.dtype())?,
         )?;
         Ok(Self {
-            embed: w.require(&format!("{prefix}embed_tokens.weight"))?.clone(),
+            // Packed-detected, exactly like the Linears above: `quant::embedding` loads the
+            // table packed when `{base}.scales` is present and dense otherwise. Worth doing here
+            // even though `quant::lin`'s note says embeddings "stay dense in every tier" — that
+            // default suits a DECODER, where the table doubles as the LM head. This is a caption
+            // encoder: it returns last-hidden states, never logits, and reads the table once via a
+            // gather of <=300 rows out of 256,000. Dense bf16 that is 1.18 GB (over half the
+            // encoder) resident to serve ~0.1% of itself; Q4 is 0.33 GB. On iOS the encoder phase
+            // sets the low-resolution memory floor (docs/ios-epics.md, E5).
+            // A packed table's `weight` is u32 on disk, so its own dtype is meaningless here --
+            // the dequantized VALUES take the scales' dtype. Read the scales when packed, the
+            // weight when dense.
+            embed_dtype: w
+                .get(&format!("{prefix}embed_tokens.scales"))
+                .unwrap_or(w.require(&format!("{prefix}embed_tokens.weight"))?)
+                .dtype(),
+            embed: mlx_gen::quant::embedding(
+                w,
+                &format!("{prefix}embed_tokens"),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             layers,
             norm,
             cfg: cfg.clone(),
@@ -295,7 +318,14 @@ impl Gemma2 {
 
         // embed + √hidden scale (cast to embedding dtype, per the reference)
         let flat = ids.reshape(&[b * l])?;
-        let emb = self.embed.take_axis(&flat, 0)?.reshape(&[b, l, hidden])?;
+        // `TokenEmbedding::forward` returns f32 (both FLUX.2 and Z-Image run f32 internally);
+        // Gemma-2 runs in the checkpoint dtype, so cast back to keep the dense path
+        // bit-identical to before this was packed-detected.
+        let emb = self
+            .embed
+            .forward(&flat)?
+            .as_dtype(self.embed_dtype)?
+            .reshape(&[b, l, hidden])?;
         let normalizer = scalar((hidden as f32).sqrt()).as_dtype(emb.dtype())?;
         let mut x = multiply(&emb, &normalizer)?;
 
