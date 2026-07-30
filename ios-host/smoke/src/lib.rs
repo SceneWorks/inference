@@ -193,6 +193,79 @@ fn available_memory_mib() -> Option<f64> {
     None
 }
 
+/// Tell MLX what iOS will actually give this process, and cap its buffer reuse cache.
+///
+/// # The bug this fixes
+///
+/// MLX sizes its memory limit and its buffer-cache limit from the system's *recommended working
+/// set*, which on a Mac is the right denominator. An iOS app is not bounded by the machine's RAM but
+/// by a per-process jetsam limit far below it, and nothing tells MLX so. On a 12 GB iPhone 17 Pro Max
+/// the device reported:
+///
+/// ```text
+/// MLX budget — memory_limit=11109 MiB, cache_limit=11109 MiB, os_available=6014 MiB
+/// ```
+///
+/// MLX applies backpressure at ~11 GB — a threshold this process can never reach, because jetsam
+/// kills it at ~6.1 GB first. So the cache limit is effectively infinite, and MLX returns nothing to
+/// the OS. A Z-Image decode traced on device showed `active + cache` conserved at **6068 MiB** across
+/// every sample, with cache absorbing exactly what active released:
+///
+/// ```text
+/// active 2752 + cache 3316 = 6068      active 1269 + cache 4799 = 6068
+/// active 2190 + cache 3878 = 6068      active  988 + cache 5080 = 6068
+/// ```
+///
+/// The decode itself was bounded and correct — 24 of 25 tiles, MLX peak 2901 MiB against the host's
+/// 3102. It was killed with 4 MiB of headroom while sitting on ~3.9 GB of *reclaimable* cache. This
+/// is why `get_active_memory`/`get_peak_memory` cannot be used alone to predict an iOS kill: jetsam
+/// counts `phys_footprint`, which includes the cache both metrics exclude.
+///
+/// # Why a cache limit rather than periodic `clear_cache`
+///
+/// Clearing is reactive and unsynchronized — it frees whatever happens to be cached when it runs,
+/// which is not necessarily before the allocation that overruns. A limit is enforced by the
+/// allocator at every allocation, so the invariant holds continuously rather than at sample points.
+///
+/// Not `set_memory_limit` alone either: that bounds *live* allocation and would make a legitimate
+/// working set fail instead of reclaiming reusable buffers it is already holding.
+#[cfg(target_os = "ios")]
+fn bound_mlx_to_the_jetsam_limit() -> String {
+    let Some(avail_mib) = available_memory_mib() else {
+        return "os_proc_available_memory unavailable -- MLX limits left at their defaults".into();
+    };
+    let mib = |m: f64| (m * 1024.0 * 1024.0) as usize;
+
+    // Cache: a quarter of the real budget. Big enough that tile-to-tile reuse still hits (the decode
+    // recycles same-shaped buffers), small enough to leave room for the largest transient — z-image's
+    // is ~2.9 GB, which does not fit beside a multi-GB cache under a ~6 GB cap.
+    let cache_mib = (avail_mib / 4.0).min(1024.0);
+    // Live allocation: 85% of the budget, so MLX applies backpressure BEFORE jetsam applies a kill.
+    // Backpressure is recoverable and a jetsam kill is not, so the useful limit is the lower one.
+    let limit_mib = avail_mib * 0.85;
+
+    let prev_limit = mlx_rs::memory::set_memory_limit(mib(limit_mib));
+    let prev_cache = mlx_rs::memory::set_cache_limit(mib(cache_mib));
+    format!(
+        "MLX limits bound to the jetsam budget: memory {:.0} -> {:.0} MiB, cache {:.0} -> {:.0} MiB \
+         (os_proc_available_memory = {avail_mib:.0} MiB). MLX sizes these from device RAM, which on \
+         iOS overshoots the per-process cap by ~2x and lets the reuse cache grow until jetsam kills \
+         the app while it holds GBs of reclaimable memory.",
+        prev_limit as f64 / (1024.0 * 1024.0),
+        limit_mib,
+        prev_cache as f64 / (1024.0 * 1024.0),
+        cache_mib,
+    )
+}
+
+#[cfg(not(target_os = "ios"))]
+fn bound_mlx_to_the_jetsam_limit() -> String {
+    // macOS has no per-process cap, so there is no smaller truth to tell MLX and its own sizing is
+    // already correct. Deliberately not mirrored for symmetry: capping the cache here would slow the
+    // host lane to make it resemble a constraint it does not have.
+    "not applicable on this platform (no per-app cap; MLX's own sizing is correct)".to_string()
+}
+
 /// Report the OS-enforced per-app memory limit, so every other number has a denominator.
 fn check_memory_headroom() -> Check {
     const NAME: &str = "per-app memory limit (OS-reported)";
@@ -1434,6 +1507,15 @@ pub fn run_report() -> String {
         // First: it is the denominator for every memory number below, and it must be sampled
         // before anything large is resident.
         check_memory_headroom(),
+        // Second, and before any allocation: MLX's own limits are sized from device RAM and
+        // overshoot the per-process jetsam cap by ~2x, so its reuse cache grows until the app is
+        // killed holding GBs of reclaimable memory. Correcting them after a model is loaded would
+        // leave the cache already grown past the new limit.
+        Check {
+            name: "MLX limits vs the jetsam cap",
+            passed: true,
+            detail: bound_mlx_to_the_jetsam_limit(),
+        },
         check_metallib_resolves(),
         check_gemm(Dtype::Float32, "f32 GEMM (steel)"),
         check_gemm(Dtype::Bfloat16, "bf16 GEMM (steel)"),
