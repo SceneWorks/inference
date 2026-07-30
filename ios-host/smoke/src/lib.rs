@@ -1095,15 +1095,37 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             offload_policy: OffloadPolicy::Sequential,
             ..GenLoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
         };
+        // Resolution is a knob because the 1024px answer was "killed" and the next question is
+        // where the boundary actually sits. Z-Image is native at 1024, so anything below is a
+        // fit-finding measurement, not a shipping proposal. Bound before the load so the load's own
+        // breadcrumbs can name it.
+        let edge: u32 = std::env::var("IOS_SMOKE_ZIMAGE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        append_breadcrumb(
+            "zimage-progress.txt",
+            &format!(
+                "  [{edge}px] before load — {} MiB avail",
+                available_memory_mib().map(|m| format!("{m:.0}")).unwrap_or_default()
+            ),
+        );
         let generator =
             mlx_gen_z_image::load(&spec).map_err(|e| format!("load failed: {e}"))?;
+        append_breadcrumb(
+            "zimage-progress.txt",
+            &format!(
+                "  [{edge}px] after load — {} MiB avail",
+                available_memory_mib().map(|m| format!("{m:.0}")).unwrap_or_default()
+            ),
+        );
 
         // Availability is not engagement: the ladder rungs are request-scoped, so they must be asked
         // for. `transformer_window_size: Some(1)` is the published production window.
         let request = GenerationRequest {
             prompt: "a lighthouse on a rocky coast at dawn".to_string(),
-            width: 1024,
-            height: 1024,
+            width: edge,
+            height: edge,
             count: 1,
             steps: Some(4),
             seed: Some(0),
@@ -1117,16 +1139,46 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             ..Default::default()
         };
 
-        let mut noop = |_: Progress| {};
+        // Phase-level breadcrumbs, because the coarse one is not localizing the kill.
+        //
+        // Both 1024 and 768 died with NO breadcrumb at all, and the check only writes one after the
+        // whole generate returns. Since halving the pixel count changed nothing, the decode peak is
+        // probably not what kills it — but "probably not the decode" is not an answer. The provider
+        // already emits phase progress; discarding it into a no-op threw away exactly the signal
+        // needed. Each distinct phase now appends a line WITH the live headroom, so the last line
+        // written names the phase that died and what was left when it started.
+        //
+        // Written on phase CHANGE, not per step: a 4-step denoise would otherwise write four
+        // identical lines and a 30-block window sweep far more.
+        let mut last_phase = String::new();
+        let mut on_progress = |pr: Progress| {
+            let phase = match pr {
+                Progress::Step { .. } => "Step".to_string(),
+                other => format!("{other:?}"),
+            };
+            if phase != last_phase {
+                let avail = available_memory_mib()
+                    .map(|m| format!("{m:.0} MiB avail"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                append_breadcrumb(
+                    "zimage-progress.txt",
+                    &format!(
+                        "  [{edge}px] phase {phase} — {avail}, MLX active {:.0} MiB",
+                        mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0)
+                    ),
+                );
+                last_phase = phase;
+            }
+        };
         let out = generator
-            .generate(&request, &mut noop)
+            .generate(&request, &mut on_progress)
             .map_err(|e| format!("generate failed: {e}"))?;
         let image = match out {
             GenerationOutput::Images(mut v) if !v.is_empty() => v.remove(0),
             _ => return Err("generator returned no image".into()),
         };
-        if (image.width, image.height) != (1024, 1024) {
-            return Err(format!("got {}x{}, expected 1024x1024", image.width, image.height));
+        if (image.width, image.height) != (edge, edge) {
+            return Err(format!("got {}x{}, expected {edge}x{edge}", image.width, image.height));
         }
         let (lo, hi) = image
             .pixels
@@ -1139,8 +1191,8 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
         if let Some(docs) = dirs_documents() {
             match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
                 Some(buf) => {
-                    if let Err(e) = buf.save(docs.join("zimage-1024.png")) {
-                        eprintln!("could not write zimage-1024.png: {e}");
+                    if let Err(e) = buf.save(docs.join(format!("zimage-{edge}.png"))) {
+                        eprintln!("could not write zimage-{edge}.png: {e}");
                     }
                 }
                 None => eprintln!("zimage pixel buffer does not match dimensions"),
@@ -1149,13 +1201,31 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
 
         let secs = started.elapsed().as_secs_f64();
         let mlx_peak = mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0);
+        // WHERE the memory went, not just how much peaked.
+        //
+        // `os_proc_available_memory` falls ~2.5 GB across a render and does not come back, while
+        // MLX reports a much smaller peak and `clear_cache()` is already called between configs.
+        // Two candidates, and they need opposite fixes:
+        //
+        //   - MLX's buffer CACHE is holding it -> `set_cache_limit(0)` stops the retention.
+        //   - it is WIRED -> `set_wired_limit` is the lever, and `clear_cache` cannot help
+        //     because wired pages are not evictable and still count against the footprint.
+        //
+        // `get_cache_memory()` distinguishes them. Sampled after the render and again after an
+        // explicit clear, so the clear's actual effect is visible rather than assumed.
+        let cache_before = mlx_rs::memory::get_cache_memory() as f64 / (1024.0 * 1024.0);
+        let active_before = mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0);
+        mlx_rs::memory::clear_cache();
+        let cache_after = mlx_rs::memory::get_cache_memory() as f64 / (1024.0 * 1024.0);
+        let active_after = mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0);
         let headroom = available_memory_mib()
             .map(|m| format!(", {m:.0} MiB still available"))
             .unwrap_or_default();
         let line = format!(
-            "1024px full ladder (rung 4 w=1): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
+            "{edge}px full ladder (rung 4 w=1): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
              process RSS peak {:.0} MiB{headroom}, pixel range {lo}..{hi} \
-             [host predicted 4468 MiB]",
+             [host predicted 4468 MiB] | cache {cache_before:.0}->{cache_after:.0} MiB, \
+             active {active_before:.0}->{active_after:.0} MiB after clear_cache",
             peak_rss_mib(),
         );
         // Breadcrumb before returning: if this model dies, it dies HERE, and the report never gets
