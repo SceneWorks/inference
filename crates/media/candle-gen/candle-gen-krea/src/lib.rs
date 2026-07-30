@@ -1210,9 +1210,10 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             // `blocks x 2 x steps` times.
             //
             // Rung 4 stays `Implemented` and stays selectable: within the memory ladder it is reached
-            // only when nothing cheaper fits, so its alternative there is no render at all. sc-16104
-            // tracks the separate tier-seam question of whether a rung-4-only fit should outrank a
-            // lower tier that fits resident. sc-16096 removes the conversion, after which this becomes
+            // only when nothing cheaper fits, so its alternative there is no render at all. It is also
+            // reachable to hold a HIGHER tier under an automatic tier choice, which is a decided
+            // fidelity-first trade rather than an oversight (SC-16090/SC-16104) — so this conversion is
+            // paid on q8, the tier where it is worst. sc-16096 removes it, after which this becomes
             // `DeviceFormatTransfer` and the `owner_story` escape hatch goes away.
             block_materialization: MemoryWindowMaterialization::HostFormatConversion {
                 converts:

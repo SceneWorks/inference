@@ -56,19 +56,23 @@
 //!    per-window work — see [`MemoryWindowMaterialization`]. Forking the shared order would encode a
 //!    fixable implementation defect into the contract 20 family stories then have to honour.
 //!
-//! ## Where the magnitude DOES reach a decision — and it is not here (SC-16104)
+//! ## Where the magnitude reaches a TIER decision, and why that is allowed (SC-16104)
 //!
 //! Reason 1 is a statement about the *ladder*, and it must not be over-read into "the cost never
 //! matters anywhere". One layer up, a caller choosing a numeric **tier** can consume this ladder's
 //! verdict as a boolean: SceneWorks' capability-downtier collapses "fits, resident" and "fits, but
 //! only by engaging rung 4" into the same `Fits`, then keeps the highest-fidelity tier that fits. So
-//! a tier whose *only* fit is rung 4 is preferred over a lower tier that fits resident, and there the
-//! cost genuinely decides — a q8 rung-4 render measured at ~1466 ms/block (~44 s/step) can be chosen
-//! over a q4 resident one.
+//! under an automatic tier choice, a tier whose *only* fit is rung 4 is preferred over a lower tier
+//! that fits resident, and the cost of that rung is what the higher tier is bought with — tens of
+//! seconds per step on q8, extrapolating z-image's measured ~1466 ms/block.
 //!
-//! That is a lossy boolean at the tier/strategy seam, not a defect in this order, and forking the
-//! order would not fix it. SC-16104 owns it. It is also why SC-15791's recommendation "do not enable
-//! rung 4 on q8 until the repack is hoisted" is not discharged by this decision.
+//! **That is intended.** Fidelity the user asked for is not a memory lever: the catalog refuses to
+//! substitute precision (tier integrity) and refuses to substitute geometry (SC-15807), and refusing
+//! to substitute speed-for-fidelity is the same refusal. It does mean this deliberately **declines**
+//! SC-15791's recommendation "do not enable rung 4 on q8 until the repack is hoisted" — gating q8
+//! would be the substitution the rule forbids — which raises the value of the repack fix (SC-16096)
+//! rather than lowering it. What remains open on SC-16104 is disclosure, not policy: nothing tells a
+//! caller its render is slow *because* it is streaming blocks to hold the tier.
 //!
 //! # A rung declares no non-VRAM resource cost (SC-16090)
 //!
