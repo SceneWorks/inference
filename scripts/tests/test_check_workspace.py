@@ -50,7 +50,12 @@ class WithinWorkspaceTests(unittest.TestCase):
         )
 
     def test_ignored_parts_cover_the_documented_set(self) -> None:
-        self.assertEqual(self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex"})
+        self.assertEqual(
+            self.gate.IGNORED_TREE_PARTS,
+            # ios-host is workspace-EXCLUDED host-app scaffolding for on-device testing, so
+            # it carries its own Cargo.lock legitimately.
+            {".git", "target", ".claude", ".codex", "ios-host"},
+        )
 
 
 if __name__ == "__main__":

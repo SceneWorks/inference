@@ -3,3 +3,8 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Generated iOS host project (XcodeGen; regenerate with `xcodegen generate` in ios-host/).
+ios-host/*.xcodeproj/
+ios-host/App/Info.plist
+ios-host/smoke/target/

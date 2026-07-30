@@ -28,6 +28,10 @@ members = [
 ]
 exclude = [
     "crates/media/candle-gen/vendor/candle-kernels",
+    # iOS host-app scaffolding (E3): an app target and an on-device smoke test, not part of the
+    # shipped runtime graph check-workspace.py governs. Kept out so EXPECTED_MEMBER_COUNT and the
+    # single-lockfile invariant continue to describe the product surface only.
+    "ios-host/smoke",
 ]
 
 # Internal packages are paths so a checkout has one contract package, one

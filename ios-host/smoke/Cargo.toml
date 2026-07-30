@@ -1,0 +1,17 @@
+[package]
+name = "ios-smoke"
+version = "0.0.0"
+edition = "2021"
+description = "On-device MLX smoke test: proves the bundled metallib resolves and its kernels compute correctly on iOS."
+license = "Apache-2.0"
+publish = false
+
+# Deliberately NOT a workspace member (the root manifest excludes it). This is host-app
+# scaffolding for E3, not part of the shipped runtime graph that check-workspace.py governs.
+
+[lib]
+# staticlib for linking into the .app; rlib so `cargo test` can exercise the same code on macOS.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "c0e5c4a4350ec4989e5dc130158dee7757eae785" }

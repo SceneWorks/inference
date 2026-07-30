@@ -73,7 +73,13 @@ FORBIDDEN_GRAPH_PACKAGES = {
 # and build output (.git, target), plus agent tooling that nests its own gitignored worktrees --
 # each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
 # be swept into the single-lockfile / single-manifest invariants below.
-IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex"})
+#
+# `ios-host` joins them for a different reason: it is host-app scaffolding for on-device testing
+# (an Xcode project plus a small Rust staticlib), deliberately EXCLUDED from the workspace in the
+# root Cargo.toml so it never enters the shipped runtime graph. Being excluded, it resolves its
+# own Cargo.lock -- legitimately, not as drift. The invariants here describe the product surface,
+# and the iOS smoke test is test apparatus rather than product.
+IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex", "ios-host"})
 
 # --- epic 13657 guardrail: inference never fetches weights and never derives a download-cache
 # location. Every model component is a caller-provisioned local path (WeightsSource::Dir / File);
