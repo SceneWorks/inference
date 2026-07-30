@@ -200,8 +200,12 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// width — q8 base ⇒ q8 branch, q4 base ⇒ q8 branch (the declared, measured floor), dense base ⇒ dense
 /// branch. It is still a LOAD-TIME decision (a resident weight can't be re-packed mid-render) but it is
 /// no longer a budget-gated *lever*: the sc-11748 gate kept a bf16 branch on any machine with headroom,
-/// which left ~8.4 GiB of precision the user did not ask for resident on a q8 render. `control_scale ==
-/// 0` stays bit-exact to the base at any tier.
+/// which left **~3.3 GB** of precision the user did not ask for resident on a q8 render — the branch's
+/// projections are 3.30 B params ≈ 6.6 GB bf16 against ~3.3 GB packed at q8
+/// ([`crate::memory`] / `gen_core::tier_integrity`). (NOT the 8.4 GB the catalog's `branchPackSaveGb`
+/// once claimed: 8.4 exceeds the whole branch, so it was never a weight-side quantity; the key is
+/// retracted and sc-16013 owns the re-measure.) `control_scale == 0` stays bit-exact to the base at any
+/// tier.
 fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot(root)?;
     if !spec.adapters.is_empty() {

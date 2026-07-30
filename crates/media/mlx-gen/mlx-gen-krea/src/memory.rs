@@ -719,8 +719,9 @@ mod tests {
     }
 
     /// The plan's peaks are estimated with the branch at its integrity tier, so a q4 base projects a
-    /// LOWER peak than it did when the branch was left bf16 — the 8.4 GiB of unrequested precision the
-    /// old ladder carried until its last rung. Guards against a regression that re-estimates the branch
+    /// LOWER peak than it did when the branch was left bf16 — the ~3.3 GB of unrequested precision the
+    /// old ladder carried until its last rung (6.6 GB bf16 → ~3.3 GB at the q8 floor; NOT the retracted
+    /// 8.4 GB, which exceeds the whole branch). Guards against a regression that re-estimates the branch
     /// dense while the loader packs it (an under- or over-prediction of the real resident set).
     #[test]
     fn plan_peaks_use_the_integrity_branch_tier_not_bf16() {
