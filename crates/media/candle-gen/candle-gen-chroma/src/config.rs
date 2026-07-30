@@ -12,7 +12,7 @@
 //! slices this v1 wires **txt2img only** — LoRA/LoKr and Q4/Q8 are NOT advertised (and are rejected
 //! at load rather than silently dropped); ControlNet / IP-Adapter are later ports.
 
-use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor};
+use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, SizeFloor};
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
@@ -131,7 +131,7 @@ impl ChromaVariant {
                 audio_voices: vec![],
                 audio_languages: vec![],
                 audio_edit_modes: vec![],
-                ..Default::default()
+                size_floor: SizeFloor::RangeChecked,
             },
         }
     }

@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, SizeFloor, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -216,7 +216,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

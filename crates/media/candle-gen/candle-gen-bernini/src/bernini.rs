@@ -40,7 +40,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, CancelFlag, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    WeightsSource,
+    SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -589,7 +589,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

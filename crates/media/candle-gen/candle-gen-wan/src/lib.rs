@@ -75,7 +75,8 @@ use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress, Quant, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress, Quant, SizeFloor,
+    WeightsSource,
 };
 use candle_gen::{
     check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
@@ -740,7 +741,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

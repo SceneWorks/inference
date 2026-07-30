@@ -39,7 +39,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
 };
 
 pub use config::{MochiConfig, MochiVaeConfig};
@@ -127,7 +127,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

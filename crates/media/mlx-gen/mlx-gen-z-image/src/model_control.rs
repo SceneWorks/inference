@@ -21,7 +21,7 @@ use mlx_gen::{
     require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
     ControlBranch, Error, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
-    StagedHeavy, WeightsSource,
+    SizeFloor, StagedHeavy, WeightsSource,
 };
 use mlx_rs::Dtype;
 use std::path::Path;
@@ -53,7 +53,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Advertised so a weights-free caller can reject a bad `kind` before
             // paying for a load. Same expression the `ControlBranch` override
             // returns, so the two cannot drift.
-            accepted_control_kinds: crate::model_base_control::accepted_kinds(),
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_negative_prompt: false,
             supports_guidance: false,
@@ -86,7 +85,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

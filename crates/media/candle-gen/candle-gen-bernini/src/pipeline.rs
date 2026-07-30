@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -107,7 +107,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

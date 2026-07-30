@@ -95,7 +95,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, WeightsSource,
+    ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
@@ -648,7 +648,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

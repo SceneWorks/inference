@@ -24,7 +24,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -117,7 +117,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

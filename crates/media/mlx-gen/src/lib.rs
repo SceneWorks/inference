@@ -98,7 +98,7 @@ pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationPhase, GenerationRequest, Generator, KeyframeRef, Modality,
-    ModelDescriptor, PhaseAdapter, ReplacementMode, VideoClipRef,
+    ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor, VideoClipRef,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{

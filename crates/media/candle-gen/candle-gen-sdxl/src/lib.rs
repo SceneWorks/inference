@@ -171,7 +171,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
+    Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline, SdxlComponents};
@@ -472,7 +472,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

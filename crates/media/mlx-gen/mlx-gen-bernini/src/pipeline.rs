@@ -17,7 +17,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
-    WeightsSource,
+    SizeFloor, WeightsSource,
 };
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
@@ -89,7 +89,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

@@ -31,7 +31,7 @@ use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::{
     default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    Quant, Result, SizeFloor, WeightsSource,
 };
 
 use crate::config::NeoChatConfig;
@@ -128,7 +128,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

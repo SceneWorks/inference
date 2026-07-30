@@ -29,7 +29,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy,
-    Precision, Progress, Quant, Result, WeightsSource,
+    Precision, Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
@@ -303,7 +303,7 @@ pub fn descriptor_vace() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

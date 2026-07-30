@@ -24,7 +24,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::concatenate_axis;
@@ -96,7 +96,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

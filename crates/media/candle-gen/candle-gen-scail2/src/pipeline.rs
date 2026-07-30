@@ -22,7 +22,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    WeightsSource,
+    SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
@@ -104,7 +104,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

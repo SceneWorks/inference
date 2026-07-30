@@ -37,7 +37,7 @@ use candle_audio::candle_core::Device;
 use candle_audio::gen_core::{
     self, AdapterSpec, AudioEditMode, AudioTrack, Capabilities, Conditioning, ConditioningKind,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, WeightsSource,
+    OffloadPolicy, Precision, Progress, SizeFloor, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -1086,7 +1086,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_conversation_history: false,
             supports_conversation_session: false,
             max_speakers: None,
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

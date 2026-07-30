@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    ModelDescriptor, Progress, SizeFloor, WeightsSource,
 };
 
 use crate::pipeline::{SanaGenerateRequest, SanaPipeline, SanaSprintPipeline};
@@ -177,7 +177,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -231,7 +231,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

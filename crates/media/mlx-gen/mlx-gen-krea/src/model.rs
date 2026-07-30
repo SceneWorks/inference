@@ -14,7 +14,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, WeightsSource,
+    Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -142,7 +142,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

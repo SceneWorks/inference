@@ -23,7 +23,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, gen_core, require_base_dir,
     require_control, run_flow_sampler, Capabilities, Conditioning, ConditioningKind, ControlBranch,
     Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
     TimestepConvention,
 };
 use mlx_rs::transforms::eval;
@@ -92,7 +92,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

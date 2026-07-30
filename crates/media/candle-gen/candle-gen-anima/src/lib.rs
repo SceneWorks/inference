@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
 };
 
 /// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
@@ -117,7 +117,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

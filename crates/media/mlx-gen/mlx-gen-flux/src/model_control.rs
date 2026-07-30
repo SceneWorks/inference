@@ -35,7 +35,7 @@ use mlx_gen::{
     require_control, run_flow_sampler, AcceptedControlKinds, Capabilities, ConditioningKind,
     ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, TimestepConvention,
+    Result, SizeFloor, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -114,7 +114,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            ..Default::default()
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
