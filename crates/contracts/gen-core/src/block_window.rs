@@ -68,12 +68,18 @@
 //! `conformance_errors` checks; this is the same statement addressed to whoever writes the backend.
 //!
 //! **The obligation binds the rung, not this trait.** It applies to any realization of bounded
-//! transformer residency, including one that has not adopted this driver — `candle-gen-krea`'s shipped
-//! streamed trunk folds its own block sequence and never touches [`BlockWindowBackend`], and it is the
-//! realization that currently violates the obligation. That divergence is itself a defect (SC-15792:
-//! a backend-local reimplementation of the driver is a review failure, because rung 4 fell through the
-//! cracks originally by primitives being less enforced than the selector), but it means the obligation
-//! must not be read as scoped to implementors of this trait.
+//! transformer residency, including one that has not adopted this driver, so it must not be read as
+//! scoped to implementors of [`BlockWindowBackend`].
+//!
+//! `candle-gen-krea` is the worked example of why the two halves are separable, because they were
+//! fixed by two different stories. Its shipped streamed trunk used to fold its own block sequence and
+//! never touch this trait, AND rebuild each block from the MLX affine triples inside the per-window
+//! path. SC-15792 moved it onto the driver — a backend-local reimplementation is a review failure,
+//! because rung 4 fell through the cracks originally by primitives being less enforced than the
+//! selector. SC-16096 separately removed the per-window conversion, content-addressing each source
+//! triple into a device-format sidecar prepared once, which is what flipped its declaration from
+//! `HostFormatConversion` to `DeviceFormatTransfer`. Adopting the driver was necessary and not
+//! sufficient; neither story alone would have discharged both.
 
 use std::ops::Range;
 

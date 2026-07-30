@@ -170,6 +170,21 @@ pub use residency::{
     sequential_offload_enabled, Residency, OFFLOAD_ENV,
 };
 
+// Driver memory-pool introspection (sc-12818, widened by SC-15792). Gated on `cuda` alone rather
+// than on `testkit`: the CUDA compile/Clippy lane enables `cuda` and NOT `testkit`, so a probe living
+// only behind `testkit` is invisible to the one lane that can build it — which is precisely why
+// SC-15791's spike ended up forking `default_pool` instead of extending testkit. `testkit` re-exports
+// the two original functions, so existing consumers are unchanged.
+#[cfg(feature = "cuda")]
+pub mod cuda_mempool;
+
+// Rung-4 bounded transformer residency, the candle half (SC-15792, epic 15448). The schedule lives
+// in `gen_core::block_window` (hoisted by SC-15790 so candle would not fork it); this binds candle's
+// two backend answers — both measured in SC-15791, both different from MLX's — plus the teardown
+// synchronize that has no MLX counterpart because MLX has no driver/pool split.
+pub mod block_window;
+pub use block_window::BlockPlan;
+
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, and GPU
 // peak-VRAM helpers that had been hand-copied — and had drifted — across ~16 `#[cfg(test)]`
 // validation modules in the provider crates. Weight snapshots are not resolved here: inference never

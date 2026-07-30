@@ -39,143 +39,14 @@
 
 #![cfg(feature = "cuda")]
 
-use std::collections::HashMap;
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::VarBuilder;
-use candle_gen::quant::{lin, QLinear, MLX_GROUP_SIZE};
 
-const MIB: f64 = 1024.0 * 1024.0;
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+mod rung4_support;
+use rung4_support::{CappedPool, GIB, MIB};
 
 // ---------------------------------------------------------------------------------------------------
 // The capped pool
 // ---------------------------------------------------------------------------------------------------
-
-mod capped {
-    use candle_gen::candle_core::cuda::cudarc::driver::sys;
-    use std::ffi::c_void;
-
-    /// An explicitly created, size-capped stream-ordered pool installed as device `ordinal`'s
-    /// **current** pool. Restores the device's original pool on drop, because this is a
-    /// process-global device property and leaving it installed would silently cap every later test.
-    pub struct CappedPool {
-        pool: sys::CUmemoryPool,
-        previous: sys::CUmemoryPool,
-        ordinal: i32,
-    }
-
-    fn device(ordinal: i32) -> Option<sys::CUdevice> {
-        unsafe {
-            if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut dev: sys::CUdevice = 0;
-            (sys::cuDeviceGet(&mut dev, ordinal) == sys::CUresult::CUDA_SUCCESS).then_some(dev)
-        }
-    }
-
-    impl CappedPool {
-        /// Create a pool limited to `cap_bytes` and make it the device's current pool.
-        ///
-        /// MUST be installed before candle allocates anything material. The pool is consulted per
-        /// allocation, so a later install would still cap subsequent allocations — but anything
-        /// already resident came from the previous pool and is invisible to the cap.
-        pub fn install(ordinal: i32, cap_bytes: usize) -> Option<Self> {
-            let dev = device(ordinal)?;
-            unsafe {
-                // The device's existing current pool, so it can be restored.
-                let mut previous: sys::CUmemoryPool = std::ptr::null_mut();
-                if sys::cuDeviceGetMemPool(&mut previous, dev) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-
-                let mut props: sys::CUmemPoolProps = std::mem::zeroed();
-                props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
-                props.handleTypes = sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE;
-                props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-                props.location.id = ordinal;
-                // The whole point: an enforced ceiling, unlike a balloon.
-                props.maxSize = cap_bytes;
-
-                let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-                if sys::cuMemPoolCreate(&mut pool, &props) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                if sys::cuDeviceSetMemPool(dev, pool) != sys::CUresult::CUDA_SUCCESS {
-                    sys::cuMemPoolDestroy(pool);
-                    return None;
-                }
-                Some(Self {
-                    pool,
-                    previous,
-                    ordinal,
-                })
-            }
-        }
-
-        fn attr(&self, which: sys::CUmemPool_attribute) -> u64 {
-            let mut v: u64 = 0;
-            unsafe {
-                if sys::cuMemPoolGetAttribute(
-                    self.pool,
-                    which,
-                    (&mut v as *mut u64).cast::<c_void>(),
-                ) != sys::CUresult::CUDA_SUCCESS
-                {
-                    return 0;
-                }
-            }
-            v
-        }
-
-        /// **Read the CAPPED pool, not the default one.** SC-15791's probe reads
-        /// `cuDeviceGetDefaultMemPool`; under a custom current pool that is the wrong handle and would
-        /// report ~0 while the real allocations happen elsewhere. Any harness combining the two must
-        /// switch to the current pool.
-        pub fn used(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)
-        }
-
-        pub fn used_high(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH)
-        }
-
-        pub fn reserved_high(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)
-        }
-
-        pub fn reset_high(&self) {
-            for which in [
-                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
-                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
-            ] {
-                let mut zero: u64 = 0;
-                unsafe {
-                    sys::cuMemPoolSetAttribute(
-                        self.pool,
-                        which,
-                        (&mut zero as *mut u64).cast::<c_void>(),
-                    );
-                }
-            }
-        }
-    }
-
-    impl Drop for CappedPool {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(dev) = device(self.ordinal) {
-                    sys::cuDeviceSetMemPool(dev, self.previous);
-                }
-                sys::cuMemPoolDestroy(self.pool);
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------------------------------
 // A: does the cap actually bind CANDLE's allocator?
@@ -202,7 +73,10 @@ fn capped_pool_binds_candles_allocator() -> Result<()> {
         candle_gen::gpu::nvidia_smi_rendered_free_gib().unwrap_or(0.0),
         CAP / (1024 * 1024),
     );
-    let pool = capped::CappedPool::install(0, CAP).expect("install a capped pool");
+    let capped = CappedPool::install(0, CAP).expect("install a capped pool");
+    // Trap 1: the counters must follow the CAPPED pool, not `cuDeviceGetDefaultMemPool`, which
+    // reports ~0 while every allocation lands here.
+    let pool = capped.counters();
     let dev = Device::new_cuda(0)?;
 
     let chunk_elems = CHUNK_MIB * 1024 * 1024 / 4; // f32
@@ -280,7 +154,8 @@ fn non_pool_overhead_is_measured() -> Result<()> {
     // below is what matters and an idle GPU keeps that honest.
     let free_before = smi_free();
 
-    let pool = capped::CappedPool::install(0, 256 * 1024 * 1024).expect("capped pool");
+    let capped = CappedPool::install(0, 256 * 1024 * 1024).expect("capped pool");
+    let pool = capped.counters();
     let dev = Device::new_cuda(0)?;
     // Force the context and the usual kernel/cuBLAS machinery to materialize.
     let a = Tensor::randn(0f32, 1f32, (512, 512), &dev)?;
@@ -328,197 +203,25 @@ fn non_pool_overhead_is_measured() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// C: the payoff — does rung 4 survive a cap the resident path cannot?
+// C: the payoff — MOVED
 // ---------------------------------------------------------------------------------------------------
-
-/// Minimal tier plumbing, duplicated from `rung4_block_streaming_spike.rs` rather than shared: these
-/// are separate test binaries and the spike is deliberately throwaway. SC-15792 will own the real one.
-struct Tier {
-    path: PathBuf,
-    packed: Vec<Vec<String>>,
-    dense: Vec<Vec<String>>,
-    dims: HashMap<String, (usize, usize)>,
-}
-
-impl Tier {
-    fn open(path: &Path) -> Result<Self> {
-        // SAFETY: an immutable HF-cache blob; nothing rewrites it mid-test.
-        let st = unsafe { MmapedSafetensors::new(path)? };
-        let views = st.tensors();
-        let n = views
-            .iter()
-            .filter_map(|(k, _)| k.strip_prefix("layers."))
-            .filter_map(|r| r.split('.').next())
-            .filter_map(|i| i.parse::<usize>().ok())
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
-        assert!(n > 0, "no `layers.N.` blocks in {}", path.display());
-
-        let shapes: HashMap<&str, &[usize]> =
-            views.iter().map(|(k, v)| (k.as_str(), v.shape())).collect();
-        let (mut packed, mut dense) = (vec![Vec::new(); n], vec![Vec::new(); n]);
-        let mut dims = HashMap::new();
-        for (k, v) in &views {
-            let Some(b) = k
-                .strip_prefix("layers.")
-                .and_then(|r| r.split('.').next())
-                .and_then(|i| i.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            if let Some(base) = k.strip_suffix(".scales") {
-                let w = shapes[format!("{base}.weight").as_str()];
-                packed[b].push(base.to_string());
-                dims.insert(base.to_string(), (w[0], v.shape()[1] * MLX_GROUP_SIZE));
-            } else if let Some(base) = k.strip_suffix(".weight") {
-                if !shapes.contains_key(format!("{base}.scales").as_str()) {
-                    dense[b].push(k.to_string());
-                }
-            } else if !k.ends_with(".biases") {
-                dense[b].push(k.to_string());
-            }
-        }
-        Ok(Self {
-            path: path.to_path_buf(),
-            packed,
-            dense,
-            dims,
-        })
-    }
-
-    fn n_blocks(&self) -> usize {
-        self.packed.len()
-    }
-
-    fn view(&self, dev: &Device) -> Result<VarBuilder<'static>> {
-        // SAFETY: immutable HF-cache blob; a fresh mmap per view.
-        let st = unsafe { MmapedSafetensors::new(&self.path)? };
-        Ok(VarBuilder::from_backend(
-            Box::new(st),
-            DType::F32,
-            dev.clone(),
-        ))
-    }
-}
-
-fn materialize(
-    tier: &Tier,
-    view: &VarBuilder,
-    range: Range<usize>,
-) -> Result<Vec<(Vec<QLinear>, Vec<Tensor>)>> {
-    let mut out = Vec::new();
-    for b in range {
-        let mut lins = Vec::new();
-        for base in &tier.packed[b] {
-            let (o, i) = tier.dims[base];
-            lins.push(lin(view, base, i, o, false)?);
-        }
-        let mut dense = Vec::new();
-        for key in &tier.dense[b] {
-            dense.push(view.get_unchecked_dtype(key, DType::F32)?);
-        }
-        out.push((lins, dense));
-    }
-    Ok(out)
-}
-
-/// **The verdict SC-15791 could not reach.** Under an enforced cap sitting between the two
-/// footprints, the windowed path must complete and the fully-resident path must fail to allocate.
-///
-/// That is a genuine discriminating result rather than gate arithmetic — the thing the balloon could
-/// not deliver, because on WDDM the balloon is not a ceiling and this is.
-#[test]
-#[ignore = "needs a CUDA host and the hosted z-image q4 tier (SC16091_Q4 env)"]
-fn rung4_windowed_survives_a_cap_the_resident_path_cannot() -> Result<()> {
-    let Ok(q4) = std::env::var("SC16091_Q4") else {
-        println!("[sc-16091] SKIP: SC16091_Q4 not set");
-        return Ok(());
-    };
-    // SC-15791 measured window 1 at ~256 MiB reserved and the resident stack at ~3488 MiB. A 1 GiB
-    // cap sits between them with wide margin on both sides.
-    const CAP: usize = 1024 * 1024 * 1024;
-
-    let pool = capped::CappedPool::install(0, CAP).expect("install a capped pool");
-    let dev = Device::new_cuda(0)?;
-    let tier = Tier::open(Path::new(&q4))?;
-    println!(
-        "\n[sc-16091] ENFORCED CAP {} MiB, {} blocks. window 1 needs ~256 MiB; resident needs ~3488 MiB.",
-        CAP / (1024 * 1024),
-        tier.n_blocks(),
-    );
-
-    // Windowed: one block at a time. Must succeed.
-    pool.reset_high();
-    let mut windowed_err = None;
-    for b in 0..tier.n_blocks() {
-        let view = tier.view(&dev)?;
-        match materialize(&tier, &view, b..b + 1) {
-            Ok(blocks) => {
-                if let Err(e) = dev.synchronize() {
-                    windowed_err = Some(e.to_string());
-                    break;
-                }
-                drop(blocks);
-            }
-            Err(e) => {
-                windowed_err = Some(e.to_string());
-                break;
-            }
-        }
-    }
-    let windowed_peak = pool.used_high();
-    println!(
-        "  windowed (window 1): {} | peak used {:.1} MiB, reserved-high {:.1} MiB",
-        match &windowed_err {
-            None => "COMPLETED".to_string(),
-            Some(e) => format!("FAILED — {e}"),
-        },
-        windowed_peak as f64 / MIB,
-        pool.reserved_high() as f64 / MIB,
-    );
-
-    // Resident: all blocks at once. Must fail under the same cap.
-    pool.reset_high();
-    let view = tier.view(&dev)?;
-    let resident = materialize(&tier, &view, 0..tier.n_blocks())
-        .and_then(|blocks| dev.synchronize().map(|_| blocks));
-    let resident_err = match &resident {
-        Ok(_) => None,
-        Err(e) => Some(e.to_string()),
-    };
-    println!(
-        "  resident (all {} blocks): {} | peak used {:.1} MiB",
-        tier.n_blocks(),
-        match &resident_err {
-            None => "COMPLETED".to_string(),
-            Some(e) => format!("FAILED — {e}"),
-        },
-        pool.used_high() as f64 / MIB,
-    );
-    drop(resident);
-
-    assert!(
-        windowed_err.is_none(),
-        "the windowed path must survive a {} MiB cap: {windowed_err:?}",
-        CAP / (1024 * 1024)
-    );
-    assert!(
-        resident_err.is_some(),
-        "the resident path COMPLETED under a {} MiB cap despite needing ~3488 MiB — the cap is not \
-         binding this path either, so it is no better than the balloon and must not be reported as a \
-         small-card verdict",
-        CAP / (1024 * 1024)
-    );
-    assert!(
-        windowed_peak as usize <= CAP,
-        "the windowed peak {} exceeded the cap it supposedly ran under",
-        windowed_peak
-    );
-    println!(
-        "  ⇒ DISCRIMINATING RESULT: rung 4's window bound lets a model run inside an ENFORCED budget \
-         that the resident path cannot fit. This is measured behaviour under a real ceiling, not gate \
-         arithmetic on a 96 GiB card."
-    );
-    Ok(())
-}
+//
+// The rung-4 verdict this file originally carried ("windowed survives a cap the resident path
+// cannot") now lives in `rung4_block_window_real_weights.rs` as
+// `windowed_fits_an_enforced_cap_the_resident_path_cannot`, and is STRONGER there in three ways
+// (SC-15792):
+//
+//   * it drives `candle_gen::block_window::run_windowed` — the shipped driver — where this file's
+//     version hand-rolled its own `for b in 0..n { view; materialize; sync; drop }` loop. A test that
+//     proves a bound for a loop nothing ships is the fork rung 4 exists to prevent;
+//   * both arms go through ONE code path (`BlockPlan` at window 1 vs at `n_blocks`), so the
+//     comparison cannot be between two loaders that could each be wrong;
+//   * the budget assertion is on RESERVED rather than USED — reserved is the unit the admission gate
+//     reads, and it ran ~48% higher.
+//
+// The measured result is unchanged in shape: under a 1024 MiB enforced cap on this 95.6 GiB host,
+// windowed COMPLETED at 261.4 MiB used / 416.0 MiB reserved while resident FAILED with
+// `CUDA_ERROR_OUT_OF_MEMORY` at 949.0 MiB used.
+//
+// Arms A and B above stay here: they are about the METHOD (does the cap bind candle's allocator, and
+// what sits outside the pool), which is sc-16091's finding and not rung-4-specific.
