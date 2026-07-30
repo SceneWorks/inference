@@ -166,21 +166,51 @@ pub fn decode_to_image(
     decoded_to_image(&decoded_nchw)
 }
 
-/// The decode tiling to use, from `MLX_GEN_SANA_DECODE_TILE` (a latent-space tile edge in pixels,
-/// e.g. `256`); `None` decodes whole-image.
+/// Default tile edge in **output** pixels, and its overlap. Measured: at 1024² this holds the
+/// sequential peak to 3294 MiB on the host and 2751 MiB on device, against 9177 MiB untiled.
+/// A quarter-tile overlap is enough for the trapezoidal blend without paying for large redundant
+/// borders.
+pub const DECODE_TILE_EDGE: i32 = 128;
+/// Overlap for [`DECODE_TILE_EDGE`], in output pixels.
+pub const DECODE_OVERLAP: i32 = DECODE_TILE_EDGE / 4;
+
+/// The decode tiling for this render, or `None` to decode whole-image.
 ///
-/// An env knob rather than a request field **for now**: the point of this step is to measure what
-/// tiling buys before deciding the policy. The eventual shape should follow Krea's
-/// budget-gated `auto_tiling_*` — estimate the decode peak from the render shape and tile only
-/// when it would exceed the budget — so tiling costs nothing when memory is plentiful.
-fn decode_tiling() -> Option<TilingConfig> {
-    let px: i32 = std::env::var("MLX_GEN_SANA_DECODE_TILE")
-        .ok()?
-        .parse()
-        .ok()?;
-    // A quarter-tile overlap: enough for the trapezoidal blend to hide seams without paying for
-    // large redundant borders.
-    Some(TilingConfig::spatial_only(px, px / 4))
+/// # Why `Sequential` is the trigger
+///
+/// `Sequential` is the memory-constrained signal — it is the policy a phone loads under, and the
+/// one `runtime-ios` uses. Under it, **tiling is not optional**: an untiled DC-AE decode was
+/// measured at 9177 MiB on the host and **killed the app on device**, while the tiled path
+/// completed at 2751 MiB (`docs/ios-epics.md`, E5).
+///
+/// This default is the fix for a real shipping defect, not a preference. Tiling used to be
+/// reachable *only* through `MLX_GEN_SANA_DECODE_TILE`, which nothing in `runtime-ios` or
+/// `mlx-gen-ios-catalog` sets — so a product building the iOS bundle and calling SANA got exactly
+/// the configuration that dies. The proven-good path must be the default one.
+///
+/// `Resident` keeps the whole-image decode. That is deliberate and not merely conservative: tiling
+/// changes output pixels by construction (DC-AE's attention normalizer is global — see
+/// [`decode_tiled`]), so a Mac with memory to spare should pay nothing for a bound it does not need.
+///
+/// The env var survives as a **measurement override**, which is what it was built for
+/// (`mlx-gen-ios-catalog`'s `image_budget` and `tiling_fidelity` sweep it). `0` forces whole-image
+/// so the untiled path stays reachable for A/Bs.
+///
+/// SC-15449: this is rung 2 (`BoundedDecode`) driven by a load-time signal. The shared contract's
+/// budget model — tile only when the *predicted peak* exceeds the budget, at a calibrated
+/// edge/overlap — is the correct eventual shape and is tracked as the adoption story; this keeps the
+/// device safe in the meantime without pretending to be that.
+fn decode_tiling(is_sequential: bool) -> Option<TilingConfig> {
+    match std::env::var("MLX_GEN_SANA_DECODE_TILE").ok().and_then(|v| v.parse::<i32>().ok()) {
+        // Explicit override, including `0` for "no tiling" — the A/B control.
+        Some(0) => None,
+        Some(px) => Some(TilingConfig::spatial_only(px, px / 4)),
+        None if is_sequential => Some(TilingConfig::spatial_only(
+            DECODE_TILE_EDGE,
+            DECODE_OVERLAP,
+        )),
+        None => None,
+    }
 }
 
 /// DC-AE tiling parameters: the ×32 spatial compression, and the single stage that runs at full
@@ -708,7 +738,12 @@ impl SanaHeavy {
         let latents = self.denoise_one(cond, req, guidance, cancel, on_progress)?;
         on_progress(Progress::Decoding);
         release_denoise_graph(std::slice::from_ref(&latents))?;
-        self.decode_view().decode_one(&latents, cancel)
+        // Whole-image unless the env override says otherwise. This is the standalone entrypoint —
+        // it holds every component itself, so it has resident semantics and no memory pressure to
+        // bound. The `Sequential` default lives at the residency-driven call site in `model.rs`.
+        let tiling = resolve_decode_tiling(false);
+        self.decode_view()
+            .decode_one(&latents, cancel, tiling.as_ref())
     }
 
     /// **Denoise** one image from pre-encoded conditioning, stopping at the latents — the phase-B half
@@ -921,17 +956,23 @@ pub struct SanaDecodeView<'a> {
 impl SanaDecodeView<'_> {
     /// DC-AE-decode one already-denoised, already-evaluated latent to an [`Image`].
     ///
-    /// Tiling comes from [`decode_tiling`], which is where the bounded-decode policy lives; whole-image
-    /// decode is the default and is byte-identical to the pre-staging path.
-    pub fn decode_one(&self, latents: &Array, cancel: &CancelFlag) -> Result<Image> {
-        decode_to_image(
-            self.decoder,
-            self.dc_ae_cfg,
-            latents,
-            cancel,
-            decode_tiling().as_ref(),
-        )
+    /// `tiling` is the caller's decision, from [`resolve_decode_tiling`] — the same shape as
+    /// `mlx-gen-z-image`'s `decode_batch`, and passed rather than derived because only the caller
+    /// knows the load's residency.
+    pub fn decode_one(
+        &self,
+        latents: &Array,
+        cancel: &CancelFlag,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        decode_to_image(self.decoder, self.dc_ae_cfg, latents, cancel, tiling)
     }
+}
+
+/// The decode tiling for a load with the given residency. See [`decode_tiling`] for the policy;
+/// this is the public entry point the model layer calls.
+pub fn resolve_decode_tiling(is_sequential: bool) -> Option<TilingConfig> {
+    decode_tiling(is_sequential)
 }
 
 impl StagedHeavy for SanaHeavy {
@@ -1056,6 +1097,56 @@ impl SanaPipeline {
 mod tests {
     use super::*;
     use mlx_rs::transforms::eval;
+
+    /// The default under `Sequential` must TILE, with no environment help.
+    ///
+    /// This is a regression gate on a real shipping defect, not a style check. Tiling used to be
+    /// reachable only through `MLX_GEN_SANA_DECODE_TILE`, which nothing in `runtime-ios` or
+    /// `mlx-gen-ios-catalog` sets — so a product building the iOS bundle got the whole-image decode,
+    /// which was measured at 9177 MiB and **killed the app on device**. Everything the iOS work
+    /// proved was reachable only through a knob the product does not turn.
+    ///
+    /// Deliberately asserted against the env var being ABSENT, because its presence is exactly what
+    /// masked the bug.
+    #[test]
+    fn sequential_tiles_by_default_without_any_env_var() {
+        // The suite runs single-threaded (`.cargo/config.toml` forces RUST_TEST_THREADS=1), so
+        // mutating process env here cannot race a sibling test.
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+
+        let sequential = decode_tiling(true).expect(
+            "Sequential must tile by default: untiled DC-AE decode is the configuration that was \
+             jetsam-killed on device",
+        );
+        let spatial = sequential.spatial.expect("spatial tiling");
+        assert_eq!(spatial.tile_px, DECODE_TILE_EDGE);
+        assert_eq!(spatial.overlap_px, DECODE_OVERLAP);
+
+        // Resident keeps the exact whole-image decode: tiling changes pixels by construction
+        // (DC-AE's attention normalizer is global), so a host with memory to spare pays nothing.
+        assert!(
+            decode_tiling(false).is_none(),
+            "Resident must keep the exact untiled decode"
+        );
+    }
+
+    /// The env var stays an override for measurement, `0` meaning whole-image.
+    #[test]
+    fn env_override_wins_over_the_residency_default() {
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "256");
+        let forced = decode_tiling(false).expect("an explicit edge tiles even under Resident");
+        assert_eq!(forced.spatial.unwrap().tile_px, 256);
+
+        // `0` is the A/B control: it must force whole-image even under Sequential, or the untiled
+        // path becomes unreachable for the comparison that established it is fatal.
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+        assert!(
+            decode_tiling(true).is_none(),
+            "0 must force whole-image, so the untiled control stays measurable"
+        );
+
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+    }
 
     #[test]
     fn noise_shape_is_batch1_32ch() {

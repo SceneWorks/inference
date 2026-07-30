@@ -120,6 +120,29 @@ fn render_measured(
     (pixels, peak)
 }
 
+/// The residency A/B, with the DECODE STRATEGY held constant.
+///
+/// # Why this test pins the env var, and why that is not a dodge
+///
+/// The sibling suites (SDXL, Z-Image) assert that `Sequential` output is byte-identical to
+/// `Resident`. The claim under test is that the residency *mechanism* — dropping components and
+/// re-loading them per generation — is transparent. That claim is true for SANA and is what this
+/// asserts.
+///
+/// What is **not** true for SANA is that its bounded decode is free. `Sequential` now tiles the
+/// DC-AE decode by default (untiled was measured at 9177 MiB and killed the app on device), and
+/// DC-AE tiling is **not output-preserving**: its `SanaMultiscaleLinearAttention` normalizes by
+/// `1/(Σ+eps)` over every spatial position it is given, so a tile sees a different denominator than
+/// the whole image. Z-Image's VAE is convolutional and reconstructs exactly under overlapping
+/// tiles; SANA's cannot, by construction rather than by tuning.
+///
+/// So comparing a tiled `Sequential` against an untiled `Resident` measures the decode strategy and
+/// tells you nothing about residency. `MLX_GEN_SANA_DECODE_TILE=0` equalizes the two arms, and the
+/// byte-identity assertion then means what it means everywhere else in the workspace.
+///
+/// The divergence the default introduces is not swept up — it is asserted directly in
+/// [`sequential_default_tiles_and_therefore_diverges`] below, so the surprising behaviour is pinned
+/// rather than merely absent.
 #[test]
 #[ignore = "needs a Sana_1600M_1024px_diffusers snapshot; set SANA_PIPELINE_WEIGHTS"]
 fn sequential_bounds_peak_and_is_byte_identical() {
@@ -127,11 +150,15 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         eprintln!("skipping: set SANA_PIPELINE_WEIGHTS to run the SANA residency A/B");
         return;
     };
+    // Equalize the decode across both arms; see the doc comment.
+    std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+
     let req = probe_request();
     let (pixels_resident, peak_resident) =
         render_measured(OffloadPolicy::Resident, snap.clone(), &req);
     let (pixels_sequential, peak_sequential) =
         render_measured(OffloadPolicy::Sequential, snap, &req);
+    std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
 
     println!(
         "SANA ({}) {}x{} @ {} steps:\n  Resident   peak = {:.3} GiB\n  Sequential peak = {:.3} GiB\n  saved = {:.3} GiB ({:.1}%)",
@@ -165,6 +192,58 @@ fn sequential_bounds_peak_and_is_byte_identical() {
     );
 }
 
+/// The default `Sequential` render DIVERGES from `Resident`, and that is the intended behaviour.
+///
+/// Pinned explicitly because it is surprising and because the test above deliberately equalizes it
+/// away. A consumer that switches `OffloadPolicy` for memory reasons gets a *different image* from
+/// SANA — not a worse one, and not a seamed one, but not the same bytes.
+///
+/// The trade is forced, not chosen: an untiled DC-AE decode was measured at 9177 MiB and killed the
+/// app on an iPhone with a 6135 MiB cap, while the tiled path completed at 2751 MiB. Exact-but-dead
+/// is not a policy. `Resident` keeps the exact decode, so a host with memory to spare pays nothing.
+///
+/// If this test ever starts failing because the two agree, something re-enabled the untiled decode
+/// under `Sequential` — which is the shipping defect this whole change exists to close, and it must
+/// not come back silently.
+#[test]
+#[ignore = "needs a Sana_1600M_1024px_diffusers snapshot; set SANA_PIPELINE_WEIGHTS"]
+fn sequential_default_tiles_and_therefore_diverges() {
+    let Some(snap) = snapshot() else {
+        eprintln!("skipping: set SANA_PIPELINE_WEIGHTS to run the SANA residency A/B");
+        return;
+    };
+    // No override: this is exactly what a product gets.
+    std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+
+    let req = probe_request();
+    let (resident, _) = render_measured(OffloadPolicy::Resident, snap.clone(), &req);
+    let (sequential, _) = render_measured(OffloadPolicy::Sequential, snap, &req);
+
+    let diff = resident
+        .iter()
+        .zip(&sequential)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        diff > 0,
+        "Sequential produced byte-identical output to Resident, which means it did NOT tile. \
+         Untiled DC-AE decode is the configuration that was killed on device — see \
+         `pipeline::decode_tiling`."
+    );
+
+    // Different, but not broken: a layout error or a lost tile moves most of the frame. DC-AE's
+    // attention-scope shift moves a minority of bytes and none of them far (measured mean |Δ| ~2.6
+    // of 255 — see `decode_tiling_parity`).
+    let fraction = diff as f64 / resident.len() as f64;
+    println!("default Sequential vs Resident: {diff}/{} bytes differ ({:.1}%)", resident.len(), 100.0 * fraction);
+    assert!(
+        fraction < 0.95,
+        "nearly every byte differs ({:.1}%) — that is a layout or geometry error, not the \
+         attention-scope shift tiling is expected to cause",
+        100.0 * fraction
+    );
+}
+
 /// img2img and `count > 1` through the **staged** seam (sc-13571 adoption).
 ///
 /// These are the two request shapes the staged decode restructured, and neither was covered.
@@ -187,6 +266,21 @@ fn staged_seam_preserves_img2img_and_multi_image_output() {
         eprintln!("skipping: set SANA_PIPELINE_WEIGHTS to run the SANA staged-seam checks");
         return;
     };
+    // Equalize the decode, for the same reason as `sequential_bounds_peak_and_is_byte_identical`:
+    // the subject here is the staged SEAM (the encoder's lifetime across `shed_dit`, and the
+    // denoise-all-then-decode-all reordering). Leaving the default in place would compare a tiled
+    // Sequential against an untiled Resident and fail on the decode strategy, which this test does
+    // not exercise and cannot diagnose.
+    std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+    struct RestoreEnv;
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        }
+    }
+    // Guard, not a trailing call: an assertion failure below must not leak the override into
+    // whatever test runs next.
+    let _restore = RestoreEnv;
 
     // ── count > 1.
     let mut batch = probe_request();

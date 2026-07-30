@@ -3131,6 +3131,7 @@ name = "runtime-macos"
 version = "0.0.0"
 dependencies = [
  "candle-audio-catalog",
+ "image",
  "mlx-gen-catalog",
  "mlx-llm",
  "runtime-catalog",

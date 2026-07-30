@@ -450,6 +450,12 @@ impl Sana {
             DEFAULT_GUIDANCE
         });
 
+        // Bounded decode, resolved from the SAME residency signal that drives the shed. Under
+        // `Sequential` — the memory-constrained policy a phone loads under — the DC-AE decode
+        // tiles, because untiled was measured at 9177 MiB and killed the app on device. Resolved
+        // once here rather than inside the decode loop so every image in a batch decodes alike.
+        let tiling = crate::pipeline::resolve_decode_tiling(self.residency.is_sequential());
+
         // sc-13571: the DiT-dropping staged decode. Under `Sequential` `run_staged` frees the trunk
         // after denoise and before the DC-AE decode, so the decode peak excludes it; under `Resident`
         // nothing is shed and the decode borrows the still-warm bundle.
@@ -548,7 +554,7 @@ impl Sana {
                 on_progress(Progress::Decoding);
                 let mut images = Vec::with_capacity(latents.len());
                 for latent in &latents {
-                    images.push(view.decode_one(latent, &req.cancel)?);
+                    images.push(view.decode_one(latent, &req.cancel, tiling.as_ref())?);
                 }
                 Ok(GenerationOutput::Images(images))
             },

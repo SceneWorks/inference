@@ -37,3 +37,7 @@ audio = ["dep:candle-audio-catalog"]
 # bundle exposes it; runtime-cuda already forwards the audio catalog's cuda feature and runtime-cpu
 # has no GPU lane.
 audio-metal = ["audio", "candle-audio-catalog/metal"]
+
+[dev-dependencies]
+# The sana_canonical example writes its reference render to PNG.
+image = { workspace = true }
