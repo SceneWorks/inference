@@ -836,12 +836,22 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     // the two live explanations for that death: a decode genuinely too large, or ~2.9 GB of LLM-era
     // memory still resident underneath it (MLX's own accounting cannot see the difference).
     //
-    // Ordered last, after the two configurations known to survive, so a kill still leaves those
-    // proven and the breadcrumb names the fatal one unambiguously.
+    // The untiled config runs FIRST here, which is the opposite of the shipping list's
+    // ascending-peak ordering, and deliberately so.
+    //
+    // Ordering by ascending peak is a safety property: a kill leaves the cheaper configs proven.
+    // But it makes the fatal config untestable, because headroom does not survive a render.
+    // Measured on a cold process: `os_proc_available_memory` fell 4664 -> 1223 MiB across a single
+    // 512px tiled render, while MLX reported a 3093 MiB peak and RSS only 2068 — so ~3.4 GB left
+    // the available pool and did not come back. Any config that runs third starts with ~1.2 GB and
+    // dies whatever its own demand, which tells us nothing about that demand.
+    //
+    // To measure the untiled decode we must give it the headroom a real first render would have.
+    // If it survives at full headroom, its death in every previous run was accumulation, not size.
     const DIAGNOSTIC: &[(&str, u32, Option<u32>)] = &[
+        ("512 UNTILED (diagnostic: first, at full headroom)", 512, Some(0)),
         ("1024 tile128", 1024, Some(128)),
         ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256)),
-        ("512 UNTILED (diagnostic: the config that died)", 512, None),
     ];
 
     let configs: &[(&str, u32, Option<u32>)] =
@@ -860,10 +870,15 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 
     let mut details: Vec<String> = Vec::new();
     for &(label, edge, tile) in configs {
-        match tile {
-            Some(px) => std::env::set_var("MLX_GEN_SANA_DECODE_TILE", px.to_string()),
-            None => std::env::remove_var("MLX_GEN_SANA_DECODE_TILE"),
-        }
+        // ALWAYS set it explicitly; `0` is the provider's "no tiling" control.
+        //
+        // This used to `remove_var` for the untiled case, which silently stopped meaning
+        // whole-image the moment SANA made tiling the default under `Sequential`: an unset variable
+        // now selects the provider default, so a config labelled UNTILED tiled anyway and reported
+        // 2566 MiB — a number that would have exonerated the untiled decode on the strength of a
+        // run that never performed one. Leaving the variable unset is no longer a way to express
+        // anything; only `0` is.
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", tile.unwrap_or(0).to_string());
 
         mlx_rs::memory::clear_cache();
         mlx_rs::memory::reset_peak_memory();

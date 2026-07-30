@@ -179,9 +179,24 @@ fi
 # The device must be UNLOCKED to launch an app: SpringBoard denies the request with
 # FBSOpenApplicationErrorDomain 7 otherwise, after a successful build and install. Say so plainly
 # rather than letting a 40-line CoreDevice error explain it.
+# Forward the harness's own env gates to the app. `devicectl` takes them as a JSON dict; without
+# this an on-device run can only ever exercise the default configuration, which is why the
+# image-only attribution experiment (IOS_SMOKE_IMAGE_ONLY) had no way to reach the device.
+LAUNCH_ENV="{}"
+for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+  val=$(printenv "$var" || true)
+  if [ -n "$val" ]; then
+    LAUNCH_ENV=$(python3 -c "
+import json,sys
+d = json.loads(sys.argv[1]); d[sys.argv[2]] = sys.argv[3]; print(json.dumps(d))" "$LAUNCH_ENV" "$var" "$val")
+  fi
+done
+[ "$LAUNCH_ENV" = "{}" ] || say "forwarding env: $LAUNCH_ENV"
+
 say "launching (unlock the device if prompted; console output follows)"
 xcrun devicectl device process launch \
   --device "$DEVICE" --terminate-existing \
+  --environment-variables "$LAUNCH_ENV" \
   com.idkplay.SceneWorksSmoke 2>&1 | tail -5
 
 # The app writes its report to Documents and keeps running (it is a GUI app). Poll for the file
