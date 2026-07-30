@@ -495,7 +495,9 @@ mod tests {
         let root =
             std::path::PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
         let cfg = Krea2Config::from_snapshot(&root).unwrap();
-        let dst = std::env::temp_dir().join("krea_q8_convert_test");
+        // Per-process scratch dir: the `remove_dir_all` below would otherwise wipe a second
+        // concurrent `cargo test` process's fixtures out of the shared `$TMPDIR`.
+        let dst = std::env::temp_dir().join(format!("krea_q8_convert_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         quantize_transformer(&root, &dst, 8).unwrap();
 

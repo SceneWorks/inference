@@ -688,7 +688,11 @@ mod tests {
         let mut o1 = TrainOptimizer::from_config(opt_name, 1e-3, 0.0).unwrap();
         o1.set_lr_scaled(1.0);
         o1.step(&mut resumed, &g).unwrap();
-        let path = std::env::temp_dir().join(format!("mlxgen_resume_test_{opt_name}.safetensors"));
+        // The pid keeps two concurrent `cargo test` processes, which share `$TMPDIR`, apart.
+        let path = std::env::temp_dir().join(format!(
+            "mlxgen_resume_test_{opt_name}_{}.safetensors",
+            std::process::id()
+        ));
         o1.save_state(&path).unwrap();
         let mut o2 = TrainOptimizer::from_config(opt_name, 1e-3, 0.0).unwrap();
         o2.set_lr_scaled(1.0);
@@ -730,7 +734,10 @@ mod tests {
         for _ in 0..3 {
             prod.step(&mut p, &g).unwrap();
         }
-        let path = std::env::temp_dir().join("mlxgen_prodigy_roundtrip.safetensors");
+        let path = std::env::temp_dir().join(format!(
+            "mlxgen_prodigy_roundtrip_{}.safetensors",
+            std::process::id()
+        ));
         prod.save_state(&path).unwrap();
         let mut restored = Prodigy::new(1.0, 0.0);
         restored.load_state(&path).unwrap();

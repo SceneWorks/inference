@@ -1313,7 +1313,9 @@ mod tests {
     }
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("mlx_gen_wan_adapters_test");
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let dir =
+            std::env::temp_dir().join(format!("mlx_gen_wan_adapters_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }

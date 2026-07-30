@@ -896,7 +896,12 @@ mod tests {
     fn load_turbo_errors_when_bundled_lora_missing() {
         // A dir with no turbo_lora.safetensors must fail loudly on the missing bundled LoRA (the
         // model-defining component), not silently fall back to a CFG render.
-        let dir = std::env::temp_dir().join("ideogram4_turbo_no_lora_test");
+        // Per-process scratch dir: the "no turbo_lora.safetensors here" premise must not be broken by
+        // a second concurrent `cargo test` process writing into the shared `$TMPDIR`.
+        let dir = std::env::temp_dir().join(format!(
+            "ideogram4_turbo_no_lora_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
         let e = load_turbo(&spec)

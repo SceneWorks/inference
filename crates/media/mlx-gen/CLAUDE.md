@@ -34,6 +34,7 @@ cargo test -p mlx-gen-z-image some_test_name    # one test by name
 ```
 
 - **`RUST_TEST_THREADS=1` is forced** via `.cargo/config.toml` (`force = true`). MLX's shared default Metal device is **not thread-safe** and SIGSEGVs under cargo's parallel harness. Do not remove this or run tests with `--test-threads`.
+- **Temp fixtures must be process-unique** (`std::process::id()` in the path, as most sites already do). `RUST_TEST_THREADS=1` plus cargo's sequential test-binary execution means only one test runs at a time *within* an invocation — but it says nothing about two **concurrent `cargo test` processes** (two worktrees, two agents), which share one `$TMPDIR`. A hardcoded name there lets one run's copy of a test truncate, rewrite, or `remove_file` the other's fixture mid-test; the reader then fails `SafeTensors(NotFile)`. A worktree isolates the *build*, not `$TMPDIR` (sc-16057).
 - Workspace types are shared across crates — when changing a public type in `mlx-gen` core or a crate reused by others (e.g. SDXL types reused by kolors/instantid; FLUX types reused by pulid), lint/test with `--workspace`, not crate-scoped, or you'll discover the break in CI.
 - `mlx-sys` builds MLX from source via cmake (~5 min, cached) and needs full Xcode + the Metal Toolchain. Apple-Silicon only.
 

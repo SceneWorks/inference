@@ -2139,7 +2139,12 @@ mod tests {
         opt.step(&mut p, &grads).unwrap();
         eval(p.values()).unwrap();
 
-        let dir = std::env::temp_dir().join("mlxgen_anima_resume_roundtrip");
+        // Per-process scratch dir: the `remove_dir_all` below would otherwise wipe a second
+        // concurrent `cargo test` process's fixtures out of the shared `$TMPDIR`.
+        let dir = std::env::temp_dir().join(format!(
+            "mlxgen_anima_resume_roundtrip_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let stem = "anima_style";
