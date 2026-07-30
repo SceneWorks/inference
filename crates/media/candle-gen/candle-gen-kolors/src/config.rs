@@ -16,7 +16,7 @@
 //! provider) are NOT advertised here, and are rejected at load rather than silently dropped (the
 //! false-capability trap).
 
-use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, Quant};
+use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, Quant, SizeFloor};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -106,6 +106,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

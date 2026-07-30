@@ -9,7 +9,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    ModelDescriptor, Quant, SizeFloor,
 };
 
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
@@ -228,6 +228,7 @@ impl Flux2Variant {
                 audio_voices: vec![],
                 audio_languages: vec![],
                 audio_edit_modes: vec![],
+                size_floor: SizeFloor::RangeChecked,
             },
         }
     }

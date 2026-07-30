@@ -36,7 +36,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, default_seed, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, WeightsSource,
+    Quant, SizeFloor, WeightsSource,
 };
 
 use config::{DitConfig, VAE_SCALE};
@@ -102,6 +102,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

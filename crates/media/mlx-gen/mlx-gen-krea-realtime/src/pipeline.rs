@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use mlx_gen::{
     default_seed, AdapterApplyReport, AdapterSpec, CancelFlag, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, Modality,
-    ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    ModelDescriptor, Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
@@ -113,6 +113,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

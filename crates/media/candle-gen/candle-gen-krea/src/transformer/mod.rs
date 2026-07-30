@@ -21,6 +21,7 @@ pub mod rope;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::quant::Nvfp4Context;
+use candle_gen::BlockPlan;
 
 use crate::config::Krea2Config;
 use crate::loader::{linear_detect, linear_detect_planned, Weights};
@@ -55,16 +56,87 @@ pub struct Krea2Transformer {
 }
 
 /// Trunk-block residency. The normal path keeps every block resident. The constrained-card path
-/// retains the read-only mmap/adapter overlay and materializes one block at a time on the compute
-/// device, synchronizing before each block is dropped so the allocator can reuse that working set.
+/// retains the read-only mmap and materializes only the current window of blocks on the compute
+/// device, driven by [`candle_gen::block_window::run_windowed`] (SC-15792). The per-block
+/// `Device::synchronize()` this arm used to carry is gone: SC-15791 ablated it at **1.00x** peak on
+/// both the live and reserved counters, so it bought nothing per window. The synchronize that does
+/// matter runs once per forward instead of once per block — 1 per denoise step rather than 28 — and
+/// the driver owns it, on every exit path including cancellation and failure.
 enum TransformerBlocks {
     Resident(Vec<SingleStreamBlock>),
     Streamed(std::sync::Arc<Weights>),
 }
 
+/// The shipped rung-4 window for the Candle realization: **one block**.
+///
+/// This deliberately contradicts MLX, where SC-15744 recommended 2–4 to amortize page-cache re-reads.
+/// SC-15791 measured the trade on CUDA and it has the opposite shape: per-step time is FLAT in window
+/// size while peak is LINEAR. SC-15792 re-measured it through this implementation and reproduced the
+/// slope exactly — **107.9 MiB per block of window** on both. (The intercepts differ, 153.4 vs
+/// 23.3 MiB, because SC-15792's sweep includes the per-forward dequant transient the spike's
+/// materialization-only arm excluded.)
+///
+/// **SC-16096 removed the reason, and the timing half is now UNMEASURED — stated rather than
+/// assumed.** The spike attributed the flat time to a per-block host format conversion that a larger
+/// window repeats rather than amortizes; SC-16096 replaced it with device-format sidecars prepared
+/// once per component. So SC-15791's *mechanism* for the flatness no longer exists, and nothing has
+/// re-swept window size against time since: SC-16096 measured the conversion, not the window, and
+/// SC-15792's sweep takes one sample per window in ascending order, which cannot discriminate a trend
+/// from warm-up on a host with this much spread. SC-16154 owns the re-measurement.
+///
+/// **The value stays 1 regardless, and not by inertia.** What IS re-measured through this
+/// implementation is the memory side: peak is linear in the window at 107.9 MiB/block, unchanged by
+/// the sidecars. Rung 4 is only ever reached when no cheaper rung fits, so its job at that point is
+/// to minimize peak; a window that costs proportionally more peak for an unquantified time saving is
+/// the wrong trade for the situation the rung exists to serve. If SC-16154 finds a real gradient,
+/// widening is a one-line change to `SUPPORTED_TRANSFORMER_WINDOWS` plus fresh evidence.
+///
+/// Every larger window is therefore strictly worse — more peak for no time — which is why
+/// `krea_turbo_memory_strategy_contract` publishes `transformer_window_sizes: vec![1]` and does not
+/// offer the selector a wider one.
+///
+/// The driver still takes the window as a parameter rather than baking this in: a bound that is only
+/// ever exercised at its tightest setting is a bound nothing has measured, and the peak-by-window
+/// evidence for this rung is produced by driving the real implementation across `w`.
+pub const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
+
+/// Materialize a whole rung-4 window's trunk blocks onto the compute device, in order.
+///
+/// A named function rather than a closure inside the driver call, and that is the point. The rung's
+/// bound is `window x per-block bytes`, which holds only if every block in the window is live at
+/// once: loading each block inside the forward loop instead would hold **one** at a time and
+/// silently execute a window of 1 whatever was asked for — correct output, no bound, no error, and
+/// no test would notice. Adversarial review of SC-15792 confirmed that by hand-mutation: inlining
+/// the load left all 199 crate tests green. Extracted so the regression is a visible deletion and so
+/// `a_window_materializes_every_block_before_any_of_them_runs` can assert the count directly.
+fn materialize_window(
+    view: &Weights,
+    cfg: &Krea2Config,
+    dit_plan: &DitPlan,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<SingleStreamBlock>> {
+    range
+        .map(|i| {
+            SingleStreamBlock::load_planned(
+                view,
+                &format!("transformer_blocks.{i}"),
+                cfg.num_attention_heads,
+                cfg.num_kv_heads,
+                cfg.attention_head_dim,
+                cfg.hidden_size,
+                cfg.norm_eps,
+                dit_plan,
+            )
+        })
+        .collect()
+}
+
 /// Fold a render state through a block sequence with a cancellation checkpoint before every block.
-/// Keeping the checkpoint in the same helper used by the streamed implementation makes the
-/// cancellation granularity independently testable without constructing the multi-gigabyte model.
+///
+/// Used by the **resident** trunk paths. The streamed path runs on
+/// [`candle_gen::block_window::run_windowed`] instead (SC-15792) — it needs window arithmetic and a
+/// release discipline this helper does not model, and re-deriving those per family is the fork that
+/// rung 4 exists to prevent. The two agree on cancellation granularity: one checkpoint per block.
 fn fold_block_sequence<T>(
     num_blocks: usize,
     cancel: &candle_gen::gen_core::CancelFlag,
@@ -433,6 +505,7 @@ impl Krea2Transformer {
             timestep,
             context,
             candle_gen::ATTN_SCORES_BUDGET,
+            DEFAULT_TRANSFORMER_WINDOW,
             &candle_gen::gen_core::CancelFlag::default(),
         )
         .map_err(|error| match error {
@@ -441,15 +514,21 @@ impl Krea2Transformer {
         })
     }
 
-    /// [`Self::forward`] with the constrained-card attention budget and cancellation threaded through
-    /// the block loop. On a streamed trunk each block is the sole block-weight working set on the
-    /// accelerator; synchronization before drop makes that lifecycle physical rather than advisory.
+    /// [`Self::forward`] with the constrained-card attention budget, the rung-4 block window, and
+    /// cancellation threaded through the block loop.
+    ///
+    /// On a streamed trunk the window's blocks are the only block weights resident on the accelerator
+    /// at once — the schedule, the release discipline and the typed cancellation all come from
+    /// [`candle_gen::block_window::run_windowed`] rather than being re-derived here. `transformer_window`
+    /// is the number of consecutive blocks held materialized; see [`DEFAULT_TRANSFORMER_WINDOW`] for
+    /// why the shipped value is 1 and why it is still a parameter. It is ignored by the resident arm.
     pub fn forward_with_memory(
         &self,
         latent: &Tensor,
         timestep: &Tensor,
         context: &Tensor,
         attention_scores_budget: usize,
+        transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
         let cfg = &self.cfg;
@@ -484,29 +563,38 @@ impl Krea2Transformer {
             }
             TransformerBlocks::Streamed(weights) => {
                 let cfg = &self.cfg;
-                let plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
-                combined = fold_block_sequence(cfg.num_layers, cancel, combined, |i, combined| {
-                    let block = SingleStreamBlock::load_planned(
-                        weights,
-                        &format!("transformer_blocks.{i}"),
-                        cfg.num_attention_heads,
-                        cfg.num_kv_heads,
-                        cfg.attention_head_dim,
-                        cfg.hidden_size,
-                        cfg.norm_eps,
-                        &plan,
-                    )?;
-                    let combined = block.forward_with_attention_budget(
-                        &combined,
-                        &tvec,
-                        &rcos,
-                        &rsin,
-                        attention_scores_budget,
-                    )?;
-                    self.device.synchronize()?;
-                    drop(block);
-                    Ok(combined)
-                })?;
+                let dit_plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+                let block_plan = BlockPlan::new(cfg.num_layers, transformer_window)?;
+                combined = candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &block_plan,
+                    cancel,
+                    combined,
+                    // The view is the retained read-only mmap. It caches no tensors — every `get`
+                    // reads the mapping and produces a new device tensor — so an `Arc` clone IS a
+                    // fresh view, and re-`mmap`ing per window would buy a guarantee the type already
+                    // gives. See `candle_gen::block_window`'s module docs for why Candle discharges
+                    // MLX's freshness obligation structurally instead of by re-opening.
+                    || Ok(std::sync::Arc::clone(weights)),
+                    |mut state, view, range| {
+                        let blocks = materialize_window(view, cfg, &dit_plan, range)?;
+                        for block in &blocks {
+                            // Finer than the driver's per-window gate, deliberately (sc-16003): one
+                            // block is ~2 s at 2048², and a cancel unread until the window ends is
+                            // grace the worker's bounded wind-down does not have. At the shipped
+                            // window of 1 the two coincide; this keeps that true if it ever widens.
+                            candle_gen::check_cancel(cancel)?;
+                            state = block.forward_with_attention_budget(
+                                &state,
+                                &tvec,
+                                &rcos,
+                                &rsin,
+                                attention_scores_budget,
+                            )?;
+                        }
+                        Ok(state)
+                    },
+                )?;
             }
         }
 
@@ -736,8 +824,11 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
 
+    /// The resident/edit trunk's per-block cancel checkpoint. (The streamed trunk moved onto
+    /// `candle_gen::block_window::run_windowed` in SC-15792 and no longer uses this helper; its
+    /// cancellation is covered by `streamed_cancel_is_typed_and_stops_inside_the_trunk` below.)
     #[test]
-    fn streamed_block_fold_stops_before_loading_the_next_block_after_cancel() {
+    fn resident_block_fold_stops_before_loading_the_next_block_after_cancel() {
         let cancel = candle_gen::gen_core::CancelFlag::default();
         let cancel_from_block = cancel.clone();
         let mut visited = Vec::new();
@@ -751,6 +842,267 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, candle_gen::CandleError::Canceled));
         assert_eq!(visited, vec![0]);
+    }
+
+    /// Fixture-driven `(resident, streamed, cfg, latent, timestep, context)` for the rung-4 tests.
+    /// Six blocks so window 4 leaves a ragged 2-block tail.
+    #[allow(clippy::type_complexity)]
+    fn streamed_pair() -> (
+        Krea2Transformer,
+        Krea2Transformer,
+        std::path::PathBuf,
+        Tensor,
+        Tensor,
+        Tensor,
+    ) {
+        let (resident, streamed, cfg, path) = crate::testfix::tiny_transformer_streamed_pair(6);
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let timestep = Tensor::from_vec(vec![0.3f32], 1, &Device::Cpu).unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        (resident, streamed, path, latent, timestep, context)
+    }
+
+    /// **SC-15792's parity criterion.** The windowed trunk must produce the resident trunk's output
+    /// exactly — not to a tolerance — at every window size including one with a ragged tail.
+    ///
+    /// Exactness is available and therefore required: rung 4 re-orders *when* weights are read, never
+    /// what arithmetic runs on them, so any deviation is a defect rather than accumulated error. The
+    /// ragged case (window 4 over 6 blocks) is the arm that catches a driver whose last window is
+    /// mis-clamped — it would silently skip layers and still return a plausible tensor.
+    #[test]
+    fn streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window() {
+        let (resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+
+        let want = resident
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+            .expect("the resident trunk renders");
+
+        for window in [1usize, 2, 3, 4, 6, 99] {
+            let got = streamed
+                .forward_with_memory(
+                    &latent,
+                    &timestep,
+                    &context,
+                    candle_gen::ATTN_SCORES_BUDGET,
+                    window,
+                    &cancel,
+                )
+                .unwrap_or_else(|e| panic!("streamed trunk at window {window}: {e:?}"));
+
+            assert_eq!(got.dims(), want.dims(), "window {window}: shape");
+            let max_delta = (&got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+            assert_eq!(
+                max_delta, 0.0,
+                "window {window}: streaming must not change the math (max |delta| {max_delta})"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The parity assertion above is only worth its green if it can go red. A window that silently
+    /// dropped its ragged tail — the exact failure `BlockPlan`'s clamping prevents — must produce a
+    /// DIFFERENT tensor, or `streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window`
+    /// would pass with the last blocks never running.
+    ///
+    /// Stated as a property of the fixture rather than by mutating the driver: running the trunk
+    /// truncated to 4 of its 6 blocks must not coincidentally equal the full trunk.
+    #[test]
+    fn a_trunk_that_skipped_its_tail_would_not_match() {
+        let (resident, _streamed, path, latent, timestep, context) = streamed_pair();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let full = resident
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+            .unwrap();
+
+        // A 4-block trunk over the same weights = "window 4 dropped the ragged tail".
+        let (truncated, _, _, tpath) = crate::testfix::tiny_transformer_streamed_pair(4);
+        let short = truncated
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+            .unwrap();
+
+        let delta = (&short - &full)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert!(
+            delta > 0.0,
+            "the parity test would be vacuous: a trunk missing two blocks matched the full one"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tpath);
+    }
+
+    /// A cancel tripped mid-trunk surfaces as the TYPED `Canceled` through the streamed driver, and
+    /// bridges to `gen_core::Error::Canceled`. A stringified `Msg` here would report a cancelled
+    /// render as a failed job (sc-4481) — the exact regression SC-15754 had to fix on the MLX twin,
+    /// and the path now crosses two `From` conversions either of which could flatten it.
+    #[test]
+    fn streamed_cancel_is_typed_and_stops_inside_the_trunk() {
+        let (_resident, streamed, path, latent, timestep, context) = streamed_pair();
+
+        let cancelled = candle_gen::gen_core::CancelFlag::default();
+        cancelled.cancel();
+        let error = streamed
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancelled,
+            )
+            .expect_err("a tripped flag must abort the streamed trunk");
+
+        assert!(
+            matches!(error, candle_gen::CandleError::Canceled),
+            "expected the typed Canceled, got {error:?}"
+        );
+        assert!(matches!(
+            candle_gen::gen_core::Error::from(error),
+            candle_gen::gen_core::Error::Canceled
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A degenerate window is a typed error, not a hang. `BlockPlan::new` rejects 0, and the streamed
+    /// arm must surface that rather than looping forever on a zero-length step.
+    #[test]
+    fn a_zero_window_is_rejected_rather_than_looping() {
+        let (_resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let error = streamed
+            .forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                0,
+                &candle_gen::gen_core::CancelFlag::default(),
+            )
+            .expect_err("a zero window must be rejected");
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref m) if m.contains("window")),
+            "{error:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The CPU half of the rung's mutation check.** Every block in the window must be live at
+    /// once, because that — not the loop shape — is what makes peak `window x per-block bytes`.
+    ///
+    /// This exists because the failure mode is silent in the worst way: loading blocks one at a time
+    /// inside the forward loop produces identical output, raises no error, and executes a window of 1
+    /// whatever the selector asked for. Adversarial review of SC-15792 demonstrated it — inlining the
+    /// materialization left all 199 tests in this crate green — so a comment warning about it was not
+    /// coverage. The GPU twin (`defeating_the_release_restores_the_resident_peak`) measures the peak;
+    /// this one runs on every CI lane and needs no accelerator.
+    #[test]
+    fn a_window_materializes_every_block_before_any_of_them_runs() {
+        let (_resident, streamed, cfg, path) = crate::testfix::tiny_transformer_streamed_pair(6);
+        let dit_plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+        let TransformerBlocks::Streamed(weights) = &streamed.blocks else {
+            panic!("the fixture must produce a streamed trunk");
+        };
+
+        for window in [1usize, 2, 3, 4] {
+            let plan = BlockPlan::new(cfg.num_layers, window).unwrap();
+            for range in plan.windows() {
+                let want = range.len();
+                let blocks = materialize_window(weights, &cfg, &dit_plan, range.clone())
+                    .unwrap_or_else(|e| panic!("window {window}, blocks {range:?}: {e:?}"));
+                assert_eq!(
+                    blocks.len(),
+                    want,
+                    "window {window}, blocks {range:?}: {} blocks were materialized together, not \
+                     {want}. Peak is then `1 x per-block bytes` regardless of the selected window, \
+                     and the rung reports a bound it does not hold.",
+                    blocks.len()
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The configuration SC-15791 flagged as untested.** Its release-semantics arms all ran on one
+    /// device and one stream, where CUDA's stream-ordered allocator guarantees reuse ordering a
+    /// priori; it said so explicitly and refused to treat that as licence to relax sc-12195's
+    /// phase-boundary sync. The nearest untested shape is a window driver materializing from a worker
+    /// thread, so it is driven here rather than left as an assumption.
+    ///
+    /// CPU cannot reproduce a CUDA stream race — what this pins is that the driver is `Send`-safe and
+    /// order-preserving off the main thread, so the CUDA arm in
+    /// `rung4_block_window_real_weights.rs` has a compiled, exercised path to run.
+    #[test]
+    fn streamed_output_is_identical_when_driven_from_a_worker_thread() {
+        let (_resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+
+        let run = |dit: &Krea2Transformer| {
+            dit.forward_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &cancel,
+            )
+        };
+
+        let on_main = run(&streamed).expect("main-thread render");
+        let on_worker = std::thread::scope(|s| s.spawn(|| run(&streamed)).join().unwrap())
+            .expect("worker-thread render");
+
+        let delta = (&on_worker - &on_main)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(
+            delta, 0.0,
+            "materializing windows from a worker thread must not change the output"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

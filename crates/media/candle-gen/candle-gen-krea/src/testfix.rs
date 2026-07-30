@@ -265,6 +265,45 @@ pub(crate) fn tiny_transformer() -> (Krea2Transformer, Krea2Config, PathBuf) {
     (dit, c, path)
 }
 
+/// A resident and a **block-streamed** [`Krea2Transformer`] over the SAME serialized weights, at a
+/// configurable trunk depth. Returns `(resident, streamed, cfg, temp_path)` — the caller drops the
+/// file when done.
+///
+/// One file, two residency policies, is the whole point: it makes "identical to the resident path"
+/// (SC-15792's parity criterion) an assertion about the *schedule* rather than about two weight
+/// draws that happen to agree. Deep enough by default for a ragged tail — `BlockPlan` at window 4
+/// over 6 blocks leaves a 2-block last window, which is where a driver that mis-clamps silently
+/// drops layers.
+///
+/// CPU/F32 on purpose: the rung's schedule, its release ordering and its cancellation contract are
+/// backend-neutral, so pinning them here keeps them covered on every CI lane instead of only on the
+/// Windows CUDA compile check. The CUDA-specific claims — peak by window, the pool's driver/reserved
+/// split — are what `rung4_block_window_real_weights.rs` measures, and they cannot be faked here.
+pub(crate) fn tiny_transformer_streamed_pair(
+    num_layers: usize,
+) -> (Krea2Transformer, Krea2Transformer, Krea2Config, PathBuf) {
+    use std::sync::Arc;
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let (t, c) = build_tiny_map(&mut |s| rnd(s), num_layers);
+    let path = std::env::temp_dir().join(format!(
+        "krea_tiny_stream_{}_{}.safetensors",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    candle_gen::candle_core::safetensors::save(&t, &path).unwrap();
+
+    let resident = {
+        let w = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
+        Krea2Transformer::load(&w, &c).unwrap()
+    };
+    let streamed = {
+        let w = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
+        Krea2Transformer::load_block_streamed(Arc::new(w), &c).unwrap()
+    };
+    (resident, streamed, c, path)
+}
+
 /// [`tiny_dit`] with a configurable single-stream depth (the control-branch inject-offset tests
 /// need ≥ 2 main blocks). Unseeded weights.
 pub(crate) fn tiny_dit_layers(num_layers: usize) -> (KreaTrainDit, Krea2Config, PathBuf) {

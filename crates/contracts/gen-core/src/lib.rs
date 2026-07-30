@@ -66,7 +66,7 @@ pub use generator::{
     default_seed, AudioEditMode, AudioEditRef, AudioParams, Capabilities, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode,
+    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
     SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
@@ -83,7 +83,8 @@ pub use memory_strategy::{
     MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryRunContext,
     MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, MemoryWarmRunSemantics, TransformerComponent, MEMORY_CALIBRATION_ABI,
+    MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
+    TransformerComponent, MEMORY_CALIBRATION_ABI,
 };
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{

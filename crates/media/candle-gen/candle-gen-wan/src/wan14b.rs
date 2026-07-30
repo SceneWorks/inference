@@ -31,7 +31,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Progress, Quant, WeightsSource,
+    OffloadPolicy, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{check_cancel, effective_offload_policy, CandleError, Result as CResult};
 
@@ -1171,6 +1171,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
