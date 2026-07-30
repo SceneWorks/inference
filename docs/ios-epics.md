@@ -432,6 +432,17 @@ Binding both limits to `os_proc_available_memory` (live to 85%, cache to min(25%
 
 Max active is *identical*. Nothing about the model or the ladder changed.
 
+**SANA does not pay for it.** The obvious risk of capping the cache is thrash: SANA's shipped device
+config decodes at 128 px tiles — the finest grid we run, and the workload a reuse cache exists for —
+so a too-small cap would surface here as latency rather than as a kill. It does not:
+
+| SANA on device | before | after |
+|---|---:|---:|
+| 1024 tile128 | 36.5 s / 2751 MiB | **34.0 s / 2733 MiB** |
+| headroom at end | — | 4985 MiB |
+
+Marginally faster, marginally lower peak.
+
 **Scope: this is not a Z-Image finding.** It affects every MLX model on iOS, and it retires the
 admission test used throughout this document — see the S5.2 correction below. Z-Image was simply the
 first model whose working set was large enough to expose it. SANA passed despite the cache, not
