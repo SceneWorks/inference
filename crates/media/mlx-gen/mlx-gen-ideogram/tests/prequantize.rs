@@ -115,7 +115,10 @@ fn prequantize_loads_and_generates() {
         "degenerate image — packed Q{bits} load broke the forward"
     );
 
-    let out_path = std::env::temp_dir().join(format!("ideogram4_q{bits}_turnkey.png"));
+    let out_path = std::env::temp_dir().join(format!(
+        "ideogram4_q{bits}_turnkey_{}.png",
+        std::process::id()
+    ));
     image::RgbImage::from_raw(res, res, im.pixels.clone())
         .unwrap()
         .save(&out_path)

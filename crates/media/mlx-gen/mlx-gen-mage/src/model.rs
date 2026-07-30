@@ -1344,7 +1344,12 @@ mod tests {
         // `load`" is caught: under it this call would report the fingerprint mismatch above. The
         // real entrypoint treats the path as the transformer dir itself and never opens
         // `<path>/transformer`, so it gets past identity and fails later, at the actual load.
-        let staged = std::env::temp_dir().join("mage-finetuned-nonexistent-component");
+        // Pid-keyed so the "this path does not exist" premise cannot be broken by a leftover from,
+        // or a concurrent, second `cargo test` process sharing `$TMPDIR`.
+        let staged = std::env::temp_dir().join(format!(
+            "mage-finetuned-nonexistent-component-{}",
+            std::process::id()
+        ));
         let finetuned = load_error(
             load_finetuned(
                 MageVariant::Base,
@@ -1398,7 +1403,10 @@ mod tests {
             0x5a,
         );
         let adapters = vec![mlx_gen::runtime::AdapterSpec::new(
-            std::env::temp_dir().join("mage-adapter-never-read.safetensors"),
+            std::env::temp_dir().join(format!(
+                "mage-adapter-never-read-{}.safetensors",
+                std::process::id()
+            )),
             0.8,
             mlx_gen::runtime::AdapterKind::Lora,
         )];
@@ -1416,7 +1424,10 @@ mod tests {
              identity check like any other load, got: {published}"
         );
 
-        let staged = std::env::temp_dir().join("mage-adapters-nonexistent-component");
+        let staged = std::env::temp_dir().join(format!(
+            "mage-adapters-nonexistent-component-{}",
+            std::process::id()
+        ));
         let finetuned = load_error(
             load_finetuned(
                 MageVariant::Base,

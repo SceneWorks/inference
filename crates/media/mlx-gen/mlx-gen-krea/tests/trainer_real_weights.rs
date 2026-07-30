@@ -49,7 +49,7 @@ fn safetensors_header(path: &std::path::Path) -> String {
 #[ignore = "needs real krea/Krea-2-Raw weights (~25 GB) + a Mac; run as its own process"]
 fn short_train_produces_loadable_adapter() {
     let root = raw_snapshot().expect("krea/Krea-2-Raw snapshot (HF cache or KREA_RAW_DIR)");
-    let tmp = std::env::temp_dir().join("krea_trainer_smoke");
+    let tmp = std::env::temp_dir().join(format!("krea_trainer_smoke_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let img_path = tmp.join("swatch.png");
     write_synth_image(&img_path);
@@ -131,7 +131,7 @@ fn short_train_produces_loadable_adapter() {
 #[ignore = "needs real krea/Krea-2-Raw weights (~25 GB) + a Mac; run as its own process"]
 fn short_train_checkpointed_produces_loadable_adapter() {
     let root = raw_snapshot().expect("krea/Krea-2-Raw snapshot (HF cache or KREA_RAW_DIR)");
-    let tmp = std::env::temp_dir().join("krea_trainer_smoke_ckpt");
+    let tmp = std::env::temp_dir().join(format!("krea_trainer_smoke_ckpt_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let img_path = tmp.join("swatch.png");
     write_synth_image(&img_path);

@@ -95,7 +95,7 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
 
 /// Train a tiny adapter (`network_type`) on the real Raw DiT and return its `.safetensors` path.
 fn train_tiny_adapter(raw: &std::path::Path, network_type: NetworkType, tag: &str) -> PathBuf {
-    let tmp = std::env::temp_dir().join(format!("krea_apply_smoke_{tag}"));
+    let tmp = std::env::temp_dir().join(format!("krea_apply_smoke_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let img_path = tmp.join("swatch.png");
     write_synth_image(&img_path);
@@ -215,7 +215,7 @@ fn train_concept_lora(
     steps: u32,
     out_name: &str,
 ) -> PathBuf {
-    let tmp = std::env::temp_dir().join("krea_lora_viability");
+    let tmp = std::env::temp_dir().join(format!("krea_lora_viability_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let mut trainer =
         load_trainer(&LoadSpec::new(WeightsSource::Dir(raw.to_path_buf()))).expect("load_trainer");
@@ -295,7 +295,7 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("krea_lora_viability");
+    let tmp = std::env::temp_dir().join(format!("krea_lora_viability_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let images = write_solid_images(&tmp, 5, [230, 30, 230]);
     let steps: u32 = std::env::var("KREA_LORA_STEPS")

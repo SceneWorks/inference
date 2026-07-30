@@ -57,7 +57,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[test]
 #[ignore = "needs real LTX-2.3 + Gemma weights"]
 fn ltx_trainer_trains_and_writes_lora_that_reloads() {
-    let tmp = std::env::temp_dir().join("ltx_trainer_e2e");
+    let tmp = std::env::temp_dir().join(format!("ltx_trainer_e2e_{}", std::process::id()));
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
 
@@ -182,7 +182,7 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
 #[test]
 #[ignore = "needs real LTX-2.3 + Gemma weights"]
 fn ltx_trainer_trains_with_gradient_checkpointing() {
-    let tmp = std::env::temp_dir().join("ltx_trainer_e2e_ckpt");
+    let tmp = std::env::temp_dir().join(format!("ltx_trainer_e2e_ckpt_{}", std::process::id()));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_ltx::provider_registry()
@@ -251,7 +251,7 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
 #[test]
 #[ignore = "needs real ltx_2_3_base_q8 weights (~20 GB) + the Gemma encoder"]
 fn ltx_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("ltx_trainer_samples_e2e");
+    let tmp = std::env::temp_dir().join(format!("ltx_trainer_samples_e2e_{}", std::process::id()));
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
     let mut trainer = mlx_gen_ltx::provider_registry()

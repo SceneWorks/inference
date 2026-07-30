@@ -144,7 +144,8 @@ fn turbo_generates_single_dit_8step() {
     );
     assert!(max > min, "degenerate (constant) turbo image — no signal");
 
-    let out_path = std::env::temp_dir().join("ideogram4_turbo_8step.png");
+    let out_path =
+        std::env::temp_dir().join(format!("ideogram4_turbo_8step_{}.png", std::process::id()));
     image::RgbImage::from_raw(res, res, img.pixels.clone())
         .unwrap()
         .save(&out_path)

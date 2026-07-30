@@ -469,7 +469,10 @@ fn write_lora(name: &str, seed: u64, mag: f32, dt: Dtype) -> PathBuf {
         entries.push((format!("diffusion_model.{stem}.lora_A.weight"), a));
         entries.push((format!("diffusion_model.{stem}.lora_B.weight"), b));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_krea_quant_tier_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_quant_tier_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();

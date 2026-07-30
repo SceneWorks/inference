@@ -433,7 +433,15 @@ fn decode_tiling_never_starves_the_temporal_receptive_field() {
 /// patch×stride alignment — fails here in CI instead of after a 20 GB load.
 #[test]
 fn smoke_request_is_within_the_advertised_surface() {
-    let spec = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
+    // A per-process empty dir, not the shared `$TMPDIR` itself: the provider only needs the root to
+    // exist, and this keeps whatever another concurrent `cargo test` process left in `$TMPDIR` out
+    // of this weights root.
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_realtime_empty_weights_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = LoadSpec::new(WeightsSource::Dir(dir));
     let gen = mlx_gen_krea_realtime::provider_registry()
         .unwrap()
         .load(MODEL_ID, &spec)

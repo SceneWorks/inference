@@ -482,7 +482,9 @@ mod tests {
         let (targets, params) = build_lora_targets(&mut host, &paths, 4, 7).unwrap();
         let adapter = TrainAdapter::Lora { targets };
 
-        let dir = std::env::temp_dir().join("mage_lora_meta_roundtrip");
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let dir =
+            std::env::temp_dir().join(format!("mage_lora_meta_roundtrip_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("m.safetensors");
         adapter.save(&params, 8.0, 4.0, -1, "", &path).unwrap();

@@ -715,7 +715,14 @@ mod tests {
         t.push((format!("{ma}.norm.weight"), zeros(&[256])));
         t.push((format!("{ma}.norm.bias"), zeros(&[256])));
 
-        let path = std::env::temp_dir().join("mlx_gen_sam2_synth_memory.safetensors");
+        // Process-unique: `RUST_TEST_THREADS=1` serializes tests *within* a run, but two concurrent
+        // `cargo test` invocations on one machine (two worktrees, two agents) share `$TMPDIR`, so a
+        // fixed name lets the other run's copy of this same test truncate or delete the file between
+        // this save and load — `Weights::from_file` then fails `NotFile`.
+        let path = std::env::temp_dir().join(format!(
+            "mlx_gen_sam2_synth_memory_{}.safetensors",
+            std::process::id()
+        ));
         let refs: Vec<(&str, &Array)> = t.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         let w = Weights::from_file(&path).unwrap();

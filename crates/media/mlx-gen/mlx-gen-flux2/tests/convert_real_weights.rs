@@ -37,7 +37,10 @@ fn true_v2_bf16_file() -> PathBuf {
 fn convert_assembles_loadable_diffusers_dir() {
     let base = base_snapshot();
     let source = true_v2_bf16_file();
-    let out = std::env::temp_dir().join("mlx_gen_flux2_true_v2_convert_out");
+    let out = std::env::temp_dir().join(format!(
+        "mlx_gen_flux2_true_v2_convert_out_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&out); // idempotent: clear any prior run
 
     // Convert + assemble. The internal base-validation guard asserts produced keyset+shapes match

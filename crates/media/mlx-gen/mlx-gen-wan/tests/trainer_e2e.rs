@@ -112,7 +112,10 @@ fn run_trainer_e2e_cfg(
     } else {
         optimizer
     };
-    let tmp = std::env::temp_dir().join(format!("{model_id}_{tag}_trainer_e2e"));
+    let tmp = std::env::temp_dir().join(format!(
+        "{model_id}_{tag}_trainer_e2e_{}",
+        std::process::id()
+    ));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_wan::provider_registry()
@@ -346,7 +349,7 @@ fn wan_ti2v_5b_trainer_prodigy_optimizer() {
 /// TI2V-5B] → VAE decode → first frame as `Image`) on real weights. Single frame (F=1) + one prompt
 /// keeps the per-cadence cost down on the heavy 14B/5B loads.
 fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
-    let tmp = std::env::temp_dir().join(format!("{model_id}_samples_e2e"));
+    let tmp = std::env::temp_dir().join(format!("{model_id}_samples_e2e_{}", std::process::id()));
     let items = make_dataset(&tmp);
     let mut trainer = mlx_gen_wan::provider_registry()
         .unwrap()

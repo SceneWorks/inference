@@ -201,7 +201,7 @@ fn peft_format_merges_end_to_end() {
         .enumerate()
         .map(|(i, n)| (n.as_str(), arrs[i % 3]))
         .collect();
-    let dir = std::env::temp_dir().join("mlx_gen_sdxl_peft_test");
+    let dir = std::env::temp_dir().join(format!("mlx_gen_sdxl_peft_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("peft_lora.safetensors");
     Array::save_safetensors(tensors, None, &path).unwrap();

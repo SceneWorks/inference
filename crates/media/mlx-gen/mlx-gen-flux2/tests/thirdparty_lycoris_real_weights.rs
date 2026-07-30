@@ -54,7 +54,10 @@ fn thirdparty_loha_and_lokr_apply_on_real_tree() {
         shapes.iter().map(|(p, s)| (p, s)).collect::<Vec<_>>()
     );
 
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_thirdparty_rw");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_flux2_thirdparty_rw_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let r = 2i32;
 
