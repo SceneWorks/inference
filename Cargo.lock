@@ -2209,6 +2209,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-ios-catalog"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-sana",
+ "sceneworks-gen-core-testkit",
+]
+
+[[package]]
 name = "mlx-gen-joycaption"
 version = "0.0.0"
 dependencies = [
@@ -3059,6 +3068,7 @@ dependencies = [
 name = "runtime-ios"
 version = "0.0.0"
 dependencies = [
+ "mlx-gen-ios-catalog",
  "mlx-llm",
  "runtime-catalog",
 ]

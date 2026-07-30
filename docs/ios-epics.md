@@ -383,10 +383,10 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 
 | Story | Notes |
 |---|---|
-| S5.1 SANA on device | `mlx-gen` + `-pid` + `-sana`. Already builds for iOS; this is the device half. |
+| S5.1 SANA on device | **Mac-side done** — composition, surface tests, and the `aarch64-apple-ios` cross-compile all green. The device half is Session A. |
 | S5.2 Memory residency | Encoder / DiT / DC-AE decoder. 2-bit Gemma-2 encoder if needed; DC-AE tiling. Uses E4's unload seam. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
-| S5.5 `media` feature in `runtime-ios` | Plus the ordered surface test for that profile — the bundle's current test asserts the media registry is *empty*, so this is a deliberate edit to both. |
+| S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
 | S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. Enforced like E4's thresholds. |
 
 **Exit:** SANA generates a correct 1024px image within the memory cap, `gen-core-testkit`

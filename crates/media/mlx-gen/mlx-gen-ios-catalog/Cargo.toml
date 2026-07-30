@@ -1,0 +1,21 @@
+[package]
+name = "mlx-gen-ios-catalog"
+version = "0.0.0"
+edition = "2021"
+description = "Explicit narrow media provider catalog for iOS: the image generators that fit a phone."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+mlx-gen = { path = ".." }
+# SANA only. This is deliberately NOT mlx-gen-catalog: that composes 32 provider crates including
+# the video families (wan, ltx, mochi, svd), none of it validated on iOS and none of it shaped for
+# a device with a hard per-app memory cap. Depending on the whole catalog to obtain one small
+# generator would compile a graph the platform cannot run.
+#
+# `mlx-gen-sana` pulls `mlx-gen-pid` transitively for the Gemma-2 CHI caption encoder (epic 8485 /
+# sc-8488) -- SANA's text conditioning IS Gemma-2-2b-it, reused rather than duplicated.
+mlx-gen-sana = { path = "../mlx-gen-sana" }
+
+[dev-dependencies]
+sceneworks-gen-core-testkit = { workspace = true }

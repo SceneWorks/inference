@@ -127,7 +127,9 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             lanes.update(macos_metal=True, real_weights=True, release=True)
             continue
 
-        if _under(path, "crates/bundles/runtime-ios"):
+        if _under(path, "crates/bundles/runtime-ios") or _under(
+            path, "crates/media/mlx-gen/mlx-gen-ios-catalog"
+        ):
             lanes.update(ios_build=True, release=True)
             continue
 

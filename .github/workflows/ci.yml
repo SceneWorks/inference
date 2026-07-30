@@ -323,6 +323,12 @@ jobs:
         run: >-
           cargo build --locked --target aarch64-apple-ios
           -p mlx-llm -p mlx-llm-server -p runtime-ios
+      # The image lane (E5). Separate step so a media-only break is obvious in the log rather than
+      # buried in the LLM build.
+      - name: Build the iOS media profile
+        run: >-
+          cargo build --locked --features media --target aarch64-apple-ios
+          -p runtime-ios
       - name: Build for iOS simulator
         run: cargo build --locked --target aarch64-apple-ios-sim -p mlx-llm -p runtime-ios
       - name: Clippy iOS packages
@@ -334,7 +340,10 @@ jobs:
       # iOS. It runs on the HOST (an iOS test binary needs a device or simulator runner, which
       # this tier does not have) -- the composition it validates is target-independent.
       - name: Test runtime-ios catalog surface
-        run: cargo test --locked -p runtime-ios
+        run: |
+          cargo test --locked -p runtime-ios
+          cargo test --locked --features media -p runtime-ios
+          cargo test --locked -p mlx-gen-ios-catalog
       # A green build is NOT evidence of an iOS artifact. Before ios-metal-sdk.patch, this lane
       # would have passed while emitting a macOS metallib that links fine and dies at the first
       # kernel dispatch on device. Assert the platform of what was actually produced.

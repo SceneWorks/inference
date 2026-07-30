@@ -15,6 +15,8 @@
 //! path `pmetal-mlx-sys` publishes as `DEP_MLX_METALLIB` and refuses to copy a metallib built for
 //! the wrong platform.
 
+#[cfg(feature = "media")]
+pub use mlx_gen_ios_catalog as media;
 pub use mlx_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
@@ -38,15 +40,31 @@ pub const SUPPORTED_TARGET_TRIPLES: &[&str] = &["aarch64-apple-ios", "aarch64-ap
 /// `.cargo/config.toml`.
 pub const NATIVE_PREREQUISITES: &[&str] = &["iOS 18.0+", "Xcode 16+ with the Metal toolchain"];
 
+/// The bundle's media registry: the narrow iOS image catalog under `media`, empty without it.
+///
+/// Deliberately `mlx-gen-ios-catalog` rather than `mlx-gen-catalog` — see this crate's
+/// `Cargo.toml` and the catalog's own docs for why a phone does not compile the 32-provider graph.
+fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        mlx_gen_ios_catalog::provider_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
 /// Build the complete validated iOS runtime composition.
 ///
-/// No media registry and no audio lane: an empty [`gen_core::ProviderRegistry`] is passed for
-/// media, mirroring how the other bundles compose under `--no-default-features`.
+/// No audio lane on either profile: that lane is the one sanctioned cross-backend seam
+/// (sc-12835) and is not extended to a new platform incidentally.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     RuntimeCatalog::try_new(
         PLATFORM,
         BACKEND,
-        gen_core::ProviderRegistryBuilder::new().build(),
+        media_registry(),
         mlx_llm::text_registry(),
         mlx_llm::snapshot_preparer_registry(),
     )
@@ -69,11 +87,21 @@ mod tests {
         assert_eq!(snapshot.text_llm_ids, ["mlx-llama", "mlx-joycaption"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
 
-        // Deliberately empty (Cargo.toml explains why). These assertions are the guard: the iOS
-        // media story is a narrow, purpose-built registry in E5, so an incidental
-        // `mlx-gen-catalog` dependency — 32 providers including video — must fail here rather
-        // than quietly compile into an iPhone app.
+        // The media surface is feature-gated and NARROW by design. Under `media` it is exactly
+        // the iOS image catalog; without it, empty. Either way an incidental `mlx-gen-catalog`
+        // dependency — 32 providers including video — fails here rather than quietly compiling
+        // into an iPhone app.
+        #[cfg(feature = "media")]
+        assert_eq!(
+            snapshot.generator_ids,
+            ["sana_1600m", "sana_sprint_1600m"],
+            "the iOS image surface changed; confirm the new provider fits an 8 GB device's cap \
+             (mlx-llm's memory_budget example) before updating this"
+        );
+        #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
+
+        // Never, on either profile: these belong to the full media graph, not to a phone.
         assert!(snapshot.transform_ids.is_empty());
         assert!(snapshot.trainer_ids.is_empty());
         assert!(snapshot.captioner_ids.is_empty());
