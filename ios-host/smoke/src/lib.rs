@@ -1213,7 +1213,25 @@ pub fn run_report() -> String {
     // and the residue hypothesis is dead. Either answer is worth one device run.
     let image_only = std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
 
-    let snapshot = if image_only { None } else { find_snapshot() };
+    // `IOS_SMOKE_ONLY=sana|zimage` runs ONE model lane and skips the rest.
+    //
+    // This is not a convenience. Headroom does not survive a render — measured, twice: available
+    // memory fell 4664 -> 1223 MiB across one 512px SANA render, and 4620 -> 2093 across the two
+    // shipping configs. A model running after another therefore starts with whatever the previous
+    // one left, and a model needing more than that dies without ever reporting a number about
+    // ITSELF. Z-Image (host: ~4468 MiB) ran third with 2093 MiB available and died before writing
+    // a single breadcrumb — which says nothing about Z-Image.
+    //
+    // Any model whose demand approaches the cap must be measured alone, first, at full headroom.
+    let only = std::env::var("IOS_SMOKE_ONLY").unwrap_or_default();
+    let run_sana = only.is_empty() || only == "sana";
+    let run_zimage = only.is_empty() || only == "zimage";
+
+    let snapshot = if image_only || !only.is_empty() {
+        None
+    } else {
+        find_snapshot()
+    };
     #[allow(unused_mut)]
     let mut checks = vec![
         // First: it is the denominator for every memory number below, and it must be sampled
@@ -1232,10 +1250,15 @@ pub fn run_report() -> String {
     // Last, deliberately: it is the largest allocation in the run, so putting it after the LLM
     // checks means a jetsam kill during image generation cannot be mistaken for one during them.
     #[cfg(feature = "media")]
-    checks.push(check_image_generation(find_media_snapshot().as_deref()));
-    // Last of all: the largest single allocation in the run.
+    if run_sana {
+        checks.push(check_image_generation(find_media_snapshot().as_deref()));
+    }
+    // Last of all: the largest single allocation in the run — which is exactly why it usually needs
+    // `IOS_SMOKE_ONLY=zimage` to be measurable at all.
     #[cfg(feature = "zimage")]
-    checks.push(check_zimage_generation(find_zimage_snapshot().as_deref()));
+    if run_zimage {
+        checks.push(check_zimage_generation(find_zimage_snapshot().as_deref()));
+    }
 
     let failed = checks.iter().filter(|c| !c.passed).count();
     let mut out = String::new();

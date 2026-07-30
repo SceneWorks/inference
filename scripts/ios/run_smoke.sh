@@ -186,7 +186,7 @@ fi
 # this an on-device run can only ever exercise the default configuration, which is why the
 # image-only attribution experiment (IOS_SMOKE_IMAGE_ONLY) had no way to reach the device.
 LAUNCH_ENV="{}"
-for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
   val=$(printenv "$var" || true)
   if [ -n "$val" ]; then
     LAUNCH_ENV=$(python3 -c "
