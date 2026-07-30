@@ -823,9 +823,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     // evidence against the tiled decode. The second config stays because a second resolution
     // exercises a different allocation shape, and it is labelled so nobody reads its PNG as a
     // regression.
-    const SHIPPING: &[(&str, u32, Option<u32>)] = &[
-        ("1024 tile128", 1024, Some(128)),
-        ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256)),
+    const SHIPPING: &[(&str, u32, Option<u32>, bool)] = &[
+        ("1024 tile128", 1024, Some(128), false),
+        ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256), false),
     ];
 
     // Under `IOS_SMOKE_IMAGE_ONLY` the untiled configuration comes back — the one that died.
@@ -848,13 +848,26 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     //
     // To measure the untiled decode we must give it the headroom a real first render would have.
     // If it survives at full headroom, its death in every previous run was accumulation, not size.
-    const DIAGNOSTIC: &[(&str, u32, Option<u32>)] = &[
-        ("512 UNTILED (diagnostic: first, at full headroom)", 512, Some(0)),
-        ("1024 tile128", 1024, Some(128)),
-        ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256)),
+    // Third element `Some(0)` is untiled; fourth forces a GPU sync between decoder stages.
+    //
+    // The eval-stages row is the discriminating experiment. Plain untiled dies here even first and
+    // cold, so total work is not the question any more — the question is whether what kills it is
+    // the SUM of the decode's allocations or how many of them are live AT ONCE. MLX is lazy, so an
+    // untiled decode can materialize most of a stage graph together; `MLX_GEN_DCAE_EVAL_STAGES`
+    // serializes it without changing the work or the tiling.
+    //
+    // On the host that flag moves the peak by 2 MiB — nothing. If it is the difference between
+    // living and dying on device, then jetsam's per-process-limit is being crossed by an
+    // instantaneous spike that host accounting never shows, and "how the memory is grabbed" matters
+    // as much as how much. That would also explain the direction flip: host over-reads tiled
+    // configs by ~16% and under-reads this one by >1.4 GB.
+    const DIAGNOSTIC: &[(&str, u32, Option<u32>, bool)] = &[
+        ("512 UNTILED + stage-eval (serialized, not tiled)", 512, Some(0), true),
+        ("1024 tile128", 1024, Some(128), false),
+        ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256), false),
     ];
 
-    let configs: &[(&str, u32, Option<u32>)] =
+    let configs: &[(&str, u32, Option<u32>, bool)] =
         if std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some() {
             DIAGNOSTIC
         } else {
@@ -869,7 +882,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
 
     let mut details: Vec<String> = Vec::new();
-    for &(label, edge, tile) in configs {
+    for &(label, edge, tile, stage_eval) in configs {
         // ALWAYS set it explicitly; `0` is the provider's "no tiling" control.
         //
         // This used to `remove_var` for the untiled case, which silently stopped meaning
@@ -879,6 +892,13 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         // run that never performed one. Leaving the variable unset is no longer a way to express
         // anything; only `0` is.
         std::env::set_var("MLX_GEN_SANA_DECODE_TILE", tile.unwrap_or(0).to_string());
+        // Serialize the decoder's stages: a GPU sync after each, so their transients cannot be
+        // live together. Costs a sync per stage and changes no arithmetic.
+        if stage_eval {
+            std::env::set_var("MLX_GEN_DCAE_EVAL_STAGES", "1");
+        } else {
+            std::env::remove_var("MLX_GEN_DCAE_EVAL_STAGES");
+        }
 
         mlx_rs::memory::clear_cache();
         mlx_rs::memory::reset_peak_memory();
