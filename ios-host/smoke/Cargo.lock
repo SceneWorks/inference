@@ -459,6 +459,7 @@ dependencies = [
  "core-llm-testkit",
  "image",
  "libc",
+ "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "runtime-ios",
 ]
@@ -641,6 +642,17 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+]
+
+[[package]]
+name = "mlx-gen-z-image"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-pid",
+ "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]

@@ -1031,6 +1031,155 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
 }
 
+/// **Z-Image-Turbo on device (E5 go/no-go).** The second image model, and a different bet from SANA.
+///
+/// # Why this one, and why it might work where SANA's untiled path did not
+///
+/// Z-Image already carries the whole `gen_core::memory_strategy` ladder (rungs 0-4), which SANA does
+/// not. Rung 4 streams the 30-block DiT instead of holding it, so its denoise phase is 1.795 GiB
+/// rather than 4.653, and its request peak becomes decode-bound at **4.363 GiB** — measured on host
+/// against this exact q4 tier, with the full ladder engaged
+/// (`mlx-gen-z-image/tests/block_residency_real_weights.rs`).
+///
+/// That is 73% of this device's measured 6135 MiB cap. It is also, unlike SANA's fatal
+/// configuration, the SHIPPING shape: the number and the thing that runs are the same thing.
+///
+/// # What would make it fail anyway
+///
+/// Host readings are shape-dependently wrong in both directions — they over-read SANA's tiled
+/// configs by ~16% and under-read its untiled one by >1.4 GB, and the untiled decode died because a
+/// *single stage* needed ~1 GB more than the host charged. So 73% is a reason to try, not a
+/// prediction. If z-image dies here, the next question is whether one of its stages has that same
+/// shape, which the breadcrumb + a stage trace would answer.
+///
+/// Untiled is never attempted: z-image untiled is **19.172 GiB** at 1024², three times the cap.
+#[cfg(feature = "zimage")]
+fn check_zimage_generation(dir: Option<&Path>) -> Check {
+    const NAME: &str = "Z-Image-Turbo generation (E5 go/no-go)";
+    let Some(dir) = dir else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- no Z-Image q4 tier in Documents/ (push with scripts/ios/push_model.sh)"
+                .to_string(),
+        };
+    };
+
+    use runtime_ios::gen_core::{
+        GenerationMemory, GenerationOutput, GenerationRequest, LoadSpec as GenLoadSpec,
+        OffloadPolicy, Progress, WeightsSource,
+    };
+
+    mlx_rs::memory::clear_cache();
+    mlx_rs::memory::reset_peak_memory();
+    let started = Instant::now();
+
+    let run = || -> Result<String, String> {
+        // `Sequential` + a `Dir` source are what make rung 4 AVAILABLE at all — z-image declares it
+        // Missing for single-file/ComfyUI loads, because streaming rebuilds blocks from the snapshot
+        // per window and an in-memory `Weights` has no re-openable source.
+        let spec = GenLoadSpec {
+            offload_policy: OffloadPolicy::Sequential,
+            ..GenLoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+        };
+        let generator =
+            mlx_gen_z_image::load(&spec).map_err(|e| format!("load failed: {e}"))?;
+
+        // Availability is not engagement: the ladder rungs are request-scoped, so they must be asked
+        // for. `transformer_window_size: Some(1)` is the published production window.
+        let request = GenerationRequest {
+            prompt: "a lighthouse on a rocky coast at dawn".to_string(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(4),
+            seed: Some(0),
+            memory: Some(GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                transformer_window_size: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut noop = |_: Progress| {};
+        let out = generator
+            .generate(&request, &mut noop)
+            .map_err(|e| format!("generate failed: {e}"))?;
+        let image = match out {
+            GenerationOutput::Images(mut v) if !v.is_empty() => v.remove(0),
+            _ => return Err("generator returned no image".into()),
+        };
+        if (image.width, image.height) != (1024, 1024) {
+            return Err(format!("got {}x{}, expected 1024x1024", image.width, image.height));
+        }
+        let (lo, hi) = image
+            .pixels
+            .iter()
+            .fold((255u8, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        if hi - lo < 32 {
+            return Err(format!("near-constant image (range {lo}..{hi}) -- decode produced nothing"));
+        }
+
+        if let Some(docs) = dirs_documents() {
+            match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
+                Some(buf) => {
+                    if let Err(e) = buf.save(docs.join("zimage-1024.png")) {
+                        eprintln!("could not write zimage-1024.png: {e}");
+                    }
+                }
+                None => eprintln!("zimage pixel buffer does not match dimensions"),
+            }
+        }
+
+        let secs = started.elapsed().as_secs_f64();
+        let mlx_peak = mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0);
+        let headroom = available_memory_mib()
+            .map(|m| format!(", {m:.0} MiB still available"))
+            .unwrap_or_default();
+        let line = format!(
+            "1024px full ladder (rung 4 w=1): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
+             process RSS peak {:.0} MiB{headroom}, pixel range {lo}..{hi} \
+             [host predicted 4468 MiB]",
+            peak_rss_mib(),
+        );
+        // Breadcrumb before returning: if this model dies, it dies HERE, and the report never gets
+        // written. Same reasoning as the SANA lane.
+        append_breadcrumb("zimage-progress.txt", &line);
+        Ok(line)
+    };
+
+    match run() {
+        Ok(detail) => Check { name: NAME, passed: true, detail },
+        Err(e) => {
+            append_breadcrumb("zimage-progress.txt", &format!("FAILED {e}"));
+            Check { name: NAME, passed: false, detail: e }
+        }
+    }
+}
+
+/// The Z-Image q4 tier, if pushed. Identified by its diffusers component tree, like SANA's, but
+/// under a distinct directory name so the two snapshots coexist without either finder claiming the
+/// other's.
+#[cfg(feature = "zimage")]
+fn find_zimage_snapshot() -> Option<std::path::PathBuf> {
+    let docs = dirs_documents()?;
+    let looks_right = |p: &std::path::Path| {
+        p.join("transformer").is_dir() && p.join("vae").is_dir() && p.join("text_encoder").is_dir()
+    };
+    std::fs::read_dir(&docs)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name().is_some_and(|n| n.to_string_lossy().contains("zimage"))
+                && looks_right(p)
+        })
+}
+
 /// Run every check and render a human- and test-readable report.
 ///
 /// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
@@ -1071,6 +1220,9 @@ pub fn run_report() -> String {
     // checks means a jetsam kill during image generation cannot be mistaken for one during them.
     #[cfg(feature = "media")]
     checks.push(check_image_generation(find_media_snapshot().as_deref()));
+    // Last of all: the largest single allocation in the run.
+    #[cfg(feature = "zimage")]
+    checks.push(check_zimage_generation(find_zimage_snapshot().as_deref()));
 
     let failed = checks.iter().filter(|c| !c.passed).count();
     let mut out = String::new();

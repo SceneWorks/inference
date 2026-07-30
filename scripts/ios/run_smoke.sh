@@ -25,6 +25,9 @@ while [ $# -gt 0 ]; do
     # Documents/<any-subdir>/ (scripts/ios/push_model.sh <dir> sana); without one the check
     # reports "skipped" rather than failing.
     --media)  CARGO_FEATURES="--features media"; shift ;;
+    # E5 go/no-go for Z-Image-Turbo. Additive over --media; needs a q4 tier pushed to
+    # Documents/<name containing "zimage">/ (scripts/ios/push_model.sh <tier> zimage-q4).
+    --zimage) CARGO_FEATURES="--features media,zimage"; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -262,6 +265,20 @@ if ! head -1 "$REPORT" | grep -q "SMOKE: PASS"; then
   say "FAIL"
   exit 1
 fi
+
+# --- generated artifacts ------------------------------------------------------------------------
+# Pull the renders. A memory number says the model FIT; only the image says it worked, and these are
+# the artifacts worth keeping from a device session. Written to the desktop rather than /tmp so they
+# survive and can actually be looked at.
+ARTIFACT_DIR=${ARTIFACT_DIR:-$HOME/Desktop/sana-ios}
+mkdir -p "$ARTIFACT_DIR"
+for png in sana-1024-tile128.png sana-512-tile256.png zimage-1024.png; do
+  if xcrun devicectl device copy from --device "$DEVICE" \
+      --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
+      --source "Documents/$png" --destination "$ARTIFACT_DIR/device-$png" >/dev/null 2>&1; then
+    echo "  pulled $png -> $ARTIFACT_DIR/device-$png"
+  fi
+done
 
 # --- performance regression thresholds (S4.6) ---------------------------------------------------
 # The report carries measurements the checks themselves do not assert on: a threshold invented

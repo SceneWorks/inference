@@ -17,6 +17,12 @@ crate-type = ["staticlib", "rlib"]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
 media = ["runtime-ios/media", "dep:image"]
+# E5 go/no-go for a SECOND image model. Deliberately a direct path dep rather than a catalog entry:
+# `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA only) and widening it is an
+# architectural decision, not a way to run an experiment. This crate is excluded from the workspace,
+# so a dep here reaches neither `EXPECTED_MEMBER_COUNT` nor the catalog's ordered surface test.
+# If z-image earns a place on iOS, THAT is when the catalog changes.
+zimage = ["dep:mlx-gen-z-image", "dep:image"]
 
 [dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "c0e5c4a4350ec4989e5dc130158dee7757eae785" }
@@ -34,3 +40,6 @@ libc = "0.2"
 # LOOKED at. A pixel-range assertion proves the decode produced content; only the image proves it
 # produced the right content, and "SANA runs on iPhone" is a claim worth being able to see.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Z-Image-Turbo, for the go/no-go above. Carries the full memory ladder (rungs 0-4) already, which
+# is why it is the cheapest second model to try.
+mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", optional = true }
