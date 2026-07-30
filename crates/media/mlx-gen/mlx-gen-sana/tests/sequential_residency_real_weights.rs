@@ -13,7 +13,10 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, WeightsSource};
+use mlx_gen::{
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
+    WeightsSource,
+};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -66,6 +69,29 @@ fn probe_request() -> GenerationRequest {
         steps: Some(steps),
         ..Default::default()
     }
+}
+
+/// Like [`render_measured`] but returns EVERY image, for `count > 1`.
+fn render_all(
+    policy: OffloadPolicy,
+    snap: PathBuf,
+    req: &GenerationRequest,
+) -> (Vec<Vec<u8>>, usize) {
+    let spec = LoadSpec::new(WeightsSource::Dir(snap)).with_offload_policy(policy);
+    let model = mlx_gen_sana::provider_registry()
+        .expect("build provider registry")
+        .load(model_id(), &spec)
+        .expect("load sana");
+    reset_peak_memory();
+    let out = model.generate(req, &mut |_| {}).expect("generate");
+    let peak = get_peak_memory();
+    let images = match out {
+        GenerationOutput::Images(v) => v.into_iter().map(|i| i.pixels).collect(),
+        other => panic!("expected Images, got {other:?}"),
+    };
+    drop(model);
+    clear_cache();
+    (images, peak)
 }
 
 fn render_measured(
@@ -136,6 +162,91 @@ fn sequential_bounds_peak_and_is_byte_identical() {
          reduce peak",
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
+    );
+}
+
+/// img2img and `count > 1` through the **staged** seam (sc-13571 adoption).
+///
+/// These are the two request shapes the staged decode restructured, and neither was covered.
+///
+/// **img2img** is the path where the DC-AE *encoder*'s lifetime matters. `StagedHeavy::shed_dit`
+/// drops the encoder along with the trunk, so an encoder still needed after the shed would be gone.
+/// It is not — `encode_init_latents` runs inside the denoise phase — but that is an argument, and
+/// the argument is exactly what a restructure invalidates.
+///
+/// **count > 1** is the reordering itself: every seed now denoises before anything decodes, so the
+/// trunk can be shed once for the batch instead of held across N decodes. That changes what is
+/// live when, and it changes `Mid` from one latent to a `Vec`.
+///
+/// Both are asserted against the **resident** path rather than against a golden, so this stays a
+/// statement about the seam (staging must not change pixels) and not about SANA's sampler.
+#[test]
+#[ignore = "needs a Sana_1600M_1024px_diffusers snapshot; set SANA_PIPELINE_WEIGHTS"]
+fn staged_seam_preserves_img2img_and_multi_image_output() {
+    let Some(snap) = snapshot() else {
+        eprintln!("skipping: set SANA_PIPELINE_WEIGHTS to run the SANA staged-seam checks");
+        return;
+    };
+
+    // ── count > 1.
+    let mut batch = probe_request();
+    batch.count = 2;
+    let (batch_resident, _) = render_all(OffloadPolicy::Resident, snap.clone(), &batch);
+    let (batch_sequential, _) = render_all(OffloadPolicy::Sequential, snap.clone(), &batch);
+    assert_eq!(batch_resident.len(), 2, "count=2 must return two images");
+    assert_eq!(
+        batch_sequential.len(),
+        2,
+        "count=2 must return two images under Sequential too"
+    );
+    assert_ne!(
+        batch_resident[0], batch_resident[1],
+        "the two seeds produced identical images — the per-image seed offset was lost, which the \
+         batch reordering could silently do by hoisting the seed out of the loop"
+    );
+    for (i, (r, s)) in batch_resident.iter().zip(&batch_sequential).enumerate() {
+        let diff = r.iter().zip(s).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            diff, 0,
+            "image {i} of a count=2 batch differs between residencies: {diff} bytes"
+        );
+    }
+
+    // ── img2img: use the first batch image as the reference, so no fixture is needed and the
+    // init latents are in-distribution.
+    let init = Image {
+        width: batch.width,
+        height: batch.height,
+        pixels: batch_resident[0].clone(),
+    };
+    let mut i2i = probe_request();
+    i2i.conditioning = vec![Conditioning::Reference {
+        image: init,
+        strength: Some(0.6),
+    }];
+    let (i2i_resident, _) = render_all(OffloadPolicy::Resident, snap.clone(), &i2i);
+    let (i2i_sequential, _) = render_all(OffloadPolicy::Sequential, snap, &i2i);
+
+    let diff = i2i_resident[0]
+        .iter()
+        .zip(&i2i_sequential[0])
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        diff, 0,
+        "img2img differs between residencies: {diff} bytes. Under Sequential the DC-AE encoder is \
+         built only when the request needs it and is dropped by `shed_dit` — a lifetime error there \
+         shows up here and nowhere else."
+    );
+    // A strength-0.6 img2img must still resemble neither pure noise nor the input exactly.
+    let unchanged = i2i_resident[0]
+        .iter()
+        .zip(&batch_resident[0])
+        .filter(|(a, b)| a == b)
+        .count();
+    assert!(
+        unchanged < i2i_resident[0].len(),
+        "img2img returned the reference image unchanged — the denoise did not run"
     );
 }
 
