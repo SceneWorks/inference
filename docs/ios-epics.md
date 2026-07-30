@@ -264,9 +264,26 @@ this split is designed to prevent.
 | Story | Notes |
 |---|---|
 | S4.1 Threading contract + hostile-threading test | `mlx-llm` engines are neither `Send` nor `Sync`, and MLX's Metal device is not thread-safe. On macOS a test detail; on iOS host-app correctness. |
-| S4.2 Peak-RSS instrumentation against **two** lines | The ~6 GB cap we ship against, and a ~4 GB reference for the 8 GB device class. The second costs nothing and tells us how far a broader release is (spec §0.1). |
-| S4.3 KV cache and buffer sizing under the cap | Sustained decode without jetsam. |
-| S4.4 Energy + sustained thermal baselines | Instruments Energy Log; tok/s at t=0 vs t=5min. These are also the evidence that would reopen the ANE question (strategy §7.2). |
+| S4.2 Peak-RSS instrumentation | **DONE** — `getrusage(RUSAGE_SELF)` peak RSS reported by every on-device run. Measured on a 2.64 GiB Q4 Qwen3-4B: **215 MiB after load, 2903 MiB peak, ~2980 MiB under sustained work**. Against the ~6 GB cap that is roughly half; against the ~4 GB line of an 8 GB device it is comfortable but not spacious. |
+| S4.3 Sustained decode without jetsam | **DONE for repeated generations** — 512 tok over 4 segments, **RSS growth 0 MiB** (2980 → 2980), no jetsam. Note the scope: `generate` allocates a fresh KV cache per call, so this proves no leak across calls, *not* KV growth within one long context. That needs a prefix-cached or multi-turn path and remains open. |
+| S4.4 Energy + sustained thermal baselines | **Partly done.** Throughput holds across ~30 s of continuous GPU work — 16.7 → 20.7 → 20.3 → 18.8 tok/s, **no thermal decay** (the first segment is slowest because weights fault in lazily, so >100% retention is expected, not a speed-up). Still open: the Instruments **energy** number and a 5-minute soak, which are the evidence that would reopen the ANE question (strategy §7.2). |
+**Measured on an iPhone 17 Pro Max (iOS 26.5.2), Qwen3-4B Q4:**
+
+```
+[ok] sustained decode -- 512 tok over 4 segments
+     128tok@16.7t/s/2980MiB  128tok@20.7t/s  128tok@20.3t/s  128tok@18.8t/s
+     retention 112% | RSS 2980 -> 2980 MiB (growth 0, baseline 2963)
+```
+
+Two readings worth stating carefully, because both invite over-claiming:
+
+- **"Growth 0" is real but narrower than it sounds.** `generate` allocates a fresh KV cache per
+  call, so this shows the runtime does not leak across repeated generations. A single long
+  context growing its cache is a *different* measurement and is not covered.
+- **"Retention 112%" is not a speed-up.** The first segment is slowest because MLX faults weights
+  in lazily, so the real load cost lands on the first forward pass. The honest reading is
+  *throughput is flat*, with no thermal decay over ~30 s.
+
 | S4.5 Staged load/unload **seam** | Built even though a 17 Pro does not need it, and left disabled. Retrofitting it into a pipeline that assumed co-residency is the expensive version. |
 | S4.6 Regression thresholds in Tier 3 | Baselines enforced, not merely recorded. |
 | S4.7 Integrate the increased-memory-limit entitlement | Once Apple grants it. Requested separately; lead time is not ours. |

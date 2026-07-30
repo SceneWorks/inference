@@ -265,6 +265,116 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
     }
 }
 
+/// Sustained decode: the memory and throughput question E4 actually owns.
+///
+/// The short generation above says nothing about this. A single 64-token run has a KV cache of
+/// negligible size, so it cannot show whether memory grows without bound or whether throughput
+/// degrades as the context fills — and on a phone with a hard per-app cap, an OOM kill (jetsam)
+/// looks like the app "just closing", with no crash log tying it to inference.
+///
+/// So: several back-to-back generations, sampling peak RSS and per-segment throughput as they go.
+/// What we want to see is RSS holding flat across repeated work and steady tok/s rather than a
+/// decay curve as the device warms.
+///
+/// **Scope, precisely.** `TextLlm::generate` allocates a fresh KV cache per call
+/// (`decode/stream.rs`), so this measures *repeated independent generations* — it proves the
+/// runtime does not leak across calls and does not throttle over ~30 s of continuous GPU work. It
+/// does **not** measure a single long context: KV growth within one generation needs a
+/// prefix-cached or multi-turn path, and is a separate measurement.
+///
+/// Reported, not asserted. A threshold invented from one device on one thermal state would be
+/// noise; these numbers are the baseline a threshold can later be set from (S4.6).
+fn check_sustained_decode(model_dir: Option<&Path>) -> Check {
+    const NAME: &str = "sustained decode (memory + throughput)";
+    const TOTAL_TOKENS: u32 = 512;
+    const SEGMENTS: usize = 4;
+
+    let Some(dir) = model_dir else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- no snapshot in Documents/".to_string(),
+        };
+    };
+
+    let run = || -> Result<String, String> {
+        let llm = runtime_ios::llm::load_for_model(&LoadSpec::dense(
+            dir.to_string_lossy().to_string(),
+        ))
+        .map_err(|e| format!("load failed: {e}"))?;
+
+        let baseline_rss = peak_rss_mib();
+        let mut segments = Vec::with_capacity(SEGMENTS);
+        let per_segment = TOTAL_TOKENS / SEGMENTS as u32;
+
+        for i in 0..SEGMENTS {
+            let request = TextLlmRequest {
+                messages: vec![Message::user(
+                    "Write a detailed account of a long sea voyage, with many specific incidents.",
+                )],
+                sampling: Sampling::greedy(),
+                max_new_tokens: per_segment,
+                // Vary the seed so segments are not identical work; greedy still keeps each one
+                // deterministic and comparable run to run.
+                seed: Some(i as u64),
+                ..Default::default()
+            };
+            let started = Instant::now();
+            let out = llm
+                .complete(&request)
+                .map_err(|e| format!("segment {i} failed: {e}"))?;
+            let secs = started.elapsed().as_secs_f64();
+            let tokens = out.usage.generated_tokens;
+            segments.push((
+                tokens,
+                tokens as f64 / secs.max(1e-6),
+                peak_rss_mib(),
+                out.usage.prompt_tokens,
+            ));
+        }
+
+        let first = segments.first().expect("SEGMENTS > 0");
+        let last = segments.last().expect("SEGMENTS > 0");
+        // Throughput retention across the run. Well under 1.0 means thermal throttling; this is
+        // the headline number for E4/S4.4. Note the FIRST segment is usually the slowest (weights
+        // fault in lazily on the first forward pass), so retention above 100% is expected and is
+        // not evidence of speed-up.
+        let retention = last.1 / first.1.max(1e-6);
+        let rss_growth = last.2 - first.2;
+        let total: u32 = segments.iter().map(|s| s.0).sum();
+
+        let per_seg = segments
+            .iter()
+            .map(|(t, tps, rss, _)| format!("{t}tok@{tps:.1}t/s/{rss:.0}MiB"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        Ok(format!(
+            "{total} tok over {SEGMENTS} segments | {per_seg} | retention {:.0}% \
+             (first {:.1} -> last {:.1} tok/s) | RSS {:.0} -> {:.0} MiB (growth {rss_growth:.0}, \
+             baseline {baseline_rss:.0})",
+            retention * 100.0,
+            first.1,
+            last.1,
+            first.2,
+            last.2,
+        ))
+    };
+
+    match run() {
+        Ok(detail) => Check {
+            name: NAME,
+            passed: true,
+            detail,
+        },
+        Err(e) => Check {
+            name: NAME,
+            passed: false,
+            detail: e,
+        },
+    }
+}
+
 /// The full backend-neutral conformance suite, on device (S3.5).
 ///
 /// This is the check that makes "conformant on iOS" mean the same thing it means on macOS: the
@@ -367,6 +477,7 @@ pub fn run_report() -> String {
         check_softmax(),
         check_generation(snapshot.as_deref()),
         check_conformance(snapshot.as_deref()),
+        check_sustained_decode(snapshot.as_deref()),
     ];
 
     let failed = checks.iter().filter(|c| !c.passed).count();
