@@ -294,7 +294,7 @@ the lane fails **before** a broader-device release would, rather than after
 
 | S4.5 Staged load/unload **seam** | **DONE and measured** — `idle 0 → loaded 2693 → dropped 0 → cleared 0 MiB, 100% reclaimed`. Built while the 17 Pro Max does not need it, because retrofitting it into a pipeline that assumed co-residency is the expensive version. **Finding: `drop` alone returns everything** — the buffer cache is not holding weights, so `clear_cache` is a guard, not the mechanism. Measured via MLX's `get_active_memory`, not RSS: `ru_maxrss` is a high-water mark that never falls, so it would have reported "nothing freed". |
 | S4.6 Regression thresholds | **DONE** — `run_smoke.sh` asserts throughput ≥ 12 tok/s, peak RSS ≤ 4096 MiB, and RSS growth ≤ 256 MiB, overridable by env var. Deliberately loose: these catch a lost fast path, a leak, or thermal collapse — not a warm phone. A check that fails on a slow afternoon teaches people to ignore it. Verified by a negative test (`THRESHOLD_MIN_TPS=999` → exit 1, naming the metric). |
-| S4.7 Integrate the increased-memory-limit entitlement | Once Apple grants it. Requested separately; lead time is not ours. |
+| S4.7 Integrate the increased-memory-limit entitlement | **DONE — and it never needed Apple.** `com.apple.developer.kernel.increased-memory-limit` is a **self-serve** capability: automatic signing regenerates the profile to include it, unlike the approval-gated ones (CarPlay, HLS, …). This story was written assuming a request-and-wait, and that assumption sat unexamined long enough to shape E5's device planning. Claimed in `ios-host/App/SceneWorksSmoke.entitlements` alongside `extended-virtual-addressing` — needed independently, since MLX memory-maps weights and SANA's snapshot is 4.73 GB, which can exhaust a 4 GB address space even when residency is fine. |
 
 **Exit: substantially met.** Published and enforced: steady tok/s, peak RSS, sustained-decode
 memory growth, and the unload seam — all asserted by `run_smoke.sh`, all verified to fail when
@@ -822,7 +822,9 @@ report and took the last match, so it silently depended on which checks existed 
 The image check's detail carries `MLX peak N MiB` *and* `process RSS peak N MiB`, which would have
 repointed the LLM's RSS ceiling at SANA's number. Extraction is now anchored to the named check.
 
-**Jetsam-proofing.** The app has no `increased-memory-limit` entitlement (S4.7, still pending), so
+**Jetsam-proofing.** Written when the app had no `increased-memory-limit` entitlement (since
+claimed — see S4.7, it was self-serve all along). The mitigations stay: an entitlement raises the
+cap, it does not remove it, and a kill is still a kill. So
 SANA's 4773 MiB configuration may be killed outright — and a jetsam kill takes the whole report with
 it, including the LLM checks that already passed, leaving "no report was produced", which is
 indistinguishable from a launch failure. Two mitigations: configurations run in **ascending measured

@@ -609,8 +609,10 @@ Developer account* — not by headcount.
 | `runtime-ios` + `runtime-ios-ffi` crates, catalog surface tests, conformance wiring | Claude | Rust, verified by the repo's existing gates |
 | CI config (`select_lanes.py`, workflows, Tier 1/2) | Claude | Config plus the repo's own Python gates |
 | SwiftUI host app + XCTest target (§5.2b) | Claude drafts, you build and run | Claude can write Swift; only you can drive Xcode's GUI and a device |
-| Signing, provisioning, `com.apple.developer.kernel.increased-memory-limit` entitlement | **You only** | Apple Developer account. The entitlement needs a request to Apple — **start it in Phase 0**, its lead time is not under our control |
-| Device measurement: Instruments energy/thermals, jetsam behaviour, the real per-app cap | **You only** | Physical iPhone |
+| Signing and provisioning | **You only** | Apple Developer account |
+| ~~`com.apple.developer.kernel.increased-memory-limit` entitlement~~ | ~~You only~~ → **Claude** | **Corrected 2026-07-30.** It is a **self-serve** capability, not an approval-gated one: declaring it in an entitlements file is enough, and automatic signing regenerates the profile to match. There is no request and no Apple lead time. See below. |
+| Device measurement: Instruments energy/thermals, jetsam behaviour | **You only** | Physical iPhone |
+| ~~The real per-app cap~~ | ~~You only~~ → **measured automatically** | `os_proc_available_memory()` is now the first check in the smoke report, so the cap is a number in every device run rather than something to go and find out |
 | Self-hosted runner + tethered device (Tier 3) | **You only** | Hardware and network access |
 
 ### 8.2 The actual bottleneck
@@ -622,8 +624,16 @@ the Rust lands. Plan the schedule around your availability for device sessions.
 
 Two consequences worth acting on now:
 
-1. **Request the increased-memory-limit entitlement during Phase 0**, before it is needed. It
-   gates A2 and T2, and its turnaround is Apple's, not ours.
+1. ~~**Request the increased-memory-limit entitlement during Phase 0**, before it is needed. It
+   gates A2 and T2, and its turnaround is Apple's, not ours.~~
+
+   **Withdrawn 2026-07-30 — there was never anything to request.** The entitlement is self-serve;
+   it is now declared in `ios-host/App/SceneWorksSmoke.entitlements` and granted by automatic
+   signing. Worth recording *why* this survived so long, because the shape recurs: it was written
+   into the plan as an external dependency at spec time, and an external dependency is exactly the
+   kind of item that gets scheduled around rather than re-examined. Nothing downstream ever
+   questioned it — E5's device planning was built on top of a constraint that did not exist. The
+   check that would have caught it (declare it and see whether signing succeeds) cost minutes.
 2. **Batch device work.** A2 and T2 are both "load it, watch RSS, tune, repeat" — running them as
    scheduled sessions rather than ad-hoc interrupts is materially faster.
 
