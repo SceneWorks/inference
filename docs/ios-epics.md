@@ -296,6 +296,25 @@ the lane fails **before** a broader-device release would, rather than after
 | S4.6 Regression thresholds | **DONE** — `run_smoke.sh` asserts throughput ≥ 12 tok/s, peak RSS ≤ 4096 MiB, and RSS growth ≤ 256 MiB, overridable by env var. Deliberately loose: these catch a lost fast path, a leak, or thermal collapse — not a warm phone. A check that fails on a slow afternoon teaches people to ignore it. Verified by a negative test (`THRESHOLD_MIN_TPS=999` → exit 1, naming the metric). |
 | S4.7 Integrate the increased-memory-limit entitlement | **DONE — and it never needed Apple.** `com.apple.developer.kernel.increased-memory-limit` is a **self-serve** capability: automatic signing regenerates the profile to include it, unlike the approval-gated ones (CarPlay, HLS, …). This story was written assuming a request-and-wait, and that assumption sat unexamined long enough to shape E5's device planning. Claimed in `ios-host/App/SceneWorksSmoke.entitlements` alongside `extended-virtual-addressing` — needed independently, since MLX memory-maps weights and SANA's snapshot is 4.73 GB, which can exhaust a 4 GB address space even when residency is fine. |
 
+> **Re-validated under corrected MLX limits (2026-07-30).** The buffer-cache finding below
+> ([S5.2 correction](#the-229-s-is-the-model-not-the-configuration-2026-07-30)) means every memory
+> number in this epic was measured while MLX believed it had ~11 GB rather than ~6. The LLM lane was
+> therefore re-run on device with the limits bound, and **nothing moved**:
+>
+> | | recorded | re-measured |
+> |---|---:|---:|
+> | steady tok/s | 20.4 | 20.3 |
+> | peak RSS | 2903 MiB | 2782 MiB |
+> | sustained retention | 101% | 106% |
+> | RSS growth over 512 tok | 0 MiB | 0 MiB |
+> | staged seam | 2693 MiB, 100% reclaimed | 2693 MiB, 100% |
+>
+> **S4.5 had already recorded the reason, without recognising it.** "`drop` alone returns everything
+> — the buffer cache is not holding weights, so `clear_cache` is a guard, not the mechanism." That
+> was filed as a note about the unload seam. It is actually the LLM lane reporting that it does not
+> accumulate a reuse cache at all — which is why the misconfiguration never reached it, and why an
+> image model was the first thing to expose it. The E3/E4 thresholds stand as published.
+
 **Exit: substantially met.** Published and enforced: steady tok/s, peak RSS, sustained-decode
 memory growth, and the unload seam — all asserted by `run_smoke.sh`, all verified to fail when
 violated. **Not met: energy per 100 tokens** (S4.4), which needs an Instruments Energy Log capture
