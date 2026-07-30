@@ -291,15 +291,13 @@ pub struct ControlLaneInputs<'a> {
     pub height: u32,
     /// Whether the lane can drop to `OffloadPolicy::Sequential` (the Krea control lane wires it).
     pub supports_sequential: bool,
-    /// Candidate resolution scales (largest-first, in `(0,1)`) offered as the last resort (sc-11749).
-    pub resolution_scales: &'a [f64],
 }
 
 /// Decide the Krea control lane's memory-adaptation plan (sc-11750): assemble the per-lane
 /// [`StagePeaks`] estimator + [`LaneLevers`] and run them through the shared
 /// [`plan_memory_adaptation`]. `safe_gib` is the device budget ([`mlx_gen::memory::safe_budget_gib`]);
-/// the returned [`MemoryPlan`] tells the caller which levers to apply (residency / decode tiling /
-/// resolution) and whether the render fits at all.
+/// the returned [`MemoryPlan`] tells the caller which non-geometry levers to apply and whether the
+/// requested geometry fits at all.
 ///
 /// The pose branch's tier is **not** one of those levers (sc-15799): it is [`control_branch_tier`] of
 /// the base tier, so every peak below is estimated with the branch already at the tier it will actually
@@ -308,44 +306,41 @@ pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> 
     let levers = LaneLevers {
         text_resident_gib: text_resident_gib(inputs.base_tier),
         supports_sequential: inputs.supports_sequential,
-        resolution_scales: inputs.resolution_scales,
     };
     // Tier integrity: the branch follows the base tier, with the declared q4 → q8 floor. Same value the
     // loader packs to, so the estimate describes the configuration that will actually be resident.
     let branch_tier = control_branch_tier(inputs.base_tier);
 
-    plan_memory_adaptation(safe_gib, levers, |scale| {
-        // Scale the render dimensions; keep them multiple-of-16 legal (the DiT/VAE alignment) by
-        // flooring to the nearest 16 — the same alignment the pipeline validates.
-        let w = scale_render_dim(inputs.width, scale);
-        let h = scale_render_dim(inputs.height, scale);
+    plan_memory_adaptation(
+        safe_gib,
+        levers,
         StagePeaks {
             denoise_ex_text_gib: control_denoise_peak_ex_text_gib(
                 inputs.cfg,
                 inputs.branch_blocks,
                 inputs.base_tier,
                 branch_tier,
-                w,
-                h,
+                inputs.width,
+                inputs.height,
             ),
             decode_ex_text_gib: qwen_vae_decode_peak_ex_text_gib(
                 inputs.cfg,
                 inputs.branch_blocks,
                 inputs.base_tier,
                 branch_tier,
-                w,
-                h,
+                inputs.width,
+                inputs.height,
             ),
             decode_tiled_floor_ex_text_gib: Some(qwen_vae_decode_tiled_floor_ex_text_gib(
                 inputs.cfg,
                 inputs.branch_blocks,
                 inputs.base_tier,
                 branch_tier,
-                w,
-                h,
+                inputs.width,
+                inputs.height,
             )),
-        }
-    })
+        },
+    )
 }
 
 /// Map a base-DiT quant width to the [`Quant`] tier it names (`4 → Q4`, `8 → Q8`); any other width is
@@ -376,26 +371,8 @@ pub fn control_branch_quant_bits(base_bits: Option<i32>) -> Option<i32> {
     control_branch_tier(base_bits.and_then(tier_from_bits)).map(Quant::bits)
 }
 
-/// Candidate render-resolution scales for the LAST-RESORT resolution lever (sc-11749), largest-first.
-/// Full resolution (`1.0`) is always tried first by [`plan_control_resolution`], so a machine with
-/// headroom pays ZERO resolution cost; these are the fallbacks tried only when the un-tileable denoise
-/// activation peak is still over budget after residency + decode tiling + branch quant. `0.75²`/`0.5²`
-/// cut the activation area to ~56% / 25% — the sc-11750 ladder's resolution rung.
-const CONTROL_RESOLUTION_SCALES: [f64; 2] = [0.75, 0.5];
-
-/// Scale a render dimension by `scale` and floor to a legal multiple of 16 (the DiT/VAE patch/×8-VAE
-/// alignment [`crate::pipeline`] validates), never below one 16-px block.
-fn scale_render_dim(dim: u32, scale: f64) -> u32 {
-    (((dim as f64 * scale) as u32) / 16 * 16).max(16)
-}
-
-/// Decide the render resolution for the Krea control lane (sc-11749) — the render-time RESOLUTION lever,
-/// the LAST-RESORT rung of the sc-11750 escalation ladder (the only lever that costs image quality, so it
-/// engages only after the free/cheap ones). By the time this runs the cheaper levers are already applied:
-/// **Sequential residency** was selected at load (the worker fit-gate `apply_residency_policy`, epic
-/// 10834 — reflected here by `text_co_resident`), **branch quant** was decided at load (sc-11748 —
-/// reflected by `branch_tier`), and **decode tiling** engages right after (sc-11747). This returns the
-/// LARGEST 16-aligned resolution ≤ the requested one whose two shape-derived peaks both fit `safe_gib`:
+/// Test whether the requested render geometry fits after the non-geometry strategies have engaged.
+/// This is deliberately a predicate: it cannot return a substitute width or height.
 ///   * the **un-tileable DENOISE** activation peak — the sc-11749 target (candle #480's ~11 GiB @ 1024²);
 ///     resolution is the only lever that shrinks it once residency + branch quant are spent, and
 ///   * the **tiled Qwen-VAE DECODE** floor — the best the decode can reach at this resolution (decode
@@ -408,18 +385,10 @@ fn scale_render_dim(dim: u32, scale: f64) -> u32 {
 /// `Resident` path); under `Sequential` it was dropped before the heavy phase, matching the
 /// `*_ex_text_gib` estimators.
 ///
-/// - `Ok((width, height))` **unchanged** when the request already fits — the common case (a large-memory
-///   Mac, or a 32 GB Mac where residency + decode tiling suffice at full res per the sc-11847 calibration)
-///   — so a machine with headroom renders at exactly the requested size (the sc-11750 zero-overhead
-///   guarantee).
-/// - `Ok((w, h))` with a smaller 16-aligned size (aspect ratio preserved) when a reduction is forced.
-/// - `Err` when even the smallest scale is over budget — a **catchable** pre-render error (like the
-///   decode-tiling gate's), surfaced before the render rather than an OS/GPU kill mid-run.
-///
 /// `safe_gib` is injected ([`mlx_gen::memory::safe_budget_gib`] at the call site) so the decision is
 /// unit-testable without a device.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_control_resolution(
+pub fn control_geometry_fits(
     safe_gib: f64,
     cfg: &Krea2Config,
     branch_blocks: usize,
@@ -428,7 +397,7 @@ pub fn plan_control_resolution(
     width: u32,
     height: u32,
     text_co_resident: bool,
-) -> Result<(u32, u32)> {
+) -> bool {
     let text = if text_co_resident {
         text_resident_gib(base_tier)
     } else {
@@ -437,38 +406,35 @@ pub fn plan_control_resolution(
     // A resolution fits when BOTH the un-tileable denoise peak and the tiled decode floor (decode tiling
     // engages next, sc-11747) are within budget at that size — the text encoder counted only when it
     // stays co-resident (`Resident`; `Sequential` dropped it before the heavy phase).
-    let fits = |w: u32, h: u32| {
-        let denoise =
-            control_denoise_peak_ex_text_gib(cfg, branch_blocks, base_tier, branch_tier, w, h)
-                + text;
-        let decode = qwen_vae_decode_tiled_floor_ex_text_gib(
-            cfg,
-            branch_blocks,
-            base_tier,
-            branch_tier,
-            w,
-            h,
-        ) + text;
-        denoise <= safe_gib && decode <= safe_gib
-    };
-    // Full resolution first: a machine with headroom never reduces (the sc-11750 zero-overhead guarantee).
-    if fits(width, height) {
-        return Ok((width, height));
+    let denoise =
+        control_denoise_peak_ex_text_gib(cfg, branch_blocks, base_tier, branch_tier, width, height)
+            + text;
+    let decode = qwen_vae_decode_tiled_floor_ex_text_gib(
+        cfg,
+        branch_blocks,
+        base_tier,
+        branch_tier,
+        width,
+        height,
+    ) + text;
+    denoise <= safe_gib && decode <= safe_gib
+}
+
+/// Preserve the requested geometry on admission or return a typed refusal. This small seam pins the
+/// invariant independently of model weights: no feasibility decision can substitute dimensions.
+pub fn require_control_geometry(width: u32, height: u32, feasible: bool) -> Result<(u32, u32)> {
+    if feasible {
+        Ok((width, height))
+    } else {
+        Err(Error::GeometryRefused {
+            reason: "krea_2_turbo_control requested geometry exceeds the measured unified-memory \
+                     feasibility bound; no current verified alternative is available"
+                .to_owned(),
+            requested_width: width,
+            requested_height: height,
+            alternative: None,
+        })
     }
-    for &scale in &CONTROL_RESOLUTION_SCALES {
-        let (w, h) = (
-            scale_render_dim(width, scale),
-            scale_render_dim(height, scale),
-        );
-        if fits(w, h) {
-            return Ok((w, h));
-        }
-    }
-    Err(Error::Msg(format!(
-        "krea_2 control render at {width}×{height} exceeds the ~{safe_gib:.0} GiB unified-memory budget \
-         even at the smallest supported resolution (with the text encoder offloaded, the decode tiled, \
-         and the pose branch packed). Lower the output resolution or run on a Mac with more memory."
-    )))
 }
 
 #[cfg(test)]
@@ -476,8 +442,6 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core::mempolicy::Lever;
     use mlx_gen::OffloadPolicy;
-
-    const SCALES: [f64; 2] = [0.75, 0.5];
 
     fn inputs(base_tier: Option<Quant>) -> ControlLaneInputs<'static> {
         // `Krea2Config` is not `'static`; the tests build one and leak it once (test-only) so the
@@ -492,7 +456,6 @@ mod tests {
             width: 1024,
             height: 1024,
             supports_sequential: true,
-            resolution_scales: &SCALES,
         }
     }
 
@@ -549,7 +512,6 @@ mod tests {
         assert!(plan.engaged.is_empty(), "no lever on a big Mac: {plan:?}");
         assert_eq!(plan.residency, OffloadPolicy::Resident);
         assert!(!plan.tile_decode);
-        assert_eq!(plan.resolution_scale, 1.0);
         assert!(plan.feasible);
     }
 
@@ -608,17 +570,14 @@ mod tests {
         );
     }
 
-    /// Residency is tried before the quality-costing resolution lever: a mid budget engages the cheap
-    /// levers (residency/tiling) but keeps full resolution.
+    /// Only non-geometry strategies can appear in a memory plan.
     #[test]
-    fn keeps_full_resolution_until_forced() {
-        // 18 GiB fits with the cheap levers (proven above) → resolution must stay 1.0.
+    fn adaptation_plan_has_no_geometry_lever() {
         let plan = plan_control_adaptation(18.0, inputs(Some(Quant::Q4)));
-        assert_eq!(
-            plan.resolution_scale, 1.0,
-            "must not drop res prematurely: {plan:?}"
-        );
-        assert!(!plan.engaged.contains(&Lever::ResolutionReduction));
+        assert!(plan
+            .engaged
+            .iter()
+            .all(|lever| matches!(lever, Lever::SequentialResidency | Lever::VaeDecodeTiling)));
     }
 
     // ── sc-11747: the render-time decode-tiling gate (`plan_control_decode_tiling`). ───────────────
@@ -738,66 +697,21 @@ mod tests {
         );
     }
 
-    // ── sc-11749: the render-time resolution lever (`plan_control_resolution`). ─────────────────────
-
-    /// A large-memory Mac (or any budget above the full-res peaks) keeps the requested resolution — the
-    /// sc-11750 zero-overhead guarantee: no reduction, exact requested size returned.
     #[test]
-    fn resolution_lever_keeps_full_res_with_headroom() {
+    fn geometry_feasibility_checks_only_the_requested_shape() {
         let cfg = Krea2Config::turbo();
-        // 100 GiB dwarfs even the 1024² bf16 peaks → return the request unchanged.
-        assert_eq!(
-            plan_control_resolution(100.0, &cfg, 7, None, None, 1024, 1024, true).unwrap(),
-            (1024, 1024)
-        );
-        // And a q4 render on a 24 GiB (≈32 GB Mac) budget: the sc-11847 calibration has residency +
-        // decode tiling absorbing the 1024² peak, so resolution must NOT drop (text already offloaded).
-        assert_eq!(
-            plan_control_resolution(
-                24.0,
-                &cfg,
-                7,
-                Some(Quant::Q4),
-                Some(Quant::Q4),
-                1024,
-                1024,
-                false
-            )
-            .unwrap(),
-            (1024, 1024)
-        );
-    }
-
-    /// A budget just under the full-res DENOISE peak forces a reduction to a smaller 16-aligned scale.
-    /// NB (sc-11847): on measured MLX the peak is resident-weight-dominated, so the activation term this
-    /// lever shrinks is only ~1.9 GiB @ 1024² (NOT the ~11 GiB of the candle #480 CUDA profile the story
-    /// premise cited) — a WEAK lever. This test picks a budget in that narrow denoise-driven window; the
-    /// binding overage must be the (resolution-shrinkable) denoise activation, not the ~resolution-flat
-    /// decode floor, for a reduction to be reachable at all.
-    #[test]
-    fn resolution_lever_reduces_when_denoise_bound() {
-        let cfg = Krea2Config::turbo();
-        let dn_full =
-            control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), Some(Quant::Q4), 1024, 1024);
-        let dc_full = qwen_vae_decode_tiled_floor_ex_text_gib(
-            &cfg,
-            7,
-            Some(Quant::Q4),
-            Some(Quant::Q4),
-            1024,
-            1024,
-        );
-        // The reduction is only reachable when denoise (not the ~resolution-flat decode floor) is the
-        // binding peak — resolution can't shrink the decode floor. Guard that precondition.
-        assert!(
-            dn_full > dc_full,
-            "denoise must be the binding peak for a resolution reduction to help: {dn_full} vs {dc_full}"
-        );
-        // Just under the full-res denoise peak (and above the decode floor + the smaller-scale denoise):
-        // full res fails on denoise, a smaller scale fits.
-        let safe = dn_full - 0.01;
-        let (w, h) = plan_control_resolution(
-            safe,
+        let full_peak =
+            control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), Some(Quant::Q4), 1024, 1024)
+                .max(qwen_vae_decode_tiled_floor_ex_text_gib(
+                    &cfg,
+                    7,
+                    Some(Quant::Q4),
+                    Some(Quant::Q4),
+                    1024,
+                    1024,
+                ));
+        assert!(control_geometry_fits(
+            full_peak,
             &cfg,
             7,
             Some(Quant::Q4),
@@ -805,96 +719,34 @@ mod tests {
             1024,
             1024,
             false,
-        )
-        .unwrap();
-        assert!(
-            w < 1024 && h < 1024,
-            "a denoise-bound over-budget render must reduce resolution: got {w}×{h}"
-        );
-        assert!(
-            w % 16 == 0 && h % 16 == 0,
-            "reduced dims must stay 16-aligned"
-        );
-    }
-
-    /// Co-resident text (the `Resident` path) raises BOTH peaks — proving `text_co_resident` is wired.
-    /// And it documents the lever's real MLX limit: the ~2+ GiB text term is resolution-INDEPENDENT and
-    /// exceeds the max activation the resolution lever can recover (~1.4 GiB, 1024²→512²), so a budget
-    /// that fits full-res under `Sequential` (text dropped) is INFEASIBLE under `Resident` — this lever
-    /// can't rescue co-resident text; only Sequential residency (selected upstream by the worker fit-gate)
-    /// can. The resolution lever therefore targets the activation/decode overage that survives residency.
-    #[test]
-    fn resolution_lever_counts_coresident_text_but_cannot_rescue_it() {
-        let cfg = Krea2Config::turbo();
-        let dn =
-            control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), Some(Quant::Q4), 1024, 1024);
-        let dc = qwen_vae_decode_tiled_floor_ex_text_gib(
+        ));
+        assert!(!control_geometry_fits(
+            full_peak - 0.01,
             &cfg,
             7,
             Some(Quant::Q4),
             Some(Quant::Q4),
             1024,
             1024,
-        );
-        // Just above the full-res ex-text peaks: fits with text dropped (Sequential), not with it resident.
-        let safe = dn.max(dc) + 0.25;
-        // Sequential (text dropped) → full res fits, no reduction.
+            false,
+        ));
+    }
+
+    #[test]
+    fn admitted_geometry_is_exactly_the_requested_geometry_or_typed_refusal() {
         assert_eq!(
-            plan_control_resolution(
-                safe,
-                &cfg,
-                7,
-                Some(Quant::Q4),
-                Some(Quant::Q4),
-                1024,
-                1024,
-                false
-            )
-            .unwrap(),
-            (1024, 1024)
+            require_control_geometry(1024, 768, true).unwrap(),
+            (1024, 768)
         );
-        // Resident (text co-resident) → the resolution-flat ~2 GiB text term is over budget at EVERY
-        // scale (resolution can't shrink it), so this is infeasible — the fix is Sequential, upstream.
-        assert!(
-            plan_control_resolution(safe, &cfg, 7, Some(Quant::Q4), Some(Quant::Q4), 1024, 1024, true)
-                .is_err(),
-            "co-resident text can't be rescued by resolution — needs Sequential residency (upstream)"
-        );
-    }
-
-    /// A budget below even the smallest scale's floor → a catchable, tagged `Err` before the render, not
-    /// an OS/GPU kill mid-run (mirrors the decode-tiling gate's infeasible path).
-    #[test]
-    fn resolution_lever_errs_when_infeasible() {
-        let cfg = Krea2Config::turbo();
-        let err = plan_control_resolution(
-            1.0,
-            &cfg,
-            7,
-            Some(Quant::Q4),
-            Some(Quant::Q4),
-            1024,
-            1024,
-            true,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("krea_2 control render") && err.contains("resolution"),
-            "over-budget render must surface a catchable, tagged error: {err}"
-        );
-    }
-
-    /// The reduced dims stay legal multiples of `RES_MULTIPLE` (16) for a non-square, odd-multiple
-    /// request — the pipeline's `validate_multiple_of` must never trip on a resolution-lever output.
-    #[test]
-    fn resolution_lever_output_is_16_aligned() {
-        assert_eq!(scale_render_dim(1024, 0.75), 768);
-        assert_eq!(scale_render_dim(1024, 0.5), 512);
-        // A non-multiple-of-16 scaled value floors DOWN to the nearest 16 (e.g. 720·0.75 = 540 → 528).
-        assert_eq!(scale_render_dim(720, 0.75), 528);
-        assert_eq!(scale_render_dim(720, 0.75) % 16, 0);
-        // Never below one 16-px block.
-        assert_eq!(scale_render_dim(16, 0.5), 16);
+        let error = require_control_geometry(1024, 768, false).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GeometryRefused {
+                requested_width: 1024,
+                requested_height: 768,
+                alternative: None,
+                ..
+            }
+        ));
     }
 }

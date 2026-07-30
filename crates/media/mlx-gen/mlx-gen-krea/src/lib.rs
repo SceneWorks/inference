@@ -66,7 +66,9 @@ pub mod vae;
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
 pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};
-pub use memory::{plan_control_adaptation, ControlLaneInputs};
+pub use memory::{
+    control_geometry_fits, plan_control_adaptation, require_control_geometry, ControlLaneInputs,
+};
 pub use model::{
     descriptor, edit_descriptor, load, load_edit, load_from_native_dit_file, load_raw,
     load_turbo_edit, raw_descriptor, turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID,
