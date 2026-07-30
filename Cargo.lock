@@ -3123,6 +3123,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen-ios-catalog",
  "mlx-llm",
+ "pmetal-mlx-rs",
  "runtime-catalog",
 ]
 

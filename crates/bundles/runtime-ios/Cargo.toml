@@ -9,6 +9,10 @@ repository = "https://github.com/SceneWorks/inference"
 [dependencies]
 runtime-catalog = { workspace = true }
 mlx-llm = { workspace = true }
+# For `bound_mlx_to_platform_limits`. This bundle is the only place that knows BOTH that the backend
+# is MLX and that the platform caps a process well below device RAM, so it is the only place that can
+# reconcile the two — and doing so needs MLX's memory API directly, not through an engine crate.
+mlx-rs = { workspace = true }
 
 # The iOS image lane (E5). NOT `mlx-gen-catalog`: that composes 32 provider crates including the
 # video families (wan, ltx, mochi, svd), none validated on iOS and none shaped for a device with a
