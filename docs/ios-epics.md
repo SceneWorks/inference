@@ -385,7 +385,7 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 | Story | Notes |
 |---|---|
 | S5.1 SANA on device | **Mac-side done** — composition, surface tests, and the `aarch64-apple-ios` cross-compile all green. The device half is Session A. |
-| S5.2 Memory residency | **BLOCKED — measured, does not fit.** See the table below. Needs a smaller text encoder before anything else is worth trying. |
+| S5.2 Memory residency | **Mac-side DONE — fits 8 GB, tightly.** `Residency::run_staged` sheds the Q4 trunk before decode (−1905 MiB) and the now-working tiled decode bounds the DC-AE transient: 1024px at 3294 MiB, 512px at 3453, both inside a 4096 MiB budget at 80–85% (56–78% of a 12 GB device's). Peak verified count-independent; Resident/Sequential byte-parity and repeat-job bounding re-verified on real weights. Device confirmation is Session A, and at 8 GB it is the *deciding* measurement, not a formality. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
 | S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
 | S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. Enforced like E4's thresholds. |
@@ -716,16 +716,35 @@ was live underneath the ~3.5 GB decode transient — which is the whole story of
 `run_staged`'s `materialize_mid` hook is *literally* `release_denoise_graph`: this branch rebuilt one
 piece of a seam whose other half was already there.
 
-**Both levers, measured** (Q4 + Q4 embedding, sequential, 4 steps):
+**Both levers, measured** (Q4 + Q4 embedding, sequential, 4 steps, count 1):
 
-| | before | after `run_staged` | + tiling | budget |
+| | before | after `run_staged` | + tiling | vs 4 GB cap |
 |---|---:|---:|---:|---|
-| 512px | 6678 MiB | **4773 MiB** | — | 78% of 6 GB |
-| 1024px | — | 9177 MiB | **3465 MiB** (256px tiles) | 56% of 6 GB |
-| 1024px | — | — | **3294 MiB** (128px tiles) | 80% of 4 GB |
+| 512px | 6678 MiB | **4773 MiB** | **3453 MiB** (256px tiles) | 84% |
+| 1024px | — | 9177 MiB | **3465 MiB** (256px tiles) | 85% |
+| 1024px | — | — | **3294 MiB** (128px tiles) | 80% |
 
 The DiT drop is worth **1905 MiB**, almost exactly the trunk. `Decoding` now begins at **0 MiB
 active** where it began at 2173.
+
+**Read those as TIGHT, not comfortable.** 80–85% of an 8 GB device's cap is what the harness itself
+tags `TIGHT`, and `set_memory_limit` is backpressure while jetsam is a kill — so fitting the budget
+proves the working set fits, not that iOS lets the app live. On a 12 GB device (~6 GB cap) the same
+configurations sit at 56–78%, which is the comfortable case.
+
+**Peak is essentially count-independent, which had to be checked rather than assumed.** The staged
+change reordered the count loop to denoise every seed before anything decodes, so phase C now runs N
+decodes back-to-back in one scope where the old code interleaved them — and a decode transient is
+the largest allocation in the request. Measured with `--count`:
+
+| config | count 1 | count 3 |
+|---|---:|---:|
+| 1024px, 128px tiles | 3294 | 3295 |
+| 512px, 256px tiles | 3453 | 3538 |
+| 512px, untiled | 4773 | 5129 |
+
+The tiled paths are flat because `tiled_decode`'s per-tile `eval` bounds the graph; untiled 512px
+grows +356 MiB across three images and still fits. Nothing stacks.
 
 **1024px at 128px tiles lands on 3294 MiB, which is the denoise peak.** SANA is now denoise-bound,
 not decode-bound: further decode tiling buys nothing. This inverts the §"two independent problems"
@@ -752,6 +771,7 @@ decode exactly, and does (max |Δ| = 0).
 **§0.1's guardrail survives after all.** Every configuration above fits a 4096 MiB budget — an 8 GB
 device — so SANA does not need to be restricted to 12 GB hardware. The earlier "12 GB only"
 recommendation is withdrawn; it was written against a peak that assumed the trunk stayed resident.
+The 8 GB case is tight enough that the device session decides it, not the host harness.
 
 **Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
 tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's

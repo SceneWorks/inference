@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p mlx-gen-ios-catalog --example image_budget -- <snapshot_dir>
-//!     [--budget-mib N] [--steps N] [--size N] [--resident-only]
+//!     [--budget-mib N] [--steps N] [--size N] [--count N] [--resident-only]
 //! ```
 //!
 //! The media counterpart to `mlx-llm`'s `memory_budget`, and the reason it exists separately: a
@@ -55,6 +55,7 @@ fn measure(
     policy: OffloadPolicy,
     size: u32,
     steps: u32,
+    count: u32,
     label: &str,
 ) -> Result<(usize, f64), Box<dyn std::error::Error>> {
     println!("\n{label}");
@@ -79,7 +80,7 @@ fn measure(
         prompt: "a lighthouse on a rocky coast at dawn".to_string(),
         width: size,
         height: size,
-        count: 1,
+        count,
         steps: Some(steps),
         seed: Some(0),
         ..Default::default()
@@ -144,11 +145,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = args
         .next()
-        .ok_or("usage: image_budget <snapshot_dir> [--budget-mib N] [--steps N] [--size N] [--resident-only]")?;
+        .ok_or("usage: image_budget <snapshot_dir> [--budget-mib N] [--steps N] [--size N] [--count N] [--resident-only]")?;
 
     let mut budget_mib = DEFAULT_BUDGET_MIB;
     let mut steps = 4u32; // SANA is few-step; 4 exercises the loop without dominating the runtime.
     let mut size = 1024u32;
+    // Not cosmetic. Since the staged-decode change the count loop denoises EVERY seed before
+    // anything decodes (so the trunk is shed once for the batch), which means phase C now runs N
+    // decodes back-to-back inside one scope. A decode transient is the largest allocation in the
+    // request, so whether two of them can be live at once is the difference between the published
+    // peak holding for `count > 1` and not.
+    let mut count = 1u32;
     let mut resident_only = false;
     let mut sequential_only = false;
     let mut no_cache = false;
@@ -159,6 +166,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--steps" => steps = args.next().ok_or("--steps needs a value")?.parse()?,
             "--size" => size = args.next().ok_or("--size needs a value")?.parse()?,
+            "--count" => count = args.next().ok_or("--count needs a value")?.parse()?,
             "--resident-only" => resident_only = true,
             // Skip the resident pass. The two runs share a process, and MLX's peak is a
             // high-water mark, so a resident peak measured first masks any sequential improvement.
@@ -178,7 +186,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let budget_bytes = budget_mib * 1024 * 1024;
     println!(
         "iOS image-generation budget\n  budget {budget_mib} MiB ({:.1} GiB) -- an 8 GB device's \
-         cap unless overridden\n  {size}px, {steps} steps",
+         cap unless overridden\n  {size}px, {steps} steps, count {count}",
         budget_mib as f64 / 1024.0
     );
     memory::set_memory_limit(budget_bytes);
@@ -195,6 +203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             OffloadPolicy::Resident,
             size,
             steps,
+            count,
             "RESIDENT (all components co-resident)",
         )?
     };
@@ -207,7 +216,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             OffloadPolicy::Sequential,
             size,
             steps,
-            "SEQUENTIAL (encode -> drop encoder -> denoise -> decode)",
+            count,
+            "SEQUENTIAL (encode -> drop encoder -> denoise -> shed DiT -> decode)",
         )?)
     };
 
