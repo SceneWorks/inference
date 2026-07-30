@@ -190,7 +190,9 @@ mod tests {
         opt.step(&mut params, &grads).unwrap();
         opt.step(&mut params, &grads).unwrap();
 
-        let dir = std::env::temp_dir().join("mlxgen_resume_bundle_test");
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let dir =
+            std::env::temp_dir().join(format!("mlxgen_resume_bundle_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stem = "swatch";
         save_resume(&dir, stem, 4, 2, &opt, &params).unwrap();
@@ -237,7 +239,10 @@ mod tests {
         let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
         opt.set_lr_scaled(1.0);
         opt.step(&mut params, &grads).unwrap();
-        let dir = std::env::temp_dir().join("mlxgen_resume_mismatch_test");
+        let dir = std::env::temp_dir().join(format!(
+            "mlxgen_resume_mismatch_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         save_resume(&dir, "s", 1, 1, &opt, &params).unwrap();
         let (found, _) = find_latest_resume(&dir, "s").unwrap();
@@ -253,7 +258,10 @@ mod tests {
     /// them: a lookup for the base stem must NOT match a suffixed expert's snapshot (F-125 / sc-9651).
     #[test]
     fn find_latest_resume_isolates_per_expert_stems() {
-        let dir = std::env::temp_dir().join("mlxgen_resume_isolation_test");
+        let dir = std::env::temp_dir().join(format!(
+            "mlxgen_resume_isolation_test_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let one = |v: f32| -> LoraParams {

@@ -84,7 +84,7 @@ fn max_abs_diff(a: &mlx_rs::Array, b: &mlx_rs::Array) -> f32 {
 }
 
 fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
-    let tmp = std::env::temp_dir().join(format!("mage_trainer_e2e_{tag}"));
+    let tmp = std::env::temp_dir().join(format!("mage_trainer_e2e_{tag}_{}", std::process::id()));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_mage::provider_registry()
@@ -236,7 +236,7 @@ fn mage_lokr_trains_writes_adapter_and_reloads() {
 #[test]
 #[ignore = "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT); renders previews"]
 fn mage_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("mage_trainer_e2e_samples");
+    let tmp = std::env::temp_dir().join(format!("mage_trainer_e2e_samples_{}", std::process::id()));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_mage::provider_registry()
@@ -321,7 +321,7 @@ fn mage_trainer_emits_preview_samples() {
 fn mage_lora_reload_changes_generated_image() {
     use mlx_gen_mage::{resolve_gs_key, GenerationSample, MageFlowPipeline};
 
-    let tmp = std::env::temp_dir().join("mage_trainer_e2e_render");
+    let tmp = std::env::temp_dir().join(format!("mage_trainer_e2e_render_{}", std::process::id()));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_mage::provider_registry()

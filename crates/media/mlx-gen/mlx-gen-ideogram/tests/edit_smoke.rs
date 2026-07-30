@@ -118,7 +118,7 @@ fn img2img_smoke() {
         )
         .expect("img2img generate");
     let px = assert_valid(&img, h, w);
-    let out = std::env::temp_dir().join("ideogram4_img2img.png");
+    let out = std::env::temp_dir().join(format!("ideogram4_img2img_{}.png", std::process::id()));
     image::RgbImage::from_raw(w, h, px)
         .unwrap()
         .save(&out)
@@ -187,7 +187,10 @@ fn inpaint_mask_routes_keep_vs_repaint() {
     );
 
     for (tag, px) in [("keep_all", &keep_all), ("repaint_all", &repaint_all)] {
-        let out = std::env::temp_dir().join(format!("ideogram4_inpaint_{tag}.png"));
+        let out = std::env::temp_dir().join(format!(
+            "ideogram4_inpaint_{tag}_{}.png",
+            std::process::id()
+        ));
         image::RgbImage::from_raw(w, h, px.clone())
             .unwrap()
             .save(&out)

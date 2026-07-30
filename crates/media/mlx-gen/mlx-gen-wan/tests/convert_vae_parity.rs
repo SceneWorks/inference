@@ -47,7 +47,10 @@ fn ti2v_5b_vae_convert_matches_golden() {
         source.display()
     );
 
-    let out = std::env::temp_dir().join("mlx_gen_wan_vae_parity.safetensors");
+    let out = std::env::temp_dir().join(format!(
+        "mlx_gen_wan_vae_parity_{}.safetensors",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&out);
     eprintln!("converting {} → {}", source.display(), out.display());
 

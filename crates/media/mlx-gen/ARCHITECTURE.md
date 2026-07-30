@@ -78,6 +78,9 @@ carries an explicit remap in its `from_weights`. Today the Z-Image block keys al
   real structural bug diverges by orders of magnitude.
 - **Single-threaded harness.** `.cargo/config.toml` sets `RUST_TEST_THREADS=1`: MLX's shared
   default Metal device is not thread-safe and SIGSEGVs under cargo's parallel harness.
+- **Process-unique temp fixtures.** The single-threaded harness serializes tests *within* one
+  invocation only. Two concurrent `cargo test` processes share one `$TMPDIR`, so any temp fixture
+  path must carry `std::process::id()` or the two runs clobber each other (sc-16057).
 
 ## CI
 GitHub Actions (`.github/workflows/ci.yml`), two lanes:

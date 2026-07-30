@@ -317,7 +317,9 @@ mod tests {
 
     #[test]
     fn round_trip_file_with_metadata() {
-        let dir = std::env::temp_dir().join("mlx_gen_weights_test");
+        // Per-process scratch dir (matching `mlx_gen_appledouble_{pid}` below) — a fixed `$TMPDIR`
+        // name races a second concurrent `cargo test`.
+        let dir = std::env::temp_dir().join(format!("mlx_gen_weights_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("w.safetensors");
 

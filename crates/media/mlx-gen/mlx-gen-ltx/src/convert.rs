@@ -807,8 +807,12 @@ mod tests {
 
     /// Write tensors to a unique temp safetensors file and return its path.
     fn write_tmp(entries: &[(&str, Array)]) -> PathBuf {
+        // `tag` separates the cases within a run; the pid separates two *concurrent* `cargo test`
+        // processes, which share `$TMPDIR` and would otherwise rewrite each other's fixture.
         let tag: usize = entries.iter().map(|(k, _)| k.len()).sum::<usize>() + entries.len();
-        let path = std::env::temp_dir().join(format!("mlx_gen_ltx_convert_test_{tag}.safetensors"));
+        let pid = std::process::id();
+        let path =
+            std::env::temp_dir().join(format!("mlx_gen_ltx_convert_test_{tag}_{pid}.safetensors"));
         Array::save_safetensors(
             entries.iter().map(|(k, v)| (*k, v)),
             None::<&HashMap<String, String>>,

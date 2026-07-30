@@ -112,7 +112,10 @@ fn profile_footprint() {
         "[{label}] degenerate image — quant broke the forward"
     );
 
-    let out_path = std::env::temp_dir().join(format!("ideogram4_{label}_{res}.png"));
+    let out_path = std::env::temp_dir().join(format!(
+        "ideogram4_{label}_{res}_{}.png",
+        std::process::id()
+    ));
     image::RgbImage::from_raw(res, res, im.pixels.clone())
         .unwrap()
         .save(&out_path)

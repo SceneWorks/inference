@@ -1315,7 +1315,9 @@ mod tests {
         TrainingRequest {
             items,
             config,
-            output_dir: std::env::temp_dir().join("mage_trainer_unit"),
+            // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+            output_dir: std::env::temp_dir()
+                .join(format!("mage_trainer_unit_{}", std::process::id())),
             file_name: "lora.safetensors".to_string(),
             trigger_words: vec![],
             cancel: CancelFlag::new(),

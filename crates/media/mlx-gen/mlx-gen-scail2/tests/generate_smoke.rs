@@ -79,8 +79,15 @@ fn color_mask(w: usize, h: usize, split: usize) -> Image {
 #[test]
 fn missing_reference_errors() {
     // load() only needs an existing dir (config.json is optional → defaults). The conditioning
-    // extraction runs before any weight load, so an empty request fails fast.
-    let spec = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
+    // extraction runs before any weight load, so an empty request fails fast. Use a per-process
+    // empty dir rather than the shared `$TMPDIR` itself, so nothing another concurrent `cargo test`
+    // process leaves lying around is ever inside this provider's weights root.
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_scail2_empty_weights_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = LoadSpec::new(WeightsSource::Dir(dir));
     let gen = mlx_gen_scail2::provider_registry()
         .unwrap()
         .load(MODEL_ID, &spec)

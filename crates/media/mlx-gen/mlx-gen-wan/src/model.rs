@@ -1962,11 +1962,15 @@ mod tests {
 
     // ---- sc-12459: `dit_resident_bytes` shard-dir sizing must match `Weights::from_dir` ----------
 
-    /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
-    /// forced repo-wide, so no cross-test races on the shared temp root).
+    /// A fresh, empty scratch dir for one sizing test (recreated per run).
+    ///
+    /// Keyed by pid as well as `name`: `RUST_TEST_THREADS=1` only serializes tests *within* one
+    /// invocation, so it rules out cross-*test* races but not cross-*process* ones — two concurrent
+    /// `cargo test` runs on the same machine share `$TMPDIR`, and the `remove_dir_all` below would
+    /// then delete the other run's fixtures mid-test.
     fn sizing_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir()
-            .join("mlx_gen_wan_dit_sizing")
+            .join(format!("mlx_gen_wan_dit_sizing_{}", std::process::id()))
             .join(name);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -2057,7 +2061,11 @@ mod tests {
     }
 
     fn tmp_dir() -> PathBuf {
-        let d = std::env::temp_dir().join("mlx_gen_wan_model_site_test");
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let d = std::env::temp_dir().join(format!(
+            "mlx_gen_wan_model_site_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
