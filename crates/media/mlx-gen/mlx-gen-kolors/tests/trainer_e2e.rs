@@ -141,7 +141,7 @@ fn run_cfg(
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_trainer_trains_and_writes_lora_that_reloads() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_lora_e2e");
+    let tmp = std::env::temp_dir().join(format!("kolors_trainer_lora_e2e_{}", std::process::id()));
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora);
 
     // The produced adapter carries PEFT keys under the diffusers-UNet prefix + reload metadata.
@@ -182,7 +182,7 @@ fn kolors_trainer_trains_and_writes_lora_that_reloads() {
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_trainer_trains_and_writes_lokr_that_reloads() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_lokr_e2e");
+    let tmp = std::env::temp_dir().join(format!("kolors_trainer_lokr_e2e_{}", std::process::id()));
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr);
 
     let w = Weights::from_file(&adapter_path).unwrap();
@@ -222,7 +222,7 @@ fn kolors_trainer_trains_and_writes_lokr_that_reloads() {
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_trainer_gradient_checkpointing_converges() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_gc_e2e");
+    let tmp = std::env::temp_dir().join(format!("kolors_trainer_gc_e2e_{}", std::process::id()));
     let (losses, steps, adapter_path) = run_cfg(
         &tmp,
         "swatch_lora_gc.safetensors",
@@ -284,7 +284,8 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 #[test]
 #[ignore = "needs real Kolors weights (+ tokenizer.json overlay)"]
 fn kolors_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_samples_e2e");
+    let tmp =
+        std::env::temp_dir().join(format!("kolors_trainer_samples_e2e_{}", std::process::id()));
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_kolors::MODEL_ID, "kolors");
     let mut trainer = mlx_gen_kolors::provider_registry()

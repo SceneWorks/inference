@@ -45,7 +45,8 @@ fn assemble_real_bernini_renderer() {
         base.display()
     );
 
-    let out = std::env::temp_dir().join("bernini_renderer_mlx_test");
+    let out =
+        std::env::temp_dir().join(format!("bernini_renderer_mlx_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     assemble_bernini_renderer_snapshot(&out, &pkg, &base, None, true).expect("assemble");
 
