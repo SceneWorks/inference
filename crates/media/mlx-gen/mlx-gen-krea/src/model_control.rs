@@ -318,8 +318,7 @@ impl KreaTurboControl {
                     req.height,
                     text_co_resident,
                 );
-                let (render_width, render_height) =
-                    crate::memory::require_control_geometry(req.width, req.height, feasible)?;
+                crate::memory::require_control_geometry(req.width, req.height, feasible)?;
 
                 // Budget-gated decode tiling (sc-11747): estimate the Qwen-VAE decode peak from this
                 // render's shape + the resident-weight footprint (base tier + pose branch tier) and, if it
@@ -333,26 +332,24 @@ impl KreaTurboControl {
                     heavy.branch.num_blocks(),
                     heavy_owned.base_tier,
                     heavy_owned.branch_tier,
-                    render_width,
-                    render_height,
+                    req.width,
+                    req.height,
                     text_co_resident,
                 )?;
 
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
                 // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
-                let plan = heavy.heavy.prepare_control(
-                    &context,
-                    control_image,
-                    render_width,
-                    render_height,
-                )?;
+                let plan =
+                    heavy
+                        .heavy
+                        .prepare_control(&context, control_image, req.width, req.height)?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
-                        width: render_width,
-                        height: render_height,
+                        width: req.width,
+                        height: req.height,
                         steps,
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),
@@ -423,11 +420,13 @@ mod tests {
         let path = &source[start..end];
         assert!(path
             .contains("crate::memory::require_control_geometry(req.width, req.height, feasible)?"));
+        assert!(
+            !path.contains("render_width") && !path.contains("render_height"),
+            "the admitted path must not introduce substitutable geometry variables"
+        );
+        assert!(path.contains(".prepare_control(&context, control_image, req.width, req.height)?"));
         assert!(path.contains(
-            "heavy.heavy.prepare_control(\n                    &context,\n                    control_image,\n                    render_width,\n                    render_height,"
-        ));
-        assert!(path.contains(
-            "let opts = TurboOptions {\n                        width: render_width,\n                        height: render_height,"
+            "let opts = TurboOptions {\n                        width: req.width,\n                        height: req.height,"
         ));
     }
 

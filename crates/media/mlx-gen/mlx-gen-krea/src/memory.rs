@@ -420,11 +420,11 @@ pub fn control_geometry_fits(
     denoise <= safe_gib && decode <= safe_gib
 }
 
-/// Preserve the requested geometry on admission or return a typed refusal. This small seam pins the
-/// invariant independently of model weights: no feasibility decision can substitute dimensions.
-pub fn require_control_geometry(width: u32, height: u32, feasible: bool) -> Result<(u32, u32)> {
+/// Admit the requested geometry or return a typed refusal. This seam intentionally returns no
+/// replacement dimensions: after admission, the render path must use the immutable request fields.
+pub fn require_control_geometry(width: u32, height: u32, feasible: bool) -> Result<()> {
     if feasible {
-        Ok((width, height))
+        Ok(())
     } else {
         Err(Error::GeometryRefused {
             reason: "krea_2_turbo_control requested geometry exceeds the measured unified-memory \
@@ -734,10 +734,7 @@ mod tests {
 
     #[test]
     fn admitted_geometry_is_exactly_the_requested_geometry_or_typed_refusal() {
-        assert_eq!(
-            require_control_geometry(1024, 768, true).unwrap(),
-            (1024, 768)
-        );
+        require_control_geometry(1024, 768, true).unwrap();
         let error = require_control_geometry(1024, 768, false).unwrap_err();
         assert!(matches!(
             error,
