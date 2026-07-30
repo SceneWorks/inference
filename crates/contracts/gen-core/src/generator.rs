@@ -1553,14 +1553,14 @@ pub struct Capabilities {
     /// [`Conditioning::Control`] at all.
     ///
     /// `Default` is [`AcceptedControlKinds::Any`], matching
-    /// [`ControlBranch::accepted_control_kinds`]'s own default, so no existing
+    /// [`crate::control::ControlBranch::accepted_control_kinds`]'s own default, so no existing
     /// descriptor changes meaning. A single-signal branch advertises its
     /// restriction here as well as overriding the trait method — Qwen-Image v1 is
     /// `Only([Pose])`.
     ///
     /// # Why duplicate the trait method
     ///
-    /// [`ControlBranch::accepted_control_kinds`] takes `&self` on a **loaded**
+    /// [`crate::control::ControlBranch::accepted_control_kinds`] takes `&self` on a **loaded**
     /// generator, so the accepted set is unknowable until the weights are in
     /// memory. That makes "is this control kind acceptable?" a question no
     /// weights-free consumer can ask, and a caller that wants to reject a bad
