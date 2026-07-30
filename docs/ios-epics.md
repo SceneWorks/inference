@@ -391,6 +391,58 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 | S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
 | S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. Enforced like E4's thresholds. |
 
+### Z-Image-Turbo renders on device — and the four kills were a platform bug (2026-07-30)
+
+**A second image model runs on iPhone.** Z-Image-Turbo q4, 1024×1024, on the iPhone 17 Pro Max:
+
+```text
+1024px full ladder (rung 4 w=1): 229.1s, MLX peak 2901 MiB,
+process RSS peak 832 MiB, 6063 MiB still available, pixel range 0..255
+```
+
+It was jetsam-killed four times first, and the diagnosis went through two wrong answers worth
+recording, because both were reached from real measurements.
+
+**Wrong answer 1 — "not a memory failure."** The host ran the identical path to completion at
+3102 MiB, so the kill looked like a platform-path fault (the E1 `mlx_qqmm` pattern). The device log
+settled it the other way: `killed by jetsam reason per-process-limit`. It *was* a footprint kill.
+
+**Wrong answer 2 — "the bounded configuration never engaged."** The trace showed ~102 MiB of
+footprint at decode entry and then a >6 GB excursion, which is the shape of this VAE's ~14 GiB
+*untiled* 1024² transient. Plausible, and false: instrumenting the resolved plan showed the device
+running `TILED edge=256 overlap=64`, exactly as asked, with 24 of 25 tiles materialized and MLX peak
+plateaued at 2901 MiB against the host's 3102. **The decode was correct and bounded the entire
+time.**
+
+**Actual cause — MLX's limits are sized from device RAM, not from the jetsam cap.** The device
+reported `memory_limit=11109 MiB, cache_limit=11109 MiB` against an `os_proc_available_memory` of
+6014 MiB. MLX's backpressure threshold sat at a value the process can never reach, so its buffer
+reuse cache grew unbounded and returned nothing to the OS. `active + cache` was conserved at
+**6068 MiB** across every sample — the cache absorbing exactly what active released — leaving 4 MiB
+of headroom for the whole decode. The next transient over that killed it.
+
+Binding both limits to `os_proc_available_memory` (live to 85%, cache to min(25%, 1 GiB)) fixes it:
+
+| | killed | passing |
+|---|---:|---:|
+| min available | 4 MiB | **2146 MiB** |
+| max buffer cache | 5864 MiB | **1070 MiB** |
+| max active | 2901 MiB | 2901 MiB |
+| tiles completed | 24/25 | **25/25** |
+
+Max active is *identical*. Nothing about the model or the ladder changed.
+
+**Scope: this is not a Z-Image finding.** It affects every MLX model on iOS, and it retires the
+admission test used throughout this document — see the S5.2 correction below. Z-Image was simply the
+first model whose working set was large enough to expose it. SANA passed despite the cache, not
+because of it.
+
+**Still open.** 229 s is ~14× the host's 15.9 s, with the 4-step denoise accounting for ~190 s.
+Bounding the cache did not cause it (the killed runs were also ~200 s), and it is a separate
+investigation — z-image on iOS is a *fit* result, not yet a *usable* one. Catalog inclusion
+(`mlx-gen-ios-catalog` is deliberately SANA-only) remains a separate decision and is not implied by
+this.
+
 ### Measured: SANA does not fit an 8 GB device (2026-07-30)
 
 `cargo run --release -p mlx-gen-ios-catalog --example image_budget -- <q4-snapshot>` against a
