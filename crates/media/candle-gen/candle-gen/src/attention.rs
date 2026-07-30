@@ -29,14 +29,70 @@
 //! composable `softmax(_, D::Minus1)` (grad-carrying, used by the trainers), the fused `softmax_last_dim`,
 //! or an f32-upcast variant — unchanged. The helpers only wrap the scores matmul + softmax + value matmul
 //! in the budgeted query-row chunking; the numerics of a single block are exactly the caller's.
+//!
+//! ## The boundaries come from the shared rung-3 planner (SC-15796)
+//!
+//! Rung 3 of the SC-15448 memory ladder splits into a backend-neutral **planner** — measured budgets
+//! plus pure arithmetic, no tensors — and a genuinely per-backend **kernel**. The planner lives in
+//! [`gen_core::attention_budget`]; SC-15793 hoisted it there and made `mlx_gen::attention` a shim over
+//! it, and this module is the candle half. This module's `query_block` is now a pure delegation to
+//! [`AttentionBudget::query_block_rows`] and applies no arithmetic of its own, so a budget
+//! published as `strategyParameters.chunkedAttention.attentionChunkSize` names the **same** chunking on
+//! both backends and the epic's per-backend calibration evidence is comparable rather than two
+//! coincidentally-equal literals.
+//!
+//! The public `sdpa_budgeted_*` signatures still take a plain `budget: usize`, so the ~20 consumer
+//! crates need no edits — only `query_block`'s body moved.
+//!
+//! The kernels must NOT merge, and that is measured rather than assumed: candle's `attention_basic`
+//! **materializes** `[B,H,Sq,Sk]`, so bounding it is worth **−32%** on the Z-Image denoise phase
+//! (8.394 → 5.709 GB, SC-15256), while MLX's fused SDPA never builds that tensor and the same rung is
+//! worth **−1.7%** on its denoise phase (SC-15615). One planner, two kernels roughly an order of
+//! magnitude apart in value; neither magnitude may be inferred from the other.
+//!
+//! ## Why this module does not take [`gen_core::attention_budget::AttentionPlan`]
+//!
+//! gen-core pairs the budget with a cancel flag in `AttentionPlan` because a bounded call splits one
+//! previously atomic kernel launch into N, and those boundaries are the only place a cancel can land
+//! *inside* a transformer forward. That shape is deliberately **not** carried across here yet, for
+//! reasons that are candle's own rather than inherited from the MLX twin:
+//!
+//! - **Candle's cancellation lands outside the forward, at three sites that already exist.** Per denoise
+//!   step in [`crate::sampler`] (`run_flow_sampler` and the DPM/ancestral run loops each test
+//!   `cancel.is_cancelled()` before the model eval), per decode tile through [`crate::check_cancel`]
+//!   inside the [`crate::vae_tiling`] callback, and per load phase in [`crate::residency`]. All three
+//!   raise [`crate::CandleError::Canceled`], which the `From` bridge lifts to `gen_core::Error::Canceled`
+//!   — a *cancelled* job, not a failed one (sc-4481).
+//! - **A between-chunk check would be a genuine granularity gain, and it is a behaviour change.**
+//!   Candle's DiT forward carries no cancel check today (`candle-gen-z-image/src/packed_dit.rs` has
+//!   none), so on a 4-step Z-Image-Turbo render the finest in-denoise granularity is one whole step.
+//!   Adding one is worth doing, but it means threading a plan through `sdpa_budgeted_*` and every
+//!   provider's `forward_with_attention_budget` (~39 call sites across ~20 crates), whereas this
+//!   refactor is behaviour-preserving by construction. Tracked as **SC-16007**, not folded in here.
+//!
+//! [`AttentionBudget`] and [`CONSTRAINED_ATTN_SCORES_BUDGET`] are re-exported below because they *are*
+//! the shared planner; `AttentionPlan` is not, because nothing on this backend consumes it yet.
 
 use candle_core::{Result, Tensor, D};
+
+/// The rung-3 **planner**, re-exported from its shared home ([`gen_core::attention_budget`], SC-15793)
+/// so candle provider code names the same budget type — and, where it applies, the same declared value
+/// — as the MLX lane. Only the kernels below are candle's.
+///
+/// [`CONSTRAINED_ATTN_SCORES_BUDGET`] is the **Z-Image** operating point (64 Mi), measured
+/// independently on both backends. It is not a contract-wide constant: candle's Krea lane measured and
+/// publishes 128 Mi (`candle_gen_krea::pipeline::CONSTRAINED_ATTN_SCORES_BUDGET`), and the
+/// i32-overflow guard below runs the same planner at 1e9. What is shared is the planner, not the number.
+pub use gen_core::attention_budget::{AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET};
 
 /// Max elements in a single attention scores tensor before the query rows are chunked. candle CUDA
 /// kernels index elements with **i32**, so a scores/probs tensor exceeding `i32::MAX` (~2.147e9)
 /// silently corrupts its tail. 1.0e9 keeps each chunk well under the limit while leaving every render
 /// size whose single-pass scores are already `≤ 1e9` a single un-chunked pass (byte-identical to the
 /// pre-guard path). Matches the per-crate F-003 budget so the two never diverge.
+///
+/// This is the **same planner** as the memory rung's [`CONSTRAINED_ATTN_SCORES_BUDGET`] at a different
+/// setting — a correctness guard rather than a memory operating point, which is why it is much larger.
 pub const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
 
 /// The largest query-block length whose `[…, block, Sk]` scores element count stays within `budget`.
@@ -44,12 +100,25 @@ pub const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
 /// common sizes are the unchanged single matmul+softmax+matmul. `rows_per_query` is the product of all
 /// the leading (non-query, non-key) dims times `sk` — i.e. the element count contributed by ONE query
 /// row (`B·H·Sk` for the 4-D shape, `N·Sk` for the flat shape).
+///
+/// **Pure delegation to [`AttentionBudget::query_block_rows`] (SC-15796).** This must not apply
+/// arithmetic of its own: candle and MLX would then plan different boundaries from the same declared
+/// budget, which is the exact divergence the shared planner exists to prevent.
+/// `the_delegation_reproduces_the_sc9116_guard_arithmetic` pins that the delegation is boundary-for-
+/// boundary what this crate computed before the hoist, and
+/// `candle_chunk_boundaries_match_the_shared_cross_backend_table` pins it against the shared table.
 fn query_block(rows_per_query: usize, sq: usize, budget: usize) -> usize {
-    if rows_per_query.saturating_mul(sq) <= budget {
-        sq
+    // `usize::MAX` is this crate's un-chunked sentinel (the trainers and every unbounded call site pass
+    // it). Map it to the planner's own `u64::MAX` sentinel explicitly rather than via `as`, which would
+    // widen to 2^32-1 — a real budget — on a 32-bit target.
+    let budget = if budget == usize::MAX {
+        u64::MAX
     } else {
-        (budget / rows_per_query.max(1)).max(1)
-    }
+        budget as u64
+    };
+    // The result is bounded above by `sq`, which came from a `usize`, so the narrowing is exact.
+    AttentionBudget::from_score_elements(budget, false)
+        .query_block_rows(rows_per_query as u64, sq as u64) as usize
 }
 
 /// i32-overflow-safe SDPA over the 4-D shape `q,k,v: [B, H, Sq, D]` (k/v key length `Sk` may differ
@@ -84,6 +153,7 @@ pub fn sdpa_budgeted_bhsd(
 
     let block = query_block(b * h * sk, sq, budget);
     if block >= sq {
+        record_chunk_count(1);
         let mut scores = (q.matmul(&k_t)? * scale)?;
         if let Some(m) = mask {
             scores = scores.broadcast_add(m)?;
@@ -111,6 +181,7 @@ pub fn sdpa_budgeted_bhsd(
         blocks.push(probs.matmul(&v)?); // [B,H,len,D]
         start += len;
     }
+    record_chunk_count(blocks.len());
     Tensor::cat(&blocks, 2) // [B,H,Sq,D]
 }
 
@@ -135,6 +206,7 @@ pub fn sdpa_budgeted_flat(
 
     let block = query_block(n * sk, sq, budget);
     if block >= sq {
+        record_chunk_count(1);
         let scores = (q.matmul(&k_t)? * scale)?;
         let probs = softmax(&scores)?;
         return probs.matmul(&v);
@@ -149,8 +221,46 @@ pub fn sdpa_budgeted_flat(
         blocks.push(probs.matmul(&v)?); // [N,len,D]
         start += len;
     }
+    record_chunk_count(blocks.len());
     Tensor::cat(&blocks, 1) // [N,Sq,D]
 }
+
+/// Test-only observation of how many chunks the last `sdpa_budgeted_*` call actually ran.
+///
+/// Without this, every equivalence test below is a false green: they all assert *chunked == single
+/// pass*, which is trivially true when the chunking never engages, so the whole suite would keep
+/// passing with the lever deleted — or with the kernel sizing its chunks from arithmetic of its own
+/// rather than from the shared planner. Compiled out entirely in release; `RUST_TEST_THREADS=1` is
+/// forced repo-wide (`.cargo/config.toml`), so a process-global counter is safe. Mirrors
+/// `mlx_gen::attention`'s probe so the two backends' conformance tests read the same way.
+#[cfg(test)]
+mod chunk_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Chunks run by the most recent `sdpa_budgeted_*` call (`1` = the un-chunked fast path).
+    pub fn last_chunk_count() -> usize {
+        LAST_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Reset before a call so a stale value cannot satisfy an assertion.
+    pub fn reset() {
+        LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+use chunk_probe::{last_chunk_count, reset as reset_chunk_count};
+
+#[cfg(test)]
+fn record_chunk_count(n: usize) {
+    chunk_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_chunk_count(_n: usize) {}
 
 #[cfg(test)]
 mod tests {
@@ -170,6 +280,19 @@ mod tests {
         }
     }
 
+    /// Assert the chunk count the last `sdpa_budgeted_*` call ran. Every `chunked == single pass`
+    /// assertion below is vacuous without this — `chunked == single` is trivially true when the
+    /// chunking never engages.
+    fn assert_chunks(expected: usize) {
+        assert_eq!(
+            last_chunk_count(),
+            expected,
+            "the kernel ran {} chunks, not {expected} — the equivalence around this call would be \
+             vacuous",
+            last_chunk_count()
+        );
+    }
+
     #[test]
     fn bhsd_chunked_matches_single_pass() {
         // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
@@ -180,18 +303,21 @@ mod tests {
         let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let sm = |x: &Tensor| softmax_last_dim(x);
+        reset_chunk_count();
         let single = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, None, sm, usize::MAX).unwrap();
-        // Full single pass, tiny budget → single-row chunks, and a MID-SIZE budget forcing multi-row
-        // chunks + a remainder (block=3 over s=7 → chunks 3,3,1) — the sc-9116 test-hardening ask.
-        approx_eq(
-            &single,
-            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, None, sm, 1).unwrap(),
-        );
-        approx_eq(
-            &single,
-            // budget = b·h·sk·block = 1·2·7·3 = 42 → block = 42/(1·2·7) = 3.
-            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, None, sm, 42).unwrap(),
-        );
+        // The unbounded arm must be a single un-chunked pass. Then a tiny budget → single-row chunks,
+        // and a MID-SIZE budget forcing multi-row chunks + a remainder (block=3 over s=7 → chunks
+        // 3,3,1) — the sc-9116 test-hardening ask.
+        assert_chunks(1);
+        reset_chunk_count();
+        let one_row = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, None, sm, 1).unwrap();
+        assert_chunks(7);
+        approx_eq(&single, &one_row);
+        reset_chunk_count();
+        // budget = b·h·sk·block = 1·2·7·3 = 42 → block = 42/(1·2·7) = 3.
+        let ragged = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, None, sm, 42).unwrap();
+        assert_chunks(3);
+        approx_eq(&single, &ragged);
     }
 
     #[test]
@@ -205,11 +331,13 @@ mod tests {
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let mask = Tensor::randn(0f32, 1f32, (b, 1, 1, s), &dev).unwrap();
         let sm = |x: &Tensor| softmax_last_dim(x);
+        reset_chunk_count();
         let single = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, usize::MAX).unwrap();
-        approx_eq(
-            &single,
-            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 42).unwrap(),
-        );
+        assert_chunks(1);
+        reset_chunk_count();
+        let chunked = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 42).unwrap();
+        assert_chunks(3);
+        approx_eq(&single, &chunked);
     }
 
     #[test]
@@ -225,15 +353,17 @@ mod tests {
         // Distinct per-(query,key) bias so a wrong (un-narrowed / mis-aligned) slice would diverge.
         let mask = Tensor::randn(0f32, 1f32, (b, 1, s, s), &dev).unwrap();
         let sm = |x: &Tensor| softmax_last_dim(x);
+        reset_chunk_count();
         let single = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, usize::MAX).unwrap();
-        approx_eq(
-            &single,
-            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 1).unwrap(),
-        );
-        approx_eq(
-            &single,
-            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 42).unwrap(),
-        );
+        assert_chunks(1);
+        reset_chunk_count();
+        let one_row = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 1).unwrap();
+        assert_chunks(7);
+        approx_eq(&single, &one_row);
+        reset_chunk_count();
+        let ragged = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 42).unwrap();
+        assert_chunks(3);
+        approx_eq(&single, &ragged);
     }
 
     #[test]
@@ -275,9 +405,12 @@ mod tests {
     /// `strategyParameters.chunkedAttention.attentionChunkSize` means two different things and the two
     /// backends' numbers cannot be placed in one matrix.
     ///
-    /// This crate deliberately keeps its own `query_block` for now (rung 3's candle refactor is its own
-    /// story); what this test guarantees is that the two implementations cannot silently drift apart
-    /// while that is true. Flip either side's arithmetic and this goes red.
+    /// Since SC-15796 [`query_block`] *is* a delegation to the shared planner, comparing the two
+    /// against each other would now be a tautology — it would pass with the shared arithmetic wrong.
+    /// What remains load-bearing, and what this asserts, is the delegation against the table's
+    /// **declared literals**: perturb the shared planner and candle goes red here, which is what makes
+    /// the delegation a checked property rather than a claim. The kernel's own use of the boundary is
+    /// pinned separately by [`the_kernels_chunk_exactly_as_the_shared_planner_declares`].
     #[test]
     fn candle_chunk_boundaries_match_the_shared_cross_backend_table() {
         for case in gen_core::attention_budget::CROSS_BACKEND_CHUNK_CASES {
@@ -290,19 +423,123 @@ mod tests {
                 "{}: candle plans {candle} rows, the shared table declares {}",
                 case.what, case.expect_rows
             );
-            // And against the shared planner directly, so this compares implementations rather than
-            // two copies of the same literal.
-            let shared = gen_core::attention_budget::AttentionBudget::from_score_elements(
-                case.budget,
-                false,
-            )
-            .query_block_rows(case.rows_per_query, case.sq);
-            assert_eq!(
-                candle as u64, shared,
-                "{}: candle plans {candle} rows, gen-core's shared planner plans {shared}",
-                case.what
-            );
         }
+    }
+
+    /// **The kernel-to-planner binding (SC-15796).** [`query_block`] delegating is only half of AC 1:
+    /// the kernels have to actually *size their chunks from it*. A kernel that reintroduced local
+    /// arithmetic — the failure this refactor exists to prevent — would leave every test above green.
+    ///
+    /// So for a sweep of block sizes covering the whole range (a single row, ragged multi-row splits,
+    /// and the un-chunked call), both kernels must run exactly `ceil(Sq / shared_boundary)` chunks.
+    /// The shared table's own rows are production geometries (Sq up to 65536) that cannot be launched
+    /// in a unit test — the sibling MLX test learned that the hard way — so this sweeps runnable shapes
+    /// and derives the expected count from the planner rather than from a literal.
+    #[test]
+    fn the_kernels_chunk_exactly_as_the_shared_planner_declares() {
+        let dev = Device::Cpu;
+        let sm = |x: &Tensor| softmax_last_dim(x);
+        // Sq = 11 is prime, so every block size below it leaves a ragged tail — a kernel that rounded
+        // the tail differently from `ceil` shows up here.
+        let (b, h, s, d) = (1usize, 3usize, 11usize, 4usize);
+        let q4 = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k4 = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v4 = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let (n, sf) = (3usize, 11usize);
+        let q3 = Tensor::randn(0f32, 1f32, (n, sf, d), &dev).unwrap();
+        let k3 = Tensor::randn(0f32, 1f32, (n, sf, d), &dev).unwrap();
+        let v3 = Tensor::randn(0f32, 1f32, (n, sf, d), &dev).unwrap();
+
+        let mut chunked_arms = 0;
+        for rows in [1usize, 2, 4, 7, 10, 11] {
+            // 4-D: rows_per_query = B·H·Sk.
+            let rows_per_query = b * h * s;
+            let budget = rows_per_query * rows;
+            let block = query_block(rows_per_query, s, budget);
+            assert_eq!(
+                block, rows,
+                "the planner did not produce the {rows}-row block"
+            );
+            reset_chunk_count();
+            sdpa_budgeted_bhsd(&q4, &k4, &v4, 0.5, None, sm, budget).unwrap();
+            assert_chunks(s.div_ceil(block));
+
+            // Flat: rows_per_query = N·Sk. Same planner, different layout.
+            let rows_per_query = n * sf;
+            let budget = rows_per_query * rows;
+            let block = query_block(rows_per_query, sf, budget);
+            assert_eq!(block, rows, "the flat planner missed the {rows}-row block");
+            reset_chunk_count();
+            sdpa_budgeted_flat(&q3, &k3, &v3, 0.5, sm, budget).unwrap();
+            assert_chunks(sf.div_ceil(block));
+
+            if rows < s {
+                chunked_arms += 1;
+            }
+        }
+        assert!(
+            chunked_arms >= 5,
+            "only {chunked_arms} arms actually chunked — this test would pass with chunking gone"
+        );
+    }
+
+    /// **AC 6 without a GPU: the delegation is boundary-for-boundary the pre-hoist arithmetic.**
+    ///
+    /// Real-weight output can only change if a *boundary* changes — query-row chunking is otherwise
+    /// numerically identical by construction, since each row's softmax already spans the complete
+    /// key/value domain. So pinning the boundaries against the closed form this crate shipped from
+    /// sc-9116 until SC-15796 pins the output too, on hardware this can run on.
+    ///
+    /// The oracle below is deliberately **not** a second planner: nothing derives a production boundary
+    /// from it, and it exists permanently as the i32-overflow guard's own invariant — a correctness
+    /// guard, not just a memory operating point, so the boundaries it produces must never drift.
+    /// SC-15793's adversarial review swept the same equivalence over ~3M grid cases plus ~4M random
+    /// full-range inputs with zero divergences; this keeps a representative slice of that in CI.
+    #[test]
+    fn the_delegation_reproduces_the_sc9116_guard_arithmetic() {
+        /// The pre-SC-15796 closed form, verbatim.
+        fn pre_hoist(rows_per_query: usize, sq: usize, budget: usize) -> usize {
+            if rows_per_query.saturating_mul(sq) <= budget {
+                sq
+            } else {
+                (budget / rows_per_query.max(1)).max(1)
+            }
+        }
+
+        let budgets = [
+            0usize,
+            1,
+            42,
+            63,
+            4096,
+            CONSTRAINED_ATTN_SCORES_BUDGET as usize,
+            ATTN_SCORES_BUDGET,
+            usize::MAX,
+        ];
+        let rows = [0usize, 1, 7, 16384, 30 * 4128, 2 * 10 * 16384, 65536];
+        let sqs = [0usize, 1, 2, 7, 32, 4128, 16384, 65536];
+        let mut chunking_cases = 0;
+        for &budget in &budgets {
+            for &rows_per_query in &rows {
+                for &sq in &sqs {
+                    let want = pre_hoist(rows_per_query, sq, budget);
+                    let got = query_block(rows_per_query, sq, budget);
+                    assert_eq!(
+                        got, want,
+                        "budget {budget}, rows_per_query {rows_per_query}, sq {sq}: the shared \
+                         planner moved a boundary the i32-overflow guard shipped"
+                    );
+                    if want < sq {
+                        chunking_cases += 1;
+                    }
+                }
+            }
+        }
+        // A grid where nothing ever chunks would agree trivially.
+        assert!(
+            chunking_cases > 100,
+            "only {chunking_cases} grid cases actually chunked — the agreement is near-vacuous"
+        );
     }
 
     /// The shared table must cover the budget this crate actually ships as its i32-overflow guard,
@@ -326,15 +563,17 @@ mod tests {
         let k = Tensor::randn(0f32, 1f32, (n, s, d), &dev).unwrap();
         let v = Tensor::randn(0f32, 1f32, (n, s, d), &dev).unwrap();
         let sm = |x: &Tensor| softmax_last_dim(x);
+        reset_chunk_count();
         let single = sdpa_budgeted_flat(&q, &k, &v, 0.5, sm, usize::MAX).unwrap();
-        approx_eq(
-            &single,
-            &sdpa_budgeted_flat(&q, &k, &v, 0.5, sm, 1).unwrap(),
-        );
-        approx_eq(
-            &single,
-            // budget = n·sk·block = 3·7·3 = 63 → block = 63/(3·7) = 3.
-            &sdpa_budgeted_flat(&q, &k, &v, 0.5, sm, 63).unwrap(),
-        );
+        assert_chunks(1);
+        reset_chunk_count();
+        let one_row = sdpa_budgeted_flat(&q, &k, &v, 0.5, sm, 1).unwrap();
+        assert_chunks(7);
+        approx_eq(&single, &one_row);
+        reset_chunk_count();
+        // budget = n·sk·block = 3·7·3 = 63 → block = 63/(3·7) = 3.
+        let ragged = sdpa_budgeted_flat(&q, &k, &v, 0.5, sm, 63).unwrap();
+        assert_chunks(3);
+        approx_eq(&single, &ragged);
     }
 }
