@@ -180,6 +180,19 @@ pub fn tile_edge_candidates() -> Vec<i32> {
     edges
 }
 
+/// Whether `edge` is one of [`tile_edge_candidates`] — the **single** legality predicate for the PiD
+/// tile domain (SC-15775).
+///
+/// [`validate_tile`] is the production gate, but three other places need the same yes/no without
+/// building a rejection message: the shared seam's mis-wiring assertion
+/// ([`selected_decode_tiling`](crate::engine::selected_decode_tiling)), a provider's route-domain
+/// conformance check ([`decode_routes`](crate::decode_routes)), and the tests of both. Answering it
+/// here rather than re-spelling `MIN_TILE_EDGE`/`TILE_ALIGN` arithmetic at each site is what keeps a
+/// consumer's idea of "legal" from drifting away from what [`validate_tile`] actually enforces.
+pub fn is_tile_edge_candidate(edge: i32) -> bool {
+    tile_edge_candidates().contains(&edge)
+}
+
 /// Accept or reject an externally chosen `(edge, overlap)` for a PiD decode of `th × tw` output.
 ///
 /// The refusals are the planner's own invariants, made explicit so an out-of-domain selection is a
@@ -195,8 +208,8 @@ pub fn tile_edge_candidates() -> Vec<i32> {
 /// `th`/`tw` are the super-resolved output dims, carried so the message can name the decode the
 /// selection was rejected for. `model_id` only labels the error. Pure — no device query.
 pub fn validate_tile(model_id: &str, edge: i32, overlap: i32, th: i32, tw: i32) -> Result<()> {
-    let candidates = tile_edge_candidates();
-    if !candidates.contains(&edge) {
+    if !is_tile_edge_candidate(edge) {
+        let candidates = tile_edge_candidates();
         return Err(Error::Msg(format!(
             "{model_id}: PiD decode tile edge {edge} is not one of the production candidates \
              {candidates:?} ({TILE_ALIGN}px-aligned, {MIN_TILE_EDGE}..={WATCHDOG_SAFE_EDGE}) for a \
