@@ -198,6 +198,12 @@ fn step_gate(
     }
     let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
     on_progress(Progress::Step { current, total });
+    // The progress callback is also the worker's phase-boundary cancellation seam. Re-check after
+    // it returns so a cancel requested at `Step` stops before the next expensive model evaluation
+    // and does not leave that denoise graph for request-scope cleanup to reclaim.
+    if cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
     Ok(())
 }
 
@@ -993,6 +999,29 @@ mod tests {
         for (a, b) in got.iter().zip([0.3_f32, -0.7, 1.1]) {
             assert!((a - b).abs() < 1e-7);
         }
+    }
+
+    #[test]
+    fn step_progress_callback_can_cancel_before_model_evaluation() {
+        let cancel = CancelFlag::new();
+        let callback_cancel = cancel.clone();
+        let result = step_gate(
+            &cancel,
+            &mut |progress| {
+                assert!(matches!(
+                    progress,
+                    Progress::Step {
+                        current: 1,
+                        total: 1
+                    }
+                ));
+                callback_cancel.cancel();
+            },
+            &[1.0, 0.0],
+            1,
+            1.0,
+        );
+        assert!(matches!(result, Err(gen_core::Error::Canceled)));
     }
 
     // --- Unified framework backend: MlxLatentOps (epic 7114 P2, sc-7118) ---------------------------
