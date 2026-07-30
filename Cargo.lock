@@ -2214,6 +2214,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "mlx-gen-sana",
+ "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
 ]
 

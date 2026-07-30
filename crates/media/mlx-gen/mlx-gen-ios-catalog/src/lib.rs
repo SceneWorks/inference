@@ -12,11 +12,18 @@
 //!
 //! # What ships
 //!
-//! **SANA** (`mlx-gen-sana`), base and sprint. Chosen because it is the smallest capable image
-//! generator in the workspace and its text conditioning is Gemma-2-2b-it, reused from
-//! `mlx-gen-pid`'s caption encoder (epic 8485 / sc-8488) rather than duplicated. Rough budget at
-//! 4-bit: encoder ~1.4 GB + DiT ~0.35 GB + DC-AE decoder ≈ **~2 GB**, which leaves room under an
-//! 8 GB device's ~4 GB cap.
+//! **SANA** (`mlx-gen-sana`), base and sprint — the smallest capable image generator here, with
+//! text conditioning reused from `mlx-gen-pid`'s Gemma-2-2b-it caption encoder (epic 8485 /
+//! sc-8488) rather than duplicated.
+//!
+//! **It does not currently fit an 8 GB device.** Measured with this crate's `image_budget`
+//! example against a 4096 MiB budget: 8340 MiB peak at 1024px under `OffloadPolicy::Sequential`,
+//! and still 4363 MiB at 256px. Resolution is not the lever — most of the footprint is weights
+//! (Q4: encoder 2.3 GB + DiT 2.0 GB + DC-AE 1.25 GB), not activations. An earlier "~2 GB" estimate
+//! in these docs came from prose rather than measurement and was wrong by ~4×.
+//!
+//! Shipping G6 needs a smaller text encoder (the 2-bit SANA quant the crate docs mention is not
+//! ported), DC-AE tiling, or a decision to target 12 GB devices only. See `docs/ios-epics.md` E5.
 //!
 //! # What does not, yet
 //!

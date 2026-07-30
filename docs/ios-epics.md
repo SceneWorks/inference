@@ -385,10 +385,51 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 | Story | Notes |
 |---|---|
 | S5.1 SANA on device | **Mac-side done** — composition, surface tests, and the `aarch64-apple-ios` cross-compile all green. The device half is Session A. |
-| S5.2 Memory residency | Encoder / DiT / DC-AE decoder. 2-bit Gemma-2 encoder if needed; DC-AE tiling. Uses E4's unload seam. |
+| S5.2 Memory residency | **BLOCKED — measured, does not fit.** See the table below. Needs a smaller text encoder before anything else is worth trying. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
 | S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
 | S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. Enforced like E4's thresholds. |
+
+### Measured: SANA does not fit an 8 GB device (2026-07-30)
+
+`cargo run --release -p mlx-gen-ios-catalog --example image_budget -- <q4-snapshot>` against a
+4096 MiB budget, on macOS:
+
+| Resolution | Resident | Sequential | Verdict |
+|---|---|---|---|
+| 1024px | 10553 MiB (258%) | 8340 MiB (204%) | over |
+| 512px | 6199 MiB (151%) | 5065 MiB (124%) | over |
+| 256px | 5131 MiB (125%) | **4363 MiB (107%)** | over |
+
+**Resolution is not the lever.** Dropping from 1024px to 256px — a 16× reduction in pixels —
+saves only ~4 GB of a ~8.3 GB peak, because most of the footprint is *weights*, not activations.
+Even at 256px, sequential residency lands 7% over the cap. The floor is the Q4 tier itself:
+Gemma-2 encoder 2.3 GB + DiT 2.0 GB + DC-AE 1.25 GB.
+
+Two things this corrects:
+
+- **The "~2 GB" figure quoted earlier in this document (and in `mlx-gen-ios-catalog`'s docs) was
+  wrong** — it came from crate prose, not measurement. The real Q4 tier is ~5.6 GB on disk and
+  peaks at 8.3 GB working set.
+- **`OffloadPolicy::Sequential` is not just a memory win, it is also FASTER** (3.4 s vs 5.2 s at
+  1024px). That is counter-intuitive — the expectation was that reloading components costs time —
+  and worth understanding before relying on it. Likely less allocator pressure and better cache
+  behaviour, but that is a hypothesis, not a measurement.
+
+**What would actually move the number**, in order of expected effect:
+
+1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component
+   and is dropped after the encode phase anyway. The crate docs reference a 2-bit Clark-Labs SANA
+   drop; `mlx-gen-sana` notes that quant is **not ported**. Porting it, or substituting a smaller
+   encoder, is the first real lever.
+2. **DC-AE tiling** — 1.25 GB of decoder held for the final phase only.
+3. **A 12 GB device only.** SANA fits a 17 Pro Max's ~6 GB cap sequentially at 512px (5065 MiB is
+   over 4 GB but under 6). That ships G6 on *one* device class and abandons the §0.1 guardrail —
+   a product decision, not an engineering one.
+
+Until one of these lands, S5.2 is blocked and the device session for E5 would only confirm a
+number already known on the host. **That is the harness working as intended**: this finding cost
+20 minutes on a Mac rather than a device session and a jetsam kill.
 
 **Exit:** SANA generates a correct 1024px image within the memory cap, `gen-core-testkit`
 conformance green on device, media registry validated in the bundle.

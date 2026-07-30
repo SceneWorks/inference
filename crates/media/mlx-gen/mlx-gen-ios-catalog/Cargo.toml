@@ -19,3 +19,6 @@ mlx-gen-sana = { path = "../mlx-gen-sana" }
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }
+# The image_budget example reads MLX's allocator accounting directly (get_active_memory /
+# get_peak_memory), which the gen-core contract deliberately does not expose -- it is tensor-free.
+mlx-rs = { workspace = true }
