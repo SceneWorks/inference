@@ -61,8 +61,13 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 /// All figures MiB. `previous_*` are what MLX had chosen for itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MlxLimits {
-    /// `os_proc_available_memory()` at the time of the call — the real budget. `None` off-iOS.
+    /// `os_proc_available_memory()` at the time of the call. `None` off-iOS.
+    ///
+    /// **This is headroom REMAINING, not the total cap** — it shrinks as the process grows, which is
+    /// why the call belongs at startup. See [`MlxLimits::called_late`].
     pub os_available_mib: Option<f64>,
+    /// MLX's live allocation when the call was made. Near zero in a freshly started process.
+    pub active_at_call_mib: f64,
     pub previous_memory_limit_mib: f64,
     pub previous_cache_limit_mib: f64,
     pub memory_limit_mib: f64,
@@ -75,6 +80,18 @@ impl MlxLimits {
     pub fn changed(&self) -> bool {
         self.memory_limit_mib < self.previous_memory_limit_mib
             || self.cache_limit_mib < self.previous_cache_limit_mib
+    }
+
+    /// The call happened after a model was already resident, so the budget it derived is too small.
+    ///
+    /// `os_proc_available_memory()` reports headroom *remaining*. Call it at startup and it is
+    /// effectively the cap; call it with 3 GB of weights loaded and it reports what is left, so a
+    /// naive 85% of it can land **below the memory already live** — a self-inflicted backpressure
+    /// stall derived from a correct-looking API. [`bound_mlx_to_platform_limits`] clamps rather than
+    /// setting such a limit, and sets this so the caller can see that it did.
+    pub fn called_late(&self) -> bool {
+        self.os_available_mib.is_some()
+            && self.active_at_call_mib > self.os_available_mib.unwrap_or(0.0) * 0.1
     }
 }
 
@@ -148,9 +165,12 @@ pub fn bound_mlx_to_platform_limits() -> MlxLimits {
         prev
     };
 
+    let active_at_call_mib = mib(mlx_rs::memory::get_active_memory());
+
     let Some(available) = os_available_mib else {
         return MlxLimits {
             os_available_mib: None,
+            active_at_call_mib,
             previous_memory_limit_mib: mib(previous_memory_limit),
             previous_cache_limit_mib: mib(previous_cache_limit),
             memory_limit_mib: mib(previous_memory_limit),
@@ -159,13 +179,18 @@ pub fn bound_mlx_to_platform_limits() -> MlxLimits {
     };
 
     let cache_mib = (available / 4.0).min(1024.0);
-    let memory_mib = available * 0.85;
+    // Never set a live-allocation ceiling below what is already live. `available` is headroom
+    // REMAINING, so a late call reports a small number and 85% of it can land under the resident
+    // working set — which would not protect anything, it would stall the process against a limit it
+    // has already passed. The clamp keeps a late call harmless; `called_late()` reports that it was.
+    let memory_mib = (available * 0.85).max(active_at_call_mib * 1.1);
     let to_bytes = |m: f64| (m * 1024.0 * 1024.0) as usize;
     mlx_rs::memory::set_memory_limit(to_bytes(memory_mib));
     mlx_rs::memory::set_cache_limit(to_bytes(cache_mib));
 
     MlxLimits {
         os_available_mib: Some(available),
+        active_at_call_mib,
         previous_memory_limit_mib: mib(previous_memory_limit),
         previous_cache_limit_mib: mib(previous_cache_limit),
         memory_limit_mib: memory_mib,
@@ -202,15 +227,26 @@ mod tests {
 
         #[cfg(not(target_os = "ios"))]
         {
-            assert_eq!(limits.os_available_mib, None, "a Mac has no per-app cap to report");
+            assert_eq!(
+                limits.os_available_mib, None,
+                "a Mac has no per-app cap to report"
+            );
             assert_eq!(limits.memory_limit_mib, limits.previous_memory_limit_mib);
             assert_eq!(limits.cache_limit_mib, limits.previous_cache_limit_mib);
-            assert!(!limits.changed(), "must not touch MLX's sizing where it is already correct");
+            assert!(
+                !limits.changed(),
+                "must not touch MLX's sizing where it is already correct"
+            );
         }
         #[cfg(target_os = "ios")]
         {
-            let available = limits.os_available_mib.expect("iOS reports a per-process budget");
-            assert!(limits.cache_limit_mib <= 1024.0, "cache must be capped at 1 GiB");
+            let available = limits
+                .os_available_mib
+                .expect("iOS reports a per-process budget");
+            assert!(
+                limits.cache_limit_mib <= 1024.0,
+                "cache must be capped at 1 GiB"
+            );
             assert!(
                 limits.memory_limit_mib < available,
                 "the live-allocation limit must sit BELOW the budget so backpressure precedes a \
