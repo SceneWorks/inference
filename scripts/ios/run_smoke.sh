@@ -16,10 +16,15 @@ ROOT=$(pwd)
 PROFILE=release
 CARGO_PROFILE_FLAG=--release
 DEVICE=""
+CARGO_FEATURES=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --debug)  PROFILE=debug; CARGO_PROFILE_FLAG=""; shift ;;
     --device) DEVICE="$2"; shift 2 ;;
+    # E5: also run the SANA image-generation check. Needs a SANA snapshot pushed to
+    # Documents/<any-subdir>/ (scripts/ios/push_model.sh <dir> sana); without one the check
+    # reports "skipped" rather than failing.
+    --media)  CARGO_FEATURES="--features media"; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -29,8 +34,15 @@ say() { printf '\n=== %s\n' "$1"; }
 # --- device -----------------------------------------------------------------------------------
 if [ -z "$DEVICE" ]; then
   # First device listed as available+paired. Explicit --device when more than one is attached.
+  #
+  # Matched by UUID SHAPE, not by column position. The previous `$(NF-3)` counted back from the end
+  # of the line, which put it inside the Model column as soon as that column had a different word
+  # count -- "iPhone 17 Pro Max (iPhone18,2)" yields NF=11 and `$(NF-3)` is the literal "17". Every
+  # subsequent devicectl call then failed with "The specified device was not found. (Name: 17)".
   DEVICE=$(xcrun devicectl list devices 2>/dev/null \
-    | awk '/available \(paired\)/ {print $(NF-3); exit}')
+    | awk '/available \(paired\)/ {print; exit}' \
+    | grep -oE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' \
+    | head -1)
 fi
 if [ -z "$DEVICE" ]; then
   echo "no paired device found; connect an iPhone with Developer Mode enabled" >&2
@@ -66,8 +78,9 @@ say "signing team $DEVELOPMENT_TEAM"
 SMOKE_TARGET="$ROOT/ios-host/smoke/target"
 LIB="$SMOKE_TARGET/aarch64-apple-ios/$PROFILE/libios_smoke.a"
 
-say "building ios-smoke for aarch64-apple-ios ($PROFILE)"
-( cd "$ROOT/ios-host/smoke" && cargo build --target aarch64-apple-ios $CARGO_PROFILE_FLAG )
+say "building ios-smoke for aarch64-apple-ios ($PROFILE${CARGO_FEATURES:+, $CARGO_FEATURES})"
+# shellcheck disable=SC2086  # both flag vars are deliberately word-split
+( cd "$ROOT/ios-host/smoke" && cargo build --target aarch64-apple-ios $CARGO_PROFILE_FLAG $CARGO_FEATURES )
 
 # Guard against a stale staticlib. Xcode links whatever .a is on disk, so a Rust source edit that
 # did not get rebuilt produces a green run reporting the PREVIOUS build's results -- which looks
@@ -178,9 +191,19 @@ THRESHOLD_MAX_RSS_GROWTH_MIB=${THRESHOLD_MAX_RSS_GROWTH_MIB:-256}
 fail_threshold() { echo "threshold: $1" >&2; THRESHOLD_FAILED=1; }
 THRESHOLD_FAILED=0
 
+# Pull a number from ONE named check's line, not from the whole report.
+#
+# These greps used to scan the file and take the last match, which silently depends on the set of
+# checks and their order. Adding the E5 image-generation check broke exactly that: its detail
+# carries "MLX peak ... MiB" and "process RSS peak ... MiB", so a bare `grep 'peak [0-9]* MiB' |
+# tail -1` began reading SANA's number under the LLM's threshold. Anchor to the check name.
+from_check() { # <check-name-fragment> <grep-pattern> <extract-pattern>
+  grep -- "$1" "$REPORT" | grep -o -- "$2" | grep -o -- "$3" | tail -1
+}
+
 # Steady-state throughput. Sustained decode's LAST segment is the honest figure: the first is
 # depressed by lazy weight faulting, so using it would mask a real slowdown.
-tps=$(grep -o 'last [0-9.]* tok/s' "$REPORT" | grep -o '[0-9.]*' | tail -1)
+tps=$(from_check 'sustained decode' 'last [0-9.]* tok/s' '[0-9.]*')
 if [ -n "$tps" ]; then
   awk -v v="$tps" -v m="$THRESHOLD_MIN_TPS" 'BEGIN { exit !(v < m) }' \
     && fail_threshold "throughput ${tps} tok/s is below ${THRESHOLD_MIN_TPS} tok/s" \
@@ -190,7 +213,7 @@ fi
 # Peak RSS. 4 GiB is chosen against the ~4 GB cap of an 8 GB device, not the ~6 GB of this one --
 # so the lane fails BEFORE a broader-device release would (docs/architecture/ios-project-spec.md
 # §0.1), rather than after.
-rss=$(grep -o 'peak [0-9]* MiB' "$REPORT" | grep -o '[0-9]*' | tail -1)
+rss=$(from_check 'runtime-ios generation' 'peak [0-9]* MiB' '[0-9]*')
 if [ -n "$rss" ] && [ "$rss" -gt "$THRESHOLD_MAX_RSS_MIB" ]; then
   fail_threshold "peak RSS ${rss} MiB exceeds ${THRESHOLD_MAX_RSS_MIB} MiB"
 elif [ -n "$rss" ]; then
@@ -199,11 +222,32 @@ fi
 
 # Memory growth across repeated generations. Measured 0; a nonzero trend means a leak across
 # calls, which on a memory-capped device ends as a jetsam kill with no crash log.
-growth=$(grep -o 'growth [0-9-]*' "$REPORT" | grep -o '[0-9-]*' | tail -1)
+growth=$(from_check 'sustained decode' 'growth [0-9-]*' '[0-9-]*')
 if [ -n "$growth" ] && [ "$growth" -gt "$THRESHOLD_MAX_RSS_GROWTH_MIB" ]; then
   fail_threshold "RSS grew ${growth} MiB across segments (limit ${THRESHOLD_MAX_RSS_GROWTH_MIB})"
 elif [ -n "$growth" ]; then
   echo "  RSS growth ${growth} MiB (limit ${THRESHOLD_MAX_RSS_GROWTH_MIB})"
+fi
+
+# E5 image generation, when --media ran it. The gauge is MLX's own peak, not RSS: on the host
+# `getrusage` was measured BELOW MLX's peak (2961 vs 4773 MiB), so it is not seeing Metal buffer
+# allocations, and a ceiling read off it would be vacuous.
+#
+# 5120 MiB is set against the ~6 GB cap of a 12 GB device, deliberately NOT the 4 GB of an 8 GB one.
+# The LLM ceiling above is the strict 8 GB line because the LLM is the guardrail product; SANA is
+# measured at 3294-4773 MiB and the 8 GB case is genuinely tight, so a device run on this hardware
+# cannot honestly assert it. Re-baseline downward when 8 GB hardware is available (E5, S5.2).
+THRESHOLD_MAX_IMAGE_PEAK_MIB=${THRESHOLD_MAX_IMAGE_PEAK_MIB:-5120}
+# The MAXIMUM across configurations, not the last one. `from_check`'s `tail -1` is right where a
+# line carries one value, but the image check reports several (512 untiled, 1024 tiled) on one line
+# and the ceiling must be read against the worst of them — which is 512 untiled at 4773 MiB, while
+# the last is 1024 tiled at 3294. Taking the last would hide a regression in every earlier config.
+img_peak=$(grep -- 'SANA image generation' "$REPORT" \
+  | grep -o -- 'MLX peak [0-9]* MiB' | grep -o -- '[0-9]*' | sort -n | tail -1)
+if [ -n "$img_peak" ] && [ "$img_peak" -gt "$THRESHOLD_MAX_IMAGE_PEAK_MIB" ]; then
+  fail_threshold "SANA MLX peak ${img_peak} MiB exceeds ${THRESHOLD_MAX_IMAGE_PEAK_MIB} MiB"
+elif [ -n "$img_peak" ]; then
+  echo "  SANA MLX peak ${img_peak} MiB (ceiling ${THRESHOLD_MAX_IMAGE_PEAK_MIB})"
 fi
 
 if [ "$THRESHOLD_FAILED" -ne 0 ]; then
