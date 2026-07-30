@@ -89,6 +89,7 @@ fn run_with(component: TransformerComponent) -> Run {
     let (quant, _) = tier_from_path();
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.offload_policy = OffloadPolicy::Sequential;
+    spec.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }

@@ -24,21 +24,13 @@
 //! never happened therefore cannot be drained, which is what makes
 //! [`block_stream_drains_exactly_what_the_block_read`] a real check rather than a tautology.
 //!
-//! ## The resident-blocks precondition, and why it is enforced rather than documented
+//! ## The deferred-materialization precondition
 //!
-//! Streaming bounds residency only if the *resident* `layers` are not also materialized. Under
-//! [`OffloadPolicy::Sequential`](mlx_gen::OffloadPolicy) they are not: the heavy bundle is rebuilt per
-//! generate, its blocks are fresh unevaluated handles, and a streaming forward never touches them, so
-//! they stay at ~0 bytes. Under `Resident` the same generator serves many requests, so after the first
-//! ordinary render the blocks ARE materialized and a streaming forward would add a window on top of
-//! them — strictly more memory and strictly slower.
-//!
-//! Rung 1 has a load-time-vs-request-time seam of the same shape and resolves it by silently yielding
-//! resident behaviour (see [`crate::memory_strategy`]). Rung 4 does NOT: `generate` rejects a
-//! `stream_transformer_blocks` request on a non-`Sequential` generator with a typed error. A silent
-//! degradation there would be a *false green* — the calibration harness would record a rung-4 run that
-//! saved nothing, which is exactly the failure mode SC-15750's mutation check exists to prevent, one
-//! layer up.
+//! Streaming bounds residency only if the full `layers` stack remains lazy. The load-time
+//! [`mlx_gen::LoadShape::DeferredMaterialization`] flag selects that shape independently from
+//! [`mlx_gen::OffloadPolicy`]: Resident keeps the generator and non-windowed state warm, while
+//! Sequential also releases completed phases. A rung-4 request on an eager load is rejected before
+//! execution, preventing a false-green calibration over already-materialized blocks.
 
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::weights::Weights;
