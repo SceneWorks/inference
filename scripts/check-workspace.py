@@ -128,6 +128,16 @@ DELETED_ENV_SIDE_CHANNELS = (
     "PULID_FACE_WEIGHTS_DIR",
 )
 
+# The crate that owns the shared PiD decode seam and, since sc-15775, the shared per-route decode
+# domain. A direct dependency on it is what makes a provider PiD-eligible.
+PID_SEAM_CRATE = "mlx-gen-pid"
+
+# Any one of these in a provider's sources means it declared its per-route decode domain through the
+# shared type rather than hand-rolling the split. Kept as a set of spellings (not one) because the
+# import style is the provider's choice: `mlx_gen_pid::DecodeRoutes`, a `use` of the module, or a
+# local `decode_routes()` helper built on it all satisfy the obligation.
+PID_DECODE_ROUTE_MARKERS = ("DecodeRoutes", "decode_routes")
+
 _CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 _CFG_TEST_MOD = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
 
@@ -409,6 +419,70 @@ def check_rust_sources(root: Path) -> None:
         fail(f"inference source must not reference HF caches or deleted env side channels:\n  {joined}")
 
 
+def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
+    """A PiD-eligible provider that adopts bounded decode must declare its routes through the shared
+    ``mlx_gen_pid::DecodeRoutes`` (sc-15775).
+
+    ``mlx_gen_pid::engine::selected_decode_tiling`` is a shared, provider-agnostic seam. Native VAE
+    tile edges (256-768 output px) and PiD tile edges (512px-aligned, 1024..=4096) are disjoint by
+    construction, because the student decodes a ``scale x`` super-resolved output. A provider that
+    emits its native ladder into ``GenerationMemory::decode_tile_edge`` therefore turns a working
+    ``use_pid`` + bounded-decode request into a hard ``budget::validate_tile`` rejection at generate
+    time — and the seam must not paper over it, because silently re-planning would execute a different
+    strategy than the selector chose.
+
+    ``DecodeRoutes`` makes the bad declaration unrepresentable (it accepts only the native ladder) and
+    ``check_decode_routes`` refuses a native ladder that reaches into the PiD domain. Those help only a
+    provider that *uses* them, so this is the tripwire for one that does not: it lives here, in a lane
+    that fires on any workspace change, so the next adopter cannot opt out by simply not calling the
+    shared type. The alternative — a conformance check the provider's own suite has to remember to
+    invoke — is exactly the "documented, not enforced" failure sc-15775 exists to close.
+
+    Scoped to the three facts that together mean "this provider can hit the seam with a selection":
+    a direct ``mlx-gen-pid`` dependency (PiD-eligible), a ``register_memory_strategy`` call (its
+    contract is resolvable, so a selector can choose a strategy for it), and a ``decode_tile_edges``
+    declaration (it publishes rung-2 candidates). A provider missing any one of them cannot reach the
+    hazard and is not asked to declare routes.
+    """
+    packages_by_id = {package["id"]: package for package in metadata["packages"]}
+    violations: list[str] = []
+    for member_id in metadata["workspace_members"]:
+        package = packages_by_id[member_id]
+        if package["name"] == PID_SEAM_CRATE:
+            continue
+        if not any(
+            dependency["name"] == PID_SEAM_CRATE for dependency in package["dependencies"]
+        ):
+            continue
+        manifest_dir = Path(package["manifest_path"]).parent
+        if not manifest_dir.is_dir():
+            continue
+        sources = {
+            path: path.read_text(encoding="utf-8")
+            for path in sorted(manifest_dir.rglob("*.rs"))
+            if IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts)
+        }
+        joined = "\n".join(sources.values())
+        if "register_memory_strategy" not in joined or "decode_tile_edges" not in joined:
+            continue
+        if any(marker in joined for marker in PID_DECODE_ROUTE_MARKERS):
+            continue
+        violations.append(
+            f"{package['name']} depends on {PID_SEAM_CRATE}, registers a memory-strategy contract, "
+            "and publishes decode_tile_edges, but never declares its per-route decode domain"
+        )
+
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "a PiD-eligible provider that adopts bounded decode must declare BOTH decode routes "
+            "through the shared mlx_gen_pid::DecodeRoutes and gate admission on its `validate` "
+            "(sc-15775) — native VAE tile edges are not legal PiD tiles, so emitting the native "
+            "ladder into a use_pid request is refused at generate time rather than re-planned:\n  "
+            f"{joined}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -424,6 +498,7 @@ def main() -> int:
         check_graph(metadata)
         check_network_clients(metadata)
         check_rust_sources(ROOT)
+        check_pid_decode_route_adoption(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
         return 1

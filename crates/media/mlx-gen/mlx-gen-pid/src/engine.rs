@@ -238,15 +238,35 @@ pub fn resolve_pid_decoder_at_sigma(
 /// falling back to the auto-plan when the selected edge is not a legal PiD tile would execute a
 /// different strategy than the selector chose, which is the exact failure the shared contract forbids
 /// — so an out-of-domain edge must be loud. What an adopting provider has to do is refuse the
-/// combination at *admission*, where it has the route in hand: Z-Image's `memory_strategy::safety_check`
-/// validates the decode parameters against the route's own candidate domain and rejects a native
-/// geometry under `use_pid` (and vice versa) before a request ever reaches here. Copy that shape.
+/// combination at *admission*, where it has the route in hand.
+///
+/// That obligation is **enforced rather than described** (SC-15775): declare the routes with
+/// [`DecodeRoutes`](crate::decode_routes::DecodeRoutes), whose constructor cannot be handed a
+/// PiD-route ladder at all, gate admission on
+/// [`DecodeRoutes::validate`](crate::decode_routes::DecodeRoutes::validate), and run
+/// [`check_decode_routes`](crate::decode_routes::check_decode_routes) in the provider's test suite.
+/// A provider that bypasses all of that still trips the `debug_assert` below the first time any test
+/// drives a native geometry into a `use_pid` request, so the mis-wiring surfaces in CI instead of in a
+/// user's generate call.
 pub fn selected_decode_tiling(req: &GenerationRequest) -> Option<(i32, i32)> {
     let memory = req.memory?;
     if !memory.tile_vae_decode {
         return None;
     }
     let edge = memory.decode_tile_edge?;
+    // SC-15775. `req.use_pid` is already true for every caller of this function (the sole path in is
+    // `resolve_pid_decoder_at_sigma`, which returns early otherwise), so an edge here is bound for the
+    // super-resolving student. Release behaviour is deliberately unchanged — `validate_tile` in
+    // `mint_planned_decoder_with_tiling` still rejects, typed, and still never re-plans — but a debug
+    // build fails loudly and names the fix, which turns a production rejection into a CI failure.
+    debug_assert!(
+        crate::budget::is_tile_edge_candidate(edge as i32),
+        "PiD decode seam received tile edge {edge}, which is not one of the student's candidates \
+         {:?}: the provider emitted a NATIVE VAE geometry into the `use_pid` route. Declare both \
+         routes with `mlx_gen_pid::decode_routes::DecodeRoutes` and reject the combination at \
+         admission (SC-15775).",
+        crate::budget::tile_edge_candidates(),
+    );
     let overlap = memory
         .decode_overlap
         .unwrap_or(crate::budget::DEFAULT_TILE_OVERLAP as u32);
@@ -589,19 +609,67 @@ mod selected_tiling_tests {
         );
     }
 
-    /// A geometry from the *native VAE* route reaches the validator as-is and is refused there — it is
-    /// never quietly re-planned, because executing a different strategy than the selector chose is
-    /// exactly what the shared contract forbids.
+    /// A geometry from the *native VAE* route is **refused**, never quietly re-planned — executing a
+    /// different strategy than the selector chose is exactly what the shared contract forbids.
+    ///
+    /// This is the release-build half: the geometry travels to
+    /// [`budget::validate_tile`](crate::budget::validate_tile) as-is and is rejected there, typed,
+    /// with no fallback to the auto-plan. The debug-build half is
+    /// [`the_seam_asserts_when_a_provider_emits_a_native_vae_edge`].
     #[test]
-    fn a_native_vae_geometry_is_passed_through_to_be_refused_not_silently_replanned() {
-        let selected = selected_decode_tiling(&req(Some(GenerationMemory {
+    fn a_native_vae_geometry_is_refused_by_the_validator_not_silently_replanned() {
+        // Deliberately NOT through `selected_decode_tiling` — in a debug build the SC-15775 assertion
+        // fires there first, which the `#[should_panic]` test below is what covers.
+        assert!(crate::budget::validate_tile("t", 512, 64, 4096, 4096).is_err());
+        assert!(crate::budget::validate_tile("t", 768, 64, 4096, 4096).is_err());
+        // Nothing about the refusal is a re-plan: the auto-plan for the same output is a legal tile,
+        // and the rejected selection did not become it.
+        let plan = crate::budget::plan_tile_edge(1, 4096, 4096, 16, 1536, 8.0);
+        assert!(crate::budget::is_tile_edge_candidate(plan.edge));
+        assert_ne!(plan.edge, 512);
+    }
+
+    /// SC-15775, the mis-wiring net: a provider that emits its **native** VAE ladder into the
+    /// `use_pid` route trips the shared seam's assertion, so the defect lands in CI rather than in a
+    /// user's generate call.
+    ///
+    /// `debug_assertions`-gated because that is exactly the contract — the assertion costs nothing in
+    /// release, where [`budget::validate_tile`](crate::budget::validate_tile) is still the (typed)
+    /// rejection.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "NATIVE VAE geometry")]
+    fn the_seam_asserts_when_a_provider_emits_a_native_vae_edge() {
+        let _ = selected_decode_tiling(&req(Some(GenerationMemory {
             tile_vae_decode: true,
             decode_tile_edge: Some(512),
             decode_overlap: Some(64),
             ..Default::default()
         })));
-        assert_eq!(selected, Some((512, 64)));
-        let (edge, overlap) = selected.unwrap();
-        assert!(crate::budget::validate_tile("t", edge, overlap, 4096, 4096).is_err());
+    }
+
+    /// Every candidate the student actually publishes passes the seam untouched — the assertion
+    /// guards the domain, it does not narrow it.
+    #[test]
+    fn every_pid_candidate_passes_the_seam_unchanged() {
+        for edge in crate::budget::tile_edge_candidates() {
+            assert_eq!(
+                selected_decode_tiling(&req(Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    decode_tile_edge: Some(edge as u32),
+                    decode_overlap: Some(crate::budget::DEFAULT_TILE_OVERLAP as u32),
+                    ..Default::default()
+                }))),
+                Some((edge, crate::budget::DEFAULT_TILE_OVERLAP))
+            );
+            assert!(crate::budget::validate_tile(
+                "t",
+                edge,
+                crate::budget::DEFAULT_TILE_OVERLAP,
+                8192,
+                8192
+            )
+            .is_ok());
+        }
     }
 }

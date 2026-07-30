@@ -125,6 +125,15 @@
 //! `safety_check` and the request scope, which both see `use_pid`, enforce the route's own subset. A
 //! selection built for one route is rejected on the other rather than silently re-planned.
 //!
+//! Both the split and its disjointness are the shared [`mlx_gen_pid::DecodeRoutes`]' (SC-15775), not
+//! this file's: this module's `decode_routes()` declares only the native ladder, the PiD half comes
+//! from the student, and
+//! [`check_decode_routes`](mlx_gen_pid::check_decode_routes) refuses a native ladder that reaches into
+//! the PiD domain. The
+//! obligation used to be a doc comment on `mlx_gen_pid::engine::selected_decode_tiling` telling the
+//! next adopter to copy this file's shape; it is now an API that the next adopter cannot get wrong
+//! quietly.
+//!
 //! ## Ownership
 //!
 //! This file declares *structure and parameter domains only*. Measured coefficients, envelopes, and
@@ -211,33 +220,26 @@ pub const DECODE_TILE_EDGES_REJECTED: &[u32] = &[448, 384, 320, 256];
 ///
 /// Same parameter, same unit, a different decoder: `use_pid` replaces the native VAE with a
 /// super-resolving student that decodes in high-resolution *pixel* space at `scale×` the request, so
-/// its legal tiles live in an entirely different range — [`mlx_gen_pid::budget`]'s `TILE_ALIGN`
-/// multiples between `MIN_TILE_EDGE` and the Metal watchdog-safe `WATCHDOG_SAFE_EDGE`. Derived from
-/// those constants rather than re-spelled, so the two cannot drift.
+/// its legal tiles live in an entirely different range.
 ///
 /// SC-15615 had to *refuse* rung 2 (and cumulatively rung 3) on the PiD route because the student
 /// planned its own tiling and never read the contract's parameters — admitting a selection would have
 /// executed a different strategy than the selector chose. SC-15510 reconciles them instead: the
 /// student now accepts an explicit plan, and this is the value it accepts.
 ///
-/// **One candidate, for the same reason the native ladder has three.** `mlx_gen_pid::budget` will
-/// *validate* seven aligned edges between `MIN_TILE_EDGE` and `WATCHDOG_SAFE_EDGE`, and publishing all
-/// seven was the first draft. But the native domain earned its three by a real-weight sweep that
-/// rejected four for seaming — and publishing an unmeasured seven beside it would be exactly the
-/// double standard this story spent its evidence budget arguing against. Only
-/// [`PREFERRED_TILE_EDGE`](mlx_gen_pid::budget::PREFERRED_TILE_EDGE) has seam evidence: sc-10087's A/B
-/// measured 2048 px tiles at 256 px overlap as showing no measurable seam on this student, which is
-/// why the planner itself prefers it.
-///
-/// Widening this needs a per-student sweep against the untiled super-resolved decode, the way
-/// `every_declared_decode_candidate_runs_and_preserves_the_image` does for the native VAE. Until then
-/// one measured point is the honest domain — and a one-element domain is fully covered by a
-/// single-point pass, which is what SC-15508 actually asks.
+/// **The value is not this provider's to choose** (SC-15775). The student is shared across every
+/// PiD-eligible provider and tied to a *latent space* rather than to a model, so the domain — and the
+/// seam evidence behind its single candidate — lives with the student in
+/// [`DecodeRoutes::pid_edges`](mlx_gen_pid::DecodeRoutes::pid_edges). This function only re-exports it
+/// under the name the rest of this module reads. A provider that could *supply* this ladder could
+/// supply its native one by mistake, which is the whole defect the shared type exists to make
+/// unrepresentable.
 pub fn pid_decode_tile_edges() -> Vec<u32> {
-    vec![mlx_gen_pid::budget::PREFERRED_TILE_EDGE as u32]
+    mlx_gen_pid::DecodeRoutes::pid_edges()
 }
 
 /// The PiD route's feather overlap — the sc-10087 A/B's 256 px, which is `mlx_gen_pid`'s own default.
+/// Like the ladder above, owned by the student rather than by this provider.
 pub const PID_DECODE_OVERLAP: u32 = mlx_gen_pid::budget::DEFAULT_TILE_OVERLAP as u32;
 
 /// The production transformer-window domain for ladder rung 4 (SC-15754): how many of the 30 unified
@@ -349,7 +351,8 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2";
 
-/// The decode candidates a route will accept, and the default it falls back to.
+/// This provider's two bounded-decode routes, reconciled by the shared
+/// [`DecodeRoutes`](mlx_gen_pid::DecodeRoutes) (SC-15775).
 ///
 /// `use_pid` swaps the native VAE for a super-resolving student whose legal tiles live in a different
 /// range of the same unit (see [`pid_decode_tile_edges`]), so the domain is per-route. The contract's
@@ -357,33 +360,13 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
 /// and the static validator is not route-aware — while `safety_check` and the request scope, which
 /// both see `use_pid`, enforce the route's own subset. Defense in depth in the direction the contract
 /// allows: narrower at admission, never broader.
-fn decode_domain(use_pid: bool) -> (Vec<u32>, u32) {
-    if use_pid {
-        (pid_decode_tile_edges(), PID_DECODE_OVERLAP)
-    } else {
-        (DECODE_TILE_EDGES.to_vec(), DECODE_OVERLAP)
-    }
-}
-
-/// The union of both routes' tile edges, descending. Sorted and deduped because the shared
-/// conformance check rejects duplicate candidates.
-fn all_decode_tile_edges() -> Vec<u32> {
-    let mut edges: Vec<u32> = DECODE_TILE_EDGES
-        .iter()
-        .copied()
-        .chain(pid_decode_tile_edges())
-        .collect();
-    edges.sort_unstable_by(|a, b| b.cmp(a));
-    edges.dedup();
-    edges
-}
-
-/// The union of both routes' overlaps, descending.
-fn all_decode_overlaps() -> Vec<u32> {
-    let mut overlaps = vec![PID_DECODE_OVERLAP, DECODE_OVERLAP];
-    overlaps.sort_unstable_by(|a, b| b.cmp(a));
-    overlaps.dedup();
-    overlaps
+///
+/// The split used to be hand-rolled here. It is now the shared type's, because the PiD half of it is
+/// not this provider's to state: `DecodeRoutes` takes only the native ladder, derives the PiD one from
+/// the student, and its `conformance_errors` refuses a native ladder that reaches into the PiD domain
+/// — the cross-provider hazard SC-15775 exists to close.
+fn decode_routes() -> mlx_gen_pid::DecodeRoutes {
+    mlx_gen_pid::DecodeRoutes::new(DECODE_TILE_EDGES.iter().copied(), DECODE_OVERLAP)
 }
 
 /// Build the Z-Image MLX provider contract for `provider_id`.
@@ -435,8 +418,8 @@ pub fn memory_strategy_contract(provider_id: &str, spec: &LoadSpec) -> MemoryPro
                 },
                 parameters: match strategy {
                     MemoryStrategy::BoundedDecode => MemoryParameterRanges {
-                        decode_tile_edges: all_decode_tile_edges(),
-                        decode_overlaps: all_decode_overlaps(),
+                        decode_tile_edges: decode_routes().published_edges(),
+                        decode_overlaps: decode_routes().published_overlaps(),
                         ..Default::default()
                     },
                     MemoryStrategy::BoundedAttention => MemoryParameterRanges {
@@ -581,7 +564,7 @@ pub(crate) struct ZImageMemoryScope {
     pub(crate) geometry: MemoryGeometry,
     pub(crate) memory: Option<GenerationMemory>,
     /// Which decode this request runs, so `configure_decode` validates the route's own candidate
-    /// subset rather than the published union (see [`decode_domain`]).
+    /// subset rather than the published union (see [`decode_routes`]).
     pub(crate) use_pid: bool,
     /// The window a rung-4 selection admitted, so `materialize_transformer_window` can check the
     /// hook's `(first_block, block_count)` against the plan actually running instead of accepting any
@@ -675,22 +658,16 @@ impl MemoryRequestScope for ZImageMemoryScope {
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
         self.ensure_active()?;
-        let (edges, expected_overlap) = decode_domain(self.use_pid);
-        if !edges.contains(&tile_edge) {
-            return Err(CoreError::Unsupported(format!(
-                "{}: decode tile edge {tile_edge} is outside the {} route's candidates {edges:?}",
+        // The same shared, route-aware gate `safety_check` uses (SC-15775) — one implementation, so
+        // the scope cannot admit a geometry admission refused, or vice versa.
+        decode_routes()
+            .validate(
                 self.provider_id,
-                if self.use_pid { "PiD" } else { "native VAE" },
-            )));
-        }
-        if overlap != expected_overlap {
-            return Err(CoreError::Unsupported(format!(
-                "{}: the {} decode overlap is {expected_overlap}, got {overlap}",
-                self.provider_id,
-                if self.use_pid { "PiD" } else { "native VAE" },
-            )));
-        }
-        Ok(())
+                self.use_pid,
+                Some(tile_edge),
+                Some(overlap),
+            )
+            .map_err(CoreError::Unsupported)
     }
 
     fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
@@ -811,31 +788,16 @@ pub(crate) fn safety_check(
     // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
     // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
     // that the cost-order default now lives in exactly one documented place.
+    // SC-15775: the check itself is the shared `DecodeRoutes` gate rather than a per-provider match,
+    // so the next PiD-eligible adopter inherits it instead of re-deriving (or forgetting) it.
     if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-        let (edges, overlap) = decode_domain(context.use_pid);
-        let route = if context.use_pid {
-            "PiD overlay"
-        } else {
-            "native VAE"
-        };
-        match context.selection.parameters.decode_tile_edge {
-            Some(edge) if edges.contains(&edge) => {}
-            other => {
-                return MemorySafetyDecision::Reject {
-                    reason: format!(
-                        "{}: decode tile edge {other:?} is not a {route} candidate {edges:?}",
-                        contract.provider_id
-                    ),
-                };
-            }
-        }
-        if context.selection.parameters.decode_overlap != Some(overlap) {
-            return MemorySafetyDecision::Reject {
-                reason: format!(
-                    "{}: the {route} decode overlap is {overlap}, got {:?}",
-                    contract.provider_id, context.selection.parameters.decode_overlap
-                ),
-            };
+        if let Err(reason) = decode_routes().validate(
+            contract.provider_id.as_str(),
+            context.use_pid,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ) {
+            return MemorySafetyDecision::Reject { reason };
         }
     }
     if !context.budget.fits(context.predicted_peak_bytes) {
@@ -909,7 +871,7 @@ mod tests {
     /// no more, no less, which is what the shared validator requires. `use_pid` picks the route's
     /// decode domain, since the two do not overlap.
     fn selection_for(strategy: MemoryStrategy, use_pid: bool) -> MemorySelection {
-        let (edges, overlap) = decode_domain(use_pid);
+        let (edges, overlap) = decode_routes().domain(use_pid);
         let edge = if use_pid {
             // The largest PiD candidate, so the value is unambiguously from the PiD ladder.
             edges[0]
@@ -987,10 +949,45 @@ mod tests {
         let contract = contract();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        // SC-15775: the PiD-eligible half of the same conformance obligation. The shared check refuses
+        // a native ladder that reaches into the PiD student's tile domain, which is what keeps a
+        // `use_pid` + rung-2 request from carrying a geometry the shared seam would have to reject at
+        // generate time.
+        mlx_gen_pid::decode_routes::assert_decode_routes(crate::model::MODEL_ID, &decode_routes());
         assert_eq!(
             contract.calibration.as_ref().unwrap().fingerprint,
             "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2"
         );
+    }
+
+    /// SC-15775: the route domains are disjoint **by construction**, not by the current numbers
+    /// happening not to collide.
+    ///
+    /// The native ladder is a real-weight measurement that could legitimately move; what may never
+    /// move is that a native edge is never also a legal PiD tile, because the student decodes a
+    /// `scale×` super-resolved output and its floor sits above the whole native output. This asserts
+    /// the property against `mlx_gen_pid`'s own predicate rather than against the literals, so a future
+    /// widening of either side is caught here.
+    #[test]
+    fn no_native_decode_candidate_is_a_legal_pid_tile_edge() {
+        let routes = decode_routes();
+        mlx_gen_pid::check_decode_routes(crate::model::MODEL_ID, &routes).unwrap();
+        for &edge in routes.native_edges() {
+            assert!(
+                !mlx_gen_pid::budget::is_tile_edge_candidate(edge as i32),
+                "native candidate {edge} is also a legal PiD tile edge; the shared seam could not \
+                 tell the routes apart"
+            );
+        }
+        // The rejected native edges (which a future sweep might readmit) are on the same side.
+        for &edge in DECODE_TILE_EDGES_REJECTED {
+            assert!(!mlx_gen_pid::budget::is_tile_edge_candidate(edge as i32));
+        }
+        // And the PiD ladder this provider publishes is one the seam will actually honour.
+        for edge in pid_decode_tile_edges() {
+            assert!(mlx_gen_pid::budget::is_tile_edge_candidate(edge as i32));
+            assert!(!DECODE_TILE_EDGES.contains(&edge));
+        }
     }
 
     /// The fingerprint must move when the execution structure does. SC-15754 changes *when the trunk
