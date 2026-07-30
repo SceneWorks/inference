@@ -94,8 +94,9 @@ pub use registry::{
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec,
-    MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
+    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant,
+    WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

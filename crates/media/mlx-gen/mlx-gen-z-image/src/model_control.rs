@@ -169,8 +169,13 @@ pub(crate) fn resolve_control_base_and_control<'a>(
 pub(crate) fn load_control_text_encoder_only(
     root: &Path,
     quant: Option<Quant>,
+    streamable: bool,
 ) -> Result<TextEncoder> {
-    let mut text_encoder = loader::load_text_encoder(root)?;
+    let mut text_encoder = if streamable {
+        loader::load_text_encoder_streamable(root)?
+    } else {
+        loader::load_text_encoder(root)?
+    };
     if let Some(q) = quant {
         text_encoder.quantize(q.bits())?;
     }
@@ -282,7 +287,14 @@ pub(crate) fn build_control_residency(
         move || {
             let (root, _control) =
                 resolve_control_base_and_control(&spec_text, model_id, precision_msg)?;
-            load_control_text_encoder_only(root, spec_text.quantize)
+            load_control_text_encoder_only(
+                root,
+                spec_text.quantize,
+                matches!(
+                    spec_text.load_shape,
+                    mlx_gen::LoadShape::DeferredMaterialization
+                ),
+            )
         },
         move |_use_pid| {
             let (root, control) =
@@ -368,15 +380,18 @@ impl ZImageTurboControl {
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
-        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
-        // request selected it; a selection on a non-Sequential generator is rejected rather than
-        // silently degraded (see `pipeline::resolve_block_window`).
-        let block_window =
-            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
+        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
+        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
+        let deferred_materialization = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
         // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
         // includes the encoder, so an unscoped request conditions exactly as before.
         let encoder_window =
-            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
+            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores

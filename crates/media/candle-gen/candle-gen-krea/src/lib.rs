@@ -1219,10 +1219,11 @@ candle_gen::register_generators! {
 #[cfg(any(feature = "cuda", test))]
 fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContract {
     use gen_core::{
-        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
-        MemoryStrategySupport, MemoryWindowMaterialization,
+        MemoryPrerequisiteScope, MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy,
+        MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
+        MemoryWindowMaterialization,
     };
 
     MemoryProviderContract {
@@ -1266,6 +1267,17 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                 },
             })
             .collect(),
+        load_shape: LoadShape::DeferredMaterialization,
+        // Candle Krea's current streamed-block realization lives inside its three-stage loader.
+        // This additive edge records that backend coupling without making phase release a shared
+        // rung-4 prerequisite; MLX therefore remains free to use Resident+Deferred.
+        additional_prerequisites: vec![(
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        )],
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1480,6 +1492,18 @@ mod tests {
             tier,
         };
         let contract = krea_turbo_memory_strategy_contract();
+        assert!(
+            !gen_core::MemoryStrategy::BoundedTransformerResidency
+                .engages(gen_core::MemoryStrategy::StagedResidency),
+            "the shared rung-4 contract must not imply phase release"
+        );
+        assert!(
+            contract.engages(
+                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategy::StagedResidency
+            ),
+            "Krea's additive backend prerequisite must preserve its current three-stage coupling"
+        );
 
         assert_eq!(
             krea_generation_memory(contract, selected(gen_core::MemoryStrategy::Resident)),

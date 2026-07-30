@@ -179,10 +179,11 @@ mod explicit_registry_tests {
         use mlx_gen::gen_core::{LoadSpec, MemoryStrategy, MemoryStrategySupport, WeightsSource};
 
         let registry = super::provider_registry().unwrap();
-        // SC-15754: rung 4 is declared per LOAD — a re-openable snapshot dir loaded `Sequential`.
+        // SC-15998: rung 4 is declared per load — a re-openable snapshot dir with deferred
+        // materialization, independent from phase residency.
         // The registry must hand back the same contract the direct builder produces for that load.
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         for id in [
             "z_image_turbo",
             "z_image",

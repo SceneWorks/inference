@@ -890,6 +890,7 @@ mod tests {
             identity: None,
             text_encoder: None,
             offload_policy: Default::default(),
+            load_shape: Default::default(),
             components: Default::default(),
         };
         let err = match crate::provider_registry().unwrap().load("kolors", &spec) {
