@@ -800,14 +800,23 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     /// registering it, this check must fail loudly rather than quietly pick whatever is first.
     const SANA_ID: &str = "sana_1600m";
 
-    // (label, edge, decode tile in output px). `None` decodes whole-image.
+    // (label, edge, decode tile in output px). `None` would decode whole-image; nothing here does.
     //
-    // Ordered by ASCENDING measured peak, not by resolution: 1024-tiled is 3294 MiB on the host and
-    // 512-untiled is 4773. This app carries no `increased-memory-limit` entitlement (E5/S4.7 is
-    // still pending), so the larger configuration may be jetsam-killed — and running it first would
-    // mean learning nothing about the one that was going to work.
+    // BOTH configurations tile, and that is a device finding rather than a preference. An earlier
+    // revision ran `512 untiled` — 4773 MiB on the host, comfortably inside a 6136 MiB cap on
+    // paper — and it was **jetsam-killed on device** while 1024-at-128px-tiles completed at 2839
+    // MiB. So tiling is not merely how large images fit; it is what makes SANA survivable here at
+    // all, and the untiled path is not a configuration this harness should be asking the phone for.
+    //
+    // Why the host number misled: `image_budget` measures under `set_memory_limit`, which applies
+    // backpressure and makes MLX evict rather than grow. The device has no such limit — it has
+    // jetsam, which kills — so an untiled decode is free to allocate past what the host run
+    // recorded. That is the exact gap between "the working set fits" and "iOS lets the app live",
+    // and it is why this check exists.
+    //
+    // Still ordered by ASCENDING measured peak, so a kill leaves the cheaper configuration proven.
     let configs: &[(&str, u32, Option<u32>)] =
-        &[("1024 tile128", 1024, Some(128)), ("512 untiled", 512, None)];
+        &[("1024 tile128", 1024, Some(128)), ("512 tile256", 512, Some(256))];
 
     // Truncate any breadcrumb from a previous run FIRST. A stale one would be read as this run's
     // progress and point the blame at the wrong configuration — the same class of mistake as the
