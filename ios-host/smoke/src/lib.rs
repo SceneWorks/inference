@@ -166,6 +166,55 @@ fn peak_rss_mib() -> f64 {
     }
 }
 
+/// The per-app memory the OS will still let this process allocate, in MiB — or `None` off iOS.
+///
+/// Every memory conclusion on this branch has been measured against an *assumed* cap: "~6 GB on a
+/// 12 GB device, ~4 GB on 8 GB". Those are folklore. `os_proc_available_memory` is the number iOS
+/// actually enforces, read from the process it applies to, and it is the only way to know whether a
+/// measured peak has headroom or is one allocation from a jetsam kill.
+///
+/// It reports memory *remaining*, not the total limit, so it must be sampled at a known point —
+/// here, at the start of the report, before anything large is resident. Sampling it again after a
+/// large allocation gives the drop, which is a cross-check on MLX's own accounting.
+#[cfg(target_os = "ios")]
+fn available_memory_mib() -> Option<f64> {
+    extern "C" {
+        fn os_proc_available_memory() -> libc::size_t;
+    }
+    // SAFETY: no arguments, no pointers; returns 0 when unavailable (e.g. an unsupported platform).
+    let bytes = unsafe { os_proc_available_memory() };
+    (bytes > 0).then(|| bytes as f64 / (1024.0 * 1024.0))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn available_memory_mib() -> Option<f64> {
+    // macOS has no per-app cap, so there is no honest number to report and the host run says so
+    // rather than inventing one.
+    None
+}
+
+/// Report the OS-enforced per-app memory limit, so every other number has a denominator.
+fn check_memory_headroom() -> Check {
+    const NAME: &str = "per-app memory limit (OS-reported)";
+    match available_memory_mib() {
+        Some(mib) => Check {
+            name: NAME,
+            passed: true,
+            detail: format!(
+                "os_proc_available_memory = {mib:.0} MiB available at start of run \
+                 ({:.2} GiB) -- this is the real ceiling every peak below is measured against, \
+                 not an assumed one",
+                mib / 1024.0
+            ),
+        },
+        None => Check {
+            name: NAME,
+            passed: true,
+            detail: "not applicable on this platform (no per-app cap)".to_string(),
+        },
+    }
+}
+
 /// End-to-end generation through the `runtime-ios` bundle, from a snapshot in the app container.
 ///
 /// This is the check that matters for the product: not "does MLX dispatch a kernel" but "does the
@@ -842,8 +891,14 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             // jetsam reads, so the divergence is a host artifact; it is printed so the two can be
             // compared on device, where it should not appear.
             let mlx_peak = mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0);
+            // Headroom LEFT after the largest allocation of the run. This is the number that says
+            // whether the configuration is comfortable or one step from a kill, and unlike a
+            // percentage-of-assumed-cap it comes from the OS.
+            let headroom = available_memory_mib()
+                .map(|m| format!(", {m:.0} MiB still available"))
+                .unwrap_or_default();
             Ok(format!(
-                "{label}: {secs:.1}s, MLX peak {mlx_peak:.0} MiB, process RSS peak {:.0} MiB, \
+                "{label}: {secs:.1}s, MLX peak {mlx_peak:.0} MiB, process RSS peak {:.0} MiB{headroom}, \
                  pixel range {lo}..{hi}",
                 peak_rss_mib(),
             ))
@@ -890,6 +945,9 @@ pub fn run_report() -> String {
     let snapshot = find_snapshot();
     #[allow(unused_mut)]
     let mut checks = vec![
+        // First: it is the denominator for every memory number below, and it must be sampled
+        // before anything large is resident.
+        check_memory_headroom(),
         check_metallib_resolves(),
         check_gemm(Dtype::Float32, "f32 GEMM (steel)"),
         check_gemm(Dtype::Bfloat16, "bf16 GEMM (steel)"),

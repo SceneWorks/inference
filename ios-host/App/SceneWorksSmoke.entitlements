@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Raises the per-app memory limit above the device default.
+
+	     This is a SELF-SERVE capability, not one of the approval-gated ones (CarPlay, HLS, and
+	     friends): automatic signing regenerates the provisioning profile to include it. If that
+	     is ever wrong for this account the build fails loudly at the signing step, which is a
+	     better outcome than the branch continuing to assume a cap it never measured.
+
+	     It matters here because SANA's largest measured configuration is 4773 MiB of MLX
+	     allocation (docs/ios-epics.md, E5) and jetsam is a kill, not backpressure — the process
+	     dies where it stands with no crash log tying it to inference. The smoke report prints
+	     `os_proc_available_memory` so the effect of this entitlement is a measured number rather
+	     than an assumption. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<!-- Lets the process address more than 4 GB of virtual memory. Distinct from the limit above
+	     and needed alongside it: the increased limit raises what may be RESIDENT, this raises what
+	     may be MAPPED. MLX memory-maps weight files, so a snapshot larger than 4 GB (SANA's is
+	     4.73) can exhaust the address space even when residency is within budget. -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

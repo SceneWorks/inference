@@ -122,19 +122,24 @@ for entry in "$SRC"/*; do
     || { echo "MISSING on device: $name/ could not be listed" >&2; MISSING=1; continue; }
   for f in "$entry"/*; do
     fname=$(basename "$f")
-    local_gb=$(ls -l "$f" | awk '{printf "%.2f", $5/1e9}')
+    # GiB, not GB. devicectl LABELS its size column "GB" and reports GiB: a 1988912542-byte file
+    # lists as "1.85 GB" (1.99 decimal GB / 1.85 GiB). Comparing decimal GB against it flagged the
+    # transformer as a mismatch when the push was fine — and, worse, let the other two through only
+    # because their error happened to fall inside the tolerance. Match its units and the agreement
+    # is exact to two decimals, so the tolerance can be tight enough to actually mean something.
+    local_gib=$(ls -l "$f" | awk '{printf "%.2f", $5/1073741824}')
     line=$(echo "$SUB" | grep -F -- "$fname" || true)
     if [ -z "$line" ]; then
       echo "MISSING on device: $name/$fname" >&2; MISSING=1; continue
     fi
-    # devicectl reports GB for large files; compare to 0.1 GB tolerance (its rounding), which is
-    # loose on size but decisive against a whole component being substituted for another.
-    dev_gb=$(echo "$line" | grep -oE '[0-9.]+ GB' | grep -oE '[0-9.]+' || echo "")
-    if [ -n "$dev_gb" ]; then
-      awk -v a="$local_gb" -v b="$dev_gb" 'BEGIN { exit !((a-b < -0.1) || (a-b > 0.1)) }' \
-        && { echo "SIZE MISMATCH: $name/$fname local ${local_gb} GB vs device ${dev_gb} GB" >&2; MISSING=1; }
+    dev_gib=$(echo "$line" | grep -oE '[0-9.]+ GB' | grep -oE '[0-9.]+' || echo "")
+    if [ -n "$dev_gib" ]; then
+      awk -v a="$local_gib" -v b="$dev_gib" 'BEGIN { exit !((a-b < -0.02) || (a-b > 0.02)) }' \
+        && { echo "SIZE MISMATCH: $name/$fname local ${local_gib} GiB vs device ${dev_gib} GiB" >&2; MISSING=1; }
+      printf '  ok %s/%s (%s GiB)\n' "$name" "$fname" "$dev_gib"
+    else
+      printf '  ok %s/%s\n' "$name" "$fname"
     fi
-    printf '  ok %s/%s\n' "$name" "$fname"
   done
 done
 [ "$MISSING" -eq 0 ] || { echo "push incomplete" >&2; exit 1; }

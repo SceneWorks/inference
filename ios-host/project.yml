@@ -49,6 +49,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.idkplay.SceneWorksSmoke
+        # Raises the per-app memory limit and the virtual-address ceiling. See the file itself for
+        # why both, and why this is not an approval-gated capability. If automatic signing cannot
+        # grant them the build fails here rather than the app being killed on device.
+        CODE_SIGN_ENTITLEMENTS: App/SceneWorksSmoke.entitlements
         # The Rust staticlib and everything MLX links against.
         OTHER_LDFLAGS:
           - -lios_smoke
