@@ -59,6 +59,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// (the base Turbo text phase + DiT/VAE + the pose control branch).
 pub struct KreaTurboControl {
     descriptor: ModelDescriptor,
+    memory_strategy: gen_core::MemoryProviderContract,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -124,6 +125,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     validate_control_spec(spec)?;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(
+            KREA_2_TURBO_CONTROL_ID,
+            spec,
+        )?,
         residency: build_control_residency(spec)?,
     }))
 }
@@ -261,6 +266,21 @@ impl ControlBranch for KreaTurboControl {
 }
 
 impl KreaTurboControl {
+    fn calibration_fault(
+        &self,
+        req: &GenerationRequest,
+        phase: gen_core::MemoryPhase,
+    ) -> Result<()> {
+        match req.memory {
+            Some(memory) if memory.calibration_error_phase == Some(phase) => {
+                Err(Error::Msg(format!(
+                    "{KREA_2_TURBO_CONTROL_ID}: injected memory-strategy calibration error at {phase:?}"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
     /// lifts `mlx_rs` device exceptions; the trait wrapper bridges into [`gen_core::Error`]). Renders
     /// `req.count` CFG-free Turbo images, one per pose per seed (`seed + n`), each pose-locked by the
@@ -297,10 +317,15 @@ impl KreaTurboControl {
                 maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)
             },
             // Materialize the context while the text phase is still alive (Sequential only).
-            |ctx: &Array| Ok(mlx_rs::transforms::eval([ctx])?),
+            |ctx: &Array| {
+                mlx_rs::transforms::eval([ctx])?;
+                self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
+                Ok(())
+            },
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
             // identically for both residencies.
             |heavy_owned, context, on_progress| {
+                self.calibration_fault(req, gen_core::MemoryPhase::Denoise)?;
                 let heavy = heavy_owned.as_ref();
                 let safe_gib = mlx_gen::memory::safe_budget_gib();
 
@@ -326,16 +351,21 @@ impl KreaTurboControl {
                 // single-pass (a machine with headroom pays zero tiling overhead). Count-invariant (shape
                 // + tiers only), so it is decided ONCE here and reused for every seed. An infeasible
                 // decode surfaces here as a catchable error, before the render, rather than an OOM mid-run.
-                let decode_tiling = crate::memory::plan_control_decode_tiling(
-                    safe_gib,
-                    &heavy_owned.cfg,
-                    heavy.branch.num_blocks(),
-                    heavy_owned.base_tier,
-                    heavy_owned.branch_tier,
-                    req.width,
-                    req.height,
-                    text_co_resident,
-                )?;
+                let decode_tiling = match req.memory {
+                    Some(memory) if memory.tile_vae_decode => {
+                        Some(crate::memory::requested_control_decode_tiling(memory)?)
+                    }
+                    _ => crate::memory::plan_control_decode_tiling(
+                        safe_gib,
+                        &heavy_owned.cfg,
+                        heavy.branch.num_blocks(),
+                        heavy_owned.base_tier,
+                        heavy_owned.branch_tier,
+                        req.width,
+                        req.height,
+                        text_co_resident,
+                    )?,
+                };
 
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
@@ -360,6 +390,7 @@ impl KreaTurboControl {
                         heavy.branch,
                         control_scale,
                         decode_tiling.as_ref(),
+                        req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
                         &req.cancel,
                         on_progress,
@@ -392,6 +423,28 @@ impl Generator for KreaTurboControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            KREA_2_TURBO_CONTROL_ID,
+            &self.memory_strategy,
+            context,
+        )
+    }
 }
 
 // Explicit registration for `krea_2_turbo_control`. The `impl Generator` stays hand-written
@@ -401,6 +454,14 @@ mlx_gen::register_generators! {
     pub(crate) const CONTROL_REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: KREA_2_TURBO_CONTROL_ID,
+        contract: |spec| {
+            crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, spec)
+        },
+    };
 
 #[cfg(test)]
 mod tests {

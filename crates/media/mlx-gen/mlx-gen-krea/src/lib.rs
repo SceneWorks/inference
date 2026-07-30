@@ -51,6 +51,7 @@ pub mod control;
 pub mod convert;
 pub mod loader;
 pub mod memory;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod multiphase;
@@ -98,6 +99,7 @@ pub fn register_providers(
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_generator(model_control::CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -131,6 +133,32 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw"]);
+
+        let contract = registry
+            .memory_strategy_contract(
+                "krea_2_turbo_control",
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                    .with_control(mlx_gen::WeightsSource::File(
+                        "/nonexistent/control.safetensors".into(),
+                    ))
+                    .with_offload_policy(mlx_gen::OffloadPolicy::Sequential),
+            )
+            .unwrap()
+            .expect("Krea control memory contract");
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            crate::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            contract
+                .capability(mlx_gen::gen_core::MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            crate::memory_strategy::DECODE_TILE_EDGES
+        );
+        gen_core_testkit::check_memory_strategy_contract(&contract)
+            .expect("Krea control memory contract conformance");
     }
 }
 

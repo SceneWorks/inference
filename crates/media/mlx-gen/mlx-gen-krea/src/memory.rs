@@ -437,6 +437,32 @@ pub fn require_control_geometry(width: u32, height: u32, feasible: bool) -> Resu
     }
 }
 
+/// Resolve the exact bounded-decode parameters selected through the shared calibration contract.
+pub fn requested_control_decode_tiling(
+    memory: mlx_gen::gen_core::GenerationMemory,
+) -> Result<TilingConfig> {
+    let edge = memory.decode_tile_edge.ok_or_else(|| {
+        Error::Msg("krea_2_turbo_control bounded decode requires decode_tile_edge".to_owned())
+    })?;
+    let overlap = memory.decode_overlap.ok_or_else(|| {
+        Error::Msg("krea_2_turbo_control bounded decode requires decode_overlap".to_owned())
+    })?;
+    if !crate::memory_strategy::DECODE_TILE_EDGES.contains(&edge)
+        || overlap != crate::memory_strategy::DECODE_OVERLAP
+    {
+        return Err(Error::Msg(format!(
+            "krea_2_turbo_control unsupported bounded decode {edge}/{overlap}"
+        )));
+    }
+    Ok(TilingConfig {
+        spatial: Some(mlx_gen::tiling::SpatialTiling {
+            tile_px: edge as i32,
+            overlap_px: overlap as i32,
+        }),
+        temporal: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
