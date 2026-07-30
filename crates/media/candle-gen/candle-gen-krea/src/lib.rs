@@ -1185,7 +1185,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
         MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
         MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
-        MemoryStrategySupport,
+        MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
     MemoryProviderContract {
@@ -1194,6 +1194,35 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             device_residency: true,
             host_backed_weights: true,
             host_to_device_block_materialization: true,
+            // SC-16090, declared honestly rather than absorbed. The streamed trunk calls
+            // `SingleStreamBlock::load_planned` INSIDE the per-forward block loop (the
+            // `TransformerBlocks::Streamed` arm of `transformer::Krea2Transformer`), so on a packed
+            // tier every window rebuilds that block's projections from the MLX affine triples: through
+            // `loader::linear_detect`'s packed branch to `quant::QLinear::packed` ->
+            // `candle_gen::quant::QLinear::from_packed_gs` -> `candle_gen::quant::repack_packed_weight`.
+            //
+            // Krea does NOT go through `candle_gen::quant::lin` (its loader is an `MmapedSafetensors`
+            // wrapper, not a `VarBuilder` — see `crate::quant`'s module docs), so the conversion is the
+            // same one SC-15791 measured but reached from a different call site, on a different model's
+            // tier. The device round trip is present here too: `Weights::get_native` / `get_f32` load
+            // the triple onto the compute device and `repack::q4_parts` pulls all three straight back
+            // to the CPU. Under true CFG the loop runs twice per step, so a window's cost is paid
+            // `blocks x 2 x steps` times.
+            //
+            // Rung 4 stays `Implemented` and stays selectable: within the memory ladder it is reached
+            // only when nothing cheaper fits, so its alternative there is no render at all. It is also
+            // reachable to hold a HIGHER tier under an automatic tier choice, which is a decided
+            // fidelity-first trade rather than an oversight (SC-16090/SC-16104) — so this conversion is
+            // paid on q8, the tier where it is worst. sc-16096 removes it, after which this becomes
+            // `DeviceFormatTransfer` and the `owner_story` escape hatch goes away.
+            block_materialization: MemoryWindowMaterialization::HostFormatConversion {
+                converts:
+                    "MLX affine packed triple -> GGML Q4_1 (q4) / dense f32 grid -> Q8_0 (q8), \
+                           per projection, per window, per forward (loader::linear_detect -> \
+                           quant::QLinear::packed -> candle_gen::quant::repack_packed_weight)"
+                        .to_owned(),
+                owner_story: "sc-16096".to_owned(),
+            },
         },
         strategies: MemoryStrategy::ALL
             .into_iter()
@@ -1522,6 +1551,56 @@ mod tests {
         // ...while the rungs the provider DOES declare stay on, so this is not a vacuous all-false.
         assert!(memory.chunk_attention);
         assert!(memory.stream_transformer_blocks);
+    }
+
+    /// **SC-16090.** The shipped contract must be conformance-clean, asserted here rather than only in
+    /// gen-core's own tests, because `conformance_errors` has no caller in this repo: the consumer is
+    /// SceneWorks' selector, which bails on ANY non-empty result and drops this provider to
+    /// resident-only gating. So a rung-4 declaration that stops naming its owner story — or a `converts`
+    /// string emptied while editing — would not fail anything here and would surface in production as
+    /// Krea silently losing its whole ladder.
+    ///
+    /// Also pins the declaration itself, so flipping to `DeviceFormatTransfer` is a deliberate two-place
+    /// edit (sc-16096) rather than something a refactor can do quietly while the comment above still
+    /// claims a conversion happens.
+    #[test]
+    fn the_shipped_contract_is_conformance_clean_and_declares_its_window_realization() {
+        use gen_core::{MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization};
+
+        let contract = build_krea_turbo_memory_strategy_contract();
+        assert_eq!(
+            contract.conformance_errors(),
+            Vec::<String>::new(),
+            "the shipped Krea contract must be conformance-clean; a non-empty result makes the \
+             shared selector drop every rung, not just rung 4"
+        );
+
+        // Rung 4 is declared Implemented, so the window-realization rule is genuinely engaged above
+        // rather than passing because nothing streams.
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        ));
+
+        let Some(MemoryWindowMaterialization::HostFormatConversion {
+            converts,
+            owner_story,
+        }) = contract.window_materialization()
+        else {
+            panic!(
+                "Krea's streamed trunk still rebuilds each block from the packed triple per forward, \
+                 so the honest declaration is HostFormatConversion until sc-16096 lands: {:?}",
+                contract.window_materialization()
+            );
+        };
+        assert_eq!(owner_story, "sc-16096");
+        assert!(
+            converts.contains("repack_packed_weight"),
+            "`converts` is the pointer a reviewer follows to the conversion; it must name the real \
+             call site, not a path Krea does not take: {converts}"
+        );
     }
 
     #[test]
