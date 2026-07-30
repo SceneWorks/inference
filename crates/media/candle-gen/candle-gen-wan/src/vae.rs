@@ -66,6 +66,9 @@ pub(crate) fn candle_error(error: CandleError) -> candle_gen::candle_core::Error
     match error {
         CandleError::Candle(error) => error,
         CandleError::Msg(message) => candle_gen::candle_core::Error::Msg(message),
+        error @ CandleError::GeometryRefused { .. } => {
+            candle_gen::candle_core::Error::Msg(error.to_string())
+        }
         // Compatibility wrappers use a fresh, never-cancelled flag, so this arm is defensive only.
         CandleError::Canceled => candle_gen::candle_core::Error::Msg("cancelled".into()),
     }
@@ -804,6 +807,21 @@ fn plan_wan22_tiling(
 mod budget_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn compatibility_error_bridge_keeps_geometry_refusal_details() {
+        let bridged = candle_error(CandleError::GeometryRefused {
+            reason: "requested geometry is not feasible".to_owned(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: None,
+        });
+        let message = bridged.to_string();
+
+        assert!(message.contains("requested geometry is not feasible"));
+        assert!(message.contains("1536x1024"));
+        assert!(message.contains("verified alternative: None"));
+    }
 
     #[test]
     fn streaming_driver_cancels_between_chunks_and_cleans_up() {
