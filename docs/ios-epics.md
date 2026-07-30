@@ -416,6 +416,64 @@ Two things this corrects:
   and worth understanding before relying on it. Likely less allocator pressure and better cache
   behaviour, but that is a hypothesis, not a measurement.
 
+### Scoping the fix (2026-07-30)
+
+**Correction first.** I earlier said 512px would fit a 17 Pro Max's ~6 GB cap sequentially. That
+was wrong: I compared a number measured under a **4 GB** budget (5065 MiB) against a 6 GB cap. The
+budget changes the measurement — MLX's backpressure limit alters allocator behaviour — so re-run
+at 6144 MiB, 512px is **6678 MiB (109%)**, still over. Never compare across budgets.
+
+Measured against a 12 GB device (~6144 MiB cap):
+
+| Resolution | Resident | Sequential | Verdict |
+|---|---|---|---|
+| 1024px | — | 8340 MiB (136%) | over |
+| 768px | 8287 MiB (135%) | 8146 MiB (133%) | over |
+| 512px | 6899 MiB (112%) | 6678 MiB (109%) | over |
+| **256px** | 6320 MiB (103%) | **5049 MiB (82%)** | **fits, tight** |
+
+So there *is* a shipping configuration today — 256px sequential on a 12 GB device — but it is one
+device class at a thumbnail resolution, and only 18% clear of the cap.
+
+**The 2-bit quant is the wrong lever.** `mlx-gen-sana`'s docs mention an unported 2-bit Clark Labs
+quant, and I assumed that was the fix. Reading the code: that quant applies to the **transformer
+trunk**, and the trunk is already 2.0 GB in Q4.
+
+**The real lever is the text encoder's embedding table**, found by breaking the encoder's 2.32 GB
+down by tensor:
+
+| Component | Size | Quantized? |
+|---|---|---|
+| `embed_tokens` | **1.18 GB** | **no — dense BF16** |
+| packed projections | 1.01 GB | yes (Q4) |
+| scales/biases | 0.13 GB | — |
+
+`gemma2.rs:65` states it outright: *"`embed_tokens` is NOT routed here — it stays dense in every
+tier."* That is a reasonable default for a decoder, where the embedding is also the LM head. But
+**this is a caption encoder** — it takes last-hidden states, never produces logits
+(`gemma2.rs:3`), and touches the table exactly once via `take_axis`, a pure gather of ≤300 rows
+from 256,000 (`gemma2.rs:298`).
+
+Quantizing it costs one gather-then-dequantize of the ~300 selected rows — MLX already exposes
+`dequantize` — and saves:
+
+| Embedding tier | Table | Encoder total |
+|---|---|---|
+| BF16 (today) | 1.18 GB | 2.32 GB |
+| Q8 | 0.63 GB | 1.77 GB |
+| Q4 | 0.33 GB | **1.47 GB** |
+
+**~0.85 GB off the encoder**, which is the phase that dominates the low-resolution floor.
+
+**Scope:** small and well-bounded — quantize `embed_tokens` when writing the tier, and gather-then
+-dequantize in `Gemma2::forward`. It touches `mlx-gen-pid`'s Gemma-2 (shared with SANA), so PiD's
+dense path must stay bit-identical, and it needs a new tier on the HF snapshot. Estimate **2–4
+days**, against an unknown-size trunk port.
+
+**What it does not do:** ~0.85 GB does not bring 1024px (8.3 GB) under a 6 GB cap. It would move
+512px from 6678 → ~5.8 GB, i.e. 512px on a 12 GB device — a real improvement over 256px, and
+still not an 8 GB device.
+
 **What would actually move the number**, in order of expected effect:
 
 1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component
