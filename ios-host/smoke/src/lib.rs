@@ -1180,6 +1180,30 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             ),
         );
 
+        // What MLX believes its budget is, against what iOS will actually allow.
+        //
+        // MLX sizes its memory and cache limits from the system's recommended working-set, which on a
+        // Mac is the right denominator. An iOS app is not bounded by the machine's RAM but by a
+        // per-process jetsam limit far below it, and nothing tells MLX that. If these two numbers
+        // come back near device RAM rather than near `os_proc_available_memory`, then MLX is holding
+        // reclaimable buffers up to a ceiling that does not exist, and the app is killed while
+        // sitting on memory it would have freed on request.
+        append_breadcrumb(
+            "zimage-progress.txt",
+            &format!(
+                "  [{edge}px] MLX budget — memory_limit={:.0} MiB, cache_limit(probe)={:.0} MiB, \
+                 os_available={} MiB",
+                mlx_rs::memory::get_memory_limit() as f64 / (1024.0 * 1024.0),
+                {
+                    // No getter for the cache limit: set it to read it, then restore what was there.
+                    let prev = mlx_rs::memory::set_cache_limit(0);
+                    mlx_rs::memory::set_cache_limit(prev);
+                    prev as f64 / (1024.0 * 1024.0)
+                },
+                available_memory_mib().map(|m| format!("{m:.0}")).unwrap_or_default()
+            ),
+        );
+
         // A concurrent sampler, because the interesting failure kills the process mid-decode.
         //
         // Every breadcrumb so far is written by the progress callback, which fires on phase CHANGE --
@@ -1199,16 +1223,24 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             std::thread::spawn(move || {
                 let t0 = Instant::now();
                 while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                    // `cache` is not decoration. The 1024px kill ran the decode with 4 MiB of
+                    // headroom while MLX reported a 2901 MiB peak — so ~3.2 GB of the process
+                    // footprint was invisible to `active`/`peak`. MLX retains freed buffers in a
+                    // reuse cache that those two metrics exclude but `phys_footprint` (and therefore
+                    // jetsam) counts in full. Without this column the trace shows a bounded decode
+                    // being killed for no reason.
+                    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
                     append_breadcrumb(
                         "zimage-progress.txt",
                         &format!(
-                            "    t={:>6.2}s avail={:>6} MiB active={:>6.0} MiB peak={:>6.0} MiB tiles={}",
+                            "    t={:>6.2}s avail={:>6} MiB active={:>6.0} cache={:>6.0} peak={:>6.0} MiB tiles={}",
                             t0.elapsed().as_secs_f64(),
                             available_memory_mib()
                                 .map(|m| format!("{m:.0}"))
                                 .unwrap_or_else(|| "n/a".to_string()),
-                            mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0),
-                            mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0),
+                            mib(mlx_rs::memory::get_active_memory()),
+                            mib(mlx_rs::memory::get_cache_memory()),
+                            mib(mlx_rs::memory::get_peak_memory()),
                             mlx_gen::vae_tiling::tiles_decoded(),
                         ),
                     );
