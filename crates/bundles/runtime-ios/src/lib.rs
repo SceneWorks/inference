@@ -86,6 +86,50 @@ mod tests {
         assert!(snapshot.audio_generator_ids.is_empty());
     }
 
+    /// The threading contract is enforced by the **type system**, not by documentation.
+    ///
+    /// A loaded provider holds MLX `Array`s and MLX's default Metal device is not thread-safe, so
+    /// a provider must be driven from one thread (or behind a mutex). On macOS that reads as a
+    /// test-harness detail — `.cargo/config.toml` forces `RUST_TEST_THREADS=1`, so the problem
+    /// stays hidden. **On iOS it is host-app correctness**: a Swift caller that hops a provider
+    /// onto a `DispatchQueue` or into a `Task` would race MLX's device and crash intermittently,
+    /// and intermittent is the expensive kind.
+    ///
+    /// Asserted here rather than assumed: `Box<dyn TextLlm>` is **not `Send`**, so that mistake
+    /// does not compile. The check is a runtime read of a compile-time fact — `impls_send` is
+    /// resolved by autoref specialization, so it reports what the type system actually decided
+    /// rather than what this comment claims. If a future change made the trait object `Send`, the
+    /// unsafe pattern would silently become legal and this test fails first.
+    #[test]
+    fn provider_is_not_send_so_cross_thread_use_cannot_compile() {
+        // Autoref specialization: the inherent method on `Wrap<T>` wins only when `T: Send`,
+        // otherwise the blanket trait method on `&Wrap<T>` is selected. That makes "is this type
+        // Send?" observable at runtime without a `trybuild` fixture.
+        struct Wrap<T>(std::marker::PhantomData<T>);
+        trait NotSend {
+            fn impls_send(&self) -> bool {
+                false
+            }
+        }
+        impl<T> NotSend for &Wrap<T> {}
+        impl<T: Send> Wrap<T> {
+            fn impls_send(&self) -> bool {
+                true
+            }
+        }
+
+        let provider = Wrap::<Box<dyn super::core_llm::TextLlm>>(std::marker::PhantomData);
+        assert!(
+            !(&provider).impls_send(),
+            "Box<dyn TextLlm> became Send: a host could now move a provider across threads, \
+             which races MLX's non-thread-safe Metal device"
+        );
+
+        // Control: a plainly-Send type reports true, so a false negative above would be caught.
+        let snapshot = Wrap::<super::RuntimeCatalogSnapshot>(std::marker::PhantomData);
+        assert!((&snapshot).impls_send(), "control type should be Send");
+    }
+
     /// The declared triples are the ones the toolchain and CI actually build.
     #[test]
     fn supported_triples_are_ios_only() {

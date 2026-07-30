@@ -77,6 +77,26 @@ python3 scripts/ios/bundle_metallib.py \
 `newLibraryWithURL:` and then fails at the first kernel dispatch, so the guard turns a runtime
 crash into a build failure.
 
+## Threading: one provider, one thread
+
+A loaded provider holds MLX `Array`s, and MLX's default Metal device is **not thread-safe**. Drive
+one provider from one thread, or put it behind a mutex.
+
+The type system enforces this: `Box<dyn TextLlm>` is **not `Send`**, so moving a provider between
+threads does not compile (pinned by a test in this crate). That covers Rust callers completely.
+
+**It does not cover a Swift host**, which reaches the runtime through a C ABI where Rust's marker
+traits are invisible. On that side the rule is a convention you have to keep:
+
+- Own the provider on one thread — a dedicated serial `DispatchQueue` is the simplest correct
+  choice. Do **not** call in from arbitrary `Task` contexts, whose executor may hop threads.
+- Never call in from the main thread for anything long: model load and generation are seconds of
+  blocking work, and a blocked main thread is a watchdog kill.
+- Stream callbacks fire on the calling thread. Marshal to the main thread before touching UI.
+
+On macOS this reads as a test detail — `.cargo/config.toml` forces `RUST_TEST_THREADS=1`, so
+violations stay hidden. On iOS it is app correctness, and the failure mode is intermittent.
+
 ## Building
 
 No environment variables are needed — `.cargo/config.toml` pins the iOS deployment target:
