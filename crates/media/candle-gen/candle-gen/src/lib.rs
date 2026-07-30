@@ -202,6 +202,18 @@ pub enum CandleError {
     /// variant, sc-4481). Mirrors mlx-gen's `Error::Canceled`.
     #[error("cancelled")]
     Canceled,
+
+    /// A measured pre-render refusal. Keep every decision-surface field typed across the Candle seam
+    /// so worker/API telemetry can distinguish it from an opaque backend failure.
+    #[error(
+        "geometry refused: {reason}; requested {requested_width}x{requested_height}; verified alternative: {alternative:?}"
+    )]
+    GeometryRefused {
+        reason: String,
+        requested_width: u32,
+        requested_height: u32,
+        alternative: Option<(u32, u32)>,
+    },
 }
 
 impl From<CandleError> for gen_core::Error {
@@ -212,6 +224,17 @@ impl From<CandleError> for gen_core::Error {
             CandleError::Msg(s) => gen_core::Error::Msg(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
+            CandleError::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
         }
     }
 }
@@ -229,6 +252,17 @@ impl From<gen_core::Error> for CandleError {
             gen_core::Error::Canceled => CandleError::Canceled,
             gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
             gen_core::Error::Unsupported(s) => CandleError::Msg(format!("unsupported: {s}")),
+            gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => CandleError::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
             gen_core::Error::Io(io) => CandleError::Msg(io.to_string()),
             gen_core::Error::Backend(b) => CandleError::Msg(b.to_string()),
             gen_core::Error::Msg(s) => CandleError::Msg(s),
@@ -310,6 +344,36 @@ mod tests {
         let candle_err = CandleError::from(bad.unwrap_err());
         let neutral: gen_core::Error = candle_err.into();
         assert!(matches!(neutral, gen_core::Error::Backend(_)));
+    }
+
+    #[test]
+    fn geometry_refusal_round_trips_without_losing_decision_fields() {
+        let neutral = gen_core::Error::GeometryRefused {
+            reason: "measured infeasible".to_owned(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: Some((1024, 1024)),
+        };
+        let candle = CandleError::from(neutral);
+        assert!(matches!(
+            &candle,
+            CandleError::GeometryRefused {
+                reason,
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+            } if reason == "measured infeasible"
+        ));
+        let neutral = gen_core::Error::from(candle);
+        assert!(matches!(
+            neutral,
+            gen_core::Error::GeometryRefused {
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+                ..
+            }
+        ));
     }
 
     #[test]

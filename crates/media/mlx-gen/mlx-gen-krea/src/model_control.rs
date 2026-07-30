@@ -411,6 +411,27 @@ mod tests {
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
 
     #[test]
+    fn generate_call_path_preserves_requested_geometry_through_render() {
+        let source = include_str!("model_control.rs");
+        let start = source
+            .find("let feasible = crate::memory::control_geometry_fits(")
+            .expect("requested-geometry feasibility gate");
+        let end = source[start..]
+            .find("Ok(GenerationOutput::Images(images))")
+            .map(|offset| start + offset)
+            .expect("render-loop end");
+        let path = &source[start..end];
+        assert!(path
+            .contains("crate::memory::require_control_geometry(req.width, req.height, feasible)?"));
+        assert!(path.contains(
+            "heavy.heavy.prepare_control(\n                    &context,\n                    control_image,\n                    render_width,\n                    render_height,"
+        ));
+        assert!(path.contains(
+            "let opts = TurboOptions {\n                        width: render_width,\n                        height: render_height,"
+        ));
+    }
+
+    #[test]
     fn descriptor_is_krea_2_turbo_control() {
         let d = descriptor();
         assert_eq!(d.id, "krea_2_turbo_control");
