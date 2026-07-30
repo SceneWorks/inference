@@ -157,6 +157,11 @@ mod explicit_registry_tests {
                 .decode_tile_edges,
             crate::memory_strategy::DECODE_TILE_EDGES
         );
+        assert_eq!(
+            crate::memory_strategy::DECODE_TILE_EDGES,
+            [crate::memory_strategy::DECODE_TILE_EDGE],
+            "only the exact real-weight-verified 512 px decode edge may be advertised"
+        );
         let routes = mlx_gen_pid::assert_decode_routes(
             "krea_2_turbo_control",
             crate::memory_strategy::DECODE_TILE_EDGES,

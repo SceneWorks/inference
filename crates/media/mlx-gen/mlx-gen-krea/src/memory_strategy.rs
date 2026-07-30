@@ -13,10 +13,13 @@ use mlx_gen::gen_core::{
 };
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "krea-control-mlx-v3-q4-pose-bounded-decode-512-384-64";
+    "krea-control-mlx-v4-q4-pose-bounded-decode-512-64";
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
-pub const DECODE_TILE_EDGES: [u32; 2] = [DECODE_TILE_EDGE, 384];
+/// Exact tile-edge domain admitted by current real-weight evidence. The 384 px candidate is
+/// deliberately excluded: the clean 1024² sc-16099 run exceeded the established diffusion-latent
+/// maximum-error threshold, so it must not inherit the 512 px calibration.
+pub const DECODE_TILE_EDGES: [u32; 1] = [DECODE_TILE_EDGE];
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
     mlx_gen_pid::DecodeRoutes::new(
