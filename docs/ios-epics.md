@@ -319,6 +319,47 @@ the lane fails before a broader-device release would rather than after.
 
 ---
 
+## Working without a dedicated device
+
+The iPhone is a daily driver, not lab hardware. That is a real constraint, and it shapes the
+remaining work more than the estimates do.
+
+**Most of what is left does not need the phone.** Sorting the remaining questions by where they
+can actually be answered:
+
+| Question | Mac? | Why |
+|---|---|---|
+| Does it build for iOS? | **yes** | CI cross-compiles both triples already |
+| Is the composition right? | **yes** | Surface tests are target-independent |
+| Are the Metal kernels correct? | **yes** | Same metallib; E3 proved the iOS build matches |
+| Does the model generate correctly? | **yes** | Same code, same weights |
+| **Does it fit the memory cap?** | **mostly** | `examples/memory_budget` — see below |
+| **Does it thermally throttle?** | no | Passive cooling in a phone chassis |
+| **Energy per 100 tokens** | no | Instruments, on device |
+
+`cargo run --release -p mlx-llm --example memory_budget -- <snapshot> [--budget-mib N]` runs a
+model under a simulated iOS per-app cap **on macOS**, reporting MLX's active/peak/cache footprint
+and a fits / tight / over-budget verdict. Validated against the device: it reports 2719 MiB peak
+where the iPhone measured 2693 MiB, ~1% apart. Allocator behaviour carries over because it is the
+same code, weights, and Metal allocator.
+
+It does **not** simulate jetsam (`set_memory_limit` is backpressure — MLX blocks rather than
+failing) or the host app's own footprint. A pass is necessary, not sufficient. But it moves the
+*search* for a memory configuration off the phone, leaving the device to *confirm* one number.
+
+**Two batched device sessions, not continuous access:**
+
+| Session | When | What | ~Time |
+|---|---|---|---|
+| **A** | after E5's Mac-side work | SANA generation, memory at the cap, latency baselines, **plus the Instruments energy capture that closes E4/S4.4** | ~2 h |
+| **B** | after E6's Mac-side work | Two models under one cap — the one thing the Mac cannot simulate faithfully | ~2 h |
+
+Between sessions the phone is free. During one: **plugged in, auto-lock off**. Three runs died on
+auto-lock during E3/E4 bring-up, each costing a full rebuild cycle — that is the difference
+between a 2-hour session and a 4-hour one.
+
+---
+
 ## E5 — Small image generation (SANA)
 
 **Goal:** G6 — a small image-only generator on device.
