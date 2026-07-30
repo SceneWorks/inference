@@ -1134,6 +1134,22 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
                 chunk_attention: true,
                 stream_transformer_blocks: true,
                 transformer_window_size: Some(1),
+                // The decode tile edge, and the reason it is a knob.
+                //
+                // z-image's published ladder marks every edge below 512 "rejected", because the
+                // REQUEST peak pinned at 4.898 GiB however small the tiles got — finer tiles cost
+                // fidelity and bought no admission. But that ladder was measured WITHOUT rung 4.
+                // With rung 4 carrying denoise down to 1.795 GiB, the decode becomes the binding
+                // phase, so shrinking it moves the request peak for the first time:
+                //
+                //   edge 512 -> decode 4.363 GiB      edge 384 -> 3.896      edge 256 -> 3.544
+                //
+                // The phase trace puts the kill inside a decode that had 5778 MiB available, so the
+                // device charges >1.3 GB more than the host's 4468 for this phase. A smaller edge is
+                // the only lever that acts on that phase without changing the model.
+                decode_tile_edge: std::env::var("IOS_SMOKE_ZIMAGE_TILE")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
                 ..Default::default()
             }),
             ..Default::default()
