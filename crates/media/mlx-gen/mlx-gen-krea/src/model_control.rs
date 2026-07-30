@@ -195,11 +195,17 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// auto-detecting loader already built packed Linears in [`KreaHeavy::from_snapshot`], and
 /// [`crate::model::load_time_quant_bits`] returns `None` (or errors on a bit mismatch).
 ///
-/// The pose branch loads bf16 from its overlay (it carries no `.scales`), then is budget-gated to the
-/// base tier at load (sc-11748): [`crate::memory::should_quantize_control_branch`] packs it only when the
-/// base is itself packed AND the device budget won't fit the bf16 branch — otherwise the branch stays
-/// bf16 (a large-memory Mac pays no dequant-on-forward tax, per sc-11750). It is a LOAD-TIME decision (a
-/// resident weight can't be re-packed mid-render).
+/// The pose branch loads bf16 from its overlay (it carries no `.scales`), then is packed to the tier
+/// **tier integrity** assigns it (sc-15799): [`crate::memory::control_branch_quant_bits`] of the base
+/// width — q8 base ⇒ q8 branch, q4 base ⇒ q8 branch (the declared, measured floor), dense base ⇒ dense
+/// branch. It is still a LOAD-TIME decision (a resident weight can't be re-packed mid-render) but it is
+/// no longer a budget-gated *lever*: the sc-11748 gate kept a bf16 branch on any machine with headroom,
+/// which left **~3.3 GB** of precision the user did not ask for resident on a q8 render — the branch's
+/// projections are 3.30 B params ≈ 6.6 GB bf16 against ~3.3 GB packed at q8
+/// ([`crate::memory`] / `gen_core::tier_integrity`). (NOT the 8.4 GB the catalog's `branchPackSaveGb`
+/// once claimed: 8.4 exceeds the whole branch, so it was never a weight-side quantity; the key is
+/// retracted and sc-16013 owns the re-measure.) `control_scale == 0` stays bit-exact to the base at any
+/// tier.
 fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot(root)?;
     if !spec.adapters.is_empty() {
@@ -211,27 +217,16 @@ fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned>
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
     let mut branch = Krea2ControlBranch::from_source(control, &cfg)?;
-    // sc-11748 — budget-gated branch quant. The pose overlay always loads bf16; pack it to the base tier
-    // ONLY when the base is itself packed AND the device budget won't fit the bf16 branch at the lane's
-    // worst-case resolution. This is a LOAD-TIME gate: the branch is a resident weight that cannot be
-    // re-packed mid-render, so the decision is made once here (matching whichever tier the base runs at,
-    // whether packed at load or a pre-packed turnkey). A large-memory Mac keeps the branch bf16 — no
-    // dequant-on-forward — per sc-11750; `control_scale == 0` stays bit-exact to the base at any tier.
+    // sc-15799 — tier integrity. The pose overlay always loads bf16 (it ships no `.scales`); pack it to
+    // the tier the base tier implies, whether the base was packed at load or arrived pre-packed. No
+    // device-budget reading: the branch's tier is a consequence of the user's tier choice, not a rung.
     let base_bits = crate::model::effective_base_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)?;
     let base_tier = tier_from_bits(base_bits);
-    let mut branch_tier = None;
-    if let Some(bits) = base_bits {
-        if crate::memory::should_quantize_control_branch(
-            mlx_gen::memory::safe_budget_gib(),
-            &cfg,
-            branch.num_blocks(),
-            base_bits,
-            crate::model::RES_MAX,
-        ) {
-            branch.quantize(bits)?;
-            branch_tier = tier_from_bits(Some(bits));
-        }
+    let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
+    if let Some(bits) = branch_bits {
+        branch.quantize(bits)?;
     }
+    let branch_tier = tier_from_bits(branch_bits);
     Ok(ControlHeavyOwned {
         heavy,
         branch,
@@ -242,14 +237,11 @@ fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned>
 }
 
 /// Map an effective quant width (`4`/`8`) to the [`Quant`] tier the decode-tiling cost model weighs; any
-/// other width (or dense bf16) has no tier. Mirrors `crate::memory::tier_from_bits`, which is private to
-/// that module.
+/// other width (or dense bf16) has no tier. Delegates to `crate::memory::tier_from_bits` rather than
+/// mirroring it: the base and branch tiers must be read off ONE mapping now that the branch's tier is
+/// derived from the base's (sc-15799).
 fn tier_from_bits(bits: Option<i32>) -> Option<Quant> {
-    match bits {
-        Some(4) => Some(Quant::Q4),
-        Some(8) => Some(Quant::Q8),
-        _ => None,
-    }
+    bits.and_then(crate::memory::tier_from_bits)
 }
 
 /// The pose branch is pose-only (`Only([Pose])`) and defaults an unset `control_scale` to the S0 mid

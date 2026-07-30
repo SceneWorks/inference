@@ -5,9 +5,10 @@
 //!
 //! Two shape-derived peaks drive the plan (both **excluding** the phase-A Qwen3-VL text encoder, whose
 //! footprint the policy carries once as the residency lever):
-//!   * the **control-denoise** peak — the resident heavy weights (base DiT + the bf16 pose branch + the
-//!     VAE, all held through the heavy phase) plus the per-step activation working set of the
-//!     concatenated single-stream forward with the N-block branch injected;
+//!   * the **control-denoise** peak — the resident heavy weights (base DiT + the pose branch, at the tier
+//!     [`mlx_gen::gen_core::tier_integrity::control_branch_tier`] assigns it, + the VAE, all held through
+//!     the heavy phase) plus the per-step activation working set of the concatenated single-stream forward
+//!     with the N-block branch injected;
 //!   * the **Qwen-VAE decode** peak — the same resident heavy weights plus the full-output decode spike
 //!     through the `AutoencoderKLQwenImage` decoder stack (the sc-11747 target); its tiled floor is the
 //!     resident weights + the assembled output buffers + one minimal tile.
@@ -33,6 +34,7 @@
 //! estimate stays ≥ the measured peak (within ≤ ~1.16× at every tested point).
 
 use mlx_gen::gen_core::mempolicy::{plan_memory_adaptation, LaneLevers, MemoryPlan, StagePeaks};
+use mlx_gen::gen_core::tier_integrity::control_branch_tier;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingConfig, VaeTiling};
 use mlx_gen::{Error, Quant, Result};
 
@@ -289,9 +291,6 @@ pub struct ControlLaneInputs<'a> {
     pub height: u32,
     /// Whether the lane can drop to `OffloadPolicy::Sequential` (the Krea control lane wires it).
     pub supports_sequential: bool,
-    /// Whether the pose branch may be packed to the base tier at load (sc-11748). `true` ⇒ the
-    /// branch-quant lever is offered (bf16 → `base_tier`); `false` ⇒ the branch stays bf16.
-    pub allow_branch_quant: bool,
     /// Candidate resolution scales (largest-first, in `(0,1)`) offered as the last resort (sc-11749).
     pub resolution_scales: &'a [f64],
 }
@@ -300,38 +299,32 @@ pub struct ControlLaneInputs<'a> {
 /// [`StagePeaks`] estimator + [`LaneLevers`] and run them through the shared
 /// [`plan_memory_adaptation`]. `safe_gib` is the device budget ([`mlx_gen::memory::safe_budget_gib`]);
 /// the returned [`MemoryPlan`] tells the caller which levers to apply (residency / decode tiling /
-/// branch quant / resolution) and whether the render fits at all.
+/// resolution) and whether the render fits at all.
+///
+/// The pose branch's tier is **not** one of those levers (sc-15799): it is [`control_branch_tier`] of
+/// the base tier, so every peak below is estimated with the branch already at the tier it will actually
+/// load at. There is no branch-quant saving left for the policy to spend.
 pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> MemoryPlan {
-    // The branch packs to the base tier when the lever is offered (and the base is itself packed);
-    // otherwise it stays bf16. `branch_quant_saves` is the bf16 → base-tier delta on the branch weights.
-    let branch_quant_saves_gib = if inputs.allow_branch_quant && inputs.base_tier.is_some() {
-        (branch_bytes(inputs.cfg, inputs.branch_blocks, None)
-            - branch_bytes(inputs.cfg, inputs.branch_blocks, inputs.base_tier))
-            / GIB
-    } else {
-        0.0
-    };
-
     let levers = LaneLevers {
         text_resident_gib: text_resident_gib(inputs.base_tier),
         supports_sequential: inputs.supports_sequential,
-        branch_quant_saves_gib,
         resolution_scales: inputs.resolution_scales,
     };
+    // Tier integrity: the branch follows the base tier, with the declared q4 → q8 floor. Same value the
+    // loader packs to, so the estimate describes the configuration that will actually be resident.
+    let branch_tier = control_branch_tier(inputs.base_tier);
 
     plan_memory_adaptation(safe_gib, levers, |scale| {
         // Scale the render dimensions; keep them multiple-of-16 legal (the DiT/VAE alignment) by
         // flooring to the nearest 16 — the same alignment the pipeline validates.
         let w = scale_render_dim(inputs.width, scale);
         let h = scale_render_dim(inputs.height, scale);
-        // The branch is estimated at bf16 here; the branch-quant *saving* is applied by the policy via
-        // `branch_quant_saves_gib`, so the peaks must NOT also pre-apply it (double counting).
         StagePeaks {
             denoise_ex_text_gib: control_denoise_peak_ex_text_gib(
                 inputs.cfg,
                 inputs.branch_blocks,
                 inputs.base_tier,
-                None,
+                branch_tier,
                 w,
                 h,
             ),
@@ -339,7 +332,7 @@ pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> 
                 inputs.cfg,
                 inputs.branch_blocks,
                 inputs.base_tier,
-                None,
+                branch_tier,
                 w,
                 h,
             ),
@@ -347,7 +340,7 @@ pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> 
                 inputs.cfg,
                 inputs.branch_blocks,
                 inputs.base_tier,
-                None,
+                branch_tier,
                 w,
                 h,
             )),
@@ -355,9 +348,11 @@ pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> 
     })
 }
 
-/// Map a base-DiT quant width to the [`Quant`] tier the pose branch matches (`4 → Q4`, `8 → Q8`); any
-/// other width has no tier (the branch stays bf16).
-fn tier_from_bits(bits: i32) -> Option<Quant> {
+/// Map a base-DiT quant width to the [`Quant`] tier it names (`4 → Q4`, `8 → Q8`); any other width is
+/// dense (`None`). NVFP4 has no honest bit width (sc-11042) and never reaches this lane, so it is not
+/// expressible here — the branch tier is derived from the resulting [`Quant`] by
+/// [`control_branch_tier`], which does handle it.
+pub(crate) fn tier_from_bits(bits: i32) -> Option<Quant> {
     match bits {
         4 => Some(Quant::Q4),
         8 => Some(Quant::Q8),
@@ -365,47 +360,20 @@ fn tier_from_bits(bits: i32) -> Option<Quant> {
     }
 }
 
-/// Decide whether to pack the pose control branch to the base tier at LOAD time (sc-11748) — the
-/// branch-quant lever's mechanism half. The branch is a resident weight that cannot be re-packed
-/// mid-render, so the decision must hold for the largest render the loaded model can serve: this runs
-/// the shared [`plan_control_adaptation`] policy at the lane's worst-case resolution (`max_size`²) and
-/// returns [`MemoryPlan::quantize_branch`].
+/// The quant width the pose control branch is packed to at LOAD, given the base DiT's width
+/// (sc-15799 tier integrity — this REPLACES the sc-11748 budget gate `should_quantize_control_branch`).
 ///
-/// - `base_bits` `None` (dense bf16 base) or a non-Q4/Q8 width ⇒ `false`: there is no base tier for the
-///   branch to match (the branch only ever packs to the base's tier).
-/// - A machine with headroom ⇒ `false`: the branch stays bf16 (no dequant-on-forward) — the sc-11750
-///   "large-memory Mac pays zero overhead" guarantee.
-/// - A constrained Mac whose projected footprint won't fit even after the cheaper residency /
-///   decode-tiling levers ⇒ `true`: pack the branch to the base tier.
+/// A pure function of the base width. The device budget is deliberately **not** an input: packing the
+/// branch to the selected tier is not a memory lever the policy spends, it is what the user's tier
+/// choice already means. See [`mlx_gen::gen_core::tier_integrity`] for the rule and for the one
+/// declared, measured exception (a q4 base floors its branch at q8, because a q4 control residual
+/// measures "pose-locked; non-pose details drift").
 ///
-/// `resolution_scales` is deliberately empty — resolution reduction is a separate lever (sc-11749); this
-/// gate stands on residency + decode-tiling + branch-quant, so it never assumes a resolution reduction
-/// this call would not apply. `safe_gib` is injected ([`mlx_gen::memory::safe_budget_gib`] at the call
-/// site) so the decision is unit-testable without a device.
-pub fn should_quantize_control_branch(
-    safe_gib: f64,
-    cfg: &Krea2Config,
-    branch_blocks: usize,
-    base_bits: Option<i32>,
-    max_size: u32,
-) -> bool {
-    let Some(base_tier) = base_bits.and_then(tier_from_bits) else {
-        return false;
-    };
-    plan_control_adaptation(
-        safe_gib,
-        ControlLaneInputs {
-            cfg,
-            branch_blocks,
-            base_tier: Some(base_tier),
-            width: max_size,
-            height: max_size,
-            supports_sequential: true,
-            allow_branch_quant: true,
-            resolution_scales: &[],
-        },
-    )
-    .quantize_branch
+/// - `None` (dense bf16 base) ⇒ `None`: the branch is already at the selected tier.
+/// - `Some(8)` ⇒ `Some(8)`: follows exactly.
+/// - `Some(4)` ⇒ `Some(8)`: the declared floor.
+pub fn control_branch_quant_bits(base_bits: Option<i32>) -> Option<i32> {
+    control_branch_tier(base_bits.and_then(tier_from_bits)).map(Quant::bits)
 }
 
 /// Candidate render-resolution scales for the LAST-RESORT resolution lever (sc-11749), largest-first.
@@ -524,7 +492,6 @@ mod tests {
             width: 1024,
             height: 1024,
             supports_sequential: true,
-            allow_branch_quant: true,
             resolution_scales: &SCALES,
         }
     }
@@ -572,33 +539,58 @@ mod tests {
     }
 
     /// Large-memory Mac (128 GB → ~100 GiB safe): the fast path — NOTHING engages, full res, Resident,
-    /// bf16 branch, single-pass decode. The sc-11750 regression guard, end to end through the Krea
-    /// estimators (not just the synthetic gen-core model).
+    /// single-pass decode. The sc-11750 regression guard, end to end through the Krea estimators (not
+    /// just the synthetic gen-core model). Note the branch tier is NOT part of the fast path any more
+    /// (sc-15799): a q4 base packs its branch to q8 on this machine too, because that is what the tier
+    /// choice means, not a concession to a tight budget.
     #[test]
     fn large_memory_mac_engages_nothing() {
         let plan = plan_control_adaptation(100.0, inputs(Some(Quant::Q4)));
         assert!(plan.engaged.is_empty(), "no lever on a big Mac: {plan:?}");
         assert_eq!(plan.residency, OffloadPolicy::Resident);
-        assert!(!plan.tile_decode && !plan.quantize_branch);
+        assert!(!plan.tile_decode);
         assert_eq!(plan.resolution_scale, 1.0);
         assert!(plan.feasible);
     }
 
-    /// A 32 GB Mac (~24 GiB usable) with a q4 base: levers engage in cost order and the render fits.
-    /// The single-pass decode peak (~24.5 GiB ex-text on measured MLX, sc-11847) is over budget once the
+    /// What the repack BUYS (sc-15799): a 32 GB Mac (~24 GiB usable) now runs a q4 control render fully
+    /// resident with a monolithic decode — nothing engages. It could not before, because the bf16 branch
+    /// put the decode peak (~24.5 GiB ex-text on measured MLX, sc-11847) over the budget on its own. The
+    /// old ladder reached that saving only at its LAST rung, after staging the text phase and tiling the
+    /// decode; tier integrity has it from the start, and at strictly better quality than a q4 branch.
+    #[test]
+    fn q8_branch_lets_a_constrained_mac_run_fully_resident() {
+        let cfg = Krea2Config::turbo();
+        let plan = plan_control_adaptation(24.0, inputs(Some(Quant::Q4)));
+        assert!(
+            plan.engaged.is_empty() && plan.feasible,
+            "a q8 branch must fit 24 GiB with no lever: {plan:?}"
+        );
+        // The same render with the branch left dense does NOT fit — the regression this guards.
+        let dense_branch_peak =
+            qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024)
+                + text_resident_gib(Some(Quant::Q4));
+        assert!(
+            dense_branch_peak > 24.0,
+            "a bf16 branch must NOT fit 24 GiB, else this test proves nothing: {dense_branch_peak:.2}"
+        );
+    }
+
+    /// A 24 GB Mac (~18 GiB usable) with a q4 base: levers engage in cost order and the render fits.
+    /// The single-pass decode peak (21.55 GiB ex-text with the q8 branch) is over budget even once the
     /// text phase is dropped → residency then decode tiling must engage.
     #[test]
     fn constrained_mac_engages_levers_in_cost_order_and_fits() {
-        let plan = plan_control_adaptation(24.0, inputs(Some(Quant::Q4)));
+        let plan = plan_control_adaptation(18.0, inputs(Some(Quant::Q4)));
         assert!(
             plan.feasible,
-            "a 32GB Mac must fit a q4 control render: {plan:?}"
+            "a 24GB Mac must fit a q4 control render: {plan:?}"
         );
         assert!(
             !plan.engaged.is_empty(),
-            "something must engage under 24 GiB"
+            "something must engage under 18 GiB"
         );
-        // Cost order: whatever engaged is ascending (never quant before residency, etc.).
+        // Cost order: whatever engaged is ascending (never resolution before tiling, etc.).
         let mut sorted = plan.engaged.clone();
         sorted.sort();
         assert_eq!(
@@ -608,20 +600,20 @@ mod tests {
         // The single-pass decode peak is the binding peak over budget → decode tiling is engaged.
         assert!(
             plan.tile_decode,
-            "decode tiling must engage on a 32GB Mac: {plan:?}"
+            "decode tiling must engage on a 24GB Mac: {plan:?}"
         );
         assert!(
-            plan.projected_peak_gib <= 24.0,
+            plan.projected_peak_gib <= 18.0,
             "projected peak over budget: {plan:?}"
         );
     }
 
     /// Residency is tried before the quality-costing resolution lever: a mid budget engages the cheap
-    /// levers (residency/tiling/quant) but keeps full resolution.
+    /// levers (residency/tiling) but keeps full resolution.
     #[test]
     fn keeps_full_resolution_until_forced() {
-        // 24 GiB fits with the cheap levers (proven above) → resolution must stay 1.0.
-        let plan = plan_control_adaptation(24.0, inputs(Some(Quant::Q4)));
+        // 18 GiB fits with the cheap levers (proven above) → resolution must stay 1.0.
+        let plan = plan_control_adaptation(18.0, inputs(Some(Quant::Q4)));
         assert_eq!(
             plan.resolution_scale, 1.0,
             "must not drop res prematurely: {plan:?}"
@@ -706,51 +698,44 @@ mod tests {
         );
     }
 
-    // ── sc-11748: the load-time branch-quant gate (`should_quantize_control_branch`). ──────────────
+    // ── sc-15799: the load-time branch TIER (`control_branch_quant_bits`) — not a lever. ───────────
 
-    /// A dense bf16 base (or a non-Q4/Q8 width) never packs the branch — there is no base tier to match,
-    /// even under a starved budget.
+    /// A dense bf16 base carries a dense branch: it is already at the selected tier, so there is nothing
+    /// to pack. Same for a width that names no tier.
     #[test]
-    fn branch_quant_gate_dense_base_never_packs() {
-        let cfg = Krea2Config::turbo();
-        assert!(!should_quantize_control_branch(2.0, &cfg, 7, None, 1024));
-        assert!(!should_quantize_control_branch(
-            2.0,
-            &cfg,
-            7,
-            Some(16),
-            1024
-        ));
+    fn branch_tier_dense_base_stays_dense() {
+        assert_eq!(control_branch_quant_bits(None), None);
+        assert_eq!(control_branch_quant_bits(Some(16)), None);
     }
 
-    /// The sc-11750 hard requirement: a large-memory Mac keeps the branch bf16 even with a packed base,
-    /// at either tier and up to the worst-case resolution — no dequant-on-forward tax on a machine that
-    /// does not need it.
+    /// The invariant this story exists for: a PACKED base never carries a bf16 branch, and the tier is a
+    /// function of the base alone — q8 follows exactly, q4 floors at q8 (the declared, measured
+    /// exception). A mutation restoring the sc-11748 budget gate fails here, because there is no budget
+    /// to pass.
     #[test]
-    fn branch_quant_gate_large_memory_keeps_bf16() {
-        let cfg = Krea2Config::turbo();
-        assert!(!should_quantize_control_branch(
-            100.0,
-            &cfg,
-            7,
-            Some(4),
-            2048
-        ));
-        assert!(!should_quantize_control_branch(
-            100.0,
-            &cfg,
-            7,
-            Some(8),
-            2048
-        ));
+    fn branch_tier_follows_the_base_with_the_declared_q4_floor() {
+        assert_eq!(control_branch_quant_bits(Some(8)), Some(8));
+        assert_eq!(control_branch_quant_bits(Some(4)), Some(8));
     }
 
-    /// A constrained Mac whose worst-case footprint won't fit even after residency + decode tiling packs
-    /// the branch to the base tier (the deeper-escalation lever engages).
+    /// The plan's peaks are estimated with the branch at its integrity tier, so a q4 base projects a
+    /// LOWER peak than it did when the branch was left bf16 — the ~3.3 GB of unrequested precision the
+    /// old ladder carried until its last rung (6.6 GB bf16 → ~3.3 GB at the q8 floor; NOT the retracted
+    /// 8.4 GB, which exceeds the whole branch). Guards against a regression that re-estimates the branch
+    /// dense while the loader packs it (an under- or over-prediction of the real resident set).
     #[test]
-    fn branch_quant_gate_constrained_mac_packs() {
+    fn plan_peaks_use_the_integrity_branch_tier_not_bf16() {
         let cfg = Krea2Config::turbo();
-        assert!(should_quantize_control_branch(12.0, &cfg, 7, Some(4), 2048));
+        let integrity = plan_control_adaptation(100.0, inputs(Some(Quant::Q4))).projected_peak_gib;
+        let dense_branch =
+            control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024).max(
+                qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024),
+            ) + text_resident_gib(Some(Quant::Q4));
+        assert!(
+            integrity < dense_branch,
+            "the plan must price the q8 branch it will load ({integrity:.2}), not a bf16 one \
+             ({dense_branch:.2})"
+        );
     }
 
     // ── sc-11749: the render-time resolution lever (`plan_control_resolution`). ─────────────────────
