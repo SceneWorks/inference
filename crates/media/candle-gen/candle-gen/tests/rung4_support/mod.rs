@@ -97,6 +97,11 @@ impl Pool {
     }
 }
 
+/// [`Pool::open`] as a free function, for callers that read better that way.
+pub fn pool_open(ordinal: i32) -> Option<Pool> {
+    Pool::open(ordinal)
+}
+
 /// Driver-level `(free, total)` bytes — what a smaller card's VRAM gate would see. Needs a current
 /// context; see `candle_gen::cuda_mempool::mem_info`.
 pub fn mem_info() -> (u64, u64) {
@@ -282,6 +287,13 @@ impl Tier {
         self.bytes.iter().sum()
     }
 
+    /// A raw mmap, for a caller that reads the packed triple on the HOST rather than through the
+    /// device — the corrected-loader arm SC-15791 measured the production round trip against.
+    pub fn open_raw(&self) -> Result<MmapedSafetensors> {
+        // SAFETY: as `open_view`.
+        unsafe { MmapedSafetensors::new(&self.path) }
+    }
+
     /// A **fresh** weights view — what the caller hands to
     /// `candle_gen::block_window::run_windowed`'s `open`. Header-only: mapping a file faults no page.
     pub fn open_view(&self, dev: &Device) -> Result<VarBuilder<'static>> {
@@ -342,7 +354,13 @@ pub fn materialize(tier: &Tier, view: &VarBuilder, range: Range<usize>) -> Resul
 /// A plausible per-block forward. Accumulates into an on-DEVICE scalar and never reads it back: a
 /// `to_scalar` per projection would synchronize the stream on every call, serializing exactly the
 /// asynchrony these harnesses are measuring.
-pub fn compute(blocks: &[Block], tokens: usize, dev: &Device, acc: &Tensor) -> Result<Tensor> {
+pub fn compute(blocks: &[Block], tokens: usize, dev: &Device) -> Result<Tensor> {
+    compute_into(blocks, tokens, dev, &Tensor::zeros((), DType::F32, dev)?)
+}
+
+/// [`compute`] accumulating into an existing scalar, so a caller can thread one value across a whole
+/// step's windows and compare it across window sizes.
+pub fn compute_into(blocks: &[Block], tokens: usize, dev: &Device, acc: &Tensor) -> Result<Tensor> {
     let mut acc = acc.clone();
     for b in blocks {
         for (_, ql, in_dim) in &b.lins {
@@ -448,4 +466,17 @@ impl Drop for CappedPool {
             sys::cuMemPoolDestroy(self.pool);
         }
     }
+}
+
+/// The window ranges for `n_blocks` at `window`, straight from [`BlockPlan`] — the shared arithmetic,
+/// never a local re-derivation.
+///
+/// SC-15792's scope note is explicit that a forked `BlockPlan` is a review failure, and a test
+/// harness is not exempt: a harness with its own clamping can disagree with the driver about the
+/// ragged tail and report a bound for a schedule nothing runs.
+pub fn windows(n_blocks: usize, window: usize) -> Vec<Range<usize>> {
+    candle_gen::BlockPlan::new(n_blocks, window)
+        .expect("a valid block plan")
+        .windows()
+        .collect()
 }

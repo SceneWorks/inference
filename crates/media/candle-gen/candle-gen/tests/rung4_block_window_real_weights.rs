@@ -61,8 +61,8 @@ use candle_gen::{CandleError, Result};
 
 mod rung4_support;
 use rung4_support::{
-    compute, disclose_host, env_path_opt, env_usize, linear_fit, materialize, quiesce_and_reset,
-    Block, Pool, Tier, GIB, MIB,
+    compute_into, disclose_host, env_path_opt, env_usize, linear_fit, materialize,
+    quiesce_and_reset, Block, Pool, Tier, GIB, MIB,
 };
 
 const TAG: &str = "sc-15792";
@@ -89,7 +89,7 @@ fn windowed_step(tier: &Tier, dev: &Device, window: usize, cancel: &CancelFlag) 
             // The whole window is materialized before any of it runs — that is what makes peak
             // linear in `window` rather than constant at one block.
             let blocks = materialize(tier, view, range)?;
-            let acc = compute(&blocks, TOKENS, dev, &acc)?;
+            let acc = compute_into(&blocks, TOKENS, dev, &acc)?;
             Ok(acc)
         },
     )
@@ -234,7 +234,7 @@ fn defeating_the_release_restores_the_resident_peak() -> Result<()> {
         || tier.open_view(&dev).map_err(CandleError::from),
         |acc, view: &mut VarBuilder<'static>, range: Range<usize>| {
             let blocks = materialize(&tier, view, range)?;
-            let acc = compute(&blocks, TOKENS, &dev, &acc)?;
+            let acc = compute_into(&blocks, TOKENS, &dev, &acc)?;
             leaked.extend(blocks);
             Ok(acc)
         },
@@ -297,7 +297,7 @@ fn cancel_and_injected_error_leave_no_residual_growth() -> Result<()> {
             || tier.open_view(&dev).map_err(CandleError::from),
             |acc, view: &mut VarBuilder<'static>, range: Range<usize>| {
                 let blocks = materialize(&tier, view, range.clone())?;
-                let acc = compute(&blocks, TOKENS, &dev, &acc)?;
+                let acc = compute_into(&blocks, TOKENS, &dev, &acc)?;
                 // Trip part-way, so a window is live when the flag is read at the next boundary.
                 if range.start == 3 {
                     cancel.cancel();
@@ -333,7 +333,7 @@ fn cancel_and_injected_error_leave_no_residual_growth() -> Result<()> {
             || tier.open_view(&dev).map_err(CandleError::from),
             |acc, view: &mut VarBuilder<'static>, range: Range<usize>| {
                 let blocks = materialize(&tier, view, range.clone())?;
-                let acc = compute(&blocks, TOKENS, &dev, &acc)?;
+                let acc = compute_into(&blocks, TOKENS, &dev, &acc)?;
                 if range.start == 3 {
                     // Fail with the window still materialized — the state the release must survive.
                     return Err(CandleError::Msg(format!(
@@ -407,7 +407,10 @@ fn cancel_and_injected_error_leave_no_residual_growth() -> Result<()> {
 #[test]
 #[ignore = "real weights + CUDA; set SC15792_Q4"]
 fn windowed_fits_an_enforced_cap_the_resident_path_cannot() -> Result<()> {
-    let Some(path) = env_path_opt(TAG, TIER_ENV) else {
+    // `SC16091_Q4` is accepted as well: this arm is the successor to sc-16091's
+    // `rung4_windowed_survives_a_cap_the_resident_path_cannot`, and anyone re-running that story's
+    // documented invocation should exercise something rather than silently skip.
+    let Some(path) = env_path_opt(TAG, TIER_ENV).or_else(|| env_path_opt(TAG, "SC16091_Q4")) else {
         return Ok(());
     };
     let cap_mib = env_usize("SC15792_CAP_MIB", 1024);
@@ -425,6 +428,9 @@ fn windowed_fits_an_enforced_cap_the_resident_path_cannot() -> Result<()> {
     let dev = Device::new_cuda(0).expect("CUDA device 0");
     let cancel = CancelFlag::default();
     let n = tier.n_blocks();
+    // The host's real VRAM, disclosed here too: a cap is an ALLOCATOR ceiling on a 95.6 GiB card, not
+    // a physical small card, and a report that omits the host invites the SC-15256 misreading.
+    disclose_host(TAG, &pool);
     println!(
         "[{TAG}] ENFORCED CAP {cap_mib} MiB | {} blocks, {:.1} MiB/block on disk",
         n,
@@ -462,6 +468,64 @@ fn windowed_fits_an_enforced_cap_the_resident_path_cannot() -> Result<()> {
         win_reserved <= cap_mib as f64,
         "the windowed reserved high-water ({win_reserved:.1} MiB) exceeded the cap ({cap_mib} MiB) \
          — the counters are not following the capped pool"
+    );
+    Ok(())
+}
+
+/// **The configuration SC-15791 explicitly left untested and asked this story to cover.**
+///
+/// Its release-semantics arms all ran on one device and one stream, where CUDA's stream-ordered
+/// allocator guarantees reuse ordering a priori — it said so, and refused to treat that as licence to
+/// relax sc-12195's phase-boundary sync. It named the nearest untested shape: a window driver
+/// materializing from a **worker thread**. (Its own `overlap_prefetch` arm did that, and it flagged
+/// the result as unproven.)
+///
+/// This drives the real driver from a spawned thread over the same real packed tier and requires the
+/// output to be bit-identical to the main-thread run. The window bound must also still hold there —
+/// a driver that behaved differently off-thread could hold output while silently losing the bound.
+///
+/// **What a green here does and does not mean.** It is a negative result on one configuration, not a
+/// proof that no cross-thread hazard exists: candle hands out one stream per device, so a worker
+/// thread sharing this `Device` shares that stream and inherits its ordering. The genuinely untested
+/// shape is two *distinct* `Device` instances for one GPU, which no candle provider builds today.
+/// This does not license removing sc-12195's sync, and `residency.rs` is untouched by SC-15792.
+#[test]
+#[ignore = "real weights + CUDA; set SC15792_Q4"]
+fn worker_thread_materialization_is_bit_identical() -> Result<()> {
+    let Some((tier, dev, pool)) = open_tier() else {
+        return Ok(());
+    };
+    let cancel = CancelFlag::default();
+
+    quiesce_and_reset(&dev, &pool)?;
+    let on_main = windowed_step(&tier, &dev, 1, &cancel)?.to_scalar::<f32>()?;
+    let main_live = pool.used_high() as f64 / MIB;
+    let main_reserved = pool.reserved_high() as f64 / MIB;
+
+    quiesce_and_reset(&dev, &pool)?;
+    let on_worker = std::thread::scope(|s| {
+        s.spawn(|| -> Result<f32> {
+            Ok(windowed_step(&tier, &dev, 1, &cancel)?.to_scalar::<f32>()?)
+        })
+        .join()
+        .expect("the worker thread must not panic")
+    })?;
+    let worker_live = pool.used_high() as f64 / MIB;
+    let worker_reserved = pool.reserved_high() as f64 / MIB;
+
+    println!(
+        "[{TAG}] WORKER THREAD: main {on_main} (live {main_live:.1} / reserved {main_reserved:.1} MiB) \
+         | worker {on_worker} (live {worker_live:.1} / reserved {worker_reserved:.1} MiB)"
+    );
+    assert_eq!(
+        on_worker, on_main,
+        "materializing windows from a worker thread changed the output — this is the sc-12195-adjacent \
+         configuration, and a mismatch here is a reuse-ordering defect, not a tolerance question"
+    );
+    assert!(
+        (worker_live - main_live).abs() < 0.05 * main_live,
+        "the window bound did not hold off the main thread: {worker_live:.1} MiB against \
+         {main_live:.1} MiB on it"
     );
     Ok(())
 }

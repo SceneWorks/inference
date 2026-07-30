@@ -37,276 +37,39 @@
 //! | `constrained_budget_sweep` | the small-card disclosure |
 //!
 //! Throwaway measurement code by the story's own terms — the answer is the deliverable. Kept as an
-//! `#[ignore]` real-weight test so SC-15792 can re-run it against its implementation. It drives the
-//! production packed loader but deliberately does **not** drive
-//! `gen_core::block_window::run_windowed`: there is no candle `BlockWindowBackend` yet, and building
-//! one is SC-15792's job, not this spike's.
+//! `#[ignore]` real-weight test. It drives the production packed loader but deliberately does **not**
+//! drive `gen_core::block_window::run_windowed` — its whole job is to ablate configurations the
+//! driver cannot express (no per-window sync; a retained view; a prefetch thread), which is what made
+//! it a spike rather than an implementation. SC-15792 built the driver; the arms that measure the
+//! SHIPPED schedule live in `rung4_block_window_real_weights.rs`.
 //!
-//! The forked pool accessors this file shipped with are **gone** (SC-15792). They duplicated
-//! `default_pool`'s driver calls because testkit exported only `USED_MEM_HIGH` and gating this file
-//! behind the `testkit` feature would have dropped it from CI's cuda compile/Clippy coverage
-//! (ci.yml enables `cuda` and not `testkit` — a cuda-gated lint "sat red on main until found by hand",
-//! sc-12379). The shared implementation now lives at `candle_gen::cuda_mempool`, gated on `cuda`
-//! alone, so both constraints hold at once. What remains below is a five-line unwrap policy, not a
-//! second copy of the driver knowledge.
+//! **Everything duplicated is gone (SC-15792).** This file shipped with its own `default_pool` driver
+//! calls, its own `Tier`/`Block`/`materialize`/`compute`, and — worst — its own `fn windows()`, a
+//! line-for-line re-derivation of `BlockPlan::windows()` including the ragged-tail clamp. That last
+//! one is the forked `BlockPlan` SC-15792's scope note prohibits, and a harness is not exempt: a
+//! harness that clamps differently from the driver reports a bound for a schedule nothing runs. All
+//! of it now comes from `mod rung4_support`, and the pool accessors from `candle_gen::cuda_mempool`
+//! (gated on `cuda`, not `testkit`, which is why the fork existed — ci.yml enables the former and not
+//! the latter, and a cuda-gated lint once "sat red on main until found by hand", sc-12379).
+//!
+//! What is still local is what is genuinely spike-only: `materialize_host_repack`, the corrected
+//! loader this measured the production round trip against.
 
 #![cfg(feature = "cuda")]
 
-use std::collections::HashMap;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::quant::{dequant_mlx_q4_reference, lin, QLinear, MLX_GROUP_SIZE};
+use candle_gen::quant::{dequant_mlx_q4_reference, QLinear, MLX_GROUP_SIZE};
 
-const MIB: f64 = 1024.0 * 1024.0;
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-
-// ---------------------------------------------------------------------------------------------------
-// Driver memory-pool probe
-//
-// The mapping to the MLX spike's counters, which is what makes the two comparable at all:
-//   MLX get_active_memory  ↔  CU_MEMPOOL_ATTR_USED_MEM_CURRENT
-//   MLX get_peak_memory    ↔  CU_MEMPOOL_ATTR_USED_MEM_HIGH
-//   MLX get_cache_memory   ↔  RESERVED_MEM_CURRENT − USED_MEM_CURRENT
-//   MLX clear_cache()      ↔  cuMemPoolTrimTo(pool, 0)
-//
-// RESERVED is not a footnote: `nvidia-smi memory.used` reports driver-RESERVED bytes, so RESERVED is
-// the unit a VRAM gate consumes, and it exceeds USED by the pool's allocation granularity.
-// ---------------------------------------------------------------------------------------------------
-/// Panicking adapter over the shared [`candle_gen::cuda_mempool`] probe.
-///
-/// The only thing this adds is the unwrap policy: every accessor here **panics** on a driver error
-/// rather than returning `Option`, because in a measurement context a silent `unwrap_or(0)` lets a
-/// broken probe print a plausible report and bank a green. The driver calls, the counter semantics
-/// and the two traps are documented once, in the shared module.
-mod pool {
-    use candle_gen::cuda_mempool::MemPool;
-
-    pub struct Pool(MemPool);
-
-    impl Pool {
-        /// The default pool candle allocates from. NOTE: under a custom *current* pool this is the
-        /// wrong handle and reports ~0 — see `candle_gen::cuda_mempool`'s trap 1. Nothing in this
-        /// file installs one.
-        pub fn open(ordinal: i32) -> Option<Self> {
-            MemPool::device_default(ordinal).map(Self)
-        }
-
-        pub fn used(&self) -> u64 {
-            self.0.used().expect("CU_MEMPOOL_ATTR_USED_MEM_CURRENT")
-        }
-
-        pub fn used_high(&self) -> u64 {
-            self.0.used_high().expect("CU_MEMPOOL_ATTR_USED_MEM_HIGH")
-        }
-
-        pub fn reserved(&self) -> u64 {
-            self.0
-                .reserved()
-                .expect("CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT")
-        }
-
-        pub fn reserved_high(&self) -> u64 {
-            self.0
-                .reserved_high()
-                .expect("CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH")
-        }
-
-        pub fn release_threshold(&self) -> u64 {
-            self.0
-                .release_threshold()
-                .expect("CU_MEMPOOL_ATTR_RELEASE_THRESHOLD")
-        }
-
-        /// Reset both high-water marks. Quiesce first — see the shared module's trap 2.
-        pub fn reset_high(&self) {
-            assert!(
-                self.0.reset_high_water(),
-                "resetting the high-water marks failed — peaks would be stale"
-            );
-        }
-
-        /// A no-op at a release threshold of 0, which is where candle leaves it. Kept because the
-        /// spike's finding is precisely that it recovers nothing.
-        pub fn trim(&self) {
-            assert!(self.0.trim(), "cuMemPoolTrimTo failed");
-        }
-    }
-
-    /// Driver-level `(free, total)` bytes — what a smaller card's VRAM gate would see.
-    pub fn mem_info() -> (u64, u64) {
-        candle_gen::cuda_mempool::mem_info().expect("cuMemGetInfo_v2 (needs a current context)")
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------
-// The tier under test
-// ---------------------------------------------------------------------------------------------------
-
-/// Everything about a packed transformer tier that can be read from the safetensors **header** alone.
-struct Tier {
-    path: PathBuf,
-    packed: Vec<Vec<String>>,
-    dense: Vec<Vec<String>>,
-    dims: HashMap<String, (usize, usize)>,
-    bytes: Vec<usize>,
-    n_tensors: usize,
-    file_bytes: u64,
-}
-
-impl Tier {
-    fn open(path: &Path, group_size: usize) -> Result<Self> {
-        // SAFETY: an immutable HF-cache blob; nothing rewrites it mid-test.
-        let st = unsafe { MmapedSafetensors::new(path)? };
-        let views = st.tensors();
-        let n_tensors = views.len();
-
-        let n_blocks = views
-            .iter()
-            .filter_map(|(k, _)| k.strip_prefix("layers."))
-            .filter_map(|rest| rest.split('.').next())
-            .filter_map(|i| i.parse::<usize>().ok())
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
-        assert!(n_blocks > 0, "no `layers.N.` blocks in {}", path.display());
-
-        let mut packed = vec![Vec::new(); n_blocks];
-        let mut dense = vec![Vec::new(); n_blocks];
-        let mut bytes = vec![0usize; n_blocks];
-        let mut dims = HashMap::new();
-
-        // `.data().len()` is a length on the mmap view, not a read, so no page is faulted here.
-        let mut shape: HashMap<&str, (&[usize], usize)> = HashMap::new();
-        for (k, v) in &views {
-            shape.insert(k.as_str(), (v.shape(), v.data().len()));
-        }
-
-        let block_of = |k: &str| -> Option<usize> {
-            k.strip_prefix("layers.")?
-                .split('.')
-                .next()?
-                .parse::<usize>()
-                .ok()
-        };
-
-        for (k, v) in &views {
-            let Some(b) = block_of(k) else { continue };
-            bytes[b] += v.data().len();
-            if let Some(base) = k.strip_suffix(".scales") {
-                let w = shape
-                    .get(format!("{base}.weight").as_str())
-                    .unwrap_or_else(|| panic!("{base}.scales has no {base}.weight sibling"));
-                packed[b].push(base.to_string());
-                dims.insert(base.to_string(), (w.0[0], v.shape()[1] * group_size));
-            } else if let Some(base) = k.strip_suffix(".weight") {
-                if !shape.contains_key(format!("{base}.scales").as_str()) {
-                    dense[b].push(k.to_string());
-                }
-            } else if !k.ends_with(".biases") {
-                dense[b].push(k.to_string());
-            }
-        }
-        for p in &mut packed {
-            p.sort();
-        }
-        for d in &mut dense {
-            d.sort();
-        }
-
-        // Per-block figures below are block 0's; assert the stack is uniform so that is honest.
-        let (lo, hi) = (*bytes.iter().min().unwrap(), *bytes.iter().max().unwrap());
-        assert!(
-            hi - lo < hi / 100,
-            "blocks are not uniform ({lo}..{hi} bytes) — per-block figures taken from block 0 would \
-             misrepresent the stack"
-        );
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            packed,
-            dense,
-            dims,
-            bytes,
-            n_tensors,
-            file_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        })
-    }
-
-    fn n_blocks(&self) -> usize {
-        self.packed.len()
-    }
-
-    fn all_block_bytes(&self) -> usize {
-        self.bytes.iter().sum()
-    }
-
-    /// A **fresh** weights view — the `BlockWindowBackend::open_view` analogue. Header-only.
-    fn open_view(&self, dev: &Device) -> Result<VarBuilder<'static>> {
-        // SAFETY: immutable HF-cache blob; a fresh mmap per view, never mutated behind the mapping.
-        let st = unsafe { MmapedSafetensors::new(&self.path)? };
-        Ok(VarBuilder::from_backend(
-            Box::new(st),
-            DType::F32,
-            dev.clone(),
-        ))
-    }
-
-    /// A raw mmap for the corrected-loader arm, which reads the triple on the host.
-    fn open_raw(&self) -> Result<MmapedSafetensors> {
-        // SAFETY: as above.
-        unsafe { MmapedSafetensors::new(&self.path) }
-    }
-}
-
-/// One materialized transformer block.
-struct Block {
-    /// `(name, projection, in_dim)`.
-    lins: Vec<(String, QLinear, usize)>,
-    dense: Vec<Tensor>,
-}
-
-impl Block {
-    fn dense_bytes(&self) -> usize {
-        self.dense
-            .iter()
-            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
-            .sum()
-    }
-}
-
-/// Materialize `range` through the **production** packed loader (`candle_gen::quant::lin`) onto the
-/// view's device — what a naive `BlockWindowBackend` would do.
-///
-/// NOTE the round trip this incurs when the view is on CUDA: `lin_gs` loads `wq`/`scales`/`biases`
-/// onto the view's device (`quant/mod.rs:973-975`), then `repack::q4_parts` immediately pulls all
-/// three back with `to_device(&Cpu)` (`repack.rs:133-144`) to do the host repack, then uploads the
-/// Q4_1 bytes. So the raw triple crosses PCIe up and back down for nothing. `materialize_host_repack`
-/// below is the corrected path, and the gap between them is measured in `window_sweep_cost`.
-fn materialize(tier: &Tier, view: &VarBuilder, range: Range<usize>) -> Result<Vec<Block>> {
-    let mut out = Vec::with_capacity(range.len());
-    for b in range {
-        let mut lins = Vec::with_capacity(tier.packed[b].len());
-        for base in &tier.packed[b] {
-            let (out_dim, in_dim) = tier.dims[base];
-            lins.push((
-                base.clone(),
-                lin(view, base, in_dim, out_dim, false)?,
-                in_dim,
-            ));
-        }
-        let mut dense = Vec::with_capacity(tier.dense[b].len());
-        for key in &tier.dense[b] {
-            dense.push(view.get_unchecked_dtype(key, DType::F32)?);
-        }
-        out.push(Block { lins, dense });
-    }
-    Ok(out)
-}
+mod rung4_support;
+use rung4_support::{
+    compute, disclose_host as disclose, env_path_opt as env_opt, env_path_req, env_usize,
+    linear_fit, materialize, median, pool_open, quiesce_and_reset, windows, Block, Tier, GIB, MIB,
+};
 
 /// The **corrected** materialization: read the packed triple straight to the host, repack on the
 /// host, and upload only the resulting `Q4_1` blocks. Identical arithmetic to [`materialize`] — it
@@ -342,119 +105,14 @@ fn materialize_host_repack(
     Ok(out)
 }
 
-/// A plausible per-block forward. Accumulates into an on-DEVICE scalar and never reads it back: a
-/// `to_scalar` per projection would synchronize the stream on every call and serialize exactly the
-/// overlap the Q5 arm is trying to detect.
-fn compute(blocks: &[Block], tokens: usize, dev: &Device) -> Result<Tensor> {
-    let mut acc = Tensor::zeros((), DType::F32, dev)?;
-    for b in blocks {
-        for (_, ql, in_dim) in &b.lins {
-            let x = Tensor::ones((tokens, *in_dim), DType::F32, dev)?;
-            acc = (acc + ql.forward(&x)?.sum_all()?)?;
-        }
-    }
-    Ok(acc)
-}
-
-fn env_path_req(key: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(key).unwrap_or_else(|_| panic!("{key} not set — see the module docstring")),
-    )
-}
-
-/// An OPTIONAL env path: `None` prints a SKIP rather than panicking, so the documented
-/// `-- --ignored` invocation does not fail arms whose inputs were not supplied (the house pattern —
-/// `mlx_repack_real_weights.rs` uses `.ok()` for its optional tiers).
-fn env_path_opt(key: &str) -> Option<PathBuf> {
-    match std::env::var(key) {
-        Ok(v) => Some(PathBuf::from(v)),
-        Err(_) => {
-            println!("[sc-15791] SKIP: {key} not set");
-            None
-        }
-    }
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-/// The host's VRAM, disclosed in every report — SC-15256's closing note is that an acceptance
-/// measured as gate arithmetic on a 97.9 GB card is not evidence about an 8 GB one.
-fn disclose_host(pool: &pool::Pool) {
-    let (free, total) = pool::mem_info();
-    assert!(
-        total > 0 && free > 0,
-        "the driver reported no memory — a zeroed probe must not be allowed to satisfy the \
-         host-VRAM-disclosure requirement"
-    );
-    println!(
-        "[sc-15791] HOST: CUDA device 0 total {:.1} GiB, free now {:.1} GiB | pool used {:.1} MiB / \
-         reserved {:.1} MiB / release-threshold {} bytes",
-        total as f64 / GIB,
-        free as f64 / GIB,
-        pool.used() as f64 / MIB,
-        pool.reserved() as f64 / MIB,
-        pool.release_threshold(),
-    );
-}
-
-/// Quiesce the device and the pool, THEN reset the watermarks.
-///
-/// Order is load-bearing for `RESERVED_MEM_HIGH`. Resetting the watermark to 0 while the pool still
-/// physically holds pages makes it snap straight back to the current reserved value, so the next
-/// measurement inherits the previous one. That is not hypothetical: the first run of this sweep
-/// reported window 1's reserved peak as 3488.0 MiB — exactly the fully-resident control's figure —
-/// because the control's pages had not been returned when the reset ran.
-fn quiesce_and_reset(dev: &Device, pool: &pool::Pool) -> Result<()> {
-    dev.synchronize()?;
-    pool.trim();
-    pool.reset_high();
-    Ok(())
-}
-
-fn windows(n_blocks: usize, window: usize) -> impl Iterator<Item = Range<usize>> {
-    (0..n_blocks).step_by(window).map(move |s| {
-        let e = (s + window).min(n_blocks);
-        s..e
-    })
-}
-
-/// Least-squares fit of `peak ≈ a·window + b` over the sweep, in MiB. `b` is the per-window fixed
-/// overhead — on the production loader it is the device-side staging of the raw triple that
-/// [`materialize_host_repack`] avoids.
-fn linear_fit(points: &[(usize, f64)]) -> (f64, f64) {
-    let n = points.len() as f64;
-    let sx: f64 = points.iter().map(|(w, _)| *w as f64).sum();
-    let sy: f64 = points.iter().map(|(_, p)| *p).sum();
-    let sxx: f64 = points.iter().map(|(w, _)| (*w as f64) * (*w as f64)).sum();
-    let sxy: f64 = points.iter().map(|(w, p)| (*w as f64) * p).sum();
-    let a = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    (a, (sy - a * sx) / n)
-}
-
-/// Median of a small sample. Every headline timing is reported as a median with its range, because a
-/// single sample of this quantity varies ~10% run to run.
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
-
-// ---------------------------------------------------------------------------------------------------
-// Q1 — cost per window, its scaling, the loader overhead, and the release-guard ablation
-// ---------------------------------------------------------------------------------------------------
-
 #[test]
 #[ignore = "needs a CUDA host with the hosted z-image q4 tier (SC15791_Q4 env)"]
 fn window_sweep_cost() -> Result<()> {
     let q4 = env_path_req("SC15791_Q4");
     let repeats = env_usize("SC15791_REPEATS", 3);
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
 
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
     println!(
@@ -464,7 +122,7 @@ fn window_sweep_cost() -> Result<()> {
         tier.file_bytes as f64 / GIB,
         tier.n_tensors,
         tier.n_blocks(),
-        tier.all_block_bytes() as f64 / GIB,
+        tier.total_block_bytes() as f64 / GIB,
         tier.packed[0].len(),
         tier.dense[0].len(),
     );
@@ -723,8 +381,8 @@ fn overlap_prefetch() -> Result<()> {
     let tokens = env_usize("SC15791_TOKENS", 1024);
     let repeats = env_usize("SC15791_REPEATS", 3);
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = std::sync::Arc::new(Tier::open(&q4, MLX_GROUP_SIZE)?);
 
     // Warm.
@@ -766,7 +424,7 @@ fn overlap_prefetch() -> Result<()> {
         let t = Instant::now();
         type Prefetch = Result<(Vec<Block>, VarBuilder<'static>)>;
         let mut pending: Option<std::thread::JoinHandle<Prefetch>> = None;
-        let ranges: Vec<Range<usize>> = windows(tier.n_blocks(), window).collect();
+        let ranges: Vec<Range<usize>> = windows(tier.n_blocks(), window);
         let mut acc = Vec::new();
         for (i, range) in ranges.iter().enumerate() {
             let (blocks, view) = match pending.take() {
@@ -843,8 +501,8 @@ fn overlap_prefetch() -> Result<()> {
 fn release_semantics() -> Result<()> {
     let q4 = env_path_req("SC15791_Q4");
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
 
     {
@@ -856,7 +514,7 @@ fn release_semantics() -> Result<()> {
 
     println!("\n[sc-15791] Q2 — does dropping a window return the memory?");
     let threshold = pool.release_threshold();
-    let (free_before, _) = pool::mem_info();
+    let (free_before, _) = rung4_support::mem_info();
     let (used_before, reserved_before) = (pool.used(), pool.reserved());
 
     let view = tier.open_view(&dev)?;
@@ -864,21 +522,21 @@ fn release_semantics() -> Result<()> {
     let used_live_nosync = pool.used();
     dev.synchronize()?;
     let (used_live, reserved_live) = (pool.used(), pool.reserved());
-    let (free_live, _) = pool::mem_info();
+    let (free_live, _) = rung4_support::mem_info();
 
     // Drop with NO synchronize.
     drop(blocks);
     drop(view);
     let (used_drop_nosync, reserved_drop_nosync) = (pool.used(), pool.reserved());
-    let (free_drop_nosync, _) = pool::mem_info();
+    let (free_drop_nosync, _) = rung4_support::mem_info();
 
     dev.synchronize()?;
     let (used_sync, reserved_sync) = (pool.used(), pool.reserved());
-    let (free_sync, _) = pool::mem_info();
+    let (free_sync, _) = rung4_support::mem_info();
 
     // Only now the trim, with `reserved_sync` already captured so its effect is attributable.
     pool.trim();
-    let (free_trim, _) = pool::mem_info();
+    let (free_trim, _) = rung4_support::mem_info();
     let reserved_trim = pool.reserved();
 
     let block_mib = tier.bytes[0] as f64 / MIB;
@@ -1095,8 +753,8 @@ fn release_semantics() -> Result<()> {
 fn packed_quant_per_block() -> Result<()> {
     let q4 = env_path_req("SC15791_Q4");
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
     let st = tier.open_raw()?;
 
@@ -1205,12 +863,12 @@ fn packed_quant_per_block() -> Result<()> {
 #[test]
 #[ignore = "optional: needs the hosted z-image q8 tier (SC15791_Q8 env)"]
 fn q8_tier_cost() -> Result<()> {
-    let Some(q8) = env_path_opt("SC15791_Q8") else {
+    let Some(q8) = env_opt("sc-15791", "SC15791_Q8") else {
         return Ok(());
     };
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q8, MLX_GROUP_SIZE)?;
     println!(
         "\n[sc-15791] Q8 TIER: {:.2} GiB on disk, {} blocks, {:.1} MiB/block on disk",
@@ -1286,8 +944,8 @@ fn constrained_budget_sweep() -> Result<()> {
         return Ok(());
     }
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
 
     // window 30 == one all-covering window == the resident path, through the same code, so the
@@ -1331,7 +989,7 @@ fn constrained_budget_sweep() -> Result<()> {
     let mut balloon: Vec<Tensor> = Vec::new();
     let chunk_elems = 256usize * 1024 * 1024; // 1 GiB of f32
     loop {
-        let (free, _) = pool::mem_info();
+        let (free, _) = rung4_support::mem_info();
         if free as f64 / GIB <= target_free as f64 {
             break;
         }
@@ -1341,7 +999,7 @@ fn constrained_budget_sweep() -> Result<()> {
         }
         dev.synchronize()?;
     }
-    let (free_under, total) = pool::mem_info();
+    let (free_under, total) = rung4_support::mem_info();
     let achieved = free_under as f64 / GIB;
     println!(
         "\n[sc-15791] CONSTRAINED: {} GiB balloon; driver free now {achieved:.2} GiB of {:.1} GiB \

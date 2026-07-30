@@ -28,7 +28,7 @@
 //! The hook is therefore wired to `Ok(())` **here, once**, rather than exposed to each family: a
 //! per-family hook is an invitation to re-derive MLX's answer without MLX's reason.
 //!
-//! ## 2. `release` is a per-window NO-OP. The synchronize is REQUEST-scoped, and it is not optional.
+//! ## 2. `release` is a per-window NO-OP. The synchronize is PER-FORWARD, and it is not optional.
 //!
 //! The obvious reading of "does the memory come back?" gives the wrong answer here, so the two
 //! counters are stated separately:
@@ -49,6 +49,11 @@
 //!   above;
 //! - **at teardown**, something must synchronize or the last window stays charged against the free
 //!   VRAM a co-resident component and the next job's admission gate read.
+//!
+//! "Teardown" means once per [`run_windowed`] call, i.e. once per denoise-step forward — the sampler
+//! calls the trunk `steps x count` times per request, so this is not literally request-scoped. It is
+//! the tightest scope the driver can enforce without knowing which call is the last, and it takes the
+//! sync count from 30 per step (one per window, the shape Krea shipped) to 1.
 //!
 //! `cuMemPoolTrimTo` is a **no-op** at a release threshold of 0 and must not be credited with the
 //! recovery — reading only the pool counter produces the wrong answer here.
@@ -71,7 +76,7 @@
 //! retained buffer for a stale view to pin. The obligation is real but vacuous here, and the honest
 //! discharge is to say so rather than to pay a re-`mmap` per window for a guarantee the type already
 //! gives. `open` is a caller-supplied closure so a family whose view *does* cache can return a
-//! genuinely fresh one; `window_bound_holds_when_the_view_is_reopened_per_window` pins that the
+//! genuinely fresh one; `a_fresh_view_is_opened_per_window_and_dropped_before_the_next` pins that the
 //! driver calls it once per window either way.
 //!
 //! Correspondingly, gen-core's "`apply` must take its tensors OUT of the view" rule is an MLX rule
@@ -86,8 +91,17 @@
 //! the above**, and SC-15791 says so explicitly. Every arm it measured stayed on one device and one
 //! stream, where the stream-ordered allocator guarantees reuse ordering a priori. Nothing here is a
 //! reason to remove that sync. The nearest untested configuration is a window driver materializing
-//! from a worker thread, which is covered by
-//! `windowed_output_is_identical_when_driven_from_a_worker_thread`.
+//! from a worker thread, and SC-15791 asked SC-15792 to cover it. Two arms do, at different strengths,
+//! and the difference is stated rather than glossed:
+//!
+//! - `candle_gen_krea::transformer::tests::streamed_output_is_identical_when_driven_from_a_worker_thread`
+//!   runs on CPU. It pins that the driver is `Send`-safe and order-preserving off the main thread, and
+//!   it **cannot** reproduce a CUDA stream race.
+//! - `rung4_block_window_real_weights::worker_thread_materialization_is_bit_identical` is the CUDA arm,
+//!   on real packed weights.
+//!
+//! Neither is a proof that no such race exists — a negative result on one configuration is not one —
+//! so sc-12195's sync stays exactly where it is.
 
 use std::ops::Range;
 
@@ -119,10 +133,12 @@ where
         (self.open)().map_err(Into::into)
     }
 
-    /// Deliberately empty. Candle's per-window bound is held by pool reuse, ablated at 1.00x in
-    /// SC-15791; the synchronize that actually returns pages to the driver is request-scoped and runs
-    /// in [`run_windowed`]. Making this a synchronize instead would move a request-scoped cost onto
-    /// every window for no measured gain.
+    /// Deliberately empty. Candle's per-window bound is held by pool reuse, ablated at **1.00x** on
+    /// both the live and reserved counters in SC-15791; the synchronize that actually returns pages to
+    /// the driver runs once per [`run_windowed`] call instead. Synchronizing here as well would cost
+    /// 30 syncs per denoise step rather than 1, for a peak that is measurably unchanged. (SC-15791's
+    /// two timings, 7.99 s guarded against 8.36 s unguarded, sit inside that host's run-to-run spread
+    /// and are not evidence either way on speed — the claim here is about peak, which was flat.)
     fn release(&self) {}
 }
 
@@ -353,7 +369,7 @@ mod tests {
     /// contract is that a family whose view *does* cache gets a genuinely fresh one — and a driver
     /// that hoisted the open out of the loop would silently break exactly that family.
     #[test]
-    fn window_bound_holds_when_the_view_is_reopened_per_window() {
+    fn a_fresh_view_is_opened_per_window_and_dropped_before_the_next() {
         struct View<'a> {
             id: usize,
             log: &'a RefCell<Vec<String>>,
@@ -419,7 +435,7 @@ mod tests {
     /// refactor that starts constructing plans here inherits the validation rather than re-deriving
     /// it (a window of 0 would loop forever; `n_blocks` of 0 would silently skip the whole trunk).
     #[test]
-    fn degenerate_plans_never_reach_the_driver() {
+    fn a_degenerate_plan_is_rejected_before_the_driver_runs() {
         assert!(BlockPlan::new(28, 0).is_err());
         assert!(BlockPlan::new(0, 1).is_err());
     }

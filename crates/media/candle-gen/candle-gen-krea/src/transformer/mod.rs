@@ -59,8 +59,9 @@ pub struct Krea2Transformer {
 /// retains the read-only mmap and materializes only the current window of blocks on the compute
 /// device, driven by [`candle_gen::block_window::run_windowed`] (SC-15792). The per-block
 /// `Device::synchronize()` this arm used to carry is gone: SC-15791 ablated it at **1.00x** peak on
-/// both the live and reserved counters, so it bought nothing per window — the synchronize that does
-/// matter is the request-scoped one, and the driver owns it.
+/// both the live and reserved counters, so it bought nothing per window. The synchronize that does
+/// matter runs once per forward instead of once per block — 1 per denoise step rather than 28 — and
+/// the driver owns it, on every exit path including cancellation and failure.
 enum TransformerBlocks {
     Resident(Vec<SingleStreamBlock>),
     Streamed(std::sync::Arc<Weights>),
@@ -84,6 +85,37 @@ enum TransformerBlocks {
 /// ever exercised at its tightest setting is a bound nothing has measured, and the peak-by-window
 /// evidence for this rung is produced by driving the real implementation across `w`.
 pub const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
+
+/// Materialize a whole rung-4 window's trunk blocks onto the compute device, in order.
+///
+/// A named function rather than a closure inside the driver call, and that is the point. The rung's
+/// bound is `window x per-block bytes`, which holds only if every block in the window is live at
+/// once: loading each block inside the forward loop instead would hold **one** at a time and
+/// silently execute a window of 1 whatever was asked for — correct output, no bound, no error, and
+/// no test would notice. Adversarial review of SC-15792 confirmed that by hand-mutation: inlining
+/// the load left all 199 crate tests green. Extracted so the regression is a visible deletion and so
+/// `a_window_materializes_every_block_before_any_of_them_runs` can assert the count directly.
+fn materialize_window(
+    view: &Weights,
+    cfg: &Krea2Config,
+    dit_plan: &DitPlan,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<SingleStreamBlock>> {
+    range
+        .map(|i| {
+            SingleStreamBlock::load_planned(
+                view,
+                &format!("transformer_blocks.{i}"),
+                cfg.num_attention_heads,
+                cfg.num_kv_heads,
+                cfg.attention_head_dim,
+                cfg.hidden_size,
+                cfg.norm_eps,
+                dit_plan,
+            )
+        })
+        .collect()
+}
 
 /// Fold a render state through a block sequence with a cancellation checkpoint before every block.
 ///
@@ -531,24 +563,7 @@ impl Krea2Transformer {
                     // MLX's freshness obligation structurally instead of by re-opening.
                     || Ok(std::sync::Arc::clone(weights)),
                     |mut state, view, range| {
-                        // Materialize the WHOLE window before running any of it. The rung's bound is
-                        // `window x per-block bytes`; loading each block inside the forward loop
-                        // below would hold one at a time and silently measure a window of 1 whatever
-                        // was asked for — correct output, no bound, no error.
-                        let blocks = range
-                            .map(|i| {
-                                SingleStreamBlock::load_planned(
-                                    view.as_ref(),
-                                    &format!("transformer_blocks.{i}"),
-                                    cfg.num_attention_heads,
-                                    cfg.num_kv_heads,
-                                    cfg.attention_head_dim,
-                                    cfg.hidden_size,
-                                    cfg.norm_eps,
-                                    &dit_plan,
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                        let blocks = materialize_window(view, cfg, &dit_plan, range)?;
                         for block in &blocks {
                             // Finer than the driver's per-window gate, deliberately (sc-16003): one
                             // block is ~2 s at 2048², and a cancel unread until the window ends is
@@ -991,6 +1006,43 @@ mod tests {
             matches!(error, candle_gen::CandleError::Msg(ref m) if m.contains("window")),
             "{error:?}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The CPU half of the rung's mutation check.** Every block in the window must be live at
+    /// once, because that — not the loop shape — is what makes peak `window x per-block bytes`.
+    ///
+    /// This exists because the failure mode is silent in the worst way: loading blocks one at a time
+    /// inside the forward loop produces identical output, raises no error, and executes a window of 1
+    /// whatever the selector asked for. Adversarial review of SC-15792 demonstrated it — inlining the
+    /// materialization left all 199 tests in this crate green — so a comment warning about it was not
+    /// coverage. The GPU twin (`defeating_the_release_restores_the_resident_peak`) measures the peak;
+    /// this one runs on every CI lane and needs no accelerator.
+    #[test]
+    fn a_window_materializes_every_block_before_any_of_them_runs() {
+        let (_resident, streamed, cfg, path) = crate::testfix::tiny_transformer_streamed_pair(6);
+        let dit_plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+        let TransformerBlocks::Streamed(weights) = &streamed.blocks else {
+            panic!("the fixture must produce a streamed trunk");
+        };
+
+        for window in [1usize, 2, 3, 4] {
+            let plan = BlockPlan::new(cfg.num_layers, window).unwrap();
+            for range in plan.windows() {
+                let want = range.len();
+                let blocks = materialize_window(weights, &cfg, &dit_plan, range.clone())
+                    .unwrap_or_else(|e| panic!("window {window}, blocks {range:?}: {e:?}"));
+                assert_eq!(
+                    blocks.len(),
+                    want,
+                    "window {window}, blocks {range:?}: {} blocks were materialized together, not \
+                     {want}. Peak is then `1 x per-block bytes` regardless of the selected window, \
+                     and the rung reports a bound it does not hold.",
+                    blocks.len()
+                );
+            }
+        }
+
         let _ = std::fs::remove_file(&path);
     }
 

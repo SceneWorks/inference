@@ -315,11 +315,12 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         block_count: u32,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if block_count == 1 {
+        if SUPPORTED_TRANSFORMER_WINDOWS.contains(&block_count) {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "krea_2_turbo: transformer residency window is fixed at one block, got {block_count}"
+                "krea_2_turbo: transformer residency window is fixed at \
+                 {SUPPORTED_TRANSFORMER_WINDOWS:?}, got {block_count}"
             )))
         }
     }
@@ -363,16 +364,36 @@ fn krea_generation_memory(
     if selection.strategy == MemoryStrategy::Resident {
         return None;
     }
+    let stream_transformer_blocks = contract.engages(
+        selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    );
     Some(gen_core::GenerationMemory {
         tile_vae_decode: contract.engages(selection.strategy, MemoryStrategy::BoundedDecode),
         chunk_attention: contract.engages(selection.strategy, MemoryStrategy::BoundedAttention),
-        stream_transformer_blocks: contract.engages(
-            selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ),
+        stream_transformer_blocks,
+        // SC-15792: carry the SELECTED window through, rather than dropping it and letting the
+        // pipeline fall back to the provider default. Leaving it at `None` made the executed window
+        // independent of the chosen one — so calibration evidence recorded against a selection would
+        // have described a run that never happened. Only forwarded when the rung is actually
+        // engaged, so a selection that does not stream blocks stays byte-for-byte as before.
+        transformer_window_size: stream_transformer_blocks
+            .then_some(selection.parameters.transformer_window_size)
+            .flatten(),
         ..Default::default()
     })
 }
+
+/// The rung-4 windows this provider will execute — the same list
+/// `krea_turbo_memory_strategy_contract` publishes as `transformer_window_sizes`.
+///
+/// One entry, deliberately: SC-15791 measured per-step time FLAT in the window while peak is LINEAR
+/// on Candle, so a wider window is strictly worse. See
+/// [`crate::transformer::DEFAULT_TRANSFORMER_WINDOW`].
+///
+/// NOT cfg-gated, unlike the contract that publishes it: `generate` re-validates the window on every
+/// build, and the streamed trunk itself is not cuda-only (it runs on CPU in the parity tests).
+const SUPPORTED_TRANSFORMER_WINDOWS: &[u32] = &[1];
 
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
@@ -487,7 +508,7 @@ impl Generator for KreaGenerator {
         };
         let reference = img2img_reference(req);
 
-        if req.memory.is_some() {
+        if let Some(memory) = req.memory.as_ref() {
             if self.descriptor.id != KREA_2_TURBO_ID
                 || self.offload_policy != OffloadPolicy::Sequential
                 || reference.is_some()
@@ -499,6 +520,21 @@ impl Generator for KreaGenerator {
                      native-VAE, ordinary Turbo text-to-image requests",
                     self.descriptor.id
                 )));
+            }
+            // SC-15792: re-validate the rung-4 window here, not only in `MemoryRequestScope`.
+            // `materialize_transformer_window` guards the calibration lifecycle, but this arm is
+            // reachable with a hand-built `GenerationMemory` that never opens a scope — and since
+            // the window is now genuinely honoured, an out-of-domain value would execute a schedule
+            // the provider never declared. gen-core's rule for these fields is that an unsupported
+            // value is "a typed rejection rather than a silently different execution than the
+            // selector chose"; before the window was plumbed the same request silently ran 1.
+            if let Some(window) = memory.transformer_window_size {
+                if !SUPPORTED_TRANSFORMER_WINDOWS.contains(&window) {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: transformer residency window is fixed at {:?}, got {window}",
+                        self.descriptor.id, SUPPORTED_TRANSFORMER_WINDOWS
+                    )));
+                }
             }
             let images = pipeline::render_three_stage(
                 &self.root,
@@ -1242,7 +1278,10 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                         ..Default::default()
                     },
                     MemoryStrategy::BoundedTransformerResidency => MemoryParameterRanges {
-                        transformer_window_sizes: vec![1],
+                        // One source for what this provider publishes, what its request scope
+                        // accepts, and what `generate` re-validates — three sites that were three
+                        // independent literals before SC-15792 and would have drifted silently.
+                        transformer_window_sizes: SUPPORTED_TRANSFORMER_WINDOWS.to_vec(),
                         ..Default::default()
                     },
                     MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
@@ -1504,8 +1543,83 @@ mod tests {
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                // SC-15792: the SELECTED window travels with the selection. Pinned as a non-default
+                // value on purpose — `None` is `GenerationMemory::default()`, so asserting it would
+                // pass with the propagation deleted, which is exactly how the field came to be
+                // dropped on the floor in the first place.
+                transformer_window_size: Some(1),
                 ..Default::default()
             })
+        );
+    }
+
+    /// **SC-15792 — the selected window must be the executed one.**
+    ///
+    /// `krea_generation_memory` used to build its `GenerationMemory` with `..Default::default()`,
+    /// which silently discarded `transformer_window_size`: the pipeline then fell back to the
+    /// provider constant no matter what the selector chose. That is invisible while the constant and
+    /// the only published candidate are both 1 — so this drives a window the provider does NOT
+    /// publish, which the shipped path can never produce, and asserts it survives the mapping.
+    ///
+    /// The companion half is that such a value is REJECTED at the request boundary rather than
+    /// executed; `generate` checks it against `SUPPORTED_TRANSFORMER_WINDOWS`.
+    #[test]
+    fn the_selected_transformer_window_travels_to_the_request() {
+        use gen_core::MemoryStrategy;
+
+        let contract = krea_turbo_memory_strategy_contract();
+        let select = |strategy, window| {
+            krea_generation_memory(
+                contract,
+                gen_core::MemorySelection {
+                    strategy,
+                    parameters: gen_core::MemoryStrategyParameters {
+                        transformer_window_size: window,
+                        ..Default::default()
+                    },
+                    tier: gen_core::MemoryNumericTier {
+                        precision: gen_core::Precision::Bf16,
+                        quant: Some(Quant::Q4),
+                    },
+                },
+            )
+        };
+
+        // A window the provider does not publish still arrives intact — the mapping's job is to
+        // carry the selection faithfully, and rejecting it is `generate`'s job, not this one's.
+        let engaged = select(MemoryStrategy::BoundedTransformerResidency, Some(4))
+            .expect("rung 4 maps to a per-generation memory block");
+        assert!(engaged.stream_transformer_blocks);
+        assert_eq!(
+            engaged.transformer_window_size,
+            Some(4),
+            "the selected window was dropped; the pipeline would silently run the provider default"
+        );
+
+        // A rung that does not stream blocks must not carry a window: it would be a parameter for a
+        // lever that is off, and the pipeline reads the field without re-checking the flag.
+        let shallower = select(MemoryStrategy::BoundedAttention, Some(4))
+            .expect("rung 3 maps to a per-generation memory block");
+        assert!(!shallower.stream_transformer_blocks);
+        assert_eq!(shallower.transformer_window_size, None);
+    }
+
+    /// The three places this provider states its rung-4 window — what it publishes, what its request
+    /// scope accepts, and what `generate` re-validates — must agree. They were three independent
+    /// literals before SC-15792.
+    #[test]
+    fn the_published_window_candidates_are_the_ones_the_scope_accepts() {
+        let contract = krea_turbo_memory_strategy_contract();
+        let published = contract
+            .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung 4 is declared")
+            .parameters
+            .transformer_window_sizes
+            .clone();
+        assert_eq!(published, SUPPORTED_TRANSFORMER_WINDOWS.to_vec());
+        assert!(
+            !published.is_empty(),
+            "an empty candidate list would make every window unsupported and rung 4 unselectable"
         );
     }
 
