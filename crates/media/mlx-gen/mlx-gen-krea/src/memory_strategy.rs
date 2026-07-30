@@ -65,6 +65,8 @@ pub fn memory_strategy_contract(
                 },
             })
             .collect(),
+        load_shape: spec.load_shape,
+        additional_prerequisites: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
