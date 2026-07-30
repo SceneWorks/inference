@@ -123,11 +123,32 @@ The surface test now enforces its absence, which is the stronger guarantee.
 Mac; nothing here is. It owns metallib resolution inside the app sandbox, model provisioning into
 the app container, and the entire device-CI apparatus — which has no precedent in this repo.
 
+**Status: the two hard questions are answered.** On an iPhone 17 Pro Max (iOS 26.5.2),
+`scripts/ios/run_smoke.sh` reports:
+
+```
+SMOKE: PASS
+  [ok] metallib resolves + elementwise kernel -- sum(ones[4,4]) = 16
+  [ok] f32 GEMM (steel)  -- sum(64x64 matmul) = 262144 (expected 262144)
+  [ok] bf16 GEMM (steel) -- sum(64x64 matmul) = 262144 (expected 262144)
+  [ok] softmax reduction kernel -- sum(softmax(ones[4,8])) = 4
+```
+
+S3.3 (sandbox metallib resolution) and **R11** (are the cross-compiled kernels numerically
+correct, or merely iOS-targeted?) are both closed. Expected values are arithmetic rather than MLX
+references, so agreement is evidence, not tautology; bf16 is the one that matters most, given
+sc-2772's precedent of 16-bit kernels compiling at the wrong deployment target and emitting
+garbage.
+
+**What remains is plumbing, not risk:** getting weights into the app container (S3.4), hosting
+`mlx-llm-server` instead of the smoke test (S3.1), running the real conformance suite (S3.5), and
+the runner (S3.6/S3.7).
+
 | Story | Notes |
 |---|---|
-| S3.1 iOS app target (`ios-host/`) | Thin SwiftUI shell that starts `mlx-llm-server` on a background thread. Also serves as the `xcodebuild test` host, which Tier 3 requires. |
+| S3.1 iOS app target (`ios-host/`) | **Scaffolded** — `ios-host/` builds, signs, installs and launches on device via `scripts/ios/run_smoke.sh` (XcodeGen spec, SwiftUI shell, workspace-excluded Rust staticlib). Still to do: host `mlx-llm-server` rather than the smoke test. |
 | S3.2 Bind to loopback + USB forwarding | The server has **no auth**. It must not reach a LAN interface. Bearer token if remote access is ever needed. |
-| S3.3 Metallib resolution on device | **The first genuine unknown.** Verify the bundled metallib resolves inside the sandbox with no `$HOME` cache available. |
+| S3.3 Metallib resolution on device | **DONE — verified on an iPhone 17 Pro Max (iOS 26.5.2).** The 124 MB bundled metallib resolves inside the sandbox via `load_colocated_library`. Run it with `scripts/ios/run_smoke.sh`. |
 | S3.4 Model provisioning into the app container | How weights reach `WeightsSource::Dir` on a phone — Files app, iTunes file sharing, or a dev-time copy. Unspecified today; needed before anything runs. |
 | S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. |
 | S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
