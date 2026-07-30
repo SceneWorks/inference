@@ -97,7 +97,13 @@ say "building ios-smoke for aarch64-apple-ios ($PROFILE${CARGO_FEATURES:+, $CARG
 # did not get rebuilt produces a green run reporting the PREVIOUS build's results -- which looks
 # like a passing test rather than a build mistake, and cost three confusing runs before it was
 # caught. Compare mtimes and fail loudly instead.
-NEWEST_SRC=$(find "$ROOT/ios-host/smoke/src" "$ROOT/crates" -name '*.rs' -newer "$LIB" -print -quit 2>/dev/null || true)
+# Only sources that can actually reach the staticlib. `tests/`, `examples/` and `benches/` are
+# separate compilation units that never link into it, so editing one and re-running would otherwise
+# abort a perfectly valid device run — which is exactly what happened after adding a SANA
+# real-weights test. A guard that cries wolf gets disabled, so keep it precise.
+NEWEST_SRC=$(find "$ROOT/ios-host/smoke/src" "$ROOT/crates" -name '*.rs' -newer "$LIB" \
+  -not -path '*/tests/*' -not -path '*/examples/*' -not -path '*/benches/*' \
+  -print -quit 2>/dev/null || true)
 if [ -n "$NEWEST_SRC" ]; then
   echo "stale staticlib: $NEWEST_SRC is newer than $LIB" >&2
   echo "(the build above should have caught this -- check for a cargo failure)" >&2
