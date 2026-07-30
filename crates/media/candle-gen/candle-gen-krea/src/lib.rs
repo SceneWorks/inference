@@ -1359,6 +1359,62 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
 
+    /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
+    ///
+    /// SC-15796 hoisted candle's chunk arithmetic onto `gen_core::attention_budget`, which also carries
+    /// Z-Image's measured 64 Mi operating point. Krea's 128 Mi is a **legitimately different, measured**
+    /// family operating point — the GPU-validated ControlNet chunk size — published through the same
+    /// `attentionChunkSize` field, and `configure_attention` rejects anything else. Unifying the two
+    /// numbers would silently re-calibrate this family, so this pins the split explicitly:
+    ///
+    /// 1. Krea declares exactly 128 Mi, and it is **not** the shared Z-Image constant.
+    /// 2. The declared value is still interpreted by the *shared planner* — at the krea grounded-TE
+    ///    geometry (B·H = 1·32, Sq = Sk = 8192, the inclusive token cap) 128 Mi plans 512 query rows
+    ///    where 64 Mi would plan 256, so the number is load-bearing and the planner reads it.
+    /// 3. `configure_attention` accepts 128 Mi and rejects the shared 64 Mi.
+    #[test]
+    fn krea_keeps_its_own_128_mi_budget_on_the_shared_planner() {
+        use candle_gen::attention::{AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET as SHARED};
+
+        // (1) The declared family operating point, and that it is not the shared one.
+        assert_eq!(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET, 128 * 1024 * 1024);
+        assert_eq!(SHARED, 64 * 1024 * 1024);
+        assert_ne!(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64, SHARED);
+
+        // (2) Shared planner, krea's budget. The grounded TE at its 8192-token cap: 32·8192 score
+        // elements per query row.
+        let rows_per_query = 32u64 * 8192;
+        let krea = AttentionBudget::from_score_elements(
+            pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64,
+            false,
+        );
+        assert_eq!(krea.query_block_rows(rows_per_query, 8192), 512);
+        let z_image = AttentionBudget::from_score_elements(SHARED, false);
+        assert_eq!(z_image.query_block_rows(rows_per_query, 8192), 256);
+
+        // (3) The published contract admits krea's value and only krea's value.
+        use gen_core::MemoryRequestScope;
+        let mut scope = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(gen_core::GenerationMemory {
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            finished: false,
+        };
+        scope
+            .configure_attention(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32)
+            .expect("krea must accept its own declared budget");
+        let err = scope
+            .configure_attention(SHARED as u32)
+            .expect_err("krea must reject the shared z-image budget");
+        assert!(
+            err.to_string().contains("attention chunk size is fixed"),
+            "{err}"
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+    }
+
     #[test]
     fn shared_memory_ladder_maps_to_cumulative_existing_controls() {
         let tier = gen_core::MemoryNumericTier {
