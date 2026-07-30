@@ -64,30 +64,40 @@ BYTES=$(find "$SRC" -type f -exec ls -l {} \; | awk '{s+=$5} END {print s+0}')
 say "pushing $(echo "$BYTES" | awk '{printf "%.2f GB", $1/1e9}') from $SRC"
 
 # --- push -------------------------------------------------------------------------------------
-# `copy to --source <dir> --destination <path>` makes <path> the directory and copies the source's
-# CONTENTS into it — it does NOT create <path>/<basename>. Verified against the device: pushing
-# `inner/` (holding probe.txt) to `Documents/dirprobe` yields `Documents/dirprobe/probe.txt`.
+# THE RULE, verified against the device both ways: `--destination` is the full path the source
+# BECOMES. It is not a containing directory.
 #
-# So a component directory must name itself in the destination. Getting this wrong is not a
-# no-op: SANA's `transformer/` and `vae/` both hold a file called
-# `diffusion_pytorch_model.safetensors`, so pushing both to one destination silently OVERWROTE the
-# 1.99 GB trunk with the 1.25 GB decoder — a push that exits 0 and leaves a corrupt snapshot.
+#   --source inner/ --destination Documents/dirprobe    -> Documents/dirprobe/probe.txt
+#   --source f.txt  --destination Documents/f.txt       -> Documents/f.txt
+#   --source f.txt  --destination Documents             -> Documents  IS NOW THE FILE
+#
+# That last line is not hypothetical. Pushing five files with `--destination Documents` replaced
+# the Documents DIRECTORY with a 738-byte tokenizer_config.json, wiping the container — and
+# devicectl exited 0 every time. The corresponding directory mistake is just as quiet: SANA's
+# `transformer/` and `vae/` both hold a file named `diffusion_pytorch_model.safetensors`, so
+# pushing both to one destination silently overwrote the 1.99 GB trunk with the 1.25 GB decoder.
+#
+# One rule covers both: the destination always names the entry.
 DEST="Documents${REMOTE:+/$REMOTE}"
 say "destination $DEST/"
 for entry in "$SRC"/*; do
   name=$(basename "$entry")
-  # A directory names itself in the destination; a loose file goes to the destination directly.
-  if [ -d "$entry" ]; then target="$DEST/$name"; else target="$DEST"; fi
-  # NOT `|| true`. The first version swallowed every copy failure here and then reported success,
-  # because the verification below could not distinguish "listing is empty" from "listing failed".
-  # Three copies errored with "device not found" and the script still exited 0. Fail on the spot.
-  if ! xcrun devicectl device copy to --device "$DEVICE" \
+  target="$DEST/$name"
+  # Capture, THEN inspect. Piping devicectl straight into grep makes the pipeline's status grep's,
+  # discarding devicectl's own — which is how the first version reported five successful pushes
+  # that had not happened. Scanning the text for "Error" is not enough either: the destination
+  # mistake above exits 0 and prints a perfectly ordinary success block.
+  if ! COPY_OUT=$(xcrun devicectl device copy to --device "$DEVICE" \
       --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-      --source "$entry" --destination "$target" 2>&1 \
-      | grep -E 'Error|error:'; then
-    : # grep exits 1 when it matched nothing, which is the success case.
-  else
-    echo "copy failed for $name" >&2; exit 1
+      --source "$entry" --destination "$target" 2>&1); then
+    echo "copy failed for $name:" >&2; echo "$COPY_OUT" | tail -5 >&2; exit 1
+  fi
+  # devicectl echoes the resulting device path; require it to end in the entry we asked for. This
+  # is what catches a silently-wrong destination, which no exit code will.
+  if ! echo "$COPY_OUT" | grep -qE "^Path: .*/${name}$"; then
+    echo "copy landed somewhere unexpected for $name (wanted a path ending in /$name):" >&2
+    echo "$COPY_OUT" | grep -E '^Path:' >&2 || echo "  (devicectl printed no Path line)" >&2
+    exit 1
   fi
   printf '  pushed %s -> %s\n' "$name" "$target"
 done
