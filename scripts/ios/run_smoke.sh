@@ -157,9 +157,58 @@ fi
 echo
 cat "$REPORT"
 
-if head -1 "$REPORT" | grep -q "SMOKE: PASS"; then
-  say "PASS"
-else
+if ! head -1 "$REPORT" | grep -q "SMOKE: PASS"; then
   say "FAIL"
   exit 1
 fi
+
+# --- performance regression thresholds (S4.6) ---------------------------------------------------
+# The report carries measurements the checks themselves do not assert on: a threshold invented
+# from one device in one thermal state would be noise, and a check that fails on a warm phone
+# teaches people to ignore it. So the numbers are asserted HERE, deliberately loose -- these catch
+# a regression (a lost fast path, a leak, thermal collapse), not a slow afternoon.
+#
+# Baselines measured on an iPhone 17 Pro Max / iOS 26.5.2 with Qwen3-4B Q4 (docs/ios-epics.md E4):
+#   steady throughput ~20.6 tok/s   peak RSS ~2.9 GiB   sustained RSS growth 0 MiB
+# Re-baseline deliberately when the model, quantization, or device class changes.
+THRESHOLD_MIN_TPS=${THRESHOLD_MIN_TPS:-12}
+THRESHOLD_MAX_RSS_MIB=${THRESHOLD_MAX_RSS_MIB:-4096}
+THRESHOLD_MAX_RSS_GROWTH_MIB=${THRESHOLD_MAX_RSS_GROWTH_MIB:-256}
+
+fail_threshold() { echo "threshold: $1" >&2; THRESHOLD_FAILED=1; }
+THRESHOLD_FAILED=0
+
+# Steady-state throughput. Sustained decode's LAST segment is the honest figure: the first is
+# depressed by lazy weight faulting, so using it would mask a real slowdown.
+tps=$(grep -o 'last [0-9.]* tok/s' "$REPORT" | grep -o '[0-9.]*' | tail -1)
+if [ -n "$tps" ]; then
+  awk -v v="$tps" -v m="$THRESHOLD_MIN_TPS" 'BEGIN { exit !(v < m) }' \
+    && fail_threshold "throughput ${tps} tok/s is below ${THRESHOLD_MIN_TPS} tok/s" \
+    || echo "  throughput ${tps} tok/s (floor ${THRESHOLD_MIN_TPS})"
+fi
+
+# Peak RSS. 4 GiB is chosen against the ~4 GB cap of an 8 GB device, not the ~6 GB of this one --
+# so the lane fails BEFORE a broader-device release would (docs/architecture/ios-project-spec.md
+# §0.1), rather than after.
+rss=$(grep -o 'peak [0-9]* MiB' "$REPORT" | grep -o '[0-9]*' | tail -1)
+if [ -n "$rss" ] && [ "$rss" -gt "$THRESHOLD_MAX_RSS_MIB" ]; then
+  fail_threshold "peak RSS ${rss} MiB exceeds ${THRESHOLD_MAX_RSS_MIB} MiB"
+elif [ -n "$rss" ]; then
+  echo "  peak RSS ${rss} MiB (ceiling ${THRESHOLD_MAX_RSS_MIB})"
+fi
+
+# Memory growth across repeated generations. Measured 0; a nonzero trend means a leak across
+# calls, which on a memory-capped device ends as a jetsam kill with no crash log.
+growth=$(grep -o 'growth [0-9-]*' "$REPORT" | grep -o '[0-9-]*' | tail -1)
+if [ -n "$growth" ] && [ "$growth" -gt "$THRESHOLD_MAX_RSS_GROWTH_MIB" ]; then
+  fail_threshold "RSS grew ${growth} MiB across segments (limit ${THRESHOLD_MAX_RSS_GROWTH_MIB})"
+elif [ -n "$growth" ]; then
+  echo "  RSS growth ${growth} MiB (limit ${THRESHOLD_MAX_RSS_GROWTH_MIB})"
+fi
+
+if [ "$THRESHOLD_FAILED" -ne 0 ]; then
+  say "FAIL (performance regression)"
+  exit 1
+fi
+
+say "PASS"

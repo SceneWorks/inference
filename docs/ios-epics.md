@@ -284,8 +284,14 @@ Two readings worth stating carefully, because both invite over-claiming:
   in lazily, so the real load cost lands on the first forward pass. The honest reading is
   *throughput is flat*, with no thermal decay over ~30 s.
 
+The thresholds derived from these (S4.6) assert against the **last** segment, not the first: the
+first is depressed by lazy weight faulting, so using it as the throughput figure would mask a real
+slowdown. The RSS ceiling is set at 4 GiB — the cap of an *8 GB* device, not this 12 GB one — so
+the lane fails **before** a broader-device release would, rather than after
+([spec §0.1](architecture/ios-project-spec.md)).
+
 | S4.5 Staged load/unload **seam** | Built even though a 17 Pro does not need it, and left disabled. Retrofitting it into a pipeline that assumed co-residency is the expensive version. |
-| S4.6 Regression thresholds in Tier 3 | Baselines enforced, not merely recorded. |
+| S4.6 Regression thresholds | **DONE** — `run_smoke.sh` asserts throughput ≥ 12 tok/s, peak RSS ≤ 4096 MiB, and RSS growth ≤ 256 MiB, overridable by env var. Deliberately loose: these catch a lost fast path, a leak, or thermal collapse — not a warm phone. A check that fails on a slow afternoon teaches people to ignore it. Verified by a negative test (`THRESHOLD_MIN_TPS=999` → exit 1, naming the metric). |
 | S4.7 Integrate the increased-memory-limit entitlement | Once Apple grants it. Requested separately; lead time is not ours. |
 
 **Exit:** G5 numbers published — TTFT, steady tok/s, peak RSS, energy per 100 tokens — and
