@@ -46,6 +46,14 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
+            // ADVERTISED, not merely implemented. `generate` already routes through
+            // `validate_request_skip_size` because `width`/`height == 0` means
+            // "size from the driving-video frames" and the range check would
+            // wrongly reject that sentinel. Until this field existed, a consumer
+            // holding these `Capabilities` had no way to learn it, so a caller
+            // mirroring the shared floor to type-check before a load rejected a
+            // request this model renders.
+            size_floor: mlx_gen::gen_core::SizeFloor::ResolvedDownstream,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
@@ -87,6 +95,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }

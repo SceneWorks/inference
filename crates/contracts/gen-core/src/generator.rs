@@ -6,6 +6,7 @@
 //! [`ModelDescriptor`] property plus a [`GenerationOutput`] variant — *not* a per-modality
 //! trait split (which breaks on multi-modal models).
 
+use crate::control::AcceptedControlKinds;
 use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
@@ -1491,6 +1492,23 @@ pub struct ModelDescriptor {
     pub required_components: &'static [&'static str],
 }
 
+/// How a model's advertised size range is enforced.
+///
+/// The distinction already existed as two entry points —
+/// [`Capabilities::validate_request`] and
+/// [`Capabilities::validate_request_skip_size`] — with the choice made by the
+/// provider and advertised nowhere. This makes it readable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SizeFloor {
+    /// `width`/`height` must lie within `min_size..=max_size`. The common case.
+    #[default]
+    RangeChecked,
+    /// `width`/`height == 0` is a "resolve from the driving media" sentinel and
+    /// the range check does not apply to it; the provider range-checks its own
+    /// resolved size (F-158).
+    ResolvedDownstream,
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).
@@ -1512,6 +1530,43 @@ pub struct Capabilities {
     pub max_size: u32,
     pub max_count: u32,
     pub mac_only: bool,
+    /// How this model's size range is enforced — and therefore whether
+    /// `min_size`/`max_size` are a bound a caller may rely on.
+    ///
+    /// `Default` is [`SizeFloor::RangeChecked`], so every existing descriptor keeps
+    /// today's behaviour with no edit. A provider whose `width`/`height == 0` means
+    /// "resolve from the driving media" sets [`SizeFloor::ResolvedDownstream`]
+    /// instead — SCAIL-2 sizes from its driving-video frames.
+    ///
+    /// # Why this is on `Capabilities` rather than only in the provider
+    ///
+    /// The policy already exists, as
+    /// [`validate_request_skip_size`](Self::validate_request_skip_size), and a
+    /// provider selects it by *calling* that variant. Nothing **advertises** the
+    /// choice, so a consumer holding a `Capabilities` cannot tell which floor a
+    /// provider will apply, and a consumer that mirrors the shared floor to
+    /// type-check requests before a load will reject a legal `0×0` on SCAIL-2.
+    /// SceneWorks' Aether Studio hit exactly that and now carries a hand-built
+    /// table of size-sentinel families; this field deletes it.
+    pub size_floor: SizeFloor,
+    /// Which [`ControlKind`]s this model admits, when it takes a
+    /// [`Conditioning::Control`] at all.
+    ///
+    /// `Default` is [`AcceptedControlKinds::Any`], matching
+    /// [`ControlBranch::accepted_control_kinds`]'s own default, so no existing
+    /// descriptor changes meaning. A single-signal branch advertises its
+    /// restriction here as well as overriding the trait method — Qwen-Image v1 is
+    /// `Only([Pose])`.
+    ///
+    /// # Why duplicate the trait method
+    ///
+    /// [`ControlBranch::accepted_control_kinds`] takes `&self` on a **loaded**
+    /// generator, so the accepted set is unknowable until the weights are in
+    /// memory. That makes "is this control kind acceptable?" a question no
+    /// weights-free consumer can ask, and a caller that wants to reject a bad
+    /// `kind` before paying for a load has nowhere to look. The trait method stays
+    /// authoritative at generate time; this is the same fact, advertised.
+    pub accepted_control_kinds: AcceptedControlKinds,
     // Audio surface (sc-12834) — read by the floor when a request carries
     // [`GenerationRequest::audio`]; all `Default` to the empty/no-audio surface so image/video
     // descriptors are untouched.
@@ -1654,7 +1709,15 @@ impl Capabilities {
     /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
     /// floor, not a replacement for them.
     pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
-        self.validate_request_inner(id, req, true)
+        // The size check is now gated on the ADVERTISED floor rather than on the
+        // caller picking the right entry point. A descriptor that leaves
+        // `size_floor` at its `Default` behaves exactly as before; SCAIL-2, which
+        // sets `ResolvedDownstream`, gets its sentinel accepted here instead of
+        // only inside `validate_request_skip_size`.
+        //
+        // This is what lets a weights-free consumer hold a `Capabilities` and get
+        // the right answer without knowing which variant the provider calls.
+        self.validate_request_inner(id, req, self.size_floor == SizeFloor::RangeChecked)
     }
 
     /// The shared floor **minus the size-range check** — for providers with a "match the driving-media

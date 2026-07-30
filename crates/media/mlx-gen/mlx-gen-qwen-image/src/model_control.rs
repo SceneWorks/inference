@@ -61,6 +61,10 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            // Advertised so a weights-free caller can reject a bad `kind` before
+            // paying for a load. Same expression the `ControlBranch` override
+            // returns, so the two cannot drift.
+            accepted_control_kinds: accepted_kinds(),
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
@@ -92,6 +96,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }

@@ -41,10 +41,11 @@ use std::path::Path;
 /// This is the *acceptance policy* for the request-side [`Conditioning::Control`] `kind`, kept on the
 /// trait so the validation collapses into the shared [`ControlBranch::resolve_control`] helper rather
 /// than re-implementing the `kind` check in each provider.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AcceptedControlKinds {
     /// Any [`ControlKind`] is accepted — the input-agnostic Fun-Union default (pose/canny/depth all
     /// flow through the same VAE-encoded control path; they differ only by host preprocessor).
+    #[default]
     Any,
     /// Only these specific kinds are accepted (e.g. Qwen-Image v1 = `[Pose]`); any other is rejected
     /// at `resolve_control` rather than silently treated as the accepted one.
