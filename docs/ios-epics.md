@@ -810,6 +810,39 @@ The 8 GB case is tight enough that the device session decides it, not the host h
 > The 8 GB claim is therefore **unverified**, and unverifiable without 8 GB hardware. What is
 > confirmed on a 12 GB device is 1024px tiled at 2751 MiB.
 
+> **RESOLVED (2026-07-30) — the missing term is MLX's buffer cache, and the sign is now known.**
+>
+> The paragraph above is right that "the two counters do not measure the same thing", and it could
+> not say why. The mechanism is now measured. `get_peak_memory`/`get_active_memory` report MLX's
+> *live* allocation. Jetsam reads `phys_footprint`, which additionally includes MLX's **buffer reuse
+> cache** — memory MLX has freed internally but not returned to the OS. The identity is
+> `footprint ≈ active + cache + non-MLX`, and the missing term is not small: on device it reached
+> **5864 MiB**.
+>
+> It is unbounded in practice because MLX sizes its cache limit from the system's recommended
+> working set. On a 12 GB iPhone 17 Pro Max it reported `memory_limit=11109 MiB,
+> cache_limit=11109 MiB` against an `os_proc_available_memory` of **6014 MiB**. MLX's backpressure
+> threshold sits at a value the process can never reach, so the cache grows until jetsam kills the
+> app. A Z-Image decode trace shows `active + cache` conserved at **6068 MiB** across every sample,
+> the cache absorbing exactly what active released:
+>
+> ```text
+> active 2752 + cache 3316 = 6068     active 1269 + cache 4799 = 6068
+> active 2190 + cache 3878 = 6068     active  988 + cache 5080 = 6068
+> ```
+>
+> **Consequences for everything above.** The error bar is no longer of unknown sign — a host MLX
+> peak *understates* the footprint iOS charges, by the size of a cache that grows to fill the
+> (over-large) limit MLX believes it has. So "host < cap" was never a YES for a second, sharper
+> reason than the one given: the quantity being compared to the cap was missing its largest
+> variable term. **SANA's 2751 MiB device figure passed despite this, not because of it** — it is a
+> peak-active number, not a footprint number, and the same is true of every MLX peak in this
+> document.
+>
+> Once MLX's limits are bound to `os_proc_available_memory` rather than to device RAM, the cache is
+> capped and the identity closes. Re-measured device figures under that regime are the first ones
+> that can be compared to the cap directly.
+
 **Found in passing — a progress-contract violation shared by every mlx-gen image provider.**
 `gen_core_testkit`'s progress contract requires `Progress::Decoding` **exactly once** per generation
 and names once-per-output as a failure ("the restarting-bar class", F-136/F-162). SANA emitted it
