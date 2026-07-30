@@ -175,23 +175,23 @@ result generates correctly on macOS — *"The capital of France is Paris, and th
 is Berlin…"*, so Q4 preserved the model rather than merely the file format. Staged at
 `~/models/ios-eval/Qwen3-4B-Instruct-2507-q4`.
 
-**Separate finding — the chat template is silently dropped, and NOT by the preparer.**
-`load_chat_template` (`mlx-llm/src/provider.rs`) reads the model's Jinja template only from
-`tokenizer_config.json`, falling back to the typed `Llama3Template` with
-`supports_tools = supports_thinking = false` when absent. Newer HF exports — including this Qwen3
-— ship the template as a **`chat_template.jinja` sidecar** instead, which nothing reads. Verified:
-the dense source and the prepared snapshot *both* report `tools=false`, so the preparer loses
-nothing; the gap is in template discovery. The sidecar here does render a `tools` section and
-`<tool_call>` blocks, so the fallback costs a real capability.
+**Separate bug, found here and FIXED — the chat template was silently dropped.**
+`load_chat_template` read the model's Jinja template only from `tokenizer_config.json`, falling
+back to the typed `Llama3Template` with `supports_tools = supports_thinking = false` when absent.
+Newer HF exports — including this Qwen3 — ship the template as a **`chat_template.jinja` sidecar**
+instead, which nothing read. The sidecar here renders a `tools` section and `<tool_call>` blocks,
+so a tool-capable model reported `tools=false`. Not iOS-specific: it applied on macOS equally, and
+put v1's `supports_tools` goal (G2) at risk.
 
-Consequences worth tracking:
-- **v1's `supports_tools` goal (G2) is affected on any model using the sidecar convention** — it
-  is not an iOS issue, it applies equally on macOS today.
-- The fix is small (also probe `chat_template.jinja`), belongs in `mlx-llm` rather than this
-  initiative, and should carry a preparer change to copy the sidecar through.
-- Until then, prefer snapshots with an inline `tokenizer_config.json` template when tool calling
-  matters, and treat a `tools=false` descriptor on a tool-capable model as this bug rather than a
-  model limitation.
+Two halves, both fixed:
+- **Discovery** — `JinjaChatTemplate::from_snapshot_dir` (core-llm) reads both conventions, inline
+  first. Adopted by `mlx-llm` and by `candle-llm`'s three call sites, which had the same bug.
+- **Preservation** — `SnapshotTokenizer` carries `chat_template_jinja` so the preparer copies the
+  sidecar through. Note `write_snapshot` has **two** write paths (staged and direct); the first
+  patch only fixed one, and the prepared snapshot still reported `tools=false` until both were.
+
+Verified: source and prepared snapshot now both report `tools=true`, with three regression tests
+in `core-llm` (sidecar read, inline precedence, error when neither exists).
 | S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. |
 | S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
 | S3.7 Runner heartbeat | A sleeping runner must fail loudly, not report green-by-absence. |

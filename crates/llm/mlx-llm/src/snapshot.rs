@@ -2,6 +2,7 @@
 //! story 7660).
 //!
 //! A *snapshot* is the `{config.json, model.safetensors, tokenizer.json, tokenizer_config.json}`
+//! set (plus a `chat_template.jinja` sidecar when the source ships one)
 //! directory the engine loads ([`crate::models::CausalLm::from_weights`]). Two producers feed it:
 //! the GGUF converter ([`mod@crate::gguf::convert`], story 7165) and — added here — a Hugging Face
 //! safetensors directory. Both funnel their dense tensor set through one sink, [`write_snapshot`],
@@ -171,6 +172,9 @@ pub(crate) fn write_streaming_snapshot(
         if let Some(t) = &tokenizer.tokenizer_config_json {
             std::fs::write(stage.join("tokenizer_config.json"), t)?;
         }
+        if let Some(t) = &tokenizer.chat_template_jinja {
+            std::fs::write(stage.join("chat_template.jinja"), t)?;
+        }
         for tensor in staged.values() {
             std::fs::remove_file(&tensor.path)?;
         }
@@ -323,6 +327,11 @@ pub struct SnapshotTokenizer {
     pub tokenizer_json: Option<String>,
     /// `tokenizer_config.json` contents.
     pub tokenizer_config_json: Option<String>,
+    /// `chat_template.jinja` contents — the sidecar convention newer Hugging Face exports use
+    /// instead of an inline `chat_template` key. Carried through so a prepared snapshot keeps the
+    /// model's own template: without it the loader falls back to the typed Llama-3 template and
+    /// reports tool calling and thinking as unsupported.
+    pub chat_template_jinja: Option<String>,
 }
 
 /// What writing a snapshot produced.
@@ -571,6 +580,9 @@ pub fn write_snapshot(
     if let Some(t) = &tokenizer.tokenizer_config_json {
         std::fs::write(out_dir.join("tokenizer_config.json"), t)?;
     }
+    if let Some(t) = &tokenizer.chat_template_jinja {
+        std::fs::write(out_dir.join("chat_template.jinja"), t)?;
+    }
 
     Ok(SnapshotReport {
         num_tensors,
@@ -623,6 +635,7 @@ pub fn write_hf_snapshot(
     let tokenizer = SnapshotTokenizer {
         tokenizer_json: read_to_string_if_exists(&source.join("tokenizer.json"))?,
         tokenizer_config_json: read_to_string_if_exists(&source.join("tokenizer_config.json"))?,
+        chat_template_jinja: read_to_string_if_exists(&source.join("chat_template.jinja"))?,
     };
 
     let weights = Weights::from_dir(source)?;

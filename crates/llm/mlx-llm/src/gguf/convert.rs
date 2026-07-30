@@ -156,6 +156,9 @@ pub fn convert(
             SnapshotTokenizer {
                 tokenizer_json: Some(to_pretty(&t.tokenizer_json)?),
                 tokenizer_config_json: Some(to_pretty(&t.tokenizer_config_json)?),
+                // GGUF carries its chat template inside the metadata, which `reconstruct` folds
+                // into `tokenizer_config.json`'s inline `chat_template` — there is no sidecar.
+                chat_template_jinja: None,
             },
             TokenizerStatus::Reconstructed(t.kind),
         ),

@@ -617,7 +617,7 @@ pub fn descriptor() -> TextLlmDescriptor {
 /// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`) when present; otherwise
 /// fall back to the typed Llama-3 template.
 fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
-    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+    match JinjaChatTemplate::from_snapshot_dir(dir) {
         Ok(t) => Box::new(t),
         Err(_) => Box::new(Llama3Template),
     }

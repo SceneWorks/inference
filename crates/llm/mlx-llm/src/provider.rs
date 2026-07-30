@@ -532,15 +532,20 @@ impl ConstraintMask for JsonMask<'_> {
     }
 }
 
-/// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`, story 7164) when
-/// present; otherwise fall back to the typed Llama-3 template. Also reports two template-gated
-/// capabilities, detected from the source (not the family, matching the transformers convention):
+/// Use the model's own Jinja `chat_template` (story 7164) when present; otherwise fall back to the
+/// typed Llama-3 template. Also reports two template-gated capabilities, detected from the source
+/// (not the family, matching the transformers convention):
 /// - **thinking** — the template gates an `enable_thinking` kwarg (sc-7585).
 /// - **tools** — the template renders tool calls (it mentions `tool_call`), so it has a `tools`
 ///   section and the model emits parseable `<tool_call>` blocks (sc-7636). Covers the Qwen3.6 XML and
 ///   the Qwen2.5/Hermes JSON tool templates alike.
+///
+/// Reads BOTH template conventions via [`JinjaChatTemplate::from_snapshot_dir`]: the inline
+/// `chat_template` in `tokenizer_config.json`, and the newer `chat_template.jinja` sidecar that
+/// current exports (Qwen3-Instruct-2507 among them) ship instead. Reading only the JSON made those
+/// models silently report `supports_tools = false` despite shipping a tools-capable template.
 fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
-    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+    match JinjaChatTemplate::from_snapshot_dir(dir) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
             let supports_tools = t.source().contains("tool_call");

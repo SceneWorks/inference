@@ -184,6 +184,51 @@ impl JinjaChatTemplate {
         Self::from_tokenizer_config(&v)
     }
 
+    /// The filename newer Hugging Face exports use for a sidecar chat template.
+    pub const SIDECAR_FILE: &'static str = "chat_template.jinja";
+
+    /// Load a model's chat template from a snapshot directory, trying both conventions.
+    ///
+    /// `transformers` moved the template out of `tokenizer_config.json` into a
+    /// [`SIDECAR_FILE`](Self::SIDECAR_FILE) sidecar, and current exports (Qwen3-Instruct-2507
+    /// among them) ship *only* the sidecar. Reading just the JSON silently yields no template,
+    /// which downstream turns into a fallback template with tool calling and thinking reported as
+    /// unsupported — a real capability lost to a file-layout change.
+    ///
+    /// The inline `chat_template` wins when both exist: it is the older, more explicit form, and a
+    /// snapshot carrying both was written by a tool that considered the JSON authoritative.
+    /// `bos_token`/`eos_token` always come from `tokenizer_config.json`, which the sidecar has no
+    /// way to express.
+    pub fn from_snapshot_dir(dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        if let Ok(t) = Self::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+            return Ok(t);
+        }
+
+        let source = std::fs::read_to_string(dir.join(Self::SIDECAR_FILE))?;
+        if source.trim().is_empty() {
+            return Err(Error::Msg(format!(
+                "{} is empty",
+                dir.join(Self::SIDECAR_FILE).display()
+            )));
+        }
+
+        // Best-effort: a sidecar-only snapshot still has a tokenizer_config.json carrying the
+        // special tokens, it just has no chat_template key.
+        let (bos_token, eos_token) =
+            match std::fs::read_to_string(dir.join("tokenizer_config.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            {
+                Some(v) => (
+                    extract_token(v.get("bos_token")).unwrap_or_default(),
+                    extract_token(v.get("eos_token")).unwrap_or_default(),
+                ),
+                None => (String::new(), String::new()),
+            };
+        Ok(Self::with_tokens(source, bos_token, eos_token))
+    }
+
     /// The raw template source.
     pub fn source(&self) -> &str {
         &self.source
@@ -1046,6 +1091,67 @@ mod tests {
             .as_secs() as i64;
         let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
         assert_eq!(out, format!("Today: {}", format_date("%d %b %Y", y, m, d)));
+    }
+
+    /// A snapshot carrying ONLY a `chat_template.jinja` sidecar still yields the model's own
+    /// template. Current Hugging Face exports (Qwen3-Instruct-2507 among them) ship this way, and
+    /// reading only `tokenizer_config.json` silently loses tool-calling and thinking support.
+    #[test]
+    fn snapshot_dir_reads_the_sidecar_template() {
+        let dir = std::env::temp_dir().join(format!("core-llm-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"bos_token": "<s>", "eos_token": "</s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(JinjaChatTemplate::SIDECAR_FILE),
+            "{% for m in messages %}<tool_call>{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+
+        let t = JinjaChatTemplate::from_snapshot_dir(&dir).unwrap();
+        // The capability probes downstream run over `source()`, so this is what makes a
+        // sidecar-only model report supports_tools correctly.
+        assert!(t.source().contains("tool_call"));
+        assert_eq!(
+            t.render(&[Message::user("hi")], false).unwrap(),
+            "<tool_call>hi"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When both conventions are present the inline `chat_template` wins: it is the older, more
+    /// explicit form, so a snapshot carrying both was written by a tool that considered the JSON
+    /// authoritative.
+    #[test]
+    fn snapshot_dir_prefers_the_inline_template() {
+        let dir = std::env::temp_dir().join(format!("core-llm-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template": "INLINE", "bos_token": "<s>", "eos_token": "</s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(JinjaChatTemplate::SIDECAR_FILE), "SIDECAR").unwrap();
+
+        let t = JinjaChatTemplate::from_snapshot_dir(&dir).unwrap();
+        assert_eq!(t.source(), "INLINE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No template by either convention is an error, so the caller falls back deliberately.
+    #[test]
+    fn snapshot_dir_errors_without_any_template() {
+        let dir = std::env::temp_dir().join(format!("core-llm-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"bos_token": "<s>"}"#).unwrap();
+        assert!(JinjaChatTemplate::from_snapshot_dir(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

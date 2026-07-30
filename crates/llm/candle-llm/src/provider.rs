@@ -654,8 +654,13 @@ impl ConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (its source mentions `tool_call`), so it has a
 ///   `tools` section and the model emits parseable `<tool_call>` blocks (story 7636). Covers the
 ///   Qwen3.6 XML and the Qwen2.5/Hermes JSON tool templates alike.
+///
+/// Reads BOTH template conventions via [`JinjaChatTemplate::from_snapshot_dir`]: the inline
+/// `chat_template` in `tokenizer_config.json`, and the newer `chat_template.jinja` sidecar that
+/// current exports ship instead. Reading only the JSON made those models silently report
+/// `supports_tools = false` despite shipping a tools-capable template.
 fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
-    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+    match JinjaChatTemplate::from_snapshot_dir(dir) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
             let supports_tools = t.source().contains("tool_call");
@@ -665,13 +670,13 @@ fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
     }
 }
 
-/// Pick a chat template for a GGUF load: a sibling `tokenizer_config.json` first, then the GGUF's
+/// Pick a chat template for a GGUF load: a sibling snapshot template first (inline
+/// `tokenizer_config.json` or a `chat_template.jinja` sidecar), then the GGUF's
 /// own embedded `chat_template` metadata, then the typed Llama-3 default. Also reports
 /// `supports_thinking` (the chosen template's source gates `enable_thinking`) and `supports_tools`
 /// (its source renders tool calls — it mentions `tool_call`).
 fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> (Box<dyn ChatTemplate>, bool, bool) {
-    if let Ok(t) = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
-    {
+    if let Ok(t) = JinjaChatTemplate::from_snapshot_dir(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
         let supports_tools = t.source().contains("tool_call");
         return (Box::new(t), supports_thinking, supports_tools);
