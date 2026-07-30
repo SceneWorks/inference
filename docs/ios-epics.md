@@ -168,6 +168,30 @@ Use a **dense bf16** snapshot (e.g. `mlx-community/Qwen3-4B-Instruct-2507-bf16`,
 the engine quantize projections on ingest via `write_snapshot` / the `SnapshotPreparer`. For
 on-device work that ingest step is required anyway — 7.5 GB dense will not fit the per-app memory
 cap, so E3/E4 need a Q4-prepared snapshot, which is exactly what the preparer produces.
+
+**Prepared, and it works.** `cargo run --release -p mlx-llm --example prepare_snapshot -- <src>
+<out> q4` turns the 7.50 GiB dense source into **2.64 GiB** (35.2%, 902 tensors, 5.1 s), and the
+result generates correctly on macOS — *"The capital of France is Paris, and the capital of Germany
+is Berlin…"*, so Q4 preserved the model rather than merely the file format. Staged at
+`~/models/ios-eval/Qwen3-4B-Instruct-2507-q4`.
+
+**Separate finding — the chat template is silently dropped, and NOT by the preparer.**
+`load_chat_template` (`mlx-llm/src/provider.rs`) reads the model's Jinja template only from
+`tokenizer_config.json`, falling back to the typed `Llama3Template` with
+`supports_tools = supports_thinking = false` when absent. Newer HF exports — including this Qwen3
+— ship the template as a **`chat_template.jinja` sidecar** instead, which nothing reads. Verified:
+the dense source and the prepared snapshot *both* report `tools=false`, so the preparer loses
+nothing; the gap is in template discovery. The sidecar here does render a `tools` section and
+`<tool_call>` blocks, so the fallback costs a real capability.
+
+Consequences worth tracking:
+- **v1's `supports_tools` goal (G2) is affected on any model using the sidecar convention** — it
+  is not an iOS issue, it applies equally on macOS today.
+- The fix is small (also probe `chat_template.jinja`), belongs in `mlx-llm` rather than this
+  initiative, and should carry a preparer change to copy the sidecar through.
+- Until then, prefer snapshots with an inline `tokenizer_config.json` template when tool calling
+  matters, and treat a `tools=false` descriptor on a tool-capable model as this bug rather than a
+  model limitation.
 | S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. |
 | S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
 | S3.7 Runner heartbeat | A sleeping runner must fail loudly, not report green-by-absence. |
