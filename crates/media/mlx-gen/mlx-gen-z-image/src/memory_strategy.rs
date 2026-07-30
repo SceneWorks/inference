@@ -27,9 +27,11 @@
 //! | 3 Bounded attention | Implemented | [`mlx_gen::attention::sdpa_budgeted_bhsd`] threaded through every DiT attention (SC-15615) |
 //! | 4 Bounded transformer residency | Implemented (snapshot loads) | [`mlx_gen::block_residency::run_windowed`] over the 30 unified blocks, and the 15 ControlNet blocks (SC-15754) |
 //!
-//! Rung 4 is `Missing` for a **single-file / ComfyUI** load and only that: streaming rebuilds blocks
-//! from the snapshot per window, and an in-memory `Weights` has no re-openable source. The contract is
-//! built per `LoadSpec`, so that is declared per load rather than averaged into a half-truth.
+//! Rung 4 is available only for a snapshot load that explicitly requests
+//! [`LoadShape::DeferredMaterialization`](mlx_gen::LoadShape). The two facts are independent:
+//! `WeightsSource::Dir` supplies a re-openable source, while the load shape says not to bulk-commit
+//! the resident transformer stacks. Phase-level release remains the separate
+//! [`OffloadPolicy`](mlx_gen::OffloadPolicy) axis.
 //!
 //! **This is the MLX column, and it is not the Candle column.** As of SC-15754 the MLX lane carries
 //! all five rungs; `candle-gen-z-image` carries 0-3 and has no rung 4. Neither the presence nor the
@@ -53,11 +55,9 @@
 //! is a shared-contract gap (a load-time-vs-request-time seam) rather than a Z-Image one; it is
 //! recorded here so no calibration reads a rung-1 cell as request-selectable.
 //!
-//! **Rung 4 has the same load-time dependency and resolves it the opposite way — it REJECTS.** A
-//! window only bounds anything if the resident trunk is not also materialized, which is true under
-//! `Sequential` and false on a warm `Resident` generator. Yielding resident behaviour there (rung 1's
-//! answer) would write a rung-4 row into the calibration evidence for a run that saved nothing, so
-//! `pipeline::resolve_block_window` returns a typed error instead. Same seam, different blast radius.
+//! **Rung 4 does not depend on rung 1.** A window needs a deferred-materialization load, which can be
+//! composed with either `Resident` or `Sequential` phase residency. An eager load rejects the window
+//! because it would add a second block copy on top of the materialized trunk.
 //!
 //! ## What each rung is worth here (measured, Apple M5 Max, real `z_image_turbo`, 1024², 4 steps,
 //! staged residency, count 1 — `tests/block_residency_real_weights.rs`)
@@ -316,23 +316,24 @@ pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
 ///
 /// `Dit`, not `Both`, and that is a measured decision rather than caution.
 ///
-/// The encoder scope does cut the conditioning phase hard (bf16 2.718 -> 1.455 GiB at window 1,
-/// -46.5%). But measured end-to-end through `generate()`, the z-image **request** peak is
-/// decode-bound at ~4.365 GiB on every tier, so the conditioning saving changes what the user pays by
-/// **0.0%** (`component_scope_real_weights`). The epic's rule is explicit: a win on a phase that does
-/// not move the request peak is not a win. Declaring `Both` here would make the selector pay the
-/// per-window re-materialization and write a rung-4-with-encoder-scope row into the calibration
-/// evidence for a run that saved nothing — the false green this epic keeps re-learning.
+/// SC-15998 retired the old `0.0%` request-saving conclusion: that measurement ran inside a
+/// Sequential load whose decode phase bound the composed request. With phase residency held
+/// SC-15998 measured the scopes against the missing like-for-like control. At q4 512²/1 step,
+/// Resident+Deferred without rung 4 and each of `Dit`, `TextEncoder`, and `Both` all reached the same
+/// 4.847 GiB request peak: 0.0% incremental request saving. The windows did move their targeted
+/// phase peaks, but decode bound this envelope, so no scope may be recorded as a request saving.
+///
+/// `Dit` remains the production default only as the narrowest historical scope, not because this
+/// acceptance probe showed a request-peak advantage. Selection still requires production-envelope
+/// evidence keyed to the exact load shape.
 ///
 /// [`TRANSFORMER_WINDOW_COMPONENTS`] still publishes all three, because the capability is real and a
 /// caller may select it; this is only the default. The families where it should actually pay are the
 /// TE-dominant ones (Mage-Flow, lens, Kolors, flux2-klein, Sana), each of which owes its own
 /// measurement before flipping this — see `crate::text_encoder::stream`.
 ///
-/// For the record, the large bf16 conditioning drop this story produced (8.489 -> 2.718 GiB, which is
-/// what took bf16 from conditioning-bound above an 8 GB budget to decode-bound inside it) comes from
-/// the encoder being *streamable at all* under `Sequential` — the per-layer view drain — and NOT from
-/// this component scope. Those are separate levers and only the first pays on z-image.
+/// The historical coupled figures remain useful only as evidence for that exact staged composition;
+/// the v3 calibration fingerprint prevents them from being read as resident+deferred evidence.
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
 
 /// The one bounded-attention parameter this provider accepts: the shared
@@ -345,11 +346,19 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// Calibration content fingerprint. It must change whenever quantization floors, tensor layout, or
 /// execution structure change in a way that invalidates measurements taken against this provider.
 ///
-/// `-v2` retires the SC-15615 rung-3 declaration: rung 4 changes *when the trunk weights exist*
-/// during a denoise step, and the rung-2 decode domain is no longer a single point — both are
-/// execution-structure changes, so evidence taken against `-v1` must not be readable as covering this.
+/// The shape suffix is load-bearing: SC-15998 measured Eager and Deferred baselines at 9.550 and
+/// 4.847 GiB respectively, so evidence from one must never authorize the other.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2";
+    "z-image-mlx-independent-materialization-v3-deferred";
+pub const EAGER_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "z-image-mlx-independent-materialization-v3-eager";
+
+pub const fn memory_calibration_fingerprint(load_shape: mlx_gen::LoadShape) -> &'static str {
+    match load_shape {
+        mlx_gen::LoadShape::EagerMaterialization => EAGER_MEMORY_CALIBRATION_FINGERPRINT,
+        mlx_gen::LoadShape::DeferredMaterialization => MEMORY_CALIBRATION_FINGERPRINT,
+    }
+}
 
 /// This provider's two bounded-decode routes, reconciled by the shared
 /// [`DecodeRoutes`](mlx_gen_pid::DecodeRoutes) (SC-15775).
@@ -392,7 +401,8 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    // SC-15754: rung 4 is available only when this SPECIFIC load can execute it, and two load-time
+    // SC-15754 / SC-15998: rung 4 is available only when this SPECIFIC load can execute it, and two
+    // independent load-time
     // facts decide that. Declaring it here rather than failing at generate time is what keeps the
     // selector from choosing a strategy the loaded generator cannot run — the contract is built per
     // `LoadSpec`, so it can say so.
@@ -400,17 +410,11 @@ pub fn memory_strategy_contract(
     // 1. It rebuilds trunk blocks from the snapshot per window, so it needs a **re-openable source**.
     //    A `WeightsSource::Dir` (every registry load) has one; a single-file / in-place ComfyUI load
     //    does not.
-    // 2. It only bounds anything under `OffloadPolicy::Sequential`. Under `Resident` the trunk is
-    //    already materialized and a window would *add* a copy on top of it — strictly more memory and
-    //    strictly slower. `pipeline::resolve_block_window` refuses that at generate time as defense in
-    //    depth, but a run-time error is a poor failure mode for a memory optimization: the selector
-    //    would have picked a working lower rung had it known. So the contract says `Missing` and the
-    //    selector never reaches the refusal.
-    //
-    // This is the same load-time-vs-request-time seam rung 1 documents, resolved at the layer that can
-    // actually express it.
+    // 2. `LoadShape::DeferredMaterialization` says the request wants those re-openable blocks instead
+    //    of bulk-committing the stack. `OffloadPolicy` is deliberately absent: phase release and
+    //    intra-phase block materialization are separate axes.
     let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
-        && matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential);
+        && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization);
     // Bound once: the declaration is checked at construction, so building it twice inside the
     // capability map would re-run the check and re-allocate for no gain.
     let routes = decode_routes(provider_id)?;
@@ -456,6 +460,8 @@ pub fn memory_strategy_contract(
                 },
             })
             .collect(),
+        load_shape: spec.load_shape,
+        additional_prerequisites: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -487,7 +493,7 @@ pub fn memory_strategy_contract(
             ],
         },
         calibration: Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
+            memory_calibration_fingerprint(spec.load_shape),
         )),
         asset_facts: asset_facts(spec),
         runtime: MemoryRuntimeSemantics::default(),
@@ -881,10 +887,10 @@ mod tests {
         MEMORY_CALIBRATION_ABI,
     };
 
-    /// The load rung 4 is available on: a re-openable snapshot dir, loaded `Sequential`.
+    /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
     fn spec() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
-            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
     }
 
     fn contract() -> MemoryProviderContract {
@@ -1001,7 +1007,7 @@ mod tests {
         );
         assert_eq!(
             contract.calibration.as_ref().unwrap().fingerprint,
-            "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2"
+            MEMORY_CALIBRATION_FINGERPRINT
         );
     }
 
@@ -1051,23 +1057,59 @@ mod tests {
         }
     }
 
-    /// The fingerprint must move when the execution structure does. SC-15754 changes *when the trunk
-    /// weights exist* during a denoise step, which is precisely the "execution structure" the shared
-    /// contract says invalidates prior measurements — so evidence taken against the rung-3 declaration
-    /// must not be readable as covering this one.
+    /// The fingerprint must move when the execution structure does. SC-15998 removes staged
+    /// residency from rung 4's shared composition, so evidence from the coupled v2 execution must
+    /// not be readable as covering this one.
     #[test]
-    fn the_fingerprint_retired_the_rung_three_generation() {
+    fn the_fingerprint_retired_the_coupled_staged_window_generation() {
         assert_ne!(
             MEMORY_CALIBRATION_FINGERPRINT,
-            "z-image-mlx-staged-tiled-decode-bounded-attention-v1"
+            "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2"
         );
         let contract = contract();
         let mut ctx = context(MemoryStrategy::BoundedAttention);
         ctx.calibration_fingerprint =
-            "z-image-mlx-staged-tiled-decode-bounded-attention-v1".to_owned();
+            "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2".to_owned();
         assert!(matches!(
             safety_check(&contract, &ctx),
             MemorySafetyDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn eager_and_deferred_evidence_identities_cannot_cross_authorize() {
+        let deferred = contract();
+        let eager_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()));
+        let eager = memory_strategy_contract(crate::model::MODEL_ID, &eager_spec).unwrap();
+        assert_eq!(
+            deferred.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            eager.calibration.as_ref().unwrap().fingerprint,
+            EAGER_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_ne!(
+            deferred.calibration.as_ref().unwrap().fingerprint,
+            eager.calibration.as_ref().unwrap().fingerprint
+        );
+
+        // Use a lower rung implemented by both contracts so rejection proves evidence identity,
+        // not Deferred-only rung-4 availability.
+        let mut deferred_context = context(MemoryStrategy::BoundedAttention);
+        deferred_context.calibration_fingerprint = MEMORY_CALIBRATION_FINGERPRINT.to_owned();
+        assert!(matches!(
+            safety_check(&eager, &deferred_context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+
+        let mut eager_context = context(MemoryStrategy::BoundedAttention);
+        eager_context.calibration_fingerprint = EAGER_MEMORY_CALIBRATION_FINGERPRINT.to_owned();
+        assert!(matches!(
+            safety_check(&deferred, &eager_context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
         ));
     }
 
@@ -1206,19 +1248,13 @@ mod tests {
         assert!(contract.validate_selection(&sel).is_err());
     }
 
-    /// Rung 4 is declared per LOAD, and both load-time preconditions are enforced at the contract
+    /// Rung 4 is declared per load, and both load-time preconditions are enforced at the contract
     /// layer rather than at generate time.
-    ///
-    /// The `Resident` half is the one that matters in production: the worker selects from evidence, so
-    /// a contract that advertised rung 4 on a `Resident`-loaded generator would let it pick a strategy
-    /// that then hard-errors in `resolve_block_window` — a run-time failure for a request that had a
-    /// perfectly good lower rung available. Saying `Missing` up front means the selector simply picks
-    /// the next rung down.
     #[test]
-    fn a_resident_load_declares_rung_four_missing_so_the_selector_never_picks_it() {
-        let resident = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
+    fn rung_four_availability_uses_source_and_load_shape_not_offload_policy() {
+        let eager = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Resident);
-        let contract = memory_strategy_contract(crate::model::MODEL_ID, &resident).unwrap();
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &eager).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
@@ -1239,14 +1275,25 @@ mod tests {
         ] {
             contract.validate_selection(&selection(strategy)).unwrap();
         }
-        // ...and the Sequential load of the same snapshot does advertise it, so this is the policy
-        // doing the work rather than the path.
-        let sequential = super::memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap();
+        // Resident+Deferred advertises rung 4: phase release is not the discriminator.
+        let deferred = super::memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap();
         assert!(matches!(
-            sequential
+            deferred
                 .capability(MemoryStrategy::BoundedTransformerResidency)
                 .map(|c| &c.support),
             Some(MemoryStrategySupport::Implemented)
+        ));
+        // Sequential+Eager remains unavailable: staged residency does not imply deferred blocks.
+        let staged_eager =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        let staged_eager =
+            super::memory_strategy_contract(crate::model::MODEL_ID, &staged_eager).unwrap();
+        assert!(matches!(
+            staged_eager
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|c| &c.support),
+            Some(MemoryStrategySupport::Missing)
         ));
     }
 
@@ -1257,7 +1304,7 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::File(
             "/nonexistent/z-image.safetensors".into(),
         ))
-        .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
@@ -1479,11 +1526,10 @@ mod tests {
         assert_eq!(crate::pipeline::block_window_size(&staged), None);
     }
 
-    /// Rung 4 has no request-scoped lever on a `Resident`-loaded generator, and unlike rung 1 that is
-    /// an ERROR rather than a silent downgrade — a windowed forward there would add memory, and a
-    /// silently-resident "rung 4" run would poison the calibration evidence.
+    /// Rung 4 has no request-scoped lever on an eager generator. That is an error rather than a
+    /// silent downgrade because a window over an already-materialized trunk would poison evidence.
     #[test]
-    fn a_resident_load_refuses_rung_four_instead_of_degrading() {
+    fn an_eager_load_refuses_rung_four_instead_of_degrading() {
         let req = GenerationRequest {
             prompt: "a fox".to_owned(),
             memory: z_image_generation_memory(
@@ -1495,10 +1541,36 @@ mod tests {
         let err = crate::pipeline::resolve_block_window(&req, false, "z_image_turbo")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Sequential"), "{err}");
+        assert!(err.contains("DeferredMaterialization"), "{err}");
         assert_eq!(
             crate::pipeline::resolve_block_window(&req, true, "z_image_turbo").unwrap(),
             Some(TRANSFORMER_WINDOW_SIZE as usize)
+        );
+        let full_width = crate::transformer::ZImageTransformerConfig::turbo().n_layers;
+        let deferred_plain = GenerationRequest {
+            prompt: "a fox".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::pipeline::resolve_block_window(&deferred_plain, true, "z_image_turbo").unwrap(),
+            Some(full_width),
+            "a deferred load must not materialize the lazy resident stack on an unscoped request"
+        );
+        let deferred_text_encoder = GenerationRequest {
+            prompt: "a fox".to_owned(),
+            memory: Some(GenerationMemory {
+                stream_transformer_blocks: true,
+                transformer_window_size: Some(1),
+                transformer_window_component: Some(TransformerComponent::TextEncoder),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::pipeline::resolve_block_window(&deferred_text_encoder, true, "z_image_turbo")
+                .unwrap(),
+            Some(full_width),
+            "excluding the DiT from rung 4 must preserve its deferred materialization shape"
         );
         // Every lower rung is unaffected by the residency policy.
         for strategy in [
