@@ -385,7 +385,7 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 | Story | Notes |
 |---|---|
 | S5.1 SANA on device | **DONE.** A 1024px image generated on an iPhone 17 Pro Max in 36.5 s at 2839 MiB, through `provider_registry()` and the `Generator` contract. See the device section below. |
-| S5.2 Memory residency | **DONE on a 12 GB device; 8 GB is now doubtful.** Confirmed on hardware at 2839 MiB against a measured 6136 MiB cap. But the host's 4773 MiB untiled configuration was jetsam-killed, so host numbers understate device demand and the earlier "fits 8 GB at 80–85%" claim cannot be trusted without 8 GB hardware. Mac-side detail follows. **Mac-side: fits 8 GB, tightly.** `Residency::run_staged` sheds the Q4 trunk before decode (−1905 MiB) and the now-working tiled decode bounds the DC-AE transient: 1024px at 3294 MiB, 512px at 3453, both inside a 4096 MiB budget at 80–85% (56–78% of a 12 GB device's). Peak verified count-independent; Resident/Sequential byte-parity and repeat-job bounding re-verified on real weights. Device confirmation is Session A, and at 8 GB it is the *deciding* measurement, not a formality. |
+| S5.2 Memory residency | **DONE on a 12 GB device; 8 GB unverified.** Confirmed on hardware at 2751 MiB against a measured 6135 MiB cap. The host's 4773 MiB untiled configuration died on device — but **not** because host numbers understate demand: the one paired measurement has the host reading ~16% *high* (3294 host vs 2751 device), and the dead config projects to ~4110 MiB, two gigabytes under the cap. The death is unattributed (see the correction below); a host MLX peak is not a footprint figure. Usable rule: **host ≫ cap is a valid NO, host < cap is never a YES.** Mac-side detail follows, and every figure in it carries an unknown error bar. **Mac-side: fits 8 GB, tightly.** `Residency::run_staged` sheds the Q4 trunk before decode (−1905 MiB) and the now-working tiled decode bounds the DC-AE transient: 1024px at 3294 MiB, 512px at 3453, both inside a 4096 MiB budget at 80–85% (56–78% of a 12 GB device's). Peak verified count-independent; Resident/Sequential byte-parity and repeat-job bounding re-verified on real weights. Device confirmation is Session A, and at 8 GB it is the *deciding* measurement, not a formality. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
 | S5.7 Device harness for image generation | **DONE.** `ios-smoke` gains a `media` feature carrying a SANA check (two configurations, loaded through `provider_registry()` rather than a direct loader), `scripts/ios/push_model.sh` provisions a snapshot into the app container, and `run_smoke.sh --media` drives both. Validated on the host first, where MLX peaks reproduce `image_budget`'s numbers exactly. |
 | S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
@@ -774,13 +774,41 @@ device — so SANA does not need to be restricted to 12 GB hardware. The earlier
 recommendation is withdrawn; it was written against a peak that assumed the trunk stayed resident.
 The 8 GB case is tight enough that the device session decides it, not the host harness.
 
-> **Superseded the same day by the device run below — read that first.** The device session did
-> decide it, and not in this claim's favour. A configuration this section calls comfortable
-> (512px untiled, 4773 MiB against a 6136 MiB cap) was **jetsam-killed** on hardware, because
-> `set_memory_limit` applies backpressure where the device applies a kill. Host numbers therefore
-> *understate* device demand, and every "fits 8 GB at N%" figure above is an underestimate of
-> unknown size. The 8 GB claim is not withdrawn — it is **unverified**, and cannot be verified
-> without 8 GB hardware. What *is* confirmed on a 12 GB device is 1024px tiled at 2839 MiB.
+> **Superseded twice the same day. Read the correction below before using any figure above.**
+>
+> *First revision (wrong, retained so the error is traceable):* a configuration this section calls
+> comfortable — 512px untiled, 4773 MiB against a 6136 MiB cap — died on hardware, from which this
+> doc concluded that `set_memory_limit`'s backpressure makes host numbers **understate** device
+> demand.
+>
+> *That conclusion does not survive its own evidence.* It generalized from one unexplained death
+> while ignoring the only **paired** measurement on the branch, which points the opposite way:
+>
+> | SANA 1024px, 128px tiles | |
+> |---|---:|
+> | host (`image_budget`) | 3294 MiB |
+> | device | **2751 MiB** |
+>
+> The host reads ~16% **high**, not low. Apply that one measured ratio to the config that died and
+> it projects to ~4110 MiB — **two gigabytes under the cap** — and it died anyway. Only two
+> readings survive: the host→device map is violently shape-dependent (one large transient versus
+> many small tile transients), or **the death was not a footprint kill at all**. The latter is not
+> speculation: §"what is established, and what is inferred" below already recorded that an MLX
+> allocation abort is indistinguishable from jetsam at this vantage, and that ambiguity was then
+> reasoned past rather than resolved.
+>
+> Supporting asymmetry: on device MLX peak ≈ process RSS (2751 vs 2964). On host they diverge
+> sharply (4773 vs 2961). **The two counters do not measure the same thing on the two platforms**,
+> so a host MLX peak is not a footprint figure and its mapping to the footprint jetsam reads is
+> uncalibrated in magnitude and *unestablished in sign*.
+>
+> **The only rule that survives:** a host peak far above the cap cannot shrink enough to fit under
+> any plausible reading, so **host ≫ cap is a valid NO; host < cap is never a YES.** Every host
+> figure in this document used as evidence about the device carries an error bar that is unknown
+> and not even known to be positive.
+>
+> The 8 GB claim is therefore **unverified**, and unverifiable without 8 GB hardware. What is
+> confirmed on a 12 GB device is 1024px tiled at 2751 MiB.
 
 **Found in passing — a progress-contract violation shared by every mlx-gen image provider.**
 `gen_core_testkit`'s progress contract requires `Progress::Decoding` **exactly once** per generation
