@@ -10,7 +10,8 @@ Date: 2026-07-29. Lane: MLX on iOS.
 
 ## How this is cut
 
-**Five epics**, drawn on **distinct failure modes** rather than on task order. Each owns one
+**Six epics** (originally five — E5 was split at its riskiest story; see below), drawn on
+**distinct failure modes** rather than on task order. Each owns one
 thing that can go wrong, has its own exit criteria, and is independently demoable.
 
 Two constraints set the grain:
@@ -28,20 +29,21 @@ Two constraints set the grain:
 | **E2** | `runtime-ios` composition | Composition — **retired** | ~~`RuntimeCatalog` validates; surface test green~~ **met** | ~~2~~ **done** |
 | **E3** | On-device proof | Device runtime — **retired** | ~~`textllm_conformance` green on a physical iPhone~~ **met** | ~~3–4~~ **done** |
 | **E4** | Memory & performance | Memory, thermals, threading — **mostly retired** | G5 numbers published + enforced — **all but energy** | ~3 → **1 story left** |
-| **E5** | On-device image generation | **Model portability** | G6 + G7 | ~9 |
+| **E5** | Small image generation (SANA) | Model portability | G6 | ~2 |
+| **E6** | Unified AR LLM + image (sensenova) | **Dual-path runtime** — highest remaining risk | G7 | ~3 |
 
 ```
-E1 ──> E2 ──> E3 ──> E4 ──┐
-  toolchain  bundle  device  perf │
-                                  ├──> ship: text-only (~wk 9–11)
-                                  │
-                                  └──> E5 ──> ship: full v1 (~wk 18–20)
-                                       image
+E1 ──> E2 ──> E3 ──> E4 ──┬──> ship: text-only            [E1-E3 done, E4 6/7]
+  toolchain bundle device perf │
+                              ├──> E5 ─> ship: + image     (SANA, ~2 wks)
+                              │    sana
+                              └──> E6 ─> ship: + unified   (sensenova, ~3 wks)
+                                   unified
 ```
 
-E5's *build* half is already de-risked — `mlx-gen`, `-pid` and `-sana` compile for
-`aarch64-apple-ios` today ([spec §2.2](architecture/ios-project-spec.md)) — but its device and
-memory work depends on E3 and E4.
+E5 and E6 are independent of each other, not sequential: both need E4's memory seam, neither needs
+the other. E5 shipping is a real milestone on its own — which is why the riskiest story now lives
+in E6 rather than inside it.
 
 ---
 
@@ -317,28 +319,69 @@ the lane fails before a broader-device release would rather than after.
 
 ---
 
-## E5 — On-device image generation
+## E5 — Small image generation (SANA)
 
-**Goal:** G6 (small image-only) and G7 (unified AR LLM + image) on device.
+**Goal:** G6 — a small image-only generator on device.
 
-**Why separate:** a distinct failure mode — model portability and memory residency — and it is
-the only epic gated on a launch requirement that could slip independently of the text runtime.
-It is also the largest.
+**Why separate:** a distinct failure mode — model portability and memory residency — and the only
+epic gated on a launch requirement that could slip independently of the text runtime.
+
+**Estimate: ~2 weeks.** This was planned at 9 weeks for E5-as-one-epic, before any of the runtime
+worked. Six of that estimate's assumptions have since been measured and retired:
+
+| Assumed at planning time | Now known |
+|---|---|
+| `mlx-gen` might not cross-compile | Zero `cfg(target_os)` gates; same `mlx-sys` build already fixed in E1 |
+| Metal kernels unproven on device | Proven — f32/bf16 GEMM and softmax correct (E3) |
+| Memory headroom unknown | ~2.9 GiB of ~6 GB used by the LLM; SANA + Gemma-2 is ~2 GB |
+| No way to make room for a second model | Unload reclaims 100% (E4/S4.5) |
+| No packaging or provisioning path | metallib bundling + `devicectl` push, both working |
+| No device harness | `run_smoke.sh` builds, signs, installs, launches, asserts thresholds |
+
+What is left is genuinely SANA-specific: getting it resident and correct, and measuring latency.
 
 | Story | Notes |
 |---|---|
-| S5.1 SANA on device | `mlx-gen` + `-pid` + `-sana`. Already **builds** for iOS; this is the device half. |
-| S5.2 Memory residency | Encoder / DiT / DC-AE decoder. 2-bit Gemma-2 encoder if needed; DC-AE tiling. Depends on E4's seam. |
+| S5.1 SANA on device | `mlx-gen` + `-pid` + `-sana`. Already builds for iOS; this is the device half. |
+| S5.2 Memory residency | Encoder / DiT / DC-AE decoder. 2-bit Gemma-2 encoder if needed; DC-AE tiling. Uses E4's unload seam. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
-| S5.4 sensenova on device | Dual-path AR + flow-matching, sharing `mlx-llm`'s KV cache with the text lane. **The riskiest story in the initiative.** |
-| S5.5 `media` feature in `runtime-ios` | Plus the ordered surface test for that profile. |
-| S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. |
+| S5.5 `media` feature in `runtime-ios` | Plus the ordered surface test for that profile — the bundle's current test asserts the media registry is *empty*, so this is a deliberate edit to both. |
+| S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. Enforced like E4's thresholds. |
 
-**Exit:** SANA generates a correct 1024px image within the memory cap; sensenova produces both
-text and image output; media registry validated in the bundle.
+**Exit:** SANA generates a correct 1024px image within the memory cap, `gen-core-testkit`
+conformance green on device, media registry validated in the bundle.
 
-**Risk:** S5.4. SANA is a known-shape diffusion port; the unified model with its dual-path
-runtime is a different animal. See below.
+**Risk:** low-moderate. SANA is a known-shape diffusion port on a build that already works. The
+open question is memory residency under the cap (S5.2), which E4's seam exists to answer.
+
+---
+
+## E6 — Unified AR LLM + image (sensenova)
+
+**Goal:** G7 — `mlx-gen-sensenova` producing both text and image output on device.
+
+**Why separate from E5:** this was S5.4, and the epic doc already flagged splitting here if it
+resisted. Splitting it *before* starting is the better call: SANA shipping is a real milestone
+that should not be held hostage to the riskiest story in the initiative, and the two have
+different shapes. SANA is a diffusion port of known shape; sensenova is a dual-path AR +
+flow-matching runtime that shares `mlx-llm`'s `ContiguousKvCache`, `sample`, and `Rope`
+(sc-7159) — the coupling that made Lane A the right choice in the first place
+([strategy §6.3](architecture/ios-strategy.md)).
+
+**Estimate: ~3 weeks, low confidence.** Unlike E5's stories, nothing here has been de-risked by
+the work so far. That coupling to `mlx-llm` is a benefit on this lane, but it also means the
+unified model exercises paths the text lane does not.
+
+| Story | Notes |
+|---|---|
+| S6.1 sensenova on device | Dual-path AR + flow-matching; shares the KV cache with the text lane. |
+| S6.2 Co-residency or staged handoff | Two models under one cap. Where E4/S4.5's seam earns its keep — or where it turns out not to be enough. |
+| S6.3 Unified conformance + latency | Both modalities, sustained. |
+
+**Exit:** sensenova produces both text and image output on device, within the memory cap.
+
+**Risk:** the highest remaining in the initiative. If it stalls, E5 has already shipped G6 and the
+text lane is unaffected — which is the point of the split.
 
 ---
 
@@ -346,8 +389,9 @@ runtime is a different animal. See below.
 
 Recorded so a re-cut is a decision rather than drift:
 
-- **E5 splits into two** if sensenova resists. SANA (S5.1–S5.3, S5.5) is well understood; the
-  unified AR-plus-image model is not. Plan E5 as one epic and split at S5.4 if it stalls.
+- ~~**E5 splits into two** if sensenova resists.~~ **Done, and pre-emptively rather than
+  reactively** (2026-07-29): E5 is now SANA-only and E6 is sensenova. Waiting for it to stall
+  would have meant discovering the split mid-epic, with G6 already entangled in G7's risk.
 - **A sixth epic appears** if the week 9–11 consumer turns out to be a **native app** rather than
   the headless server. The FFI layer, a real host app, and API-stability review then become their
   own workstream. Today [spec §5.2.1](architecture/ios-project-spec.md) folds that into E3 as a
@@ -362,17 +406,22 @@ Recorded so a re-cut is a decision rather than drift:
 ## Sequencing
 
 ```
-        wk  0    2      4        8        11              20
-E1 toolchain [====]
-E2 bundle         [====]
-E3 device              [======]
-E4 perf                       [=====]
-                                    ^ ship: text-only
-E5 image                             [==================]
-                                                        ^ ship: v1
+                     DONE ──────────────────┐   remaining
+E1 toolchain  [done]                        │
+E2 bundle     [done]                        │
+E3 device     [done]                        │
+E4 perf       [6/7 — energy open]           │
+                                            ├─> ship: text-only  (ready now)
+E5 sana                                     [====]        ~2 wks
+E6 sensenova                                [======]      ~3 wks
 ```
 
-~18–20 weeks for one engineer plus Claude. Device time and Apple provisioning are the bottleneck,
-not code throughput ([spec §8.2](architecture/ios-project-spec.md)) — E3 and E4 are the
-device-bound epics and should be planned around scheduled hardware sessions rather than ad-hoc
-interruptions.
+**E1–E3 are complete and E4 is six of seven** — the text lane is shippable today. What remains is
+~5 weeks: SANA (~2) and sensenova (~3), plus E4's energy measurement.
+
+The original plan said ~18–20 weeks. That estimate was written before anything ran; most of it was
+risk that has since been measured away rather than work that has been done faster. The remaining
+5 weeks are the parts nothing so far has de-risked.
+
+Device time and Apple provisioning remain the bottleneck, not code throughput
+([spec §8.2](architecture/ios-project-spec.md)) — plan E5/E6 around scheduled hardware sessions.

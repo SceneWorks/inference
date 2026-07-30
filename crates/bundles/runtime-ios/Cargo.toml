@@ -15,7 +15,7 @@ mlx-llm = { workspace = true }
 # `mlx-gen-catalog` composes 32 provider crates including the video families (wan, ltx, mochi,
 # svd) — the wrong shape for a device with a hard per-app memory cap, and none of it validated
 # on iOS. Adding the whole catalog to get one small image generator would compile a graph the
-# platform cannot run. The iOS image track (E5) instead composes a *narrow* media registry from
+# platform cannot run. The iOS image track (E5/E6) instead composes a *narrow* media registry from
 # `mlx-gen-sana` (+ its `mlx-gen-pid` dependency) and `mlx-gen-sensenova`, which is a new
 # composition root rather than a feature flag on this crate.
 #

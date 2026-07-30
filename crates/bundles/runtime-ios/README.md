@@ -30,7 +30,7 @@ would compile a graph the platform cannot run.
 
 On-device image generation instead composes a **narrow, purpose-built registry** — `mlx-gen-sana`
 (with its `mlx-gen-pid` dependency) and `mlx-gen-sensenova` — as its own composition root. See
-[the iOS epic breakdown](../../../docs/ios-epics.md) (E5).
+[the iOS epic breakdown](../../../docs/ios-epics.md) (E5 for SANA, E6 for the unified model).
 
 The Candle `audio` lane is likewise out of scope until an iOS audio story exists: that lane is the
 one sanctioned cross-backend seam (`docs/architecture/audio-backend-strategy.md`) and should not
