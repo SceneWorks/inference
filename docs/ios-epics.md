@@ -149,7 +149,25 @@ the runner (S3.6/S3.7).
 | S3.1 iOS app target (`ios-host/`) | **Scaffolded** — `ios-host/` builds, signs, installs and launches on device via `scripts/ios/run_smoke.sh` (XcodeGen spec, SwiftUI shell, workspace-excluded Rust staticlib). Still to do: host `mlx-llm-server` rather than the smoke test. |
 | S3.2 Bind to loopback + USB forwarding | The server has **no auth**. It must not reach a LAN interface. Bearer token if remote access is ever needed. |
 | S3.3 Metallib resolution on device | **DONE — verified on an iPhone 17 Pro Max (iOS 26.5.2).** The 124 MB bundled metallib resolves inside the sandbox via `load_colocated_library`. Run it with `scripts/ios/run_smoke.sh`. |
-| S3.4 Model provisioning into the app container | How weights reach `WeightsSource::Dir` on a phone — Files app, iTunes file sharing, or a dev-time copy. Unspecified today; needed before anything runs. |
+| S3.4 Model provisioning into the app container | How weights reach `WeightsSource::Dir` on a phone — Files app, iTunes file sharing, or a dev-time copy. Still unspecified. **A snapshot is now staged locally** at `~/models/ios-eval/Qwen3-4B-Instruct-2507-bf16` (verified generating on macOS). See the format constraint below before choosing one. |
+
+**Snapshot format constraint — found the hard way, worth knowing before picking a model.**
+`mlx-llm` cannot load the common `*-MLX-4bit` community snapshots. Those quantize the **embedding
+table** (`model.embed_tokens.weight` as packed `U32` with `scales`/`biases`), while the engine
+loads `embed_tokens` densely via `req_bf16` and has no quantized-embedding path — by design, since
+its documented quant invariant is that only attention/MLP *projections* are quantized and
+embeddings, the LM head, and norms stay dense.
+
+The failure is not obvious from the error: MLX reports
+`[rms_norm] (*weight) must have the same size as the last dimension of x but has 2560 elements`,
+because the packed `[151936, 320]` table yields a 320-wide embedding where 2560 is expected, and
+the first norm downstream is what actually complains. **It fails identically on macOS**, so it is
+a snapshot-compatibility issue, not an iOS one.
+
+Use a **dense bf16** snapshot (e.g. `mlx-community/Qwen3-4B-Instruct-2507-bf16`, 7.5 GB) and let
+the engine quantize projections on ingest via `write_snapshot` / the `SnapshotPreparer`. For
+on-device work that ingest step is required anyway — 7.5 GB dense will not fit the per-app memory
+cap, so E3/E4 need a Q4-prepared snapshot, which is exactly what the preparer produces.
 | S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. |
 | S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
 | S3.7 Runner heartbeat | A sleeping runner must fail loudly, not report green-by-absence. |
