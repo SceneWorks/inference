@@ -482,6 +482,22 @@ The usable question is resolution — or the PiD super-resolving decode route, w
 carries (`mlx-gen-pid` is a dependency) and which is the one lever that changes the denoise cost
 rather than the decode.
 
+**Resolution scaling confirms it, and shows the ladder did its job.** Device, rung 4 on, tile 256:
+
+| output | time | MLX peak | headroom left |
+|---|---:|---:|---:|
+| 512px | **60.6 s** | 2836 MiB | 5374 MiB |
+| 1024px | 229.1 s | 2901 MiB | 2146 MiB |
+
+Time scales **3.78×** for 4× the pixels — tracking the latent-position count almost exactly, which is
+what the `SPATIAL_SCALE`-8 explanation predicts (and slightly sub-quadratic, so this is
+bandwidth-bound rather than attention-bound at these sizes).
+
+**Memory is flat: 2836 vs 2901 MiB for a 4× change in output area.** That is the ladder working as
+designed — rung 4 bounds denoise residency per block and rung 2 bounds the decode per tile, so
+neither scales with resolution. On this model, on this device, **resolution buys time, not memory**,
+and the fit question and the latency question are therefore independent.
+
 **Status: a fit result, not yet a usable one at 1024px.** Catalog inclusion
 (`mlx-gen-ios-catalog` is deliberately SANA-only) remains a separate decision and is not implied by
 any of this.
