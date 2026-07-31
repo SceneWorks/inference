@@ -30,8 +30,7 @@ mod common;
 
 use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
 use mlx_gen::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, Quant,
-    WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
 };
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
@@ -88,7 +87,6 @@ impl Run {
 fn run_with(component: TransformerComponent) -> Run {
     let (quant, _) = tier_from_path();
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    spec.offload_policy = OffloadPolicy::Sequential;
     spec.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
     if let Some(q) = quant {
         spec = spec.with_quant(q);
@@ -102,6 +100,7 @@ fn run_with(component: TransformerComponent) -> Run {
         seed: Some(1234),
         steps: Some(env_u32("ZIMAGE_STEPS", 4)),
         memory: Some(GenerationMemory {
+            stage_residency: true,
             tile_vae_decode: true,
             chunk_attention: true,
             stream_transformer_blocks: true,

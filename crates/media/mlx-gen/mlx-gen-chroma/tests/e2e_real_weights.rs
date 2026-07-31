@@ -122,11 +122,15 @@ fn chroma_hd_e2e_matches_diffusers() {
     .expect("load Chroma1-HD");
 
     // 1. masked T5 encode parity (sc-3838 numeric).
-    let (pe, pm) = encode_prompt(model.tokenizer_ref(), model.t5_ref(), PROMPT).unwrap();
+    let (pe, pm) = model
+        .with_text_refs(|tokenizer, t5| encode_prompt(tokenizer, t5, PROMPT))
+        .unwrap();
     let pe_rel = peak_rel(&pe, g.require("prompt_embeds").unwrap());
     eprintln!("prompt_embeds peak-rel = {pe_rel:.4}");
     assert!(pe_rel < 5e-2, "masked T5 prompt_embeds diverged: {pe_rel}");
-    let (nege, _) = encode_prompt(model.tokenizer_ref(), model.t5_ref(), NEG).unwrap();
+    let (nege, _) = model
+        .with_text_refs(|tokenizer, t5| encode_prompt(tokenizer, t5, NEG))
+        .unwrap();
     eprintln!(
         "neg_embeds peak-rel = {:.4}",
         peak_rel(&nege, g.require("neg_embeds").unwrap())
@@ -147,15 +151,16 @@ fn chroma_hd_e2e_matches_diffusers() {
     let ones = Array::ones::<f32>(&[1, si]).unwrap();
     let full_mask = concatenate_axis(&[g.require("prompt_mask").unwrap(), &ones], 1).unwrap();
     let noise_pred = model
-        .transformer_ref()
-        .forward(
-            g.require("init_latents").unwrap(),
-            golden_embeds,
-            g.require("timestep").unwrap(),
-            g.require("img_ids").unwrap(),
-            &txt_ids,
-            Some(&full_mask),
-        )
+        .with_transformer_ref(|transformer| {
+            transformer.forward(
+                g.require("init_latents").unwrap(),
+                golden_embeds,
+                g.require("timestep").unwrap(),
+                g.require("img_ids").unwrap(),
+                &txt_ids,
+                Some(&full_mask),
+            )
+        })
         .unwrap();
     let np_rel = peak_rel(&noise_pred, g.require("noise_pred").unwrap());
     eprintln!("noise_pred peak-rel = {np_rel:.4}");
@@ -186,15 +191,16 @@ fn chroma_hd_quant_bounded() {
         let spec = LoadSpec::new(WeightsSource::Dir(hf_snapshot("Chroma1-HD"))).with_quant(q);
         let model = load_chroma(ChromaVariant::Hd, &spec).expect("load quantized Chroma1-HD");
         let np = model
-            .transformer_ref()
-            .forward(
-                g.require("init_latents").unwrap(),
-                golden_embeds,
-                g.require("timestep").unwrap(),
-                g.require("img_ids").unwrap(),
-                &txt_ids,
-                Some(&full_mask),
-            )
+            .with_transformer_ref(|transformer| {
+                transformer.forward(
+                    g.require("init_latents").unwrap(),
+                    golden_embeds,
+                    g.require("timestep").unwrap(),
+                    g.require("img_ids").unwrap(),
+                    &txt_ids,
+                    Some(&full_mask),
+                )
+            })
             .unwrap();
         let rl = rel_l2(&np, golden_np);
         eprintln!("{q:?} noise_pred rel-L2 vs dense = {rl:.4}");

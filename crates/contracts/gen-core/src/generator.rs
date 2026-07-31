@@ -445,6 +445,12 @@ pub struct GenerationRequest {
 /// serve different resolutions and live budgets truthfully without a process-global toggle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GenerationMemory {
+    /// Release whole model components between conditioning, denoise, and decode for this request.
+    ///
+    /// Unlike [`LoadSpec::offload_policy`](crate::LoadSpec::offload_policy), this is an execution
+    /// decision on one generation. A cached generator may therefore keep a warm component pair for
+    /// one request, stage the next request, and rebuild the warm pair for a later request.
+    pub stage_residency: bool,
     /// Force the provider's bounded/tiled native VAE decode even below its automatic tiling threshold.
     pub tile_vae_decode: bool,
     /// Bound attention scratch by chunking independent query rows. This must preserve the provider's
@@ -2258,6 +2264,7 @@ mod tests {
         assert_eq!(
             GenerationMemory::default(),
             GenerationMemory {
+                stage_residency: false,
                 tile_vae_decode: false,
                 chunk_attention: false,
                 stream_transformer_blocks: false,
@@ -2277,6 +2284,7 @@ mod tests {
     #[test]
     fn strategy_parameters_default_to_the_providers_own_constants() {
         let memory = GenerationMemory::default();
+        assert!(!memory.stage_residency);
         assert_eq!(memory.decode_tile_edge, None);
         assert_eq!(memory.decode_overlap, None);
         assert_eq!(memory.transformer_window_size, None);

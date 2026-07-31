@@ -374,6 +374,7 @@ fn the_request_peak_effect_of_the_predicted_split() {
         // multi-tier snapshot root.
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
         spec.offload_policy = OffloadPolicy::Sequential;
+        spec.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
         spec = match tier.as_str() {
             "q4" => spec.with_quant(Quant::Q4),
             "q8" => spec.with_quant(Quant::Q8),
@@ -387,6 +388,7 @@ fn the_request_peak_effect_of_the_predicted_split() {
             seed: Some(1234),
             steps: Some(steps),
             memory: Some(GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,

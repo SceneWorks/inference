@@ -1,7 +1,7 @@
 //! Shared component-residency seam (epic 10834; sc-11125, consolidating F-173/F-174/F-175/F-177).
 //!
 //! Every wired image provider that supports [`OffloadPolicy::Sequential`](crate::OffloadPolicy) had
-//! grown a near-verbatim copy of the same machinery: a two-variant residency enum, an `encode` that
+//! grown a near-verbatim copy of the same machinery: a two-variant residency state, an `encode` that
 //! loaded the text encoder → encoded → `eval`ed → dropped it → `clear_cache()`, a `load_seq_heavy`,
 //! a `heavy()` borrow-resolver with an identical `unreachable!`, and a `was_sequential` cleanup tail.
 //! Eight copies (sdxl, z-image, qwen-image ×3, krea ×2, lens) drifted independently — and each of the
@@ -38,38 +38,30 @@
 
 use crate::error::{Error, Result};
 use crate::runtime::{CancelFlag, LoadPhase, OffloadPolicy, Progress};
+use std::sync::{Mutex, MutexGuard};
 
 /// Boxed phase-A loader: rebuilds the `Text` component (text/vision encoder) from the captured load
-/// spec on each `Sequential` generate. `Send + Sync` so a `Residency`-holding generator keeps the
-/// auto-traits its `Resident` twin has.
-type TextLoader<Text> = Box<dyn Fn() -> Result<Text> + Send + Sync>;
+/// spec. `streamable` selects the request's component form at the point of use rather than at
+/// generator construction. `Send + Sync` keeps a `Residency`-holding generator's auto-traits.
+type TextLoader<Text> = Box<dyn Fn(bool) -> Result<Text> + Send + Sync>;
 
 /// Boxed heavy-phase loader: rebuilds the `Heavy` render bundle (DiT + VAE + overlays). The `bool` is
-/// the request's `use_pid` (F-177) — the loader skips the PiD student + caption encoder when it is
-/// `false`, since that overlay participates only at decode and only when PiD is requested.
-type HeavyLoader<Heavy> = Box<dyn Fn(bool) -> Result<Heavy> + Send + Sync>;
+/// the request's `use_pid` (F-177); the second is the request's `streamable` component form.
+type HeavyLoader<Heavy> = Box<dyn Fn(bool, bool) -> Result<Heavy> + Send + Sync>;
 
 /// The warm-resident pair: the phase-A `Text` component + the `Heavy` render bundle, both held for the
-/// whole job and across jobs. Boxed inside [`Residency`] so the heavy `Resident` variant does not
-/// bloat every `Sequential` handle (`clippy::large_enum_variant`).
+/// whole job and across jobs. `streamable` records the form used to build the pair so a request that
+/// needs the other form evicts before reloading instead of mixing resident and streamed weights.
 struct ResidentPair<Text, Heavy> {
     text: Text,
     heavy: Heavy,
+    streamable: bool,
 }
 
-/// The two per-phase loader closures a `Sequential` residency re-runs each generate. Boxed for the
-/// same size reason as [`ResidentPair`].
+/// The two per-phase loader closures retained for the generator's whole lifetime.
 struct SeqLoaders<Text, Heavy> {
     load_text: TextLoader<Text>,
     load_heavy: HeavyLoader<Heavy>,
-}
-
-enum Inner<Text, Heavy> {
-    /// Every component loaded once and held warm (the default `Resident` policy). `run` borrows these.
-    Resident(Box<ResidentPair<Text, Heavy>>),
-    /// Nothing held but the loader closures; each `run` re-loads the components in phase order and
-    /// frees them, bounding peak unified memory to `max(text, heavy)` instead of their sum.
-    Sequential(Box<SeqLoaders<Text, Heavy>>),
 }
 
 /// A heavy render bundle whose denoise-only component (the DiT) can be **shed** after the denoise
@@ -103,7 +95,9 @@ pub trait StagedHeavy {
 /// encoder, or a tuple of them). `Heavy` is the render bundle — everything but the text encoder (the
 /// DiT/U-Net, the VAE, and any ControlNet / PiD overlay).
 pub struct Residency<Text, Heavy> {
-    inner: Inner<Text, Heavy>,
+    loaders: SeqLoaders<Text, Heavy>,
+    warm: Mutex<Option<ResidentPair<Text, Heavy>>>,
+    on_staged: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl<Text, Heavy> Residency<Text, Heavy> {
@@ -111,7 +105,27 @@ impl<Text, Heavy> Residency<Text, Heavy> {
     /// load; [`run`](Self::run) borrows them for every generation.
     pub fn resident(text: Text, heavy: Heavy) -> Self {
         Self {
-            inner: Inner::Resident(Box::new(ResidentPair { text, heavy })),
+            // Compatibility constructor for in-memory providers that do not expose request-scoped
+            // staging. The shared shape still retains two loaders, but calling either is a typed
+            // error rather than fabricating a reload source that does not exist.
+            loaders: SeqLoaders {
+                load_text: Box::new(|_| {
+                    Err(Error::Msg(
+                        "resident-only component source cannot reload text".into(),
+                    ))
+                }),
+                load_heavy: Box::new(|_, _| {
+                    Err(Error::Msg(
+                        "resident-only component source cannot reload heavy components".into(),
+                    ))
+                }),
+            },
+            warm: Mutex::new(Some(ResidentPair {
+                text,
+                heavy,
+                streamable: false,
+            })),
+            on_staged: None,
         }
     }
 
@@ -127,31 +141,53 @@ impl<Text, Heavy> Residency<Text, Heavy> {
         load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            inner: Inner::Sequential(Box::new(SeqLoaders {
+            loaders: SeqLoaders {
+                load_text: Box::new(move |_| load_text()),
+                load_heavy: Box::new(move |use_pid, _| load_heavy(use_pid)),
+            },
+            warm: Mutex::new(None),
+            on_staged: None,
+        }
+    }
+
+    /// Build a request-scoped residency. Construction retains only loaders; the first request
+    /// decides whether to populate the warm pair or run the phase-staged lifecycle.
+    pub fn request_scoped(
+        load_text: impl Fn(bool) -> Result<Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool, bool) -> Result<Heavy> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            loaders: SeqLoaders {
                 load_text: Box::new(load_text),
                 load_heavy: Box::new(load_heavy),
-            })),
+            },
+            warm: Mutex::new(None),
+            on_staged: None,
         }
     }
 
-    /// Whether this residency is `Sequential` (re-loads per generate). Providers use it for the
-    /// load-time F-181 re-quantization warning and for tests.
+    /// Attach a once-per-provider advisory hook for staged execution.
+    pub fn with_staged_advisory(mut self, advisory: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_staged = Some(Box::new(advisory));
+        self
+    }
+
+    /// Whether no warm pair is currently cached. Legacy policy-based providers use this as their
+    /// resident/sequential discriminator; request-scoped providers use it only for observation.
     pub fn is_sequential(&self) -> bool {
-        matches!(self.inner, Inner::Sequential(_))
+        self.warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
     }
 
-    /// Borrow the warm-resident components `(text, heavy)`, or `None` under `Sequential` (which holds
-    /// no components between generations). Providers whose public surface reaches the components
-    /// *outside* the staged [`run`](Self::run) lifecycle — a concrete-typed parity/test accessor such
-    /// as Chroma's `denoise` / `*_ref` real-weight helpers, which drive the default `Resident` policy —
-    /// use this to reach the warm components. It exposes only a shared borrow, so it changes no
-    /// behavior; the staged `Sequential` drop discipline is unaffected (it holds no components to
-    /// borrow, hence `None`).
-    pub fn resident_parts(&self) -> Option<(&Text, &Heavy)> {
-        match &self.inner {
-            Inner::Resident(pair) => Some((&pair.text, &pair.heavy)),
-            Inner::Sequential(_) => None,
-        }
+    /// Run `f` while borrowing the warm pair, or return `None` when no pair is cached.
+    pub fn with_resident_parts<R>(&self, f: impl FnOnce(&Text, &Heavy) -> R) -> Option<R> {
+        let warm = self
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        warm.as_ref().map(|pair| f(&pair.text, &pair.heavy))
     }
 
     /// The single dispatch every wired provider shares (sc-11126, F-180): map an
@@ -175,14 +211,80 @@ impl<Text, Heavy> Residency<Text, Heavy> {
         load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
         load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
     ) -> Result<Self> {
+        let loaders = SeqLoaders {
+            load_text: Box::new(move |_| load_text()),
+            load_heavy: Box::new(move |use_pid, _| load_heavy(use_pid)),
+        };
         match policy {
             OffloadPolicy::Resident => {
-                let text = load_text()?;
-                let heavy = load_heavy(true)?;
-                Ok(Self::resident(text, heavy))
+                let text = (loaders.load_text)(false)?;
+                let heavy = (loaders.load_heavy)(true, false)?;
+                Ok(Self {
+                    loaders,
+                    warm: Mutex::new(Some(ResidentPair {
+                        text,
+                        heavy,
+                        streamable: false,
+                    })),
+                    on_staged: None,
+                })
             }
-            OffloadPolicy::Sequential => Ok(Self::sequential(load_text, load_heavy)),
+            OffloadPolicy::Sequential => Ok(Self {
+                loaders,
+                warm: Mutex::new(None),
+                on_staged: None,
+            }),
         }
+    }
+
+    fn warm(&self) -> Result<MutexGuard<'_, Option<ResidentPair<Text, Heavy>>>> {
+        self.warm
+            .lock()
+            .map_err(|_| Error::Msg("component-residency mutex poisoned".into()))
+    }
+
+    /// Drop the warm pair and flush MLX's allocator before any replacement load starts.
+    fn evict_warm_locked(warm: &mut Option<ResidentPair<Text, Heavy>>) -> bool {
+        let Some(pair) = warm.take() else {
+            return false;
+        };
+        drop(pair);
+        note_clear_cache();
+        mlx_rs::memory::clear_cache();
+        true
+    }
+
+    /// Ensure a warm pair exists in the requested component form. A form change is an eviction, and
+    /// eviction completes (drop + cache flush) before either loader runs.
+    fn ensure_warm_locked(
+        &self,
+        warm: &mut Option<ResidentPair<Text, Heavy>>,
+        streamable: bool,
+        _use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        let mismatch = warm
+            .as_ref()
+            .is_some_and(|pair| pair.streamable != streamable);
+        if mismatch {
+            Self::evict_warm_locked(warm);
+        }
+        if warm.is_none() {
+            on_progress(Progress::Loading(LoadPhase::TextEncoder));
+            let text = (self.loaders.load_text)(streamable)?;
+            on_progress(Progress::Loading(LoadPhase::Renderer));
+            // A warm pair is reused across requests, so it must include any configured optional
+            // overlay even when the request that populates it does not use that overlay. This
+            // preserves the legacy Resident guarantee and prevents a later use_pid=true request
+            // from seeing a warm bundle built for use_pid=false.
+            let heavy = (self.loaders.load_heavy)(true, streamable)?;
+            *warm = Some(ResidentPair {
+                text,
+                heavy,
+                streamable,
+            });
+        }
+        Ok(())
     }
 
     /// Drive one generation through the staged residency lifecycle, running identically for both
@@ -220,43 +322,73 @@ impl<Text, Heavy> Residency<Text, Heavy> {
         materialize: impl FnOnce(&E) -> Result<()>,
         render: impl FnOnce(&Heavy, E, &mut dyn FnMut(Progress)) -> Result<Out>,
     ) -> Result<Out> {
+        let stage_residency = self.is_sequential();
+        self.run_request_scoped(
+            stage_residency,
+            false,
+            cancel,
+            use_pid,
+            on_progress,
+            encode,
+            materialize,
+            render,
+        )
+    }
+
+    /// Request-scoped counterpart to [`run`](Self::run). `stage_residency` chooses the lifecycle for
+    /// this call; `streamable` chooses the loader form independently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_request_scoped<E, Out>(
+        &self,
+        stage_residency: bool,
+        streamable: bool,
+        cancel: &CancelFlag,
+        use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+        encode: impl FnOnce(&Text) -> Result<E>,
+        materialize: impl FnOnce(&E) -> Result<()>,
+        render: impl FnOnce(&Heavy, E, &mut dyn FnMut(Progress)) -> Result<Out>,
+    ) -> Result<Out> {
         // F-173: a request cancelled before the (Sequential) load preamble returns promptly.
         check_cancel(cancel)?;
-        match &self.inner {
-            Inner::Resident(pair) => {
-                let enc = encode(&pair.text)?;
-                // F-173: before render (cheap under Resident; the analogue of Sequential's pre-heavy
-                // check, kept so both policies drive the identical boundary set).
-                check_cancel(cancel)?;
-                render(&pair.heavy, enc, on_progress)
-            }
-            Inner::Sequential(loaders) => {
-                // ── Phase A: load the encoder, encode, materialize, then FREE it + clear_cache().
-                // The guard is declared BEFORE `text` so, at the block's end, `text` drops first
-                // (freeing the encoder) and the guard's `clear_cache()` fires after — on the success
-                // path AND on any `?` early return within the block (F-174). `enc` is moved out.
-                let enc = {
-                    let _text_cleanup = ClearCacheGuard;
-                    // F-179: signal the phase-A encoder load so the UI shows activity during it.
-                    on_progress(Progress::Loading(LoadPhase::TextEncoder));
-                    let text = (loaders.load_text)()?;
-                    let enc = encode(&text)?;
-                    materialize(&enc)?;
-                    enc
-                };
-                // F-173: before the multi-GB heavy load.
-                check_cancel(cancel)?;
-                // ── Phase B: load the heavy bundle (skipping PiD when !use_pid, F-177), render, then
-                // FREE it + clear_cache() on every exit. Same guard-before-value ordering as Phase A.
-                let _heavy_cleanup = ClearCacheGuard;
-                // F-179: signal the heavy-bundle load (the biggest silent gap — DiT + VAE + overlays).
-                on_progress(Progress::Loading(LoadPhase::Renderer));
-                let heavy = (loaders.load_heavy)(use_pid)?;
-                // F-173: after the heavy load (a cancel during the ~20 GB load returns before denoise).
-                check_cancel(cancel)?;
-                render(&heavy, enc, on_progress)
-            }
+        // The warm-state mutex is also the request lifecycle lock. Holding it through either path
+        // prevents a concurrent warm request from repopulating the cache while a staged request is
+        // loading its own components.
+        let mut warm = self.warm()?;
+        if !stage_residency {
+            self.ensure_warm_locked(&mut warm, streamable, use_pid, on_progress)?;
+            let pair = warm
+                .as_ref()
+                .ok_or_else(|| Error::Msg("warm residency was not populated".into()))?;
+            let enc = encode(&pair.text)?;
+            check_cancel(cancel)?;
+            let result = render(&pair.heavy, enc, on_progress);
+            drop(warm);
+            return result;
         }
+
+        if let Some(advisory) = &self.on_staged {
+            advisory();
+        }
+        // Eviction completes before the first staged loader starts. This is the ordering that keeps a
+        // warm pair and its replacement from overlapping at the request peak.
+        Self::evict_warm_locked(&mut warm);
+        let enc = {
+            let _text_cleanup = ClearCacheGuard;
+            on_progress(Progress::Loading(LoadPhase::TextEncoder));
+            let text = (self.loaders.load_text)(streamable)?;
+            let enc = encode(&text)?;
+            materialize(&enc)?;
+            enc
+        };
+        check_cancel(cancel)?;
+        let _heavy_cleanup = ClearCacheGuard;
+        on_progress(Progress::Loading(LoadPhase::Renderer));
+        let heavy = (self.loaders.load_heavy)(use_pid, streamable)?;
+        check_cancel(cancel)?;
+        let result = render(&heavy, enc, on_progress);
+        drop(warm);
+        result
     }
 }
 
@@ -289,43 +421,84 @@ impl<Text, Heavy: StagedHeavy> Residency<Text, Heavy> {
         materialize_mid: impl FnOnce(&Mid) -> Result<()>,
         decode: impl FnOnce(Heavy::DecodeView<'_>, Mid, &mut dyn FnMut(Progress)) -> Result<Out>,
     ) -> Result<Out> {
+        let stage_residency = self.is_sequential();
+        self.run_staged_request_scoped(
+            stage_residency,
+            false,
+            cancel,
+            use_pid,
+            on_progress,
+            encode,
+            materialize_enc,
+            denoise,
+            materialize_mid,
+            decode,
+        )
+    }
+
+    /// Request-scoped counterpart to [`run_staged`](Self::run_staged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_staged_request_scoped<E, Mid, Out>(
+        &self,
+        stage_residency: bool,
+        streamable: bool,
+        cancel: &CancelFlag,
+        use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+        encode: impl FnOnce(&Text) -> Result<E>,
+        materialize_enc: impl FnOnce(&E) -> Result<()>,
+        denoise: impl FnOnce(&Heavy, E, &mut dyn FnMut(Progress)) -> Result<Mid>,
+        materialize_mid: impl FnOnce(&Mid) -> Result<()>,
+        decode: impl FnOnce(Heavy::DecodeView<'_>, Mid, &mut dyn FnMut(Progress)) -> Result<Out>,
+    ) -> Result<Out> {
         check_cancel(cancel)?;
-        match &self.inner {
-            Inner::Resident(pair) => {
-                let enc = encode(&pair.text)?;
-                check_cancel(cancel)?;
-                let mid = denoise(&pair.heavy, enc, on_progress)?;
-                decode(pair.heavy.decode_view(), mid, on_progress)
-            }
-            Inner::Sequential(loaders) => {
-                // ── Phase A: load the encoder, encode, materialize, then FREE it + clear_cache().
-                let enc = {
-                    let _text_cleanup = ClearCacheGuard;
-                    on_progress(Progress::Loading(LoadPhase::TextEncoder));
-                    let text = (loaders.load_text)()?;
-                    let enc = encode(&text)?;
-                    materialize_enc(&enc)?;
-                    enc
-                };
-                check_cancel(cancel)?;
-                // ── Phase B: load the heavy bundle, denoise, materialize the latents so the DiT is no
-                // longer referenced through the lazy graph, then SHED the DiT + clear_cache() so the
-                // decode peak excludes it.
-                on_progress(Progress::Loading(LoadPhase::Renderer));
-                let heavy = (loaders.load_heavy)(use_pid)?;
-                check_cancel(cancel)?;
-                let mid = denoise(&heavy, enc, on_progress)?;
-                materialize_mid(&mid)?;
-                // Guard declared BEFORE `light` so at scope end `light` (the VAE) drops FIRST, then the
-                // flush fires — the same guard-before-value ordering Phase A/B use.
-                let _light_cleanup = ClearCacheGuard;
-                let light = heavy.shed_dit(); // drops the DiT
-                note_clear_cache();
-                mlx_rs::memory::clear_cache(); // free the DiT's GPU buffers NOW, before the decode
-                                               // ── Phase C: decode from the light (VAE) bundle.
-                decode(Heavy::light_view(&light), mid, on_progress)
-            }
+        let mut warm = self.warm()?;
+        if !stage_residency {
+            self.ensure_warm_locked(&mut warm, streamable, use_pid, on_progress)?;
+            let pair = warm
+                .as_ref()
+                .ok_or_else(|| Error::Msg("warm residency was not populated".into()))?;
+            let enc = encode(&pair.text)?;
+            check_cancel(cancel)?;
+            let mid = denoise(&pair.heavy, enc, on_progress)?;
+            let result = decode(pair.heavy.decode_view(), mid, on_progress);
+            drop(warm);
+            return result;
         }
+
+        if let Some(advisory) = &self.on_staged {
+            advisory();
+        }
+        Self::evict_warm_locked(&mut warm);
+        let enc = {
+            let _text_cleanup = ClearCacheGuard;
+            on_progress(Progress::Loading(LoadPhase::TextEncoder));
+            let text = (self.loaders.load_text)(streamable)?;
+            let enc = encode(&text)?;
+            materialize_enc(&enc)?;
+            enc
+        };
+        check_cancel(cancel)?;
+        let (light, mid) = {
+            // The guard covers the heavy load itself and every fallible operation through the DiT
+            // shed. On success it flushes immediately after the DiT drops and before decode; on
+            // error/cancel it flushes after the partially/fully loaded heavy bundle drops.
+            let _heavy_cleanup = ClearCacheGuard;
+            on_progress(Progress::Loading(LoadPhase::Renderer));
+            let heavy = (self.loaders.load_heavy)(use_pid, streamable)?;
+            check_cancel(cancel)?;
+            let mid = denoise(&heavy, enc, on_progress)?;
+            materialize_mid(&mid)?;
+            (heavy.shed_dit(), mid)
+        };
+        let result = {
+            // Guard-before-value ordering makes the light bundle drop before its final cache flush.
+            let _light_cleanup = ClearCacheGuard;
+            let light = light;
+            decode(Heavy::light_view(&light), mid, on_progress)
+        };
+        drop(warm);
+        result
     }
 }
 
@@ -339,7 +512,7 @@ fn check_cancel(cancel: &CancelFlag) -> Result<()> {
     }
 }
 
-/// Emit the F-181 advisory: a `Sequential` + `quantize` load over a **dense** snapshot re-quantizes
+/// Emit the F-181 advisory: staged/`Sequential` execution over a **dense** quantized snapshot re-quantizes
 /// the whole model on every generate (repeated compute) and the dense transient means the per-phase
 /// peak is the *dense* component size, shrinking the memory win. Packed (pre-quantized) snapshots
 /// avoid both. Providers call this from their `Sequential` load arm when they detect that combination;
@@ -347,7 +520,7 @@ fn check_cancel(cancel: &CancelFlag) -> Result<()> {
 /// (e.g. SDXL's `SDXL_LORA_VENDORED`).
 pub fn warn_sequential_requantize(model_id: &str, bits: i32) {
     eprintln!(
-        "{model_id}: Sequential offload with Q{bits} over a dense snapshot re-quantizes the whole \
+        "{model_id}: staged residency with Q{bits} over a dense snapshot re-quantizes the whole \
          model on EVERY generate (repeated compute; the dense transient makes the per-phase peak the \
          dense component size, not the packed one — shrinking the memory win). Point at a \
          pre-quantized Q{bits} snapshot to avoid both."
@@ -384,6 +557,7 @@ fn note_clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// A shared event log the fake components/closures append to, so a test can assert the exact
@@ -498,6 +672,220 @@ mod tests {
         )
     }
 
+    fn request_residency(log: &Log) -> Residency<FakeText, FakeHeavy> {
+        let lt = log.clone();
+        let lh = log.clone();
+        Residency::request_scoped(
+            move |streamable| {
+                record(&lt, &format!("load_text_streamable_{streamable}"));
+                Ok(FakeText { log: lt.clone() })
+            },
+            move |use_pid, streamable| {
+                record(
+                    &lh,
+                    &format!("load_heavy_pid_{use_pid}_streamable_{streamable}"),
+                );
+                Ok(FakeHeavy {
+                    log: lh.clone(),
+                    with_pid: use_pid,
+                })
+            },
+        )
+    }
+
+    fn request_run(
+        residency: &Residency<FakeText, FakeHeavy>,
+        stage_residency: bool,
+        streamable: bool,
+        log: &Log,
+    ) -> u32 {
+        let encode_log = log.clone();
+        let materialize_log = log.clone();
+        let render_log = log.clone();
+        residency
+            .run_request_scoped(
+                stage_residency,
+                streamable,
+                &CancelFlag::new(),
+                false,
+                &mut ignore_progress,
+                move |_text| {
+                    record(&encode_log, "encode");
+                    Ok(41u32)
+                },
+                move |_encoded| {
+                    record(&materialize_log, "materialize");
+                    Ok(())
+                },
+                move |_heavy, encoded, _progress| {
+                    record(&render_log, "render");
+                    Ok(encoded + 1)
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn request_scoped_construction_loads_nothing_and_warm_reuses_one_pair() {
+        let log = new_log();
+        let residency = request_residency(&log);
+        assert!(
+            events(&log).is_empty(),
+            "construction must retain only loaders"
+        );
+
+        assert_eq!(request_run(&residency, false, false, &log), 42);
+        assert_eq!(request_run(&residency, false, false, &log), 42);
+        let events = events(&log);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "load_text_streamable_false")
+                .count(),
+            1,
+            "two warm requests must reuse one text component"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "load_heavy_pid_true_streamable_false")
+                .count(),
+            1,
+            "two warm requests must reuse one heavy component"
+        );
+        assert!(
+            !events.iter().any(|event| event == "materialize"),
+            "warm execution must preserve the non-materializing path"
+        );
+    }
+
+    #[test]
+    fn warm_staged_warm_evicts_before_loading_and_rebuilds_after_staging() {
+        let log = new_log();
+        let residency = request_residency(&log);
+        reset_clear_cache_calls();
+
+        assert_eq!(request_run(&residency, false, false, &log), 42);
+        assert_eq!(request_run(&residency, true, false, &log), 42);
+        assert_eq!(request_run(&residency, false, false, &log), 42);
+
+        assert_eq!(
+            events(&log),
+            [
+                "load_text_streamable_false",
+                "load_heavy_pid_true_streamable_false",
+                "encode",
+                "render",
+                "drop_text",
+                "drop_heavy_pid",
+                "load_text_streamable_false",
+                "encode",
+                "materialize",
+                "drop_text",
+                "load_heavy_pid_false_streamable_false",
+                "render",
+                "drop_heavy_nopid",
+                "load_text_streamable_false",
+                "load_heavy_pid_true_streamable_false",
+                "encode",
+                "render",
+            ],
+            "warm pair must drop before staged loading; staged leaves no pair for the next warm request"
+        );
+        assert_eq!(
+            clear_cache_calls(),
+            3,
+            "warm eviction plus staged text/heavy cleanup each flush once"
+        );
+    }
+
+    #[test]
+    fn changing_component_form_evicts_before_reloading() {
+        let log = new_log();
+        let residency = request_residency(&log);
+        assert_eq!(request_run(&residency, false, false, &log), 42);
+        assert_eq!(request_run(&residency, false, true, &log), 42);
+        assert_eq!(
+            events(&log),
+            [
+                "load_text_streamable_false",
+                "load_heavy_pid_true_streamable_false",
+                "encode",
+                "render",
+                "drop_text",
+                "drop_heavy_pid",
+                "load_text_streamable_true",
+                "load_heavy_pid_true_streamable_true",
+                "encode",
+                "render",
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_warm_and_staged_requests_never_overlap_component_loads() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let log = new_log();
+        let timed_load = |active: Arc<AtomicUsize>, max_active: Arc<AtomicUsize>| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            active.fetch_sub(1, Ordering::SeqCst);
+        };
+        let residency = Arc::new(Residency::request_scoped(
+            {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                let log = log.clone();
+                move |_| {
+                    timed_load(active.clone(), max_active.clone());
+                    Ok(FakeText { log: log.clone() })
+                }
+            },
+            {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                let log = log.clone();
+                move |use_pid, _| {
+                    timed_load(active.clone(), max_active.clone());
+                    Ok(FakeHeavy {
+                        log: log.clone(),
+                        with_pid: use_pid,
+                    })
+                }
+            },
+        ));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for stage in [false, true] {
+                let residency = residency.clone();
+                let start = start.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    residency
+                        .run_request_scoped(
+                            stage,
+                            false,
+                            &CancelFlag::new(),
+                            false,
+                            &mut ignore_progress,
+                            |_| Ok(()),
+                            |_| Ok(()),
+                            |_, _, _| Ok(()),
+                        )
+                        .unwrap();
+                });
+            }
+            start.wait();
+        });
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "warm and staged requests loaded components concurrently"
+        );
+    }
+
     #[test]
     fn run_staged_sequential_sheds_the_dit_before_the_decode() {
         // sc-13571 / GitHub #1658: the DiT (heavy bundle) must be dropped + clear_cache'd AFTER denoise
@@ -551,6 +939,42 @@ mod tests {
         );
         // clear_cache fires for the text drop, the DiT shed, and the light drop.
         assert_eq!(clear_cache_calls(), 3);
+    }
+
+    #[test]
+    fn run_staged_denoise_error_drops_heavy_and_flushes_before_returning() {
+        let log = new_log();
+        let residency = seq_residency(&log);
+        reset_clear_cache_calls();
+        let error = residency
+            .run_staged_request_scoped(
+                true,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut ignore_progress,
+                |_| Ok(()),
+                |_| Ok(()),
+                |_, (), _| Err::<(), _>(Error::Msg("denoise failed".into())),
+                |_| Ok(()),
+                |_, (), _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::Msg(_)));
+        assert_eq!(
+            events(&log),
+            [
+                "load_text",
+                "drop_text",
+                "load_heavy_nopid",
+                "drop_heavy_nopid",
+            ]
+        );
+        assert_eq!(
+            clear_cache_calls(),
+            2,
+            "text and heavy error paths must each flush"
+        );
     }
 
     #[test]
@@ -950,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_parts_borrows_under_resident_and_is_none_under_sequential() {
+    fn with_resident_parts_borrows_under_resident_and_is_none_under_sequential() {
         // The read-only accessor providers use to reach warm components outside `run` (Chroma's
         // `*_ref`/`denoise` real-weight helpers): `Some((text, heavy))` under `Resident`, `None`
         // under `Sequential` (which holds no components between generates).
@@ -963,12 +1387,12 @@ mod tests {
             },
         );
         assert!(
-            resident.resident_parts().is_some(),
+            resident.with_resident_parts(|_, _| ()).is_some(),
             "Resident must expose its warm components"
         );
         let sequential = seq_residency(&log);
         assert!(
-            sequential.resident_parts().is_none(),
+            sequential.with_resident_parts(|_, _| ()).is_none(),
             "Sequential holds no warm components to borrow"
         );
     }

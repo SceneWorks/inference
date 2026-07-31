@@ -202,6 +202,7 @@ fn image_delta(a: &Image, b: &Image) -> (u8, f64) {
 
 fn bounded() -> Option<GenerationMemory> {
     Some(GenerationMemory {
+        stage_residency: true,
         // Rung 2 is on in both arms (it is what the constrained-Mac path already does), so the ONLY
         // difference between the arms is the attention budget.
         tile_vae_decode: true,
@@ -212,6 +213,7 @@ fn bounded() -> Option<GenerationMemory> {
 
 fn staged_only() -> Option<GenerationMemory> {
     Some(GenerationMemory {
+        stage_residency: true,
         tile_vae_decode: true,
         ..Default::default()
     })

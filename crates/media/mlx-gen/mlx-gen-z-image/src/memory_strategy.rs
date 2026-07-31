@@ -21,8 +21,8 @@
 //!
 //! | Rung | Support | Executable seam |
 //! |---|---|---|
-//! | 0 Resident | Implemented | `Residency::resident` — encoder + DiT + VAE held warm |
-//! | 1 Staged residency | Implemented (load-time, see below) | `Residency::run_staged` (sc-10839 / sc-13571): encode → drop encoder → denoise → **drop DiT** → decode |
+//! | 0 Resident | Implemented | Request-scoped `Residency` warm pair — encoder + DiT + VAE held across requests |
+//! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → drop encoder → denoise → **drop DiT** → decode |
 //! | 2 Bounded decode | Implemented | `Vae::decode_tiled` over the [`DECODE_TILE_EDGES`] ladder, or the PiD student over [`pid_decode_tile_edges`] (`pipeline::decode_tiling`) |
 //! | 3 Bounded attention | Implemented | [`mlx_gen::attention::sdpa_budgeted_bhsd`] threaded through every DiT attention (SC-15615) |
 //! | 4 Bounded transformer residency | Implemented (snapshot loads) | [`mlx_gen::block_residency::run_windowed`] over the 30 unified blocks, and the 15 ControlNet blocks (SC-15754) |
@@ -30,8 +30,7 @@
 //! Rung 4 is available only for a snapshot load that explicitly requests
 //! [`LoadShape::DeferredMaterialization`](mlx_gen::LoadShape). The two facts are independent:
 //! `WeightsSource::Dir` supplies a re-openable source, while the load shape says not to bulk-commit
-//! the resident transformer stacks. Phase-level release remains the separate
-//! [`OffloadPolicy`](mlx_gen::OffloadPolicy) axis.
+//! the resident transformer stacks. Phase-level release remains a separate request-scoped axis.
 //!
 //! **This is the MLX column, and it is not the Candle column.** As of SC-15754 the MLX lane carries
 //! all five rungs; `candle-gen-z-image` carries 0-3 and has no rung 4. Neither the presence nor the
@@ -46,14 +45,11 @@
 //! (and the two figures are published in different units, GB vs GiB). This file is calibration-facing,
 //! so the scope of every quoted number matters: see `gen_core::attention_budget` for the full table.
 //!
-//! **Rung 1 has no request-scoped lever.** Staging is gated on [`mlx_gen::Residency::is_sequential`],
-//! which comes from the *load-time* [`OffloadPolicy`](mlx_gen::OffloadPolicy), so selecting
-//! `StagedResidency` on a generator that was loaded `Resident` yields resident behaviour — the
-//! selection is honoured only if the consumer also loaded the provider `Sequential`.
-//! `z_image_generation_memory` maps rung 1 to an all-false [`GenerationMemory`] for exactly that
-//! reason: there is nothing per-request to turn on. Krea's CUDA adoption has the same shape, so this
-//! is a shared-contract gap (a load-time-vs-request-time seam) rather than a Z-Image one; it is
-//! recorded here so no calibration reads a rung-1 cell as request-selectable.
+//! **Rung 1 is request-scoped (SC-15806).** `z_image_generation_memory` sets
+//! [`GenerationMemory::stage_residency`] only when the contract says rung 1 is engaged. The same
+//! cached generator can therefore serve warm → staged → warm without reconstruction. Z-Image ignores
+//! the legacy load-time [`OffloadPolicy`](mlx_gen::OffloadPolicy); the shared contract selection is
+//! the authority.
 //!
 //! **Rung 4 does not depend on rung 1.** A window needs a deferred-materialization load, which can be
 //! composed with either `Resident` or `Sequential` phase residency. An eager load rejects the window
@@ -549,6 +545,7 @@ pub(crate) fn z_image_generation_memory(
     // additionally gated on its OWN rung being engaged, so a lever that is off never ships the
     // values it would have been driven with.
     let parameters = selection.parameters;
+    let stage_residency = contract.engages(selection.strategy, MemoryStrategy::StagedResidency);
     let tile_vae_decode = contract.engages(selection.strategy, MemoryStrategy::BoundedDecode);
     let chunk_attention = contract.engages(selection.strategy, MemoryStrategy::BoundedAttention);
     let stream_transformer_blocks = contract.engages(
@@ -556,6 +553,7 @@ pub(crate) fn z_image_generation_memory(
         MemoryStrategy::BoundedTransformerResidency,
     );
     Some(GenerationMemory {
+        stage_residency,
         tile_vae_decode,
         decode_tile_edge: tile_vae_decode
             .then_some(parameters.decode_tile_edge)
@@ -1387,7 +1385,10 @@ mod tests {
         );
         assert_eq!(
             z_image_generation_memory(&contract(), &selection(MemoryStrategy::StagedResidency)),
-            Some(GenerationMemory::default())
+            Some(GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            })
         );
         assert_eq!(
             z_image_generation_memory(&contract(), &selection(MemoryStrategy::BoundedDecode)),

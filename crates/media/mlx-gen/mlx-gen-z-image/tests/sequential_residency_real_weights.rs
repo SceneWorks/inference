@@ -93,12 +93,16 @@ fn render_measured_id(
     req: &GenerationRequest,
 ) -> (Vec<u8>, usize) {
     let spec = spec.with_offload_policy(policy);
+    let mut request = req.clone();
+    let mut memory = request.memory.unwrap_or_default();
+    memory.stage_residency = matches!(policy, OffloadPolicy::Sequential);
+    request.memory = Some(memory);
     let model = mlx_gen_z_image::provider_registry()
         .unwrap()
         .load(model_id, &spec)
         .expect("load model");
     reset_peak_memory();
-    let out = model.generate(req, &mut |_| {}).expect("generate");
+    let out = model.generate(&request, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();
     let img = match out {
         GenerationOutput::Images(mut v) => {
