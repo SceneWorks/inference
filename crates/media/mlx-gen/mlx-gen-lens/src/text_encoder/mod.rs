@@ -9,3 +9,4 @@
 pub mod encoder;
 pub mod gpt_oss;
 pub mod mxfp4;
+mod stream;

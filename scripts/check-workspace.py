@@ -669,6 +669,67 @@ def _line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
+def _configure_decode_hooks_are_unconditional_rejections(text: str) -> bool:
+    """Whether every concrete ``configure_decode`` hook is a single typed ``Err`` expression.
+
+    ``MemoryRequestScope`` requires the method even from a provider whose contract declares rung 2
+    Missing. Such a hook is not evidence that native tile geometry can reach the PiD seam. Keep the
+    exemption deliberately narrow: any statement, delegation, ``?``, or success arm before the
+    rejection remains an adoption signal and must use ``DecodeRoutes``.
+    """
+    starts = list(re.finditer(r"\bfn\s+configure_decode\b", text))
+    if not starts:
+        return False
+    for start in starts:
+        open_index = text.find("{", start.end())
+        if open_index < 0:
+            return False
+        end = _match_brace(text, open_index)
+        body = text[open_index + 1 : end - 1].strip()
+        prefix = re.match(r"Err\s*\(", body)
+        if prefix is None:
+            return False
+        outer_open = body.find("(", prefix.start())
+        if _match_paren(body, outer_open) != len(body):
+            return False
+    return True
+
+
+def _match_paren(text: str, open_index: int) -> int:
+    """Index just past the ``)`` matching ``open_index``, ignoring Rust strings and comments."""
+    depth = 0
+    i = open_index
+    while i < len(text):
+        char = text[i]
+        if char == "(":
+            depth += 1
+            i += 1
+        elif char == ")":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+        elif char == '"':
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+        elif char == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            newline = text.find("\n", i)
+            i = len(text) if newline == -1 else newline
+        elif char == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = len(text) if close == -1 else close + 2
+        else:
+            i += 1
+    return len(text) + 1
+
+
 def check_rust_sources(root: Path) -> None:
     """Fail on any HF-cache reference in workspace Rust, or a production read of a deleted env
     side channel. See RUST_BANNED_SUBSTRINGS / DELETED_ENV_SIDE_CHANNELS for the precise scoping."""
@@ -792,7 +853,16 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         evidence = "\n".join(evidence_sources)
         if "register_memory_strategy" not in triggers:
             continue
-        if not any(marker in triggers for marker in PID_RUNG_TWO_MARKERS):
+        rung_two_markers = [marker for marker in PID_RUNG_TWO_MARKERS if marker in triggers]
+        if not rung_two_markers:
+            continue
+        # SC-15800: `MemoryRequestScope` requires `configure_decode` even for a rung-4-only adopter.
+        # A single-expression typed rejection cannot emit a native tile into the PiD seam, so do not
+        # mistake that trait-completeness method for a bounded-decode implementation. Every broader
+        # hook shape still fails closed through the route checks below.
+        if rung_two_markers == [
+            "configure_decode"
+        ] and _configure_decode_hooks_are_unconditional_rejections(evidence):
             continue
         missing: list[str] = []
         if not any(marker in evidence for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS):
