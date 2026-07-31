@@ -143,6 +143,12 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION_EDIT)
         .register_generator(model::REGISTRATION_EDIT_BASE)
         .register_generator(model::REGISTRATION_EDIT_TURBO)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION_BASE)
+        .register_memory_strategy(model::MEMORY_REGISTRATION_TURBO)
+        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT)
+        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_BASE)
+        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_TURBO)
         // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055).
         .register_trainer(training::REGISTRATION)
 }
@@ -185,6 +191,13 @@ mod explicit_registry_tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("unused".into()));
+        for id in MODEL_IDS {
+            assert!(registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .is_some());
+        }
     }
 
     /// Every id is prefixed with the family id, matching the image-family convention

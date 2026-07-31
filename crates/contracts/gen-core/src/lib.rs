@@ -75,16 +75,16 @@ pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
-    MemoryAssetFacts, MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics,
-    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
-    MemoryConformanceState, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
-    MemoryEvidenceKey, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown,
-    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRejection,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
+    adapter_stack_resident_bytes, AdapterResidencyMode, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryBudget, MemoryCacheSemantics, MemoryCacheState, MemoryCalibrationIdentity,
+    MemoryCleanupSemantics, MemoryComponentKind, MemoryConformanceState, MemoryEvidence,
+    MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey, MemoryEvidenceVerdict,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
+    MemoryPeakBreakdown, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRejection, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
     TransformerComponent, MEMORY_CALIBRATION_ABI,
 };

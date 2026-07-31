@@ -27,9 +27,10 @@
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryMode, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, GenerationMemory,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryGeometry, MemoryMode, MemoryPhase, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemorySelection, MemoryStrategy, Result as CoreResult,
 };
 use mlx_gen::{
@@ -51,6 +52,25 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
 /// request estimator and fail-closed wired-memory boundary are exposed now; SC-15509 owns adding
 /// verified optimized rungs and their provider implementation.
 pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> MemoryProviderContract {
+    memory_strategy_contract_with_adapters(provider_id, tier, &[])
+}
+
+/// Build the load-exact Mage contract. Mage installs every adapter as a forward-time residual after
+/// quantization, so a fully sizeable stack is independently resident and is part of the predicted
+/// peak. An unreadable stack stays undeclared; the consumer can distinguish that evidence gap from
+/// an adapter-free load and fail closed.
+pub fn memory_strategy_contract_for_spec(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> MemoryProviderContract {
+    memory_strategy_contract_with_adapters(provider_id, spec.quantize, &spec.adapters)
+}
+
+fn memory_strategy_contract_with_adapters(
+    provider_id: &str,
+    tier: Option<Quant>,
+    adapters: &[mlx_gen::AdapterSpec],
+) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -60,16 +80,31 @@ pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> Memor
             cache_eviction: true,
         },
     );
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables: vec![
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-        ],
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let mut variables = vec![
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+    ];
+    let adapter_bytes = adapter_stack_resident_bytes(adapters, AdapterResidencyMode::Additive);
+    contract.formula = if let Some(adapter_bytes) = adapter_bytes.filter(|bytes| *bytes > 0) {
+        variables.push(MemoryFormulaVariable::OverlayBytes);
+        contract.asset_facts.overlay_bytes = adapter_bytes;
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: vec![MemoryResidentComponent {
+                id: "adapter_stack".to_owned(),
+                kind: MemoryComponentKind::AdapterStack,
+                resident_bytes: adapter_bytes,
+                bounded_by: None,
+            }],
+        }
+    } else {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
@@ -539,7 +574,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        memory_strategy_contract: memory_strategy_contract(variant.id(), spec.quantize),
+        memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec),
         pipeline,
     }))
 }
@@ -721,14 +756,15 @@ fn request_context_error(
     if context.budget.total_bytes == 0 {
         return Some(format!("{provider_id}: request budget is unavailable"));
     }
-    let required_total_peak_bytes = (crate::memory::generation_peak_gb(
+    let required_total_peak_bytes = ((crate::memory::generation_peak_gb(
         tier,
         context.geometry.width,
         context.geometry.height,
         context.geometry.batch,
     ) * 1_000_000_000.0)
-        .round() as u64;
-    let maximum_resident_credit = contract.asset_facts.base_bytes;
+        .round() as u64)
+        .saturating_add(contract.auxiliary_resident_bytes());
+    let maximum_resident_credit = contract.total_resident_bytes();
     let credited_resident_bytes =
         required_total_peak_bytes.saturating_sub(context.predicted_peak_bytes);
     if context.predicted_peak_bytes > required_total_peak_bytes
@@ -1021,6 +1057,23 @@ mage_registrations! {
     EditTurbo => (descriptor_edit_turbo, load_edit_turbo, REGISTRATION_EDIT_TURBO),
 }
 
+macro_rules! mage_memory_registration {
+    ($name:ident, $id:literal) => {
+        pub const $name: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $id,
+                contract: |spec| Ok(memory_strategy_contract_for_spec($id, spec)),
+            };
+    };
+}
+
+mage_memory_registration!(MEMORY_REGISTRATION, "mage_flow");
+mage_memory_registration!(MEMORY_REGISTRATION_BASE, "mage_flow_base");
+mage_memory_registration!(MEMORY_REGISTRATION_TURBO, "mage_flow_turbo");
+mage_memory_registration!(MEMORY_REGISTRATION_EDIT, "mage_flow_edit");
+mage_memory_registration!(MEMORY_REGISTRATION_EDIT_BASE, "mage_flow_edit_base");
+mage_memory_registration!(MEMORY_REGISTRATION_EDIT_TURBO, "mage_flow_edit_turbo");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1118,44 @@ mod tests {
                 cache_eviction: true,
             }
         ));
+    }
+
+    #[test]
+    fn adapter_contract_adds_load_exact_residency_and_preserves_missing_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("mage-memory-adapters-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let adapter = root.join("mage.safetensors");
+        std::fs::write(&adapter, vec![0_u8; 4096]).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![
+            mlx_gen::AdapterSpec::new(adapter, 1.0, mlx_gen::AdapterKind::Lora),
+        ]);
+        let contract = memory_strategy_contract_for_spec("mage_flow", &spec);
+
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(contract.auxiliary_resident_bytes(), 4096);
+        assert_eq!(contract.asset_facts.overlay_bytes, 4096);
+        assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
+        assert_eq!(
+            contract
+                .predicted_peak_from_base(100)
+                .predicted_peak_bytes(),
+            4196
+        );
+
+        let missing = LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![
+            mlx_gen::AdapterSpec::new(
+                root.join("missing.safetensors"),
+                1.0,
+                mlx_gen::AdapterKind::Lora,
+            ),
+        ]);
+        let missing_contract = memory_strategy_contract_for_spec("mage_flow", &missing);
+        assert_eq!(missing_contract.auxiliary_resident_bytes(), 0);
+        assert!(!missing_contract
+            .formula
+            .uses(MemoryFormulaVariable::OverlayBytes));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
