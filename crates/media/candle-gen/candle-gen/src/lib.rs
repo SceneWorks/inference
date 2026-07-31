@@ -166,8 +166,8 @@ pub use sync::{cached, lock_recover};
 // schedule and each omitted the same two things.
 pub mod residency;
 pub use residency::{
-    check_cancel, effective_offload_policy, run_sequential, run_three_stage_sequential,
-    sequential_offload_enabled, Residency, OFFLOAD_ENV,
+    check_cancel, run_sequential, run_three_stage_sequential, synchronize_result, Residency,
+    StagedHeavy,
 };
 
 // Driver memory-pool introspection (sc-12818, widened by SC-15792). Gated on `cuda` alone rather

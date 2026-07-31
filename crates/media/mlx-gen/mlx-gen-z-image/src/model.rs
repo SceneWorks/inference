@@ -603,7 +603,10 @@ impl ZImageTurbo {
             },
             // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an
             // un-evaluated `cap` keeps the encoder referenced through the graph and the drop frees nothing.
-            |cap| Ok(mlx_rs::transforms::eval([cap])?),
+            |cap| match cap {
+                Some(cap) => Ok(mlx_rs::transforms::eval([cap])?),
+                None => Ok(()),
+            },
             // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
             // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
             |heavy: &ZImageHeavyOwned, cap, on_progress| {
@@ -981,7 +984,7 @@ mod tests {
                 panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
             });
             assert!(
-                res.is_sequential(),
+                res.with_resident_parts(|_, _| ()).is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }

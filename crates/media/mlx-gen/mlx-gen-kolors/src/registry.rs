@@ -32,6 +32,8 @@ use crate::ip_adapter::load_kolors_ip_adapter;
 use crate::model::{KolorsHeavy, KolorsText, DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
 use crate::sampler::{KolorsEulerSampler, BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
 
+type KolorsEncodedConditioning = ((Array, Array), Option<(Array, Array)>);
+
 /// Registry id — the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
 
@@ -444,7 +446,10 @@ impl KolorsGenerator {
             // Materialize the (context, pooled) tuples while the encoder is still alive (Sequential
             // only) — MLX is lazy, so un-evaluated outputs keep the 6B encoder referenced and the drop
             // would free nothing.
-            |(pos, neg): &((Array, Array), Option<(Array, Array)>)| {
+            |encoded: Option<&KolorsEncodedConditioning>| {
+                let Some((pos, neg)) = encoded else {
+                    return Ok(());
+                };
                 let mut arrays = vec![&pos.0, &pos.1];
                 if let Some(n) = neg {
                     arrays.push(&n.0);

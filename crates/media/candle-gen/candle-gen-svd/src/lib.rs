@@ -42,10 +42,7 @@ use candle_gen::gen_core::{
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
     Progress, SizeFloor, WeightsSource,
 };
-use candle_gen::{
-    check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
-    Result as CResult,
-};
+use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
 use config::{
     ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig, MODEL_ID, SIZE_ALIGN, VAE_SCALE,
@@ -757,7 +754,7 @@ fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
         descriptor: descriptor(),
         root,
         device,
-        offload: effective_offload_policy(spec.offload_policy),
+        offload: spec.offload_policy,
         components: Mutex::new(None),
     })
 }

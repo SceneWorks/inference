@@ -33,7 +33,7 @@ use candle_gen::gen_core::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, SizeFloor, WeightsSource,
 };
-use candle_gen::{check_cancel, effective_offload_policy, CandleError, Result as CResult};
+use candle_gen::{check_cancel, CandleError, Result as CResult};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
@@ -1010,9 +1010,8 @@ pub struct Wan14bGenerator {
     /// these files, the UMT5 TE + VAE in place when their files are set (sc-10909) else from
     /// [`Self::root`], and the tiny tokenizer always from [`Self::root`]; `None` on the registry path.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
-    /// Component-residency policy (epic 12732, sc-12733), resolved once at load via
-    /// [`effective_offload_policy`] (honoring both `LoadSpec::offload_policy` and the family-wide
-    /// `CANDLE_GEN_OFFLOAD=sequential` A/B override). [`OffloadPolicy::Resident`] keeps the cached
+    /// Video component-residency policy (epic 12732, sc-12733), copied from `LoadSpec` at load.
+    /// [`OffloadPolicy::Resident`] keeps the cached
     /// [`Components`] warm; [`OffloadPolicy::Sequential`] drives the staged
     /// [`Pipeline::render_sequential`] (TE-offload + expert-swap + VAE-staging), bounding the denoise
     /// peak on a 24 GB card. The resident [`components`](Self::components) cache stays untouched under
@@ -1215,9 +1214,8 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         )));
     }
     let device = candle_gen::default_device()?;
-    // Resolve the residency policy once (sc-12733): honors both `spec.offload_policy` and the
-    // family-wide `CANDLE_GEN_OFFLOAD=sequential` A/B override.
-    let offload = effective_offload_policy(spec.offload_policy);
+    // Video retains the explicit load-time policy contract (sc-12733).
+    let offload = spec.offload_policy;
     Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -1310,7 +1308,7 @@ fn build_comfyui_generator(
 ) -> gen_core::Result<Wan14bGenerator> {
     let variant = if i2v { Variant::I2v } else { Variant::T2v };
     let device = candle_gen::default_device()?;
-    let offload = effective_offload_policy(offload_policy);
+    let offload = offload_policy;
     Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -1637,8 +1635,7 @@ mod tests {
         }
     }
 
-    /// The load path resolves the residency policy from `LoadSpec::offload_policy` via
-    /// [`effective_offload_policy`]: the default spec stays `Resident` (cached-components, unchanged
+    /// The load path copies the residency policy from `LoadSpec::offload_policy`: the default spec stays `Resident` (cached-components, unchanged
     /// path), an explicit `Sequential` spec flips the generator onto the staged expert-swap render.
     #[test]
     fn load_resolves_offload_policy_from_spec() {
@@ -1659,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn comfyui_public_load_honors_explicit_policy_and_env_override() {
+    fn comfyui_public_load_honors_explicit_policy() {
         let call = |policy| {
             load_from_comfyui_experts_with_offload(
                 "/comfy/high.safetensors",
@@ -1673,7 +1670,6 @@ mod tests {
             .unwrap();
             last_public_comfyui_offload_for_test().unwrap()
         };
-        let _env = candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, None);
         assert_eq!(
             call(OffloadPolicy::Sequential),
             OffloadPolicy::Sequential,
@@ -1683,15 +1679,6 @@ mod tests {
             call(OffloadPolicy::Resident),
             OffloadPolicy::Resident,
             "the compatibility loader's historical default remains resident"
-        );
-
-        drop(_env);
-        let _env =
-            candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, Some("sequential"));
-        assert_eq!(
-            call(OffloadPolicy::Resident),
-            OffloadPolicy::Sequential,
-            "the documented process-wide override still upgrades the public Resident request"
         );
     }
 

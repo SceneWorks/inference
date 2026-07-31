@@ -860,8 +860,7 @@ impl Pipeline {
     /// [`decode`](Self::decode)/[`decode_packed`](Self::decode_packed)); residency changes only the
     /// load/free schedule.
     ///
-    /// Selected by the generator when [`candle_gen::sequential_offload_enabled`]
-    /// (`CANDLE_GEN_OFFLOAD=sequential`) or `LoadSpec::offload_policy` is `Sequential`.
+    /// Selected by the generator when the request's memory contract asks for staged residency.
     /// Because it drops each phase after use, repeat requests reload from the (page-cached) snapshot;
     /// that reload cost is the deliberate trade for the lower peak, which is why sequential offload is
     /// opt-in per the fit-gate rather than the default.

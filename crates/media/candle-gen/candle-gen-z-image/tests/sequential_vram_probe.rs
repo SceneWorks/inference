@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 fn seam_ratio(image: &candle_gen::gen_core::Image, seam_x: usize) -> f64 {
@@ -47,11 +47,11 @@ fn measure_z_image_tier() {
             .expect("set Z_IMAGE_TIER_DIR to a hosted q4/q8/bf16 tier snapshot"),
     );
     let tier = std::env::var("Z_IMAGE_TIER_NAME").unwrap_or_else(|_| "unknown".into());
-    let policy_name = std::env::var("Z_IMAGE_POLICY").unwrap_or_else(|_| "sequential".into());
-    let policy = match policy_name.as_str() {
-        "resident" => OffloadPolicy::Resident,
-        "sequential" => OffloadPolicy::Sequential,
-        other => panic!("Z_IMAGE_POLICY must be resident or sequential, got {other}"),
+    let policy_name = std::env::var("Z_IMAGE_POLICY").unwrap_or_else(|_| "request-staged".into());
+    let stage_residency = match policy_name.as_str() {
+        "resident" => false,
+        "request-staged" => true,
+        other => panic!("Z_IMAGE_POLICY must be resident or request-staged, got {other}"),
     };
     let repeats: usize = std::env::var("Z_IMAGE_REPEATS")
         .ok()
@@ -59,7 +59,7 @@ fn measure_z_image_tier() {
         .unwrap_or(1);
     assert!(repeats > 0);
 
-    let spec = LoadSpec::new(WeightsSource::Dir(tier_dir)).with_offload_policy(policy);
+    let spec = LoadSpec::new(WeightsSource::Dir(tier_dir));
     let request = GenerationRequest {
         prompt: "a rusty robot holding a lit candle, cinematic studio lighting, highly detailed"
             .into(),
@@ -68,6 +68,10 @@ fn measure_z_image_tier() {
         steps: Some(8),
         count: 1,
         seed: Some(42),
+        memory: Some(candle_gen::gen_core::GenerationMemory {
+            stage_residency,
+            ..Default::default()
+        }),
         ..Default::default()
     };
 

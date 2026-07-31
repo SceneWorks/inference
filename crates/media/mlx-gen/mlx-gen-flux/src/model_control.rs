@@ -283,7 +283,10 @@ impl Flux1DevControl {
             req.use_pid,
             on_progress,
             |text: &FluxTextOwned| text.encode(&req.prompt),
-            |(prompt_embeds, pooled_prompt_embeds)| {
+            |encoded| {
+                let Some((prompt_embeds, pooled_prompt_embeds)) = encoded else {
+                    return Ok(());
+                };
                 mlx_rs::transforms::eval([prompt_embeds, pooled_prompt_embeds])?;
                 Ok(())
             },
