@@ -973,6 +973,24 @@ pub struct MemoryGeometry {
 pub struct MemoryBudget {
     pub total_bytes: u64,
     pub committed_bytes: u64,
+    /// Memory a backend is holding but could return under pressure — chiefly an allocator's
+    /// freed-buffer reuse cache.
+    ///
+    /// **Creditable only if something will actually reclaim it before the platform's killer fires.**
+    /// [`effective_bytes`](Self::effective_bytes) adds this back into the budget, which assumes a
+    /// reclaimer exists. That assumption holds where the OS applies backpressure and fails where it
+    /// terminates the process instead.
+    ///
+    /// iOS is the failing case, measured: jetsam reads `phys_footprint` — which counts an allocator's
+    /// reuse cache in full — and does not ask anyone to release anything first. An MLX process there
+    /// sat at `active + cache` pinned to the per-process cap across an entire decode, with ~3.9 GB
+    /// cached and reclaimable, and was killed with 4 MiB of headroom. Every byte counted here was
+    /// genuinely reclaimable and none of it was reclaimed, because nothing asked.
+    ///
+    /// What makes it creditable is bounding the allocator's own cache limit so the *allocator*
+    /// reclaims continuously rather than waiting to be asked (`runtime_ios`'s
+    /// `bound_mlx_to_platform_limits`). A caller that cannot name such a mechanism should pass `0`
+    /// here rather than credit memory that will still be resident at the moment of the kill.
     pub reclaimable_bytes: u64,
     pub reserved_headroom_bytes: u64,
 }
@@ -993,6 +1011,11 @@ impl MemoryBudget {
     }
 
     /// Exact-boundary fits are accepted.
+    ///
+    /// Both sides must be in the same currency: `predicted_peak_bytes` is **live allocation** (see
+    /// [`MemoryEvidence::observed_peak_bytes`]) and the cache appears on this side, in
+    /// [`reclaimable_bytes`](Self::reclaimable_bytes). Passing a footprint figure here counts the
+    /// cache twice and reports a fit that the platform will not honour.
     pub fn fits(self, predicted_peak_bytes: u64) -> bool {
         predicted_peak_bytes <= self.effective_bytes()
     }
@@ -1201,7 +1224,25 @@ pub struct MemoryEvidence {
     pub sceneworks_revision: String,
     pub inference_revision: String,
     pub harness_version: String,
+    /// Peak **live allocation** the formula predicts — bytes held by live tensors at the high-water
+    /// mark, excluding any allocator reuse cache. See [`observed_peak_bytes`](Self::observed_peak_bytes)
+    /// for why the distinction is load-bearing and not pedantic.
     pub predicted_peak_bytes: u64,
+    /// Peak **live allocation** measured by the calibration harness. `None` until measured.
+    ///
+    /// **Live allocation, not process footprint, and the two are not close.** An allocator's
+    /// freed-buffer reuse cache is excluded here and counted by the OS: a Z-Image 1024² render
+    /// measured 3102 MiB of live peak and 6488 MiB of `active + cache` on the same run. Comparing the
+    /// wrong one against a cap is not conservative in a predictable direction — of three
+    /// configurations measured together, the one with the **lowest** live peak had the **highest**
+    /// footprint and was the only one an iOS device refused. A ladder built on the wrong quantity can
+    /// rank a fatal configuration as the safest of its set.
+    ///
+    /// Live allocation is the right quantity *here* because it is the irreducible working set — the
+    /// part no tuning removes. The cache is modelled on the other side of the comparison, by
+    /// [`MemoryBudget::reclaimable_bytes`], whose docs carry the precondition that makes that
+    /// modelling valid. A calibration that records footprint in this field silently double-counts the
+    /// cache against a budget that already credits it.
     pub observed_peak_bytes: Option<u64>,
     pub parity: MemoryParityContract,
     pub parity_result: MemoryParityResult,
