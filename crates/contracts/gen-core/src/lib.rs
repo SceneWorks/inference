@@ -75,14 +75,15 @@ pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEnt
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
     MemoryAssetFacts, MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics,
-    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryConformanceState,
-    MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
-    MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges,
-    MemoryParityContract, MemoryParityResult, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
+    MemoryConformanceState, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
+    MemoryEvidenceKey, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown,
+    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRejection,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
     TransformerComponent, MEMORY_CALIBRATION_ABI,
 };
@@ -102,7 +103,10 @@ pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
-pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
+pub use weightsmeta::{
+    safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,
+    SafetensorsTensorHeader,
+};
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
 // dependency is INVERTED: gen-core CONSUMES `core-llm` — the same way mlx-gen re-exports gen-core via
