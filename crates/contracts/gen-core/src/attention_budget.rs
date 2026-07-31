@@ -21,8 +21,12 @@
 //! per-call score domain to `block × Sk` instead of `Sq × Sk`. Precision, schedule, seed, conditioning
 //! and the output contract are untouched — this is a quality-preserving rung, like every other one.
 //!
-//! [`AttentionBudget::query_block_rows`] is the whole planner: given how many score elements one query
-//! row contributes, and how many query rows there are, how many rows fit the budget.
+//! [`AttentionBudget::query_block_rows`] and [`AttentionBudget::head_chunks`] are the planner. The
+//! former narrows query rows; the latter narrows complete heads before a kernel considers query rows.
+//! They share a score budget, but **not a numerical contract**: head chunking preserves the query
+//! GEMM's `M` dimension and therefore its accumulation shape, while query-row chunking changes `M` and
+//! may move results by a few ULP. A kernel may prefer heads for bit identity and use query rows only
+//! when one head still exceeds the budget; callers must not treat the axes as interchangeable.
 //!
 //! ## The kernels must NOT merge — the value differs by an order of magnitude
 //!
@@ -84,6 +88,30 @@ pub struct AttentionBudget {
     /// chunking measured −0.08%, i.e. noise). An eager backend has nothing to force and may ignore it.
     /// Do not read MLX's reason for setting it as a general one — see the module doc.
     eval_per_chunk: bool,
+}
+
+/// The shared head-axis decision for a 4-D `[B, H, Sq, Sk]` score domain.
+///
+/// `chunks_heads == false` is semantically important even when `heads_per_chunk == H`: it identifies
+/// the in-budget and single-head fast paths, which should delegate once instead of entering a
+/// provider's head-splitting loop. Keeping that decision in the planner makes both early branches
+/// mutation-testable without reintroducing local budget arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadChunkPlan {
+    heads_per_chunk: u64,
+    chunks_heads: bool,
+}
+
+impl HeadChunkPlan {
+    /// Complete heads to send to each kernel call.
+    pub const fn heads_per_chunk(self) -> u64 {
+        self.heads_per_chunk
+    }
+
+    /// Whether the caller must enter its head-axis chunk loop.
+    pub const fn chunks_heads(self) -> bool {
+        self.chunks_heads
+    }
 }
 
 impl AttentionBudget {
@@ -156,6 +184,50 @@ impl AttentionBudget {
             sq
         } else {
             block
+        }
+    }
+
+    /// Plan complete-head chunks for `q/k/v: [B, H, S, D]` before query-row fallback.
+    ///
+    /// The largest chunk fits `B · heads_per_chunk · Sq · Sk` score elements in this budget. A call
+    /// that already fits, an unbounded call, an empty score domain, or `H <= 1` returns the whole head
+    /// axis with [`HeadChunkPlan::chunks_heads`] false. Otherwise the boundary is in `1..H`.
+    ///
+    /// This is deliberately separate from [`query_block_rows`](Self::query_block_rows). Splitting
+    /// heads keeps every call's full `Sq` and the query GEMM's `M` dimension, preserving the
+    /// accumulation shape and enabling bit-exact reconstruction. Query-row fallback changes `M` and
+    /// is only tolerance-equivalent. Providers that need that distinction should consume this method
+    /// first, then apply the query-row planner inside each planned head chunk only if necessary.
+    pub const fn head_chunks(self, b: u64, h: u64, sq: u64, sk: u64) -> HeadChunkPlan {
+        if self.is_unbounded() || h <= 1 {
+            return HeadChunkPlan {
+                heads_per_chunk: h,
+                chunks_heads: false,
+            };
+        }
+        let scores_per_head = b.saturating_mul(sq).saturating_mul(sk);
+        if scores_per_head.saturating_mul(h) <= self.max_score_elements {
+            return HeadChunkPlan {
+                heads_per_chunk: h,
+                chunks_heads: false,
+            };
+        }
+        let divisor = if scores_per_head == 0 {
+            1
+        } else {
+            scores_per_head
+        };
+        let block = self.max_score_elements / divisor;
+        let heads_per_chunk = if block == 0 {
+            1
+        } else if block > h {
+            h
+        } else {
+            block
+        };
+        HeadChunkPlan {
+            heads_per_chunk,
+            chunks_heads: true,
         }
     }
 
@@ -422,7 +494,43 @@ mod tests {
         assert!(!budget.eval_per_chunk());
         assert_eq!(budget.query_block(1, 30, 4128, 4128), 4128);
         assert_eq!(budget.query_block_rows(30 * 4128, 4128), 4128);
+        assert_eq!(
+            budget.head_chunks(1, 48, 4096, 4096),
+            HeadChunkPlan {
+                heads_per_chunk: 48,
+                chunks_heads: false,
+            }
+        );
         assert_eq!(AttentionBudget::default(), AttentionBudget::UNBOUNDED);
+    }
+
+    #[test]
+    fn head_axis_plans_literal_krea_boundaries_and_fast_paths() {
+        let krea = AttentionBudget::from_score_elements(128 * 1024 * 1024, false);
+
+        // Krea's native 1024² image grid has 4096 tokens and 48 DiT heads: 128 Mi fits eight heads.
+        let at_1024 = krea.head_chunks(1, 48, 4096, 4096);
+        assert!(at_1024.chunks_heads());
+        assert_eq!(at_1024.heads_per_chunk(), 8);
+
+        // The shipping real-caption harness records about 4118 combined tokens; caption context moves
+        // the literal production boundary down by one head rather than being silently ignored.
+        let with_caption = krea.head_chunks(1, 48, 4118, 4118);
+        assert!(with_caption.chunks_heads());
+        assert_eq!(with_caption.heads_per_chunk(), 7);
+
+        // At 2048², one 16384² head already exceeds 128 Mi, so query rows must be the fallback.
+        let at_2048 = krea.head_chunks(1, 48, 16384, 16384);
+        assert!(at_2048.chunks_heads());
+        assert_eq!(at_2048.heads_per_chunk(), 1);
+
+        // The two fast paths are distinct planner decisions, not consequences of a clamped boundary.
+        let in_budget = krea.head_chunks(1, 48, 32, 32);
+        assert!(!in_budget.chunks_heads());
+        assert_eq!(in_budget.heads_per_chunk(), 48);
+        let one_head_over_budget = krea.head_chunks(1, 1, 16384, 16384);
+        assert!(!one_head_over_budget.chunks_heads());
+        assert_eq!(one_head_over_budget.heads_per_chunk(), 1);
     }
 
     #[test]
