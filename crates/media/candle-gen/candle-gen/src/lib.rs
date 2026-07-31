@@ -77,7 +77,10 @@ pub use loader::{
 // chroma/flux2/qwen-image VAE mid-blocks) share ONE guarded copy. candle CUDA kernels index elements
 // with i32; a scores tensor over `i32::MAX` silently corrupts its tail at large render sizes.
 pub mod attention;
-pub use attention::{sdpa_budgeted_bhsd, sdpa_budgeted_flat, ATTN_SCORES_BUDGET};
+pub use attention::{
+    sdpa_budgeted_bhsd, sdpa_budgeted_flat, sdpa_planned_bhsd, sdpa_planned_flat,
+    ATTN_SCORES_BUDGET,
+};
 
 // Shared Qwen3-VL text-encoder grounding helpers (sc-11205 / F-118): the MRoPE / vision-splice
 // machinery (`Rotary` 1-D RoPE table, GQA `repeat_kv`, `<|image_pad|>` `image_blocks`, the vision-embed
