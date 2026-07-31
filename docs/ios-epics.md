@@ -1247,11 +1247,37 @@ tiling became the default), one carried LLM residue, one ran third with 1223 MiB
 Ascending-peak ordering is right for the shipping list and wrong for a diagnostic — headroom does not
 survive a render, so the config under test must run first.
 
-**Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
-tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's
-budget model. That work is now an optimization rather than the critical path, and it should be sized
-*after* on-device confirmation — the calibration fingerprint must not be minted before execution
-structure settles, and this change moved it.
+**`BoundedDecode` contract adoption — now landed, in two phases.** Phase 1 made the pipeline honour
+the contract's rung-2 signal (a caller setting `tile_vae_decode` had been silently ignored, decoding
+whole-image at 9177 MiB with no error). Phase 2 published the ladder: edges `[512, 384, 256, 192]` at
+a single overlap of 48, a *rejection set* of `[128, 96, 64]`, and a calibration identity split by
+offload policy.
+
+The domain is drawn where the memory curve goes flat rather than at a quality threshold:
+
+| edge | 512 | 384 | 256 | **192** | 128 | 96 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| request peak (MiB) | 5146 | 4496 | 3465 | **3294** | 3294 | 3294 | 3294 |
+| mean \|Δ\| vs whole-image | 3.042 | 3.374 | 4.478 | **5.127** | 6.214 | 7.349 | 9.397 |
+
+From 192 down the peak is pinned — denoise binds, and no smaller tile can touch it — while the image
+keeps degrading. Below 192 you pay quality for no admission win, so those edges are published as
+rejected rather than deleted, with the contingency recorded beside them: the floor is not set by the
+decode tile, so a future denoise-bounding rung means re-sweeping them before they stay out. That is
+exactly the argument z-image's ladder made and its own rung 4 later retired.
+
+**Both sweeps had to be re-run, and the reason is this section's own method note again.** The original
+numbers came through `MLX_GEN_SANA_DECODE_TILE`, whose overlap is hardwired to `edge / 4` — so the
+sweep moved two variables at once, and a contract ladder can only publish one overlap. Re-measured at
+a fixed 48, the **peak column came back byte-identical** (5146/4496/3465/3294), which is itself a
+finding: the decode transient is set by the tile's *area*, and overlap only changes how many tiles
+cover the output. The quality column did move — 512 went 2.454 → 3.042 — so those numbers were
+replaced, not carried forward. Both harnesses now drive geometry through the request and print which
+source actually chose it.
+
+**Still open:** minting `MemoryEvidence`. The fingerprint is a *key*, not evidence — `observed_peak_bytes`
+lives in the external record a calibration harness writes, and declaring an identity closes admission
+(no identity ⇒ every selection rejected) rather than asserting a measurement.
 
 **Superseded by the above**, kept because the reasoning is still sound where it applies:
 

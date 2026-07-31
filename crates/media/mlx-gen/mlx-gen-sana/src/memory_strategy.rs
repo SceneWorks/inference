@@ -114,6 +114,11 @@ use crate::pipeline::{DECODE_OVERLAP, DECODE_TILE_EDGE};
 /// *area*, while overlap only changes how many tiles cover the output. The quality column did move,
 /// as feathering should — 512 went 2.454 → 3.042 once its overlap dropped from 128 to 48.
 ///
+/// The 192 row is the cross-check between the two harness paths, because it is the one edge whose
+/// quarter *is* 48 — the same configuration measured through the env override and then through the
+/// request. It reproduced to 5.158 → 5.127, i.e. within run-to-run Metal variance rather than
+/// exactly. Read that 0.6% as noise, not as a configuration difference.
+///
 /// **The admitted set is exactly the edges at which the peak still moves.** From 192 px down the
 /// request peak is pinned at 3294 MiB — the denoise phase binds there and no smaller tile can touch
 /// it — while the image keeps degrading monotonically. Every edge below 192 is therefore image
@@ -462,6 +467,15 @@ pub(crate) struct SanaMemoryScope {
     provider_id: &'static str,
     geometry: MemoryGeometry,
     memory: Option<GenerationMemory>,
+    /// Which decode route this request was admitted for, so `configure_decode` validates against the
+    /// same route `safety_check` did.
+    ///
+    /// Carried rather than assumed `false`. It IS false on every rung-2 scope — `safety_check`
+    /// refuses a PiD-routed bounded decode outright — but `MemoryRequestScope` is a trait object, and
+    /// resting a validation argument on "the only constructor already checked" is the kind of
+    /// invariant that holds until someone adds a second path to the value. Storing it costs a `bool`
+    /// and cannot go stale.
+    use_pid: bool,
     finished: bool,
 }
 
@@ -550,12 +564,10 @@ impl MemoryRequestScope for SanaMemoryScope {
                 self.geometry.batch
             )));
         }
-        // The same shared gate `safety_check` uses — one implementation, so the scope cannot admit a
-        // geometry admission refused, or vice versa. `use_pid: false` is not an assumption here:
-        // `safety_check` rejects every PiD-routed rung-2 selection above, so a live scope is always a
-        // native-route one.
+        // The same shared gate `safety_check` uses, on the route this scope was admitted for — one
+        // implementation, so the scope cannot admit a geometry admission refused, or vice versa.
         decode_routes(self.provider_id)?
-            .validate(false, Some(tile_edge), Some(overlap))
+            .validate(self.use_pid, Some(tile_edge), Some(overlap))
             .map_err(CoreError::Unsupported)
     }
 
@@ -613,6 +625,7 @@ pub(crate) fn begin_request(
         provider_id,
         geometry: context.geometry,
         memory: sana_generation_memory(contract, &context.selection),
+        use_pid: context.use_pid,
         finished: false,
     })))
 }
@@ -713,15 +726,15 @@ mod tests {
         let sprint =
             memory_strategy_contract(crate::SPRINT_MODEL_ID, &spec(OffloadPolicy::Sequential))
                 .unwrap();
-        assert_eq!(
-            contract()
-                .capability(MemoryStrategy::BoundedDecode)
-                .map(|capability| &capability.parameters),
-            sprint
-                .capability(MemoryStrategy::BoundedDecode)
-                .map(|capability| &capability.parameters),
-            "Sprint differs in scheduler and guidance, neither of which is a memory seam"
-        );
+        // The whole capability, not just its parameters: `support` is half of what a rung declares,
+        // and a Sprint that declared one differently would slip past a parameters-only comparison.
+        for strategy in MemoryStrategy::ALL {
+            assert_eq!(
+                contract().capability(strategy),
+                sprint.capability(strategy),
+                "Sprint differs in scheduler and guidance, neither of which is a memory seam"
+            );
+        }
     }
 
     /// The three rungs this provider actually executes, and the two it does not. A rung declared
