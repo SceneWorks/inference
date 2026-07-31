@@ -622,6 +622,8 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 ///   `validate_request`); the size range is **skipped for `Modality::Audio`**, whose generators emit
 ///   a track with no width/height and leave the bounds at the unused 0 (matching the size-skipping
 ///   `validate_request_audio` floor, sc-12834/sc-13314),
+/// - any explicit-size grid multiple advertised by [`SizeFloor`](crate::SizeFloor) is non-zero and
+///   no larger than the visual descriptor's `max_size`,
 /// - `samplers` / `schedulers` / `supported_guidance_methods` entries are non-empty, whitespace-free
 ///   and duplicate-free (name *shape* only — resolvability is per-engine: several families advertise
 ///   native sampler names alongside the gen-core curated set),
@@ -665,6 +667,18 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             errs.push(format!(
                 "{ctx}: min_size {} > max_size {}",
                 caps.min_size, caps.max_size
+            ));
+        }
+    }
+    if let Some(multiple) = caps.size_floor.explicit_size_multiple() {
+        if multiple == 0 {
+            errs.push(format!(
+                "{ctx}: explicit-size multiple is 0 — grid validation would be undefined"
+            ));
+        } else if d.modality != Modality::Audio && multiple > caps.max_size {
+            errs.push(format!(
+                "{ctx}: explicit-size multiple {multiple} > max_size {} — no explicit size can pass",
+                caps.max_size
             ));
         }
     }
@@ -989,7 +1003,7 @@ mod tests {
         CaptionCapabilities, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
     };
     use crate::generator::{
-        Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor,
+        Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor, SizeFloor,
     };
     use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
     use crate::media::{AudioTrack, Image};
@@ -2406,8 +2420,9 @@ mod tests {
             modality: Modality::Image,
             capabilities: Capabilities {
                 min_size: 512,
-                max_size: 256,                                // inverted
-                max_count: 0,                                 // zero
+                max_size: 256, // inverted
+                max_count: 0,  // zero
+                size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 0 },
                 samplers: vec!["euler", "euler", "bad name"], // duplicate + whitespace
                 conditioning: vec![
                     ConditioningKind::Reference,
@@ -2423,6 +2438,7 @@ mod tests {
         assert!(has("family \"\""), "{errs:?}");
         assert!(has("max_count is 0"), "{errs:?}");
         assert!(has("min_size 512 > max_size 256"), "{errs:?}");
+        assert!(has("explicit-size multiple is 0"), "{errs:?}");
         assert!(has("duplicate sampler entry \"euler\""), "{errs:?}");
         assert!(has("sampler[2] \"bad name\""), "{errs:?}");
         assert!(has("duplicate conditioning kind Reference"), "{errs:?}");

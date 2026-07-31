@@ -32,7 +32,7 @@ use candle_gen_wan::vae16::WanVae16;
 
 use crate::clip::{ClipVisionConfig, ScailClip};
 use crate::config::Scail2Config;
-use crate::generate::{CharacterRef, Components, Scail2Job};
+use crate::generate::{CharacterRef, Components, Scail2Job, DIM_ALIGN};
 use crate::model::Scail2Dit;
 
 /// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
@@ -104,7 +104,9 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: DIM_ALIGN,
+            },
         },
     }
 }
@@ -246,10 +248,14 @@ impl Generator for Scail2 {
         // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
         reject_multi_reference(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
-        reject_over_area(self.descriptor.id, req)?;
         self.descriptor
             .capabilities
-            .validate_request(self.descriptor.id, req)
+            .validate_request(self.descriptor.id, req)?;
+        // The advertised explicit grid runs before the raw area gate. Otherwise an off-grid request
+        // in the old raw-vs-aligned band (1280x730) would still report only an area failure here while
+        // MLX reports the grid rule, even though both descriptors promise the same exact-or-rejected
+        // behavior (sc-16198).
+        reject_over_area(self.descriptor.id, req)
     }
 
     fn generate(
@@ -438,6 +444,32 @@ mod tests {
         // lands (sc-5583) — advertising it silently dropped the extra characters (sc-8985).
         assert!(!d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.samplers.contains(&"unipc"));
+        assert_eq!(
+            d.capabilities.size_floor.explicit_size_multiple(),
+            Some(DIM_ALIGN)
+        );
+    }
+
+    #[test]
+    fn explicit_off_grid_size_is_refused_weights_free() {
+        for (width, height) in [(1280, 730), (730, 1280)] {
+            let req = GenerationRequest {
+                width,
+                height,
+                count: 1,
+                ..Default::default()
+            };
+
+            let err = descriptor()
+                .capabilities
+                .validate_request(MODEL_ID, &req)
+                .expect_err("an explicit off-grid size must be refused before loading")
+                .to_string();
+            assert!(
+                err.contains("multiples of 32") && err.contains(&format!("{width}×{height}")),
+                "the refusal must name the required grid and requested size, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -519,10 +551,10 @@ mod tests {
         let err = reject_over_area(MODEL_ID, &over).expect_err("over-area must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("max area"), "message names the cap: {msg}");
-        // Exactly at the cap (1280×720 = 921 600 px) and a small in-bounds request both pass the
-        // guard. SCAIL-2 is a Wan2.1-14B I2V derivative on the z16 VAE (grid 16), so 720 is
-        // on-lattice and the canonical 720p must pass — it did not while this cap carried the
-        // TI2V-5B's 901 120 (sc-12308).
+        // Exactly at the cap (1280×720 = 921 600 px) and a small in-bounds request both pass this
+        // **area-only helper**. The full provider pre-flight rejects 1280×720 on SCAIL-2's advertised
+        // 32-pixel explicit grid (sc-16198); this row independently pins the area cap itself as a
+        // strict `>` and guards the earlier MAX_AREA_5B/MAX_AREA_14B mix-up (sc-12308).
         let at_cap = GenerationRequest {
             width: 1280,
             height: 720,
