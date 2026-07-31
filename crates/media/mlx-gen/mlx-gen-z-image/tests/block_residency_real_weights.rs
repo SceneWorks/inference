@@ -74,11 +74,13 @@ fn spec() -> LoadSpec {
     // and the window bounds residency *within* the denoise phase. Both are active together, which is
     // also the only configuration in which a window saves anything (see `pipeline::resolve_block_window`).
     spec_with(OffloadPolicy::Sequential)
+        .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
 }
 
 /// The ladder as a request, at an explicit window. `None` window = rung 3 (the previous ladder top).
 fn memory_at(window: Option<u32>) -> GenerationMemory {
     GenerationMemory {
+        stage_residency: true,
         tile_vae_decode: true,
         chunk_attention: true,
         stream_transformer_blocks: window.is_some(),

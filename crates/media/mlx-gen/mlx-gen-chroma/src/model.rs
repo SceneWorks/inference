@@ -263,15 +263,21 @@ impl Chroma {
     /// under the default `Resident` policy. Under `Sequential` no components are held between generates,
     /// so this errors (those helpers drive `Resident`; the production `generate` path threads the
     /// components through the residency seam instead).
-    fn parts(&self) -> Result<(&TextTokenizer, &T5TextEncoder, &ChromaTransformer, &Vae)> {
-        let (text, heavy) = self.residency.resident_parts().ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: components are not resident (Sequential offload holds no warm components between \
-                 generates; the parity/test accessors require the default Resident policy)",
-                self.descriptor.id
-            ))
-        })?;
-        Ok((&text.tokenizer, &text.t5, &heavy.transformer, &heavy.vae))
+    fn with_parts<R>(
+        &self,
+        f: impl FnOnce(&TextTokenizer, &T5TextEncoder, &ChromaTransformer, &Vae) -> Result<R>,
+    ) -> Result<R> {
+        self.residency
+            .with_resident_parts(|text, heavy| {
+                f(&text.tokenizer, &text.t5, &heavy.transformer, &heavy.vae)
+            })
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: components are not resident (Sequential offload holds no warm components \
+                     between generates; the parity/test accessors require the default Resident policy)",
+                    self.descriptor.id
+                ))
+            })?
     }
 
     /// The full-sequence MMDiT mask `[1, L + Si]` (0/1) = text mask ++ image ones.
@@ -407,21 +413,22 @@ impl Chroma {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let (tok, t5, tr, _) = self.parts()?;
-        let encoded = encode_cfg(tok, t5, prompt, negative, guidance)?;
-        self.denoise_prepared(
-            tr,
-            &encoded,
-            width,
-            height,
-            guidance,
-            latents,
-            sampler_name,
-            sigmas,
-            seed,
-            cancel,
-            on_progress,
-        )
+        self.with_parts(|tok, t5, tr, _| {
+            let encoded = encode_cfg(tok, t5, prompt, negative, guidance)?;
+            self.denoise_prepared(
+                tr,
+                &encoded,
+                width,
+                height,
+                guidance,
+                latents,
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress,
+            )
+        })
     }
 
     /// The transformer-side denoise from pre-encoded conditioning — the single body shared by the
@@ -551,16 +558,14 @@ impl Chroma {
     /// Test accessors (real-weight e2e, sc-3839). Reach the warm-resident components (the e2e suite
     /// drives the default `Resident` policy); a `Sequential`-loaded model errors in `parts`.
     #[doc(hidden)]
-    pub fn transformer_ref(&self) -> &ChromaTransformer {
-        self.parts().expect("components resident").2
+    pub fn with_transformer_ref<R>(&self, f: impl FnOnce(&ChromaTransformer) -> R) -> R {
+        self.with_parts(|_, _, transformer, _| Ok(f(transformer)))
+            .expect("components resident")
     }
     #[doc(hidden)]
-    pub fn tokenizer_ref(&self) -> &TextTokenizer {
-        self.parts().expect("components resident").0
-    }
-    #[doc(hidden)]
-    pub fn t5_ref(&self) -> &T5TextEncoder {
-        self.parts().expect("components resident").1
+    pub fn with_text_refs<R>(&self, f: impl FnOnce(&TextTokenizer, &T5TextEncoder) -> R) -> R {
+        self.with_parts(|tokenizer, t5, _, _| Ok(f(tokenizer, t5)))
+            .expect("components resident")
     }
 
     /// Test accessor (real-weight e2e, sc-6903): run the denoise with an explicit sampler **name**,
@@ -611,8 +616,7 @@ impl Chroma {
         height: u32,
         decoder: Option<&dyn LatentDecoder>,
     ) -> Result<Image> {
-        let (_, _, _, vae) = self.parts()?;
-        Self::decode_with_vae(vae, latents, width, height, decoder)
+        self.with_parts(|_, _, _, vae| Self::decode_with_vae(vae, latents, width, height, decoder))
     }
 
     /// Decode against an explicit VAE — the body shared by the public [`Self::decode`] (warm-resident

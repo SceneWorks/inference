@@ -111,19 +111,16 @@ pub fn descriptor() -> ModelDescriptor {
 /// A loaded base Z-Image generator — the cached descriptor, the (tiny, always-warm) tokenizer, and the
 /// component-residency strategy. Same component set as [`crate::model::ZImageTurbo`] (Qwen text
 /// encoder, DiT, VAE, and an optional PiD overlay), driven through the identical shared [`Residency`]
-/// seam so the base honors [`LoadSpec::offload_policy`] family-wide (sc-11124, F-172): `Sequential`
-/// drops the Qwen text encoder after the encode phase, bounding peak unified memory to
-/// `max(text-encoder, DiT+VAE)`.
+/// seam. SC-15806 makes residency request-scoped: `GenerationMemory::stage_residency` selects
+/// phase-staged execution, while the legacy [`LoadSpec::offload_policy`] is ignored for Z-Image.
 pub struct ZImage {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
     /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
-    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
-    /// shared [`crate::model::load_residency`] builder. `Resident` holds the text encoder + DiT + VAE
-    /// warm; `Sequential` holds only the per-phase loader closures and re-loads per generate in phase
-    /// order (encode → drop the text encoder → denoise/decode).
+    /// Shared request-scoped residency. The first warm request populates the pair; staged requests
+    /// evict it before loading either phase.
     residency: Residency<TextEncoder, ZImageHeavyOwned>,
 }
 
@@ -136,10 +133,9 @@ pub struct ZImage {
 /// load, exactly as Turbo.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // F-090 + F-172: the non-control load body is byte-identical to the plain Turbo loader (same
-    // loaders, whole-model quant order, adapter path, PiD overlay) AND now shares its `offload_policy`
-    // routing — `load_residency` runs the identical `Resident`/`Sequential` match, so a fit-gated
-    // Sequential base request is honored instead of silently loading full-Resident (sc-11124). Only the
-    // per-id error text (precision override / single-file rejection) differs.
+    // loaders, whole-model quant order, adapter path, PiD overlay) and shares the request-scoped
+    // residency builder. Only the per-id error text (precision override / single-file rejection)
+    // differs.
     let (tokenizer, residency) = crate::model::load_residency(
         spec,
         MODEL_ID,
@@ -226,23 +222,27 @@ impl ZImage {
         let is_img2img = start_step > 0;
 
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
-        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let streamable = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let tiling = pipeline::decode_tiling(req, stage_residency);
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
         // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
         // bounds it; an excluded/unselected DiT gets one all-covering window so it never
         // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
-        let deferred_materialization = self
-            .memory_strategy
-            .lifecycle
-            .transformer_window_materialization;
+        let deferred_materialization = streamable;
         let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
         // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
         // includes the encoder, so an unscoped request conditions exactly as before.
         let encoder_window =
             pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
-        let images = self.residency.run_staged(
+        let images = self.residency.run_staged_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -499,34 +499,24 @@ mod tests {
     }
 
     #[test]
-    fn build_residency_sequential_defers_all_component_loads() {
-        let res = crate::model::build_residency(
-            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
-            MODEL_ID,
-            BASE_PRECISION_MSG,
-            BASE_FILE_MSG,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
-    }
-
-    #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = crate::model::build_residency(
-            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
-            MODEL_ID,
-            BASE_PRECISION_MSG,
-            BASE_FILE_MSG,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+    fn build_residency_defers_for_both_legacy_offload_values() {
+        for policy in [
+            mlx_gen::OffloadPolicy::Resident,
+            mlx_gen::OffloadPolicy::Sequential,
+        ] {
+            let res = crate::model::build_residency(
+                &missing_snapshot_spec(policy),
+                MODEL_ID,
+                BASE_PRECISION_MSG,
+                BASE_FILE_MSG,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+            });
+            assert!(
+                res.is_sequential(),
+                "{policy:?} must begin with no warm request-scoped pair"
+            );
+        }
     }
 }

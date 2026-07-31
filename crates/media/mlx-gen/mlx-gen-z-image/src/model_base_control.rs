@@ -100,17 +100,15 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// A loaded base control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
 /// component-residency strategy (base text encoder + control transformer + VAE), driven through the
-/// shared [`Residency`] seam so the base control variant honors [`LoadSpec::offload_policy`] family-wide
-/// (sc-11124, F-172). Same component set + seam as [`crate::model_control::ZImageTurboControl`]; only the
-/// generate-time schedule + CFG differ.
+/// shared request-scoped [`Residency`] seam. Same component set + seam as
+/// [`crate::model_control::ZImageTurboControl`]; only the generate-time schedule + CFG differ.
 pub struct ZImageControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
     /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
-    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
-    /// shared [`load_control_residency`] builder (reused from the Turbo control variant).
+    /// Request-scoped residency shared with the Turbo control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
 
@@ -128,8 +126,8 @@ const PRECISION_MSG: &str = "z_image_control: only dense bf16 is wired (the text
 /// (base + control, group_size 64) plus the text encoder + VAE — the fork's whole-model quant, with the
 /// control patch embedder left dense (its in-features is not a multiple of 64). Byte-identical load path
 /// to [`crate::model_control::load`] (the control branch shape is identical — see the module doc) — it
-/// shares the same `load_control_residency` builder, so `offload_policy` is honored identically
-/// (sc-11124, F-172); only the generate-time schedule + CFG differ.
+/// shares the same request-scoped `load_control_residency` builder; only the generate-time schedule
+/// + CFG differ.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageControl {
@@ -206,23 +204,27 @@ impl ZImageControl {
         // [`Residency::run`] seam (sc-11124). Base-control delta vs the Turbo control variant: real CFG
         // (a negative-prompt uncond branch) and no bf16 cap cast.
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
-        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let streamable = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let tiling = pipeline::decode_tiling(req, stage_residency);
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
         // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
         // bounds it; an excluded/unselected DiT gets one all-covering window so it never
         // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
-        let deferred_materialization = self
-            .memory_strategy
-            .lifecycle
-            .transformer_window_materialization;
+        let deferred_materialization = streamable;
         let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
         // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
         // includes the encoder, so an unscoped request conditions exactly as before.
         let encoder_window =
             pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
-        let images = self.residency.run_staged(
+        let images = self.residency.run_staged_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
             // this flag.
@@ -504,32 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn build_control_residency_sequential_defers_all_component_loads() {
-        let res = crate::model_control::build_control_residency(
-            &missing_control_spec(OffloadPolicy::Sequential),
-            MODEL_ID,
-            PRECISION_MSG,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) base/control weights");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) control residency"
-        );
-    }
-
-    #[test]
-    fn build_control_residency_resident_eager_loads_and_fails() {
-        let err = crate::model_control::build_control_residency(
-            &missing_control_spec(OffloadPolicy::Resident),
-            MODEL_ID,
-            PRECISION_MSG,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on the missing base snapshot");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+    fn build_control_residency_defers_for_both_legacy_offload_values() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let res = crate::model_control::build_control_residency(
+                &missing_control_spec(policy),
+                MODEL_ID,
+                PRECISION_MSG,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+            });
+            assert!(
+                res.is_sequential(),
+                "{policy:?} must begin with no warm request-scoped pair"
+            );
+        }
     }
 }

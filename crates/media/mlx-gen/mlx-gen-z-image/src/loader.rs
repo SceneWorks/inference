@@ -83,13 +83,25 @@ pub(crate) fn load_text_encoder_from_weights(w: Weights) -> Result<TextEncoder> 
 /// to bf16 is the quantize path (`AdaptableLinear::quantize`, tagged PARITY-BF16) to byte-match the
 /// fork's Q8/Q4 golden; that too is a flip-to-f32 candidate once parity stops being the goal.
 pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
+    load_transformer_with_stream(root, true)
+}
+
+/// Load the transformer in the component form selected for this request.
+pub(crate) fn load_transformer_with_stream(
+    root: &Path,
+    streamable: bool,
+) -> Result<ZImageTransformer> {
     let dir = root.join("transformer");
     let transformer = load_transformer_from_weights(Weights::from_dir(&dir)?)?;
     // SC-15754: a snapshot directory is re-openable, so rung 4 (bounded transformer residency) can
     // rebuild `layers` per window from exactly these files. `remap_transformer_keys` only aliases the
     // timestep-embedder and final-layer keys — never a `layers.*` key — so a streamed block reads the
     // same names off disk that the resident load did, with no remap to replay.
-    Ok(transformer.with_block_stream(WeightsSource::Dir(dir), ""))
+    Ok(if streamable {
+        transformer.with_block_stream(WeightsSource::Dir(dir), "")
+    } else {
+        transformer
+    })
 }
 
 pub(crate) fn load_transformer_from_weights(mut w: Weights) -> Result<ZImageTransformer> {
@@ -105,7 +117,15 @@ pub fn load_control_transformer(
     root: &Path,
     control: &WeightsSource,
 ) -> Result<ZImageControlTransformer> {
-    let base = load_transformer(root)?;
+    load_control_transformer_with_stream(root, control, true)
+}
+
+pub(crate) fn load_control_transformer_with_stream(
+    root: &Path,
+    control: &WeightsSource,
+    streamable: bool,
+) -> Result<ZImageControlTransformer> {
+    let base = load_transformer_with_stream(root, streamable)?;
     let control_weights = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
         WeightsSource::Dir(p) => Weights::from_dir(p)?,
@@ -113,10 +133,12 @@ pub fn load_control_transformer(
     // SC-15754: the ControlNet checkpoint is re-openable too, so the 15-block main control stack gets
     // its own rung-4 stream alongside the base DiT's. The control keys map 1:1 onto the tree (no
     // remap), so a streamed control block reads the same names the resident load did.
-    Ok(
-        ZImageControlTransformer::from_weights(base, &control_weights, "")?
-            .with_control_block_stream(control.clone(), ""),
-    )
+    let transformer = ZImageControlTransformer::from_weights(base, &control_weights, "")?;
+    Ok(if streamable {
+        transformer.with_control_block_stream(control.clone(), "")
+    } else {
+        transformer
+    })
 }
 
 /// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
