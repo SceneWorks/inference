@@ -48,7 +48,12 @@ targets:
         UIApplicationSupportsIndirectInputEvents: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.idkplay.SceneWorksSmoke
+        # Interpolated for the same reason `DEVELOPMENT_TEAM` is: a bundle id belongs to whoever is
+        # signing. `run_smoke.sh` defaults it to the value below, so nothing changes for the usual
+        # case; a second developer whose team cannot claim `com.idkplay.*` sets `SMOKE_BUNDLE_ID` and
+        # every script follows. Changing it gives the app a FRESH Documents container, so any pushed
+        # model snapshot must be pushed again — do not change it speculatively.
+        PRODUCT_BUNDLE_IDENTIFIER: ${SMOKE_BUNDLE_ID}
         # Raises the per-app memory limit and the virtual-address ceiling. See the file itself for
         # why both, and why this is not an approval-gated capability. If automatic signing cannot
         # grant them the build fails here rather than the app being killed on device.

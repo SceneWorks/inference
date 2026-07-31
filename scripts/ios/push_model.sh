@@ -16,7 +16,10 @@
 # downloads nothing.
 set -euo pipefail
 
-BUNDLE_ID=com.idkplay.SceneWorksSmoke
+# Follows run_smoke.sh's SMOKE_BUNDLE_ID so a second developer's signing team only has to be
+# named once. Changing it gives the app a fresh Documents container, so anything already
+# pushed must be pushed again.
+BUNDLE_ID=${SMOKE_BUNDLE_ID:-com.idkplay.SceneWorksSmoke}
 
 SRC=""
 REMOTE=""

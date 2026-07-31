@@ -4,6 +4,11 @@
 [iOS project spec](architecture/ios-project-spec.md). The decision behind it is in the
 [iOS strategy](architecture/ios-strategy.md).
 
+> **Running this on your own device:** [iOS device runbook](ios-device-runbook.md) — prerequisites,
+> the exact published model snapshots, and what to record. Written for the **8 GB** measurement,
+> which is the largest unverified claim in this document: every 8 GB verdict below is derived from a
+> 12 GB device and a Mac, and one run on 8 GB hardware settles it.
+
 Date: 2026-07-29. Lane: MLX on iOS.
 
 ---

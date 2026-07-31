@@ -79,6 +79,16 @@ fi
 export DEVELOPMENT_TEAM
 say "signing team $DEVELOPMENT_TEAM"
 
+# The bundle id, for the same reason the team is resolved rather than committed: it belongs to
+# whoever signs. The default is what this repo has always used and needs no action; a developer whose
+# team cannot claim `com.idkplay.*` exports SMOKE_BUNDLE_ID and every script here follows it.
+#
+# Changing it gives the app a FRESH Documents container, so a pushed model snapshot has to be pushed
+# again — several GB. Change it only if signing actually fails, not defensively.
+SMOKE_BUNDLE_ID=${SMOKE_BUNDLE_ID:-com.idkplay.SceneWorksSmoke}
+export SMOKE_BUNDLE_ID
+say "bundle id $SMOKE_BUNDLE_ID"
+
 # The memory entitlements, on by default. Set SMOKE_ENTITLEMENTS= (empty) to build the unentitled
 # control: the report prints `os_proc_available_memory`, so the pair of runs measures what the
 # entitlement is worth on this device instead of assuming it is worth something.
@@ -172,7 +182,7 @@ if echo "$INSTALL_LOG" | grep -q "MismatchedApplicationIdentifierEntitlement"; t
   echo "the installed app was signed by team ${INSTALLED_TEAM:-<unknown>}; this build uses $DEVELOPMENT_TEAM." >&2
   echo "iOS cannot upgrade across teams. Uninstall and reinstall:" >&2
   echo >&2
-  echo "  xcrun devicectl device uninstall app --device $DEVICE com.idkplay.SceneWorksSmoke" >&2
+  echo "  xcrun devicectl device uninstall app --device $DEVICE $SMOKE_BUNDLE_ID" >&2
   echo >&2
   echo "NOTE: that DELETES the app's Documents container, including every pushed snapshot." >&2
   echo "Re-provision afterwards with scripts/ios/push_model.sh (see docs/ios-epics.md E5)." >&2
@@ -207,13 +217,13 @@ say "launching (unlock the device if prompted; console output follows)"
 if [ "$LAUNCH_ENV" = "{}" ]; then
   xcrun devicectl device process launch \
     --device "$DEVICE" --terminate-existing \
-    com.idkplay.SceneWorksSmoke 2>&1 | tail -5
+    "$SMOKE_BUNDLE_ID" 2>&1 | tail -5
 else
   say "forwarding env: $LAUNCH_ENV"
   xcrun devicectl device process launch \
     --device "$DEVICE" --terminate-existing \
     --environment-variables "$LAUNCH_ENV" \
-    com.idkplay.SceneWorksSmoke 2>&1 | tail -5
+    "$SMOKE_BUNDLE_ID" 2>&1 | tail -5
 fi
 
 # The app writes its report to Documents and keeps running (it is a GUI app). Poll for the file
@@ -245,7 +255,7 @@ for _ in $(seq 1 "$POLL_TRIES"); do
   sleep 3
   rm -f "$REPORT"
   xcrun devicectl device copy from --device "$DEVICE" \
-    --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
+    --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
     --source Documents/smoke-report.txt --destination "$REPORT" >/dev/null 2>&1 || continue
   # `copy from` preserves the device-side mtime, so this compares when the APP wrote it.
   [ "$(stat -f%m "$REPORT" 2>/dev/null || echo 0)" -ge "$LAUNCHED_AT" ] && break
@@ -260,7 +270,7 @@ if [ ! -f "$REPORT" ]; then
   BREADCRUMB=/tmp/ios-sana-progress.txt
   rm -f "$BREADCRUMB"
   if xcrun devicectl device copy from --device "$DEVICE" \
-      --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
+      --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
       --source Documents/sana-progress.txt --destination "$BREADCRUMB" >/dev/null 2>&1; then
     echo >&2
     echo "the app DID run -- image-generation breadcrumbs found, so this is a mid-run death" >&2
@@ -288,7 +298,7 @@ ARTIFACT_DIR=${ARTIFACT_DIR:-$HOME/Desktop/sana-ios}
 mkdir -p "$ARTIFACT_DIR"
 for png in sana-1024-tile128.png sana-512-tile256.png zimage-1024.png; do
   if xcrun devicectl device copy from --device "$DEVICE" \
-      --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
+      --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
       --source "Documents/$png" --destination "$ARTIFACT_DIR/device-$png" >/dev/null 2>&1; then
     echo "  pulled $png -> $ARTIFACT_DIR/device-$png"
   fi

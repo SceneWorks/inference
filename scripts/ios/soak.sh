@@ -39,7 +39,10 @@ if [ -z "$DEVICE" ]; then
 fi
 [ -n "$DEVICE" ] || { echo "no paired device" >&2; exit 1; }
 
-BUNDLE=com.idkplay.SceneWorksSmoke
+# Follows run_smoke.sh's SMOKE_BUNDLE_ID so a second developer's signing team only has to be
+# named once. Changing it gives the app a fresh Documents container, so anything already
+# pushed must be pushed again.
+BUNDLE=${SMOKE_BUNDLE_ID:-com.idkplay.SceneWorksSmoke}
 TRACE=/tmp/ios-soak.trace
 REPORT=/tmp/ios-soak-report.txt
 
