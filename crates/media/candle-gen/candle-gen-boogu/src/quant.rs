@@ -35,10 +35,9 @@ pub enum QLinear {
     /// **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast path).
     Packed {
         linear: shared::QLinear,
-        /// Bit width declared by the packed component's `config.json`. This stays beside the
-        /// repacked GGUF weight so a consumer with a component precision floor can reject an
-        /// already-packed tier that is below that floor instead of silently treating every packed
-        /// projection as idempotent.
+        /// Per-tensor bit width inferred from the packed weight/scales shapes. Mage's q4 component
+        /// deliberately contains q8 LM-layer tensors, so the component-wide config marker is not
+        /// authoritative for a projection precision floor.
         bits: i32,
     },
 }
@@ -58,9 +57,9 @@ impl QLinear {
         biases: &Tensor,
         bias: Option<Tensor>,
         group_size: usize,
-        bits: i32,
     ) -> Result<Self> {
         let device = wq.device().clone();
+        let bits = shared::mlx_packed_bits_gs(wq.dim(1)?, scales.dim(1)?, group_size) as i32;
         Ok(Self::Packed {
             linear: shared::QLinear::from_packed_gs(wq, scales, biases, bias, group_size, &device)?,
             bits,
@@ -242,7 +241,7 @@ mod tests {
         let (out_dim, in_dim) = (128usize, 256usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
 
-        let packed = QLinear::packed(&wq, &s, &b, None, G, 4)?;
+        let packed = QLinear::packed(&wq, &s, &b, None, G)?;
         assert!(packed.is_packed(), "group-32 triple ⇒ packed load");
         let dense = QLinear::dense(Linear::new(
             Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
@@ -263,7 +262,7 @@ mod tests {
     fn packed_q4_linear_cannot_satisfy_a_q8_component_floor() -> Result<()> {
         let dev = Device::Cpu;
         let (wq, s, b, _) = q4_packed(64, 128);
-        let mut packed = QLinear::packed(&wq, &s, &b, None, G, 4)?;
+        let mut packed = QLinear::packed(&wq, &s, &b, None, G)?;
         let error = packed
             .quantize_dequant_onto(candle_gen::gen_core::Quant::Q8, &dev)
             .expect_err("a packed q4 linear must not silently satisfy a q8 floor");

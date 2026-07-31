@@ -180,14 +180,7 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         } else {
             None
         };
-        return QLinear::packed(
-            &wq,
-            &scales,
-            &biases,
-            dense_bias,
-            cfg.group_size as usize,
-            cfg.bits,
-        );
+        return QLinear::packed(&wq, &scales, &biases, dense_bias, cfg.group_size as usize);
     }
     Ok(QLinear::dense(linear(w, base, bias)?))
 }
@@ -333,6 +326,28 @@ mod tests {
         }
         let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_q4_component_infers_a_q8_projection_from_its_shapes() -> Result<()> {
+        let dev = Device::Cpu;
+        let dense = Tensor::randn(0f32, 1f32, (64usize, 128usize), &dev)?;
+        let (wq, scales, biases) = candle_gen::quant::pack_mlx_affine(&dense, 8, G)?;
+        let mut map = HashMap::new();
+        map.insert("layers.0.q_proj.weight".into(), wq);
+        map.insert("layers.0.q_proj.scales".into(), scales);
+        map.insert("layers.0.q_proj.biases".into(), biases);
+
+        let dir = std::env::temp_dir().join(format!("sc16025_mixed_width_{}", std::process::id()));
+        // The component marker remains q4 even though this floor-target projection is q8.
+        write_component(&dir, map, true);
+        let weights = Weights::from_dir(&dir, &dev, DType::F32)?;
+        assert_eq!(weights.packed().map(|cfg| cfg.bits), Some(4));
+        let mut projection = linear_detect(&weights, "layers.0.q_proj", false)?;
+        projection.quantize_dequant_onto(candle_gen::gen_core::Quant::Q8, &dev)?;
 
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
