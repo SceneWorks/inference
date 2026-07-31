@@ -15,7 +15,27 @@ use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
 use crate::nvfp4_dit::DitPlan;
 use crate::quant::QLinear;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::quant::AdaptLinear;
+
+fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
+    let max_score_elements = if budget == usize::MAX {
+        u64::MAX
+    } else {
+        budget as u64
+    };
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements,
+        false,
+    ))
+}
+
+fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_gen::candle_core::Error::Msg(other.to_string()),
+    })
+}
 
 /// Join a module prefix with a leaf name.
 fn join(prefix: &str, name: &str) -> String {
@@ -46,20 +66,30 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 /// On the constrained-memory rung, complete heads are chunked first. Keeping the full query axis
 /// preserves the exact CUDA GEMM shape (and therefore byte identity) at 1024². If one head alone still
 /// exceeds the budget (the 2048² overflow case), the shared helper additionally chunks query rows.
+#[cfg(test)]
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, scores_budget: usize) -> Result<Tensor> {
+    into_candle_core(sdpa_planned(
+        q,
+        k,
+        v,
+        scale,
+        plan_from_budget(scores_budget),
+    ))
+}
+
+fn sdpa_planned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
     let (b, h, sq, _d) = q.dims4()?;
     let sk = k.dim(2)?;
+    let scores_budget = plan.budget.max_score_elements().min(usize::MAX as u64) as usize;
     let full_scores = b.saturating_mul(h).saturating_mul(sq).saturating_mul(sk);
     if full_scores <= scores_budget || h == 1 {
-        return candle_gen::sdpa_budgeted_bhsd(
-            q,
-            k,
-            v,
-            scale,
-            None,
-            softmax_last_dim,
-            scores_budget,
-        );
+        return candle_gen::sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan);
     }
 
     let scores_per_head = b.saturating_mul(sq).saturating_mul(sk).max(1);
@@ -67,19 +97,22 @@ fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, scores_budget: usize) ->
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < h {
+        if plan.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
         let len = heads_per_chunk.min(h - start);
-        chunks.push(candle_gen::sdpa_budgeted_bhsd(
+        chunks.push(candle_gen::sdpa_planned_bhsd(
             &q.narrow(1, start, len)?,
             &k.narrow(1, start, len)?,
             &v.narrow(1, start, len)?,
             scale,
             None,
             softmax_last_dim,
-            scores_budget,
+            plan,
         )?);
         start += len;
     }
-    Tensor::cat(&chunks, 1)
+    Ok(Tensor::cat(&chunks, 1)?)
 }
 
 // ── `+1` RMSNorm ────────────────────────────────────────────────────────────────────────────
@@ -204,6 +237,17 @@ impl GatedAttention {
         rope: Option<(&Tensor, &Tensor)>,
         scores_budget: usize,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(x, rope, plan_from_budget(scores_budget)))
+    }
+
+    /// Request-scoped attention forward. A bounded plan checks cancellation between both the
+    /// head-chunks used by Krea at 1024² and any query-row chunks used by the shared kernel.
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        rope: Option<(&Tensor, &Tensor)>,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
@@ -229,12 +273,12 @@ impl GatedAttention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let o = sdpa(&q, &k, &v, self.scale, scores_budget)?;
+        let o = sdpa_planned(&q, &k, &v, self.scale, attention_plan)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         // Sigmoid gate the attention output, then the shared output projection.
         let gated = (o * sigmoid(&gate)?)?;
-        self.o.forward(&gated)
+        Ok(self.o.forward(&gated)?)
     }
 
     /// Visit the five gated-attention projections under `{prefix}` (`to_q/to_k/to_v/to_gate/to_out.0`) —
@@ -510,6 +554,24 @@ impl SingleStreamBlock {
         sin: &Tensor,
         scores_budget: usize,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            x,
+            tvec,
+            cos,
+            sin,
+            plan_from_budget(scores_budget),
+        ))
+    }
+
+    /// Request-scoped variant of [`Self::forward_with_attention_budget`].
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let m = tvec.broadcast_add(&self.scale_shift_table)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
@@ -520,9 +582,9 @@ impl SingleStreamBlock {
             .forward(x)?
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
-        let attn =
-            self.attn
-                .forward_with_attention_budget(&pre, Some((cos, sin)), scores_budget)?;
+        let attn = self
+            .attn
+            .forward_with_attention_plan(&pre, Some((cos, sin)), attention_plan)?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
         let post = self
@@ -531,7 +593,7 @@ impl SingleStreamBlock {
             .broadcast_mul(&(postscale + 1.0)?)?
             .broadcast_add(postshift)?;
         let mlp = self.mlp.forward(&post)?;
-        &x + mlp.broadcast_mul(postgate)?
+        Ok((&x + mlp.broadcast_mul(postgate)?)?)
     }
 
     /// Visit the block's attention + SwiGLU projections under `{prefix}.attn` / `{prefix}.ff` — sc-11105.
@@ -695,5 +757,23 @@ mod tests {
         let full = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let chunked = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(full, chunked);
+    }
+
+    #[test]
+    fn planned_head_chunks_honor_typed_cancel_but_unbounded_ignores_it() {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+
+        let bounded = AttentionPlan::budgeted(AttentionBudget::from_score_elements(7 * 7, false))
+            .with_cancel(&cancel);
+        let error = sdpa_planned(&q, &k, &v, 0.5, bounded).unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+
+        let unbounded = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+        assert!(sdpa_planned(&q, &k, &v, 0.5, unbounded).is_ok());
     }
 }

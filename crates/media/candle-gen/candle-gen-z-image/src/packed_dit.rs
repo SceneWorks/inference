@@ -34,7 +34,27 @@ use candle_gen::candle_nn::{RmsNorm, VarBuilder};
 // With no adapter attached the forward is byte-identical to the bare base, so the dense-parity test and
 // every packed load are unchanged. (The crate's other packed seams — `packed_te`, the VAE dequant — keep
 // using the plain `crate::quant::QLinear` enum; only the DiT needs the residual surface.)
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::quant::AdaptLinear as QLinear;
+
+fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
+    let max_score_elements = if budget == usize::MAX {
+        u64::MAX
+    } else {
+        budget as u64
+    };
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements,
+        false,
+    ))
+}
+
+fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_gen::candle_core::Error::Msg(other.to_string()),
+    })
+}
 
 // Reused verbatim from candle-transformers — frozen sub-modules + the patchify/RoPE helpers that hold
 // no packed projection (identical reuse to `crate::dit`). Vendoring these would add drift for zero
@@ -159,14 +179,14 @@ impl ZImageAttention {
         })
     }
 
-    fn forward_with_attention_budget(
+    fn forward_with_attention_plan(
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
         let q = self.to_q.forward(hidden_states)?;
@@ -191,11 +211,10 @@ impl ZImageAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let context =
-            self.attention_dispatch(&q, &k, &v, attention_mask, scale, attention_scores_budget)?;
+        let context = self.attention_dispatch(&q, &k, &v, attention_mask, scale, attention_plan)?;
 
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
-        self.to_out.forward(&context)
+        Ok(self.to_out.forward(&context)?)
     }
 
     /// Visit the four attention projections (`{prefix}.to_q/to_k/to_v/to_out.0`) — the surface the
@@ -225,12 +244,12 @@ impl ZImageAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         scale: f64,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         if self.use_accelerated_attn && q.device().is_metal() {
-            self.attention_metal(q, k, v, mask, scale)
+            Ok(self.attention_metal(q, k, v, mask, scale)?)
         } else {
-            self.attention_basic(q, k, v, mask, scale, attention_scores_budget)
+            self.attention_basic(q, k, v, mask, scale, attention_plan)
         }
     }
 
@@ -254,8 +273,8 @@ impl ZImageAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         scale: f64,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         // Build the optional additive `[B,1,1,seq]` mask up front. i32-overflow guard (sc-9116): the
         // image-token scores `[B, n, seq, seq]` reach `~24·16384² ≈ 6.4e9 > i32::MAX` at a 2048² render
         // (this is the CPU/CUDA `basic` fallback — the Metal path uses candle's fused `sdpa`), so chunk
@@ -267,14 +286,14 @@ impl ZImageAttention {
             }
             None => None,
         };
-        candle_gen::sdpa_budgeted_bhsd(
+        candle_gen::sdpa_planned_bhsd(
             q,
             k,
             v,
             scale,
             m.as_ref(),
             candle_gen::candle_nn::ops::softmax_last_dim,
-            attention_scores_budget,
+            attention_plan,
         )
     }
 
@@ -433,15 +452,15 @@ impl ZImageTransformerBlock {
         })
     }
 
-    fn forward_with_attention_budget(
+    fn forward_with_attention_plan(
         &self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln_input: Option<&Tensor>,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
             let modulation = adaln.forward(adaln_input)?.unsqueeze(1)?;
@@ -456,12 +475,12 @@ impl ZImageTransformerBlock {
 
             let normed = self.attention_norm1.forward(x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward_with_attention_budget(
+            let attn_out = self.attention.forward_with_attention_plan(
                 &scaled,
                 attn_mask,
                 cos,
                 sin,
-                attention_scores_budget,
+                attention_plan,
             )?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
@@ -470,15 +489,15 @@ impl ZImageTransformerBlock {
             let scaled = normed.broadcast_mul(&scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            x + gate_mlp.broadcast_mul(&ffn_out)?
+            Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
             let normed = self.attention_norm1.forward(x)?;
-            let attn_out = self.attention.forward_with_attention_budget(
+            let attn_out = self.attention.forward_with_attention_plan(
                 &normed,
                 attn_mask,
                 cos,
                 sin,
-                attention_scores_budget,
+                attention_plan,
             )?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + attn_out)?;
@@ -486,7 +505,7 @@ impl ZImageTransformerBlock {
             let normed = self.ffn_norm1.forward(&x)?;
             let ffn_out = self.feed_forward.forward(&normed)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            x + ffn_out
+            Ok((x + ffn_out)?)
         }
     }
 
@@ -645,6 +664,25 @@ impl ZImageTransformer2DModel {
         cap_mask: &Tensor,
         attention_scores_budget: usize,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            plan_from_budget(attention_scores_budget),
+        ))
+    }
+
+    /// Request-scoped bounded forward. Only this path attaches a cancel flag; the raw-budget overload
+    /// above remains the compatibility surface for tests and non-request-scoped correctness guards.
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
@@ -675,23 +713,23 @@ impl ZImageTransformer2DModel {
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
 
         for layer in &self.noise_refiner {
-            x = layer.forward_with_attention_budget(
+            x = layer.forward_with_attention_plan(
                 &x,
                 Some(&x_attn_mask),
                 &x_cos,
                 &x_sin,
                 Some(&adaln_input),
-                attention_scores_budget,
+                attention_plan,
             )?;
         }
         for layer in &self.context_refiner {
-            cap = layer.forward_with_attention_budget(
+            cap = layer.forward_with_attention_plan(
                 &cap,
                 Some(&cap_attn_mask),
                 &cap_cos,
                 &cap_sin,
                 None,
-                attention_scores_budget,
+                attention_plan,
             )?;
         }
 
@@ -702,25 +740,25 @@ impl ZImageTransformer2DModel {
 
         let mut unified = unified;
         for layer in &self.layers {
-            unified = layer.forward_with_attention_budget(
+            unified = layer.forward_with_attention_plan(
                 &unified,
                 Some(&unified_attn_mask),
                 &unified_cos,
                 &unified_sin,
                 Some(&adaln_input),
-                attention_scores_budget,
+                attention_plan,
             )?;
         }
 
         let x_out = unified.narrow(1, 0, img_seq_len)?;
         let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
-        unpatchify(
+        Ok(unpatchify(
             &x_out,
             orig_size,
             patch_size,
             f_patch_size,
             self.cfg.in_channels,
-        )
+        )?)
     }
 
     /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
@@ -877,6 +915,39 @@ mod parity_tests {
             diff < 1e-5,
             "query-chunked attention changed the DiT output by {diff}"
         );
+    }
+
+    #[test]
+    fn constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let model = ZImageTransformer2DModel::new(&cfg, vb).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let request = candle_gen::gen_core::GenerationRequest::default();
+        request.cancel.cancel();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(2, false))
+            .with_cancel(&request.cancel);
+        let error = model
+            .forward_with_attention_plan(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan,
+            )
+            .expect_err("a canceled constrained request must not complete the DiT forward");
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+        let contract_error: candle_gen::gen_core::Error = error.into();
+        assert!(matches!(
+            contract_error,
+            candle_gen::gen_core::Error::Canceled
+        ));
     }
 
     /// **Additive install on the vendored DiT (sc-11105).** A bare-dotted LoRA over two real `layers.0`

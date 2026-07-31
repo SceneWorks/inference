@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
@@ -110,20 +111,20 @@ impl DiT {
         }
     }
 
-    pub(crate) fn forward_with_attention_budget(
+    pub(crate) fn forward_with_attention_plan(
         &self,
         x: &Tensor,
         t: &Tensor,
         cap_feats: &Tensor,
         cap_mask: &Tensor,
-        attention_scores_budget: usize,
-    ) -> candle_gen::candle_core::Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         match self {
-            // The dense stock model has no explicit budget seam. Its resident behavior stays
-            // unchanged; every sequential tier is loaded through the vendored arm below.
-            Self::Dense(m) => m.forward(x, t, cap_feats, cap_mask),
+            // The stock dense DiT has no bounded-attention seam. It remains the unchunked fast path,
+            // so a cancel flag attached to the plan is intentionally not consulted here.
+            Self::Dense(m) => Ok(m.forward(x, t, cap_feats, cap_mask)?),
             Self::Packed(m) => {
-                m.forward_with_attention_budget(x, t, cap_feats, cap_mask, attention_scores_budget)
+                m.forward_with_attention_plan(x, t, cap_feats, cap_mask, attention_plan)
             }
         }
     }
@@ -170,6 +171,14 @@ const Z_IMAGE_VAE_TILING: VaeTiling = VaeTiling {
 /// candle's `budget: usize` kernels take — gen-core owns the number.
 const CONSTRAINED_ATTN_SCORES_BUDGET: usize =
     candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as usize;
+
+fn request_attention_plan(req: &GenerationRequest, max_score_elements: usize) -> AttentionPlan<'_> {
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements as u64,
+        false,
+    ))
+    .with_cancel(&req.cancel)
+}
 
 fn check_decode_tile(cancel: &CancelFlag) -> Result<()> {
     candle_gen::check_cancel(cancel)
@@ -917,12 +926,12 @@ impl Pipeline {
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     Ok(transformer
-                        .forward_with_attention_budget(
+                        .forward_with_attention_plan(
                             latents,
                             &t_tensor,
                             &cap_feats,
                             &cap_mask,
-                            CONSTRAINED_ATTN_SCORES_BUDGET,
+                            request_attention_plan(req, CONSTRAINED_ATTN_SCORES_BUDGET),
                         )?
                         .neg()?)
                 },
@@ -1279,6 +1288,44 @@ mod tests {
 
         // Below the threshold the rung is a no-op: an in-budget call stays one un-chunked pass.
         assert_eq!(budget.query_block_rows(h * 32, 32), 32);
+    }
+
+    #[test]
+    fn constrained_request_pipeline_seam_returns_typed_canceled_without_output() {
+        use candle_gen::candle_core::Device;
+        use candle_gen::candle_nn::{VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let mut cfg = DitConfig::z_image_turbo();
+        cfg.dim = 128;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.n_layers = 2;
+        cfg.n_refiner_layers = 1;
+        cfg.cap_feat_dim = 64;
+        cfg.set_use_accelerated_attn(false);
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let transformer = DiT::Packed(Box::new(PackedDit::new(&cfg, vb).unwrap()));
+
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &device).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &device).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &device).unwrap();
+        let timestep = Tensor::from_vec(vec![0.5f32], (1,), &device).unwrap();
+
+        let request = GenerationRequest::default();
+        request.cancel.cancel();
+        let output = transformer.forward_with_attention_plan(
+            &prepared.latents,
+            &timestep,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+            request_attention_plan(&request, 2),
+        );
+        let error = output.expect_err("a canceled constrained request must produce no DiT output");
+        assert!(matches!(error, CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
     }
 
     struct DropTag {
