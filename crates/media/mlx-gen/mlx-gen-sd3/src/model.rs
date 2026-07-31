@@ -322,7 +322,10 @@ impl Sd3Large {
             // while the encoders are still alive (Sequential only) — MLX is lazy, so an un-evaluated
             // output keeps all three encoders referenced through the graph and the drop would free
             // nothing. All of `context`/`pooled` (cond + optional uncond) are forced before the drop.
-            |(cond, uncond): &(Sd3Conditioning, Option<Sd3Conditioning>)| {
+            |encoded: Option<&(Sd3Conditioning, Option<Sd3Conditioning>)>| {
+                let Some((cond, uncond)) = encoded else {
+                    return Ok(());
+                };
                 let mut arrays = vec![&cond.context, &cond.pooled];
                 if let Some(uc) = uncond {
                     arrays.push(&uc.context);

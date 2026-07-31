@@ -99,11 +99,7 @@ pub struct Krea2ControlPaths {
     /// sharper lever the worker owns by choosing smaller render dims; it needs no knob here. On a card
     /// with headroom this stays `false`.
     pub chunk_attention: bool,
-    /// Component residency for this bespoke provider. [`OffloadPolicy::Resident`] keeps Qwen3-VL,
-    /// DiT, control branch, and both VAE halves warm. [`OffloadPolicy::Sequential`] loads and encodes
-    /// Qwen3-VL first, drops it, then loads the DiT + control branch + VAE bundle for the render. The
-    /// worker selects this directly from the control-lane fit gate; this provider is intentionally not
-    /// registered, so there is no capability bit to consult.
+    /// Legacy load-time policy retained for source compatibility. The request field is authoritative.
     pub offload_policy: OffloadPolicy,
 }
 
@@ -129,6 +125,8 @@ pub struct Krea2ControlRequest {
     /// `true` **only** when the predicted decode-phase peak exceeds free VRAM — the cheapest rung (a speed
     /// cost, no quality cost) ahead of branch-quant. On a card with headroom it stays `false`.
     pub tile_vae_decode: bool,
+    /// Release the prompt encoder before loading the render bundle for this request.
+    pub stage_residency: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -144,6 +142,7 @@ impl Default for Krea2ControlRequest {
             text_style_gain: None,
             seed: 0,
             tile_vae_decode: false,
+            stage_residency: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -183,11 +182,10 @@ pub struct Krea2Control {
 }
 
 impl Krea2Control {
-    /// Build the selected component residency. Both policies use the same phase loaders; Resident loads
-    /// both now, while Sequential defers them until the shared seam runs inside `generate`.
+    /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
+    /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let policy = candle_gen::effective_offload_policy(paths.offload_policy);
         let text_root = paths.root.clone();
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
@@ -196,10 +194,9 @@ impl Krea2Control {
         let heavy_branch_tier = paths.branch_tier;
         let heavy_chunk_attention = paths.chunk_attention;
         let heavy_device = device.clone();
-        let residency = candle_gen::Residency::from_policy(
-            policy,
-            move || load_control_text(&text_root, &text_device),
-            move |_use_pid| {
+        let residency = candle_gen::Residency::request_scoped(
+            move |_| load_control_text(&text_root, &text_device),
+            move |_use_pid, _| {
                 load_control_heavy(
                     &heavy_root,
                     &heavy_control,
@@ -209,7 +206,7 @@ impl Krea2Control {
                     &heavy_device,
                 )
             },
-        )?;
+        );
         Ok(Self { device, residency })
     }
 
@@ -222,14 +219,17 @@ impl Krea2Control {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_request(req)?;
-        self.residency.run(
+        self.residency.run_request_scoped(
+            req.stage_residency,
+            false,
             &req.cancel,
-            &self.device,
             false,
             on_progress,
             |text| text.encode(req),
+            |_| Ok(self.device.synchronize()?),
             |heavy, context, on_progress| {
-                heavy.render(&self.device, req, control_image, context, on_progress)
+                let result = heavy.render(&self.device, req, control_image, context, on_progress);
+                candle_gen::synchronize_result(&self.device, result)
             },
         )
     }
@@ -410,25 +410,6 @@ fn control_image_to_nchw(
 mod tests {
     use super::*;
 
-    struct OffloadEnvGuard(Option<String>);
-
-    impl OffloadEnvGuard {
-        fn unset() -> Self {
-            let prior = std::env::var(candle_gen::OFFLOAD_ENV).ok();
-            std::env::remove_var(candle_gen::OFFLOAD_ENV);
-            Self(prior)
-        }
-    }
-
-    impl Drop for OffloadEnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var(candle_gen::OFFLOAD_ENV, value),
-                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
-            }
-        }
-    }
-
     fn missing_paths(offload_policy: OffloadPolicy) -> Krea2ControlPaths {
         Krea2ControlPaths {
             root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
@@ -440,21 +421,20 @@ mod tests {
         }
     }
 
-    /// Weight-free proof that this bespoke lane honors its direct policy even though it has no registry
-    /// descriptor/capability bit: Sequential captures loaders and touches no component weights.
+    /// Weight-free proof that construction is lazy and the legacy path policy is not an authority.
     #[test]
-    fn sequential_policy_defers_all_component_loads() {
-        let _env = OffloadEnvGuard::unset();
+    fn legacy_policy_does_not_eagerly_load_components() {
         let model = Krea2Control::load(&missing_paths(OffloadPolicy::Sequential))
-            .expect("Sequential must not touch the missing snapshot at provider construction");
-        assert!(model.residency.is_sequential());
+            .expect("construction must not touch the missing snapshot");
+        assert!(model.residency.with_resident_parts(|_, _| ()).is_none());
     }
 
-    /// The resident twin uses the same phase loaders eagerly, so the missing snapshot fails at load.
+    /// The resident legacy value is equally lazy; neither load-time value can choose the request route.
     #[test]
-    fn resident_policy_eager_loads_components() {
-        let _env = OffloadEnvGuard::unset();
-        assert!(Krea2Control::load(&missing_paths(OffloadPolicy::Resident)).is_err());
+    fn resident_legacy_policy_is_also_lazy() {
+        let model = Krea2Control::load(&missing_paths(OffloadPolicy::Resident))
+            .expect("construction must not touch the missing snapshot");
+        assert!(model.residency.with_resident_parts(|_, _| ()).is_none());
     }
 
     /// The request defaults match the Turbo control production knobs (1024², 8 CFG-free steps,
@@ -528,7 +508,7 @@ mod tests {
     /// KREA_TURBO_DIR=<tier> KREA_CONTROL_CKPT=<overlay> KREA_CONTROL_POSE=<png> \
     /// KREA_OUT=resident.rgb cargo test -p candle-gen-krea --features cuda \
     ///   control_probed_generate_for_offload_ab -- --ignored --nocapture
-    /// CANDLE_GEN_OFFLOAD=sequential KREA_TURBO_DIR=<tier> KREA_CONTROL_CKPT=<overlay> \
+    /// KREA_OFFLOAD_MODE=request-staged KREA_TURBO_DIR=<tier> KREA_CONTROL_CKPT=<overlay> \
     /// KREA_CONTROL_POSE=<png> KREA_OUT=sequential.rgb cargo test -p candle-gen-krea \
     ///   --features cuda control_probed_generate_for_offload_ab -- --ignored --nocapture
     /// ```
@@ -567,12 +547,8 @@ mod tests {
             "q4" => Some(Quant::Q4),
             other => panic!("KREA_CONTROL_BRANCH_QUANT must be bf16|q8|q4, got {other}"),
         };
-        let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
-        let offload_policy = if spec_mode == "spec-sequential" {
-            OffloadPolicy::Sequential
-        } else {
-            OffloadPolicy::Resident
-        };
+        let stage_residency =
+            std::env::var("KREA_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
 
         let pose = image::open(pose_path).expect("decode pose PNG").to_rgb8();
         let pose = image::imageops::resize(&pose, res, res, image::imageops::FilterType::Lanczos3);
@@ -587,7 +563,7 @@ mod tests {
             adapters: Vec::new(),
             branch_tier,
             chunk_attention: false,
-            offload_policy,
+            offload_policy: OffloadPolicy::Resident,
         };
         let request = Krea2ControlRequest {
             prompt: "a dancer in a colorful studio, cinematic lighting".into(),
@@ -596,6 +572,7 @@ mod tests {
             steps,
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 42,
+            stage_residency,
             ..Default::default()
         };
 
@@ -611,11 +588,8 @@ mod tests {
         let report = probe.report();
         std::fs::write(&out, &image.pixels).expect("write raw pixels");
 
-        let env_mode = std::env::var(candle_gen::OFFLOAD_ENV).unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
+        let mode = if stage_residency {
+            "request-staged"
         } else {
             "resident"
         };

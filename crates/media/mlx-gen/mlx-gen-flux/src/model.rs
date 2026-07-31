@@ -384,7 +384,10 @@ impl Flux1 {
             |text: &FluxTextOwned| text.encode(&req.prompt),
             // Materialize the embeds while the encoders are still alive (Sequential only) — MLX is lazy,
             // so an un-evaluated embed keeps the encoders referenced and the drop would free nothing.
-            |(prompt_embeds, pooled_prompt_embeds)| {
+            |encoded| {
+                let Some((prompt_embeds, pooled_prompt_embeds)) = encoded else {
+                    return Ok(());
+                };
                 mlx_rs::transforms::eval([prompt_embeds, pooled_prompt_embeds])?;
                 Ok(())
             },
@@ -441,7 +444,10 @@ impl Flux1 {
                 let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
                 Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
             },
-            |(pos_embeds, pos_pooled, neg_embeds, neg_pooled)| {
+            |encoded| {
+                let Some((pos_embeds, pos_pooled, neg_embeds, neg_pooled)) = encoded else {
+                    return Ok(());
+                };
                 mlx_rs::transforms::eval([pos_embeds, pos_pooled, neg_embeds, neg_pooled])?;
                 Ok(())
             },

@@ -744,6 +744,9 @@ impl Chroma {
             // nothing. The masks are tokenizer-derived (independent of T5), so evaling the embeds is
             // sufficient.
             |encoded| {
+                let Some(encoded) = encoded else {
+                    return Ok(());
+                };
                 match &encoded.neg {
                     Some((neg_embeds, _)) => {
                         mlx_rs::transforms::eval([&encoded.pos_embeds, neg_embeds])?

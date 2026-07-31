@@ -368,7 +368,10 @@ impl Flux2DevControl {
             req.use_pid,
             on_progress,
             |text: &Flux2TextOwned| Self::encode(tokenizer, text, &req.prompt),
-            |(prompt_embeds, _text_ids)| {
+            |encoded| {
+                let Some((prompt_embeds, _text_ids)) = encoded else {
+                    return Ok(());
+                };
                 eval([prompt_embeds])?;
                 Ok(())
             },

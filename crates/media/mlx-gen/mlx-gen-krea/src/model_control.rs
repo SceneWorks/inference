@@ -340,7 +340,8 @@ impl KreaTurboControl {
                 Ok(context)
             },
             // Materialize the context while the text phase is still alive (Sequential only).
-            |ctx: &Array| {
+            |ctx: Option<&Array>| {
+                let Some(ctx) = ctx else { return Ok(()) };
                 mlx_rs::transforms::eval([ctx])?;
                 Ok(())
             },

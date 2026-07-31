@@ -14,13 +14,13 @@
 //! set Z_IMAGE_PACKED_Q8=...\q8    (optional)
 //! cargo test -p candle-gen-z-image --features cuda --release --test packed_tier_validate -- --ignored --nocapture
 //! ```
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 /// Basic non-degeneracy: the render is not solid-black / constant (a broken packed forward — NaN or
@@ -93,6 +93,27 @@ fn render_tier(env: &str, tag: &str) {
     assert_eq!(images.len(), 1, "{tag}: expected 1 image");
     assert_coherent(&images[0], tag);
 
+    // The same warm generator must honor a staged second request without changing fixed-seed pixels.
+    let staged = GenerationRequest {
+        memory: Some(GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        }),
+        ..req
+    };
+    let staged_out = gen
+        .generate(&staged, &mut on_progress)
+        .unwrap_or_else(|e| panic!("{tag}: request-staged generate failed: {e}"));
+    let staged_images = match staged_out {
+        GenerationOutput::Images(images) => images,
+        _ => panic!("{tag}: expected staged image output"),
+    };
+    assert_eq!(staged_images.len(), 1, "{tag}: expected 1 staged image");
+    assert_eq!(
+        staged_images[0].pixels, images[0].pixels,
+        "{tag}: warm and request-staged fixed-seed pixels diverged"
+    );
+
     // Write the render next to the tier so it can be eyeballed.
     if let Some(buf) =
         image::RgbImage::from_raw(images[0].width, images[0].height, images[0].pixels.clone())
@@ -106,7 +127,7 @@ fn render_tier(env: &str, tag: &str) {
 /// The q4 packed tier renders a coherent image straight from the packed parts (the primary sc-9408
 /// deliverable — the tier is cached, so this is the routine GPU check).
 #[test]
-#[ignore = "needs Z_IMAGE_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
+#[ignore = "needs Z_IMAGE_PACKED_Q4 (packed q4 tier subdir) + a CUDA/Metal GPU; run with the matching feature --ignored"]
 fn packed_q4_renders_coherent() {
     render_tier("Z_IMAGE_PACKED_Q4", "q4");
 }
@@ -114,7 +135,7 @@ fn packed_q4_renders_coherent() {
 /// The q8 packed tier renders a coherent image (double-quant Q8_0 path); only runs when the q8 tier is
 /// present locally.
 #[test]
-#[ignore = "needs Z_IMAGE_PACKED_Q8 (packed q8 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
+#[ignore = "needs Z_IMAGE_PACKED_Q8 (packed q8 tier subdir) + a CUDA/Metal GPU; run with the matching feature --ignored"]
 fn packed_q8_renders_coherent() {
     render_tier("Z_IMAGE_PACKED_Q8", "q8");
 }

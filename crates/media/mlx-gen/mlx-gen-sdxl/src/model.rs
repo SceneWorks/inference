@@ -770,7 +770,10 @@ impl Sdxl {
             // Materialize the conditioning + pooled while the encoders are still alive (Sequential
             // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
             // graph and the drop would free nothing (cf. Wan's `encode_text_staged`).
-            |enc| Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+            |enc| match enc {
+                Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+                None => Ok(()),
+            },
             // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD) and run the
             // denoise/decode body once against the `heavy` borrow — identical for both residencies.
             // `on_progress` is threaded through the seam (F-179) and shadows the outer sink here.

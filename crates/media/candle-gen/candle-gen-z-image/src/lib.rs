@@ -116,8 +116,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PidWeights, Progress, SizeFloor,
-    WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, SizeFloor, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -167,9 +166,9 @@ pub struct ZImageGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
-    /// Effective component-residency policy selected at load. Sequential bypasses both component
-    /// caches and rebuilds/drops Qwen3, DiT, and VAE in explicit per-request phases.
-    offload_policy: OffloadPolicy,
+    /// Serializes cache use with request-staged eviction. Without this guard a warm request could
+    /// retain cloned component Arcs while a concurrent staged request attempted to shed the cache.
+    lifecycle: Mutex<()>,
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
     /// generator instance; empty ⇒ the stock unadapted build.
     adapters: Vec<AdapterSpec>,
@@ -262,6 +261,7 @@ impl Generator for ZImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
         // heavy components come from the cache.
@@ -277,7 +277,11 @@ impl Generator for ZImageGenerator {
             ),
         };
 
-        if self.offload_policy == OffloadPolicy::Sequential {
+        if req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency)
+        {
             if self.comfyui.is_some() {
                 return Err(gen_core::Error::Unsupported(
                     "z_image_turbo: sequential residency is unavailable for bespoke ComfyUI \
@@ -292,6 +296,13 @@ impl Generator for ZImageGenerator {
                         .into(),
                 ));
             }
+            // A warm request may have populated either cache. Synchronize before releasing those
+            // weights, then let the request-owned three-stage route load/drop each phase in turn.
+            self.device
+                .synchronize()
+                .map_err(candle_gen::CandleError::from)?;
+            drop(candle_gen::lock_recover(&self.components).take());
+            drop(candle_gen::lock_recover(&self.vae_encoder).take());
             let images = pipe.render_sequential(req, on_progress)?;
             return Ok(GenerationOutput::Images(images));
         }
@@ -428,13 +439,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
-    let offload_policy = candle_gen::effective_offload_policy(spec.offload_policy);
     Ok(Box::new(ZImageGenerator {
         descriptor: descriptor(),
         root,
         device,
         dtype: DType::BF16,
-        offload_policy,
+        lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
@@ -477,7 +487,7 @@ pub fn load_from_comfyui_components(
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
-        offload_policy: OffloadPolicy::Resident,
+        lifecycle: Mutex::new(()),
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
@@ -503,7 +513,7 @@ pub fn load_from_comfyui_checkpoint(
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
-        offload_policy: OffloadPolicy::Resident,
+        lifecycle: Mutex::new(()),
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
@@ -683,19 +693,22 @@ mod tests {
             .is_ok());
     }
 
-    /// The worker-facing `LoadSpec::offload_policy` selects the staged route. A pre-cancel must return
-    /// before touching the deliberately missing snapshot, proving the policy is active rather than
+    /// The request-scoped memory contract selects the staged route. A pre-cancel must return before
+    /// touching the deliberately missing snapshot, proving the request authority is active rather than
     /// silently serving the resident cache path.
     #[test]
-    fn sequential_policy_is_active_and_honors_pre_cancel_before_load() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
+    fn request_staging_is_active_and_honors_pre_cancel_before_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let generator = load(&spec).expect("lazy sequential generator");
         let cancel = gen_core::CancelFlag::default();
         cancel.cancel();
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
             cancel,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(matches!(
@@ -708,13 +721,16 @@ mod tests {
     /// Sequential requests reject it explicitly before any snapshot access instead of retaining it
     /// through denoise and making the advertised peak false.
     #[test]
-    fn sequential_policy_rejects_pid_explicitly_before_load() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
+    fn request_staging_rejects_pid_explicitly_before_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let generator = load(&spec).expect("lazy sequential generator");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
             use_pid: true,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let error = generator.generate(&req, &mut |_| {}).unwrap_err();

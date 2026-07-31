@@ -9,7 +9,6 @@ $ErrorActionPreference = "Stop"
 $output = New-Item -ItemType Directory -Force -Path $OutputDirectory
 $env:QWEN_IMAGE_SNAPSHOT = (Resolve-Path $QwenSnapshot).Path
 $env:FLUX_DEV_DIR = (Resolve-Path $FluxSnapshot).Path
-$env:CANDLE_GEN_OFFLOAD = $null
 
 function Invoke-Probe {
     param(
@@ -38,12 +37,12 @@ function Invoke-Probe {
 Invoke-Probe candle-gen-qwen-image qwen_image_probed_generate_for_offload_ab `
     QWEN_OFFLOAD_MODE "" QWEN_OUT qwen-resident.rgb qwen-resident.log
 Invoke-Probe candle-gen-qwen-image qwen_image_probed_generate_for_offload_ab `
-    QWEN_OFFLOAD_MODE spec-sequential QWEN_OUT qwen-sequential.rgb qwen-sequential.log
+    QWEN_OFFLOAD_MODE request-staged QWEN_OUT qwen-sequential.rgb qwen-sequential.log
 
 Invoke-Probe candle-gen-flux flux_dev_probed_generate_for_offload_ab `
     FLUX_OFFLOAD_MODE "" FLUX_OUT flux-dev-resident.rgb flux-dev-resident.log
 Invoke-Probe candle-gen-flux flux_dev_probed_generate_for_offload_ab `
-    FLUX_OFFLOAD_MODE spec-sequential FLUX_OUT flux-dev-sequential.rgb flux-dev-sequential.log
+    FLUX_OFFLOAD_MODE request-staged FLUX_OUT flux-dev-sequential.rgb flux-dev-sequential.log
 
 $qwenResident = Join-Path $output qwen-resident.rgb
 $qwenSequential = Join-Path $output qwen-sequential.rgb

@@ -753,7 +753,8 @@ impl Krea {
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
-            |ctx: &KreaContexts| {
+            |ctx: Option<&KreaContexts>| {
+                let Some(ctx) = ctx else { return Ok(()) };
                 match &ctx.neg {
                     Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
                     None => mlx_rs::transforms::eval([&ctx.pos])?,

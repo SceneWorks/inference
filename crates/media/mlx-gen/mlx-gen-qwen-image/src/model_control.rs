@@ -397,7 +397,10 @@ impl QwenImageControl {
                 Ok((pos, neg))
             },
             // Materialize pos (+neg) while the encoder is still alive (Sequential only).
-            |(pos, neg)| {
+            |encoded| {
+                let Some((pos, neg)) = encoded else {
+                    return Ok(());
+                };
                 match neg {
                     Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
                     None => mlx_rs::transforms::eval([pos])?,

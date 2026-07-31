@@ -460,7 +460,8 @@ impl Sana {
             // Materialize the CHI embedding + pad mask (and their uncond twins) while the encoder is
             // still alive (Sequential only) — MLX is lazy, so an un-evaluated output keeps the Gemma
             // encoder referenced through the graph and the drop would free nothing.
-            |cond: &SanaConditioning| {
+            |cond: Option<&SanaConditioning>| {
+                let Some(cond) = cond else { return Ok(()) };
                 let mut arrays = vec![&cond.cond, &cond.cond_mask];
                 if let Some((u, um)) = &cond.uncond {
                     arrays.push(u);
