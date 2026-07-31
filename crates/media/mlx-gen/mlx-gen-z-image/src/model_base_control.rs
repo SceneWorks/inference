@@ -29,7 +29,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     AcceptedControlKinds, Capabilities, ConditioningKind, ControlBranch, ControlKind,
     FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, Residency, Result,
+    ModelDescriptor, Progress, Quant, Residency, Result, SizeFloor,
 };
 
 use crate::model::validate_request;
@@ -56,6 +56,9 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            // Advertised so a weights-free caller can reject a bad `kind` before
+            // paying for a load. Same expression the `ControlBranch` override
+            // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Base is undistilled → full classifier-free guidance + negative prompting (mirrors the
             // base `z_image` descriptor), unlike the guidance-distilled Turbo control variant.
@@ -90,6 +93,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -206,15 +210,18 @@ impl ZImageControl {
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
-        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
-        // request selected it; a selection on a non-Sequential generator is rejected rather than
-        // silently degraded (see `pipeline::resolve_block_window`).
-        let block_window =
-            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
+        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
+        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
+        let deferred_materialization = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
         // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
         // includes the encoder, so an unscoped request conditions exactly as before.
         let encoder_window =
-            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
+            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores

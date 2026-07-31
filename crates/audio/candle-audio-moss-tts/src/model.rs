@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, SpeechSegment, WeightsSource,
+    Modality, ModelDescriptor, Progress, SizeFloor, SpeechSegment, WeightsSource,
 };
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
@@ -148,6 +148,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_history: false,
             supports_conversation_session: false,
             max_speakers: Some(MAX_SPEAKERS),
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

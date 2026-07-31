@@ -20,7 +20,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 use mlx_rs::random;
 use mlx_rs::Array;
@@ -147,6 +147,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -747,6 +748,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -1654,6 +1656,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

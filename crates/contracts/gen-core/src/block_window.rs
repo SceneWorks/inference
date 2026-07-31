@@ -39,6 +39,47 @@
 //!
 //! Likewise the MLX figures above are MLX figures. They establish that the shape works; they say
 //! nothing about what any other backend will measure.
+//!
+//! ## What a window materialization may cost (SC-16090)
+//!
+//! One rung-4 render materializes every block once per denoise step, so a window's cost is multiplied
+//! by `n_blocks × steps` — 240× for a 30-block stack over 8 steps. The obligation follows from that
+//! arithmetic, not from taste: **`open_view` plus the tensor reads `apply` makes must be a transfer of
+//! bytes already in the form the accelerator consumes.** A mapped read, and where the memory is not
+//! unified, a host-to-device copy. Nothing else.
+//!
+//! Specifically NOT in the per-window path:
+//!
+//! - **Format conversion.** A quantized-container repack, a dequantize-then-requantize, a transpose,
+//!   a dtype cast — anything whose cost scales with the block's weights. These are pure functions of
+//!   bytes that do not change between steps, so recomputing them per window pays them 240 times for
+//!   one answer. Do them once, ahead of the render, into an artifact a window can map.
+//! - **A device→host round trip.** Reading the source tensors through the compute device and pulling
+//!   them back to the host to convert them costs an upload plus a download per window and saves
+//!   nothing. Read host-side data host-side.
+//! - **Re-reading the source tier from a cold page cache.** Rung 4 exists for low-RAM hosts, which are
+//!   exactly the hosts that cannot hold the tier in page cache, so a per-step re-read is disk-bound.
+//!
+//! This is the invariant that lets the ladder keep ONE shared cost order across backends. SC-15791
+//! measured what its absence costs: Candle's rung 4 ran ~26× MLX's on the identical file, and ~100% of
+//! the gap was a host-side MLX-affine → GGML-`Q4_1` repack in the per-window path, with the PCIe
+//! transfer it was blamed on unresolvable against the noise floor. The contract half is
+//! [`crate::memory_strategy::MemoryWindowMaterialization`], which a provider declares and
+//! `conformance_errors` checks; this is the same statement addressed to whoever writes the backend.
+//!
+//! **The obligation binds the rung, not this trait.** It applies to any realization of bounded
+//! transformer residency, including one that has not adopted this driver, so it must not be read as
+//! scoped to implementors of [`BlockWindowBackend`].
+//!
+//! `candle-gen-krea` is the worked example of why the two halves are separable, because they were
+//! fixed by two different stories. Its shipped streamed trunk used to fold its own block sequence and
+//! never touch this trait, AND rebuild each block from the MLX affine triples inside the per-window
+//! path. SC-15792 moved it onto the driver — a backend-local reimplementation is a review failure,
+//! because rung 4 fell through the cracks originally by primitives being less enforced than the
+//! selector. SC-16096 separately removed the per-window conversion, content-addressing each source
+//! triple into a device-format sidecar prepared once, which is what flipped its declaration from
+//! `HostFormatConversion` to `DeviceFormatTransfer`. Adopting the driver was necessary and not
+//! sufficient; neither story alone would have discharged both.
 
 use std::ops::Range;
 
@@ -114,6 +155,11 @@ pub trait BlockWindowBackend {
     /// Whatever makes opening cheap is the backend's business — lazily-mapped handles, a deferred
     /// reader, an index. The driver opens one per window, so an implementation that eagerly reads
     /// the whole checkpoint here would defeat the entire rung.
+    ///
+    /// Reading the window's own tensors out of this view must also be cheap, in the specific sense the
+    /// module docs give: a transfer of already-device-format bytes, never a per-window format
+    /// conversion. A view that hands out tensors needing conversion satisfies the *bound* while
+    /// destroying the *cost*, which is the failure SC-15791 measured at ~26×.
     type View;
 
     /// Open a fresh view. Called once per window.

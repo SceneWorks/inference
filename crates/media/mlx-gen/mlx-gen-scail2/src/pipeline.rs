@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use mlx_gen::{
     default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Progress, Quant, Result, WeightsSource,
+    Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_wan::SolverKind;
 
@@ -46,6 +46,14 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
+            // ADVERTISED, not merely implemented. `generate` already routes through
+            // `validate_request_skip_size` because `width`/`height == 0` means
+            // "size from the driving-video frames" and the range check would
+            // wrongly reject that sentinel. Until this field existed, a consumer
+            // holding these `Capabilities` had no way to learn it, so a caller
+            // mirroring the shared floor to type-check before a load rejected a
+            // request this model renders.
+            size_floor: SizeFloor::ResolvedDownstream,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
@@ -166,19 +174,27 @@ impl Scail2 {
         // garbage-as-success. Every other provider re-validates at the top of its generate impl.
         //
         // scail2 supports a "match the driving-video size" convention (`width`/`height == 0` → resolved
-        // from the driving frames below), which the floor's size-range check would wrongly reject. So
-        // the full floor always runs; only the size-range check is gated on explicit dims via
-        // `validate_request_skip_size` — count/frame caps, sampler membership, conditioning allowlist,
-        // support gating, and the finiteness guard all fire even on the auto-size path.
-        if req.width > 0 && req.height > 0 {
-            self.descriptor
-                .capabilities
-                .validate_request(self.descriptor.id, req)?;
-        } else {
-            self.descriptor
-                .capabilities
-                .validate_request_skip_size(self.descriptor.id, req)?;
-        }
+        // from the driving frames below), which the floor's size-range check would wrongly reject. That
+        // exemption used to be hand-rolled here as `if req.width > 0 && req.height > 0 { … } else {
+        // validate_request_skip_size }`; it is now ADVERTISED as `SizeFloor::ResolvedDownstream` on the
+        // descriptor, so this single call applies exactly that policy — and a weights-free consumer
+        // holding these `Capabilities` computes the same verdict this line does, instead of having to
+        // guess which entry point the provider happens to call. Every other floor check is unchanged
+        // and still fires on the auto-size path: count/frame caps, sampler membership, the conditioning
+        // allowlist, support gating, and the F-053 finiteness guard.
+        //
+        // The advertised floor is also **stricter** than the branch it replaces, deliberately. `0 > 0`
+        // is false, so the old condition sent a HALF-sentinel (`0x512`, `4096x0`) down the
+        // size-skipping path: the non-zero axis carried a real, checkable size and was never
+        // range-checked, and `run` then took it verbatim into `Scail2Job` (only the zero axis is filled
+        // from the driving frame below). An explicit `0x4096` against declared bounds of 32..=1280 was
+        // accepted and rendered, with nothing downstream to catch it — `min_size`/`max_size` appear
+        // nowhere in this crate outside `descriptor()`. `ResolvedDownstream` treats only
+        // `width == 0 && height == 0` as the sentinel, which is what the convention actually means:
+        // a half-sentinel is a malformed request, not "resolve from the driving media".
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)?;
         let reference = find_conditioning(req, |c| match c {
             Conditioning::Reference { image, .. } => Some(image),
             _ => None,
@@ -309,5 +325,154 @@ mod tests {
             err.to_string().contains("sampler"),
             "expected an unsupported-sampler rejection, got: {err}"
         );
+    }
+
+    /// The first conditioning lookup `run` performs after the shared floor. Reaching it is proof the
+    /// floor **passed** — which is what makes the positive cases below non-vacuous: every weights-free
+    /// `run` ends in an error, so `is_err()` alone would assert nothing at all.
+    const CLEARED_THE_FLOOR: &str = "a Reference character image is required";
+
+    /// F-158 read the other way round: an **explicit** size is still range-checked, and only the full
+    /// `0x0` sentinel is exempt.
+    ///
+    /// This is the integration-level gate for the regression that motivated advertising
+    /// [`SizeFloor::ResolvedDownstream`](mlx_gen::gen_core::SizeFloor::ResolvedDownstream). Reading
+    /// that variant as a blanket opt-out deletes SCAIL-2's explicit-size rejection outright, and
+    /// nothing downstream catches it: `min_size`/`max_size` appear nowhere in this crate outside
+    /// [`descriptor`], so an out-of-range explicit size flows straight into [`Scail2Job`] and is
+    /// rendered. gen-core's unit tests pin [`Capabilities`] in isolation; this pins that SCAIL-2's own
+    /// `generate` — the thing a caller actually invokes — still gets the rejection.
+    ///
+    /// The half-sentinel rows are a behaviour **change**, not a re-assertion. The hand-rolled branch
+    /// this replaced tested `req.width > 0 && req.height > 0`, so `0x4096` took the size-skipping path
+    /// and its explicit 4096 height was accepted against declared bounds of 32..=1280.
+    ///
+    /// Weights-free: `run` validates before it touches `self.root`, so a rejected request never loads.
+    #[test]
+    fn run_range_checks_explicit_sizes_and_exempts_only_the_full_sentinel() {
+        let m = unloaded();
+        let mut noop = |_: Progress| {};
+
+        for (w, h, why) in [
+            (16, 16, "below min_size"),
+            (4096, 4096, "above max_size"),
+            (
+                0,
+                4096,
+                "half-sentinel: the height is explicit and above max_size",
+            ),
+            (
+                4096,
+                0,
+                "half-sentinel: the width is explicit and above max_size",
+            ),
+            (
+                0,
+                16,
+                "half-sentinel: the height is explicit and below min_size",
+            ),
+        ] {
+            let req = GenerationRequest {
+                width: w,
+                height: h,
+                ..Default::default()
+            };
+            let err = m
+                .run(&req, &mut noop)
+                .expect_err("an out-of-range explicit size must never reach the pipeline")
+                .to_string();
+            assert!(
+                err.contains("outside supported range"),
+                "{w}x{h} ({why}) must be rejected by the advertised size range, got: {err}"
+            );
+        }
+
+        for (w, h, why) in [
+            (0, 0, "the resolve-from-the-driving-video sentinel"),
+            (512, 512, "an in-range explicit size"),
+            (32, 1280, "the inclusive bounds themselves"),
+        ] {
+            let req = GenerationRequest {
+                width: w,
+                height: h,
+                ..Default::default()
+            };
+            let err = m
+                .run(&req, &mut noop)
+                .expect_err("no request renders without weights")
+                .to_string();
+            assert!(
+                err.contains(CLEARED_THE_FLOOR),
+                "{w}x{h} ({why}) must clear the size floor and fail later on missing conditioning, \
+                 got: {err}"
+            );
+        }
+    }
+
+    /// All three size verdicts a caller can obtain must be the **same** verdict.
+    ///
+    /// The point of putting `size_floor` on [`Capabilities`] is that a consumer can type-check a
+    /// request before paying for a multi-gigabyte load and get the provider's *real* answer. That
+    /// holds only while three separately-reachable paths agree, and until this change two of them
+    /// did not:
+    ///
+    /// 1. the published [`descriptor`]'s capabilities — what a consumer has **before** any load;
+    /// 2. [`Generator::validate`] — the pre-flight on a loaded provider (`impl_generator!` routes it
+    ///    to the plain [`Capabilities::validate_request`], and always has);
+    /// 3. the floor `generate` runs on itself — the only one that can actually stop a render.
+    ///
+    /// (2) and (3) disagreed about the sentinel: `validate` range-checked `0x0` and said **no**,
+    /// while `generate` hand-rolled the exemption and rendered it. And (1) and (3) disagreed about
+    /// half-sentinels: the hand-rolled predicate `req.width > 0 && req.height > 0` is *looser* than
+    /// the advertisement, so `0x512` and `4096x0` skipped the size check entirely while a consumer
+    /// reading the descriptor was told they would be rejected. Those rows go red if the branch comes
+    /// back — which is the regression class this test exists for.
+    ///
+    /// Deliberately NOT covered here: a wrong `size_floor` **value** on the descriptor. Flip it to
+    /// `RangeChecked` and all three move together — they read one field — so this stays green and
+    /// [`run_range_checks_explicit_sizes_and_exempts_only_the_full_sentinel`] is what fails. The two
+    /// are complementary: that one pins the absolute behaviour, this one pins the coupling.
+    #[test]
+    fn every_reachable_size_verdict_is_the_same_verdict() {
+        let m = unloaded();
+        let mut noop = |_: Progress| {};
+        let published = descriptor();
+
+        for (w, h) in [
+            (0, 0),
+            (512, 512),
+            (16, 16),
+            (4096, 4096),
+            (0, 512),
+            (512, 0),
+            (32, 1280),
+        ] {
+            let req = GenerationRequest {
+                width: w,
+                height: h,
+                ..Default::default()
+            };
+            // (1) what a weights-free consumer computes from the published descriptor,
+            let advertised_ok = published
+                .capabilities
+                .validate_request(MODEL_ID, &req)
+                .is_ok();
+            // (2) what the loaded provider's own pre-flight says,
+            let validate_ok = Generator::validate(&m, &req).is_ok();
+            // (3) and what the floor inside `generate` actually enforces. `run` always errors without
+            // weights, so "the floor accepted it" is read off the message, not off `is_ok`.
+            let enforced_ok = m
+                .run(&req, &mut noop)
+                .expect_err("no request renders without weights")
+                .to_string()
+                .contains(CLEARED_THE_FLOOR);
+            assert_eq!(
+                (advertised_ok, validate_ok),
+                (enforced_ok, enforced_ok),
+                "{w}x{h}: descriptor accepted={advertised_ok}, Generator::validate \
+                 accepted={validate_ok}, the floor inside generate accepted={enforced_ok} — a \
+                 caller that trusts either pre-flight would be wrong about this request",
+            );
+        }
     }
 }

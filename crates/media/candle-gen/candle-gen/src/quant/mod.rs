@@ -34,6 +34,7 @@
 //! byte-level details.
 
 pub mod repack;
+pub mod sidecar;
 
 // The NVFP4 (FP4) weight container + offline packer + CPU dequant reference (sc-11040, epic 11037):
 // E2M1 4-bit elements over 16-element blocks, one FP8-E4M3 micro-scale per block, plus a second-level
@@ -86,6 +87,7 @@ pub use repack::{
     f16_exact, mlx_packed_bits, mlx_packed_bits_gs, pack_mlx_affine, repack_mlx_q4_to_q4_1,
     repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
+pub use sidecar::PackedWeightSidecars;
 
 pub use cublaslt::{
     quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
@@ -839,6 +841,25 @@ impl QEmbedding {
         Ok(Self::Dense(candle_nn::embedding(vocab, hidden, vb)?))
     }
 
+    /// Build from an already-device-format GGML table, as produced by
+    /// [`PackedWeightSidecars`]. This is the no-conversion twin of
+    /// [`Self::from_packed_dtype_gs`]: the caller has already validated and converted the source
+    /// affine triple ahead of the render, so a window performs only a mapped read plus transfer.
+    pub fn from_qtensor(table: QTensor, out_dtype: DType) -> Result<Self> {
+        let dims = table.shape().dims();
+        if dims.len() != 2 {
+            candle_core::bail!(
+                "packed embedding device-format table must be rank 2, got {:?}",
+                table.shape()
+            );
+        }
+        Ok(Self::Quantized {
+            hidden_size: dims[1],
+            table,
+            out_dtype,
+        })
+    }
+
     /// Build a `Quantized` embedding directly from an MLX packed triple on `device` (Q4 lossless
     /// repack / Q8 re-quant, as [`QLinear::from_packed`]). The `[vocab, hidden]` table's `hidden`
     /// (the last dim, the group axis) is `scales.cols · group_size`. The forward dequantizes to
@@ -943,8 +964,8 @@ pub fn repack_packed_weight(
 /// **dense** (`{base}.weight`, path unchanged). `bias` additionally loads the dense `{base}.bias`
 /// (distinct from the packed path's own `{base}.biases`, which is always loaded packed). The candle
 /// twin of `mlx_gen::quant::lin`: one loader serves both a dense bf16 and a packed snapshot, with no
-/// `quantization` manifest to read. `vb`'s dtype is the dense-path weight dtype; the packed path
-/// builds on `vb`'s device.
+/// `quantization` manifest to read. `vb`'s dtype is the dense-path weight dtype; the packed path reads
+/// its source triple on the CPU and builds the device-format weight on `vb`'s device.
 pub fn lin(
     vb: &VarBuilder,
     base: &str,
@@ -970,9 +991,12 @@ pub fn lin_gs(
         let device = vb.device().clone();
         // The u32 packed codes must load at their native `U32` (a cast to the vb's float dtype would
         // reinterpret the bit-packed nibbles); the scales/biases upcast bf16 → f32 exactly.
-        let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
-        let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
-        let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
+        // Repacking is host work. Read the affine triple directly on CPU so a CUDA VarBuilder does
+        // not upload the source tensors only for repack::q4_parts/q8_parts to pull them back again.
+        let host_vb = vb.clone().set_device(Device::Cpu);
+        let wq = host_vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
+        let scales = host_vb.get_unchecked_dtype(&scales_key, DType::F32)?;
+        let biases = host_vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
         let bias = if bias {
             Some(vb.get_unchecked_dtype(&format!("{base}.bias"), vb.dtype())?)
         } else {
@@ -1036,9 +1060,10 @@ pub fn embedding_dtype_gs(
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
-        let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
-        let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
-        let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
+        let host_vb = vb.clone().set_device(Device::Cpu);
+        let wq = host_vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
+        let scales = host_vb.get_unchecked_dtype(&scales_key, DType::F32)?;
+        let biases = host_vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
         return QEmbedding::from_packed_dtype_gs(
             &wq,
             &scales,

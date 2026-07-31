@@ -12,8 +12,8 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
+    Generator, LatentDecoder, LoadShape, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
+    Precision, Progress, Quant, Residency, Result, SizeFloor, StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use mlx_rs::Dtype;
@@ -103,6 +103,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -329,9 +330,10 @@ pub(crate) fn build_residency(
         spec.offload_policy,
         move || {
             let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
-            // Rung 4's encoder stream only bounds anything when the encoder is loaded and dropped
-            // per phase; under `Resident` it would cost ~2x per encode and bound nothing.
-            let streamable = matches!(spec_text.offload_policy, OffloadPolicy::Sequential);
+            // SC-15998: deferred block materialization is independent from phase-level release.
+            // A Resident+Deferred generator keeps the generator and its light/non-windowed state
+            // warm across requests while the Qwen layer stack remains re-openable per block.
+            let streamable = matches!(spec_text.load_shape, LoadShape::DeferredMaterialization);
             load_text_encoder_only(root, spec_text.quantize, streamable)
         },
         move |use_pid| {
@@ -367,10 +369,8 @@ fn resolve_precision_and_root<'a>(
 /// Load the Qwen text encoder (+ optional whole-model Q4/Q8), the phase-A component dropped first
 /// under `Sequential`. Q4/Q8 is `group_size 64` over every quantizable Linear + the token Embedding
 /// (sc-2532); factored out so the `Resident` and `Sequential` paths build byte-identical encoders.
-/// `streamable` builds the rung-4 text-encoder stream (SC-15794). It is passed `true` ONLY for the
-/// `Sequential` branch: under `Resident` the encoder is held across requests, so a streamed stack
-/// would re-materialize all 36 layers per encode and bound nothing (~2x slower — see
-/// [`loader::load_text_encoder_streamable`]).
+/// `streamable` builds the rung-4 text-encoder stream (SC-15794). SC-15998 derives it from the
+/// independent [`LoadShape::DeferredMaterialization`] request, not from phase-level residency.
 fn load_text_encoder_only(
     root: &Path,
     quant: Option<Quant>,
@@ -520,15 +520,18 @@ impl ZImageTurbo {
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
-        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
-        // request selected it; a selection on a non-Sequential generator is rejected rather than
-        // silently degraded (see `pipeline::resolve_block_window`).
-        let block_window =
-            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
+        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
+        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
+        let deferred_materialization = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
         // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
         // includes the encoder, so an unscoped request conditions exactly as before.
         let encoder_window =
-            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
+            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,

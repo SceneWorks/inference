@@ -20,7 +20,7 @@ use mlx_rs::Dtype;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    Quant, Result, SizeFloor, WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -83,6 +83,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -355,6 +356,7 @@ mod tests {
                 identity: None,
                 text_encoder: None,
                 offload_policy: Default::default(),
+                load_shape: Default::default(),
                 components: Default::default(),
             };
             let err = match crate::provider_registry().unwrap().load(id, &spec) {

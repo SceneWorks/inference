@@ -16,6 +16,11 @@
 //! SC15791_REPEATS=3                                     optional; timing samples per window size
 //! SC15791_RACE_TOKENS=4096 SC15791_RACE_REPEATS=64      optional; depth of the Q3 race queue
 //! SC15791_RACE_CLAIM_MIB=256                            optional; bytes re-claimed in the Q3b probe
+//! SC16096_Q4=<...>/q4/transformer/model.safetensors     SC-16096 before/after (required together)
+//! SC16096_Q8=<...>/q8/transformer/model.safetensors     SC-16096 before/after (required together)
+//! SC16096_REPEATS=3                                     SC-16096 samples (minimum three)
+//! SC16154_Q4=<...>/q4/transformer/model.safetensors     SC-16154 post-sidecar window timing
+//! SC16154_REPEATS=12                                    SC-16154 samples per window (must be 12)
 //! cargo test -p candle-gen --features cuda --release --test rung4_block_streaming_spike \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
@@ -34,13 +39,14 @@
 //! | `release_semantics` | Q2 does VRAM come back / need a sync; Q3 must `release` be non-trivial |
 //! | `packed_quant_per_block` | Q4 the packed-quant triple, per block, bit-exact |
 //! | `q8_tier_cost` | whether SC-15744's "q8 ≈ 2× q4" carries to Candle |
+//! | `device_format_sidecars_before_after` | SC-16096 q4/q8 cost, parity, host memory, and load-bearing window bound |
+//! | `device_format_window_time_interleaved` | SC-16154 post-sidecar time by window, with balanced interleaved samples |
 //! | `constrained_budget_sweep` | the small-card disclosure |
 //!
-//! Throwaway measurement code by the story's own terms — the answer is the deliverable. Kept as an
-//! `#[ignore]` real-weight test so SC-15792 can re-run it against its implementation. It drives the
-//! production packed loader but deliberately does **not** drive
-//! `gen_core::block_window::run_windowed`: there is no candle `BlockWindowBackend` yet, and building
-//! one is SC-15792's job, not this spike's.
+//! Throwaway measurement code by SC-15791's own terms — the answer is the deliverable. Kept as an
+//! `#[ignore]` real-weight test so later hardware stories can re-run the same evidence. The original
+//! spike arms predate `gen_core::block_window::run_windowed`; SC-16154's post-sidecar timing arm uses
+//! that shared driver so its window schedule is the one production executes.
 //!
 //! The pool accessors below duplicate `candle_gen::testkit::cuda_mempool`'s `default_pool` because
 //! testkit exports only `USED_MEM_HIGH` and this spike needs the CURRENT/RESERVED/RELEASE_THRESHOLD
@@ -51,18 +57,26 @@
 
 #![cfg(feature = "cuda")]
 
-use std::collections::HashMap;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
+use candle_gen::block_window::{run_windowed, BlockPlan};
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::quant::{dequant_mlx_q4_reference, lin, QLinear, MLX_GROUP_SIZE};
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::quant::{
+    dequant_mlx_q4_reference, repack_packed_weight, PackedConfig, PackedWeightSidecars, QLinear,
+    MLX_GROUP_SIZE,
+};
 
-const MIB: f64 = 1024.0 * 1024.0;
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+mod rung4_support;
+use rung4_support::{
+    compute, compute_into, disclose_host as disclose, env_path_opt as env_opt, env_path_req,
+    env_usize, linear_fit, materialize, median, pool_open, quiesce_and_reset, windows, Block, Tier,
+    GIB, MIB,
+};
 
 // ---------------------------------------------------------------------------------------------------
 // Driver memory-pool probe
@@ -76,108 +90,138 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 // RESERVED is not a footnote: `nvidia-smi memory.used` reports driver-RESERVED bytes, so RESERVED is
 // the unit a VRAM gate consumes, and it exceeds USED by the pool's allocation granularity.
 // ---------------------------------------------------------------------------------------------------
-mod pool {
-    use candle_gen::candle_core::cuda::cudarc::driver::sys;
+// Windows process-memory probe used by SC-16096. `WorkingSetSize` includes mapped/file-backed pages;
+// `PrivateUsage` is private commit and exposes the q8 dense-grid transient the CUDA pool cannot see.
+#[cfg(windows)]
+mod host_memory {
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    pub struct Pool(sys::CUmemoryPool);
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
 
-    impl Pool {
-        /// The default stream-ordered pool `cuMemAllocAsync` draws from for **logical** device
-        /// `ordinal` — the pool candle 0.10 allocates every tensor from.
-        pub fn open(ordinal: i32) -> Option<Self> {
-            unsafe {
-                if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                let mut dev: sys::CUdevice = 0;
-                if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-                if sys::cuDeviceGetDefaultMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                Some(Self(pool))
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            size: u32,
+        ) -> i32;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Peak {
+        pub working_set_start: u64,
+        pub working_set_peak: u64,
+        pub working_set_end: u64,
+        pub private_start: u64,
+        pub private_peak: u64,
+        pub private_end: u64,
+    }
+
+    fn counters() -> (u64, u64) {
+        let mut counters = ProcessMemoryCountersEx {
+            cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            page_fault_count: 0,
+            peak_working_set_size: 0,
+            working_set_size: 0,
+            quota_peak_paged_pool_usage: 0,
+            quota_paged_pool_usage: 0,
+            quota_peak_non_paged_pool_usage: 0,
+            quota_non_paged_pool_usage: 0,
+            pagefile_usage: 0,
+            peak_pagefile_usage: 0,
+            private_usage: 0,
+        };
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "K32GetProcessMemoryInfo failed");
+        (
+            counters.working_set_size as u64,
+            counters.private_usage as u64,
+        )
+    }
+
+    fn update_max(max: &AtomicU64, value: u64) {
+        let mut old = max.load(Ordering::Relaxed);
+        while value > old {
+            match max.compare_exchange_weak(old, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
             }
-        }
-
-        /// Read one attribute. Panics rather than returning 0 on a driver error: a silent zero would
-        /// let a broken probe print a plausible report and bank a green.
-        fn attr(&self, which: sys::CUmemPool_attribute) -> u64 {
-            let mut v: u64 = 0;
-            let ok = unsafe {
-                sys::cuMemPoolGetAttribute(self.0, which, (&mut v as *mut u64).cast::<c_void>())
-                    == sys::CUresult::CUDA_SUCCESS
-            };
-            assert!(ok, "cuMemPoolGetAttribute({which:?}) failed");
-            v
-        }
-
-        /// Bytes currently **live** in the pool — the MLX `get_active_memory` analogue.
-        pub fn used(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)
-        }
-
-        /// High-water of concurrently-live pool bytes — the MLX `get_peak_memory` analogue.
-        pub fn used_high(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH)
-        }
-
-        /// Bytes the pool holds from the driver (live + cached-free).
-        pub fn reserved(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)
-        }
-
-        /// High-water of driver-reserved bytes — **the peak in the VRAM gate's own unit.**
-        pub fn reserved_high(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)
-        }
-
-        /// Bytes the pool may retain across a synchronization before returning them to the driver.
-        ///
-        /// Load-bearing for any "does the memory come back?" claim: neither candle nor cudarc sets
-        /// this, so it sits at the driver default of **0** = release everything on every synchronize.
-        /// That is why a drop decrements USED immediately while driver-visible free only recovers at
-        /// the next synchronize, and why `trim` has nothing to do.
-        pub fn release_threshold(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)
-        }
-
-        /// Reset both high-water marks (write-to-zero per the driver ABI).
-        pub fn reset_high(&self) {
-            for which in [
-                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
-                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
-            ] {
-                let mut zero: u64 = 0;
-                let ok = unsafe {
-                    sys::cuMemPoolSetAttribute(
-                        self.0,
-                        which,
-                        (&mut zero as *mut u64).cast::<c_void>(),
-                    ) == sys::CUresult::CUDA_SUCCESS
-                };
-                assert!(ok, "resetting {which:?} failed — peaks would be stale");
-            }
-        }
-
-        /// Return cached-free pool pages to the driver — the `clear_cache()` analogue. Success is NOT
-        /// the same as having freed anything: at a release threshold of 0 there is no retained cache.
-        pub fn trim(&self) {
-            let ok = unsafe { sys::cuMemPoolTrimTo(self.0, 0) == sys::CUresult::CUDA_SUCCESS };
-            assert!(ok, "cuMemPoolTrimTo failed");
         }
     }
 
-    /// Driver-level `(free, total)` bytes — what `nvidia-smi` reports, i.e. what a smaller card's
-    /// VRAM gate would actually see. Panics on driver error rather than reporting `(0, 0)`.
-    pub fn mem_info() -> (u64, u64) {
-        let (mut free, mut total) = (0usize, 0usize);
-        let ok =
-            unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) == sys::CUresult::CUDA_SUCCESS };
-        assert!(ok, "cuMemGetInfo_v2 failed");
-        (free as u64, total as u64)
+    pub fn sample<T>(f: impl FnOnce() -> T) -> (T, Peak) {
+        let (working_set_start, private_start) = counters();
+        let stop = Arc::new(AtomicBool::new(false));
+        let working_set_peak = Arc::new(AtomicU64::new(working_set_start));
+        let private_peak = Arc::new(AtomicU64::new(private_start));
+        let sampler = {
+            let stop = Arc::clone(&stop);
+            let working_set_peak = Arc::clone(&working_set_peak);
+            let private_peak = Arc::clone(&private_peak);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let (working_set, private) = counters();
+                    update_max(&working_set_peak, working_set);
+                    update_max(&private_peak, private);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let value = f();
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().expect("host-memory sampler");
+        let (working_set_end, private_end) = counters();
+        (
+            value,
+            Peak {
+                working_set_start,
+                working_set_peak: working_set_peak.load(Ordering::Relaxed),
+                working_set_end,
+                private_start,
+                private_peak: private_peak.load(Ordering::Relaxed),
+                private_end,
+            },
+        )
+    }
+}
+
+#[cfg(not(windows))]
+mod host_memory {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Peak {
+        pub working_set_start: u64,
+        pub working_set_peak: u64,
+        pub working_set_end: u64,
+        pub private_start: u64,
+        pub private_peak: u64,
+        pub private_end: u64,
+    }
+
+    pub fn sample<T>(f: impl FnOnce() -> T) -> (T, Peak) {
+        (f(), Peak::default())
     }
 }
 
@@ -185,174 +229,9 @@ mod pool {
 // The tier under test
 // ---------------------------------------------------------------------------------------------------
 
-/// Everything about a packed transformer tier that can be read from the safetensors **header** alone.
-struct Tier {
-    path: PathBuf,
-    packed: Vec<Vec<String>>,
-    dense: Vec<Vec<String>>,
-    dims: HashMap<String, (usize, usize)>,
-    bytes: Vec<usize>,
-    n_tensors: usize,
-    file_bytes: u64,
-}
-
-impl Tier {
-    fn open(path: &Path, group_size: usize) -> Result<Self> {
-        // SAFETY: an immutable HF-cache blob; nothing rewrites it mid-test.
-        let st = unsafe { MmapedSafetensors::new(path)? };
-        let views = st.tensors();
-        let n_tensors = views.len();
-
-        let n_blocks = views
-            .iter()
-            .filter_map(|(k, _)| k.strip_prefix("layers."))
-            .filter_map(|rest| rest.split('.').next())
-            .filter_map(|i| i.parse::<usize>().ok())
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
-        assert!(n_blocks > 0, "no `layers.N.` blocks in {}", path.display());
-
-        let mut packed = vec![Vec::new(); n_blocks];
-        let mut dense = vec![Vec::new(); n_blocks];
-        let mut bytes = vec![0usize; n_blocks];
-        let mut dims = HashMap::new();
-
-        // `.data().len()` is a length on the mmap view, not a read, so no page is faulted here.
-        let mut shape: HashMap<&str, (&[usize], usize)> = HashMap::new();
-        for (k, v) in &views {
-            shape.insert(k.as_str(), (v.shape(), v.data().len()));
-        }
-
-        let block_of = |k: &str| -> Option<usize> {
-            k.strip_prefix("layers.")?
-                .split('.')
-                .next()?
-                .parse::<usize>()
-                .ok()
-        };
-
-        for (k, v) in &views {
-            let Some(b) = block_of(k) else { continue };
-            bytes[b] += v.data().len();
-            if let Some(base) = k.strip_suffix(".scales") {
-                let w = shape
-                    .get(format!("{base}.weight").as_str())
-                    .unwrap_or_else(|| panic!("{base}.scales has no {base}.weight sibling"));
-                packed[b].push(base.to_string());
-                dims.insert(base.to_string(), (w.0[0], v.shape()[1] * group_size));
-            } else if let Some(base) = k.strip_suffix(".weight") {
-                if !shape.contains_key(format!("{base}.scales").as_str()) {
-                    dense[b].push(k.to_string());
-                }
-            } else if !k.ends_with(".biases") {
-                dense[b].push(k.to_string());
-            }
-        }
-        for p in &mut packed {
-            p.sort();
-        }
-        for d in &mut dense {
-            d.sort();
-        }
-
-        // Per-block figures below are block 0's; assert the stack is uniform so that is honest.
-        let (lo, hi) = (*bytes.iter().min().unwrap(), *bytes.iter().max().unwrap());
-        assert!(
-            hi - lo < hi / 100,
-            "blocks are not uniform ({lo}..{hi} bytes) — per-block figures taken from block 0 would \
-             misrepresent the stack"
-        );
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            packed,
-            dense,
-            dims,
-            bytes,
-            n_tensors,
-            file_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        })
-    }
-
-    fn n_blocks(&self) -> usize {
-        self.packed.len()
-    }
-
-    fn all_block_bytes(&self) -> usize {
-        self.bytes.iter().sum()
-    }
-
-    /// A **fresh** weights view — the `BlockWindowBackend::open_view` analogue. Header-only.
-    fn open_view(&self, dev: &Device) -> Result<VarBuilder<'static>> {
-        // SAFETY: immutable HF-cache blob; a fresh mmap per view, never mutated behind the mapping.
-        let st = unsafe { MmapedSafetensors::new(&self.path)? };
-        Ok(VarBuilder::from_backend(
-            Box::new(st),
-            DType::F32,
-            dev.clone(),
-        ))
-    }
-
-    /// A raw mmap for the corrected-loader arm, which reads the triple on the host.
-    fn open_raw(&self) -> Result<MmapedSafetensors> {
-        // SAFETY: as above.
-        unsafe { MmapedSafetensors::new(&self.path) }
-    }
-}
-
-/// One materialized transformer block.
-struct Block {
-    /// `(name, projection, in_dim)`.
-    lins: Vec<(String, QLinear, usize)>,
-    dense: Vec<Tensor>,
-}
-
-impl Block {
-    fn dense_bytes(&self) -> usize {
-        self.dense
-            .iter()
-            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
-            .sum()
-    }
-}
-
-/// Materialize `range` through the **production** packed loader (`candle_gen::quant::lin`) onto the
-/// view's device — what a naive `BlockWindowBackend` would do.
-///
-/// NOTE the round trip this incurs when the view is on CUDA: `lin_gs` loads `wq`/`scales`/`biases`
-/// onto the view's device (`quant/mod.rs:973-975`), then `repack::q4_parts` immediately pulls all
-/// three back with `to_device(&Cpu)` (`repack.rs:133-144`) to do the host repack, then uploads the
-/// Q4_1 bytes. So the raw triple crosses PCIe up and back down for nothing. `materialize_host_repack`
-/// below is the corrected path, and the gap between them is measured in `window_sweep_cost`.
-fn materialize(tier: &Tier, view: &VarBuilder, range: Range<usize>) -> Result<Vec<Block>> {
-    let mut out = Vec::with_capacity(range.len());
-    for b in range {
-        let mut lins = Vec::with_capacity(tier.packed[b].len());
-        for base in &tier.packed[b] {
-            let (out_dim, in_dim) = tier.dims[base];
-            lins.push((
-                base.clone(),
-                lin(view, base, in_dim, out_dim, false)?,
-                in_dim,
-            ));
-        }
-        let mut dense = Vec::with_capacity(tier.dense[b].len());
-        for key in &tier.dense[b] {
-            dense.push(view.get_unchecked_dtype(key, DType::F32)?);
-        }
-        out.push(Block { lins, dense });
-    }
-    Ok(out)
-}
-
-/// The **corrected** materialization: read the packed triple straight to the host, repack on the
-/// host, and upload only the resulting `Q4_1` blocks. Identical arithmetic to [`materialize`] — it
-/// calls the same `QLinear::from_packed_gs` the production loader ends up in — but it never sends the
-/// raw triple to the device only to pull it back.
-///
-/// This is the floor a rung-4 implementation can actually reach without changing any numerics, so it
-/// is measured rather than derived.
+/// Manual raw-mmap twin of the current production loader: read the packed triple on the host, repack
+/// there, and upload only the resulting device-format blocks. It remains in the older SC-15791
+/// decomposition as a cross-check; it is not SC-16096's final path because it still converts per call.
 fn materialize_host_repack(
     tier: &Tier,
     raw: &MmapedSafetensors,
@@ -380,110 +259,94 @@ fn materialize_host_repack(
     Ok(out)
 }
 
-/// A plausible per-block forward. Accumulates into an on-DEVICE scalar and never reads it back: a
-/// `to_scalar` per projection would synchronize the stream on every call and serialize exactly the
-/// overlap the Q5 arm is trying to detect.
-fn compute(blocks: &[Block], tokens: usize, dev: &Device) -> Result<Tensor> {
-    let mut acc = Tensor::zeros((), DType::F32, dev)?;
-    for b in blocks {
-        for (_, ql, in_dim) in &b.lins {
-            let x = Tensor::ones((tokens, *in_dim), DType::F32, dev)?;
-            acc = (acc + ql.forward(&x)?.sum_all()?)?;
+/// Reconstruct the exact pre-SC-16096 Krea packed path for the before measurement: source tensors
+/// first load on CUDA, then `from_packed_gs` pulls them back to CPU for repacking.
+fn materialize_prechange(
+    tier: &Tier,
+    raw: &MmapedSafetensors,
+    dev: &Device,
+    range: Range<usize>,
+) -> Result<Vec<Block>> {
+    let mut out = Vec::with_capacity(range.len());
+    for b in range {
+        let mut lins = Vec::with_capacity(tier.packed[b].len());
+        for base in &tier.packed[b] {
+            let (_, in_dim) = tier.dims[base];
+            let wq = raw.load(&format!("{base}.weight"), dev)?;
+            let scales = raw
+                .load(&format!("{base}.scales"), dev)?
+                .to_dtype(DType::F32)?;
+            let biases = raw
+                .load(&format!("{base}.biases"), dev)?
+                .to_dtype(DType::F32)?;
+            let ql = QLinear::from_packed_gs(&wq, &scales, &biases, None, MLX_GROUP_SIZE, dev)?;
+            lins.push((base.clone(), ql, in_dim));
         }
+        let mut dense = Vec::with_capacity(tier.dense[b].len());
+        for key in &tier.dense[b] {
+            dense.push(raw.load(key, dev)?.to_dtype(DType::F32)?);
+        }
+        out.push(Block { lins, dense });
     }
-    Ok(acc)
+    Ok(out)
 }
 
-fn env_path_req(key: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(key).unwrap_or_else(|_| panic!("{key} not set — see the module docstring")),
+/// SC-16096's shipping window path: map already-GGML bytes and transfer them to the target device.
+/// The API deliberately accepts neither the MLX source nor quantization parameters.
+fn materialize_sidecars(
+    tier: &Tier,
+    sidecars: &PackedWeightSidecars,
+    raw: &MmapedSafetensors,
+    dev: &Device,
+    range: Range<usize>,
+) -> Result<Vec<Block>> {
+    let mut out = Vec::with_capacity(range.len());
+    for b in range {
+        let mut lins = Vec::with_capacity(tier.packed[b].len());
+        for base in &tier.packed[b] {
+            let (_, in_dim) = tier.dims[base];
+            let weight = sidecars.load(base, dev)?;
+            lins.push((
+                base.clone(),
+                QLinear::from_qtensor_dequant(Arc::new(weight), None),
+                in_dim,
+            ));
+        }
+        let mut dense = Vec::with_capacity(tier.dense[b].len());
+        for key in &tier.dense[b] {
+            dense.push(raw.load(key, dev)?.to_dtype(DType::F32)?);
+        }
+        out.push(Block { lins, dense });
+    }
+    Ok(out)
+}
+
+/// One complete synthetic denoise step through SC-16096's sidecar-backed materializer and the shared
+/// rung-4 driver. Sidecars and the source mmap are retained outside the window loop, matching Krea's
+/// `Arc<Weights>` view: opening a window is cheap, while each packed projection maps its prepared
+/// artifact and transfers already-device-format bytes.
+fn sidecar_windowed_step(
+    tier: &Tier,
+    sidecars: &PackedWeightSidecars,
+    raw: &MmapedSafetensors,
+    dev: &Device,
+    window: usize,
+    cancel: &CancelFlag,
+) -> candle_gen::Result<Tensor> {
+    let plan = BlockPlan::new(tier.n_blocks(), window)?;
+    let init = Tensor::zeros((), DType::F32, dev)?;
+    run_windowed(
+        dev,
+        &plan,
+        cancel,
+        init,
+        || Ok(()),
+        |acc, _view: &mut (), range| {
+            let blocks = materialize_sidecars(tier, sidecars, raw, dev, range)?;
+            Ok(compute_into(&blocks, 64, dev, &acc)?)
+        },
     )
 }
-
-/// An OPTIONAL env path: `None` prints a SKIP rather than panicking, so the documented
-/// `-- --ignored` invocation does not fail arms whose inputs were not supplied (the house pattern —
-/// `mlx_repack_real_weights.rs` uses `.ok()` for its optional tiers).
-fn env_path_opt(key: &str) -> Option<PathBuf> {
-    match std::env::var(key) {
-        Ok(v) => Some(PathBuf::from(v)),
-        Err(_) => {
-            println!("[sc-15791] SKIP: {key} not set");
-            None
-        }
-    }
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-/// The host's VRAM, disclosed in every report — SC-15256's closing note is that an acceptance
-/// measured as gate arithmetic on a 97.9 GB card is not evidence about an 8 GB one.
-fn disclose_host(pool: &pool::Pool) {
-    let (free, total) = pool::mem_info();
-    assert!(
-        total > 0 && free > 0,
-        "the driver reported no memory — a zeroed probe must not be allowed to satisfy the \
-         host-VRAM-disclosure requirement"
-    );
-    println!(
-        "[sc-15791] HOST: CUDA device 0 total {:.1} GiB, free now {:.1} GiB | pool used {:.1} MiB / \
-         reserved {:.1} MiB / release-threshold {} bytes",
-        total as f64 / GIB,
-        free as f64 / GIB,
-        pool.used() as f64 / MIB,
-        pool.reserved() as f64 / MIB,
-        pool.release_threshold(),
-    );
-}
-
-/// Quiesce the device and the pool, THEN reset the watermarks.
-///
-/// Order is load-bearing for `RESERVED_MEM_HIGH`. Resetting the watermark to 0 while the pool still
-/// physically holds pages makes it snap straight back to the current reserved value, so the next
-/// measurement inherits the previous one. That is not hypothetical: the first run of this sweep
-/// reported window 1's reserved peak as 3488.0 MiB — exactly the fully-resident control's figure —
-/// because the control's pages had not been returned when the reset ran.
-fn quiesce_and_reset(dev: &Device, pool: &pool::Pool) -> Result<()> {
-    dev.synchronize()?;
-    pool.trim();
-    pool.reset_high();
-    Ok(())
-}
-
-fn windows(n_blocks: usize, window: usize) -> impl Iterator<Item = Range<usize>> {
-    (0..n_blocks).step_by(window).map(move |s| {
-        let e = (s + window).min(n_blocks);
-        s..e
-    })
-}
-
-/// Least-squares fit of `peak ≈ a·window + b` over the sweep, in MiB. `b` is the per-window fixed
-/// overhead — on the production loader it is the device-side staging of the raw triple that
-/// [`materialize_host_repack`] avoids.
-fn linear_fit(points: &[(usize, f64)]) -> (f64, f64) {
-    let n = points.len() as f64;
-    let sx: f64 = points.iter().map(|(w, _)| *w as f64).sum();
-    let sy: f64 = points.iter().map(|(_, p)| *p).sum();
-    let sxx: f64 = points.iter().map(|(w, _)| (*w as f64) * (*w as f64)).sum();
-    let sxy: f64 = points.iter().map(|(w, p)| (*w as f64) * p).sum();
-    let a = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-    (a, (sy - a * sx) / n)
-}
-
-/// Median of a small sample. Every headline timing is reported as a median with its range, because a
-/// single sample of this quantity varies ~10% run to run.
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
-
-// ---------------------------------------------------------------------------------------------------
-// Q1 — cost per window, its scaling, the loader overhead, and the release-guard ablation
-// ---------------------------------------------------------------------------------------------------
 
 #[test]
 #[ignore = "needs a CUDA host with the hosted z-image q4 tier (SC15791_Q4 env)"]
@@ -491,8 +354,8 @@ fn window_sweep_cost() -> Result<()> {
     let q4 = env_path_req("SC15791_Q4");
     let repeats = env_usize("SC15791_REPEATS", 3);
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
 
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
     println!(
@@ -502,7 +365,7 @@ fn window_sweep_cost() -> Result<()> {
         tier.file_bytes as f64 / GIB,
         tier.n_tensors,
         tier.n_blocks(),
-        tier.all_block_bytes() as f64 / GIB,
+        tier.total_block_bytes() as f64 / GIB,
         tier.packed[0].len(),
         tier.dense[0].len(),
     );
@@ -619,14 +482,13 @@ fn window_sweep_cost() -> Result<()> {
     );
     println!(
         "  peak(window) ≈ {slope:.1}·w + {intercept:.1} MiB. The {intercept:.1} MiB intercept is \
-         per-window overhead, NOT block weight: it is the raw triple staged on the device by \
-         `lin` before `q4_parts` pulls it back to the host. At the {slope:.1} MiB/block slope alone \
+         fixed allocator/loader overhead, not block weight. At the {slope:.1} MiB/block slope alone \
          the reduction would be {:.1}x.",
         resident_used as f64 / MIB / slope
     );
 
-    // ── Where the time goes. The production loader vs the corrected host-repack loader — a measured
-    // floor, not an arithmetic one. Also the CPU-only leg, to separate read+repack from all transfer.
+    // ── Where the time goes. The current production loader vs its raw-mmap host-repack twin, plus
+    // the CPU-only leg to separate read+repack from all transfer.
     // All three legs run on the SAME block (0) and are interleaved, so neither page-cache state nor
     // block-to-block variation is charged to one leg. More repeats than the sweep, because the
     // quantities being differenced here are close to the noise floor.
@@ -677,7 +539,7 @@ fn window_sweep_cost() -> Result<()> {
     let block_mib = tier.bytes[0] as f64 / MIB;
     println!(
         "  host read+repack only (CPU target)  {h:8.1} ms  (spread {:.1})\n  \
-         corrected host-repack loader         {c:8.1} ms  (spread {:.1})  ⇒ one step = {:.2} s\n  \
+         raw-mmap host-repack twin            {c:8.1} ms  (spread {:.1})  ⇒ one step = {:.2} s\n  \
          production loader (`quant::lin`)     {p:8.1} ms  (spread {:.1})  ⇒ one step = {:.2} s",
         spread(&host_only),
         spread(&corrected),
@@ -688,11 +550,11 @@ fn window_sweep_cost() -> Result<()> {
     println!(
         "  ⇒ uploading the repacked {block_mib:.1} MiB block costs {:.1} ms, which is {} the \
          ±{noise:.1} ms noise floor.\n  \
-         ⇒ the production loader's wasted round trip (raw triple to the device and straight back for \
-         `q4_parts`) costs {:.1} ms/block = {:.2} s/step — real, but NOT the dominant term.\n  \
-         ⇒ **the host read+repack is {:.0}% of the corrected path.** The story's premise that \"PCIe \
+         ⇒ the production VarBuilder seam differs from the raw-mmap twin by {:.1} ms/block = {:.2} \
+         s/step; this is loader/framework overhead, not the historical device round trip.\n  \
+         ⇒ **the host read+repack is {:.0}% of the raw-mmap path.** The story's premise that \"PCIe \
          bandwidth is the analogous bound here\" is NOT supported on this backend: transfer is a \
-         rounding error next to the format conversion, and fixing the round trip alone still leaves \
+         rounding error next to the format conversion, and removing only the round trip still leaves \
          {:.2} s/step.",
         c - h,
         if (c - h).abs() < noise { "BELOW (i.e. unresolvable against)" } else { "above" },
@@ -761,8 +623,8 @@ fn overlap_prefetch() -> Result<()> {
     let tokens = env_usize("SC15791_TOKENS", 1024);
     let repeats = env_usize("SC15791_REPEATS", 3);
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = std::sync::Arc::new(Tier::open(&q4, MLX_GROUP_SIZE)?);
 
     // Warm.
@@ -804,7 +666,7 @@ fn overlap_prefetch() -> Result<()> {
         let t = Instant::now();
         type Prefetch = Result<(Vec<Block>, VarBuilder<'static>)>;
         let mut pending: Option<std::thread::JoinHandle<Prefetch>> = None;
-        let ranges: Vec<Range<usize>> = windows(tier.n_blocks(), window).collect();
+        let ranges: Vec<Range<usize>> = windows(tier.n_blocks(), window);
         let mut acc = Vec::new();
         for (i, range) in ranges.iter().enumerate() {
             let (blocks, view) = match pending.take() {
@@ -881,8 +743,8 @@ fn overlap_prefetch() -> Result<()> {
 fn release_semantics() -> Result<()> {
     let q4 = env_path_req("SC15791_Q4");
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
 
     {
@@ -894,7 +756,7 @@ fn release_semantics() -> Result<()> {
 
     println!("\n[sc-15791] Q2 — does dropping a window return the memory?");
     let threshold = pool.release_threshold();
-    let (free_before, _) = pool::mem_info();
+    let (free_before, _) = rung4_support::mem_info();
     let (used_before, reserved_before) = (pool.used(), pool.reserved());
 
     let view = tier.open_view(&dev)?;
@@ -902,21 +764,21 @@ fn release_semantics() -> Result<()> {
     let used_live_nosync = pool.used();
     dev.synchronize()?;
     let (used_live, reserved_live) = (pool.used(), pool.reserved());
-    let (free_live, _) = pool::mem_info();
+    let (free_live, _) = rung4_support::mem_info();
 
     // Drop with NO synchronize.
     drop(blocks);
     drop(view);
     let (used_drop_nosync, reserved_drop_nosync) = (pool.used(), pool.reserved());
-    let (free_drop_nosync, _) = pool::mem_info();
+    let (free_drop_nosync, _) = rung4_support::mem_info();
 
     dev.synchronize()?;
     let (used_sync, reserved_sync) = (pool.used(), pool.reserved());
-    let (free_sync, _) = pool::mem_info();
+    let (free_sync, _) = rung4_support::mem_info();
 
     // Only now the trim, with `reserved_sync` already captured so its effect is attributable.
     pool.trim();
-    let (free_trim, _) = pool::mem_info();
+    let (free_trim, _) = rung4_support::mem_info();
     let reserved_trim = pool.reserved();
 
     let block_mib = tier.bytes[0] as f64 / MIB;
@@ -1133,8 +995,8 @@ fn release_semantics() -> Result<()> {
 fn packed_quant_per_block() -> Result<()> {
     let q4 = env_path_req("SC15791_Q4");
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
     let st = tier.open_raw()?;
 
@@ -1243,12 +1105,12 @@ fn packed_quant_per_block() -> Result<()> {
 #[test]
 #[ignore = "optional: needs the hosted z-image q8 tier (SC15791_Q8 env)"]
 fn q8_tier_cost() -> Result<()> {
-    let Some(q8) = env_path_opt("SC15791_Q8") else {
+    let Some(q8) = env_opt("sc-15791", "SC15791_Q8") else {
         return Ok(());
     };
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q8, MLX_GROUP_SIZE)?;
     println!(
         "\n[sc-15791] Q8 TIER: {:.2} GiB on disk, {} blocks, {:.1} MiB/block on disk",
@@ -1299,6 +1161,369 @@ fn q8_tier_cost() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// SC-16096 — content-addressed device-format windows, before/after, host memory, and bound mutation
+// ---------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs CUDA plus SC16096_Q4 and SC16096_Q8 real packed tiers"]
+fn device_format_sidecars_before_after() -> Result<()> {
+    let repeats = env_usize("SC16096_REPEATS", 3).max(3);
+    let dev = Device::new_cuda(0)?;
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
+
+    for (label, path, bits) in [
+        ("q4", env_path_req("SC16096_Q4"), 4i32),
+        ("q8", env_path_req("SC16096_Q8"), 8i32),
+    ] {
+        let tier = Tier::open(&path, MLX_GROUP_SIZE)?;
+        let raw = tier.open_raw()?;
+        let component_dir = path.parent().expect("tier file has a component directory");
+        println!(
+            "\n[sc-16096] {label}: {} | {:.2} GiB source mmap, {} blocks, {} packed projections/block",
+            path.display(),
+            tier.file_bytes as f64 / GIB,
+            tier.n_blocks(),
+            tier.packed[0].len()
+        );
+
+        let prepare_started = Instant::now();
+        let (prepared, build_host) = host_memory::sample(|| {
+            PackedWeightSidecars::prepare(
+                &raw,
+                component_dir,
+                PackedConfig {
+                    bits,
+                    group_size: MLX_GROUP_SIZE as i32,
+                },
+                &dev,
+            )
+        });
+        let sidecars = prepared?;
+        dev.synchronize()?;
+        println!(
+            "  prepare once: {:.3} s | created {} reused {} | source hashed {:.1} MiB | \
+             sidecars {:.1} MiB | host working-set peak Δ {:.1} MiB, private-commit peak Δ {:.1} \
+             MiB (end Δ {:.1}/{:.1} MiB)",
+            prepare_started.elapsed().as_secs_f64(),
+            sidecars.created_count(),
+            sidecars.reused_count(),
+            sidecars.source_bytes_hashed() as f64 / MIB,
+            sidecars.sidecar_bytes() as f64 / MIB,
+            build_host
+                .working_set_peak
+                .saturating_sub(build_host.working_set_start) as f64
+                / MIB,
+            build_host
+                .private_peak
+                .saturating_sub(build_host.private_start) as f64
+                / MIB,
+            build_host
+                .working_set_end
+                .saturating_sub(build_host.working_set_start) as f64
+                / MIB,
+            build_host
+                .private_end
+                .saturating_sub(build_host.private_start) as f64
+                / MIB,
+        );
+
+        // Every projection in one real block must preserve the exact GGML bytes produced by the old
+        // CUDA-target conversion. Q8 is especially important: its target-device quantizer, not a CPU
+        // approximation, defines the pre-change bytes.
+        let mut checked_bytes = 0usize;
+        let mut checked_outputs = 0usize;
+        for base in &tier.packed[0] {
+            let (_, in_dim) = tier.dims[base];
+            let wq = raw.load(&format!("{base}.weight"), &dev)?;
+            let scales = raw
+                .load(&format!("{base}.scales"), &dev)?
+                .to_dtype(DType::F32)?;
+            let biases = raw
+                .load(&format!("{base}.biases"), &dev)?
+                .to_dtype(DType::F32)?;
+            let old = repack_packed_weight(&wq, &scales, &biases, MLX_GROUP_SIZE, &dev)?;
+            let new = sidecars.load(base, &dev)?;
+            let old_bytes = old.data()?.into_owned();
+            let new_bytes = new.data()?.into_owned();
+            assert_eq!(
+                old_bytes, new_bytes,
+                "{label} {base}: sidecar bytes differ from the pre-change CUDA path"
+            );
+            checked_bytes += old_bytes.len();
+
+            // Drive the exact shared QLinear compute seam used by Krea on both weights. Unchanged
+            // bytes alone already imply an unchanged forward, but this makes that implication an
+            // executable real-CUDA output assertion for every projection in the sampled block.
+            let input = Tensor::ones((1, in_dim), DType::F32, &dev)?;
+            let old_output = QLinear::from_qtensor_dequant(Arc::new(old), None).forward(&input)?;
+            let new_output = QLinear::from_qtensor_dequant(Arc::new(new), None).forward(&input)?;
+            assert_eq!(
+                old_output.to_device(&Device::Cpu)?.to_vec2::<f32>()?,
+                new_output.to_device(&Device::Cpu)?.to_vec2::<f32>()?,
+                "{label} {base}: sidecar-backed QLinear output differs from pre-change"
+            );
+            checked_outputs += 1;
+        }
+        println!(
+            "  parity: {} real projections / {:.1} MiB and {} real QLinear CUDA forwards are \
+             BIT-EXACT to pre-change",
+            tier.packed[0].len(),
+            checked_bytes as f64 / MIB,
+            checked_outputs,
+        );
+
+        let measure =
+            |after: bool, range: Range<usize>| -> Result<(f64, u64, u64, host_memory::Peak)> {
+                quiesce_and_reset(&dev, &pool)?;
+                let base = pool.used();
+                let started = Instant::now();
+                let (materialized, host) = host_memory::sample(|| {
+                    if after {
+                        materialize_sidecars(&tier, &sidecars, &raw, &dev, range)
+                    } else {
+                        materialize_prechange(&tier, &raw, &dev, range)
+                    }
+                });
+                let blocks = materialized?;
+                dev.synchronize()?;
+                let elapsed = started.elapsed().as_secs_f64();
+                let used = pool.used_high().saturating_sub(base);
+                let reserved = pool.reserved_high();
+                drop(blocks);
+                dev.synchronize()?;
+                pool.trim();
+                Ok((elapsed, used, reserved, host))
+            };
+
+        for (name, after) in [("before", false), ("after", true)] {
+            let mut times = Vec::with_capacity(repeats);
+            let mut vram_peak = 0u64;
+            let mut host_ws_peak = 0u64;
+            let mut host_private_peak = 0u64;
+            let mut host_ws_end = 0u64;
+            let mut host_private_end = 0u64;
+            for _ in 0..repeats {
+                let (secs, used, _, host) = measure(after, 0..1)?;
+                times.push(secs);
+                vram_peak = vram_peak.max(used);
+                host_ws_peak =
+                    host_ws_peak.max(host.working_set_peak.saturating_sub(host.working_set_start));
+                host_private_peak =
+                    host_private_peak.max(host.private_peak.saturating_sub(host.private_start));
+                host_ws_end =
+                    host_ws_end.max(host.working_set_end.saturating_sub(host.working_set_start));
+                host_private_end =
+                    host_private_end.max(host.private_end.saturating_sub(host.private_start));
+            }
+            let med = median(times.clone());
+            let lo = times.iter().copied().fold(f64::MAX, f64::min);
+            let hi = times.iter().copied().fold(0.0, f64::max);
+            println!(
+                "  {name:>6} window-1: median {med:.4} s/block, spread {lo:.4}-{hi:.4} s | \
+                 VRAM live peak {:.1} MiB | host WS/private peak Δ {:.1}/{:.1} MiB, end Δ \
+                 {:.1}/{:.1} MiB",
+                vram_peak as f64 / MIB,
+                host_ws_peak as f64 / MIB,
+                host_private_peak as f64 / MIB,
+                host_ws_end as f64 / MIB,
+                host_private_end as f64 / MIB,
+            );
+        }
+
+        // Peak-by-window remeasurement. Mutating only the window width must raise the live CUDA
+        // peak; otherwise the purported bound is decorative rather than load-bearing.
+        let mut bound = Vec::new();
+        for window in [1usize, 2, 4] {
+            let width = window.min(tier.n_blocks());
+            let (secs, used, reserved, host) = measure(true, 0..width)?;
+            let mapped_peak = tier.packed[0]
+                .iter()
+                .filter_map(|base| sidecars.path_for(base))
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .max()
+                .unwrap_or(0);
+            println!(
+                "  bound mutation window {width}: {secs:.4} s | live {:.1} MiB, reserved {:.1} MiB | \
+                 host WS/private peak Δ {:.1}/{:.1} MiB | at most one {:.1} MiB sidecar mapping \
+                 held (file-backed/reclaimable; 0 retained after transfer)",
+                used as f64 / MIB,
+                reserved as f64 / MIB,
+                host.working_set_peak.saturating_sub(host.working_set_start) as f64 / MIB,
+                host.private_peak.saturating_sub(host.private_start) as f64 / MIB,
+                mapped_peak as f64 / MIB,
+            );
+            bound.push((width, used));
+        }
+        for pair in bound.windows(2) {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "{label}: mutating window {} -> {} did not increase the live CUDA peak ({} -> {})",
+                pair[0].0,
+                pair[1].0,
+                pair[0].1,
+                pair[1].1
+            );
+        }
+    }
+    Ok(())
+}
+
+/// **SC-16154: time by window after SC-16096 removed per-window format conversion.**
+///
+/// This is intentionally separate from `window_sweep_cost` (pre-sidecar) and SC-15792's
+/// `window_peak_sweep_is_linear_and_output_is_identical` (one ascending sample whose own docs say it
+/// is not timing evidence). Sidecar preparation happens once, before the clock. A full warm-up step
+/// faults the artifacts and loads the CUDA kernels before sampling.
+///
+/// Samples are interleaved in a position-balanced Latin-square order: over each six-round block
+/// every window occupies every measurement position once; the next block reverses the base direction
+/// so a monotonic within-round drift does not always favour the same neighbouring window. Reporting
+/// a grouped ascending sweep here would reintroduce the exact cold first-row/order confound this
+/// story exists to remove.
+#[test]
+#[ignore = "needs CUDA plus SC16154_Q4 real packed tier"]
+fn device_format_window_time_interleaved() -> candle_gen::Result<()> {
+    const WINDOWS: [usize; 6] = [1, 2, 4, 8, 15, 30];
+
+    let path = env_path_req("SC16154_Q4");
+    let rounds = env_usize("SC16154_REPEATS", 12);
+    assert_eq!(
+        rounds, 12,
+        "SC16154_REPEATS must be 12: the reported 95% t intervals use 11 degrees of freedom"
+    );
+    let dev = Device::new_cuda(0)?;
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-16154", &pool);
+
+    let tier = Tier::open(&path, MLX_GROUP_SIZE)?;
+    assert_eq!(
+        tier.n_blocks(),
+        *WINDOWS.last().expect("the resident window"),
+        "SC-16154's balanced order is pinned to the 30-block calibration tier"
+    );
+    let raw = tier.open_raw()?;
+    let component_dir = path.parent().expect("tier file has a component directory");
+    let prepare_started = Instant::now();
+    let sidecars = PackedWeightSidecars::prepare(
+        &raw,
+        component_dir,
+        PackedConfig {
+            bits: 4,
+            group_size: MLX_GROUP_SIZE as i32,
+        },
+        &dev,
+    )?;
+    dev.synchronize()?;
+    println!(
+        "\n[sc-16154] TIER {}: {:.2} GiB, {} blocks, sidecars created {} / reused {} in {:.3} s \
+         (EXCLUDED from per-step timing)",
+        path.display(),
+        tier.file_bytes as f64 / GIB,
+        tier.n_blocks(),
+        sidecars.created_count(),
+        sidecars.reused_count(),
+        prepare_started.elapsed().as_secs_f64(),
+    );
+    let cancel = CancelFlag::default();
+    quiesce_and_reset(&dev, &pool)?;
+    let warm = sidecar_windowed_step(&tier, &sidecars, &raw, &dev, 30, &cancel)?;
+    let reference = warm.to_scalar::<f32>()?;
+    println!("[sc-16154] warm-up complete; balanced interleaved sampling begins");
+
+    let mut samples = vec![Vec::<f64>::with_capacity(rounds); WINDOWS.len()];
+    for round in 0..rounds {
+        let mut order = WINDOWS;
+        if (round / WINDOWS.len()).is_multiple_of(2) {
+            order.rotate_left(round % WINDOWS.len());
+        } else {
+            order.reverse();
+            order.rotate_left(round % WINDOWS.len());
+        }
+        println!("[sc-16154] round {}/{} order {order:?}", round + 1, rounds);
+        for window in order {
+            quiesce_and_reset(&dev, &pool)?;
+            let started = Instant::now();
+            let value = sidecar_windowed_step(&tier, &sidecars, &raw, &dev, window, &cancel)?
+                .to_scalar::<f32>()?;
+            let secs = started.elapsed().as_secs_f64();
+            assert_eq!(
+                value, reference,
+                "window {window} changed the arithmetic: {value} vs {reference}"
+            );
+            let index = WINDOWS
+                .iter()
+                .position(|candidate| *candidate == window)
+                .expect("sampled a declared window");
+            samples[index].push(secs);
+            println!("[sc-16154]   window {window:>2}: {secs:.4} s");
+        }
+    }
+
+    println!(
+        "\n[sc-16154] POST-SIDECAR TIME — medians of {rounds} position-balanced interleaved samples; \
+         spread is full min-max"
+    );
+    println!("  window  median s       range s     spread s   spread %   vs w1");
+    let mut medians = Vec::with_capacity(WINDOWS.len());
+    for (window, values) in WINDOWS.into_iter().zip(samples.iter()) {
+        let mut sorted = values.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+        let median = if sorted.len().is_multiple_of(2) {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
+        let lo = sorted[0];
+        let hi = *sorted.last().expect("at least one timing");
+        medians.push((window, median));
+        let w1 = medians[0].1;
+        println!(
+            "  {window:>6}  {median:>8.4}  {lo:>7.4}-{hi:<7.4}  {:>8.4}  {:>8.2}%  {:>7.3}x",
+            hi - lo,
+            (hi - lo) * 100.0 / median,
+            median / w1,
+        );
+    }
+
+    let (slope, intercept) = linear_fit(&medians);
+    println!(
+        "[sc-16154] median-time fit = {slope:.6} s/window + {intercept:.4} s; \
+         memory remains peak(w) ≈ 107.9·w + 153.4 MiB (SC-15792)"
+    );
+
+    println!(
+        "[sc-16154] PAIRED WITHIN-ROUND DELTAS VS WINDOW 1 — mean and two-sided 95% t interval"
+    );
+    println!("  window  mean delta s          95% CI s   positive rounds");
+    for (window, values) in WINDOWS.into_iter().zip(samples.iter()).skip(1) {
+        let deltas = values
+            .iter()
+            .zip(&samples[0])
+            .map(|(sample, baseline)| sample - baseline)
+            .collect::<Vec<_>>();
+        let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+        let variance = deltas
+            .iter()
+            .map(|delta| (delta - mean).powi(2))
+            .sum::<f64>()
+            / (deltas.len() - 1) as f64;
+        // Student's t critical value for a two-sided 95% interval with 11 degrees of freedom.
+        let critical = 2.201;
+        let margin = critical * (variance / deltas.len() as f64).sqrt();
+        let positive = deltas.iter().filter(|delta| **delta > 0.0).count();
+        println!(
+            "  {window:>6}  {mean:>12.4}  {lo:>7.4}-{hi:<7.4}  {positive:>2}/{total:<2}",
+            lo = mean - margin,
+            hi = mean + margin,
+            total = deltas.len(),
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
 // The small-card disclosure
 // ---------------------------------------------------------------------------------------------------
 
@@ -1324,8 +1549,8 @@ fn constrained_budget_sweep() -> Result<()> {
         return Ok(());
     }
     let dev = Device::new_cuda(0)?;
-    let pool = pool::Pool::open(0).expect("default mempool");
-    disclose_host(&pool);
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-15791", &pool);
     let tier = Tier::open(&q4, MLX_GROUP_SIZE)?;
 
     // window 30 == one all-covering window == the resident path, through the same code, so the
@@ -1369,7 +1594,7 @@ fn constrained_budget_sweep() -> Result<()> {
     let mut balloon: Vec<Tensor> = Vec::new();
     let chunk_elems = 256usize * 1024 * 1024; // 1 GiB of f32
     loop {
-        let (free, _) = pool::mem_info();
+        let (free, _) = rung4_support::mem_info();
         if free as f64 / GIB <= target_free as f64 {
             break;
         }
@@ -1379,7 +1604,7 @@ fn constrained_budget_sweep() -> Result<()> {
         }
         dev.synchronize()?;
     }
-    let (free_under, total) = pool::mem_info();
+    let (free_under, total) = rung4_support::mem_info();
     let achieved = free_under as f64 / GIB;
     println!(
         "\n[sc-15791] CONSTRAINED: {} GiB balloon; driver free now {achieved:.2} GiB of {:.1} GiB \

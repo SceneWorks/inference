@@ -16,7 +16,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    ModelDescriptor, Quant, SizeFloor,
 };
 
 pub const SD3_5_LARGE_ID: &str = "sd3_5_large";
@@ -264,6 +264,7 @@ impl Sd3Variant {
                 audio_voices: vec![],
                 audio_languages: vec![],
                 audio_edit_modes: vec![],
+                size_floor: SizeFloor::RangeChecked,
             },
         }
     }

@@ -5,11 +5,10 @@
 //! Krea ships a **pre-quantized** MLX tier (`SceneWorks/krea-2-turbo-mlx`, bf16/q4/q8) whose q4/q8
 //! snapshots store each quantized `Linear` as the MLX packed triple `{base}.weight` (u32 codes) +
 //! `{base}.scales` + `{base}.biases`. The group size is read from each component `config.json`'s
-//! `quantization.group_size` ([`candle_gen::quant::PackedConfig`]) and threaded through the shared
-//! group-size-aware loaders ([`candle_gen::quant::QLinear::from_packed_gs`] /
-//! `QEmbedding::from_packed_dtype_gs`, Q4 → `Q4_1` lossless repack, Q8 → `Q8_0`) — **not** a hardcoded
-//! 64 (the hosted tier happens to pack at 64, but the loader honours whatever the config says, exactly
-//! as boogu threads its group 32). **No dense bf16 weight is ever materialized** on the packed path.
+//! `quantization.group_size` ([`candle_gen::quant::PackedConfig`]). Component open prepares
+//! content-addressed GGML sidecars (Q4 → `Q4_1` lossless repack, Q8 → `Q8_0`) using that group size;
+//! module construction maps the sidecar and transfers its bytes without re-reading or converting the
+//! affine triple. **No dense bf16 weight is ever materialized** on the packed path.
 //!
 //! Absent `.scales` (a dense bf16 tier, or a projection MLX left dense) the **dense** path is taken
 //! **unchanged** (`candle_nn::Linear` / `Embedding` from `{base}.weight`), so one crate serves both a
@@ -17,7 +16,7 @@
 //!
 //! Krea's loader is a thin `MmapedSafetensors` wrapper ([`crate::loader::Weights`]) with an
 //! adapter-merge **overlay** (`set_overlay`, sc-7836), not a `VarBuilder` — so this seam builds the
-//! quantized module from **raw tensors** pulled through `Weights` (`from_packed_gs`) rather than the
+//! quantized module from a device-format [`QTensor`] supplied by `Weights` rather than the
 //! VarBuilder-detecting `candle_gen::quant::lin`. The compute path is identical (the shared
 //! dequant-on-forward `QLinear`/`QEmbedding`, sc-7702 — *not* candle's int8 `QMatMul` fast path, whose
 //! q8_1 activation quant NaNs on outlier text features).
@@ -30,6 +29,7 @@
 //! untargeted projections, while an adapted projection resolves to its correct merged dense weight —
 //! there is no packed `quantize_onto` to no-op here (that is the VarBuilder crates' seam).
 
+use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
 use candle_gen::quant::{self as shared, AdaptLinear, Int8Context};
@@ -183,6 +183,22 @@ impl QLinear {
             (sd[0], sd[1] * group_size)
         };
         let q = shared::QLinear::from_packed_gs(wq, scales, biases, bias, group_size, &device)?;
+        Ok(Self::Adapt(AdaptLinear::from_packed(q, in_dim, out_dim)))
+    }
+
+    /// Build a packed projection from an already-converted GGML `QTensor` loaded from the
+    /// content-addressed sidecar cache (SC-16096). Unlike [`Self::packed`], this accepts no MLX
+    /// affine triple and therefore cannot repeat format conversion inside a block-window loop.
+    pub fn packed_device_format(qtensor: QTensor, bias: Option<Tensor>) -> Result<Self> {
+        let dims = qtensor.shape().dims();
+        if dims.len() != 2 {
+            candle_gen::candle_core::bail!(
+                "Krea packed device-format projection must be rank 2, got {:?}",
+                qtensor.shape()
+            );
+        }
+        let (out_dim, in_dim) = (dims[0], dims[1]);
+        let q = shared::QLinear::from_qtensor_dequant(std::sync::Arc::new(qtensor), bias);
         Ok(Self::Adapt(AdaptLinear::from_packed(q, in_dim, out_dim)))
     }
 
@@ -382,6 +398,13 @@ impl QEmbedding {
         let device = wq.device().clone();
         Ok(Self::Packed(shared::QEmbedding::from_packed_dtype_gs(
             wq, scales, biases, &device, out_dtype, group_size,
+        )?))
+    }
+
+    /// Build from already-device-format bytes loaded through the file-backed sidecar cache.
+    pub fn packed_device_format(qtensor: QTensor, out_dtype: DType) -> Result<Self> {
+        Ok(Self::Packed(shared::QEmbedding::from_qtensor(
+            qtensor, out_dtype,
         )?))
     }
 

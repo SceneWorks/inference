@@ -112,7 +112,7 @@ use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
-    Progress, Quant, WeightsSource,
+    Progress, Quant, SizeFloor, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -315,11 +315,12 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         block_count: u32,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if block_count == 1 {
+        if SUPPORTED_TRANSFORMER_WINDOWS.contains(&block_count) {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "krea_2_turbo: transformer residency window is fixed at one block, got {block_count}"
+                "krea_2_turbo: transformer residency window is fixed at \
+                 {SUPPORTED_TRANSFORMER_WINDOWS:?}, got {block_count}"
             )))
         }
     }
@@ -363,16 +364,52 @@ fn krea_generation_memory(
     if selection.strategy == MemoryStrategy::Resident {
         return None;
     }
+    let stream_transformer_blocks = contract.engages(
+        selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    );
     Some(gen_core::GenerationMemory {
         tile_vae_decode: contract.engages(selection.strategy, MemoryStrategy::BoundedDecode),
         chunk_attention: contract.engages(selection.strategy, MemoryStrategy::BoundedAttention),
-        stream_transformer_blocks: contract.engages(
-            selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ),
+        stream_transformer_blocks,
+        // SC-15792: carry the SELECTED window through, rather than dropping it and letting the
+        // pipeline fall back to the provider default. Leaving it at `None` made the executed window
+        // independent of the chosen one — so calibration evidence recorded against a selection would
+        // have described a run that never happened. Only forwarded when the rung is actually
+        // engaged, so a selection that does not stream blocks stays byte-for-byte as before.
+        transformer_window_size: stream_transformer_blocks
+            .then_some(selection.parameters.transformer_window_size)
+            .flatten(),
         ..Default::default()
     })
 }
+
+/// The rung-4 windows this provider will execute — the same list
+/// `krea_turbo_memory_strategy_contract` publishes as `transformer_window_sizes`.
+///
+/// One entry, deliberately. SC-16154 re-measured the post-SC-16096 sidecar path on CUDA with 12
+/// balanced interleaved samples per window (95.6 GiB RTX PRO 6000 Blackwell, device 0):
+///
+/// | window | median step | full min–max spread | paired mean delta vs 1 (95% CI) |
+/// |---:|---:|---:|---:|
+/// | 1 | 2.0423 s | 1.6311–2.3491 s | reference |
+/// | 2 | 2.0027 s | 1.6234–2.4844 s | +0.0416 s (-0.0984–+0.1817) |
+/// | 4 | 1.9914 s | 1.6957–2.4211 s | -0.0091 s (-0.1403–+0.1222) |
+/// | 8 | 1.8468 s | 1.7265–2.2018 s | -0.0651 s (-0.2120–+0.0818) |
+/// | 15 | 1.9286 s | 1.7662–2.4683 s | +0.0193 s (-0.1461–+0.1847) |
+/// | 30 | 2.0813 s | 1.7697–2.6964 s | +0.1911 s (+0.0298–+0.3524) |
+///
+/// Paired time is flat through window 15 (every interval includes zero) and increasing at window 30
+/// (+191 ms, interval excludes zero); the median-time fit is +2.0 ms/block. Even window 8's apparent
+/// -9.6% median is unresolved by its paired interval. Peak is linear at
+/// `107.9·window + 153.4 MiB`, so no wider window buys a demonstrated speedup while every one spends
+/// more VRAM. Rung 4 is selected only for a caller already short of VRAM; publish only the
+/// minimum-peak window. See
+/// [`crate::transformer::DEFAULT_TRANSFORMER_WINDOW`].
+///
+/// NOT cfg-gated, unlike the contract that publishes it: `generate` re-validates the window on every
+/// build, and the streamed trunk itself is not cuda-only (it runs on CPU in the parity tests).
+const SUPPORTED_TRANSFORMER_WINDOWS: &[u32] = &[1];
 
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
@@ -487,7 +524,7 @@ impl Generator for KreaGenerator {
         };
         let reference = img2img_reference(req);
 
-        if req.memory.is_some() {
+        if let Some(memory) = req.memory.as_ref() {
             if self.descriptor.id != KREA_2_TURBO_ID
                 || self.offload_policy != OffloadPolicy::Sequential
                 || reference.is_some()
@@ -499,6 +536,21 @@ impl Generator for KreaGenerator {
                      native-VAE, ordinary Turbo text-to-image requests",
                     self.descriptor.id
                 )));
+            }
+            // SC-15792: re-validate the rung-4 window here, not only in `MemoryRequestScope`.
+            // `materialize_transformer_window` guards the calibration lifecycle, but this arm is
+            // reachable with a hand-built `GenerationMemory` that never opens a scope — and since
+            // the window is now genuinely honoured, an out-of-domain value would execute a schedule
+            // the provider never declared. gen-core's rule for these fields is that an unsupported
+            // value is "a typed rejection rather than a silently different execution than the
+            // selector chose"; before the window was plumbed the same request silently ran 1.
+            if let Some(window) = memory.transformer_window_size {
+                if !SUPPORTED_TRANSFORMER_WINDOWS.contains(&window) {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: transformer residency window is fixed at {:?}, got {window}",
+                        self.descriptor.id, SUPPORTED_TRANSFORMER_WINDOWS
+                    )));
+                }
             }
             let images = pipeline::render_three_stage(
                 &self.root,
@@ -742,6 +794,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -1182,10 +1235,11 @@ candle_gen::register_generators! {
 #[cfg(any(feature = "cuda", test))]
 fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContract {
     use gen_core::{
-        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
-        MemoryStrategySupport,
+        MemoryPrerequisiteScope, MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy,
+        MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
+        MemoryWindowMaterialization,
     };
 
     MemoryProviderContract {
@@ -1194,6 +1248,10 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             device_residency: true,
             host_backed_weights: true,
             host_to_device_block_materialization: true,
+            // SC-16096: component open content-addresses each MLX affine source triple and prepares a
+            // GGML q4/q8 sidecar once. Each streamed window maps that artifact and transfers its bytes
+            // directly to CUDA; there is no per-window conversion or device-to-host round trip.
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies: MemoryStrategy::ALL
             .into_iter()
@@ -1213,7 +1271,10 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                         ..Default::default()
                     },
                     MemoryStrategy::BoundedTransformerResidency => MemoryParameterRanges {
-                        transformer_window_sizes: vec![1],
+                        // One source for what this provider publishes, what its request scope
+                        // accepts, and what `generate` re-validates — three sites that were three
+                        // independent literals before SC-15792 and would have drifted silently.
+                        transformer_window_sizes: SUPPORTED_TRANSFORMER_WINDOWS.to_vec(),
                         ..Default::default()
                     },
                     MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
@@ -1222,6 +1283,17 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                 },
             })
             .collect(),
+        load_shape: LoadShape::DeferredMaterialization,
+        // Candle Krea's current streamed-block realization lives inside its three-stage loader.
+        // This additive edge records that backend coupling without making phase release a shared
+        // rung-4 prerequisite; MLX therefore remains free to use Resident+Deferred.
+        additional_prerequisites: vec![(
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        )],
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1436,6 +1508,18 @@ mod tests {
             tier,
         };
         let contract = krea_turbo_memory_strategy_contract();
+        assert!(
+            !gen_core::MemoryStrategy::BoundedTransformerResidency
+                .engages(gen_core::MemoryStrategy::StagedResidency),
+            "the shared rung-4 contract must not imply phase release"
+        );
+        assert!(
+            contract.engages(
+                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategy::StagedResidency
+            ),
+            "Krea's additive backend prerequisite must preserve its current three-stage coupling"
+        );
 
         assert_eq!(
             krea_generation_memory(contract, selected(gen_core::MemoryStrategy::Resident)),
@@ -1475,8 +1559,88 @@ mod tests {
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                // SC-15792: the SELECTED window travels with the selection. Pinned as a non-default
+                // value on purpose — `None` is `GenerationMemory::default()`, so asserting it would
+                // pass with the propagation deleted, which is exactly how the field came to be
+                // dropped on the floor in the first place.
+                transformer_window_size: Some(1),
                 ..Default::default()
             })
+        );
+    }
+
+    /// **SC-15792 — the selected window must be the executed one.**
+    ///
+    /// `krea_generation_memory` used to build its `GenerationMemory` with `..Default::default()`,
+    /// which silently discarded `transformer_window_size`: the pipeline then fell back to the
+    /// provider constant no matter what the selector chose. That is invisible while the constant and
+    /// the only published candidate are both 1 — so this drives a window the provider does NOT
+    /// publish, which the shipped path can never produce, and asserts it survives the mapping.
+    ///
+    /// The companion half is that such a value is REJECTED at the request boundary rather than
+    /// executed; `generate` checks it against `SUPPORTED_TRANSFORMER_WINDOWS`.
+    #[test]
+    fn the_selected_transformer_window_travels_to_the_request() {
+        use gen_core::MemoryStrategy;
+
+        let contract = krea_turbo_memory_strategy_contract();
+        let select = |strategy, window| {
+            krea_generation_memory(
+                contract,
+                gen_core::MemorySelection {
+                    strategy,
+                    parameters: gen_core::MemoryStrategyParameters {
+                        transformer_window_size: window,
+                        ..Default::default()
+                    },
+                    tier: gen_core::MemoryNumericTier {
+                        precision: gen_core::Precision::Bf16,
+                        quant: Some(Quant::Q4),
+                    },
+                },
+            )
+        };
+
+        // A window the provider does not publish still arrives intact — the mapping's job is to
+        // carry the selection faithfully, and rejecting it is `generate`'s job, not this one's.
+        let engaged = select(MemoryStrategy::BoundedTransformerResidency, Some(4))
+            .expect("rung 4 maps to a per-generation memory block");
+        assert!(engaged.stream_transformer_blocks);
+        assert_eq!(
+            engaged.transformer_window_size,
+            Some(4),
+            "the selected window was dropped; the pipeline would silently run the provider default"
+        );
+
+        // A rung that does not stream blocks must not carry a window: it would be a parameter for a
+        // lever that is off, and the pipeline reads the field without re-checking the flag.
+        let shallower = select(MemoryStrategy::BoundedAttention, Some(4))
+            .expect("rung 3 maps to a per-generation memory block");
+        assert!(!shallower.stream_transformer_blocks);
+        assert_eq!(shallower.transformer_window_size, None);
+    }
+
+    /// The three places this provider states its rung-4 window — what it publishes, what its request
+    /// scope accepts, and what `generate` re-validates — must agree. They were three independent
+    /// literals before SC-15792.
+    #[test]
+    fn the_published_window_candidates_are_the_ones_the_scope_accepts() {
+        let contract = krea_turbo_memory_strategy_contract();
+        let published = contract
+            .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung 4 is declared")
+            .parameters
+            .transformer_window_sizes
+            .clone();
+        assert_eq!(published, SUPPORTED_TRANSFORMER_WINDOWS.to_vec());
+        assert!(
+            !published.is_empty(),
+            "an empty candidate list would make every window unsupported and rung 4 unselectable"
+        );
+        assert!(
+            SUPPORTED_TRANSFORMER_WINDOWS
+                .contains(&(crate::transformer::DEFAULT_TRANSFORMER_WINDOW as u32)),
+            "the shipped default must be one of the windows the contract publishes"
         );
     }
 
@@ -1522,6 +1686,39 @@ mod tests {
         // ...while the rungs the provider DOES declare stay on, so this is not a vacuous all-false.
         assert!(memory.chunk_attention);
         assert!(memory.stream_transformer_blocks);
+    }
+
+    /// **SC-16090/SC-16096.** The shipped contract must be conformance-clean, asserted here rather than only in
+    /// gen-core's own tests, because `conformance_errors` has no caller in this repo: the consumer is
+    /// SceneWorks' selector, which bails on ANY non-empty result and drops this provider to
+    /// resident-only gating. The assertion also pins SC-16096's device-format transfer declaration.
+    #[test]
+    fn the_shipped_contract_is_conformance_clean_and_declares_its_window_realization() {
+        use gen_core::{MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization};
+
+        let contract = build_krea_turbo_memory_strategy_contract();
+        assert_eq!(
+            contract.conformance_errors(),
+            Vec::<String>::new(),
+            "the shipped Krea contract must be conformance-clean; a non-empty result makes the \
+             shared selector drop every rung, not just rung 4"
+        );
+
+        // Rung 4 is declared Implemented, so the window-realization rule is genuinely engaged above
+        // rather than passing because nothing streams.
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        ));
+
+        assert_eq!(
+            contract.window_materialization(),
+            Some(&MemoryWindowMaterialization::DeviceFormatTransfer),
+            "Krea's streamed trunk maps a content-addressed GGML sidecar and transfers those bytes; \
+             the shipped contract must not retain the transitional conversion escape hatch"
+        );
     }
 
     #[test]

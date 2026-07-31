@@ -7,7 +7,7 @@
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Residency, Result,
+    Progress, Quant, Residency, Result, SizeFloor,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
@@ -73,6 +73,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

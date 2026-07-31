@@ -53,7 +53,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     self, AdapterKind, AdapterSpec, AudioTrack, Capabilities, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress, Quant,
-    WeightsSource,
+    SizeFloor, WeightsSource,
 };
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
@@ -500,6 +500,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

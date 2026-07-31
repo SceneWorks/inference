@@ -421,6 +421,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "float8",
+ "fs2",
  "half",
  "image",
  "rand",
