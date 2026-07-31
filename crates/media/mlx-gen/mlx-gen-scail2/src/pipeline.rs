@@ -223,15 +223,17 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
 ///
 /// # Where this still differs from candle
 ///
-/// Not full parity, and the gap is in this lane's favour rather than against it. `reject_over_area_dims`
-/// measures the **lattice-aligned** geometry — what actually renders — while `candle-gen-scail2`
-/// measures `req.width * req.height` raw. So a request between the two, e.g. `1280x730` (934 400 raw,
-/// 901 120 once `730` floors to `704`), is refused by candle and accepted here. Accepting it is the
-/// correct reading: candle refuses a request it would then render at a legal size, and this matches
-/// `mlx-gen-wan`'s own `over_area_is_judged_on_the_aligned_geometry`. Bringing candle onto the aligned
-/// geometry is sc-16197.
+/// The **area** halves now agree: both measure the lattice-aligned geometry — what actually renders.
+/// candle used to measure `req.width * req.height` raw, so a request between the two, e.g. `1280x730`
+/// (934 400 raw, 901 120 once `730` floors to `704`), was refused there and accepted here; sc-16197
+/// moved `candle-gen-scail2`'s `reject_over_area` onto its own `align`, the reading `mlx-gen-wan`
+/// settled for the family in `over_area_is_judged_on_the_aligned_geometry`. The two alignments still
+/// differ *below* one lattice step — [`align_dim`](mlx_gen_wan::pipeline::align_dim) floors a sub-32
+/// edge to `0` where candle's `align` carries a min-one-tile floor and raises it to `32` — but each
+/// backend's range check refuses such an edge before the area is ever compared, so no request can
+/// observe it.
 ///
-/// The backends also still disagree about the **sentinel itself**, which this story does not change:
+/// The backends do still disagree about the **sentinel itself**, which neither story changes:
 /// candle declares `SizeFloor::RangeChecked` and so refuses `0x0` at `validate`, leaving its own
 /// resolve-from-the-clip branch unreachable dead code (sc-16199).
 ///
