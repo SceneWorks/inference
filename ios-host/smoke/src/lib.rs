@@ -976,8 +976,8 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     };
 
     use runtime_ios::gen_core::{
-        GenerationOutput, GenerationRequest, LoadSpec as GenLoadSpec, OffloadPolicy, Progress,
-        WeightsSource,
+        GenerationMemory, GenerationOutput, GenerationRequest, LoadSpec as GenLoadSpec,
+        OffloadPolicy, Progress, WeightsSource,
     };
 
     /// The base (non-Sprint) SANA id. Pinned as a literal on purpose: if the catalog ever stops
@@ -1067,15 +1067,22 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 
     let mut details: Vec<String> = Vec::new();
     for &(label, edge, tile, stage_eval) in configs {
-        // ALWAYS set it explicitly; `0` is the provider's "no tiling" control.
+        // The env var is now used for ONE thing: forcing whole-image.
         //
-        // This used to `remove_var` for the untiled case, which silently stopped meaning
-        // whole-image the moment SANA made tiling the default under `Sequential`: an unset variable
-        // now selects the provider default, so a config labelled UNTILED tiled anyway and reported
-        // 2566 MiB — a number that would have exonerated the untiled decode on the strength of a
-        // run that never performed one. Leaving the variable unset is no longer a way to express
-        // anything; only `0` is.
-        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", tile.unwrap_or(0).to_string());
+        // Tiled configurations ask through the contract (`GenerationMemory::tile_vae_decode`, set on
+        // the request below), so the env var must be CLEARED for them — it outranks the request by
+        // design, and leaving it set would mean the contract path never actually ran while the
+        // report claimed a tiled render.
+        //
+        // `0` stays, because it remains the only way to express whole-image under `Sequential`:
+        // absence of a request signal selects the provider's Sequential default, which tiles. That
+        // is the same trap as before, inverted — this used to `remove_var` for the untiled case,
+        // which stopped meaning whole-image the moment tiling became the Sequential default, and a
+        // config labelled UNTILED tiled anyway and reported 2566 MiB.
+        match tile {
+            Some(0) | None => std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0"),
+            Some(_) => std::env::remove_var("MLX_GEN_SANA_DECODE_TILE"),
+        }
         // Serialize the decoder's stages: a GPU sync after each, so their transients cannot be
         // live together. Costs a sync per stage and changes no arithmetic.
         if stage_eval {
@@ -1110,6 +1117,15 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 .load(SANA_ID, &spec)
                 .map_err(|e| format!("{label}: load failed: {e}"))?;
 
+            // Tiling asked for through the CONTRACT, not the env var.
+            //
+            // SANA now honours `GenerationMemory::tile_vae_decode` (the rung-2 signal) — until
+            // today it did not, silently, so a caller could set the field and still get the
+            // whole-image decode that was measured at 9177 MiB and jetsam-killed on device. Driving
+            // the harness through the contract is what makes that path exercised on real hardware
+            // rather than only unit-tested, and it is how a product would ask.
+            //
+            // `None` is the untiled control: absence of the signal, rather than a magic `0`.
             let request = GenerationRequest {
                 prompt: "a lighthouse on a rocky coast at dawn".to_string(),
                 width: edge,
@@ -1117,8 +1133,29 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 count: 1,
                 steps: Some(4),
                 seed: Some(0),
+                memory: tile.filter(|&t| t > 0).map(|t| GenerationMemory {
+                    tile_vae_decode: true,
+                    decode_tile_edge: Some(t as u32),
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
+            // What the provider DECIDED, and which of the three inputs decided it. Printed rather
+            // than inferred: the label says what was asked for, and today that has been wrong three
+            // times. `true` is the residency — this lane loads Sequential.
+            append_breadcrumb(
+                "sana-progress.txt",
+                &format!(
+                    "  [{label}] decode plan — {}",
+                    match mlx_gen_sana::pipeline::resolved_decode_plan(request.memory, true) {
+                        Some(p) => format!(
+                            "TILED edge={} overlap={} via {:?}",
+                            p.edge, p.overlap, p.source
+                        ),
+                        None => "UNTILED (whole-image)".to_string(),
+                    }
+                ),
+            );
             let mut noop = |_: Progress| {};
             let out = generator
                 .generate(&request, &mut noop)

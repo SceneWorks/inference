@@ -45,6 +45,7 @@
 //! `[1, H, W, 3]`; [`mlx_gen::image::decoded_to_image`] expects NCHW, so the output is transposed back
 //! to NCHW before the `clip(x·0.5 + 0.5)` → RGB8 conversion.
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
@@ -196,21 +197,105 @@ pub const DECODE_OVERLAP: i32 = DECODE_TILE_EDGE / 4;
 /// (`mlx-gen-ios-catalog`'s `image_budget` and `tiling_fidelity` sweep it). `0` forces whole-image
 /// so the untiled path stays reachable for A/Bs.
 ///
-/// SC-15449: this is rung 2 (`BoundedDecode`) driven by a load-time signal. The shared contract's
-/// budget model — tile only when the *predicted peak* exceeds the budget, at a calibrated
-/// edge/overlap — is the correct eventual shape and is tracked as the adoption story; this keeps the
-/// device safe in the meantime without pretending to be that.
-fn decode_tiling(is_sequential: bool) -> Option<TilingConfig> {
-    match std::env::var("MLX_GEN_SANA_DECODE_TILE").ok().and_then(|v| v.parse::<i32>().ok()) {
-        // Explicit override, including `0` for "no tiling" — the A/B control.
-        Some(0) => None,
-        Some(px) => Some(TilingConfig::spatial_only(px, px / 4)),
-        None if is_sequential => Some(TilingConfig::spatial_only(
-            DECODE_TILE_EDGE,
-            DECODE_OVERLAP,
-        )),
-        None => None,
+/// SC-15449: this is rung 2 (`BoundedDecode`). The **request-scoped** half of the contract is
+/// honoured here; the calibrated-ladder half (a published edge domain with minted evidence, tiling
+/// only when the predicted peak exceeds the budget) is still the adoption story — see
+/// [`DecodeTilingSource`].
+///
+/// # Precedence, stated because it has bitten
+///
+/// `env override > request > load-time default`. Three sources can ask for a decode geometry and
+/// they must not be able to disagree silently:
+///
+/// 1. **`MLX_GEN_SANA_DECODE_TILE`** wins outright, including `0` for whole-image. It exists to be a
+///    *measurement* override — `image_budget` and `tiling_fidelity` sweep it, and
+///    `runtime-macos`'s `sana_canonical` example refuses to run at all when it is set, which is only
+///    coherent if the env var beats everything. An A/B knob that a request could quietly override
+///    would make every sweep it appears in untrustworthy.
+/// 2. **[`GenerationMemory::tile_vae_decode`]** — the contract's rung-2 signal. Honoured **even
+///    under `Resident`**: a caller asking for a bound gets one, and accepts that DC-AE tiling is not
+///    output-preserving (see [`decode_tiled`]). This is the half that was missing, and its absence
+///    was a defect rather than an omission — the field existed, a caller could set it, and the
+///    decode ran whole-image at 9177 MiB with no error and no diagnostic.
+/// 3. **`Sequential`** — the load-time default. Untiled under this policy was measured at 9177 MiB
+///    and killed the app on device while the tiled path completed at 2751 MiB, so the proven-good
+///    path is the default one.
+///
+/// `Resident` with nothing requested stays whole-image, deliberately: tiling changes output pixels,
+/// so a Mac with memory to spare should pay nothing for a bound it does not need. That asymmetry
+/// with z-image (whose `Resident` case tiles) is real and intentional — DC-AE's attention normalizer
+/// is global, z-image's GroupNorm VAE is not.
+pub(crate) fn decode_tiling(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<TilingConfig> {
+    resolved_decode_plan(memory, is_sequential)
+        .map(|plan| TilingConfig::spatial_only(plan.edge, plan.overlap))
+}
+
+/// Which of the three inputs decided a decode geometry.
+///
+/// Reported rather than inferred. Three separate times this session a knob that read correctly in
+/// source was not the knob the run used — an env var that stopped being forwarded, one that changed
+/// meaning when a default moved, and a summary line that asserted a configuration instead of reading
+/// it back. Naming the winning source is what turns "the code says it should tile" into a fact the
+/// harness can print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeTilingSource {
+    /// `MLX_GEN_SANA_DECODE_TILE`.
+    EnvOverride,
+    /// [`GenerationMemory::tile_vae_decode`] on the request.
+    Request,
+    /// The `OffloadPolicy::Sequential` load-time default.
+    SequentialDefault,
+}
+
+/// A resolved decode geometry and the source that chose it. `edge`/`overlap` are output pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeTilingPlan {
+    pub edge: i32,
+    pub overlap: i32,
+    pub source: DecodeTilingSource,
+}
+
+/// What the decode will **actually** do: `Some(plan)` when it tiles, `None` for whole-image.
+///
+/// Pure, and consulted by [`decode_tiling`] itself rather than duplicating its rules, so it cannot
+/// drift from the decision it reports on. Public because the difference between a tiled and an
+/// untiled DC-AE decode at 1024² is 2751 MiB against 9177 MiB — the difference between a render and
+/// a jetsam kill — and reading the *request* back does not establish which way it went.
+pub fn resolved_decode_plan(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<DecodeTilingPlan> {
+    if let Some(px) = std::env::var("MLX_GEN_SANA_DECODE_TILE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        // `0` is the whole-image A/B control, and must stay expressible.
+        return (px > 0).then_some(DecodeTilingPlan {
+            edge: px,
+            overlap: px / 4,
+            source: DecodeTilingSource::EnvOverride,
+        });
     }
+    if memory.is_some_and(|m| m.tile_vae_decode) {
+        let edge = memory
+            .and_then(|m| m.decode_tile_edge)
+            .map_or(DECODE_TILE_EDGE, |e| e as i32);
+        return Some(DecodeTilingPlan {
+            edge,
+            overlap: memory
+                .and_then(|m| m.decode_overlap)
+                .map_or(edge / 4, |o| o as i32),
+            source: DecodeTilingSource::Request,
+        });
+    }
+    is_sequential.then_some(DecodeTilingPlan {
+        edge: DECODE_TILE_EDGE,
+        overlap: DECODE_OVERLAP,
+        source: DecodeTilingSource::SequentialDefault,
+    })
 }
 
 /// DC-AE tiling parameters: the ×32 spatial compression, and the single stage that runs at full
@@ -738,10 +823,11 @@ impl SanaHeavy {
         let latents = self.denoise_one(cond, req, guidance, cancel, on_progress)?;
         on_progress(Progress::Decoding);
         release_denoise_graph(std::slice::from_ref(&latents))?;
-        // Whole-image unless the env override says otherwise. This is the standalone entrypoint —
-        // it holds every component itself, so it has resident semantics and no memory pressure to
-        // bound. The `Sequential` default lives at the residency-driven call site in `model.rs`.
-        let tiling = resolve_decode_tiling(false);
+        // Resident semantics: this standalone entrypoint holds every component itself and has no
+        // memory pressure to bound, so it does not tile by DEFAULT. It still honours an explicit
+        // request (`tile_vae_decode`) and the env override — `false` here is the residency, not a
+        // refusal. The `Sequential` default lives at the residency-driven call site in `model.rs`.
+        let tiling = resolve_decode_tiling(None, false);
         self.decode_view()
             .decode_one(&latents, cancel, tiling.as_ref())
     }
@@ -969,10 +1055,17 @@ impl SanaDecodeView<'_> {
     }
 }
 
-/// The decode tiling for a load with the given residency. See [`decode_tiling`] for the policy;
-/// this is the public entry point the model layer calls.
-pub fn resolve_decode_tiling(is_sequential: bool) -> Option<TilingConfig> {
-    decode_tiling(is_sequential)
+/// The decode tiling for a request under a load with the given residency. See [`decode_tiling`] for
+/// the policy and its precedence; this is the public entry point the model layer calls.
+///
+/// Takes the request's `memory` block, not just the residency: `tile_vae_decode` is a
+/// request-scoped signal, so a per-load answer cannot honour it. `None` is "no request-scoped
+/// signal" — the standalone [`SanaPipeline`] entrypoint, which has no contract request.
+pub fn resolve_decode_tiling(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<TilingConfig> {
+    decode_tiling(memory, is_sequential)
 }
 
 impl StagedHeavy for SanaHeavy {
@@ -1114,7 +1207,7 @@ mod tests {
         // mutating process env here cannot race a sibling test.
         std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
 
-        let sequential = decode_tiling(true).expect(
+        let sequential = decode_tiling(None, true).expect(
             "Sequential must tile by default: untiled DC-AE decode is the configuration that was \
              jetsam-killed on device",
         );
@@ -1125,7 +1218,7 @@ mod tests {
         // Resident keeps the exact whole-image decode: tiling changes pixels by construction
         // (DC-AE's attention normalizer is global), so a host with memory to spare pays nothing.
         assert!(
-            decode_tiling(false).is_none(),
+            decode_tiling(None, false).is_none(),
             "Resident must keep the exact untiled decode"
         );
     }
@@ -1134,18 +1227,137 @@ mod tests {
     #[test]
     fn env_override_wins_over_the_residency_default() {
         std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "256");
-        let forced = decode_tiling(false).expect("an explicit edge tiles even under Resident");
+        let forced =
+            decode_tiling(None, false).expect("an explicit edge tiles even under Resident");
         assert_eq!(forced.spatial.unwrap().tile_px, 256);
 
         // `0` is the A/B control: it must force whole-image even under Sequential, or the untiled
         // path becomes unreachable for the comparison that established it is fatal.
         std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
         assert!(
-            decode_tiling(true).is_none(),
+            decode_tiling(None, true).is_none(),
             "0 must force whole-image, so the untiled control stays measurable"
         );
 
         std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+    }
+
+    /// A request asking for rung 2 must GET rung 2 — including under `Resident`.
+    ///
+    /// This is the defect the adoption closes, and it was silent: `GenerationMemory::tile_vae_decode`
+    /// is a documented contract field, a caller could set it, and SANA ignored it entirely. No error,
+    /// no diagnostic — the decode simply ran whole-image at a peak measured at 9177 MiB, the exact
+    /// configuration that was jetsam-killed on device.
+    ///
+    /// `Resident` is the interesting half. SANA does not tile there by DEFAULT (tiling changes output
+    /// pixels, so a host with memory to spare should pay nothing), but a caller that explicitly asks
+    /// for a bound has accepted that trade and must receive it.
+    #[test]
+    fn an_explicit_request_tiles_under_both_residencies() {
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        let asked = Some(GenerationMemory {
+            tile_vae_decode: true,
+            ..Default::default()
+        });
+
+        for is_sequential in [false, true] {
+            let plan = resolved_decode_plan(asked, is_sequential).unwrap_or_else(|| {
+                panic!("tile_vae_decode must be honoured (is_sequential={is_sequential})")
+            });
+            assert_eq!(plan.source, DecodeTilingSource::Request);
+            assert_eq!(
+                plan.edge, DECODE_TILE_EDGE,
+                "unspecified edge falls back to the default"
+            );
+            assert_eq!(plan.overlap, DECODE_TILE_EDGE / 4);
+        }
+    }
+
+    /// The request's geometry is used when it names one, and `decode_overlap` is independent of edge.
+    #[test]
+    fn the_request_geometry_is_honoured_field_by_field() {
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        let plan = resolved_decode_plan(
+            Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(256),
+                decode_overlap: Some(32),
+                ..Default::default()
+            }),
+            false,
+        )
+        .expect("an explicit geometry tiles");
+        assert_eq!((plan.edge, plan.overlap), (256, 32));
+
+        // An edge with no overlap derives edge/4 rather than inheriting the DEFAULT overlap — a
+        // 128-derived overlap on a 256 tile would silently change the blend ratio.
+        let derived = resolved_decode_plan(
+            Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(256),
+                ..Default::default()
+            }),
+            false,
+        )
+        .expect("an explicit edge tiles");
+        assert_eq!(derived.overlap, 64);
+    }
+
+    /// Precedence is total and ordered: env beats request beats residency.
+    ///
+    /// Asserted rather than documented because three separate times this session a knob that read
+    /// correctly in source was not the knob the run used. The env var must win even against an
+    /// explicit request, or every A/B sweep that sets it (`image_budget`, `tiling_fidelity`) becomes
+    /// untrustworthy the moment a caller also asks for tiling.
+    #[test]
+    fn precedence_is_env_then_request_then_residency() {
+        let asked = Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(256),
+            ..Default::default()
+        });
+
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "512");
+        let plan = resolved_decode_plan(asked, true).expect("env tiles");
+        assert_eq!(plan.source, DecodeTilingSource::EnvOverride);
+        assert_eq!(plan.edge, 512, "env must beat an explicit request geometry");
+
+        // And `0` must beat a request too, or the untiled control cannot be measured against a
+        // caller that asks for tiling.
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+        assert!(
+            resolved_decode_plan(asked, true).is_none(),
+            "env 0 must force whole-image even when the request asks for a bound"
+        );
+
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        let plan = resolved_decode_plan(asked, true).expect("request tiles");
+        assert_eq!(plan.source, DecodeTilingSource::Request);
+        assert_eq!(plan.edge, 256, "request must beat the residency default");
+
+        let plan = resolved_decode_plan(None, true).expect("sequential tiles");
+        assert_eq!(plan.source, DecodeTilingSource::SequentialDefault);
+    }
+
+    /// `tile_vae_decode: false` is not a request to tile — a `memory` block that says nothing about
+    /// the decode must leave the residency default alone in both directions.
+    #[test]
+    fn a_memory_block_that_does_not_ask_changes_nothing() {
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        // Set a rung that is NOT rung 2, to prove the check reads the right field.
+        let other = Some(GenerationMemory {
+            chunk_attention: true,
+            ..Default::default()
+        });
+        assert!(
+            resolved_decode_plan(other, false).is_none(),
+            "Resident stays whole-image"
+        );
+        assert_eq!(
+            resolved_decode_plan(other, true).map(|p| p.source),
+            Some(DecodeTilingSource::SequentialDefault),
+            "Sequential keeps its default rather than being upgraded to a Request source"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ crate-type = ["staticlib", "rlib"]
 [features]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
-media = ["runtime-ios/media", "dep:image", "dep:mlx-gen"]
+media = ["runtime-ios/media", "dep:image", "dep:mlx-gen", "dep:mlx-gen-sana"]
 # E5 go/no-go for a SECOND image model. Deliberately a direct path dep rather than a catalog entry:
 # `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA only) and widening it is an
 # architectural decision, not a way to run an experiment. This crate is excluded from the workspace,
@@ -43,6 +43,11 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # Z-Image-Turbo, for the go/no-go above. Carries the full memory ladder (rungs 0-4) already, which
 # is why it is the cheapest second model to try.
 mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", optional = true }
+# For `pipeline::resolved_decode_plan` — reading back which of env/request/residency actually chose
+# the decode geometry. The GENERATOR still comes from the catalog registry, so this changes nothing
+# about what ships; it reaches a diagnostic the catalog does not re-export. Same shape as the
+# z-image dep below.
+mlx-gen-sana = { path = "../../crates/media/mlx-gen/mlx-gen-sana", optional = true }
 # For `vae_tiling`'s tiles-decoded counter — the only way to tell a decode that never tiled from one
 # that tiled and never released, which footprint alone cannot separate. Same path crate the provider
 # already links, so this adds no code to the binary, only a name to read it by.

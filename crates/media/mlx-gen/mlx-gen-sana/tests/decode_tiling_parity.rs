@@ -79,14 +79,9 @@ fn tiled_decode_matches_whole_image_decode() {
     let mut results: Vec<(i32, i32, u8, f64)> = Vec::new();
     for &(tile_px, overlap_px) in cases {
         let tiling = TilingConfig::spatial_only(tile_px, overlap_px);
-        let tiled = pipeline::decode_to_image(
-            &decoder,
-            &cfg,
-            &latent,
-            &Default::default(),
-            Some(&tiling),
-        )
-        .expect("tiled decode");
+        let tiled =
+            pipeline::decode_to_image(&decoder, &cfg, &latent, &Default::default(), Some(&tiling))
+                .expect("tiled decode");
 
         assert_eq!(
             (tiled.width, tiled.height),

@@ -235,7 +235,11 @@ fn sequential_default_tiles_and_therefore_diverges() {
     // attention-scope shift moves a minority of bytes and none of them far (measured mean |Δ| ~2.6
     // of 255 — see `decode_tiling_parity`).
     let fraction = diff as f64 / resident.len() as f64;
-    println!("default Sequential vs Resident: {diff}/{} bytes differ ({:.1}%)", resident.len(), 100.0 * fraction);
+    println!(
+        "default Sequential vs Resident: {diff}/{} bytes differ ({:.1}%)",
+        resident.len(),
+        100.0 * fraction
+    );
     assert!(
         fraction < 0.95,
         "nearly every byte differs ({:.1}%) — that is a layout or geometry error, not the \

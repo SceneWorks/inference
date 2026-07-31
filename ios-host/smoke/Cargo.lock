@@ -460,6 +460,7 @@ dependencies = [
  "image",
  "libc",
  "mlx-gen",
+ "mlx-gen-sana",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "runtime-ios",

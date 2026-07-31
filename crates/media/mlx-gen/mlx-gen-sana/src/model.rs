@@ -457,7 +457,8 @@ impl Sana {
         // `Sequential` — the memory-constrained policy a phone loads under — the DC-AE decode
         // tiles, because untiled was measured at 9177 MiB and killed the app on device. Resolved
         // once here rather than inside the decode loop so every image in a batch decodes alike.
-        let tiling = crate::pipeline::resolve_decode_tiling(self.residency.is_sequential());
+        let tiling =
+            crate::pipeline::resolve_decode_tiling(req.memory, self.residency.is_sequential());
 
         // sc-13571: the DiT-dropping staged decode. Under `Sequential` `run_staged` frees the trunk
         // after denoise and before the DC-AE decode, so the decode peak excludes it; under `Resident`
