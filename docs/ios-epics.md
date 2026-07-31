@@ -1013,6 +1013,25 @@ The 8 GB case is tight enough that the device session decides it, not the host h
 > z-image is active 3102 (fits) and footprint 6488 (requires bounding) — which is exactly the
 > behaviour the device showed across five runs. Both numbers are now printed by every host and device
 > run, so the comparison needs no reconstruction.
+>
+> **Re-measured: the 8 GB claim tightens but survives.** `image_budget` now returns the footprint as
+> its verdict quantity (a budget is a claim about what the OS tolerates, and the OS tolerates
+> footprint). Against the same 4096 MiB budget:
+>
+> | configuration | old verdict (peak) | re-measured (footprint) | verdict |
+> |---|---:|---:|---|
+> | 1024px Resident | 9742 MiB (238%) | 9742 MiB (238%) | OVER, unchanged |
+> | 1024px Sequential | 3294 MiB (80%) | **3749 MiB (92%)** | FITS → **TIGHT** |
+> | 512px Sequential | 3048 MiB (74%) | **3302 MiB (81%)** | FITS → **TIGHT** |
+>
+> So "fits 8 GB, tightly" at 80–85% is really **92% at 1024px**. The conclusion does not flip — SANA
+> still fits an 8 GB device sequentially — but the margin is roughly half what was published, and it
+> is now measured in the quantity that actually kills a process. Resident is unchanged because a
+> resident configuration holds everything live: there is no cache term to have missed.
+>
+> Both harnesses share one definition (`mlx_gen::memory_probe::FootprintProbe`) rather than each
+> computing `active + cache`, because two copies would agree on every passing run and diverge exactly
+> on the marginal ones — the only runs anybody consults a budget ladder for.
 
 **Found in passing — a progress-contract violation shared by every mlx-gen image provider.**
 `gen_core_testkit`'s progress contract requires `Progress::Decoding` **exactly once** per generation
