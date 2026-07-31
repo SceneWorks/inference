@@ -54,8 +54,8 @@ pub struct CharacterRef<'a> {
 }
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
-/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of
-/// [`DIM_ALIGN`]; [`generate`] rejects an invalid job rather than silently changing its geometry.
+/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the
+/// 32-pixel render lattice; [`generate`] rejects an invalid job rather than silently changing its geometry.
 /// All images are decoded + resized to `(width, height)` here.
 pub struct Scail2Job<'a> {
     pub prompt: &'a str,
@@ -94,6 +94,17 @@ fn validate_job_geometry(width: u32, height: u32) -> CResult<(usize, usize)> {
         )));
     }
     Ok((width as usize, height as usize))
+}
+
+/// Project a dimension onto the SCAIL-2 render lattice for the provider's area calculation.
+///
+/// Since sc-16198, the provider rejects off-grid explicit requests before the area gate, so this is
+/// a no-op for every reachable explicit request. Keeping the lattice projection in the area helper
+/// preserves sc-16197's rendered-geometry rule for direct helper probes and any future resolved-size
+/// path. The public low-level [`generate`] API does not call this function: it requires exact geometry
+/// through [`validate_job_geometry`].
+pub(crate) fn align(value: u32) -> usize {
+    (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
 }
 
 /// Decode and resize an RGB24 image on the host. Keeping the native-resolution tensor on CPU avoids

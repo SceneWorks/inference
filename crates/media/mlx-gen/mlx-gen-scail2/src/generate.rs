@@ -84,8 +84,8 @@ pub struct CharacterRef<'a> {
 }
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
-/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of
-/// [`DIM_ALIGN`]; [`generate`] rejects an invalid job rather than silently changing its geometry.
+/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the
+/// 32-pixel render lattice; [`generate`] rejects an invalid job rather than silently changing its geometry.
 /// All images are decoded + resized to `(width, height)` here.
 pub struct Scail2Job<'a> {
     pub prompt: &'a str,
@@ -313,6 +313,10 @@ pub fn generate(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    // Validate before touching media, adapter files, or model weights. This is also the exact
+    // geometry all image and latent paths consume, so the public job API cannot fall back to
+    // `align` and snap.
+    let (tw, th) = validate_job_geometry(job.width, job.height)?;
     if job.driving_frames.is_empty() {
         return Err(Error::Msg("scail2: a driving video is required".into()));
     }
@@ -364,9 +368,6 @@ pub fn generate(
             )));
         }
     }
-    // This is the exact geometry all image and latent paths consume. Keeping validation in the
-    // conversion makes it impossible for the public job API to fall back to `align` and snap.
-    let (tw, th) = validate_job_geometry(job.width, job.height)?;
     let cfg_disabled = job.guidance <= 1.0;
     // Experimental bf16 compute opt-in (sc-5681; see the DiT block below). Read once here so the
     // per-segment NaN guard (F-096) keys off the same flag.
@@ -801,6 +802,60 @@ mod tests {
                 "got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn public_generate_rejects_geometry_before_adapter_io() {
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        let frames = [image.clone()];
+        let masks = [image.clone()];
+        let job = Scail2Job {
+            prompt: "p",
+            negative_prompt: "",
+            width: 1280,
+            height: 730,
+            reference: CharacterRef {
+                image: &image,
+                mask: &image,
+            },
+            additional: Vec::new(),
+            driving_frames: &frames,
+            driving_masks: &masks,
+            replace_flag: false,
+            seed: 0,
+            steps: 1,
+            shift: 5.0,
+            guidance: 1.0,
+            sampler: SolverKind::UniPC,
+            fps: 16,
+            segment_len: 81,
+            segment_overlap: 5,
+        };
+        let inaccessible = AdapterSpec::new(
+            std::path::PathBuf::from("/sc16198-missing/adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        );
+        let mut noop = |_: Progress| {};
+        let err = generate(
+            Path::new("/sc16198-missing/snapshot"),
+            &Scail2Config::default(),
+            &job,
+            None,
+            &[inaccessible],
+            &CancelFlag::default(),
+            &mut noop,
+        )
+        .expect_err("invalid public job geometry must fail before adapter or snapshot I/O")
+        .to_string();
+        assert!(
+            err.contains("non-zero multiples of 32") && err.contains("1280×730"),
+            "geometry must be the first error, got: {err}"
+        );
     }
 
     /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.

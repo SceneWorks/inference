@@ -1518,12 +1518,13 @@ pub enum SizeFloor {
     /// variant as "the resolved geometry is bounded by `min_size..=max_size`": whether a provider
     /// re-checks after resolving is per-provider and is **not advertised here**.
     ///
-    /// SCAIL-2, the only descriptor setting this variant, does re-check as of sc-16167 — it refuses
-    /// a resolved geometry outside `min_size..=max_size` or over its area cap before the render,
-    /// naming the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own
-    /// guarantee, made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a
-    /// provider that sets it later. A consumer needing the bound must still read the provider, or
-    /// treat the resolved size as unbounded.
+    /// SCAIL-2, the only descriptor using this resolved-downstream policy family, sets
+    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] and does re-check as of sc-16167 — it refuses a
+    /// resolved geometry outside `min_size..=max_size` or over its area cap before the render, naming
+    /// the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own guarantee,
+    /// made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a provider that
+    /// sets it later. A consumer needing the bound must still read the provider, or treat the
+    /// resolved size as unbounded.
     ///
     /// Note "SCAIL-2" there means the **MLX** provider. `candle-gen-scail2` serves the same model id
     /// and declares [`SizeFloor::RangeCheckedOnGrid`], so it refuses the `0x0` sentinel outright

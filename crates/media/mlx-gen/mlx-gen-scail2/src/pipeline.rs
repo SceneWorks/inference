@@ -223,14 +223,17 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
 ///
 /// # Explicit-grid parity and the remaining sentinel difference
 ///
-/// sc-16198 closes the raw-versus-aligned area band for explicit requests by refusing an off-grid
-/// size on **both** backends before either area calculation. `1280x730` therefore cannot reach this
-/// function as an explicit geometry: the weights-free descriptor advertises the 32-pixel grid and
-/// the shared floor names the request in its rejection. `reject_over_area_dims` still measures the
-/// **lattice-aligned** geometry here because this function also checks a geometry resolved from the
-/// driving clip, which is allowed to be off-grid.
+/// The **area** halves now agree: both measure the lattice-aligned geometry — what actually renders.
+/// candle used to measure `req.width * req.height` raw, so a request between the two, e.g. `1280x730`
+/// (934 400 raw, 901 120 once `730` floors to `704`), was refused there and accepted here; sc-16197
+/// moved `candle-gen-scail2`'s area helper onto its render lattice.
 ///
-/// The backends also still disagree about the **sentinel itself**, which this story does not change:
+/// sc-16198 then removed the observable explicit-request band: both backends advertise the 32-pixel
+/// grid and reject an off-grid explicit size before either area calculation. MLX still measures
+/// lattice-aligned geometry here because this function also checks a size resolved from the driving
+/// clip, whose source-media geometry may be off-grid.
+///
+/// The backends do still disagree about the **sentinel itself**, which neither story changes:
 /// candle declares `SizeFloor::RangeCheckedOnGrid` and so refuses `0x0` at `validate`, leaving its
 /// own resolve-from-the-clip branch unreachable dead code (sc-16199).
 ///
@@ -422,7 +425,9 @@ impl Scail2 {
             )
         })?;
 
-        // Target size: the request's (aligned to 32 in the core), else the driving frame's native size.
+        // Explicit geometry is already on the advertised 32-pixel grid. A `0x0` sentinel first
+        // resolves to the driving frame's native size, then is aligned below while that source-media
+        // origin is still known.
         let first: &Image = driving
             .frames
             .first()
