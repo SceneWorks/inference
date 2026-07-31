@@ -41,11 +41,13 @@ pub use reasoner::{LensReasoner, DEFAULT_MAX_NEW_TOKENS};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PidWeights, Precision, Progress, Quant,
+    SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
@@ -71,6 +73,32 @@ pub const MODEL_ID_BASE: &str = "lens";
 /// (Flux.2's 8× conv VAE composed with the 2× DiT patchify). Image dims must be multiples of this.
 pub const VAE_SCALE_FACTOR: u32 = 16;
 
+/// The one production text-encoder window SC-15800 publishes.
+///
+/// Real packed weights, release build, CUDA device 0 (95.59 GiB RTX PRO 6000 Blackwell), driver
+/// RESERVED high-water in GiB. Each cell is the maximum over actual 25/47/92-token Lens tokenizer
+/// outputs; every captured conditioning tensor and mask was byte-identical to the resident path.
+///
+/// | tier | resident | w1 | w2 | w4 | w8 | all 24 |
+/// |---|---:|---:|---:|---:|---:|---:|
+/// | q4 | 13.562 | 1.719 | 2.219 | 3.281 | 5.312 | 13.531 |
+/// | q8 | 24.625 | 2.094 | 2.906 | 4.594 | 7.906 | 21.344 |
+///
+/// Window 1 cuts the binding conditioning peak 87.3% at q4 and 91.5% at q8. The all-covering
+/// mutation restores the resident live set (q8 RESERVED is lower because the sidecar path avoids the
+/// resident loader's one-time conversion transient). Prompt length changes the minimum-window peak
+/// by at most 64 MiB over this sweep, so it does not alter the selected window. No wider window buys
+/// a memory advantage; publish the tightest one. An end-to-end q4 Lens-Turbo request (512x512, one
+/// denoise step, seed 15800) produced byte-identical pixels while reducing RESERVED request peak from
+/// 21.875 GiB resident to 8.281 GiB Sequential+Deferred/window-1 (62.1%). The dense/MXFP4 control
+/// measured 38.781 GiB resident, 3.156 GiB at window 1, and 38.969 GiB for all 24 layers, with exact
+/// conditioning bytes. It is deliberately ineligible because opening a dense layer performs
+/// source-format conversion inside each window rather than the required post-SC-16096 device-format
+/// transfer.
+pub const DEFAULT_TEXT_ENCODER_WINDOW: usize = 1;
+#[cfg(any(feature = "cuda", test))]
+const TEXT_ENCODER_LAYER_COUNT: u32 = 24;
+
 /// Fixed harmony-preamble `Current date:`. The preamble is the first [`TXT_OFFSET`] tokens, which are
 /// **sliced off** before the DiT conditioning, so the date never reaches the image path — a fixed
 /// constant keeps generation deterministic regardless of wall-clock.
@@ -86,8 +114,18 @@ const VAE_DTYPE: DType = DType::F32;
 /// The loaded four components, shared by both variants (cloneable `Arc` handles).
 #[derive(Clone)]
 struct Components {
+    text: TextComponents,
+    heavy: HeavyComponents,
+}
+
+#[derive(Clone)]
+struct TextComponents {
     tokenizer: Arc<LensTokenizer>,
     encoder: Arc<GptOssTextEncoder>,
+}
+
+#[derive(Clone)]
+struct HeavyComponents {
     transformer: Arc<LensTransformer>,
     vae: Arc<Flux2Vae>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
@@ -158,13 +196,16 @@ impl Pipeline {
     /// (`QLinear::linear_detect` for the DiT, `repack_packed_weight` for the encoder experts) repack at
     /// the MLX default group size 64 that every hosted `SceneWorks/lens-mlx` tier uses, so a hypothetical
     /// future group-32 tier fails at load rather than silently repacking u32 codes to garbage.
-    fn packed_group_size(&self, sub: &str) -> Option<i32> {
+    fn packed_config(&self, sub: &str) -> Option<candle_gen::quant::PackedConfig> {
         let path = self.root.join(sub).join("config.json");
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
-            .map(|c| c.group_size)
+    }
+
+    fn packed_group_size(&self, sub: &str) -> Option<i32> {
+        self.packed_config(sub).map(|config| config.group_size)
     }
 
     /// Assert a packed component's declared `group_size` is the MLX default 64 the shared packed loaders
@@ -186,22 +227,40 @@ impl Pipeline {
         Ok(())
     }
 
+    fn packed_sidecars(
+        &self,
+        sub: &str,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<Option<Arc<candle_gen::quant::PackedWeightSidecars>>> {
+        candle_gen::check_cancel(cancel)?;
+        let Some(packed) = self.packed_config(sub) else {
+            return Ok(None);
+        };
+        let files = self.component_files(sub)?;
+        // SAFETY: immutable model shards owned by the process for the duration of preparation. The
+        // sidecar object retains only content-addressed artifact paths, never borrowed source views.
+        let source = unsafe { MmapedSafetensors::multi(&files)? };
+        let prepared = candle_gen::quant::PackedWeightSidecars::prepare_cancelable(
+            &source,
+            &self.root.join(sub),
+            packed,
+            &self.device,
+            cancel,
+        );
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        Ok(Some(Arc::new(prepared?)))
+    }
+
     fn load_components(&self) -> CResult<Components> {
-        let tokenizer =
-            LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
         // sc-9474: both already-quantize→packed conversions below (the encoder MoE experts via
         // `repack_packed_weight`, the DiT projections via `QLinear::linear_detect`) repack at the MLX
         // default group size 64. Assert the parsed `quantization.group_size` matches before loading, so a
         // future group-32 tier (as boogu's is) fails LOUD instead of silently repacking to garbage.
         self.guard_packed_group_size("text_encoder")?;
         self.guard_packed_group_size("transformer")?;
-        let encoder = GptOssTextEncoder::new_quant(
-            &EncoderConfig::gpt_oss_20b(),
-            self.component_vb("text_encoder", ENC_DTYPE)?,
-            // `ggml_dtype` is `Err` for `Quant::Nvfp4` (no GGUF block type — NVFP4 is served by
-            // `Nvfp4Linear`, sc-11042); `transpose()?` surfaces that instead of the GGUF fold path.
-            self.quant.map(quant::ggml_dtype).transpose()?,
-        )?;
+        let text = self.load_resident_text_components()?;
         // Adapters ride as **forward-time additive residuals** on the DiT's projections — on BOTH the
         // packed and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is
         // never mutated: the packed base stays packed (no dense `W` to fold into anyway), and the dense
@@ -237,29 +296,104 @@ impl Pipeline {
             None => None,
         };
         Ok(Components {
+            text,
+            heavy: HeavyComponents {
+                transformer: Arc::new(transformer),
+                vae: Arc::new(vae),
+                pid,
+            },
+        })
+    }
+
+    fn load_resident_text_components(&self) -> CResult<TextComponents> {
+        self.guard_packed_group_size("text_encoder")?;
+        let tokenizer =
+            LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
+        let encoder = GptOssTextEncoder::new_quant(
+            &EncoderConfig::gpt_oss_20b(),
+            self.component_vb("text_encoder", ENC_DTYPE)?,
+            // `ggml_dtype` is `Err` for `Quant::Nvfp4` (no GGUF block type — NVFP4 is served by
+            // `Nvfp4Linear`, sc-11042); `transpose()?` surfaces that instead of the GGUF fold path.
+            self.quant.map(quant::ggml_dtype).transpose()?,
+        )?;
+        Ok(TextComponents {
             tokenizer: Arc::new(tokenizer),
             encoder: Arc::new(encoder),
-            transformer: Arc::new(transformer),
-            vae: Arc::new(vae),
-            pid,
         })
     }
 
     /// Encode one prompt → its `num_text_layers` captured gpt-oss layers (sliced at [`TXT_OFFSET`]) +
     /// the valid mask `[1, S]` (all-1; a single prompt is unpadded). A prompt shorter than the offset
     /// (never, for real prompts) collapses to length-0 features.
+    fn load_streamable_text_components(
+        &self,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<TextComponents> {
+        candle_gen::check_cancel(cancel)?;
+        self.guard_packed_group_size("text_encoder")?;
+        let tokenizer =
+            LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
+        let files = self.component_files("text_encoder")?;
+        let vb = candle_gen::mmap_var_builder(&files, ENC_DTYPE, &self.device)?;
+        let quant = self.quant.map(quant::ggml_dtype).transpose()?;
+        let encoder = GptOssTextEncoder::new_quant_streamable(
+            &EncoderConfig::gpt_oss_20b(),
+            vb,
+            files,
+            quant,
+            self.packed_sidecars("text_encoder", cancel)?,
+        )?;
+        Ok(TextComponents {
+            tokenizer: Arc::new(tokenizer),
+            encoder: Arc::new(encoder),
+        })
+    }
+
+    fn load_heavy_components(&self) -> CResult<HeavyComponents> {
+        self.guard_packed_group_size("transformer")?;
+        let mut transformer = LensTransformer::new(
+            &LensDitConfig::lens(),
+            self.component_vb("transformer", DIT_DTYPE)?,
+        )?;
+        if !self.adapters.is_empty() {
+            adapters::install_additive(&mut transformer, &self.adapters)?;
+        }
+        if let Some(quant) = self.quant {
+            transformer.quantize(quant)?;
+        }
+        let vae = Flux2Vae::new(self.component_vb("vae", VAE_DTYPE)?)?;
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
+        Ok(HeavyComponents {
+            transformer: Arc::new(transformer),
+            vae: Arc::new(vae),
+            pid,
+        })
+    }
+
     fn encode_one(
         &self,
-        comps: &Components,
+        comps: &TextComponents,
         prompt: &str,
         date: &str,
+        window: Option<usize>,
+        cancel: &gen_core::CancelFlag,
     ) -> CResult<(Vec<Tensor>, Tensor)> {
         let ids = comps.tokenizer.encode(prompt, date)?;
         let l = ids.len();
         let input_ids = Tensor::from_vec(ids, (1, l), &self.device)?;
-        let layers = comps
-            .encoder
-            .capture(&input_ids, &DEFAULT_SELECTED_LAYERS)?;
+        let layers = comps.encoder.capture_with_window(
+            &input_ids,
+            &DEFAULT_SELECTED_LAYERS,
+            window,
+            cancel,
+        )?;
         if l > TXT_OFFSET {
             let s = l - TXT_OFFSET;
             let features = layers
@@ -287,15 +421,18 @@ impl Pipeline {
     /// collapses to `cond` under [`cfg_rescale`], so the uncond half is neither encoded nor batched —
     /// each layer is `[1, S_txt, 2880]` and the mask `[1, S_txt]` (sc-8993). The denoise loop then runs
     /// a single (batch-1) DiT forward per step instead of two.
+    #[allow(clippy::too_many_arguments)]
     fn encode_prompt(
         &self,
-        comps: &Components,
+        comps: &TextComponents,
         prompt: &str,
         negative: &str,
         date: &str,
         guided: bool,
+        window: Option<usize>,
+        cancel: &gen_core::CancelFlag,
     ) -> CResult<(Vec<Tensor>, Tensor)> {
-        let (pos_feats, pos_mask) = self.encode_one(comps, prompt, date)?;
+        let (pos_feats, pos_mask) = self.encode_one(comps, prompt, date, window, cancel)?;
         if !guided {
             // Guidance disabled: skip the uncond encode/batch entirely; cond-only conditioning.
             let features = pos_feats
@@ -312,7 +449,7 @@ impl Pipeline {
                 .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
             (zeros, pos_mask.zeros_like()?)
         } else {
-            self.encode_one(comps, negative, date)?
+            self.encode_one(comps, negative, date, window, cancel)?
         };
         let s_neg = neg_feats[0].dim(1)?;
 
@@ -343,7 +480,7 @@ impl Pipeline {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        comps: &Components,
+        comps: &HeavyComponents,
         features: &[Tensor],
         mask: &Tensor,
         init_latents: &Tensor,
@@ -422,19 +559,30 @@ impl Pipeline {
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
 
-        let (features, mask) =
-            self.encode_prompt(comps, &req.prompt, negative, DEFAULT_DATE, guided)?;
+        let (features, mask) = self.encode_prompt(
+            &comps.text,
+            &req.prompt,
+            negative,
+            DEFAULT_DATE,
+            guided,
+            None,
+            &req.cancel,
+        )?;
 
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
         // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
-        let pid_decoder =
-            candle_gen_pid::resolve_pid_decoder(comps.pid.as_deref(), req, base_seed, defaults.id)?;
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            comps.heavy.pid.as_deref(),
+            req,
+            base_seed,
+            defaults.id,
+        )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let init = create_noise(seed, latent_h, latent_w, &self.device)?;
             let latents = self.denoise(
-                comps,
+                &comps.heavy,
                 &features,
                 &mask,
                 &init,
@@ -463,7 +611,108 @@ impl Pipeline {
                         .contiguous()?;
                     pid.decode(&packed)?
                 }
-                None => vae::decode(&comps.vae, &latents, latent_h, latent_w)?,
+                None => vae::decode(&comps.heavy.vae, &latents, latent_h, latent_w)?,
+            };
+            to_image(&decoded)
+        })
+    }
+
+    fn render_sequential(
+        &self,
+        req: &GenerationRequest,
+        defaults: Defaults,
+        stream_text: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Vec<Image>> {
+        let window = if stream_text {
+            let window = req
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.transformer_window_size)
+                .unwrap_or(DEFAULT_TEXT_ENCODER_WINDOW as u32) as usize;
+            if window != DEFAULT_TEXT_ENCODER_WINDOW {
+                return Err(CandleError::Msg(format!(
+                    "{}: text-encoder window is fixed at {DEFAULT_TEXT_ENCODER_WINDOW}, got {window}",
+                    defaults.id
+                )));
+            }
+            if let Some(component) = req
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.transformer_window_component)
+            {
+                if component != gen_core::TransformerComponent::TextEncoder {
+                    return Err(CandleError::Msg(format!(
+                        "{}: transformer window must target TextEncoder, got {component:?}",
+                        defaults.id
+                    )));
+                }
+            }
+            Some(window)
+        } else {
+            None
+        };
+
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(defaults.steps as usize);
+        let guidance = req.guidance.unwrap_or(defaults.guidance);
+        let guided = guidance != 1.0;
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
+        let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+
+        let text = if stream_text {
+            self.load_streamable_text_components(&req.cancel)?
+        } else {
+            self.load_resident_text_components()?
+        };
+        let (features, mask) = self.encode_prompt(
+            &text,
+            &req.prompt,
+            negative,
+            DEFAULT_DATE,
+            guided,
+            window,
+            &req.cancel,
+        )?;
+        drop(text);
+        self.device.synchronize()?;
+
+        let heavy = self.load_heavy_components()?;
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(heavy.pid.as_deref(), req, base_seed, defaults.id)?;
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let init = create_noise(seed, latent_h, latent_w, &self.device)?;
+            let latents = self.denoise(
+                &heavy,
+                &features,
+                &mask,
+                &init,
+                latent_h,
+                latent_w,
+                steps,
+                guidance,
+                guided,
+                req.sampler.as_deref(),
+                req.scheduler.as_deref(),
+                seed,
+                &req.cancel,
+                on_progress,
+            )?;
+            on_progress(Progress::Decoding);
+            let decoded = match &pid_decoder {
+                Some(pid) => {
+                    let (b, _seq, c) = latents.dims3()?;
+                    let packed = latents
+                        .reshape((b, latent_h, latent_w, c))?
+                        .permute((0, 3, 1, 2))?
+                        .contiguous()?;
+                    pid.decode(&packed)?
+                }
+                None => vae::decode(&heavy.vae, &latents, latent_h, latent_w)?,
             };
             to_image(&decoded)
         })
@@ -562,6 +811,283 @@ impl Defaults {
 const TURBO_DEFAULTS: Defaults = Defaults::from(MODEL_ID_TURBO, TURBO);
 const BASE_DEFAULTS: Defaults = Defaults::from(MODEL_ID_BASE, BASE);
 
+#[cfg(any(feature = "cuda", test))]
+fn build_lens_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
+    build_lens_turbo_memory_strategy_contract_with_eligibility(spec, streams_text_encoder(spec))
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn build_lens_turbo_memory_strategy_contract_with_eligibility(
+    spec: &LoadSpec,
+    bounded_text: bool,
+) -> gen_core::MemoryProviderContract {
+    use gen_core::{
+        MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
+        MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
+    };
+
+    // Auxiliary overlays were not part of this calibration. Refuse every optimized rung for such a
+    // load instead of publishing a phase envelope that omits their independently resident bytes.
+    let staged = bounded_text;
+    let strategies = MemoryStrategy::ALL
+        .into_iter()
+        .map(|strategy| {
+            let implemented = match strategy {
+                MemoryStrategy::Resident => true,
+                MemoryStrategy::StagedResidency => staged,
+                MemoryStrategy::BoundedDecode | MemoryStrategy::BoundedAttention => false,
+                MemoryStrategy::BoundedTransformerResidency => bounded_text,
+            };
+            MemoryStrategyCapability {
+                strategy,
+                support: if implemented {
+                    MemoryStrategySupport::Implemented
+                } else {
+                    MemoryStrategySupport::Missing
+                },
+                parameters: if strategy == MemoryStrategy::BoundedTransformerResidency
+                    && bounded_text
+                {
+                    MemoryParameterRanges {
+                        transformer_window_sizes: vec![DEFAULT_TEXT_ENCODER_WINDOW as u32],
+                        transformer_window_components: vec![
+                            gen_core::TransformerComponent::TextEncoder,
+                        ],
+                        ..Default::default()
+                    }
+                } else {
+                    MemoryParameterRanges::default()
+                },
+            }
+        })
+        .collect();
+
+    MemoryProviderContract {
+        provider_id: MODEL_ID_TURBO.to_owned(),
+        backend: MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: true,
+            // Packed q4/q8 is the only load shape for which rung 4 is Implemented. Component-open
+            // prepares content-addressed GGML sidecars; a window maps and transfers those exact
+            // bytes, with no MLX-affine conversion or device-to-host round trip in the window.
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+        strategies,
+        // Lens does not publish bounded decode, and PiD-bearing loads deliberately fail closed for
+        // calibrated optimized admission below. There is therefore no native/PiD tiled route split
+        // for this provider contract to advertise.
+        pid_decode_routes: None,
+        load_shape: spec.load_shape,
+        additional_prerequisites: bounded_text
+            .then_some((
+                MemoryStrategy::BoundedTransformerResidency,
+                MemoryStrategyPrerequisite::Rung {
+                    rung: MemoryStrategy::StagedResidency,
+                    scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                },
+            ))
+            .into_iter()
+            .collect(),
+        lifecycle: MemoryLifecycleCapabilities {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            synchronized_phase_release: staged,
+            decode_tiling: false,
+            attention_chunking: false,
+            transformer_window_materialization: bounded_text,
+        },
+        formula: MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            variables: vec![
+                MemoryFormulaVariable::ConditioningTokenCount,
+                MemoryFormulaVariable::TransformerWindowSize,
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        },
+        calibration: memory_calibration(spec, bounded_text),
+        asset_facts: gen_core::MemoryAssetFacts::default(),
+        runtime: MemoryRuntimeSemantics::default(),
+    }
+}
+
+fn lens_memory_strategy_safety_decision(
+    provider_id: &str,
+    loaded_precision: Precision,
+    loaded_quant: Option<Quant>,
+    component_precision_floors: &'static [gen_core::ComponentPrecisionFloor],
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    let reject = |reason: String| gen_core::MemorySafetyDecision::Reject { reason };
+    let Some(calibration) = contract.calibration.as_ref() else {
+        return reject(format!(
+            "{provider_id}: this load has no rung-4 calibration identity"
+        ));
+    };
+    if context.calibration_abi != calibration.abi
+        || context.calibration_fingerprint != calibration.fingerprint
+    {
+        return reject(format!("{provider_id}: calibration handshake mismatch"));
+    }
+    if context.selection.tier.precision != loaded_precision
+        || context.selection.tier.quant != loaded_quant
+        || context.selection.tier.component_precision_floors != component_precision_floors
+    {
+        return reject(format!(
+            "{provider_id}: request tier {:?} does not match loaded {:?}/{:?}",
+            context.selection.tier, loaded_precision, loaded_quant
+        ));
+    }
+    if let Err(error) = contract.validate_selection(&context.selection) {
+        return reject(error.to_string());
+    }
+    if !context.budget.fits(context.predicted_peak_bytes) {
+        return reject(format!(
+            "{provider_id}: predicted peak {} exceeds effective budget {}",
+            context.predicted_peak_bytes,
+            context.budget.effective_bytes()
+        ));
+    }
+    gen_core::MemorySafetyDecision::Accept
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn lens_generation_memory(
+    contract: &gen_core::MemoryProviderContract,
+    selection: gen_core::MemorySelection,
+) -> Option<gen_core::GenerationMemory> {
+    use gen_core::MemoryStrategy;
+
+    // `Some(default)` is intentional for Resident: it distinguishes a request-scoped explicit
+    // Resident selection from `request.memory == None`, which means "honor this generator's load
+    // defaults". An eligible Sequential+Deferred generator defaults to staged/windowed execution,
+    // but the shared scope must still be able to select the resident baseline on that same instance.
+    let stream_transformer_blocks = contract.engages(
+        selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    );
+    Some(gen_core::GenerationMemory {
+        stage_residency: contract.engages(selection.strategy, MemoryStrategy::StagedResidency),
+        stream_transformer_blocks,
+        transformer_window_size: stream_transformer_blocks
+            .then_some(selection.parameters.transformer_window_size)
+            .flatten(),
+        transformer_window_component: stream_transformer_blocks
+            .then_some(gen_core::TransformerComponent::TextEncoder),
+        ..Default::default()
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+struct LensMemoryScope {
+    device: Device,
+    memory: Option<gen_core::GenerationMemory>,
+    finished: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl LensMemoryScope {
+    fn ensure_active(&self) -> gen_core::Result<()> {
+        if self.finished {
+            Err(gen_core::Error::Msg(
+                "lens_turbo memory-strategy request scope is already finished".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl gen_core::MemoryRequestScope for LensMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if request.use_pid || !request.conditioning.is_empty() || request.phases.is_some() {
+            return Err(gen_core::Error::Unsupported(
+                "lens_turbo: optimized memory strategies cover ordinary text-to-image only"
+                    .to_owned(),
+            ));
+        }
+        request.memory = self.memory;
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn configure_decode(
+        &mut self,
+        _tile_edge: u32,
+        _overlap: u32,
+        _geometry: gen_core::MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        Err(gen_core::Error::Unsupported(
+            "lens_turbo: bounded decode is not implemented".to_owned(),
+        ))
+    }
+
+    fn configure_attention(&mut self, _chunk_size: u32) -> gen_core::Result<()> {
+        Err(gen_core::Error::Unsupported(
+            "lens_turbo: bounded attention is not implemented".to_owned(),
+        ))
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        first_block: u32,
+        block_count: u32,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if first_block < TEXT_ENCODER_LAYER_COUNT
+            && block_count == DEFAULT_TEXT_ENCODER_WINDOW as u32
+        {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "lens_turbo: invalid text-encoder window first={first_block} count={block_count}; \
+                 layer count is {TEXT_ENCODER_LAYER_COUNT} and window is fixed at \
+                 {DEFAULT_TEXT_ENCODER_WINDOW}"
+            )))
+        }
+    }
+
+    fn finish(&mut self, _outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        self.device
+            .synchronize()
+            .map_err(gen_core::Error::backend)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Drop for LensMemoryScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.device.synchronize();
+            self.finished = true;
+        }
+    }
+}
+
 /// A loaded, dispatchable Lens generator: the pipeline + the variant's descriptor & sampling defaults.
 /// Components are cached after the first `generate`.
 pub struct LensGenerator {
@@ -569,6 +1095,11 @@ pub struct LensGenerator {
     defaults: Defaults,
     pipeline: Pipeline,
     components: Mutex<Option<Components>>,
+    sequential: bool,
+    stream_text: bool,
+    loaded_precision: Precision,
+    loaded_quant: Option<Quant>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
 }
 
 impl LensGenerator {
@@ -582,6 +1113,11 @@ impl LensGenerator {
             defaults: TURBO_DEFAULTS,
             pipeline: Pipeline::load(root.as_ref(), &device, Vec::new(), None, None),
             components: Mutex::new(None),
+            sequential: false,
+            stream_text: false,
+            loaded_precision: Precision::Bf16,
+            loaded_quant: None,
+            memory_contract: None,
         })
     }
 
@@ -590,6 +1126,36 @@ impl LensGenerator {
         Ok(candle_gen::cached(&self.components, || {
             self.pipeline.load_components()
         })?)
+    }
+
+    fn execution_mode(&self, req: &GenerationRequest) -> gen_core::Result<(bool, bool)> {
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .map(|memory| memory.stage_residency)
+            .unwrap_or(self.sequential);
+        let stream_text = req
+            .memory
+            .as_ref()
+            .map(|memory| memory.stream_transformer_blocks)
+            .unwrap_or(self.stream_text);
+        if stream_text && !stage_residency {
+            return Err(gen_core::Error::Unsupported(
+                "lens_turbo: text-encoder windows require staged residency in the same request"
+                    .to_owned(),
+            ));
+        }
+        if stream_text && !self.stream_text {
+            return Err(gen_core::Error::Unsupported(
+                "lens_turbo: this load is not an eligible packed q4/q8 text-encoder stream"
+                    .to_owned(),
+            ));
+        }
+        Ok((stage_residency, stream_text))
+    }
+
+    fn cache_components_for_request(&self, stage_residency: bool) -> bool {
+        !stage_residency && !self.sequential
     }
 
     /// e2e-parity hook (sc-5115): encode → denoise from **injected** latents → decode, factoring out
@@ -612,12 +1178,19 @@ impl LensGenerator {
             .map_err(|e| CandleError::Msg(e.to_string()))?;
         // Match render's guidance gate: at guidance == 1.0 the uncond branch is skipped (sc-8993).
         let guided = guidance != 1.0;
-        let (features, mask) = self
-            .pipeline
-            .encode_prompt(&comps, prompt, negative, date, guided)?;
+        let cancel = gen_core::CancelFlag::new();
+        let (features, mask) = self.pipeline.encode_prompt(
+            &comps.text,
+            prompt,
+            negative,
+            date,
+            guided,
+            None,
+            &cancel,
+        )?;
         // Parity hook drives the default (euler over the native flow_match schedule), no cancel.
         let latents = self.pipeline.denoise(
-            &comps,
+            &comps.heavy,
             &features,
             &mask,
             init_latents,
@@ -629,10 +1202,10 @@ impl LensGenerator {
             None,
             None,
             0,
-            &gen_core::CancelFlag::new(),
+            &cancel,
             &mut |_| {},
         )?;
-        let decoded = vae::decode(&comps.vae, &latents, latent_h, latent_w)?;
+        let decoded = vae::decode(&comps.heavy.vae, &latents, latent_h, latent_w)?;
         Ok((latents, decoded))
     }
 }
@@ -640,6 +1213,66 @@ impl LensGenerator {
 impl Generator for LensGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{}: no memory-strategy contract", self.defaults.id),
+            };
+        };
+        lens_memory_strategy_safety_decision(
+            self.defaults.id,
+            self.loaded_precision,
+            self.loaded_quant,
+            self.descriptor.capabilities.component_precision_floors,
+            contract,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        #[cfg(feature = "cuda")]
+        {
+            let Some(contract) = self.memory_contract.as_ref() else {
+                return Ok(None);
+            };
+            if context.mode != gen_core::MemoryMode::TextToImage
+                || context.has_reference
+                || context.use_pid
+                || context.has_phases
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "lens_turbo: optimized memory strategies cover ordinary text-to-image only"
+                        .to_owned(),
+                ));
+            }
+            if let gen_core::MemorySafetyDecision::Reject { reason } =
+                self.memory_strategy_safety_check(context)
+            {
+                return Err(gen_core::Error::Unsupported(reason));
+            }
+            Ok(Some(Box::new(LensMemoryScope {
+                device: self.pipeline.device.clone(),
+                memory: lens_generation_memory(contract, context.selection),
+                finished: false,
+            })))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = context;
+            Ok(None)
+        }
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -652,10 +1285,22 @@ impl Generator for LensGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let comps = self.components()?;
-        let images = self
-            .pipeline
-            .render(req, &comps, self.defaults, on_progress)?;
+        let (stage_residency, stream_text) = self.execution_mode(req)?;
+        let images = if stage_residency {
+            self.pipeline
+                .render_sequential(req, self.defaults, stream_text, on_progress)?
+        } else if !self.cache_components_for_request(stage_residency) {
+            // A Sequential-loaded generator may be asked for a resident baseline, but that resident
+            // stack is request-local. Caching it would leave the full encoder/heavy bundle alive and
+            // invalidate a later rung-4 request's cold calibrated bound on the same generator.
+            let comps = self.pipeline.load_components()?;
+            self.pipeline
+                .render(req, &comps, self.defaults, on_progress)?
+        } else {
+            let comps = self.components()?;
+            self.pipeline
+                .render(req, &comps, self.defaults, on_progress)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -700,7 +1345,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            supports_sequential_offload: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -749,6 +1394,192 @@ fn validate_request(
     Ok(())
 }
 
+fn packed_text_encoder_config(spec: &LoadSpec) -> Option<candle_gen::quant::PackedConfig> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return None;
+    };
+    let component = root.join("text_encoder");
+    let json = std::fs::read_to_string(component.join("config.json")).ok()?;
+    let config = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    let packed = candle_gen::quant::PackedConfig::from_config(&config)?;
+    let files = candle_gen::sorted_safetensors(&component, "lens").ok()?;
+    // SAFETY: read-only model artifacts, mapped only long enough to inspect the immutable headers.
+    // This makes eligibility depend on an actual packed triple, not merely a possibly stale config.
+    let source = unsafe { MmapedSafetensors::multi(&files).ok()? };
+    packed_encoder_inventory_is_exact(
+        &source,
+        &EncoderConfig::gpt_oss_20b(),
+        packed.bits,
+        packed.group_size,
+    )
+    .then_some(packed)
+}
+
+fn packed_encoder_inventory_is_exact(
+    source: &MmapedSafetensors,
+    cfg: &EncoderConfig,
+    bits: i32,
+    group_size: i32,
+) -> bool {
+    let Ok(bits) = usize::try_from(bits) else {
+        return false;
+    };
+    let Ok(group_size) = usize::try_from(group_size) else {
+        return false;
+    };
+    if !matches!(bits, 4 | 8) || group_size == 0 || 32 % bits != 0 {
+        return false;
+    }
+    let codes_per_word = 32 / bits;
+    for layer in 0..cfg.num_hidden_layers {
+        for (projection, out_dim, in_dim) in [
+            ("gate_up_proj", 2 * cfg.intermediate_size, cfg.hidden_size),
+            ("down_proj", cfg.hidden_size, cfg.intermediate_size),
+        ] {
+            if !in_dim.is_multiple_of(group_size) || !in_dim.is_multiple_of(codes_per_word) {
+                return false;
+            }
+            let base = format!("model.layers.{layer}.mlp.experts.{projection}");
+            let Ok(weight) = source.get(&format!("{base}.weight")) else {
+                return false;
+            };
+            let Ok(scales) = source.get(&format!("{base}.scales")) else {
+                return false;
+            };
+            let Ok(biases) = source.get(&format!("{base}.biases")) else {
+                return false;
+            };
+            if weight.dtype() != safetensors::tensor::Dtype::U32
+                || scales.dtype() != safetensors::tensor::Dtype::BF16
+                || biases.dtype() != safetensors::tensor::Dtype::BF16
+                || weight.shape() != [cfg.num_local_experts, out_dim, in_dim / codes_per_word]
+                || scales.shape() != [cfg.num_local_experts, out_dim, in_dim / group_size]
+                || biases.shape() != scales.shape()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn transformer_numeric_tier_matches(spec: &LoadSpec, expected_bits: usize) -> bool {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return false;
+    };
+    let component = root.join("transformer");
+    let Ok(json) = std::fs::read_to_string(component.join("config.json")) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return false;
+    };
+    let declared = candle_gen::quant::PackedConfig::from_config(&config);
+    let Ok(files) = candle_gen::sorted_safetensors(&component, "lens") else {
+        return false;
+    };
+    // SAFETY: read-only model artifacts, mapped only for immutable header inspection.
+    let Ok(source) = (unsafe { MmapedSafetensors::multi(&files) }) else {
+        return false;
+    };
+    let mut packed_triples = 0usize;
+    let mut u32_weights = 0usize;
+    for (name, view) in source.tensors() {
+        if name.ends_with(".weight") && view.dtype() == safetensors::tensor::Dtype::U32 {
+            u32_weights += 1;
+        }
+        let Some(base) = name.strip_suffix(".scales") else {
+            continue;
+        };
+        let (Ok(weight), Ok(biases)) = (
+            source.get(&format!("{base}.weight")),
+            source.get(&format!("{base}.biases")),
+        ) else {
+            return false;
+        };
+        packed_triples += 1;
+        let Some(packed) = declared else {
+            return false;
+        };
+        let Ok(bits) = usize::try_from(packed.bits) else {
+            return false;
+        };
+        let Ok(group_size) = usize::try_from(packed.group_size) else {
+            return false;
+        };
+        if bits != expected_bits
+            || group_size != candle_gen::quant::MLX_GROUP_SIZE
+            || weight.dtype() != safetensors::tensor::Dtype::U32
+            || view.dtype() != safetensors::tensor::Dtype::BF16
+            || biases.dtype() != safetensors::tensor::Dtype::BF16
+            || view.shape() != biases.shape()
+            || !matches!(weight.shape(), [_, _] | [_, _, _])
+            || weight.shape().len() != view.shape().len()
+            || weight.shape()[..weight.shape().len() - 1] != view.shape()[..view.shape().len() - 1]
+            || weight.shape()[weight.shape().len() - 1] * (32 / bits)
+                != view.shape()[view.shape().len() - 1] * group_size
+        {
+            return false;
+        }
+    }
+    match declared {
+        Some(packed) => {
+            packed.bits == expected_bits as i32
+                && packed.group_size == candle_gen::quant::MLX_GROUP_SIZE as i32
+                && packed_triples > 0
+                && packed_triples == u32_weights
+        }
+        None => u32_weights == 0 && packed_triples == 0,
+    }
+}
+
+fn is_plain_measured_load(spec: &LoadSpec) -> bool {
+    spec.adapters.is_empty()
+        && spec.pid.is_none()
+        && spec.control.is_none()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+}
+
+fn streams_text_encoder(spec: &LoadSpec) -> bool {
+    let expected_bits = match spec.quantize {
+        Some(Quant::Q4) => 4,
+        Some(Quant::Q8) => 8,
+        _ => return false,
+    };
+    let Some(packed) = packed_text_encoder_config(spec) else {
+        return false;
+    };
+    matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        )
+        && spec.precision == Precision::Bf16
+        && is_plain_measured_load(spec)
+        && packed.bits == expected_bits
+        && packed.group_size == candle_gen::quant::MLX_GROUP_SIZE as i32
+        && transformer_numeric_tier_matches(spec, expected_bits as usize)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn memory_calibration(
+    spec: &LoadSpec,
+    bounded_text: bool,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    // The base resident envelope does not carry typed adapter/PiD component bytes. Refuse calibrated
+    // admission for those load shapes until they have their own measured component accounting.
+    if !is_plain_measured_load(spec) {
+        return None;
+    }
+    let fingerprint = match spec.quantize {
+        Some(Quant::Q4) if bounded_text => "lens-turbo-candle-cuda-q4-text-window-v1",
+        Some(Quant::Q8) if bounded_text => "lens-turbo-candle-cuda-q8-text-window-v1",
+        _ => "lens-turbo-candle-cuda-resident-v1",
+    };
+    Some(gen_core::MemoryCalibrationIdentity::new(fingerprint))
+}
+
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
 /// a `microsoft/Lens` / `microsoft/Lens-Turbo` diffusers snapshot dir (`tokenizer/`, `text_encoder/`,
 /// `transformer/`, `vae/`). DiT LoRA/LoKr adapters (`spec.adapters`) are merged into the transformer
@@ -776,6 +1607,11 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
         )));
     }
     let device = candle_gen::default_device()?;
+    #[cfg(feature = "cuda")]
+    let memory_contract =
+        (defaults.id == MODEL_ID_TURBO).then(|| build_lens_turbo_memory_strategy_contract(spec));
+    #[cfg(not(feature = "cuda"))]
+    let memory_contract = None;
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
@@ -790,6 +1626,15 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             spec.pid.clone(),
         ),
         components: Mutex::new(None),
+        sequential: matches!(spec.offload_policy, OffloadPolicy::Sequential),
+        // This provider's text-window implementation is physically coupled to the staged lifecycle:
+        // conditioning must finish and release before the heavy phase opens. It is also published
+        // only for packed q4/q8, whose post-SC-16096 sidecars make each window a device-format
+        // transfer. Sequential+Eager remains a valid rung-1-only path with a resident text phase.
+        stream_text: streams_text_encoder(spec),
+        loaded_precision: spec.precision,
+        loaded_quant: spec.quantize,
+        memory_contract,
     }))
 }
 
@@ -807,14 +1652,46 @@ candle_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
+#[cfg(feature = "cuda")]
+fn registered_lens_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_lens_turbo_memory_strategy_contract(spec))
+}
+
+#[cfg(feature = "cuda")]
+fn registered_lens_turbo_memory_strategy_safety_check(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    lens_memory_strategy_safety_decision(
+        MODEL_ID_TURBO,
+        spec.precision,
+        spec.quantize,
+        descriptor_turbo().capabilities.component_precision_floors,
+        contract,
+        context,
+    )
+}
+
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID_TURBO,
+    contract: registered_lens_turbo_memory_strategy_contract,
+    safety_check: registered_lens_turbo_memory_strategy_safety_check,
+};
+
 /// Add all Candle Lens generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(TURBO_REGISTRATION)
-        .register_generator(BASE_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_generator(BASE_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry.register_memory_strategy(TURBO_MEMORY_REGISTRATION);
+    registry.register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Lens provider catalog.
@@ -844,6 +1721,464 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    fn packed_memory_spec(quant: Quant) -> (PathBuf, LoadSpec) {
+        let bits = match quant {
+            Quant::Q4 => 4,
+            Quant::Q8 => 8,
+            other => panic!("packed memory fixture does not support {other:?}"),
+        };
+        let root = std::env::temp_dir().join(format!(
+            "sc15800_lens_contract_{}_{}_{}",
+            std::process::id(),
+            bits,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let text = root.join("text_encoder");
+        std::fs::create_dir_all(&text).unwrap();
+        std::fs::write(
+            text.join("config.json"),
+            format!(r#"{{"quantization": {{"bits": {bits}, "group_size": 64}}}}"#),
+        )
+        .unwrap();
+        let base = "model.layers.0.mlp.experts.gate_up_proj";
+        let tensors = std::collections::HashMap::from([
+            (
+                format!("{base}.weight"),
+                Tensor::from_vec(vec![0u32], (1,), &Device::Cpu).unwrap(),
+            ),
+            (
+                format!("{base}.scales"),
+                Tensor::from_vec(vec![1f32], (1,), &Device::Cpu).unwrap(),
+            ),
+            (
+                format!("{base}.biases"),
+                Tensor::from_vec(vec![0f32], (1,), &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, text.join("model.safetensors"))
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_quant(quant)
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        (root, spec)
+    }
+
+    fn mini_packed_inventory(complete: bool) -> (PathBuf, EncoderConfig) {
+        let root = std::env::temp_dir().join(format!(
+            "sc15800_lens_inventory_{}_{}_{}",
+            std::process::id(),
+            complete,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cfg = EncoderConfig::gpt_oss_20b();
+        cfg.num_hidden_layers = 2;
+        cfg.num_local_experts = 2;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 64;
+        let mut tensors = std::collections::HashMap::new();
+        for layer in 0..cfg.num_hidden_layers {
+            for (projection, out_dim, in_dim) in [
+                ("gate_up_proj", 2 * cfg.intermediate_size, cfg.hidden_size),
+                ("down_proj", cfg.hidden_size, cfg.intermediate_size),
+            ] {
+                if !complete && layer == cfg.num_hidden_layers - 1 && projection == "down_proj" {
+                    continue;
+                }
+                let base = format!("model.layers.{layer}.mlp.experts.{projection}");
+                tensors.insert(
+                    format!("{base}.weight"),
+                    Tensor::zeros(
+                        (cfg.num_local_experts, out_dim, in_dim / 8),
+                        DType::U32,
+                        &Device::Cpu,
+                    )
+                    .unwrap(),
+                );
+                for suffix in ["scales", "biases"] {
+                    tensors.insert(
+                        format!("{base}.{suffix}"),
+                        Tensor::zeros(
+                            (cfg.num_local_experts, out_dim, in_dim / 64),
+                            DType::BF16,
+                            &Device::Cpu,
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        candle_gen::candle_core::safetensors::save(&tensors, root.join("model.safetensors"))
+            .unwrap();
+        (root, cfg)
+    }
+
+    #[test]
+    fn packed_inventory_requires_both_expert_projections_in_every_layer() {
+        for complete in [true, false] {
+            let (root, cfg) = mini_packed_inventory(complete);
+            let files = vec![root.join("model.safetensors")];
+            // SAFETY: immutable test fixture, alive for the duration of this assertion.
+            let source = unsafe { MmapedSafetensors::multi(&files).unwrap() };
+            assert_eq!(
+                packed_encoder_inventory_is_exact(&source, &cfg, 4, 64),
+                complete
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn transformer_artifact_must_match_the_selected_numeric_tier() {
+        let root = std::env::temp_dir().join(format!(
+            "sc15800_lens_transformer_tier_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let component = root.join("transformer");
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        let mut packed = std::collections::HashMap::from([
+            (
+                "proj.weight".to_owned(),
+                Tensor::zeros((4, 8), DType::U32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "proj.scales".to_owned(),
+                Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+            (
+                "proj.biases".to_owned(),
+                Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&packed, component.join("model.safetensors"))
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(transformer_numeric_tier_matches(&spec, 4));
+        assert!(!transformer_numeric_tier_matches(&spec, 8));
+        packed.insert(
+            "orphan.weight".to_owned(),
+            Tensor::zeros((4, 8), DType::U32, &Device::Cpu).unwrap(),
+        );
+        candle_gen::candle_core::safetensors::save(&packed, component.join("model.safetensors"))
+            .unwrap();
+        assert!(
+            !transformer_numeric_tier_matches(&spec, 4),
+            "every U32 packed weight must belong to a validated affine triple"
+        );
+
+        std::fs::write(component.join("config.json"), r#"{"dtype": "bfloat16"}"#).unwrap();
+        assert!(
+            !transformer_numeric_tier_matches(&spec, 4),
+            "packed tensors with an absent tier declaration must fail closed"
+        );
+        let dense = std::collections::HashMap::from([(
+            "proj.weight".to_owned(),
+            Tensor::zeros((4, 64), DType::BF16, &Device::Cpu).unwrap(),
+        )]);
+        candle_gen::candle_core::safetensors::save(&dense, component.join("model.safetensors"))
+            .unwrap();
+        assert!(
+            transformer_numeric_tier_matches(&spec, 4),
+            "a dense transformer is quantized to the selected tier at runtime"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pre_cancelled_streamable_component_open_is_typed_and_does_no_io() {
+        let pipeline = Pipeline::load(
+            Path::new("/nonexistent/lens"),
+            &Device::Cpu,
+            Vec::new(),
+            Some(Quant::Q4),
+            None,
+        );
+        let cancel = gen_core::CancelFlag::new();
+        cancel.cancel();
+        assert!(matches!(
+            pipeline.load_streamable_text_components(&cancel),
+            Err(CandleError::Canceled)
+        ));
+    }
+
+    #[cfg(feature = "cuda")]
+    fn sc15800_quiesce(device: &Device, pool: candle_gen::cuda_mempool::MemPool) -> CResult<()> {
+        device.synchronize()?;
+        assert!(pool.trim(), "cuMemPoolTrimTo failed");
+        assert!(pool.reset_high_water(), "CUDA pool high-water reset failed");
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn sc15800_cpu_f32(tensors: &[Tensor]) -> CResult<Vec<Vec<f32>>> {
+        tensors
+            .iter()
+            .map(|tensor| -> CResult<Vec<f32>> {
+                Ok(tensor
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?)
+            })
+            .collect()
+    }
+
+    /// SC-15800's real-weight Candle calibration. This deliberately lives beside the private phase
+    /// loaders so it measures the production Lens encoder, tokenizer, sidecar path, and shared
+    /// `block_window::run_windowed` driver rather than a look-alike loop.
+    ///
+    /// Run one tier per process (the CUDA allocator's high-water is process-global):
+    ///
+    /// ```text
+    /// SC15800_LENS_ROOT=<snapshot/q4> SC15800_LENS_QUANT=q4 \
+    /// cargo test -p candle-gen-lens --features cuda --release \
+    ///   rung4_real_weights_conditioning_window_sweep -- --ignored --nocapture --test-threads=1
+    /// ```
+    ///
+    /// Repeat with the q8 snapshot / `q8`, and the dense snapshot / `dense`. Packed q4/q8 use the
+    /// post-SC-16096 device-format sidecars; dense is measured as a control but is not eligible for a
+    /// streamed production contract because its MXFP4-to-bf16 conversion would occur per window.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "real Lens weights + CUDA; set SC15800_LENS_ROOT"]
+    fn rung4_real_weights_conditioning_window_sweep() -> CResult<()> {
+        let Ok(root) = std::env::var("SC15800_LENS_ROOT") else {
+            println!("[sc-15800] SKIP: SC15800_LENS_ROOT not set");
+            return Ok(());
+        };
+        let quant_tag = std::env::var("SC15800_LENS_QUANT").unwrap_or_else(|_| "q4".to_owned());
+        let quant = match quant_tag.as_str() {
+            "q4" => Some(Quant::Q4),
+            "q8" => Some(Quant::Q8),
+            "dense" => None,
+            other => panic!("SC15800_LENS_QUANT must be q4, q8, or dense; got {other}"),
+        };
+        let device = Device::new_cuda(0)?;
+        let pool = candle_gen::cuda_mempool::MemPool::device_default(0)
+            .expect("CUDA device 0 default memory pool");
+        let (_, total) = candle_gen::cuda_mempool::mem_info()
+            .expect("cuMemGetInfo after creating a CUDA context");
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        println!(
+            "[sc-15800] Candle Lens {quant_tag}; host CUDA device 0 {:.2} GiB; root={root}",
+            total as f64 / gib
+        );
+
+        let pipeline = Pipeline::load(Path::new(&root), &device, Vec::new(), quant, None);
+        let prompts = [
+            "a red fox",
+            "a cinematic portrait of an astronaut botanist in a humid glasshouse, soft window light, detailed leaves, 85mm lens",
+            "An intricate editorial photograph of a coastal research station at sunrise, with weathered timber, solar arrays, scientists carrying instrument cases, seabirds above the cliffs, sea mist catching warm light, layered foreground grasses, realistic materials, restrained colors, natural depth, and documentary composition. Preserve fine structural details, legible spatial relationships, and a calm atmospheric horizon.",
+        ];
+
+        // Resident references first, so no streamable embedding/norm allocation biases their floor.
+        // References move to CPU before the resident encoder is released.
+        let resident = pipeline.load_resident_text_components()?;
+        assert!(!resident.encoder.is_streamable());
+        let mut references = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            sc15800_quiesce(&device, pool)?;
+            let (features, mask) = pipeline.encode_prompt(
+                &resident,
+                prompt,
+                "",
+                DEFAULT_DATE,
+                false,
+                None,
+                &gen_core::CancelFlag::default(),
+            )?;
+            device.synchronize()?;
+            let live = pool.used_high().expect("USED_MEM_HIGH") as f64 / gib;
+            let reserved = pool.reserved_high().expect("RESERVED_MEM_HIGH") as f64 / gib;
+            let tokens = mask.dim(1)?;
+            println!(
+                "[sc-15800] prompt_tokens={tokens:>3} resident: live={live:.3} GiB reserved={reserved:.3} GiB"
+            );
+            references.push((
+                tokens,
+                sc15800_cpu_f32(&features)?,
+                mask.to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                reserved,
+            ));
+        }
+        drop(resident);
+        device.synchronize()?;
+        assert!(pool.trim());
+
+        // Component-open prepares/reuses content-addressed device-format sidecars once. No source
+        // conversion occurs inside any measured window below.
+        let streamed = pipeline.load_streamable_text_components(&gen_core::CancelFlag::new())?;
+        assert!(streamed.encoder.is_streamable());
+        // Dense is a measured control, not a publishable tier: it performs MXFP4-to-bf16 source
+        // conversion while opening each window. Resident vs minimum/all-covering is sufficient to
+        // show its bound and mutation; the production q4/q8 sidecar tiers receive the full curve.
+        let windows: &[usize] = if quant_tag == "dense" {
+            &[1, 24]
+        } else {
+            &[1, 2, 4, 8, 24]
+        };
+        for (prompt_index, prompt) in prompts.iter().enumerate() {
+            let (tokens, ref_features, ref_mask, resident_reserved) = &references[prompt_index];
+            let mut rows = Vec::new();
+            for &window in windows {
+                sc15800_quiesce(&device, pool)?;
+                let (features, mask) = pipeline.encode_prompt(
+                    &streamed,
+                    prompt,
+                    "",
+                    DEFAULT_DATE,
+                    false,
+                    Some(window),
+                    &gen_core::CancelFlag::default(),
+                )?;
+                device.synchronize()?;
+                let live = pool.used_high().expect("USED_MEM_HIGH") as f64 / gib;
+                let reserved = pool.reserved_high().expect("RESERVED_MEM_HIGH") as f64 / gib;
+                let got = sc15800_cpu_f32(&features)?;
+                let got_mask = mask
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert_eq!(got_mask, *ref_mask, "window {window} changed the mask");
+                assert_eq!(
+                    got, *ref_features,
+                    "window {window} changed conditioning bytes for {tokens} tokens"
+                );
+                println!(
+                    "[sc-15800] prompt_tokens={tokens:>3} window={window:>2}: live={live:.3} GiB reserved={reserved:.3} GiB"
+                );
+                rows.push((window, reserved));
+            }
+            let w1 = rows[0].1;
+            let w24 = rows.last().expect("window 24 row").1;
+            assert!(
+                w24 > w1 * 1.5,
+                "mutation/control failed for {tokens} tokens: all-covering window {w24:.3} GiB did not restore materially more peak than window 1 {w1:.3} GiB"
+            );
+            assert!(
+                resident_reserved > &(w1 * 1.5),
+                "window 1 did not materially reduce conditioning peak for {tokens} tokens: resident {resident_reserved:.3} GiB vs {w1:.3} GiB"
+            );
+        }
+        Ok(())
+    }
+
+    /// End-to-end companion to the conditioning sweep: the same packed Lens-Turbo request is run
+    /// resident and Sequential+Deferred in one process after sidecar preparation. Pixel bytes must
+    /// be identical, and the driver-reserved request peak reports whether staging changes the actual
+    /// admission-gate envelope rather than merely the encoder sub-phase.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "real Lens weights + CUDA; set SC15800_LENS_ROOT"]
+    fn rung4_real_weights_request_peak_and_pixels() -> CResult<()> {
+        let Ok(root) = std::env::var("SC15800_LENS_ROOT") else {
+            println!("[sc-15800] SKIP: SC15800_LENS_ROOT not set");
+            return Ok(());
+        };
+        let quant_tag = std::env::var("SC15800_LENS_QUANT").unwrap_or_else(|_| "q4".to_owned());
+        let quant = match quant_tag.as_str() {
+            "q4" => Some(Quant::Q4),
+            "q8" => Some(Quant::Q8),
+            "dense" => None,
+            other => panic!("SC15800_LENS_QUANT must be q4, q8, or dense; got {other}"),
+        };
+        let device = Device::new_cuda(0)?;
+        let pool = candle_gen::cuda_mempool::MemPool::device_default(0)
+            .expect("CUDA device 0 default memory pool");
+        let gib = 1024.0 * 1024.0 * 1024.0;
+
+        // Keep artifact creation outside both request peaks. Dense has no sidecars, but opening its
+        // streamable encoder would perform no layer conversion and remains a valid setup step.
+        let pipeline = Pipeline::load(Path::new(&root), &device, Vec::new(), quant, None);
+        let prepared = pipeline.load_streamable_text_components(&gen_core::CancelFlag::new())?;
+        drop(prepared);
+        device.synchronize()?;
+        assert!(pool.trim());
+
+        let req = GenerationRequest {
+            prompt: "a red fox in soft window light".to_owned(),
+            width: 512,
+            height: 512,
+            count: 1,
+            seed: Some(15_800),
+            steps: Some(1),
+            guidance: Some(1.0),
+            ..Default::default()
+        };
+        let run = |policy: OffloadPolicy,
+                   load_shape: gen_core::LoadShape|
+         -> CResult<(Image, f64, f64)> {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&root)))
+                .with_offload_policy(policy)
+                .with_load_shape(load_shape);
+            if let Some(quant) = quant {
+                spec = spec.with_quant(quant);
+            }
+            let generator = provider_registry()?.load(MODEL_ID_TURBO, &spec)?;
+            sc15800_quiesce(&device, pool)?;
+            let output = generator.generate(&req, &mut |_| {})?;
+            device.synchronize()?;
+            let live = pool.used_high().expect("USED_MEM_HIGH") as f64 / gib;
+            let reserved = pool.reserved_high().expect("RESERVED_MEM_HIGH") as f64 / gib;
+            let image = match output {
+                GenerationOutput::Images(mut images) if images.len() == 1 => images.remove(0),
+                GenerationOutput::Images(images) => {
+                    return Err(CandleError::Msg(format!(
+                        "expected one image, got {}",
+                        images.len()
+                    )))
+                }
+                GenerationOutput::Video { .. } | GenerationOutput::Audio(_) => {
+                    return Err(CandleError::Msg("expected image output".to_owned()))
+                }
+            };
+            drop(generator);
+            device.synchronize()?;
+            assert!(pool.trim());
+            Ok((image, live, reserved))
+        };
+
+        let (resident, resident_live, resident_reserved) = run(
+            OffloadPolicy::Resident,
+            gen_core::LoadShape::EagerMaterialization,
+        )?;
+        let (staged, staged_live, staged_reserved) = run(
+            OffloadPolicy::Sequential,
+            gen_core::LoadShape::DeferredMaterialization,
+        )?;
+        assert_eq!(
+            (staged.width, staged.height),
+            (resident.width, resident.height)
+        );
+        assert_eq!(
+            staged.pixels, resident.pixels,
+            "Sequential+Deferred changed Lens-Turbo pixels"
+        );
+        println!(
+            "[sc-15800] request {quant_tag} 512x512/1-step: resident live={resident_live:.3} GiB reserved={resident_reserved:.3} GiB; sequential-window1 live={staged_live:.3} GiB reserved={staged_reserved:.3} GiB; reserved change={:.1}%",
+            100.0 * (staged_reserved / resident_reserved - 1.0)
+        );
+        Ok(())
+    }
 
     #[test]
     fn descriptors_are_lens() {
@@ -932,6 +2267,346 @@ mod integration_tests {
                 "{id} should resolve + lazily construct in the registry"
             );
         }
+    }
+
+    #[test]
+    fn text_window_requires_sequential_deferred_packed_load() {
+        let base = || LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
+        assert!(!streams_text_encoder(&base()));
+        assert!(!streams_text_encoder(
+            &base()
+                .with_quant(Quant::Q4)
+                .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
+        ));
+        assert!(!streams_text_encoder(
+            &base()
+                .with_quant(Quant::Q4)
+                .with_offload_policy(OffloadPolicy::Sequential)
+        ));
+        assert!(!streams_text_encoder(
+            &base()
+                .with_offload_policy(OffloadPolicy::Sequential)
+                .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
+        ));
+        for quant in [Quant::Q4, Quant::Q8] {
+            let (root, spec) = packed_memory_spec(quant);
+            assert!(
+                !streams_text_encoder(&spec),
+                "a config plus one pseudo-triple must not advertise a 24-layer transfer-only encoder"
+            );
+            let wrong_quant = if quant == Quant::Q4 {
+                Quant::Q8
+            } else {
+                Quant::Q4
+            };
+            assert!(
+                !streams_text_encoder(&spec.clone().with_quant(wrong_quant)),
+                "the requested quant must match the on-disk packed tier"
+            );
+            let mut adapted = spec.clone();
+            adapted.adapters.push(AdapterSpec::new(
+                root.join("adapter.safetensors"),
+                1.0,
+                gen_core::AdapterKind::Lora,
+            ));
+            assert!(!streams_text_encoder(&adapted));
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn memory_contract_is_load_exact_and_text_encoder_scoped() {
+        use gen_core::{LoadShape, MemoryStrategy, MemoryStrategySupport, TransformerComponent};
+
+        let base = || LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
+        let (eligible_root, eligible) = packed_memory_spec(Quant::Q4);
+        let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&eligible, true);
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        ));
+        let bounded = contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .unwrap();
+        assert!(matches!(
+            bounded.support,
+            MemoryStrategySupport::Implemented
+        ));
+        assert_eq!(bounded.parameters.transformer_window_sizes, [1]);
+        assert_eq!(
+            bounded.parameters.transformer_window_components,
+            [TransformerComponent::TextEncoder]
+        );
+        assert!(contract.calibration.is_some());
+        assert!(contract
+            .calibration
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .contains("q4"));
+        let (q8_root, q8_spec) = packed_memory_spec(Quant::Q8);
+        let q8_contract =
+            build_lens_turbo_memory_strategy_contract_with_eligibility(&q8_spec, true);
+        assert_ne!(contract.calibration, q8_contract.calibration);
+        let mut adapted = eligible.clone();
+        adapted.adapters.push(AdapterSpec::new(
+            eligible_root.join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        assert!(
+            build_lens_turbo_memory_strategy_contract(&adapted)
+                .calibration
+                .is_none(),
+            "unaccounted auxiliary resident bytes must fail closed"
+        );
+
+        for ineligible in [
+            base().with_quant(Quant::Q4),
+            base()
+                .with_quant(Quant::Q4)
+                .with_offload_policy(OffloadPolicy::Sequential),
+            base()
+                .with_offload_policy(OffloadPolicy::Sequential)
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        ] {
+            let contract = build_lens_turbo_memory_strategy_contract(&ineligible);
+            gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+            assert!(matches!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            ));
+            assert!(matches!(
+                contract
+                    .capability(MemoryStrategy::StagedResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            ));
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                "lens-turbo-candle-cuda-resident-v1"
+            );
+        }
+        std::fs::remove_dir_all(eligible_root).ok();
+        std::fs::remove_dir_all(q8_root).ok();
+    }
+
+    #[test]
+    fn safety_check_rejects_stale_calibration_and_wrong_numeric_tier() {
+        let (root, spec) = packed_memory_spec(Quant::Q4);
+        let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
+        let calibration = contract.calibration.clone().unwrap();
+        let generator = LensGenerator {
+            descriptor: descriptor_turbo(),
+            defaults: TURBO_DEFAULTS,
+            pipeline: Pipeline::load(&root, &Device::Cpu, Vec::new(), Some(Quant::Q4), None),
+            components: Mutex::new(None),
+            sequential: true,
+            stream_text: true,
+            loaded_precision: Precision::Bf16,
+            loaded_quant: Some(Quant::Q4),
+            memory_contract: Some(contract),
+        };
+        let mut context = gen_core::MemoryRunContext {
+            selection: gen_core::MemorySelection {
+                strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,
+                parameters: gen_core::MemoryStrategyParameters {
+                    transformer_window_size: Some(1),
+                    transformer_window_component: Some(gen_core::TransformerComponent::TextEncoder),
+                    ..Default::default()
+                },
+                tier: gen_core::MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            mode: gen_core::MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: gen_core::MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: gen_core::MemoryBudget {
+                total_bytes: u64::MAX,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: gen_core::MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        };
+        assert_eq!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+        context.calibration_fingerprint = "stale".to_owned();
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Reject { .. }
+        ));
+        context.calibration_fingerprint = calibration.fingerprint;
+        context.selection.tier.quant = Some(Quant::Q8);
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Reject { .. }
+        ));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn selected_text_window_reaches_the_request_scope() {
+        use gen_core::MemoryRequestScope;
+
+        let (root, spec) = packed_memory_spec(Quant::Q4);
+        let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
+        let tier = gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let select = |strategy, parameters| gen_core::MemorySelection {
+            strategy,
+            parameters,
+            tier,
+        };
+        assert_eq!(
+            lens_generation_memory(
+                &contract,
+                select(
+                    gen_core::MemoryStrategy::Resident,
+                    gen_core::MemoryStrategyParameters::default()
+                )
+            ),
+            Some(gen_core::GenerationMemory::default())
+        );
+        assert_eq!(
+            lens_generation_memory(
+                &contract,
+                select(
+                    gen_core::MemoryStrategy::StagedResidency,
+                    gen_core::MemoryStrategyParameters::default()
+                )
+            ),
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            })
+        );
+        let selection = select(
+            gen_core::MemoryStrategy::BoundedTransformerResidency,
+            gen_core::MemoryStrategyParameters {
+                transformer_window_size: Some(DEFAULT_TEXT_ENCODER_WINDOW as u32),
+                transformer_window_component: Some(gen_core::TransformerComponent::TextEncoder),
+                ..Default::default()
+            },
+        );
+        let memory = lens_generation_memory(&contract, selection).unwrap();
+        assert!(memory.stage_residency);
+        assert!(memory.stream_transformer_blocks);
+        assert_eq!(memory.transformer_window_size, Some(1));
+        assert_eq!(
+            memory.transformer_window_component,
+            Some(gen_core::TransformerComponent::TextEncoder)
+        );
+
+        let mut scope = LensMemoryScope {
+            device: Device::Cpu,
+            memory: Some(memory),
+            finished: false,
+        };
+        let mut request = GenerationRequest::default();
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(request.memory, Some(memory));
+        scope
+            .materialize_transformer_window(0, DEFAULT_TEXT_ENCODER_WINDOW as u32)
+            .unwrap();
+        assert!(scope.materialize_transformer_window(0, 2).is_err());
+        assert!(scope
+            .materialize_transformer_window(TEXT_ENCODER_LAYER_COUNT, 1)
+            .is_err());
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn request_memory_overrides_load_defaults_without_cross_run_leakage() {
+        let generator = LensGenerator {
+            descriptor: descriptor_turbo(),
+            defaults: TURBO_DEFAULTS,
+            pipeline: Pipeline::load(
+                Path::new("/nonexistent/lens"),
+                &Device::Cpu,
+                Vec::new(),
+                Some(Quant::Q4),
+                None,
+            ),
+            components: Mutex::new(None),
+            sequential: true,
+            stream_text: true,
+            loaded_precision: Precision::Bf16,
+            loaded_quant: Some(Quant::Q4),
+            memory_contract: None,
+        };
+        let resolved = |memory: Option<gen_core::GenerationMemory>| {
+            generator
+                .execution_mode(&GenerationRequest {
+                    memory,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        assert_eq!(resolved(None), (true, true));
+        assert_eq!(
+            resolved(Some(gen_core::GenerationMemory::default())),
+            (false, false)
+        );
+        assert_eq!(
+            resolved(Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            })),
+            (true, false)
+        );
+        assert_eq!(resolved(None), (true, true));
+        assert!(
+            !generator.cache_components_for_request(false),
+            "a resident baseline on a Sequential-loaded generator must stay request-local"
+        );
+        assert!(candle_gen::lock_recover(&generator.components).is_none());
+
+        let ineligible = LensGenerator {
+            stream_text: false,
+            ..generator
+        };
+        assert!(ineligible
+            .execution_mode(&GenerationRequest {
+                memory: Some(gen_core::GenerationMemory {
+                    stage_residency: true,
+                    stream_transformer_blocks: true,
+                    transformer_window_size: Some(1),
+                    transformer_window_component: Some(gen_core::TransformerComponent::TextEncoder),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .is_err());
     }
 
     #[test]
