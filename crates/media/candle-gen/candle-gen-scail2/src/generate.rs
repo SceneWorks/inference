@@ -32,7 +32,7 @@ use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
 
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride, and
 /// the 28-channel mask pools 8×, so both the full and half grids stay integer + even.
-const DIM_ALIGN: u32 = 32;
+pub(crate) const DIM_ALIGN: u32 = 32;
 
 /// The loaded SCAIL-2 components (resident in the [`crate::pipeline::Scail2`] generator's cache). All
 /// run f32 (the DiT's high-token-length NaN avoidance, and z16 VAE / UMT5 / CLIP are f32 anyway).
@@ -77,7 +77,11 @@ pub struct Scail2Job<'a> {
 }
 
 /// Round a requested dim down to a multiple of [`DIM_ALIGN`] (min one tile).
-fn align(value: u32) -> usize {
+///
+/// The single source of truth for "what this pipeline actually renders at": [`crate::pipeline`]'s
+/// `reject_over_area` measures its area cap through this same function, so the admission gate can
+/// never judge a geometry the denoise loop would not produce (sc-16197).
+pub(crate) fn align(value: u32) -> usize {
     (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
 }
 
