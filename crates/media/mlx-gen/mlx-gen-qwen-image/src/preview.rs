@@ -23,11 +23,28 @@ use crate::pipeline::unpack_latents;
 /// Least-squares latent→RGB factors for the Qwen-Image VAE latent space (16 channels; row *i* maps
 /// latent channel *i* to `[r, g, b]`), with [`RGB_BIAS`] the intercept.
 ///
-/// Fit offline by ordinary least squares on `decoded_rgb ≈ latent · M + b` over (final unpacked
-/// latent, 8×-downsampled VAE decode) pairs — 2 prompts/seeds, 8-step Lightning at 1024², 32,768
-/// samples, R² = 0.9586. They approximate this VAE's decoder and nothing else: **refit whenever the
-/// VAE lineage changes**, by dumping the two halves of a real render and re-solving. A stale fit
-/// degrades preview colour only; it cannot affect the render, which never reads these.
+/// Fit by ordinary least squares on `decoded_rgb ≈ latent · M + b` over (final unpacked latent,
+/// 8×-downsampled VAE decode) pairs — 2 prompts/seeds, 8-step Lightning at 1024², 32,768 samples,
+/// R² = 0.9586.
+///
+/// **Refit whenever the VAE lineage changes**, with `tests/fit_preview_rgb.rs`:
+///
+/// ```sh
+/// QWEN_IMAGE_SNAPSHOT=… cargo test -p mlx-gen-qwen-image --release \
+///   --test fit_preview_rgb -- --ignored --nocapture
+/// ```
+///
+/// That producer renders the corpus, solves the system, and prints this block ready to paste. It
+/// exists because this comment used to end at "re-solving" — naming a procedure with no
+/// implementation, which left the constants unreproducible and the R² above uncheckable by anyone
+/// who did not fit them. The original corpus is gone, so the producer reports its delta against
+/// these values rather than claiming to replay them.
+///
+/// A stale fit degrades preview colour only; it cannot affect the render, which never reads these.
+///
+/// **These are not Qwen-Image-only.** `mlx-gen-krea` reuses [`QwenVae`](crate::QwenVae) directly, so
+/// the same latent space — and therefore the same fit — applies to the Krea family unchanged. A
+/// second family needs its own fit only if it has its own VAE.
 const RGB_FACTORS: [[f32; 3]; 16] = [
     [-0.00986379, 0.0257554, 0.211834],
     [-0.00150066, -0.00355605, 0.00219657],
