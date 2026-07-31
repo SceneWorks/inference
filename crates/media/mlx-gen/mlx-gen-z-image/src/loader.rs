@@ -49,6 +49,27 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
     load_text_encoder_from_weights(w)
 }
 
+/// The **streamable** encoder for rung 4's text-encoder scope (SC-15794): it records the re-openable
+/// directory so the layer stack can be materialized a window at a time.
+///
+/// Selected by [`mlx_gen::LoadShape::DeferredMaterialization`], independently from phase-level
+/// residency. A Resident+Deferred generator intentionally re-materializes the 36-layer window per
+/// encode while retaining its tokenizer and non-windowed generator state. SC-15998 measured that
+/// shape with no phase reload, so the repeated materialization is an explicit load-shape cost rather
+/// than an accidental rung-4 fallback.
+pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
+    let dir = root.join("text_encoder");
+    let w = Weights::from_dir(&dir)?;
+    TextEncoder::from_streamable_source(
+        &w,
+        mlx_gen::WeightsSource::Dir(dir),
+        "model",
+        &ZTextEncoderConfig::z_image(),
+    )
+}
+
+/// The in-memory / ComfyUI-normalized path: no re-openable source, so no stream. The contract declares
+/// the text-encoder component unavailable for such a load, exactly as it does for the DiT stream.
 pub(crate) fn load_text_encoder_from_weights(w: Weights) -> Result<TextEncoder> {
     TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())
 }
@@ -62,7 +83,25 @@ pub(crate) fn load_text_encoder_from_weights(w: Weights) -> Result<TextEncoder> 
 /// to bf16 is the quantize path (`AdaptableLinear::quantize`, tagged PARITY-BF16) to byte-match the
 /// fork's Q8/Q4 golden; that too is a flip-to-f32 candidate once parity stops being the goal.
 pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
-    load_transformer_from_weights(Weights::from_dir(root.join("transformer"))?)
+    load_transformer_with_stream(root, true)
+}
+
+/// Load the transformer in the component form selected for this request.
+pub(crate) fn load_transformer_with_stream(
+    root: &Path,
+    streamable: bool,
+) -> Result<ZImageTransformer> {
+    let dir = root.join("transformer");
+    let transformer = load_transformer_from_weights(Weights::from_dir(&dir)?)?;
+    // SC-15754: a snapshot directory is re-openable, so rung 4 (bounded transformer residency) can
+    // rebuild `layers` per window from exactly these files. `remap_transformer_keys` only aliases the
+    // timestep-embedder and final-layer keys — never a `layers.*` key — so a streamed block reads the
+    // same names off disk that the resident load did, with no remap to replay.
+    Ok(if streamable {
+        transformer.with_block_stream(WeightsSource::Dir(dir), "")
+    } else {
+        transformer
+    })
 }
 
 pub(crate) fn load_transformer_from_weights(mut w: Weights) -> Result<ZImageTransformer> {
@@ -78,12 +117,28 @@ pub fn load_control_transformer(
     root: &Path,
     control: &WeightsSource,
 ) -> Result<ZImageControlTransformer> {
-    let base = load_transformer(root)?;
+    load_control_transformer_with_stream(root, control, true)
+}
+
+pub(crate) fn load_control_transformer_with_stream(
+    root: &Path,
+    control: &WeightsSource,
+    streamable: bool,
+) -> Result<ZImageControlTransformer> {
+    let base = load_transformer_with_stream(root, streamable)?;
     let control_weights = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
         WeightsSource::Dir(p) => Weights::from_dir(p)?,
     };
-    ZImageControlTransformer::from_weights(base, &control_weights, "")
+    // SC-15754: the ControlNet checkpoint is re-openable too, so the 15-block main control stack gets
+    // its own rung-4 stream alongside the base DiT's. The control keys map 1:1 onto the tree (no
+    // remap), so a streamed control block reads the same names the resident load did.
+    let transformer = ZImageControlTransformer::from_weights(base, &control_weights, "")?;
+    Ok(if streamable {
+        transformer.with_control_block_stream(control.clone(), "")
+    } else {
+        transformer
+    })
 }
 
 /// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
@@ -331,5 +386,64 @@ mod quant_tier_tests {
             "requesting Q4 over a packed Q8 turnkey must error, got: {err}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// SC-15754 guard: the rung-4 block stream re-reads `layers.*` straight off the snapshot and does
+/// **not** replay [`remap_transformer_keys`], because that remap touches only the timestep embedder
+/// and the final layer. That is true today and load-bearing — a streamed block built from unremapped
+/// keys would silently differ from its resident twin, and the failure would look like a numerical
+/// drift rather than a missing remap.
+///
+/// So this pins the coupling rather than leaving it to the comment: if a future checkpoint needs a
+/// `layers.*` alias, this test fails and whoever adds it has to teach the stream about it.
+#[cfg(test)]
+mod block_stream_remap_guard {
+    use super::*;
+    use mlx_gen::weights::Weights;
+    use mlx_rs::Array;
+
+    #[test]
+    fn the_transformer_remap_never_touches_a_layers_key() {
+        let mut w = Weights::empty();
+        // A representative slice of the real key set: both remap sources, and a trunk block.
+        for key in [
+            "t_embedder.mlp.0.weight",
+            "t_embedder.mlp.2.weight",
+            "all_final_layer.2-1.adaLN_modulation.1.weight",
+            "layers.0.attention.to_q.weight",
+            "layers.29.feed_forward.w1.weight",
+            "layers.7.adaLN_modulation.0.weight",
+        ] {
+            w.insert(key, Array::from_f32(1.0));
+        }
+        let before: Vec<String> = w
+            .keys()
+            .filter(|k| k.starts_with("layers."))
+            .map(String::from)
+            .collect();
+
+        remap_transformer_keys(&mut w);
+
+        let after: Vec<String> = w
+            .keys()
+            .filter(|k| k.starts_with("layers."))
+            .map(String::from)
+            .collect();
+        let mut before_sorted = before.clone();
+        let mut after_sorted = after.clone();
+        before_sorted.sort();
+        after_sorted.sort();
+        assert_eq!(
+            before_sorted, after_sorted,
+            "remap_transformer_keys added or renamed a `layers.*` key. The rung-4 block stream reads \
+             those keys directly off the snapshot and does not replay this remap, so a streamed block \
+             would no longer match its resident twin. Teach `ZImageBlockStream` about the new alias."
+        );
+        // ...and it did do its actual job, so this is not vacuously green on a no-op remap.
+        assert!(w.get("t_embedder.linear1.weight").is_some());
+        assert!(w
+            .get("all_final_layer.2-1.adaLN_modulation.0.weight")
+            .is_some());
     }
 }

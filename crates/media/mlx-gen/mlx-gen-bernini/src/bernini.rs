@@ -46,7 +46,8 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, SizeFloor,
+    WeightsSource,
 };
 
 use mlx_gen_wan::config::WanModelConfig;
@@ -568,6 +569,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

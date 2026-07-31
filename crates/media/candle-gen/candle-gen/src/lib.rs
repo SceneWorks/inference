@@ -170,6 +170,21 @@ pub use residency::{
     sequential_offload_enabled, Residency, OFFLOAD_ENV,
 };
 
+// Driver memory-pool introspection (sc-12818, widened by SC-15792). Gated on `cuda` alone rather
+// than on `testkit`: the CUDA compile/Clippy lane enables `cuda` and NOT `testkit`, so a probe living
+// only behind `testkit` is invisible to the one lane that can build it — which is precisely why
+// SC-15791's spike ended up forking `default_pool` instead of extending testkit. `testkit` re-exports
+// the two original functions, so existing consumers are unchanged.
+#[cfg(feature = "cuda")]
+pub mod cuda_mempool;
+
+// Rung-4 bounded transformer residency, the candle half (SC-15792, epic 15448). The schedule lives
+// in `gen_core::block_window` (hoisted by SC-15790 so candle would not fork it); this binds candle's
+// two backend answers — both measured in SC-15791, both different from MLX's — plus the teardown
+// synchronize that has no MLX counterpart because MLX has no driver/pool split.
+pub mod block_window;
+pub use block_window::BlockPlan;
+
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, and GPU
 // peak-VRAM helpers that had been hand-copied — and had drifted — across ~16 `#[cfg(test)]`
 // validation modules in the provider crates. Weight snapshots are not resolved here: inference never
@@ -202,6 +217,18 @@ pub enum CandleError {
     /// variant, sc-4481). Mirrors mlx-gen's `Error::Canceled`.
     #[error("cancelled")]
     Canceled,
+
+    /// A measured pre-render refusal. Keep every decision-surface field typed across the Candle seam
+    /// so worker/API telemetry can distinguish it from an opaque backend failure.
+    #[error(
+        "geometry refused: {reason}; requested {requested_width}x{requested_height}; verified alternative: {alternative:?}"
+    )]
+    GeometryRefused {
+        reason: String,
+        requested_width: u32,
+        requested_height: u32,
+        alternative: Option<(u32, u32)>,
+    },
 }
 
 impl From<CandleError> for gen_core::Error {
@@ -212,6 +239,17 @@ impl From<CandleError> for gen_core::Error {
             CandleError::Msg(s) => gen_core::Error::Msg(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
+            CandleError::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
         }
     }
 }
@@ -229,6 +267,17 @@ impl From<gen_core::Error> for CandleError {
             gen_core::Error::Canceled => CandleError::Canceled,
             gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
             gen_core::Error::Unsupported(s) => CandleError::Msg(format!("unsupported: {s}")),
+            gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => CandleError::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
             gen_core::Error::Io(io) => CandleError::Msg(io.to_string()),
             gen_core::Error::Backend(b) => CandleError::Msg(b.to_string()),
             gen_core::Error::Msg(s) => CandleError::Msg(s),
@@ -310,6 +359,36 @@ mod tests {
         let candle_err = CandleError::from(bad.unwrap_err());
         let neutral: gen_core::Error = candle_err.into();
         assert!(matches!(neutral, gen_core::Error::Backend(_)));
+    }
+
+    #[test]
+    fn geometry_refusal_round_trips_without_losing_decision_fields() {
+        let neutral = gen_core::Error::GeometryRefused {
+            reason: "measured infeasible".to_owned(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: Some((1024, 1024)),
+        };
+        let candle = CandleError::from(neutral);
+        assert!(matches!(
+            &candle,
+            CandleError::GeometryRefused {
+                reason,
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+            } if reason == "measured infeasible"
+        ));
+        let neutral = gen_core::Error::from(candle);
+        assert!(matches!(
+            neutral,
+            gen_core::Error::GeometryRefused {
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+                ..
+            }
+        ));
     }
 
     #[test]

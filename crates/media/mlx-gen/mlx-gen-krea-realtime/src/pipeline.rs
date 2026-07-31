@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use mlx_gen::{
     default_seed, AdapterApplyReport, AdapterSpec, CancelFlag, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, Modality,
-    ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    ModelDescriptor, Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
@@ -114,6 +114,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -438,7 +439,10 @@ mod tests {
     }
 
     fn actual_tiny_adapter_report() -> AdapterApplyReport {
-        let dir = std::env::temp_dir().join("mlx_gen_krea_pipeline_report_test");
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_gen_krea_pipeline_report_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("actual_report_{}.safetensors", std::process::id()));
         let delta = Array::from_slice(&[0.25f32, -0.5], &[2]);

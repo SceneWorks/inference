@@ -22,7 +22,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    WeightsSource,
+    SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
@@ -32,7 +32,7 @@ use candle_gen_wan::vae16::WanVae16;
 
 use crate::clip::{ClipVisionConfig, ScailClip};
 use crate::config::Scail2Config;
-use crate::generate::{CharacterRef, Components, Scail2Job};
+use crate::generate::{align, CharacterRef, Components, Scail2Job, DIM_ALIGN};
 use crate::model::Scail2Dit;
 
 /// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
@@ -105,6 +105,9 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: DIM_ALIGN,
+            },
         },
     }
 }
@@ -246,10 +249,14 @@ impl Generator for Scail2 {
         // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
         reject_multi_reference(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
-        reject_over_area(self.descriptor.id, req)?;
         self.descriptor
             .capabilities
-            .validate_request(self.descriptor.id, req)
+            .validate_request(self.descriptor.id, req)?;
+        // The advertised explicit grid runs before the lattice-projected area gate. Otherwise an
+        // off-grid request in the old raw-vs-aligned band (1280x730) could still report only an area
+        // verdict here while MLX reports the grid rule, even though both descriptors promise the
+        // same exact-or-rejected behavior (sc-16198).
+        reject_over_area(self.descriptor.id, req)
     }
 
     fn generate(
@@ -302,13 +309,36 @@ fn reject_zero_steps(id: &str, req: &GenerationRequest) -> gen_core::Result<()> 
 /// VAE-decode peak. Reject past the shared A14B cap with an actionable message, mirroring the A14B MoE
 /// lane (`wan14b.rs`, sc-9028 / F-044); the incident class F-090 (sc-11215) left this lane open. `max_size`
 /// alone only bounds each edge, so 1280×1280 (both ≤ 1280) slips through without the area check.
+///
+/// sc-16197 made this helper measure the lattice-projected geometry rather than the raw product.
+/// `1280×730`, for example, projects to `1280×704`. sc-16198 then advertised that same
+/// [`DIM_ALIGN`] lattice through [`SizeFloor::RangeCheckedOnGrid`] and runs the shared floor before
+/// this helper, so every provider request that reaches this point is already on-grid and [`align`] is
+/// a no-op. Direct helper tests retain the off-grid rows to pin the rendered-geometry area rule
+/// independently.
+///
+/// The `0×0` sentinel is still refused by Candle's floor. If sc-16199 makes it reachable, this
+/// request-taking helper must be replaced with a resolved-dimensions gate so it cannot measure
+/// `32×32` while the clip resolves to a much larger geometry.
 fn reject_over_area(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
-    let area = req.width as usize * req.height as usize;
+    let (w, h) = (align(req.width), align(req.height));
+    let area = w * h;
     if area > MAX_AREA_14B {
+        // Report the geometry the gate measured, and name the snap when it happened. Quoting the raw
+        // product alone would send an off-lattice caller hunting for an off-by-one that isn't there.
+        // (The wording is candle-only: `mlx-gen-scail2` reaches the same end by naming the requested
+        // geometry in the head of its message and the rendered one in the reason clause.)
+        let snapped = if (w, h) == (req.width as usize, req.height as usize) {
+            String::new()
+        } else {
+            format!(
+                " (the requested {}×{} snaps onto the {DIM_ALIGN}-px lattice)",
+                req.width, req.height
+            )
+        };
         return Err(gen_core::Error::Msg(format!(
-            "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
-             (1280×720); reduce the resolution",
-            req.width, req.height
+            "{id}: width×height ({w}×{h} = {area} px){snapped} exceeds the max area \
+             {MAX_AREA_14B} px (1280×720); reduce the resolution"
         )));
     }
     Ok(())
@@ -438,6 +468,32 @@ mod tests {
         // lands (sc-5583) — advertising it silently dropped the extra characters (sc-8985).
         assert!(!d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.samplers.contains(&"unipc"));
+        assert_eq!(
+            d.capabilities.size_floor.explicit_size_multiple(),
+            Some(DIM_ALIGN)
+        );
+    }
+
+    #[test]
+    fn explicit_off_grid_size_is_refused_weights_free() {
+        for (width, height) in [(1280, 730), (730, 1280)] {
+            let req = GenerationRequest {
+                width,
+                height,
+                count: 1,
+                ..Default::default()
+            };
+
+            let err = descriptor()
+                .capabilities
+                .validate_request(MODEL_ID, &req)
+                .expect_err("an explicit off-grid size must be refused before loading")
+                .to_string();
+            assert!(
+                err.contains("multiples of 32") && err.contains(&format!("{width}×{height}")),
+                "the refusal must name the required grid and requested size, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -509,7 +565,6 @@ mod tests {
         // A far-over-envelope request (1280×1280, both edges ≤ `max_size` so `max_size` alone lets it
         // through) must be a fast, actionable rejection — NOT minutes of the f32 14B DiT running to an
         // opaque CUDA OOM (F-090 / sc-11215, mirroring the A14B MoE lane's sc-9028 guard).
-        assert_eq!(1280 * 720, MAX_AREA_14B);
         let over = GenerationRequest {
             prompt: "a character".into(),
             width: 1280,
@@ -519,10 +574,22 @@ mod tests {
         let err = reject_over_area(MODEL_ID, &over).expect_err("over-area must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("max area"), "message names the cap: {msg}");
-        // Exactly at the cap (1280×720 = 921 600 px) and a small in-bounds request both pass the
-        // guard. SCAIL-2 is a Wan2.1-14B I2V derivative on the z16 VAE (grid 16), so 720 is
-        // on-lattice and the canonical 720p must pass — it did not while this cap carried the
-        // TI2V-5B's 901 120 (sc-12308).
+        // Both edges are already on the lattice, so nothing was snapped and the message must not
+        // claim otherwise — the parenthetical is reserved for a request whose measured geometry
+        // differs from the typed one.
+        assert!(
+            msg.contains("1280×1280 = 1638400 px") && !msg.contains("snaps onto"),
+            "an on-lattice refusal quotes the geometry as typed, with no snap note: {msg}"
+        );
+        // The canonical 720p and a small in-bounds request both pass the guard. 1280×720 is
+        // `MAX_AREA_14B` exactly *as typed* — it did not pass while this cap carried the TI2V-5B's
+        // 901 120 (sc-12308) — but since sc-16197 the gate measures the rendered geometry, and
+        // SCAIL-2's own lattice is 32, not the z16 VAE's 16: `720` floors to `704`, so what is
+        // actually weighed here is 1280×704 = 901 120, with 20 480 px of slack. The strict-`>`
+        // boundary duty therefore moved to the on-lattice 960×960 row in
+        // `over_area_is_judged_on_the_aligned_geometry`; this row's job is now the headline
+        // resolution passing, which the raw reading would have left one pixel of slack from refusing.
+        assert_eq!(1280 * 720, MAX_AREA_14B);
         let at_cap = GenerationRequest {
             width: 1280,
             height: 720,
@@ -535,6 +602,126 @@ mod tests {
             ..over
         };
         assert!(reject_over_area(MODEL_ID, &small).is_ok());
+    }
+
+    /// The helper projects onto the render lattice before measuring the cap (sc-16197).
+    ///
+    /// The area helper projects every edge down to the [`DIM_ALIGN`] lattice. The provider now
+    /// rejects these off-grid requests before calling it (sc-16198), but direct rows still pin the
+    /// sc-16197 arithmetic independently: a regression to the raw product turns this test RED.
+    ///
+    /// Every row appears in **both orientations**. The fix aligns two edges, and a landscape-only
+    /// table gates only one of them: with `1280` and `1216` already on the lattice, dropping the
+    /// `align` from the *width* alone would leave a landscape-only table green. `mlx-gen-wan` pairs
+    /// its own area rows the same way.
+    #[test]
+    fn over_area_is_judged_on_the_aligned_geometry() {
+        let req = |w, h| GenerationRequest {
+            prompt: "a character".into(),
+            width: w,
+            height: h,
+            ..Default::default()
+        };
+        for (w, h, aw, ah) in [
+            // The story's headline row: 934 400 raw, 901 120 rendered.
+            (1280u32, 730u32, 1280usize, 704usize),
+            (730, 1280, 704, 1280),
+            // …and one where neither edge is the one the headline row snapped.
+            (1216, 760, 1216, 736),
+            (760, 1216, 736, 1216),
+        ] {
+            // Pin the area helper's retained projection arithmetic independently of provider
+            // validation and low-level generation.
+            assert_eq!(
+                (align(w), align(h)),
+                (aw, ah),
+                "{w}×{h} renders at {aw}×{ah}"
+            );
+            assert!(
+                w as usize * h as usize > MAX_AREA_14B,
+                "{w}×{h} must be over the cap AS TYPED, or this row proves nothing"
+            );
+            assert!(
+                aw * ah <= MAX_AREA_14B,
+                "{aw}×{ah} must be inside the cap once aligned"
+            );
+            reject_over_area(MODEL_ID, &req(w, h))
+                .unwrap_or_else(|e| panic!("{w}×{h} renders at {aw}×{ah}, inside the cap: {e}"));
+        }
+
+        // The band is a band, not a hole: once the ALIGNED geometry is over the cap, the request is
+        // still refused — and the message reports the measured geometry plus the snap that produced
+        // it, so the caller is not left hunting for an off-by-one against the number they typed.
+        // Both orientations again, so the reported dims cannot come out transposed.
+        for (w, h, aw, ah) in [
+            (1280u32, 760u32, 1280usize, 736usize),
+            (760, 1280, 736, 1280),
+        ] {
+            assert_eq!((align(w), align(h)), (aw, ah));
+            assert!(aw * ah > MAX_AREA_14B, "{aw}×{ah} is over the cap");
+            let err = reject_over_area(MODEL_ID, &req(w, h))
+                .expect_err("942 080 px is over the cap even after aligning");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("{aw}×{ah} = {} px", aw * ah)),
+                "the refusal quotes the RENDERED geometry: {msg}"
+            );
+            assert!(
+                msg.contains(&format!(
+                    "the requested {w}×{h} snaps onto the 32-px lattice"
+                )),
+                "the refusal names the snap that produced it: {msg}"
+            );
+        }
+
+        // The cap stays a strict `>`: 960×960 is on-lattice and EXACTLY `MAX_AREA_14B`, so aligning
+        // changes nothing and it must still pass. (The mirror of `mlx-gen-scail2`'s own 960×960 row.)
+        assert_eq!(960 * 960, MAX_AREA_14B);
+        assert!(reject_over_area(MODEL_ID, &req(960, 960)).is_ok());
+
+        // [`align`]'s min-one-tile floor is load-bearing for the paragraph in `reject_over_area`'s
+        // doc that reasons about it: a sub-lattice edge snaps UP to one tile, so the measured area
+        // can only ever grow, and the `0×0` sentinel measures 32×32 = 1024 px rather than 0. Drop
+        // the `.max(1)` and the doc's argument silently stops being true.
+        assert_eq!((align(0), align(1), align(31)), (32, 32, 32));
+        assert!(reject_over_area(MODEL_ID, &req(0, 0)).is_ok());
+        // …and that raise is not a hole: an edge under one tile still refuses when the OTHER edge
+        // carries it past the cap. `1×30000` → `32×29984` = 959 488 px.
+        assert_eq!((align(1), align(30000)), (32, 29984));
+        assert!(reject_over_area(MODEL_ID, &req(1, 30000)).is_err());
+    }
+
+    /// [`reject_over_area`] measures the **requested** dims, which are exact render dims because
+    /// [`SizeFloor::RangeCheckedOnGrid`] refuses both off-grid geometry and the `0×0` sentinel before
+    /// this helper can run.
+    ///
+    /// That is a cross-crate dependency (the floor lives in gen-core's `validate_request`), and
+    /// sc-16199 exists to revisit this very declaration. Pinning it here means relaxing the floor
+    /// turns this test RED at the site that depends on it, instead of silently opening a gap where an
+    /// auto-sized 4K clip measures 1 024 px and renders 8.2 Mpx.
+    #[test]
+    fn descriptor_declares_the_size_floor_this_gate_depends_on() {
+        assert_eq!(
+            descriptor().capabilities.size_floor,
+            SizeFloor::RangeCheckedOnGrid {
+                multiple: DIM_ALIGN
+            }
+        );
+        let sentinel = GenerationRequest {
+            prompt: "a character".into(),
+            width: 0,
+            height: 0,
+            ..Default::default()
+        };
+        // The area gate itself passes the sentinel (32×32 once aligned) — the floor is what stops it.
+        assert!(reject_over_area(MODEL_ID, &sentinel).is_ok());
+        assert!(
+            descriptor()
+                .capabilities
+                .validate_request(MODEL_ID, &sentinel)
+                .is_err(),
+            "the capability floor must refuse 0×0, or the area gate is measuring the wrong geometry"
+        );
     }
 
     #[test]

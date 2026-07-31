@@ -16,6 +16,7 @@ methodology as `dump_qwen_image_golden.py`. Output suffix: `_q8` / `_q4`.
 
 import mlx.core as mx
 import numpy as np
+from _adapter_parity_provenance import assert_frozen_mflux, golden_metadata
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
     FlowMatchEulerDiscreteScheduler as S,
@@ -39,6 +40,12 @@ STEPS = int(os.environ.get("ZIMAGE_STEPS", "4"))
 W = int(os.environ.get("ZIMAGE_W", "256"))
 H = int(os.environ.get("ZIMAGE_H", "256"))
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
+MODEL_REPOSITORY = "Tongyi-MAI/Z-Image-Turbo"
+MODEL_REVISION = os.environ.get(
+    "ZIMAGE_REFERENCE_REVISION", "f332072aa78be7aecdf3ee76d5c247082da564a6"
+)
+MODEL_PATH = os.environ.get("ZIMAGE_REFERENCE_MODEL", MODEL_REPOSITORY)
+assert_frozen_mflux()
 
 _SUFFIX = f"_q{QUANTIZE}" if QUANTIZE else ""
 OUT = os.path.join(_GOLDEN_DIR, f"z_image{_SUFFIX}_golden.safetensors")
@@ -50,7 +57,12 @@ class Holder:
 
 
 model = Holder()
-ZImageInitializer.init(model, model_config=ModelConfig.z_image_turbo(), quantize=QUANTIZE)
+ZImageInitializer.init(
+    model,
+    model_config=ModelConfig.z_image_turbo(),
+    quantize=QUANTIZE,
+    model_path=MODEL_PATH,
+)
 
 tok = model.tokenizers["z_image"]
 chat = tok.tokenizer.apply_chat_template(
@@ -109,7 +121,21 @@ tensors = {
     "decoded": decoded.astype(mx.float32),
     "sigmas": sigmas.astype(mx.float32),
 }
-meta = {"prompt": PROMPT, "seed": str(SEED), "steps": str(STEPS), "w": str(W), "h": str(H),
-        "num_valid": str(num_valid), "chat": chat, "quantize": str(QUANTIZE)}
+meta = {
+    "prompt": PROMPT,
+    "seed": str(SEED),
+    "steps": str(STEPS),
+    "w": str(W),
+    "h": str(H),
+    "num_valid": str(num_valid),
+    "chat": chat,
+    "quantize": str(QUANTIZE),
+    **golden_metadata(
+        script=__file__,
+        model_path=MODEL_PATH,
+        model_repository=MODEL_REPOSITORY,
+        model_revision=MODEL_REVISION,
+    ),
+}
 mx.save_safetensors(OUT, tensors, meta)
 print(f"\nwrote {OUT} + {PNG}; final_latents {tuple(latents.shape)}, decoded {tuple(decoded.shape)}")

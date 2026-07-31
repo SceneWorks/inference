@@ -334,6 +334,8 @@ impl ZImageTurboTrainer {
                 text_encoder,
                 &item.caption,
                 "z_image_turbo trainer",
+                // Trainers never select a memory rung: the resident encoder is the training path.
+                None,
             )?;
             eval([&x0, &cap])?;
             cache.push((x0, cap));
@@ -372,6 +374,8 @@ impl ZImageTurboTrainer {
                     text_encoder,
                     prompt,
                     "z_image_turbo trainer (sample)",
+                    // Trainers never select a memory rung: the resident encoder is the training path.
+                    None,
                 )?;
                 let cap = if compute_dtype == Dtype::Float32 {
                     cap
@@ -1035,6 +1039,7 @@ mod first_step_repro {
             trainer.text_encoder.as_ref().unwrap(),
             "a solid colour swatch",
             "sc-4874 repro",
+            None,
         )
         .unwrap();
         eval([&cap]).unwrap();

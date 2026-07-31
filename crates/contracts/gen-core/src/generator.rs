@@ -10,8 +10,8 @@ use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, PreviewSink, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
-    Error, ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRequestScope,
-    ImageMemoryRunContext, ImageMemorySafetyDecision, ImageMemoryStrategy, Result,
+    Error, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -31,25 +31,22 @@ pub trait Generator {
         Vec::new()
     }
 
-    /// The loaded provider's image-memory contract, when adopted. Existing providers inherit
+    /// The loaded provider's memory-strategy contract, when adopted. Existing providers inherit
     /// `None`, which is the compatibility-safe resident-only/unverified state.
-    fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
+    fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         None
     }
 
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
     /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
     /// resident baseline.
-    fn image_memory_safety_check(
-        &self,
-        context: &ImageMemoryRunContext,
-    ) -> ImageMemorySafetyDecision {
-        match self.image_memory_contract() {
+    fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
+        match self.memory_strategy_contract() {
             Some(contract) => match contract.validate_selection(&context.selection) {
                 Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
-                    ImageMemorySafetyDecision::Accept
+                    MemorySafetyDecision::Accept
                 }
-                Ok(()) => ImageMemorySafetyDecision::Reject {
+                Ok(()) => MemorySafetyDecision::Reject {
                     reason: format!(
                         "{}: predicted peak {} exceeds effective budget {}",
                         self.descriptor().id,
@@ -57,16 +54,16 @@ pub trait Generator {
                         context.budget.effective_bytes()
                     ),
                 },
-                Err(error) => ImageMemorySafetyDecision::Reject {
+                Err(error) => MemorySafetyDecision::Reject {
                     reason: error.to_string(),
                 },
             },
-            None if context.selection.strategy == ImageMemoryStrategy::Resident => {
-                ImageMemorySafetyDecision::Accept
+            None if context.selection.strategy == MemoryStrategy::Resident => {
+                MemorySafetyDecision::Accept
             }
-            None => ImageMemorySafetyDecision::Reject {
+            None => MemorySafetyDecision::Reject {
                 reason: format!(
-                    "{} has not adopted the shared image-memory contract",
+                    "{} has not adopted the shared memory-strategy contract",
                     self.descriptor().id
                 ),
             },
@@ -75,10 +72,10 @@ pub trait Generator {
 
     /// Open request-scoped lifecycle state after the shared selection passes the provider safety
     /// check. Existing providers return `Ok(None)` and therefore cannot execute optimized rungs.
-    fn begin_image_memory_request(
+    fn begin_memory_strategy_request(
         &self,
-        context: &ImageMemoryRunContext,
-    ) -> Result<Option<Box<dyn ImageMemoryRequestScope + '_>>> {
+        context: &MemoryRunContext,
+    ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
         let _ = context;
         Ok(None)
     }
@@ -461,6 +458,12 @@ pub struct GenerationRequest {
 /// serve different resolutions and live budgets truthfully without a process-global toggle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GenerationMemory {
+    /// Release whole model components between conditioning, denoise, and decode for this request.
+    ///
+    /// Unlike [`LoadSpec::offload_policy`](crate::LoadSpec::offload_policy), this is an execution
+    /// decision on one generation. A cached generator may therefore keep a warm component pair for
+    /// one request, stage the next request, and rebuild the warm pair for a later request.
+    pub stage_residency: bool,
     /// Force the provider's bounded/tiled native VAE decode even below its automatic tiling threshold.
     pub tile_vae_decode: bool,
     /// Bound attention scratch by chunking independent query rows. This must preserve the provider's
@@ -470,11 +473,45 @@ pub struct GenerationMemory {
     /// the accelerator. This is the last quality-preserving rung when complete weights plus bounded
     /// activations still exceed the live device budget.
     pub stream_transformer_blocks: bool,
+
+    // --- Selected strategy parameters (SC-15510) -------------------------------------------------
+    //
+    // The three booleans above say WHICH rungs run; these say with WHAT. Before SC-15510 a provider
+    // could only advertise the single hardcoded value its pipeline happened to use, which made
+    // `MemoryParameterRanges` a one-element list and left SC-15508's "a single-point pass cannot
+    // mark untested production parameters Verified" unsatisfiable. Each is `Option`, and `None` (the
+    // `Default`) means "the provider's own historical constant", so every provider that does not read
+    // them — and every request that does not set them — is byte-for-byte unaffected.
+    //
+    // The values a provider will accept are exactly the candidates it publishes in its
+    // `MemoryProviderContract`; its request scope re-validates them, so an out-of-domain value is
+    // a typed rejection rather than a silently different execution than the selector chose.
+    /// Decode tile edge in **output pixels** for the bounded (tiled) decode. `None` ⇒ the provider's
+    /// default tile edge.
+    pub decode_tile_edge: Option<u32>,
+    /// Feather/blend overlap in output pixels paired with [`Self::decode_tile_edge`]. `None` ⇒ the
+    /// provider's default overlap.
+    pub decode_overlap: Option<u32>,
+    /// Number of consecutive transformer trunk blocks held materialized at once when
+    /// [`Self::stream_transformer_blocks`] is set. `None` ⇒ the provider's default window.
+    pub transformer_window_size: Option<u32>,
+    /// Which transformer(s) [`Self::stream_transformer_blocks`] applies to (SC-15794). `None` ⇒
+    /// [`TransformerComponent::Dit`](crate::memory_strategy::TransformerComponent::Dit), the
+    /// by-convention scope every provider had before the component scope existed — so an untouched
+    /// request is byte-for-byte unaffected.
+    ///
+    /// The text-encoder scope exists because rung 4 cut the denoise far enough that **conditioning
+    /// became the binding phase** on the larger tiers. Measured on z_image_turbo at 1024²
+    /// (Apple/Metal, real weights, SC-15794): conditioning binds bf16 at 8.344 GiB against a 4.365
+    /// GiB decode floor, and the encoder's weights are 7.440 GiB of that — so the window has real
+    /// work to do there, while q4 is already decode-bound and gains nothing.
+    pub transformer_window_component: Option<crate::memory_strategy::TransformerComponent>,
+
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
     /// warm follow-up request. Production selectors must leave this at `None` (the default).
     #[doc(hidden)]
-    pub calibration_error_phase: Option<ImageMemoryPhase>,
+    pub calibration_error_phase: Option<MemoryPhase>,
 }
 
 /// The typed audio request sub-block carried by [`GenerationRequest::audio`] (sc-12834). A single
@@ -1503,6 +1540,72 @@ pub struct ModelDescriptor {
     pub control_kinds: Option<crate::control::AcceptedControlKinds>,
 }
 
+/// How a model's advertised size range is enforced.
+///
+/// The distinction already existed as two entry points —
+/// [`Capabilities::validate_request`] and
+/// [`Capabilities::validate_request_skip_size`] — with the choice made by the
+/// provider and advertised nowhere. This makes it readable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SizeFloor {
+    /// `width`/`height` must lie within `min_size..=max_size`. The common case.
+    #[default]
+    RangeChecked,
+    /// The ordinary range check plus a required grid for every explicit `width`/`height`.
+    ///
+    /// A request is accepted only when both dimensions are multiples of `multiple`. This is
+    /// advertised here, rather than hidden in provider code, so a weights-free consumer can predict
+    /// whether the engine will render the exact geometry it was asked for.
+    RangeCheckedOnGrid { multiple: u32 },
+    /// `width`/`height == 0` is a "resolve from the driving media" sentinel, and the shared range
+    /// check does not apply **to that pair of values** (F-158). Any other size — including a
+    /// half-sentinel like `0x512` — is still range-checked normally.
+    ///
+    /// # What this does not promise
+    ///
+    /// It says nothing about the size the provider *resolves* to. A consumer must not read this
+    /// variant as "the resolved geometry is bounded by `min_size..=max_size`": whether a provider
+    /// re-checks after resolving is per-provider and is **not advertised here**.
+    ///
+    /// SCAIL-2, the only descriptor using this resolved-downstream policy family, sets
+    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] and does re-check as of sc-16167 — it refuses a
+    /// resolved geometry outside `min_size..=max_size` or over its area cap before the render, naming
+    /// the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own guarantee,
+    /// made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a provider that
+    /// sets it later. A consumer needing the bound must still read the provider, or treat the
+    /// resolved size as unbounded.
+    ///
+    /// Note "SCAIL-2" there means the **MLX** provider. `candle-gen-scail2` serves the same model id
+    /// and declares [`SizeFloor::RangeCheckedOnGrid`], so it refuses the `0x0` sentinel outright
+    /// rather than resolving it — its own resolve-from-the-clip branch is unreachable. One model id,
+    /// two answers; reconciling them is sc-16199.
+    ResolvedDownstream,
+    /// [`ResolvedDownstream`](Self::ResolvedDownstream), with an additional grid requirement for
+    /// **explicit** dimensions.
+    ///
+    /// The `0x0` sentinel remains exempt because the caller did not choose the source-media
+    /// geometry; the provider may align that resolved geometry as part of its documented downstream
+    /// policy. Any non-sentinel request must already land on `multiple`, so it is either rendered
+    /// exactly or rejected before generation. SCAIL-2 uses this to preserve ordinary `640x360`
+    /// driving clips while refusing an explicit `1280x730` instead of silently rendering
+    /// `1280x704` (sc-16198).
+    ResolvedDownstreamExplicitGrid { multiple: u32 },
+}
+
+impl SizeFloor {
+    /// The required multiple for explicit dimensions, when this floor advertises one.
+    ///
+    /// `None` means the shared floor has no grid opinion; a provider may still layer a model-local
+    /// rule. Consumers can call this without loading weights.
+    pub fn explicit_size_multiple(self) -> Option<u32> {
+        match self {
+            Self::RangeChecked | Self::ResolvedDownstream => None,
+            Self::RangeCheckedOnGrid { multiple }
+            | Self::ResolvedDownstreamExplicitGrid { multiple } => Some(multiple),
+        }
+    }
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).
@@ -1524,6 +1627,28 @@ pub struct Capabilities {
     pub max_size: u32,
     pub max_count: u32,
     pub mac_only: bool,
+    /// How this model's size range is enforced — and therefore whether
+    /// `min_size`/`max_size` are a bound a caller may rely on, plus any explicit-size grid the
+    /// provider advertises.
+    ///
+    /// `Default` is [`SizeFloor::RangeChecked`], so every existing descriptor keeps
+    /// today's behaviour with no edit. A provider whose `width`/`height == 0` means
+    /// "resolve from the driving media" sets [`SizeFloor::ResolvedDownstream`]
+    /// instead — SCAIL-2 sizes from its driving-video frames and uses
+    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] to advertise that only explicit sizes must
+    /// already sit on its tile grid.
+    ///
+    /// # Why this is on `Capabilities` rather than only in the provider
+    ///
+    /// The policy already exists, as
+    /// [`validate_request_skip_size`](Self::validate_request_skip_size), and a
+    /// provider selects it by *calling* that variant. Nothing **advertises** the
+    /// choice, so a consumer holding a `Capabilities` cannot tell which floor a
+    /// provider will apply, and a consumer that mirrors the shared floor to
+    /// type-check requests before a load will reject a legal `0×0` on SCAIL-2.
+    /// SceneWorks' Aether Studio hit exactly that and now carries a hand-built
+    /// table of size-sentinel families; this field deletes it.
+    pub size_floor: SizeFloor,
     // Audio surface (sc-12834) — read by the floor when a request carries
     // [`GenerationRequest::audio`]; all `Default` to the empty/no-audio surface so image/video
     // descriptors are untouched.
@@ -1643,7 +1768,8 @@ impl Capabilities {
     /// - `steps` (when supplied) must be `>= 1` — an explicit `0` would run a 0-step denoise and
     ///   VAE-decode pure noise (F-007); the schedule builders' `.max(1)` clamps document this as the
     ///   real floor,
-    /// - `width`/`height` within `min_size..=max_size`,
+    /// - `width`/`height` within `min_size..=max_size` and, when advertised by [`SizeFloor`], on the
+    ///   required explicit-size grid,
     /// - `negative_prompt` / `guidance` / `true_cfg` only when the matching `supports_*` flag is set,
     ///   and `guidance` / `true_cfg` must be finite (a NaN would poison the guidance math, F-053),
     /// - `sampler` / `scheduler` / `guidance_method` (when supplied) must name an advertised entry,
@@ -1662,20 +1788,61 @@ impl Capabilities {
     /// steps out of range, non-finite guidance) return [`Error::Msg`].
     ///
     /// `id` is the model's descriptor id, used in error messages. Model-specific constraints — an
-    /// empty-prompt rejection, size-alignment (multiple-of-N), frame-count divisibility,
-    /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
-    /// floor, not a replacement for them.
+    /// empty-prompt rejection, a size-alignment rule not advertised by [`SizeFloor`], frame-count
+    /// divisibility, sampler→solver mapping — are layered on top by each model's own `validate`;
+    /// this is the shared floor, not a replacement for them.
     pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
-        self.validate_request_inner(id, req, true)
+        // The size check is gated on the ADVERTISED floor rather than on the caller picking the
+        // right entry point — that is what lets a weights-free consumer hold a `Capabilities` and
+        // get the right answer without knowing which variant the provider calls.
+        //
+        // `ResolvedDownstream` exempts THE SENTINEL, not every size. Its doc says the range check
+        // "does not apply to it", meaning `0x0` specifically, and the scoping is load-bearing: an
+        // earlier revision read the variant as a blanket opt-out and disabled the range check
+        // outright. That silently deleted SCAIL-2's explicit-size rejection — on main its
+        // `pipeline.rs` range-checks whenever dimensions are given and only skips for the sentinel,
+        // with a comment saying exactly that — so an explicit 16x16 against declared bounds of
+        // 32..=1280 stopped being rejected, with nothing downstream to catch it.
+        //
+        // Both dimensions must be zero. A half-sentinel (`0x512`) is not the "resolve from the
+        // driving media" convention, it is a malformed request, and it must still be rejected.
+        let is_sentinel = req.width == 0 && req.height == 0;
+        let check_size = match self.size_floor {
+            SizeFloor::RangeChecked | SizeFloor::RangeCheckedOnGrid { .. } => true,
+            SizeFloor::ResolvedDownstream | SizeFloor::ResolvedDownstreamExplicitGrid { .. } => {
+                !is_sentinel
+            }
+        };
+        self.validate_request_inner(id, req, check_size)?;
+
+        if !is_sentinel {
+            if let Some(multiple) = self.size_floor.explicit_size_multiple() {
+                if multiple == 0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: descriptor advertises an invalid explicit-size multiple of 0"
+                    )));
+                }
+                if !req.width.is_multiple_of(multiple) || !req.height.is_multiple_of(multiple) {
+                    return Err(Error::Msg(format!(
+                        "{id}: width/height must be multiples of {multiple} (got {}×{})",
+                        req.width, req.height
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// The shared floor **minus the size-range check** — for providers with a "match the driving-media
-    /// size" convention (`width`/`height == 0` is a resolve-downstream sentinel, e.g. SCAIL-2 sizing
-    /// from the driving-video frames), where the size range would wrongly reject the sentinel. Every
-    /// other floor check still runs unconditionally: count / steps / frame / fps / duration caps,
-    /// negative-prompt / guidance / true_cfg support gating, finiteness (F-053), sampler / scheduler /
-    /// guidance_method membership, and the conditioning allowlist. A provider that calls this must
-    /// range-check its resolved size itself (F-158).
+    /// The shared floor **minus the advertised spatial checks** (range and any explicit-size grid) —
+    /// for providers with a "match the driving-media size" convention (`width`/`height == 0` is a
+    /// resolve-downstream sentinel, e.g. SCAIL-2 sizing from the driving-video frames), where those
+    /// checks would wrongly reject the sentinel. Every non-spatial floor check still runs
+    /// unconditionally: count / steps / frame / fps / duration caps, negative-prompt / guidance /
+    /// true_cfg support gating, finiteness (F-053), sampler / scheduler / guidance_method membership,
+    /// and the conditioning allowlist. Prefer [`validate_request`](Self::validate_request) with a
+    /// [`SizeFloor::ResolvedDownstream`] variant so non-sentinel requests retain advertised spatial
+    /// validation. A provider that calls this lower-level escape hatch must range-check its resolved
+    /// size itself (F-158).
     pub fn validate_request_skip_size(&self, id: &str, req: &GenerationRequest) -> Result<()> {
         self.validate_request_inner(id, req, false)
     }
@@ -2140,12 +2307,40 @@ mod tests {
         assert_eq!(
             GenerationMemory::default(),
             GenerationMemory {
+                stage_residency: false,
                 tile_vae_decode: false,
                 chunk_attention: false,
                 stream_transformer_blocks: false,
+                decode_tile_edge: None,
+                decode_overlap: None,
+                transformer_window_size: None,
+                transformer_window_component: None,
                 calibration_error_phase: None,
             }
         );
+    }
+
+    /// SC-15510: the strategy-parameter carriers are additive and default-inert. This is deliberately
+    /// an exhaustive literal — adding a lever without deciding its default here fails to compile,
+    /// which is the point: a new field that defaults to anything but "the provider's own historical
+    /// constant" would silently change every existing render.
+    #[test]
+    fn strategy_parameters_default_to_the_providers_own_constants() {
+        let memory = GenerationMemory::default();
+        assert!(!memory.stage_residency);
+        assert_eq!(memory.decode_tile_edge, None);
+        assert_eq!(memory.decode_overlap, None);
+        assert_eq!(memory.transformer_window_size, None);
+        // Setting a parameter does NOT turn its rung on: the boolean is the switch, the parameter is
+        // only the value. A selector that set an edge but not `tile_vae_decode` gets no tiling.
+        let parameterized = GenerationMemory {
+            decode_tile_edge: Some(384),
+            decode_overlap: Some(64),
+            transformer_window_size: Some(2),
+            ..Default::default()
+        };
+        assert!(!parameterized.tile_vae_decode);
+        assert!(!parameterized.stream_transformer_blocks);
     }
 
     fn img(w: u32, h: u32) -> Image {
@@ -2281,6 +2476,265 @@ mod tests {
             .is_ok());
     }
 
+    /// `ResolvedDownstream` exempts **the sentinel**, not every size.
+    ///
+    /// The variant's own doc says "`width`/`height == 0` is a resolve-from-driving-media sentinel and
+    /// the range check does not apply *to it*". Scoping matters: a provider advertising this is
+    /// saying one specific pair of values is special, not that it has opted out of the shared floor.
+    ///
+    /// Written as a regression gate because the first implementation of `size_floor` read the
+    /// variant as a blanket opt-out and disabled the range check entirely. On main, SCAIL-2 got the
+    /// full check whenever dimensions were explicit — its `pipeline.rs` hand-rolls exactly this
+    /// branch, with a comment saying so — and routing that branch through a blanket
+    /// `ResolvedDownstream` silently stopped rejecting an explicit 16x16 or 4096x4096 against
+    /// declared bounds of 32..=1280. Nothing downstream catches it: `min_size`/`max_size` appear
+    /// nowhere in `mlx-gen-scail2` outside the descriptor.
+    #[test]
+    fn resolved_downstream_exempts_the_sentinel_but_still_range_checks_explicit_sizes() {
+        let c = Capabilities {
+            size_floor: SizeFloor::ResolvedDownstream,
+            ..caps()
+        };
+
+        // The sentinel is the whole point of the variant: accepted.
+        assert!(
+            c.validate_request(
+                "m",
+                &GenerationRequest {
+                    width: 0,
+                    height: 0,
+                    ..base_req()
+                }
+            )
+            .is_ok(),
+            "the 0x0 resolve-downstream sentinel must be accepted"
+        );
+
+        // Explicit dimensions are NOT the sentinel and must still meet the advertised range.
+        for (w, h, why) in [
+            (16, 16, "below min_size"),
+            (4096, 4096, "above max_size"),
+            (
+                0,
+                512,
+                "half-sentinel: only width is 0, so this is not the sentinel",
+            ),
+            (512, 0, "half-sentinel: only height is 0"),
+        ] {
+            assert!(
+                c.validate_request(
+                    "m",
+                    &GenerationRequest {
+                        width: w,
+                        height: h,
+                        ..base_req()
+                    }
+                )
+                .is_err(),
+                "{w}x{h} ({why}) must still be rejected under ResolvedDownstream"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_explicit_grid_rejects_only_off_grid_explicit_sizes() {
+        let ranged = Capabilities {
+            size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 32 },
+            ..caps()
+        };
+        let resolved = Capabilities {
+            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid { multiple: 32 },
+            ..caps()
+        };
+
+        for c in [&ranged, &resolved] {
+            assert!(c
+                .validate_request(
+                    "m",
+                    &GenerationRequest {
+                        width: 512,
+                        height: 480,
+                        ..base_req()
+                    }
+                )
+                .is_ok());
+            for (width, height) in [(512, 481), (513, 480)] {
+                let err = c
+                    .validate_request(
+                        "m",
+                        &GenerationRequest {
+                            width,
+                            height,
+                            ..base_req()
+                        },
+                    )
+                    .expect_err("an explicit off-grid size must be refused")
+                    .to_string();
+                assert!(
+                    err.contains("multiples of 32") && err.contains(&format!("{width}×{height}")),
+                    "got: {err}"
+                );
+            }
+        }
+
+        assert!(ranged
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    width: 0,
+                    height: 0,
+                    ..base_req()
+                }
+            )
+            .is_err());
+        assert!(resolved
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    width: 0,
+                    height: 0,
+                    ..base_req()
+                }
+            )
+            .is_ok());
+        assert_eq!(ranged.size_floor.explicit_size_multiple(), Some(32));
+        assert_eq!(resolved.size_floor.explicit_size_multiple(), Some(32));
+        assert_eq!(SizeFloor::RangeChecked.explicit_size_multiple(), None);
+    }
+
+    /// The default variant is unaffected — a descriptor that says nothing behaves exactly as before.
+    #[test]
+    fn range_checked_is_the_default_and_rejects_out_of_range_sizes() {
+        let c = caps();
+        assert_eq!(c.size_floor, SizeFloor::RangeChecked);
+        for (w, h) in [(16, 16), (4096, 4096), (0, 0)] {
+            assert!(
+                c.validate_request(
+                    "m",
+                    &GenerationRequest {
+                        width: w,
+                        height: h,
+                        ..base_req()
+                    }
+                )
+                .is_err(),
+                "{w}x{h} must be rejected when the floor is RangeChecked"
+            );
+        }
+    }
+
+    /// `ResolvedDownstream` exempts **size**, and nothing else.
+    ///
+    /// The sibling above pins one half of the scoping — an *explicit* size is still range-checked.
+    /// This pins the half a mis-scoping would break in the other direction: routing the sentinel
+    /// around the **whole** floor rather than around one check. That is not a hypothetical failure
+    /// mode for the provider this variant exists for. SCAIL-2's `generate` re-runs the floor itself
+    /// precisely so a `guidance: NaN` cannot NaN-poison a multi-minute video render into
+    /// garbage-as-success, and `0x0` — the auto-size path — is its *normal* request shape, not an
+    /// edge case. A sentinel that skipped the floor would therefore be un-validated in the common
+    /// case and validated only in the rare one.
+    ///
+    /// Every case is a single-field mutation of a request the test first proves is accepted, so a
+    /// rejection can only have come from the field named: no case can pass vacuously.
+    #[test]
+    fn resolved_downstream_sentinel_still_runs_every_non_size_check() {
+        let c = Capabilities {
+            size_floor: SizeFloor::ResolvedDownstream,
+            ..caps()
+        };
+        let sentinel = GenerationRequest {
+            width: 0,
+            height: 0,
+            ..base_req()
+        };
+        assert!(
+            c.validate_request("m", &sentinel).is_ok(),
+            "the 0x0 sentinel must be accepted, or every case below would pass vacuously"
+        );
+
+        let cases: Vec<(&str, &str, GenerationRequest)> = vec![
+            (
+                "count above max_count",
+                "count",
+                GenerationRequest {
+                    count: 2,
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "an explicit steps: 0 (F-007)",
+                "steps must be >= 1",
+                GenerationRequest {
+                    steps: Some(0),
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "an unadvertised sampler",
+                "unsupported sampler",
+                GenerationRequest {
+                    sampler: Some("unipc".into()),
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "an unadvertised scheduler",
+                "unsupported scheduler",
+                GenerationRequest {
+                    scheduler: Some("linear".into()),
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "a conditioning kind outside the allowlist",
+                "conditioning is not supported",
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "a non-finite float knob (F-053)",
+                "must be finite",
+                GenerationRequest {
+                    strength: Some(f32::NAN),
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "a negative prompt on a model that does not advertise one",
+                "negative prompts are not supported",
+                GenerationRequest {
+                    negative_prompt: Some("n".into()),
+                    ..sentinel.clone()
+                },
+            ),
+            (
+                "guidance on a distilled/CFG-free model",
+                "guidance is not supported",
+                GenerationRequest {
+                    guidance: Some(3.5),
+                    ..sentinel.clone()
+                },
+            ),
+        ];
+        for (why, expected, req) in cases {
+            let Err(err) = c.validate_request("m", &req) else {
+                panic!(
+                    "{why} must still be rejected on the 0x0 sentinel path — \
+                     ResolvedDownstream exempts SIZE only, not the rest of the floor"
+                );
+            };
+            // Asserting the *message* and not merely `is_err` is what makes a case non-vacuous: a
+            // future reordering that made some earlier check fire first would otherwise look green
+            // while the check this row is actually about had stopped running.
+            assert!(
+                err.to_string().contains(expected),
+                "{why}: expected a rejection naming {expected:?}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn validate_request_enforces_advertised_surface() {
         let c = caps();
@@ -2360,38 +2814,86 @@ mod tests {
             c.validate_request_skip_size("m", &auto).is_ok(),
             "skip_size must accept the 0x0 auto-size sentinel"
         );
-        // Every non-size violation must still fire on the auto-size path.
-        let rejected: Vec<GenerationRequest> = vec![
-            // oversized count
-            GenerationRequest {
-                count: 2,
-                ..auto.clone()
-            },
-            // explicit zero steps
-            GenerationRequest {
-                steps: Some(0),
-                ..auto.clone()
-            },
-            // unadvertised sampler
-            GenerationRequest {
-                sampler: Some("unipc".into()),
-                ..auto.clone()
-            },
-            // disallowed conditioning kind
-            GenerationRequest {
-                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
-                ..auto.clone()
-            },
-            // non-finite knob (not support-gated) would NaN-poison the run — finiteness still fires
-            GenerationRequest {
-                strength: Some(f32::NAN),
-                ..auto.clone()
-            },
+        // Every non-size violation must still fire on the auto-size path. Labelled rather than
+        // indexed: "skip_size case 3 failed" does not tell you which guarantee stopped holding.
+        //
+        // The last three rows close a real gap. This method's doc promises "negative-prompt /
+        // guidance / true_cfg support gating" and "scheduler … membership" on this path, and
+        // neither had a single case here — the *capability-gap* family (typed `Error::Unsupported`,
+        // F-008) was represented only by `sampler`. Support gating is the family a consumer relies
+        // on to tell "this backend can't do that" from "that value is out of range", so a
+        // size-skipping floor that quietly dropped it would let a negative prompt reach a
+        // CFG-free distilled model and be silently ignored.
+        let rejected: Vec<(&str, GenerationRequest)> = vec![
+            (
+                "oversized count",
+                GenerationRequest {
+                    count: 2,
+                    ..auto.clone()
+                },
+            ),
+            (
+                "explicit zero steps",
+                GenerationRequest {
+                    steps: Some(0),
+                    ..auto.clone()
+                },
+            ),
+            (
+                "unadvertised sampler",
+                GenerationRequest {
+                    sampler: Some("unipc".into()),
+                    ..auto.clone()
+                },
+            ),
+            (
+                "disallowed conditioning kind",
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                    ..auto.clone()
+                },
+            ),
+            (
+                // A non-finite knob is not support-gated and would NaN-poison the run.
+                "non-finite strength (F-053)",
+                GenerationRequest {
+                    strength: Some(f32::NAN),
+                    ..auto.clone()
+                },
+            ),
+            (
+                "negative prompt on a model that does not advertise one",
+                GenerationRequest {
+                    negative_prompt: Some("n".into()),
+                    ..auto.clone()
+                },
+            ),
+            (
+                "guidance on a model that does not advertise it",
+                GenerationRequest {
+                    guidance: Some(3.5),
+                    ..auto.clone()
+                },
+            ),
+            (
+                "true_cfg on a model that does not advertise it",
+                GenerationRequest {
+                    true_cfg: Some(4.0),
+                    ..auto.clone()
+                },
+            ),
+            (
+                "unadvertised scheduler",
+                GenerationRequest {
+                    scheduler: Some("linear".into()),
+                    ..auto.clone()
+                },
+            ),
         ];
-        for (i, req) in rejected.iter().enumerate() {
+        for (why, req) in &rejected {
             assert!(
                 c.validate_request_skip_size("m", req).is_err(),
-                "skip_size case {i} should have been rejected on the auto-size path"
+                "{why} must still be rejected on the auto-size path"
             );
         }
     }

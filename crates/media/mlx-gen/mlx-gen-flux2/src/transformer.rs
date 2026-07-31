@@ -1696,7 +1696,10 @@ mod tests {
     // ---- sc-2618 kohya `lora_unet_` routing (no real weights) ---------------------------------
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("mlx_gen_flux2_kohya_test");
+        // Per-process scratch dir: two concurrent `cargo test` processes share `$TMPDIR`, so a fixed
+        // name lets one run's fixtures be rewritten under the other's feet.
+        let dir =
+            std::env::temp_dir().join(format!("mlx_gen_flux2_kohya_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }

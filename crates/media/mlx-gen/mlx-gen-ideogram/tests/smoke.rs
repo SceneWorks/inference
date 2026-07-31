@@ -70,7 +70,7 @@ fn smoke_generates_image() {
     assert!(min >= 0 && max <= 255, "px out of u8 range");
 
     let bytes: Vec<u8> = px.iter().map(|&v| v as u8).collect();
-    let out = std::env::temp_dir().join("ideogram4_smoke.png");
+    let out = std::env::temp_dir().join(format!("ideogram4_smoke_{}.png", std::process::id()));
     image::RgbImage::from_raw(w, h, bytes)
         .unwrap()
         .save(&out)

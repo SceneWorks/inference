@@ -6,7 +6,7 @@ pub use candle_audio_catalog::audio;
 pub use candle_gen_catalog::media;
 pub use candle_llm as llm;
 pub use runtime_catalog::{
-    core_llm, gen_core, image_memory, RuntimeCatalog, RuntimeCatalogSnapshot,
+    core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
 };
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog

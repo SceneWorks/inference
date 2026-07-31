@@ -24,7 +24,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -118,6 +118,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -779,6 +780,7 @@ mod tests {
                 identity: None,
                 text_encoder: None,
                 offload_policy: Default::default(),
+                load_shape: Default::default(),
                 components: Default::default(),
             };
             let err = match crate::provider_registry().unwrap().load(id, &spec) {
@@ -806,6 +808,7 @@ mod tests {
             identity: None,
             text_encoder: None,
             offload_policy: Default::default(),
+            load_shape: Default::default(),
             components: Default::default(),
         };
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before

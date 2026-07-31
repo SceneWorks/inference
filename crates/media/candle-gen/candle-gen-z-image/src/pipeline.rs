@@ -159,10 +159,17 @@ const Z_IMAGE_VAE_TILING: VaeTiling = VaeTiling {
     full_res_channels: 128,
 };
 
-/// Bound the sequential packed-tier attention scores working set to 64 Mi elements. At 1024² the
-/// normal 1e9-element guard is still a single pass; this lower quality-preserving budget chunks
-/// independent query rows and releases roughly a gigabyte of transient CUDA storage.
-const Z_IMAGE_CONSTRAINED_ATTN_SCORES_BUDGET: usize = 64 * 1024 * 1024;
+/// The constrained-rung attention score budget for the sequential packed tier: 64 Mi elements. At 1024²
+/// the normal 1e9-element i32-overflow guard is still a single pass; this lower quality-preserving
+/// budget chunks independent query rows and releases roughly a gigabyte of transient CUDA storage.
+///
+/// **Derived, not declared** (SC-15796). The value is
+/// [`candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`], the shared rung-3 operating point that
+/// this backend (SC-15256) and MLX (SC-15615) measured independently and both landed on; it used to be
+/// written out once per backend with nothing tying the two together. The `as usize` is only the width
+/// candle's `budget: usize` kernels take — gen-core owns the number.
+const CONSTRAINED_ATTN_SCORES_BUDGET: usize =
+    candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as usize;
 
 fn check_decode_tile(cancel: &CancelFlag) -> Result<()> {
     candle_gen::check_cancel(cancel)
@@ -915,7 +922,7 @@ impl Pipeline {
                             &t_tensor,
                             &cap_feats,
                             &cap_mask,
-                            Z_IMAGE_CONSTRAINED_ATTN_SCORES_BUDGET,
+                            CONSTRAINED_ATTN_SCORES_BUDGET,
                         )?
                         .neg()?)
                 },
@@ -1244,6 +1251,35 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The rung-3 budget is the shared one (SC-15796).** [`CONSTRAINED_ATTN_SCORES_BUDGET`] no longer
+    /// declares 64 Mi here, so asserting its value would just restate an alias. What is worth pinning
+    /// is that this backend's *production geometry* plans the boundary the shared cross-backend table
+    /// declares — 1024² unified stack, B=1, H=30, Sq=Sk=4128 → 64 Mi / (30·4128) = **541 rows**, the
+    /// same boundary the MLX lane's rung-3 evidence (SC-15615) was taken at. Move the shared planner or
+    /// the shared budget and this goes red; that is what makes the two backends' calibration numbers
+    /// comparable rather than two coincidentally-equal literals.
+    #[test]
+    fn the_production_geometry_plans_the_shared_rung3_boundary() {
+        use candle_gen::attention::AttentionBudget;
+        let (h, sq) = (30u64, 4128u64);
+        let budget =
+            AttentionBudget::from_score_elements(CONSTRAINED_ATTN_SCORES_BUDGET as u64, false);
+        assert_eq!(budget.query_block_rows(h * sq, sq), 541);
+
+        let declared = gen_core::attention_budget::CROSS_BACKEND_CHUNK_CASES
+            .iter()
+            .find(|c| {
+                c.budget == candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET
+                    && c.rows_per_query == h * sq
+                    && c.sq == sq
+            })
+            .expect("the shared table must carry the production z-image 1024² geometry");
+        assert_eq!(budget.query_block_rows(h * sq, sq), declared.expect_rows);
+
+        // Below the threshold the rung is a no-op: an in-budget call stays one un-chunked pass.
+        assert_eq!(budget.query_block_rows(h * 32, 32), 32);
+    }
 
     struct DropTag {
         name: &'static str,

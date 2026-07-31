@@ -37,7 +37,7 @@ use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
     self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, VoiceEmbedder, WeightsSource,
+    ModelDescriptor, Progress, SizeFloor, VoiceEmbedder, WeightsSource,
 };
 use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
@@ -184,6 +184,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_history: false,
             supports_conversation_session: false,
             max_speakers: None,
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

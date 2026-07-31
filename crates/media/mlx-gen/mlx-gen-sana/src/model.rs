@@ -36,7 +36,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor,
+    WeightsSource,
 };
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
@@ -144,6 +145,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -205,6 +207,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

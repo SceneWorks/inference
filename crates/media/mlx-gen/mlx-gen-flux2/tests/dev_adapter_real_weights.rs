@@ -135,7 +135,8 @@ fn write_lora(shapes: &[(String, i32, i32)]) -> PathBuf {
         arrays.push((format!("transformer.{p}.lora_B.weight"), b));
         arrays.push((format!("transformer.{p}.alpha"), alpha.clone()));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_dev_adapter");
+    let dir =
+        std::env::temp_dir().join(format!("mlx_gen_flux2_dev_adapter_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dev_lora.safetensors");
     Array::save_safetensors(
@@ -166,7 +167,8 @@ fn write_lokr(shapes: &[(String, i32, i32)]) -> PathBuf {
         arrays.push((format!("{p}.lokr_w2_a"), w2a));
         arrays.push((format!("{p}.lokr_w2_b"), w2b));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_dev_adapter");
+    let dir =
+        std::env::temp_dir().join(format!("mlx_gen_flux2_dev_adapter_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dev_lokr.safetensors");
     Array::save_safetensors(

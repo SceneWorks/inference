@@ -26,7 +26,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -107,6 +107,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             supported_quants: &[Quant::Q4, Quant::Q8],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

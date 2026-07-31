@@ -667,13 +667,16 @@ mod tests {
     #[test]
     fn header_shapes_reads_header_without_body() {
         use std::io::Write;
+        // Process-unique fixture names: a fixed `$TMPDIR` name is shared with any other concurrent
+        // `cargo test` process running this same test, which truncates/removes it mid-read.
+        let pid = std::process::id();
         let header =
             br#"{"w":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"__metadata__":{"a":"b"}}"#;
         let mut buf = Vec::new();
         buf.extend_from_slice(&(header.len() as u64).to_le_bytes());
         buf.extend_from_slice(header);
         buf.extend_from_slice(&[7u8; 24]); // the "weights" body — must not be needed.
-        let path = std::env::temp_dir().join("mlx_gen_flux2_hdr_ok.safetensors");
+        let path = std::env::temp_dir().join(format!("mlx_gen_flux2_hdr_ok_{pid}.safetensors"));
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&buf)
@@ -688,7 +691,8 @@ mod tests {
         let mut bad = Vec::new();
         bad.extend_from_slice(&(1u64 << 40).to_le_bytes()); // claims a 1 TiB header
         bad.extend_from_slice(b"{}");
-        let bad_path = std::env::temp_dir().join("mlx_gen_flux2_hdr_bad.safetensors");
+        let bad_path =
+            std::env::temp_dir().join(format!("mlx_gen_flux2_hdr_bad_{pid}.safetensors"));
         std::fs::File::create(&bad_path)
             .unwrap()
             .write_all(&bad)
@@ -972,11 +976,14 @@ mod tests {
     /// Write tensors to a unique temp safetensors file and return its path (the test loads it back
     /// through `Weights::from_file`, the same entry the real converter uses).
     fn write_tmp_weights(entries: &[(&str, Array)]) -> PathBuf {
-        // A content-derived suffix keeps parallel test cases from colliding without `Date`/`rand`
-        // (both unavailable in this crate's MLX build).
+        // A content-derived suffix keeps test cases from colliding without `Date`/`rand` (both
+        // unavailable in this crate's MLX build); the pid additionally keeps two *concurrent*
+        // `cargo test` processes, which share `$TMPDIR`, off each other's fixtures.
         let tag: usize = entries.iter().map(|(k, _)| k.len()).sum();
-        let path =
-            std::env::temp_dir().join(format!("mlx_gen_flux2_convert_test_{tag}.safetensors"));
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!(
+            "mlx_gen_flux2_convert_test_{tag}_{pid}.safetensors"
+        ));
         Array::save_safetensors(
             entries.iter().map(|(k, v)| (*k, v)),
             None::<&HashMap<String, String>>,

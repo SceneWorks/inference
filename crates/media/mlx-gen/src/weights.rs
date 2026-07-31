@@ -55,6 +55,18 @@ impl Weights {
     /// provider can normalize them; this opt-in loader preserves the ordinary
     /// path for all other dtypes and converts only fp8 tensor views.
     pub fn from_file_with_fp8(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_with_fp8_filter(path, |_| true)
+    }
+
+    /// Load only the selected tensors from an fp8-capable safetensors file.
+    ///
+    /// Filtering happens on tensor names before any MLX array is created. Component-staged loaders
+    /// use this for fused checkpoints so a text-only phase never transiently materializes the
+    /// transformer or VAE.
+    pub fn from_file_with_fp8_filter(
+        path: impl AsRef<Path>,
+        mut include: impl FnMut(&str) -> bool,
+    ) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref())?;
         // SAFETY: the mapping is read-only and remains alive until every borrowed
         // TensorView has been copied into MLX-owned array storage below.
@@ -64,6 +76,9 @@ impl Weights {
         })?;
         let mut tensors = HashMap::new();
         for (name, view) in safe.tensors() {
+            if !include(&name) {
+                continue;
+            }
             let shape: Vec<i32> = view
                 .shape()
                 .iter()
@@ -317,7 +332,9 @@ mod tests {
 
     #[test]
     fn round_trip_file_with_metadata() {
-        let dir = std::env::temp_dir().join("mlx_gen_weights_test");
+        // Per-process scratch dir (matching `mlx_gen_appledouble_{pid}` below) — a fixed `$TMPDIR`
+        // name races a second concurrent `cargo test`.
+        let dir = std::env::temp_dir().join(format!("mlx_gen_weights_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("w.safetensors");
 
@@ -332,6 +349,33 @@ mod tests {
         assert!(w.require("blk.weight").is_ok());
         assert!(w.require("missing").is_err());
         assert_eq!(w.metadata("networkType"), Some("lokr"));
+    }
+
+    #[test]
+    fn fp8_capable_filter_materializes_only_selected_tensor_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_gen_weights_filter_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("components.safetensors");
+        let text = Array::from_slice(&[1.0f32], &[1]);
+        let transformer = Array::from_slice(&[2.0f32], &[1]);
+        Array::save_safetensors(
+            vec![
+                ("text_encoder.weight", &text),
+                ("transformer.weight", &transformer),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+
+        let weights =
+            Weights::from_file_with_fp8_filter(&path, |name| name.starts_with("text_encoder"))
+                .unwrap();
+        assert_eq!(weights.keys().collect::<Vec<_>>(), ["text_encoder.weight"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

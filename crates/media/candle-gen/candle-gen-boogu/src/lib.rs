@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor,
     WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder;
@@ -332,6 +332,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

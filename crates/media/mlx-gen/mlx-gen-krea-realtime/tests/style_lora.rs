@@ -270,7 +270,10 @@ fn write_lora(name: &str, stems: &[(&str, i32, i32)], rank: i32, seed: u64, mag:
         entries.push((format!("diffusion_model.{stem}.lora_A.weight"), a));
         entries.push((format!("diffusion_model.{stem}.lora_B.weight"), b));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_style_lora_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -293,7 +296,10 @@ fn write_lokr(name: &str, mag: f32) -> PathBuf {
         ("alpha".to_string(), "8".to_string()),
         ("rank".to_string(), "8".to_string()),
     ]);
-    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_style_lora_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     Array::save_safetensors(
@@ -781,7 +787,10 @@ fn write_lightx2v_shaped_diff_patch(name: &str, cfg: &KreaRealtimeConfig) -> (Pa
     }
 
     let expected = entries.len();
-    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_style_lora_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -883,7 +892,10 @@ fn norm_only_diff_patch_installs_through_the_norm_param_surface() {
             ));
         }
     }
-    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_style_lora_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("krea_norm_only_diff.safetensors");
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -911,7 +923,10 @@ fn out_of_surface_diff_patch_key_is_reported_not_dropped() {
     let cfg = tiny_cfg();
     let dim = cfg.wan.dim as i32;
     let d = det_fill(&[dim], 1234, 0.2, 0.0, Dtype::Float32);
-    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_style_lora_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("krea_i2v_norm_diff.safetensors");
     Array::save_safetensors(
@@ -947,7 +962,10 @@ fn provider_reports_fully_applied_and_partial_adapters_separately() {
     let dim = cfg.wan.dim as i32;
     let landed = det_fill(&[dim], 2001, 0.2, 0.0, Dtype::Float32);
     let foreign = det_fill(&[dim], 2002, 0.2, 0.0, Dtype::Float32);
-    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_krea_style_lora_test_{}",
+        std::process::id()
+    ));
     let partial = dir.join("krea_report_partial.safetensors");
     Array::save_safetensors(
         vec![
@@ -993,7 +1011,10 @@ fn reported_batch_accepts_supported_plus_wholly_unsupported_in_both_orders() {
     let dim = cfg.wan.dim as i32;
     let foreign = det_fill(&[dim], 2011, 0.2, 0.0, Dtype::Float32);
     let unsupported = std::env::temp_dir()
-        .join("mlx_gen_krea_style_lora_test")
+        .join(format!(
+            "mlx_gen_krea_style_lora_test_{}",
+            std::process::id()
+        ))
         .join("krea_report_batch_unsupported.safetensors");
     Array::save_safetensors(
         vec![(

@@ -46,8 +46,9 @@ fn synthetic_weights(arch: &Sd3Arch) -> Weights {
         })
         .collect();
     let path = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_medium_synthetic_{}.safetensors",
-        entries.len()
+        "mlx_gen_sd3_medium_synthetic_{}_{}.safetensors",
+        entries.len(),
+        std::process::id()
     ));
     Array::save_safetensors(
         entries.iter().map(|(k, v)| (k.as_str(), v)),

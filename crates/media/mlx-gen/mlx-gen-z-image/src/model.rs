@@ -7,12 +7,13 @@
 //! seeded noise → flow-match Euler denoise over the DiT → VAE decode → RGB8. The chain is
 //! parity-proven against the frozen Python fork on real bf16 weights (sc-2352).
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    Residency, Result, SizeFloor, StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use mlx_rs::Dtype;
@@ -103,6 +104,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -112,19 +114,19 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImageTurbo {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    /// Component-residency strategy (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
-    /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen
-    /// text encoder + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
-    /// per-phase loader closures and re-loads per generation in phase order (encode → **drop the text
-    /// encoder** → denoise/decode), bounding peak unified memory to `max(text-encoder, DiT+VAE)`
-    /// instead of the sum — the big win on Z-Image, whose Qwen encoder is comparable to the DiT. The
-    /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
-    /// the error-safe cache flush once for all providers.
+    /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// Request-scoped component residency (SC-15806). Construction retains the two phase loaders;
+    /// each request either populates/reuses one warm pair or runs encode → drop text → load heavy →
+    /// denoise/decode according to [`GenerationMemory::stage_residency`](gen_core::GenerationMemory).
+    /// The [`Residency`] seam owns eviction-before-reload, eval/drop/clear discipline, cancellation,
+    /// and error-safe cache flushing.
     residency: Residency<TextEncoder, ZImageHeavyOwned>,
 }
 
 /// The heavy render-phase components (the DiT transformer, the VAE, and the optional PiD decoder) —
-/// everything but the text encoder. Owned by the `Resident` components or by a `Sequential` generate.
+/// everything but the text encoder. Owned by the warm pair or by a staged request.
 /// `pub(crate)` so the **base** (non-distilled) `z_image` sibling ([`crate::model_base`]) shares the
 /// identical heavy bundle on the same shared [`load_residency`] seam (sc-11124, F-172).
 pub(crate) struct ZImageHeavyOwned {
@@ -136,7 +138,7 @@ pub(crate) struct ZImageHeavyOwned {
     pub(crate) pid: Option<PidEngine>,
 }
 
-/// The light (decode-only) z-image bundle that survives the DiT drop under `Sequential` staged decode
+/// The light (decode-only) z-image bundle that survives the DiT drop during staged decode
 /// (sc-13571, GitHub #1658): the VAE plus the optional PiD overlay. [`StagedHeavy::shed_dit`] drops the
 /// multi-GB DiT and moves these here, so the tiled VAE decode peak excludes the transformer.
 pub(crate) struct ZImageLight {
@@ -194,32 +196,91 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         tokenizer,
         residency,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
     }))
 }
 
+#[derive(Clone)]
+enum ComfyUiSource {
+    Components {
+        transformer: std::path::PathBuf,
+        text_encoder: std::path::PathBuf,
+        vae: std::path::PathBuf,
+    },
+    Checkpoint(std::path::PathBuf),
+}
+
+impl ComfyUiSource {
+    fn load_text(&self) -> Result<mlx_gen::weights::Weights> {
+        match self {
+            Self::Components { text_encoder, .. } => {
+                mlx_gen::weights::Weights::from_file_with_fp8(text_encoder)
+            }
+            Self::Checkpoint(path) => crate::comfyui::split_combined_text(path),
+        }
+    }
+
+    fn load_heavy(&self) -> Result<(mlx_gen::weights::Weights, mlx_gen::weights::Weights)> {
+        match self {
+            Self::Components {
+                transformer, vae, ..
+            } => Ok((
+                mlx_gen::weights::Weights::from_file_with_fp8(transformer)?,
+                mlx_gen::weights::Weights::from_file_with_fp8(vae)?,
+            )),
+            Self::Checkpoint(path) => crate::comfyui::split_combined_heavy(path),
+        }
+    }
+}
+
 fn build_comfyui_generator(
-    components: crate::comfyui::ComponentWeights,
+    source: ComfyUiSource,
     tokenizer_root: &Path,
 ) -> Result<Box<dyn Generator>> {
-    let text = loader::load_text_encoder_from_weights(crate::comfyui::normalize_fp8(
-        components.text_encoder,
-        "z-image text encoder",
-    )?)?;
-    let transformer = loader::load_transformer_from_weights(crate::comfyui::remap_dit(
-        crate::comfyui::normalize_fp8(components.transformer, "z-image transformer")?,
-    )?)?;
-    let vae = loader::load_vae_from_weights(crate::comfyui::remap_vae(
-        crate::comfyui::normalize_fp8(components.vae, "z-image VAE")?,
-    )?)?;
+    let text_source = source.clone();
+    let heavy_source = source;
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(tokenizer_root)?,
-        residency: Residency::resident(
-            text,
-            ZImageHeavyOwned {
-                transformer,
-                vae,
-                pid: None,
+        // A community single-file / three-file load has no snapshot component tree, so the contract's
+        // asset facts are the truthful zero (see `memory_strategy::asset_facts`).
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::File(std::path::PathBuf::from(
+                "comfyui-in-place",
+            ))),
+        )?,
+        residency: Residency::request_scoped(
+            move |streamable| {
+                if streamable {
+                    return Err(Error::Unsupported(
+                        "Z-Image ComfyUI in-memory weights cannot stream transformer blocks".into(),
+                    ));
+                }
+                loader::load_text_encoder_from_weights(crate::comfyui::normalize_fp8(
+                    text_source.load_text()?,
+                    "z-image text encoder",
+                )?)
+            },
+            move |_use_pid, streamable| {
+                if streamable {
+                    return Err(Error::Unsupported(
+                        "Z-Image ComfyUI in-memory weights cannot stream transformer blocks".into(),
+                    ));
+                }
+                let (transformer_weights, vae_weights) = heavy_source.load_heavy()?;
+                let transformer =
+                    loader::load_transformer_from_weights(crate::comfyui::remap_dit(
+                        crate::comfyui::normalize_fp8(transformer_weights, "z-image transformer")?,
+                    )?)?;
+                let vae = loader::load_vae_from_weights(crate::comfyui::remap_vae(
+                    crate::comfyui::normalize_fp8(vae_weights, "z-image VAE")?,
+                )?)?;
+                Ok(ZImageHeavyOwned {
+                    transformer,
+                    vae,
+                    pid: None,
+                })
             },
         ),
     }))
@@ -233,10 +294,10 @@ pub fn load_from_comfyui_components(
     tokenizer_root: impl AsRef<Path>,
 ) -> Result<Box<dyn Generator>> {
     build_comfyui_generator(
-        crate::comfyui::ComponentWeights {
-            transformer: mlx_gen::weights::Weights::from_file_with_fp8(transformer_file)?,
-            text_encoder: mlx_gen::weights::Weights::from_file_with_fp8(text_encoder_file)?,
-            vae: mlx_gen::weights::Weights::from_file_with_fp8(vae_file)?,
+        ComfyUiSource::Components {
+            transformer: transformer_file.as_ref().to_owned(),
+            text_encoder: text_encoder_file.as_ref().to_owned(),
+            vae: vae_file.as_ref().to_owned(),
         },
         tokenizer_root.as_ref(),
     )
@@ -248,17 +309,14 @@ pub fn load_from_comfyui_checkpoint(
     tokenizer_root: impl AsRef<Path>,
 ) -> Result<Box<dyn Generator>> {
     build_comfyui_generator(
-        crate::comfyui::split_combined_checkpoint(checkpoint_file.as_ref())?,
+        ComfyUiSource::Checkpoint(checkpoint_file.as_ref().to_owned()),
         tokenizer_root.as_ref(),
     )
 }
 
-/// Build the tokenizer + [`Residency`] seam for a non-control Z-Image generator from a [`LoadSpec`],
-/// honoring [`LoadSpec::offload_policy`] (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
-/// sc-11125). `Resident` (default) builds every heavy component now via [`build_residency`] and holds
-/// it warm; `Sequential` keeps only the spec and re-loads per generate in phase order (encode → drop
-/// the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both use
-/// the same per-phase loaders, so the components are byte-identical.
+/// Build the tokenizer + request-scoped [`Residency`] seam for a non-control Z-Image generator.
+/// `LoadSpec::offload_policy` is deliberately ignored: both values retain loaders and defer component
+/// loading until a request carries [`GenerationMemory::stage_residency`].
 ///
 /// `pub(crate)` and parameterized by `model_id` + the two per-id error strings (precision override /
 /// single-file rejection) so the **base** `z_image` sibling ([`crate::model_base`]) shares the
@@ -274,37 +332,33 @@ pub(crate) fn load_residency(
     // Precision + snapshot-dir guard up front for BOTH policies (fail fast), then the always-warm
     // tokenizer; the heavy component dispatch is the shared [`build_residency`] seam below.
     let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
-    if let Some(q) = spec.quantize {
+    let requantize_bits = if let Some(q) = spec.quantize {
         // F-009 (sc-12461): run the tier guard for BOTH residency policies, before any component
         // load — a Q4 request over a pre-quantized Q8 turnkey hard-errors here instead of silently
         // serving Q8 (`quantize()` is a no-op on packed weights). Before this fix only the
         // Sequential warn gate below evaluated it, so the DEFAULT `Resident` load skipped the guard
         // entirely; `load_heavy` re-checks for the Sequential per-generate reload path.
-        let load_time_quant =
-            mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
-        // F-181: a `Sequential` + load-time (re)quant over a *dense* snapshot re-quantizes the whole
-        // model on every generate. An already-packed turnkey loads packed (no re-quant); `Resident`
-        // quantizes once. So warn only for the Sequential-over-dense combination that actually pays
-        // the repeated cost.
-        if load_time_quant && matches!(spec.offload_policy, OffloadPolicy::Sequential) {
-            mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
-        }
-    }
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?
+            .then_some(q.bits())
+    } else {
+        None
+    };
     let tokenizer = loader::load_tokenizer(root)?;
-    Ok((
-        tokenizer,
-        build_residency(spec, model_id, precision_msg, file_msg)?,
-    ))
+    let mut residency = build_residency(spec, model_id, precision_msg, file_msg)?;
+    if let Some(bits) = requantize_bits {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        residency = residency.with_staged_advisory(move || {
+            if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                mlx_gen::residency::warn_sequential_requantize(model_id, bits);
+            }
+        });
+    }
+    Ok((tokenizer, residency))
 }
 
-/// The policy→[`Residency`] dispatch every Z-Image variant shares (sc-11126, F-180), routed through
-/// the single [`Residency::from_policy`] seam so no variant re-derives the `match offload_policy`
-/// (the divergence that let a sibling silently ignore `offload_policy` before sc-11124). `Resident`
-/// eager-loads the text encoder + heavy bundle (byte-identical to the pre-seam composition — the same
-/// per-phase loaders over independent weight files); `Sequential` captures the two loader closures and
-/// loads nothing now, deferring each to [`Residency::run`]. The deferral is weight-free-testable: under
-/// `Sequential` this touches no files, so a dispatch that ignored the policy would eager-load and fail
-/// the residency unit test's "Sequential defers" assertion.
+/// Request-scoped residency builder shared by every Z-Image variant. Both loader closures receive the
+/// request's `streamable` component form; phase-level staging is a separate argument to
+/// [`Residency::run_staged_request_scoped`].
 pub(crate) fn build_residency(
     spec: &LoadSpec,
     model_id: &'static str,
@@ -313,17 +367,16 @@ pub(crate) fn build_residency(
 ) -> Result<Residency<TextEncoder, ZImageHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
-        move || {
+    Ok(Residency::request_scoped(
+        move |streamable| {
             let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
-            load_text_encoder_only(root, spec_text.quantize)
+            load_text_encoder_only(root, spec_text.quantize, streamable)
         },
-        move |use_pid| {
+        move |use_pid, streamable| {
             let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
-            load_heavy(&spec_heavy, root, use_pid, model_id)
+            load_heavy(&spec_heavy, root, use_pid, streamable, model_id)
         },
-    )
+    ))
 }
 
 /// The `z_image_turbo` precision-override / single-file rejection messages, shared by the
@@ -352,8 +405,18 @@ fn resolve_precision_and_root<'a>(
 /// Load the Qwen text encoder (+ optional whole-model Q4/Q8), the phase-A component dropped first
 /// under `Sequential`. Q4/Q8 is `group_size 64` over every quantizable Linear + the token Embedding
 /// (sc-2532); factored out so the `Resident` and `Sequential` paths build byte-identical encoders.
-fn load_text_encoder_only(root: &Path, quant: Option<Quant>) -> Result<TextEncoder> {
-    let mut text_encoder = loader::load_text_encoder(root)?;
+/// `streamable` builds the rung-4 text-encoder stream (SC-15794). SC-15998 derives it from the
+/// independent [`mlx_gen::LoadShape::DeferredMaterialization`] request, not from phase-level residency.
+fn load_text_encoder_only(
+    root: &Path,
+    quant: Option<Quant>,
+    streamable: bool,
+) -> Result<TextEncoder> {
+    let mut text_encoder = if streamable {
+        loader::load_text_encoder_streamable(root)?
+    } else {
+        loader::load_text_encoder(root)?
+    };
     if let Some(q) = quant {
         text_encoder.quantize(q.bits())?;
     }
@@ -370,6 +433,7 @@ fn load_heavy(
     spec: &LoadSpec,
     root: &Path,
     load_pid: bool,
+    streamable: bool,
     model_id: &str,
 ) -> Result<ZImageHeavyOwned> {
     // F-009 (sc-12461): the tier guard runs here too, BEFORE the dense loads, so it fires on both
@@ -382,7 +446,7 @@ fn load_heavy(
     if let Some(q) = spec.quantize {
         mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
     }
-    let mut transformer = loader::load_transformer(root)?;
+    let mut transformer = loader::load_transformer_with_stream(root, streamable)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
@@ -395,6 +459,10 @@ fn load_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
     }
+    // SC-15754: capture what the resident blocks ended up carrying — AFTER quantization and adapters,
+    // so a streamed block replays the final state rather than re-deriving it. A no-op when rung 4 is
+    // unarmed or no adapter was installed.
+    transformer.capture_block_adapters();
     // Optional PiD decoder overlay (epic 7840, sc-7846): Z-Image is the Flux1 latent space, so it
     // reuses the `flux` PiD student (the `zimage-turbo` registry alias). Loaded only when the spec
     // carries `pid` AND this generate uses it (`load_pid`, F-177) — the Resident path passes `true`
@@ -415,10 +483,44 @@ fn load_heavy(
     })
 }
 
-mlx_gen::impl_generator!(ZImageTurbo {
-    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `impl_generator!` because this provider also implements the shared
+// memory-strategy hooks (SC-15449 / SC-15615); `descriptor` / `validate` / `generate` are the identical
+// plain delegation the macro would have emitted.
+impl Generator for ZImageTurbo {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+    }
+}
 
 impl ZImageTurbo {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -451,8 +553,27 @@ impl ZImageTurbo {
         // fit-gate signal) `run_staged` frees the DiT after denoise and before the (tiled) VAE decode,
         // so the decode peak excludes the ~3.2 GiB DiT; under `Resident` nothing is shed. `tiling` bounds
         // the decode transient on the same small-Mac signal ([`pipeline::decode_tiling`]).
-        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
-        let images = self.residency.run_staged(
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let streamable = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let tiling = pipeline::decode_tiling(req, stage_residency);
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
+        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
+        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
+        let deferred_materialization = streamable;
+        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
+        let images = self.residency.run_staged_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -461,8 +582,20 @@ impl ZImageTurbo {
             // round the text embeddings to bf16 to match the fork's golden; f32 is sharper — flip to
             // f32 once parity is not the goal.
             |text_encoder: &TextEncoder| {
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 if is_img2img {
                     Ok(cap)
                 } else {
@@ -475,6 +608,11 @@ impl ZImageTurbo {
             // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
             // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
             |heavy: &ZImageHeavyOwned, cap, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
                 // seed-independent. An unset `req.scheduler` keeps this native schedule byte-exact
                 // (epic 7114 N1); a curated name re-shapes the σ schedule over the same `shift=3.0`.
@@ -527,6 +665,8 @@ impl ZImageTurbo {
                             latents,
                             &cap,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )
@@ -540,6 +680,7 @@ impl ZImageTurbo {
             },
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
+                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
@@ -616,9 +757,18 @@ mlx_gen::register_generators! {
     footprint = component_footprint
 }
 
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::OffloadPolicy;
 
     #[test]
     fn descriptor_is_z_image_turbo() {
@@ -810,15 +960,8 @@ mod tests {
         }
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Z-Image Turbo's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the
-    // up-front precision/single-file guard passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the text encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident` — the F-172 regression this whole
-    // seam exists to prevent) would eager-load under a `Sequential` request and fail the first
-    // assertion. The existing `sequential_residency_real_weights.rs` A/B is `#[ignore]`d; this runs
-    // by default.
+    // SC-15806: Z-Image construction is request-scoped. Both legacy load-policy values retain the
+    // same loaders and defer component loading; GenerationMemory chooses the lifecycle per request.
     fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/z-image-residency-test-snapshot".into(),
@@ -827,18 +970,22 @@ mod tests {
     }
 
     #[test]
-    fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(
-            &missing_snapshot_spec(OffloadPolicy::Sequential),
-            MODEL_ID,
-            PRECISION_MSG,
-            FILE_MSG,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
+    fn build_residency_defers_for_both_legacy_offload_values() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let res = build_residency(
+                &missing_snapshot_spec(policy),
+                MODEL_ID,
+                PRECISION_MSG,
+                FILE_MSG,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+            });
+            assert!(
+                res.is_sequential(),
+                "{policy:?} must begin with no warm request-scoped pair"
+            );
+        }
     }
 
     // ── F-009 (sc-12461): the tier-mismatch guard must fire on the DEFAULT `Resident` policy, not
@@ -875,7 +1022,7 @@ mod tests {
         // missing-weights error instead — asserting on the tier message proves the guard runs first.
         let root = loader::packed_snapshot_fixture("model-heavy", 8);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q4);
-        let err = load_heavy(&spec, &root, false, MODEL_ID)
+        let err = load_heavy(&spec, &root, false, false, MODEL_ID)
             .err()
             .expect("expected a tier-mismatch error")
             .to_string();
@@ -895,22 +1042,5 @@ mod tests {
             "a matching packed tier must not trip the mismatch guard, got: {err}"
         );
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(
-            &missing_snapshot_spec(OffloadPolicy::Resident),
-            MODEL_ID,
-            PRECISION_MSG,
-            FILE_MSG,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
     }
 }

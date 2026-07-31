@@ -609,7 +609,8 @@ mod tests {
         dit_load.quantize(4).unwrap();
 
         // On-disk-quantized DiT: convert to a temp dir, then reload through the packed path.
-        let dst = std::env::temp_dir().join("boogu_e8_q4_convert");
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let dst = std::env::temp_dir().join(format!("boogu_e8_q4_convert_{}", std::process::id()));
         quantize_transformer(&root, &dst, 4).unwrap();
         let w = Weights::from_dir(dst.join("transformer")).unwrap();
         validate_transformer(&w, &cfg).unwrap();

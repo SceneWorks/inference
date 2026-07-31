@@ -645,16 +645,15 @@ pub const MIN_TEMPORAL_TILE_LATENT_FRAMES: i32 = 8;
 /// The minimum temporal **overlap**, in *latent* frames, stamped onto a selected temporal tile
 /// (sc-15325). Overlap is the secondary term above, and it is **free in peak**: the tiled decode
 /// `eval`s per tile, so the peak is one tile's transient plus the output accumulators and the overlap
-/// enters neither — a shorter stride is more passes (wall time), not a bigger graph. So there is no
-/// reason to buy a large tile and leave the blend at one latent frame.
+/// enters neither — a shorter stride is more passes (wall time), not a bigger graph.
 ///
 /// ## ⚠️ This raise is a separate change from the tile-size fix — here is its bound
 ///
 /// sc-15325's defect was tile *size*. Raising the overlap is a distinct, **beneficial but
-/// independently-motivated** change that rides along on it, and it touches two already-shipping
-/// engines (Wan z16 and z48). [`temporal_overlap_for`] raises every Wan candidate:
+/// independently-motivated** change. [`temporal_overlap_for`] raises the shared quality-oriented
+/// policy's candidates to half a latent tile:
 /// `(96, 24) → (96, 48)` (stride 72 → 48), `(64, 24) → (64, 32)`, `(48, 16) → (48, 24)`,
-/// `(32, 8) → (32, 16)`. Two things bound the risk:
+/// `(32, 8) → (32, 16)`.
 ///
 ///  * **Memory and plan selection are provably unchanged.** Overlap enters neither `peak_cost` (whose
 ///    tile term is `tile_f · tile_h · tile_w`) nor [`budgeted_plan`]'s selection key (`voxels`, the
@@ -676,8 +675,15 @@ pub const MIN_TEMPORAL_TILE_LATENT_FRAMES: i32 = 8;
 /// 9.7 %/26.6 % the starved latent-2 window produced. Tile *size* is what governs clipping; the
 /// overlap barely moves it in either direction.
 ///
-/// Quantifying the wall-time cost on the shipping Wan buckets (rather than bounding it, as here) is
-/// tracked as **sc-15445**.
+/// sc-15445 then measured that bound on both real Wan VAEs at the 640×384×81 and 832×480×121
+/// shipping points. The half-tile policy cost **31.8–48.5 %** on z16 and **21.1–39.3 %** on z48 for
+/// only **0.30–0.60/255** and **0.10–0.15/255** less error respectively, with unchanged clipping and
+/// peak. That is material wall time for a marginal Wan gain, so the Wan product selectors now choose
+/// [`TemporalOverlapPolicy::Candidate`]. Krea Realtime and SCAIL-2 deliberately retain
+/// [`TemporalOverlapPolicy::HalfTile`]: their sc-15325 correction is quality-oriented, and they share
+/// the z16 VAE while entering through a separate selector. LTX also retains half-tile overlap under
+/// its separately measured cost/benefit argument above. The full A/B, hashes, and environment are in
+/// `docs/migration/SC_15445_WAN_OVERLAP_AB.md`.
 pub const MIN_TEMPORAL_TILE_LATENT_OVERLAP: i32 = 2;
 
 /// The smallest **output**-frame temporal tile that satisfies [`MIN_TEMPORAL_TILE_LATENT_FRAMES`] for
@@ -694,10 +700,38 @@ pub fn min_temporal_tile_frames(vae: VaeTiling) -> i32 {
 /// Public so a consumer can reason about — and a test can gate — the policy without re-deriving the
 /// arithmetic.
 pub fn temporal_overlap_for(vae: VaeTiling, tile_frames: i32, candidate_overlap: i32) -> i32 {
+    temporal_overlap_for_policy(
+        TemporalOverlapPolicy::HalfTile,
+        vae,
+        tile_frames,
+        candidate_overlap,
+    )
+}
+
+/// How a selected temporal candidate's overlap is finalized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporalOverlapPolicy {
+    /// Preserve the VAE/provider candidate grid's measured overlap, enforcing only the shared
+    /// two-latent-frame floor. This is the Wan product policy after sc-15445.
+    Candidate,
+    /// Raise overlap to at least half the latent tile. This remains the quality-oriented policy for
+    /// Krea Realtime, SCAIL-2, and LTX.
+    HalfTile,
+}
+
+fn temporal_overlap_for_policy(
+    policy: TemporalOverlapPolicy,
+    vae: VaeTiling,
+    tile_frames: i32,
+    candidate_overlap: i32,
+) -> i32 {
     let scale = vae.temporal_scale.max(1);
     let tile_latent = (tile_frames / scale).max(1);
-    let want_latent = (tile_latent / 2)
-        .max(MIN_TEMPORAL_TILE_LATENT_OVERLAP)
+    let policy_floor = match policy {
+        TemporalOverlapPolicy::Candidate => MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+        TemporalOverlapPolicy::HalfTile => (tile_latent / 2).max(MIN_TEMPORAL_TILE_LATENT_OVERLAP),
+    };
+    let want_latent = policy_floor
         .max(candidate_overlap / scale)
         // `split_spatial` clamps the latent overlap to `tile − 1`; emitting more would be inert, and
         // silently-inert config is how the original defect hid (`overlap = 4` at a latent tile of 2
@@ -717,6 +751,8 @@ pub struct TileCandidates<'a> {
     pub spatial_overlap_px: i32,
     /// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames.
     pub temporal: &'a [(i32, i32)],
+    /// Whether the selected temporal candidate keeps its own overlap or is raised to half a tile.
+    pub temporal_overlap_policy: TemporalOverlapPolicy,
 }
 
 /// Why [`budgeted_plan`] could not fit a decode within the safe budget even with tiling. Carries the
@@ -839,7 +875,12 @@ pub fn budgeted_plan(
         .iter()
         .copied()
         .filter(|&(t, _)| (t as i64) < f && t >= min_tile_frames)
-        .map(|(t, o)| (t, temporal_overlap_for(vae, t, o)))
+        .map(|(t, o)| {
+            (
+                t,
+                temporal_overlap_for_policy(candidates.temporal_overlap_policy, vae, t, o),
+            )
+        })
         .collect();
     temporal.push((f as i32, 0)); // full temporal extent = no temporal tiling
 
@@ -1079,6 +1120,7 @@ mod tests {
             spatial_px: &T_SPATIAL,
             spatial_overlap_px: 64,
             temporal: &T_TEMPORAL,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
         }
     }
 
@@ -1348,6 +1390,67 @@ mod tests {
         assert_eq!(temporal_overlap_for(VaeTiling::WAN, 4, 8), 0);
     }
 
+    /// sc-15445: the policy split must remain explicit. Wan's product candidates keep their measured
+    /// overlap, while quality-oriented consumers keep the half-tile raise. Every row discriminates
+    /// against deleting the policy branch or swapping either variant.
+    #[test]
+    fn wan_candidate_and_quality_overlap_policies_discriminate_every_shipping_row() {
+        for (tile, candidate, half) in [(96, 24, 48), (64, 24, 32), (48, 16, 24), (32, 8, 16)] {
+            assert_eq!(
+                temporal_overlap_for_policy(
+                    TemporalOverlapPolicy::Candidate,
+                    VaeTiling::WAN,
+                    tile,
+                    candidate,
+                ),
+                candidate,
+            );
+            assert_eq!(
+                temporal_overlap_for_policy(
+                    TemporalOverlapPolicy::HalfTile,
+                    VaeTiling::WAN,
+                    tile,
+                    candidate,
+                ),
+                half,
+            );
+        }
+
+        // The exact two A/B geometries: overlap alone raises temporal/all VAE tile calls by 25 %.
+        for (vae, latent, h, w, tile, candidate, expected) in [
+            (VaeTiling::WAN, 21, 48, 80, 32, 8, (4, 5, 60, 75)),
+            (VaeTiling::WAN, 31, 60, 104, 48, 16, (4, 5, 96, 120)),
+            (VaeTiling::WAN22, 21, 24, 40, 32, 8, (4, 5, 60, 75)),
+            (VaeTiling::WAN22, 31, 30, 52, 48, 16, (4, 5, 96, 120)),
+        ] {
+            let iterations = |policy| {
+                let cfg = TilingConfig {
+                    spatial: Some(SpatialTiling {
+                        tile_px: 192,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(TemporalTiling {
+                        tile_frames: tile,
+                        overlap_frames: temporal_overlap_for_policy(policy, vae, tile, candidate),
+                    }),
+                };
+                let plan = cfg.plan(vae, latent, h, w);
+                (plan.t.len(), plan.t.len() * plan.h.len() * plan.w.len())
+            };
+            let candidate_iters = iterations(TemporalOverlapPolicy::Candidate);
+            let half_iters = iterations(TemporalOverlapPolicy::HalfTile);
+            assert_eq!(
+                (
+                    candidate_iters.0,
+                    half_iters.0,
+                    candidate_iters.1,
+                    half_iters.1
+                ),
+                expected,
+            );
+        }
+    }
+
     /// The floor must not make a previously-feasible decode impossible at a realistic budget: the
     /// savings move to the spatial axis. This is the affordability claim sc-15325's operating point
     /// rests on, checked against the real z16 cost coefficients (64 B/out-voxel accumulators,
@@ -1364,6 +1467,7 @@ mod tests {
             spatial_px: &SPATIAL,
             spatial_overlap_px: 64,
             temporal: &TEMPORAL,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
         };
         // Every bucket the pre-fix krea/scail2 window collapsed at, plus the one it did not, at a
         // 12 GiB budget — well under the ~21 GiB the old fixed 8-frame full-frame window actually cost.

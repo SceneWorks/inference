@@ -374,7 +374,7 @@ fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
     let plain = gen(&[]);
     let styled = gen(&[lora_spec(style_lora(), 1.0)]);
 
-    let dir = std::env::temp_dir().join("anima_sc10578_images");
+    let dir = std::env::temp_dir().join(format!("anima_sc10578_images_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     write_ppm(&dir.join("q4_plain.ppm"), &plain.pixels, 1024, 1024);
     write_ppm(&dir.join("q4_style_lora.ppm"), &styled.pixels, 1024, 1024);

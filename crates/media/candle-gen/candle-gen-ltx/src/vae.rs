@@ -14,7 +14,9 @@
 
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{
+    TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
 use candle_gen::vae_tiling;
 
 use crate::config::{LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE};
@@ -666,6 +668,7 @@ fn plan_ltx_tiling(
         spatial_px: &LTX_VAE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &LTX_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
     };
     vae_tiling::plan_tiling(
         "ltx vae decode",

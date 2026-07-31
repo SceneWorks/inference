@@ -10,9 +10,11 @@
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
+pub mod attention_budget;
 pub mod audio_dsp;
 pub mod audio_embed;
 pub mod audio_transform;
+pub mod block_window;
 pub mod caption;
 pub mod control;
 pub mod error;
@@ -20,18 +22,18 @@ pub mod face;
 pub mod generator;
 pub mod guidance;
 pub mod image_embed;
-pub mod image_memory;
 pub mod imageops;
 pub mod json_constraint;
 pub mod license;
 mod macros;
 pub mod media;
-pub mod mempolicy;
+pub mod memory_strategy;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
 pub mod sdxl_ldm;
 pub mod text_embed;
+pub mod tier_integrity;
 pub mod tiling;
 pub mod tokenizer;
 pub mod train;
@@ -63,40 +65,39 @@ pub use generator::{
     default_seed, AudioEditMode, AudioEditRef, AudioParams, Capabilities, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode,
+    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
     SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-pub use image_memory::{
-    ImageMemoryAssetFacts, ImageMemoryBackendRealization, ImageMemoryBudget,
-    ImageMemoryCacheSemantics, ImageMemoryCacheState, ImageMemoryCalibrationIdentity,
-    ImageMemoryCleanupSemantics, ImageMemoryConformanceState, ImageMemoryEvidence,
-    ImageMemoryEvidenceDimension, ImageMemoryEvidenceDimensions, ImageMemoryEvidenceKey,
-    ImageMemoryEvidenceVerdict, ImageMemoryFormulaKind, ImageMemoryFormulaVariable,
-    ImageMemoryGeometry, ImageMemoryLifecycleCapabilities, ImageMemoryMode, ImageMemoryNumericTier,
-    ImageMemoryParameterRanges, ImageMemoryParityContract, ImageMemoryParityResult,
-    ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRejection, ImageMemoryRequestScope,
-    ImageMemoryRunContext, ImageMemoryRunOutcome, ImageMemoryRuntimeSemantics,
-    ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy,
-    ImageMemoryStrategyCapability, ImageMemoryStrategyParameters, ImageMemoryStrategySupport,
-    ImageMemoryWarmRunSemantics, IMAGE_MEMORY_CALIBRATION_ABI,
-};
 pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
-pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
+pub use memory_strategy::{
+    MemoryAssetFacts, MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryConformanceState,
+    MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
+    MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges,
+    MemoryParityContract, MemoryParityResult, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
+    TransformerComponent, MEMORY_CALIBRATION_ABI,
+};
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
-    ImageEmbedderRegistration, ImageMemoryRegistration, ModelRegistration, PerComponentBytes,
+    ImageEmbedderRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
     ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec,
-    MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame, PreviewSink, Progress, Quant,
-    WeightsSource,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
+    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
+    PreviewSink, Progress, Quant, WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
+pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};

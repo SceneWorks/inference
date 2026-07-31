@@ -19,7 +19,10 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
+use mlx_gen::tiling::{
+    budgeted_plan, TemporalOverlapPolicy, TileCandidates, TilingBudgetError, TilingConfig,
+    VaeTiling,
+};
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
 use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler};
@@ -57,12 +60,30 @@ pub fn reject_over_area(
     dh: u32,
     max_area: usize,
 ) -> Result<()> {
+    reject_over_area_dims(id, req.width, req.height, dw, dh, max_area)
+}
+
+/// [`reject_over_area`] over an explicit `width`/`height` instead of `req`'s, for a provider whose
+/// rendered geometry is **not** the one on the request.
+///
+/// SCAIL-2 resolves `width`/`height == 0` from its driving-video frames (sc-16167), so `req.width`
+/// is the sentinel `0` and reading it would measure the wrong geometry — `0` area passes every cap.
+/// The two entry points share this body so the cap means the same thing whether the geometry was
+/// typed or resolved; there is no second copy of the alignment or the message to drift.
+pub fn reject_over_area_dims(
+    id: &str,
+    width: u32,
+    height: u32,
+    dw: u32,
+    dh: u32,
+    max_area: usize,
+) -> Result<()> {
     if max_area == 0 {
         return Ok(());
     }
     let (w, h) = (
-        align_dim(req.width, 1, dw as usize),
-        align_dim(req.height, 1, dh as usize),
+        align_dim(width, 1, dw as usize),
+        align_dim(height, 1, dh as usize),
     );
     let area = w as usize * h as usize;
     if area > max_area {
@@ -419,6 +440,7 @@ fn plan_vae22_tiling(
         spatial_px: &VAE22_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &VAE22_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     budgeted_plan(
         VaeTiling::WAN22,
@@ -517,6 +539,24 @@ pub fn auto_tiling_budgeted_z16(
     plan_z16_tiling(height, width, out_frames, wan_vae_safe_budget_gib())
 }
 
+/// The z16 selector used by Krea Realtime and SCAIL-2. It shares Wan's candidate grid, peak model,
+/// and free-aware budget, but deliberately retains sc-15325's quality-oriented half-tile overlap.
+/// Wan's own product providers use [`auto_tiling_budgeted_z16`], which restores the measured
+/// candidate overlap after sc-15445 found the half-tile policy materially slower for a marginal gain.
+pub fn auto_tiling_budgeted_z16_quality_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    plan_z16_tiling_with_overlap(
+        height,
+        width,
+        out_frames,
+        wan_vae_safe_budget_gib(),
+        TemporalOverlapPolicy::HalfTile,
+    )
+}
+
 /// Pure z16 tile selector behind [`auto_tiling_budgeted_z16`] (the `safe_gib` ceiling is injected so it
 /// is unit-testable without touching the global memory limit). Supplies the z16 cost model + candidate
 /// grid to the shared [`budgeted_plan`]; same `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as
@@ -527,10 +567,27 @@ fn plan_z16_tiling(
     out_frames: i32,
     safe_gib: f64,
 ) -> Result<Option<TilingConfig>> {
+    plan_z16_tiling_with_overlap(
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        TemporalOverlapPolicy::Candidate,
+    )
+}
+
+fn plan_z16_tiling_with_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    temporal_overlap_policy: TemporalOverlapPolicy,
+) -> Result<Option<TilingConfig>> {
     let candidates = TileCandidates {
         spatial_px: &VAE16_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &VAE16_TEMPORAL_FR,
+        temporal_overlap_policy,
     };
     budgeted_plan(
         VaeTiling::WAN,
@@ -1468,6 +1525,124 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const WAN_OVERLAP_EVIDENCE: [(&str, &str); 4] = [
+        (
+            "z16-640",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z16-640.log"
+            )),
+        ),
+        (
+            "z16-832",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z16-832.log"
+            )),
+        ),
+        (
+            "z48-640",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z48-640.log"
+            )),
+        ),
+        (
+            "z48-832",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z48-832.log"
+            )),
+        ),
+    ];
+    const WAN_OVERLAP_Z48_832_CLEAN_QUALITY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../docs/migration/evidence/sc-15445/z48-832-quality-clean.log"
+    ));
+
+    fn evidence_result(log: &'static str) -> &'static str {
+        let mut results = log.lines().filter_map(|line| line.strip_prefix("RESULT "));
+        let result = results
+            .next()
+            .expect("evidence log must contain one RESULT");
+        assert!(
+            results.next().is_none(),
+            "evidence log must contain exactly one RESULT"
+        );
+        result
+    }
+
+    fn evidence_fields(log: &'static str) -> BTreeMap<&'static str, &'static str> {
+        evidence_result(log)
+            .split_ascii_whitespace()
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .expect("every RESULT field must be key=value")
+            })
+            .collect()
+    }
+
+    fn evidence_f64(fields: &BTreeMap<&str, &str>, key: &str) -> f64 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("evidence RESULT {key} must be numeric"))
+    }
+
+    fn evidence_i32(fields: &BTreeMap<&str, &str>, key: &str) -> i32 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("evidence RESULT {key} must be an integer"))
+    }
+
+    fn evidence_pair(fields: &BTreeMap<&str, &str>, key: &str) -> (usize, usize) {
+        let value = fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"));
+        let (old, half) = value
+            .split_once("=>")
+            .unwrap_or_else(|| panic!("evidence RESULT {key} must be old=>half"));
+        (
+            old.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} old must be an integer")),
+            half.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} half must be an integer")),
+        )
+    }
+
+    fn evidence_range(fields: &BTreeMap<&str, &str>, key: &str) -> (f64, f64) {
+        let value = fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"));
+        let (min, max) = value
+            .split_once("..")
+            .unwrap_or_else(|| panic!("evidence RESULT {key} must be min..max"));
+        (
+            min.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} min must be numeric")),
+            max.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} max must be numeric")),
+        )
+    }
+
+    fn evidence_result_checksum() -> u64 {
+        WAN_OVERLAP_EVIDENCE
+            .iter()
+            .map(|(_, log)| evidence_result(log))
+            .chain(std::iter::once(evidence_result(
+                WAN_OVERLAP_Z48_832_CLEAN_QUALITY,
+            )))
+            .flat_map(|result| result.bytes().chain(std::iter::once(b'\n')))
+            .fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            })
+    }
 
     /// Pin the actual callback order for all four curated samplers. Heun and DPM++ SDE add
     /// intermediate evaluations, but their sigma streams still cross the expert boundary exactly
@@ -2082,6 +2257,172 @@ mod tests {
             peak <= safe,
             "z16 chosen peak {peak:.1} GiB over safe {safe:.1}"
         );
+    }
+
+    /// sc-15445 decision gate: Wan product selectors restore the historical candidate overlap while
+    /// Krea/SCAIL-2's z16 selector retains half-tile overlap. The budgets deliberately select the
+    /// 32-frame row measured at 640×384×81, so changing either policy is independently red.
+    #[test]
+    fn wan_product_and_quality_selectors_keep_the_measured_overlap_split() {
+        let wan_z16 = plan_z16_tiling(384, 640, 84, 10.0).unwrap().unwrap();
+        let quality_z16 =
+            plan_z16_tiling_with_overlap(384, 640, 84, 10.0, TemporalOverlapPolicy::HalfTile)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            wan_z16.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 8)),
+        );
+        assert_eq!(
+            quality_z16
+                .temporal
+                .map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
+        assert_eq!(
+            wan_z16.spatial.map(|s| (s.tile_px, s.overlap_px)),
+            quality_z16.spatial.map(|s| (s.tile_px, s.overlap_px)),
+            "the policy split must change only temporal overlap",
+        );
+
+        let wan_z48 = plan_vae22_tiling(384, 640, 81, 4.5, true).unwrap().unwrap();
+        assert_eq!(
+            wan_z48.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 8)),
+        );
+
+        // Parse the committed raw RESULT records rather than restating their numbers in this test.
+        // The checksum makes any evidence-row edit explicit; the assertions below independently
+        // gate the four-cell scope, reproduce every recorded call count from live tiling geometry,
+        // and enforce the cost/quality thresholds behind Candidate.
+        let expected_cells = [
+            "Z16:640x384:81",
+            "Z16:832x480:121",
+            "Z48:640x384:81",
+            "Z48:832x480:121",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut actual_cells = BTreeSet::new();
+        for (_, log) in WAN_OVERLAP_EVIDENCE {
+            let fields = evidence_fields(log);
+            let family = fields["family"];
+            let cell = format!("{family}:{}:{}", fields["bucket"], fields["product_frames"]);
+            assert!(actual_cells.insert(cell.clone()), "duplicate evidence cell");
+
+            let vae = match family {
+                "Z16" => VaeTiling::WAN,
+                "Z48" => VaeTiling::WAN22,
+                other => panic!("unexpected evidence family {other}"),
+            };
+            let (width, height) = fields["bucket"]
+                .split_once('x')
+                .map(|(w, h)| {
+                    (
+                        w.parse::<i32>().expect("numeric evidence width"),
+                        h.parse::<i32>().expect("numeric evidence height"),
+                    )
+                })
+                .expect("evidence bucket must be WIDTHxHEIGHT");
+            let decoded_frames = evidence_i32(&fields, "decoded_frames");
+            let latent_frames = if vae.causal_temporal {
+                (decoded_frames - 1) / vae.temporal_scale + 1
+            } else {
+                decoded_frames / vae.temporal_scale
+            };
+            let tile_frames = evidence_i32(&fields, "tile");
+            let candidate_overlap = evidence_i32(&fields, "old_overlap");
+            let half_overlap = evidence_i32(&fields, "current_overlap");
+            let iterations = |overlap_frames| {
+                let plan = TilingConfig {
+                    spatial: Some(mlx_gen::tiling::SpatialTiling {
+                        tile_px: 192,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(mlx_gen::tiling::TemporalTiling {
+                        tile_frames,
+                        overlap_frames,
+                    }),
+                }
+                .plan(
+                    vae,
+                    latent_frames,
+                    height / vae.spatial_scale,
+                    width / vae.spatial_scale,
+                );
+                (plan.t.len(), plan.t.len() * plan.h.len() * plan.w.len())
+            };
+            let candidate_iters = iterations(candidate_overlap);
+            let half_iters = iterations(half_overlap);
+            assert_eq!(
+                (candidate_iters.0, half_iters.0),
+                evidence_pair(&fields, "temporal_iterations"),
+                "{cell}: temporal calls must reproduce from the live planner",
+            );
+            assert_eq!(
+                (candidate_iters.1, half_iters.1),
+                evidence_pair(&fields, "all_iterations"),
+                "{cell}: all tile calls must reproduce from the live planner",
+            );
+
+            let old_s = evidence_f64(&fields, "old_seconds_median");
+            let half_s = evidence_f64(&fields, "current_seconds_median");
+            let recorded_ratio = evidence_f64(&fields, "wall_ratio");
+            assert!(
+                (half_s / old_s - recorded_ratio).abs() <= 0.0001,
+                "{cell}: recorded wall ratio must agree with medians",
+            );
+            assert!(
+                half_s / old_s >= 1.20,
+                "{cell}: half-tile wall cost stopped being material",
+            );
+            let (_, old_max) = evidence_range(&fields, "old_seconds_range");
+            let (half_min, _) = evidence_range(&fields, "current_seconds_range");
+            assert!(half_min > old_max, "{cell}: repeated timing ranges overlap",);
+
+            let old_err = evidence_f64(&fields, "old_mae255");
+            let half_err = evidence_f64(&fields, "current_mae255");
+            assert!(
+                half_err < old_err && old_err - half_err <= 0.61,
+                "{cell}: recorded quality trade no longer supports the measured decision",
+            );
+            let old_peak = evidence_f64(&fields, "old_peak_gib");
+            let half_peak = evidence_f64(&fields, "current_peak_gib");
+            assert!(
+                (half_peak / old_peak - 1.0f64).abs() <= 0.05,
+                "{cell}: overlap unexpectedly changed peak memory",
+            );
+        }
+        assert_eq!(
+            actual_cells, expected_cells,
+            "evidence must contain exactly both shipping buckets for both Wan VAE families",
+        );
+        assert_eq!(
+            evidence_result_checksum(),
+            0x5717_3a67_4348_cabb,
+            "sc-15445 RESULT records changed; audit the new evidence and update this checksum",
+        );
+
+        // The final timed row's post-timing quality phase overlapped another Metal task. Its
+        // uncontended quality-only rerun must reproduce every metric used by the decision.
+        let timed = evidence_fields(WAN_OVERLAP_EVIDENCE[3].1);
+        let clean = evidence_fields(WAN_OVERLAP_Z48_832_CLEAN_QUALITY);
+        for key in [
+            "old_mae255",
+            "current_mae255",
+            "reference_clip_mean",
+            "reference_clip_worst",
+            "old_clip_mean",
+            "old_clip_worst",
+            "current_clip_mean",
+            "current_clip_worst",
+        ] {
+            assert_eq!(
+                timed[key], clean[key],
+                "clean z48 832 quality rerun changed {key}",
+            );
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ use candle_audio::candle_core::{Device, Result as CResult, Tensor};
 use candle_audio::gen_core::{
     self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    ModelDescriptor, Progress, SizeFloor, WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
 use rand::rngs::StdRng;
@@ -178,6 +178,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_history: false,
             supports_conversation_session: false,
             max_speakers: None,
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

@@ -55,7 +55,7 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision as LoadPrecision, Progress, Result, WeightsSource,
+    Precision as LoadPrecision, Progress, Result, SizeFloor, WeightsSource,
 };
 
 use crate::audio_vae::AudioDecoder;
@@ -278,6 +278,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

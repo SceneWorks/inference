@@ -17,35 +17,62 @@ pub(crate) struct ComponentWeights {
     pub vae: Weights,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Component {
+    Transformer,
+    TextEncoder,
+    Vae,
+}
+
+fn component_name(key: &str) -> Option<(Component, &str)> {
+    if let Some(key) = key.strip_prefix("model.diffusion_model.") {
+        return Some((Component::Transformer, key));
+    }
+    if let Some(key) = key.strip_prefix("transformer.") {
+        return Some((Component::Transformer, key));
+    }
+    if let Some(key) = key.strip_prefix("conditioner.embedders.0.transformer.") {
+        return Some((Component::TextEncoder, key));
+    }
+    if let Some(key) = key.strip_prefix("text_encoders.qwen3_4b.transformer.") {
+        return Some((Component::TextEncoder, key));
+    }
+    if let Some(key) = key.strip_prefix("text_encoder.") {
+        return Some((Component::TextEncoder, key));
+    }
+    if let Some(key) = key.strip_prefix("first_stage_model.") {
+        return Some((Component::Vae, key));
+    }
+    key.strip_prefix("vae")
+        .and_then(|key| key.strip_prefix('.').map(|key| (Component::Vae, key)))
+}
+
 fn component_for_key<'a, 'b>(
     key: &'a str,
     transformer: &'b mut HashMap<String, Array>,
     text_encoder: &'b mut HashMap<String, Array>,
     vae: &'b mut HashMap<String, Array>,
 ) -> Option<(&'a str, &'b mut HashMap<String, Array>)> {
-    if let Some(key) = key.strip_prefix("model.diffusion_model.") {
-        return Some((key, transformer));
-    }
-    if let Some(key) = key.strip_prefix("transformer.") {
-        return Some((key, transformer));
-    }
-    if let Some(key) = key.strip_prefix("conditioner.embedders.0.transformer.") {
-        return Some((key, text_encoder));
-    }
-    if let Some(key) = key.strip_prefix("text_encoders.qwen3_4b.transformer.") {
-        return Some((key, text_encoder));
-    }
-    if let Some(key) = key.strip_prefix("text_encoder.") {
-        return Some((key, text_encoder));
-    }
-    if let Some(key) = key.strip_prefix("first_stage_model.") {
-        return Some((key, vae));
-    }
-    key.strip_prefix("vae.").map(|key| (key, vae))
+    let (component, key) = component_name(key)?;
+    let map = match component {
+        Component::Transformer => transformer,
+        Component::TextEncoder => text_encoder,
+        Component::Vae => vae,
+    };
+    Some((key, map))
 }
 
-pub(crate) fn split_combined_checkpoint(path: &Path) -> Result<ComponentWeights> {
-    let mut source = Weights::from_file_with_fp8(path)?;
+fn split_combined_checkpoint_selected(
+    path: &Path,
+    include_text: bool,
+    include_heavy: bool,
+) -> Result<ComponentWeights> {
+    let mut source = Weights::from_file_with_fp8_filter(path, |key| {
+        component_name(key).is_some_and(|(component, _)| match component {
+            Component::TextEncoder => include_text,
+            Component::Transformer | Component::Vae => include_heavy,
+        })
+    })?;
     let keys: Vec<String> = source.keys().map(str::to_owned).collect();
     let mut transformer = HashMap::new();
     let mut text_encoder = HashMap::new();
@@ -61,12 +88,12 @@ pub(crate) fn split_combined_checkpoint(path: &Path) -> Result<ComponentWeights>
             .ok_or_else(|| Error::MissingTensor(source_key.clone()))?;
         map.insert(target.to_owned(), value);
     }
-    for (name, map) in [
-        ("transformer", &transformer),
-        ("text encoder", &text_encoder),
-        ("VAE", &vae),
+    for (enabled, name, map) in [
+        (include_heavy, "transformer", &transformer),
+        (include_text, "text encoder", &text_encoder),
+        (include_heavy, "VAE", &vae),
     ] {
-        if map.is_empty() {
+        if enabled && map.is_empty() {
             return Err(Error::Msg(format!(
                 "z-image combined checkpoint is missing the {name} component"
             )));
@@ -77,6 +104,15 @@ pub(crate) fn split_combined_checkpoint(path: &Path) -> Result<ComponentWeights>
         text_encoder: Weights::from_map(text_encoder),
         vae: Weights::from_map(vae),
     })
+}
+
+pub(crate) fn split_combined_text(path: &Path) -> Result<Weights> {
+    Ok(split_combined_checkpoint_selected(path, true, false)?.text_encoder)
+}
+
+pub(crate) fn split_combined_heavy(path: &Path) -> Result<(Weights, Weights)> {
+    let components = split_combined_checkpoint_selected(path, false, true)?;
+    Ok((components.transformer, components.vae))
 }
 
 pub(crate) fn normalize_fp8(mut source: Weights, what: &str) -> Result<Weights> {
@@ -314,5 +350,38 @@ mod tests {
             vae_key("decoder.mid.attn_1.proj_out.weight").unwrap(),
             "decoder.mid_block.attentions.0.to_out.0.weight"
         );
+    }
+
+    #[test]
+    fn fused_checkpoint_phase_loaders_filter_before_building_arrays() {
+        let dir = std::env::temp_dir().join(format!(
+            "z_image_comfyui_phase_filter_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("combined.safetensors");
+        let text = Array::from_slice(&[1.0f32], &[1]);
+        let transformer = Array::from_slice(&[2.0f32], &[1]);
+        let vae = Array::from_slice(&[3.0f32], &[1]);
+        Array::save_safetensors(
+            vec![
+                ("text_encoder.layer.weight", &text),
+                ("transformer.block.weight", &transformer),
+                ("vae.decoder.weight", &vae),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+
+        let text_only = split_combined_text(&path).unwrap();
+        assert_eq!(text_only.keys().collect::<Vec<_>>(), ["layer.weight"]);
+        let (transformer_only, vae_only) = split_combined_heavy(&path).unwrap();
+        assert_eq!(
+            transformer_only.keys().collect::<Vec<_>>(),
+            ["block.weight"]
+        );
+        assert_eq!(vae_only.keys().collect::<Vec<_>>(), ["decoder.weight"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

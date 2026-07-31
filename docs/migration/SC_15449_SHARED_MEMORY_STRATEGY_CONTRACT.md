@@ -1,11 +1,11 @@
-# SC-15449: shared image-memory contract migration
+# SC-15449: shared memory-strategy contract migration
 
 ## Authority boundary
 
-`gen_core::image_memory` is the tensor-neutral provider contract for image-memory planning.
+`gen_core::memory_strategy` is the tensor-neutral provider contract for memory planning.
 
 - Providers own static strategy capability, lifecycle hooks, formula shape, backend realization,
-  load-exact asset facts, and `IMAGE_MEMORY_CALIBRATION_ABI` plus a content fingerprint.
+  load-exact asset facts, and `MEMORY_CALIBRATION_ABI` plus a content fingerprint.
 - Manifest/generated evidence owns coefficients, calibrated envelopes, provenance, tier/mode/overlay
   coverage, geometry, and the exact tile/chunk/window candidates exercised.
 - The SceneWorks worker owns live budget and reclaimable accounting, ordered least-cost selection,
@@ -13,41 +13,41 @@
 - A provider safety gate is defense in depth. It returns only `Accept` or `Reject`; it cannot silently
   replace the selected strategy, parameter values, or numeric tier.
 
-The selected `ImageMemoryNumericTier` is immutable within `ImageMemorySelection`. Memory strategy
+The selected `MemoryNumericTier` is immutable within `MemorySelection`. Memory strategy
 selection must never cross BF16/FP32/Q8/Q4/NVFP4 or another numeric regime.
 
 ## Compatibility and adoption
 
 Existing providers require no source changes. They inherit:
 
-- `Generator::image_memory_contract() -> None`;
+- `Generator::memory_strategy_contract() -> None`;
 - a resident-only safety default (optimized selections are rejected);
-- `Generator::begin_image_memory_request() -> Ok(None)`; and
-- no pre-load `ImageMemoryRegistration`.
+- `Generator::begin_memory_strategy_request() -> Ok(None)`; and
+- no pre-load `MemoryRegistration`.
 
-`ImageMemoryProviderContract::compatibility_default` expresses that state explicitly: Resident is
+`MemoryProviderContract::compatibility_default` expresses that state explicitly: Resident is
 implemented, all optimized rungs are Missing, and calibration is absent. It preserves existing
 resident behavior without claiming an optimized fit.
 
 An adopting provider:
 
-1. returns a five-rung contract from a separate `ImageMemoryRegistration`;
+1. returns a five-rung contract from a separate `MemoryRegistration`;
 2. exposes the same contract from the loaded generator;
 3. implements the request-scoped lifecycle scope;
 4. changes its calibration fingerprint whenever layout, quantization floors, or execution structure
    invalidate evidence; and
-5. runs `gen_core_testkit::image_memory_conformance`.
+5. runs `gen_core_testkit::memory_strategy_conformance`.
 
-`begin_image_memory_request` returns an executable request scope. Its `configure_request` method
+`begin_memory_strategy_request` returns an executable request scope. Its `configure_request` method
 translates the shared selection into any provider-native request controls; `finish` is called for
 success, cancellation, and error. Dropping Krea's scope without finishing still synchronizes the
 device as a last-resort cleanup guard.
 
 The separate registration is intentional: adding a field to every existing `ModelRegistration`
-would create provider-wide churn. `ProviderRegistry::image_memory_contract` returns `Ok(None)` for a
+would create provider-wide churn. `ProviderRegistry::memory_strategy_contract` returns `Ok(None)` for a
 known non-adopter and an error for an unknown id or malformed adopted contract.
 
-All named runtime bundles expose the contract at `runtime_{cpu,cuda,macos}::image_memory`.
+All named runtime bundles expose the contract at `runtime_{cpu,cuda,macos}::memory_strategy`.
 
 ## Ladder and backend realizations
 
@@ -99,7 +99,7 @@ all prevent optimized eligibility.
 
 ### Krea Candle/CUDA
 
-Krea phase curves map to `ImageMemoryFormulaKind::PhaseEnvelope`. Existing measured coefficients and
+Krea phase curves map to `MemoryFormulaKind::PhaseEnvelope`. Existing measured coefficients and
 boundaries remain manifest evidence; they do not move into the provider crate. The worker evaluates
 those unchanged curves through the shared selector. `krea_2_turbo` is the first adopter: the CUDA
 Candle catalog returns its five-rung provider contract with calibration fingerprint
@@ -118,7 +118,7 @@ PiD, and multi-phase requests remain outside that evidence envelope and are reje
 ### Generic MLX
 
 The on-disk/load-exact weight sum plus constant headroom maps to
-`ImageMemoryFormulaKind::AssetBytesPlusHeadroom`. Until current-environment evidence and a matching
+`MemoryFormulaKind::AssetBytesPlusHeadroom`. Until current-environment evidence and a matching
 provider fingerprint exist, it remains Implemented/unverified and cannot authorize an optimized fit.
 The worker, not each provider, makes the final decision.
 

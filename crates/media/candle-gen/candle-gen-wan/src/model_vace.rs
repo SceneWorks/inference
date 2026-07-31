@@ -27,7 +27,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor,
+    WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -435,6 +436,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

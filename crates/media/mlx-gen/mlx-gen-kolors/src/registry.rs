@@ -20,7 +20,7 @@ use mlx_gen::{
     curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, ControlKind, DiscreteModelSampling, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, Solver, WeightsSource,
+    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, SizeFloor, Solver, WeightsSource,
 };
 
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
@@ -135,6 +135,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -890,6 +891,7 @@ mod tests {
             identity: None,
             text_encoder: None,
             offload_policy: Default::default(),
+            load_shape: Default::default(),
             components: Default::default(),
         };
         let err = match crate::provider_registry().unwrap().load("kolors", &spec) {

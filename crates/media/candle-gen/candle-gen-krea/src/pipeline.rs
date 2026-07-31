@@ -663,7 +663,7 @@ pub(crate) fn render_three_stage(
         req,
         memory,
         gen_core::LoadPhase::TextEncoder,
-        gen_core::ImageMemoryPhase::Conditioning,
+        gen_core::MemoryPhase::Conditioning,
         on_progress,
     )?;
     let text = load_text(root, device)?;
@@ -676,7 +676,7 @@ pub(crate) fn render_three_stage(
         req,
         memory,
         gen_core::LoadPhase::Renderer,
-        gen_core::ImageMemoryPhase::Denoise,
+        gen_core::MemoryPhase::Denoise,
         on_progress,
     )?;
     let dit = load_dit(root, device, adapters, memory.stream_transformer_blocks)?;
@@ -694,6 +694,16 @@ pub(crate) fn render_three_stage(
     } else {
         candle_gen::ATTN_SCORES_BUDGET
     };
+    // SC-15510's rule: `None` means "the provider's own historical constant", so an untouched request
+    // is byte-for-byte unaffected. A value only ever arrives here after the request scope re-validated
+    // it against the published candidates, which for this realization is `[1]` alone — see
+    // `DEFAULT_TRANSFORMER_WINDOW` for the measurement that says a wider window is strictly worse on
+    // Candle. Reading it anyway rather than hardcoding 1: the selected value must be the executed one,
+    // or the calibration evidence describes a run that never happened.
+    let transformer_window = memory
+        .transformer_window_size
+        .map(|w| w as usize)
+        .unwrap_or(crate::transformer::DEFAULT_TRANSFORMER_WINDOW);
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         candle_gen::run_flow_sampler(
@@ -706,7 +716,14 @@ pub(crate) fn render_three_stage(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = dit.forward_with_memory(x, &t, &context, attention_budget, &req.cancel)?;
+                let v = dit.forward_with_memory(
+                    x,
+                    &t,
+                    &context,
+                    attention_budget,
+                    transformer_window,
+                    &req.cancel,
+                )?;
                 Ok(v.to_dtype(DType::F32)?)
             },
         )
@@ -745,14 +762,14 @@ fn enter_decode_boundary(
     // The callback is the public decode boundary used by callers to request cancellation. Observe a
     // flag raised there before starting the expensive, otherwise non-interruptible VAE decode.
     candle_gen::check_cancel(&req.cancel)?;
-    maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Decode)
+    maybe_inject_calibration_error(memory, gen_core::MemoryPhase::Decode)
 }
 
 fn enter_loading_boundary(
     req: &GenerationRequest,
     memory: gen_core::GenerationMemory,
     load_phase: gen_core::LoadPhase,
-    memory_phase: gen_core::ImageMemoryPhase,
+    memory_phase: gen_core::MemoryPhase,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     on_progress(Progress::Loading(load_phase));
@@ -764,11 +781,11 @@ fn enter_loading_boundary(
 
 fn maybe_inject_calibration_error(
     memory: gen_core::GenerationMemory,
-    phase: gen_core::ImageMemoryPhase,
+    phase: gen_core::MemoryPhase,
 ) -> Result<()> {
     if memory.calibration_error_phase == Some(phase) {
         Err(CandleError::Msg(format!(
-            "krea_2_turbo: injected image-memory calibration error at {phase:?}"
+            "krea_2_turbo: injected memory-strategy calibration error at {phase:?}"
         )))
     } else {
         Ok(())
@@ -1644,10 +1661,23 @@ fn render_edit_from_context(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond = heavy.dit.forward_edit(x, &t, &context, &ref_latents)?;
+                // Thread the request's cancel flag into the block loop (sc-16003): an edit step at
+                // 2048² is ~45 s (a ~37k-token joint sequence), far too long for the sampler's
+                // between-steps poll to be the only checkpoint. Both CFG legs honor it.
+                let forward_edit = |ctx: &Tensor| {
+                    heavy.dit.forward_edit_with_memory(
+                        x,
+                        &t,
+                        ctx,
+                        &ref_latents,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        &req.cancel,
+                    )
+                };
+                let cond = forward_edit(&context)?;
                 let v = match &neg_context {
                     Some(nc) => {
-                        let uncond = heavy.dit.forward_edit(x, &t, nc, &ref_latents)?;
+                        let uncond = forward_edit(nc)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -1961,9 +1991,9 @@ mod tests {
     fn calibration_faults_are_request_local_and_default_path_is_inert() {
         let clean = gen_core::GenerationMemory::default();
         for phase in [
-            gen_core::ImageMemoryPhase::Conditioning,
-            gen_core::ImageMemoryPhase::Denoise,
-            gen_core::ImageMemoryPhase::Decode,
+            gen_core::MemoryPhase::Conditioning,
+            gen_core::MemoryPhase::Denoise,
+            gen_core::MemoryPhase::Decode,
         ] {
             assert!(maybe_inject_calibration_error(clean, phase).is_ok());
             let faulted = gen_core::GenerationMemory {
@@ -2004,11 +2034,11 @@ mod tests {
         for (load_phase, memory_phase) in [
             (
                 gen_core::LoadPhase::TextEncoder,
-                gen_core::ImageMemoryPhase::Conditioning,
+                gen_core::MemoryPhase::Conditioning,
             ),
             (
                 gen_core::LoadPhase::Renderer,
-                gen_core::ImageMemoryPhase::Denoise,
+                gen_core::MemoryPhase::Denoise,
             ),
         ] {
             let request = GenerationRequest {

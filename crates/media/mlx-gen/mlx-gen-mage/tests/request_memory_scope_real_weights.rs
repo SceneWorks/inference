@@ -10,9 +10,8 @@
 #![cfg(target_os = "macos")]
 
 use mlx_gen::gen_core::{
-    Error, ImageMemoryBudget, ImageMemoryCacheState, ImageMemoryGeometry, ImageMemoryMode,
-    ImageMemoryNumericTier, ImageMemoryRunContext, ImageMemoryRunOutcome, ImageMemorySelection,
-    ImageMemoryStrategy, ImageMemoryStrategyParameters,
+    Error, MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
+    MemoryRunContext, MemoryRunOutcome, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
 };
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, Generator, LoadSpec, Precision, Quant,
@@ -41,36 +40,35 @@ fn quant() -> Option<Quant> {
 fn context(
     width: u32,
     height: u32,
-    cache_state: ImageMemoryCacheState,
+    cache_state: MemoryCacheState,
     tier: Option<Quant>,
-) -> ImageMemoryRunContext {
+) -> MemoryRunContext {
     let safe_bytes = (production_safe_budget_gb().unwrap() * 1_000_000_000.0).round() as u64;
     let predicted_peak_bytes =
         (generation_peak_gb(tier, width, height, 1) * 1_000_000_000.0).round() as u64;
-    ImageMemoryRunContext {
-        selection: ImageMemorySelection {
-            strategy: ImageMemoryStrategy::Resident,
-            parameters: ImageMemoryStrategyParameters::default(),
-            tier: ImageMemoryNumericTier {
+    MemoryRunContext {
+        selection: MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: tier,
             },
         },
-        calibration_abi: mlx_gen::gen_core::IMAGE_MEMORY_CALIBRATION_ABI,
-        calibration_fingerprint: mlx_gen_mage::model::IMAGE_MEMORY_CALIBRATION_FINGERPRINT
-            .to_owned(),
-        mode: ImageMemoryMode::TextToImage,
+        calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
+        calibration_fingerprint: mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+        mode: MemoryMode::TextToImage,
         has_reference: false,
         use_pid: false,
         has_phases: false,
-        geometry: ImageMemoryGeometry {
+        geometry: MemoryGeometry {
             width,
             height,
             batch: 1,
             frames: 1,
         },
         overlay: None,
-        budget: ImageMemoryBudget {
+        budget: MemoryBudget {
             total_bytes: safe_bytes,
             committed_bytes: 0,
             reclaimable_bytes: 0,
@@ -94,13 +92,13 @@ fn run_scoped(
     width: u32,
     height: u32,
     seed: u64,
-    cache_state: ImageMemoryCacheState,
+    cache_state: MemoryCacheState,
     tier: Option<Quant>,
     terminal: TerminalCase,
 ) -> mlx_gen::gen_core::Result<Vec<u8>> {
     let context = context(width, height, cache_state, tier);
     let mut scope = generator
-        .begin_image_memory_request(&context)?
+        .begin_memory_strategy_request(&context)?
         .expect("Mage must open its adopted resident request scope");
     let mut request = GenerationRequest {
         prompt: "a red ceramic cube on a white table".to_owned(),
@@ -114,7 +112,7 @@ fn run_scoped(
         ..Default::default()
     };
     if let Err(error) = scope.configure_request(&mut request) {
-        let _ = scope.finish(ImageMemoryRunOutcome::Error {
+        let _ = scope.finish(MemoryRunOutcome::Error {
             message: error.to_string(),
         });
         return Err(error);
@@ -135,14 +133,14 @@ fn run_scoped(
     }
     let injected_error = terminal == TerminalCase::InjectErrorAfterGeneration && output.is_ok();
     let outcome = if injected_error {
-        ImageMemoryRunOutcome::Error {
+        MemoryRunOutcome::Error {
             message: "injected post-generation provider error".to_owned(),
         }
     } else {
         match &output {
-            Ok(_) => ImageMemoryRunOutcome::Complete,
-            Err(Error::Canceled) => ImageMemoryRunOutcome::Canceled,
-            Err(error) => ImageMemoryRunOutcome::Error {
+            Ok(_) => MemoryRunOutcome::Complete,
+            Err(Error::Canceled) => MemoryRunOutcome::Canceled,
+            Err(error) => MemoryRunOutcome::Error {
                 message: error.to_string(),
             },
         }
@@ -172,7 +170,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
         512,
         512,
         7,
-        ImageMemoryCacheState::Cold,
+        MemoryCacheState::Cold,
         tier,
         TerminalCase::Complete,
     )
@@ -182,7 +180,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
         1024,
         768,
         11,
-        ImageMemoryCacheState::Warm,
+        MemoryCacheState::Warm,
         tier,
         TerminalCase::Complete,
     )
@@ -192,7 +190,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
         512,
         512,
         7,
-        ImageMemoryCacheState::Warm,
+        MemoryCacheState::Warm,
         tier,
         TerminalCase::Complete,
     )
@@ -206,7 +204,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
             512,
             512,
             13,
-            ImageMemoryCacheState::Warm,
+            MemoryCacheState::Warm,
             tier,
             TerminalCase::CancelAfterProgress,
         ),
@@ -222,7 +220,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
         512,
         512,
         17,
-        ImageMemoryCacheState::Warm,
+        MemoryCacheState::Warm,
         tier,
         TerminalCase::Complete,
     )
@@ -234,7 +232,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
             512,
             512,
             19,
-            ImageMemoryCacheState::Warm,
+            MemoryCacheState::Warm,
             tier,
             TerminalCase::InjectErrorAfterGeneration,
         ),
@@ -250,7 +248,7 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
         512,
         512,
         23,
-        ImageMemoryCacheState::Warm,
+        MemoryCacheState::Warm,
         tier,
         TerminalCase::Complete,
     )

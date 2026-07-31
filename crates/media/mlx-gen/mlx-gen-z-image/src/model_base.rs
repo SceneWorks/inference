@@ -22,11 +22,13 @@
 //! multi-component tree the Turbo loader consumes); the coordinator points the catalog entry + re-pin
 //! at that snapshot (a follow-up). Turbo and the control variant are untouched.
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Residency, Result,
+    SizeFloor,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma};
 
@@ -102,6 +104,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -109,16 +112,16 @@ pub fn descriptor() -> ModelDescriptor {
 /// A loaded base Z-Image generator — the cached descriptor, the (tiny, always-warm) tokenizer, and the
 /// component-residency strategy. Same component set as [`crate::model::ZImageTurbo`] (Qwen text
 /// encoder, DiT, VAE, and an optional PiD overlay), driven through the identical shared [`Residency`]
-/// seam so the base honors [`LoadSpec::offload_policy`] family-wide (sc-11124, F-172): `Sequential`
-/// drops the Qwen text encoder after the encode phase, bounding peak unified memory to
-/// `max(text-encoder, DiT+VAE)`.
+/// seam. SC-15806 makes residency request-scoped: `GenerationMemory::stage_residency` selects
+/// phase-staged execution, while the legacy [`LoadSpec::offload_policy`] is ignored for Z-Image.
 pub struct ZImage {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
-    /// shared [`crate::model::load_residency`] builder. `Resident` holds the text encoder + DiT + VAE
-    /// warm; `Sequential` holds only the per-phase loader closures and re-loads per generate in phase
-    /// order (encode → drop the text encoder → denoise/decode).
+    /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// Shared request-scoped residency. The first warm request populates the pair; staged requests
+    /// evict it before loading either phase.
     residency: Residency<TextEncoder, ZImageHeavyOwned>,
 }
 
@@ -131,10 +134,9 @@ pub struct ZImage {
 /// load, exactly as Turbo.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // F-090 + F-172: the non-control load body is byte-identical to the plain Turbo loader (same
-    // loaders, whole-model quant order, adapter path, PiD overlay) AND now shares its `offload_policy`
-    // routing — `load_residency` runs the identical `Resident`/`Sequential` match, so a fit-gated
-    // Sequential base request is honored instead of silently loading full-Resident (sc-11124). Only the
-    // per-id error text (precision override / single-file rejection) differs.
+    // loaders, whole-model quant order, adapter path, PiD overlay) and shares the request-scoped
+    // residency builder. Only the per-id error text (precision override / single-file rejection)
+    // differs.
     let (tokenizer, residency) = crate::model::load_residency(
         spec,
         MODEL_ID,
@@ -144,16 +146,51 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                  not a single .safetensors file",
     )?;
     Ok(Box::new(ZImage {
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         descriptor: descriptor(),
         tokenizer,
         residency,
     }))
 }
 
-mlx_gen::impl_generator!(ZImage {
-    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `impl_generator!` because this provider also implements the shared
+// memory-strategy hooks (SC-15449 / SC-15615); `descriptor` / `validate` / `generate` are the identical
+// plain delegation the macro would have emitted.
+impl Generator for ZImage {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+    }
+}
 
 impl ZImage {
     /// The rich-`Result` body behind [`Generator::generate`].
@@ -186,8 +223,27 @@ impl ZImage {
         let is_img2img = start_step > 0;
 
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
-        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
-        let images = self.residency.run_staged(
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let streamable = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let tiling = pipeline::decode_tiling(req, stage_residency);
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
+        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
+        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
+        let deferred_materialization = streamable;
+        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
+        let images = self.residency.run_staged_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -195,14 +251,31 @@ impl ZImage {
             // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
             // encoder's native precision and let the DiT promote per-op against the bf16 weights.
             |text_encoder: &TextEncoder| {
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 // Uncond conditioning = the negative prompt (empty string when unset), encoded only
                 // when CFG is active. Empty prompt is valid for the negative branch (the
                 // unconditional embedding).
                 let neg_cap = if cfg_on {
                     let neg = req.negative_prompt.as_deref().unwrap_or("");
-                    Some(pipeline::encode_uncond(&self.tokenizer, text_encoder, neg)?)
+                    Some(pipeline::encode_uncond(
+                        &self.tokenizer,
+                        text_encoder,
+                        neg,
+                        encoder_window,
+                    )?)
                 } else {
                     None
                 };
@@ -220,6 +293,11 @@ impl ZImage {
             },
             // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → (evaluated latents, PiD decoder).
             |heavy: &ZImageHeavyOwned, (cap, neg_cap), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over `shift=6.0`.
@@ -281,6 +359,8 @@ impl ZImage {
                             neg_cap_ref,
                             guidance,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )
@@ -292,6 +372,7 @@ impl ZImage {
             |mid| Ok(mlx_rs::transforms::eval(mid.0.iter())?),
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
+                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
@@ -313,6 +394,14 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+    };
 
 #[cfg(test)]
 mod tests {
@@ -411,34 +500,24 @@ mod tests {
     }
 
     #[test]
-    fn build_residency_sequential_defers_all_component_loads() {
-        let res = crate::model::build_residency(
-            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
-            MODEL_ID,
-            BASE_PRECISION_MSG,
-            BASE_FILE_MSG,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
-    }
-
-    #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = crate::model::build_residency(
-            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
-            MODEL_ID,
-            BASE_PRECISION_MSG,
-            BASE_FILE_MSG,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+    fn build_residency_defers_for_both_legacy_offload_values() {
+        for policy in [
+            mlx_gen::OffloadPolicy::Resident,
+            mlx_gen::OffloadPolicy::Sequential,
+        ] {
+            let res = crate::model::build_residency(
+                &missing_snapshot_spec(policy),
+                MODEL_ID,
+                BASE_PRECISION_MSG,
+                BASE_FILE_MSG,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+            });
+            assert!(
+                res.is_sequential(),
+                "{policy:?} must begin with no warm request-scoped pair"
+            );
+        }
     }
 }

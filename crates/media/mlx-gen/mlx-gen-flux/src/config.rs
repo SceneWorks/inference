@@ -3,7 +3,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    ModelDescriptor, Quant, SizeFloor,
 };
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
@@ -133,6 +133,7 @@ impl FluxVariant {
                 audio_voices: vec![],
                 audio_languages: vec![],
                 audio_edit_modes: vec![],
+                size_floor: SizeFloor::RangeChecked,
             },
         }
     }

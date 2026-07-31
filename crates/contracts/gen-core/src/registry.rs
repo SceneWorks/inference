@@ -7,7 +7,7 @@ use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTran
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-use crate::image_memory::ImageMemoryProviderContract;
+use crate::memory_strategy::MemoryProviderContract;
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
@@ -123,14 +123,14 @@ pub struct ModelRegistration {
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
-/// Optional, pre-load image-memory contract registration for one generator id.
+/// Optional, pre-load memory-strategy contract registration for one generator id.
 ///
 /// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
-/// catalogs opt in with [`ProviderRegistryBuilder::register_image_memory`] as providers migrate.
+/// catalogs opt in with [`ProviderRegistryBuilder::register_memory_strategy`] as providers migrate.
 #[derive(Clone, Copy)]
-pub struct ImageMemoryRegistration {
+pub struct MemoryRegistration {
     pub provider_id: &'static str,
-    pub contract: fn(&LoadSpec) -> Result<ImageMemoryProviderContract>,
+    pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
 }
 
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
@@ -212,7 +212,7 @@ pub struct AudioEmbedderRegistration {
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
-    image_memory: Vec<ImageMemoryRegistration>,
+    memory_strategy: Vec<MemoryRegistration>,
     transforms: Vec<TransformRegistration>,
     audio_transforms: Vec<AudioTransformRegistration>,
     trainers: Vec<TrainerRegistration>,
@@ -241,7 +241,11 @@ impl ProviderRegistryBuilder {
     }
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
-    builder_registration_method!(register_image_memory, image_memory, ImageMemoryRegistration);
+    builder_registration_method!(
+        register_memory_strategy,
+        memory_strategy,
+        MemoryRegistration
+    );
     builder_registration_method!(register_transform, transforms, TransformRegistration);
     builder_registration_method!(
         register_audio_transform,
@@ -310,10 +314,10 @@ impl ProviderRegistryBuilder {
         ensure_unique!(generators, "generator");
         {
             let mut ids = std::collections::BTreeSet::new();
-            for registration in &self.image_memory {
+            for registration in &self.memory_strategy {
                 if !ids.insert(registration.provider_id) {
                     return Err(Error::Msg(format!(
-                        "duplicate image-memory provider id '{}'",
+                        "duplicate memory-strategy provider id '{}'",
                         registration.provider_id
                     )));
                 }
@@ -323,7 +327,7 @@ impl ProviderRegistryBuilder {
                     .any(|generator| (generator.descriptor)().id == registration.provider_id)
                 {
                     return Err(Error::Msg(format!(
-                        "image-memory contract '{}' has no matching generator registration",
+                        "memory-strategy contract '{}' has no matching generator registration",
                         registration.provider_id
                     )));
                 }
@@ -341,7 +345,7 @@ impl ProviderRegistryBuilder {
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
-            image_memory: self.image_memory.into_boxed_slice(),
+            memory_strategy: self.memory_strategy.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
             audio_transforms: self.audio_transforms.into_boxed_slice(),
             trainers: self.trainers.into_boxed_slice(),
@@ -359,7 +363,7 @@ impl ProviderRegistryBuilder {
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
-    image_memory: Box<[ImageMemoryRegistration]>,
+    memory_strategy: Box<[MemoryRegistration]>,
     transforms: Box<[TransformRegistration]>,
     audio_transforms: Box<[AudioTransformRegistration]>,
     trainers: Box<[TrainerRegistration]>,
@@ -516,15 +520,15 @@ impl ProviderRegistry {
         }
     }
 
-    /// Return the provider-owned image-memory contract for `id`, when adopted.
+    /// Return the provider-owned memory-strategy contract for `id`, when adopted.
     ///
     /// `Ok(None)` is the compatibility-safe resident-only/unverified state. Unknown generator ids
     /// remain errors; a malformed adopted contract also fails instead of being silently trusted.
-    pub fn image_memory_contract(
+    pub fn memory_strategy_contract(
         &self,
         id: &str,
         spec: &LoadSpec,
-    ) -> Result<Option<ImageMemoryProviderContract>> {
+    ) -> Result<Option<MemoryProviderContract>> {
         if !self
             .generators()
             .any(|registration| (registration.descriptor)().id == id)
@@ -532,7 +536,7 @@ impl ProviderRegistry {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
         }
         let Some(registration) = self
-            .image_memory
+            .memory_strategy
             .iter()
             .find(|registration| registration.provider_id == id)
         else {
@@ -542,7 +546,7 @@ impl ProviderRegistry {
         let errors = contract.conformance_errors();
         if !errors.is_empty() {
             return Err(Error::Msg(format!(
-                "image-memory contract '{id}' is malformed: {}",
+                "memory-strategy contract '{id}' is malformed: {}",
                 errors.join("; ")
             )));
         }
@@ -618,6 +622,8 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 ///   `validate_request`); the size range is **skipped for `Modality::Audio`**, whose generators emit
 ///   a track with no width/height and leave the bounds at the unused 0 (matching the size-skipping
 ///   `validate_request_audio` floor, sc-12834/sc-13314),
+/// - any explicit-size grid multiple advertised by [`SizeFloor`](crate::SizeFloor) is non-zero and
+///   no larger than the visual descriptor's `max_size`,
 /// - `samplers` / `schedulers` / `supported_guidance_methods` entries are non-empty, whitespace-free
 ///   and duplicate-free (name *shape* only — resolvability is per-engine: several families advertise
 ///   native sampler names alongside the gen-core curated set),
@@ -661,6 +667,18 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             errs.push(format!(
                 "{ctx}: min_size {} > max_size {}",
                 caps.min_size, caps.max_size
+            ));
+        }
+    }
+    if let Some(multiple) = caps.size_floor.explicit_size_multiple() {
+        if multiple == 0 {
+            errs.push(format!(
+                "{ctx}: explicit-size multiple is 0 — grid validation would be undefined"
+            ));
+        } else if d.modality != Modality::Audio && multiple > caps.max_size {
+            errs.push(format!(
+                "{ctx}: explicit-size multiple {multiple} > max_size {} — no explicit size can pass",
+                caps.max_size
             ));
         }
     }
@@ -985,7 +1003,7 @@ mod tests {
         CaptionCapabilities, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
     };
     use crate::generator::{
-        Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor,
+        Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor, SizeFloor,
     };
     use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
     use crate::media::{AudioTrack, Image};
@@ -2409,8 +2427,9 @@ mod tests {
             modality: Modality::Image,
             capabilities: Capabilities {
                 min_size: 512,
-                max_size: 256,                                // inverted
-                max_count: 0,                                 // zero
+                max_size: 256, // inverted
+                max_count: 0,  // zero
+                size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 0 },
                 samplers: vec!["euler", "euler", "bad name"], // duplicate + whitespace
                 conditioning: vec![
                     ConditioningKind::Reference,
@@ -2426,6 +2445,7 @@ mod tests {
         assert!(has("family \"\""), "{errs:?}");
         assert!(has("max_count is 0"), "{errs:?}");
         assert!(has("min_size 512 > max_size 256"), "{errs:?}");
+        assert!(has("explicit-size multiple is 0"), "{errs:?}");
         assert!(has("duplicate sampler entry \"euler\""), "{errs:?}");
         assert!(has("sampler[2] \"bad name\""), "{errs:?}");
         assert!(has("duplicate conditioning kind Reference"), "{errs:?}");

@@ -20,7 +20,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
     require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
     FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, StagedHeavy,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, StagedHeavy,
     WeightsSource,
 };
 use mlx_rs::Dtype;
@@ -51,6 +51,9 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            // Advertised so a weights-free caller can reject a bad `kind` before
+            // paying for a load. Same expression the `ControlBranch` override
+            // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_negative_prompt: false,
             supports_guidance: false,
@@ -83,34 +86,36 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
 
 /// A loaded control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
 /// component-residency strategy (base text encoder + control transformer + VAE), driven through the
-/// shared [`Residency`] seam so the control variant honors [`LoadSpec::offload_policy`] family-wide
-/// (sc-11124, F-172) — `Sequential` drops the text encoder after the encode phase, bounding peak
-/// unified memory to `max(text-encoder, control-DiT+VAE)`.
+/// shared [`Residency`] seam. SC-15806 makes residency request-scoped; the legacy
+/// [`LoadSpec::offload_policy`] no longer selects the lifecycle for Z-Image.
 pub struct ZImageTurboControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
-    /// shared [`load_control_residency`] builder.
+    /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// Request-scoped residency shared with the base control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
 
 /// The heavy render-phase components for both Z-Image ControlNet variants (the composed base+control
 /// transformer and the VAE) — everything but the text encoder. There is no PiD overlay on the control
 /// path (sc-7846 is base-`z_image_turbo`-only), so the seam's `use_pid` loader flag is ignored. Owned
-/// by the `Resident` components or by a `Sequential` generate. `pub(crate)` so the **base** control
+/// by the warm pair or by a staged request. `pub(crate)` so the **base** control
 /// sibling ([`crate::model_base_control`]) shares the identical bundle + seam (sc-11124).
 pub(crate) struct ZImageControlHeavyOwned {
     pub(crate) transformer: ZImageControlTransformer,
     pub(crate) vae: Vae,
 }
 
-/// The light (decode-only) control bundle that survives the DiT drop under `Sequential` staged decode
+/// The light (decode-only) control bundle that survives the DiT drop during staged decode
 /// (sc-13571): just the VAE (the control path has no PiD overlay). [`StagedHeavy::shed_dit`] drops the
 /// control DiT so the tiled VAE decode peak excludes it.
 pub(crate) struct ZImageControlLight {
@@ -163,8 +168,13 @@ pub(crate) fn resolve_control_base_and_control<'a>(
 pub(crate) fn load_control_text_encoder_only(
     root: &Path,
     quant: Option<Quant>,
+    streamable: bool,
 ) -> Result<TextEncoder> {
-    let mut text_encoder = loader::load_text_encoder(root)?;
+    let mut text_encoder = if streamable {
+        loader::load_text_encoder_streamable(root)?
+    } else {
+        loader::load_text_encoder(root)?
+    };
     if let Some(q) = quant {
         text_encoder.quantize(q.bits())?;
     }
@@ -181,6 +191,7 @@ pub(crate) fn load_control_heavy(
     spec: &LoadSpec,
     root: &Path,
     control: &WeightsSource,
+    streamable: bool,
     model_id: &str,
 ) -> Result<ZImageControlHeavyOwned> {
     // F-009 (sc-12461): the tier guard runs here too, BEFORE the component loads, so it fires on
@@ -197,7 +208,7 @@ pub(crate) fn load_control_heavy(
     // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
     // before the overlay would replace the control Linears with QuantizedLinear that can't accept
     // the raw bf16 control weights.
-    let mut transformer = loader::load_control_transformer(root, control)?;
+    let mut transformer = loader::load_control_transformer_with_stream(root, control, streamable)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
@@ -210,16 +221,16 @@ pub(crate) fn load_control_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
     }
+    // SC-15754: capture the base blocks' final adapter state for the rung-4 stream (see
+    // `model::load_heavy`). The control branch carries none by construction.
+    transformer.capture_block_adapters();
     Ok(ZImageControlHeavyOwned { transformer, vae })
 }
 
-/// Build the tokenizer + [`Residency`] seam for either Z-Image ControlNet variant, honoring
-/// [`LoadSpec::offload_policy`] (sc-11124, F-172). `Resident` (default) builds every heavy component
-/// now and holds it warm; `Sequential` keeps only the spec and re-loads per generate in phase order
-/// (encode → drop the text encoder → denoise/decode). Both use the same per-phase loaders, so the
-/// components are byte-identical. Parameterized by `model_id` + the per-id precision-override message so
-/// the base control sibling shares it (before sc-11124 both control variants ignored `offload_policy`
-/// and silently loaded full-`Resident`).
+/// Build the tokenizer + request-scoped [`Residency`] seam for either Z-Image ControlNet variant.
+/// Both legacy offload-policy values retain the same loaders; `GenerationMemory::stage_residency`
+/// chooses warm or staged execution per request. Parameterized by `model_id` + the per-id
+/// precision-override message so the base control sibling shares it.
 pub(crate) fn load_control_residency(
     spec: &LoadSpec,
     model_id: &'static str,
@@ -232,35 +243,32 @@ pub(crate) fn load_control_residency(
     // BOTH policies); then the always-warm tokenizer, then the shared [`build_control_residency`]
     // dispatch.
     let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
-    if let Some(q) = spec.quantize {
+    let requantize_bits = if let Some(q) = spec.quantize {
         // F-009 (sc-12461): run the tier guard for BOTH residency policies, before any component
         // load — a Q4 request over a pre-quantized Q8 base turnkey hard-errors here instead of
         // silently serving Q8 (`quantize()` is a no-op on packed weights). Before this fix only the
         // Sequential warn gate below evaluated it, so the DEFAULT `Resident` load skipped the guard
         // entirely; `load_control_heavy` re-checks for the Sequential per-generate reload path.
-        let load_time_quant =
-            mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
-        // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate;
-        // only that combination pays the repeated cost, so gate the warning on it.
-        if load_time_quant && matches!(spec.offload_policy, OffloadPolicy::Sequential) {
-            mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
-        }
-    }
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?
+            .then_some(q.bits())
+    } else {
+        None
+    };
     let tokenizer = loader::load_tokenizer(root)?;
-    Ok((
-        tokenizer,
-        build_control_residency(spec, model_id, precision_msg)?,
-    ))
+    let mut residency = build_control_residency(spec, model_id, precision_msg)?;
+    if let Some(bits) = requantize_bits {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        residency = residency.with_staged_advisory(move || {
+            if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                mlx_gen::residency::warn_sequential_requantize(model_id, bits);
+            }
+        });
+    }
+    Ok((tokenizer, residency))
 }
 
-/// The policy→[`Residency`] dispatch both Z-Image control variants share (turbo + base control),
-/// routed through the single [`Residency::from_policy`] seam (sc-11126, F-180) so neither re-derives
-/// the `match offload_policy` (before sc-11124 both control variants ignored `offload_policy` and
-/// silently loaded full-`Resident`). `Resident` eager-loads the text encoder + heavy (base DiT +
-/// control branch + VAE) now; `Sequential` captures the two per-phase loaders and loads nothing now.
-/// The pose branch carries no PiD overlay, so the seam's `use_pid` arg is unused. Weight-free-testable:
-/// under `Sequential` this touches no component weights, so a dispatch that ignored the policy would
-/// eager-load and fail the "Sequential defers" unit test.
+/// Request-scoped builder shared by both Z-Image control variants. Construction touches no component
+/// weights. The pose branch carries no PiD overlay, so the seam's `use_pid` argument is unused.
 pub(crate) fn build_control_residency(
     spec: &LoadSpec,
     model_id: &'static str,
@@ -268,19 +276,18 @@ pub(crate) fn build_control_residency(
 ) -> Result<Residency<TextEncoder, ZImageControlHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
-        move || {
+    Ok(Residency::request_scoped(
+        move |streamable| {
             let (root, _control) =
                 resolve_control_base_and_control(&spec_text, model_id, precision_msg)?;
-            load_control_text_encoder_only(root, spec_text.quantize)
+            load_control_text_encoder_only(root, spec_text.quantize, streamable)
         },
-        move |_use_pid| {
+        move |_use_pid, streamable| {
             let (root, control) =
                 resolve_control_base_and_control(&spec_heavy, model_id, precision_msg)?;
-            load_control_heavy(&spec_heavy, root, control, model_id)
+            load_control_heavy(&spec_heavy, root, control, streamable, model_id)
         },
-    )
+    ))
 }
 
 /// The per-id precision-override rejection message for the turbo control variant, shared by
@@ -303,6 +310,7 @@ const PRECISION_MSG: &str =
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageTurboControl {
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -350,8 +358,27 @@ impl ZImageTurboControl {
         // control variant is guidance-distilled (no CFG / negative prompt), so the encode phase is a
         // single cond `cap`.
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
-        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
-        let images = self.residency.run_staged(
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let streamable = self
+            .memory_strategy
+            .lifecycle
+            .transformer_window_materialization;
+        let tiling = pipeline::decode_tiling(req, stage_residency);
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
+        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
+        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
+        let deferred_materialization = streamable;
+        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
+        let images = self.residency.run_staged_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
             // this flag, so `false` avoids loading a student that would never be used.
@@ -365,8 +392,20 @@ impl ZImageTurboControl {
             // cap (txt2img) + f32 control_context below. (img2img keeps f32 cap, mirroring the base
             // img2img; the DiT promotes per-op either way.)
             |text_encoder: &TextEncoder| {
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 if is_img2img {
                     Ok(cap)
                 } else {
@@ -380,6 +419,11 @@ impl ZImageTurboControl {
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
             // ── Phase B (denoise): heavy bundle + cap → evaluated latents.
             |heavy: &ZImageControlHeavyOwned, cap, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over the shift.
@@ -425,6 +469,8 @@ impl ZImageTurboControl {
                             &control_context,
                             control_scale,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )
@@ -437,6 +483,7 @@ impl ZImageTurboControl {
             // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
             // `Sequential`.
             |view, latents, on_progress| {
+                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     None,
@@ -472,6 +519,24 @@ impl Generator for ZImageTurboControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -483,9 +548,18 @@ mlx_gen::register_generators! {
     footprint = crate::model::component_footprint
 }
 
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::OffloadPolicy;
     // `WeightsSource` + `OffloadPolicy` come in via `super::*` (both used by `load`/its helpers).
 
     #[test]
@@ -516,11 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn load_honors_sequential_offload_policy() {
-        // F-172 (sc-11124): before the fix the control variant ignored `offload_policy` and always
-        // went `Resident`. Now `load` routes through the shared `load_control_residency` seam under
-        // either policy — proven weight-free by the up-front single-file base rejection running on the
-        // `Sequential` arm too, exactly as `Resident` rejects it.
+    fn both_legacy_offload_values_share_fail_fast_validation() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()))
                 .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
@@ -533,16 +603,7 @@ mod tests {
         }
     }
 
-    // ── F-180 (sc-11126): the MEANINGFUL control-variant test the smoke test above cannot be. The
-    // `load_honors_sequential_offload_policy` case only proves BOTH policies reach the same up-front
-    // base-dir guard — a dispatch that ignored `offload_policy` would pass it too. This drives the
-    // dispatch itself (`build_control_residency`) past that guard with a *valid-looking* base dir and
-    // control (non-existent, so no weights load) and asserts the deferral discriminator:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the text encoder from the missing base dir → `Err`.
-    // A `Sequential → Resident` regression (the F-172 bug this seam prevents) would eager-load under
-    // the Sequential request and fail the first assertion. Covers the turbo control variant directly;
-    // the base control variant (`model_base_control`) shares this exact `build_control_residency`.
+    // SC-15806 construction proof: both legacy values retain loaders and touch no component weights.
     fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/z-image-control-base".into(),
@@ -593,7 +654,7 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_control(control.clone())
             .with_quant(mlx_gen::Quant::Q4);
-        let err = load_control_heavy(&spec, &root, &control, MODEL_ID)
+        let err = load_control_heavy(&spec, &root, &control, false, MODEL_ID)
             .err()
             .expect("expected a tier-mismatch error")
             .to_string();
@@ -602,32 +663,17 @@ mod tests {
     }
 
     #[test]
-    fn build_control_residency_sequential_defers_all_component_loads() {
-        let res = build_control_residency(
-            &missing_control_spec(OffloadPolicy::Sequential),
-            MODEL_ID,
-            PRECISION_MSG,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) base/control weights");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) control residency"
-        );
-    }
-
-    #[test]
-    fn build_control_residency_resident_eager_loads_and_fails() {
-        let err = build_control_residency(
-            &missing_control_spec(OffloadPolicy::Resident),
-            MODEL_ID,
-            PRECISION_MSG,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on the missing base snapshot");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+    fn build_control_residency_defers_for_both_legacy_offload_values() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let res =
+                build_control_residency(&missing_control_spec(policy), MODEL_ID, PRECISION_MSG)
+                    .unwrap_or_else(|error| {
+                        panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+                    });
+            assert!(
+                res.is_sequential(),
+                "{policy:?} must begin with no warm request-scoped pair"
+            );
+        }
     }
 }

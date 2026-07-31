@@ -109,7 +109,7 @@ use candle_gen::candle_core::DType;
 use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    ModelDescriptor, Progress, SizeFloor, WeightsSource,
 };
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
@@ -301,6 +301,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

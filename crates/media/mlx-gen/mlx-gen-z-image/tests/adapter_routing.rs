@@ -13,7 +13,10 @@ use mlx_gen_z_image::{FinalLayer, TimestepEmbedder};
 use mlx_rs::Array;
 
 fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("mlx_gen_z_image_routing_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_z_image_routing_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }

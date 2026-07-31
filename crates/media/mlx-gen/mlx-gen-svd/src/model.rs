@@ -23,7 +23,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Result, WeightsSource,
+    Precision, Progress, Result, SizeFloor, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -110,6 +110,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             supported_quants: &[],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

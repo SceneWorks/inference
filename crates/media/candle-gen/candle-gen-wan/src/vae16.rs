@@ -29,7 +29,9 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tiling::{SpatialTiling, TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{
+    SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
 use candle_gen::vae_tiling;
 use candle_gen::Result as CResult;
 
@@ -823,6 +825,7 @@ fn plan_wan_z16_tiling(
         spatial_px: &WAN_Z16_VAE_SPATIAL_PX,
         spatial_overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
         temporal: &WAN_Z16_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     let budget_plan = vae_tiling::plan_tiling(
         "wan z16 vae decode",

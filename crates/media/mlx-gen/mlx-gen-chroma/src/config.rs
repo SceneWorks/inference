@@ -10,6 +10,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, Modality, ModelDescriptor, Quant,
+    SizeFloor,
 };
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
@@ -150,6 +151,7 @@ impl ChromaVariant {
                 audio_voices: vec![],
                 audio_languages: vec![],
                 audio_edit_modes: vec![],
+                size_floor: SizeFloor::RangeChecked,
             },
         }
     }

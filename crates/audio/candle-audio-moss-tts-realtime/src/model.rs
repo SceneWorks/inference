@@ -22,7 +22,7 @@ use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
     self, AudioChunk, AudioTrack, CancelFlag, Capabilities, ConversationSession, ConversationTurn,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
-    WeightsSource,
+    SizeFloor, WeightsSource,
 };
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
@@ -146,6 +146,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_history: true,
             supports_conversation_session: true,
             max_speakers: None,
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
-use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16;
+use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::WanVae;
 use mlx_rs::Array;
 
@@ -203,7 +203,7 @@ fn scail2_tiled_decode_tracks_single_pass() {
     // memory. This is the *same* call `generate.rs` now makes.
     let budget = env_i32("SCAIL2_DECODE_BUDGET_GIB", gib(old_peak).ceil() as i32);
     std::env::set_var("WAN_VAE_BUDGET_GIB", budget.to_string());
-    let new = auto_tiling_budgeted_z16(h, w, out_frames)
+    let new = auto_tiling_budgeted_z16_quality_overlap(h, w, out_frames)
         .expect("the new policy must be feasible at the old policy's peak")
         .expect("the clip must still tile at that budget");
     std::env::remove_var("WAN_VAE_BUDGET_GIB");

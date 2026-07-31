@@ -102,6 +102,31 @@ pub enum OffloadPolicy {
     Sequential,
 }
 
+/// How model weights are materialized within an already-loaded generator (SC-15998).
+///
+/// This is intentionally independent from [`OffloadPolicy`]:
+///
+/// - [`OffloadPolicy`] controls **inter-phase residency** — whether whole components are released
+///   between conditioning, denoise, and decode.
+/// - [`LoadShape`] controls **intra-phase materialization** — whether a transformer keeps a bulk
+///   resident stack or re-opens its blocks through a deferred schedule.
+///
+/// A caller can therefore request a resident, cross-request-cached generator whose mmap-backed
+/// transformer blocks remain deferred, without also asking the provider to unload whole components
+/// at phase boundaries. Providers that do not implement the requested shape may reject it or
+/// advertise the corresponding memory strategy as unavailable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LoadShape {
+    /// The historical fast path: components may bulk-materialize their complete weight stacks and
+    /// retain them across requests.
+    #[default]
+    EagerMaterialization,
+    /// Keep eligible mmap/re-openable transformer weights deferred and materialize them through a
+    /// block schedule. The schedule may be all-covering when no bound is selected; this says nothing
+    /// about phase-level component release.
+    DeferredMaterialization,
+}
+
 /// How to load a model. `weights` is required; everything else defaults to dense bf16. The
 /// device is the process-default Metal GPU — the crate runs single-device (the MLX default
 /// device is not thread-safe; the worker serializes jobs per thread).
@@ -165,6 +190,10 @@ pub struct LoadSpec {
     /// ignores it and stays `Resident`; [`Capabilities::supports_sequential_offload`](crate::generator::Capabilities::supports_sequential_offload)
     /// advertises which engines honor it (sc-11126). Backend-neutral.
     pub offload_policy: OffloadPolicy,
+    /// Weight materialization shape, independent from [`offload_policy`](Self::offload_policy).
+    /// The default preserves the historical eager/warm path. A deferred shape is meaningful only
+    /// for providers with a re-openable source such as a snapshot directory.
+    pub load_shape: LoadShape,
     /// **Named, caller-provisioned model components** (epic 13657) — the generic, additive home for
     /// the extra weight artifacts a model needs beyond its base `weights` and the typed overlays
     /// above, keyed by a stable component id. The complement of
@@ -265,6 +294,7 @@ impl LoadSpec {
             identity: None,
             text_encoder: None,
             offload_policy: OffloadPolicy::Resident,
+            load_shape: LoadShape::EagerMaterialization,
             components: BTreeMap::new(),
         }
     }
@@ -281,6 +311,16 @@ impl LoadSpec {
     /// [`Capabilities::supports_sequential_offload`](crate::generator::Capabilities::supports_sequential_offload).
     pub fn with_offload_policy(mut self, offload_policy: OffloadPolicy) -> Self {
         self.offload_policy = offload_policy;
+        self
+    }
+
+    /// Builder-style materialization-shape override (SC-15998).
+    ///
+    /// This does not alter [`Self::offload_policy`]: all four combinations are representable, so a
+    /// resident generator may defer transformer blocks and a staged generator may use an eager
+    /// per-phase load.
+    pub fn with_load_shape(mut self, load_shape: LoadShape) -> Self {
+        self.load_shape = load_shape;
         self
     }
 

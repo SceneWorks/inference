@@ -85,13 +85,13 @@
 //! **sc-15127 (S18) measured that on real weights (q4, three seeds, 13 window rolls) and found a long
 //! clip *does* drift, well past the measurement's budget** — headline mode a colour-cast/tone drift
 //! (the blue–yellow opponent axis wins every row-A cell at 832×480), alongside a separately observable
-//! saturation rise. **Whether the bounded window causes it is not resolved**: the within-regime
-//! dose-response (a wider window at 10 rolls instead of 13) is inside the between-seed noise in both
-//! buckets, so no window effect larger than 7.92/255 at 640×384 or 22.38/255 at 832×480 is detectable,
-//! and nothing smaller is excluded in either direction. The wider window also only removes 23% of the
-//! evictions, so the ladder is too short to exclude a linear-in-rolls mechanism at all. So no sink
-//! anchor is wired — the sink comparison is likewise unresolved at three seeds — the `sink_size` knob
-//! stays plumbed for a checkpoint that ships one, and the drift itself is tracked as **sc-15571**.
+//! saturation rise. **Whether the bounded window causes it is not resolved**: an enlarged
+//! within-regime dose ladder at 13/10/5 eviction rolls fits +0.571 ±1.897/255 per roll at 640×384 and
+//! −0.278 ±1.678/255 per roll at 832×480 (mean ± the predeclared 2·SEM heuristic). Neither direction
+//! clears the heuristic. Across the full eight-roll span, effects below practical floors of 19.75/255
+//! and 15.65/255 respectively remain unresolved. So no sink anchor is wired — the sink comparison is
+//! likewise unresolved at three seeds — the `sink_size` knob stays plumbed for a checkpoint that ships
+//! one, and the drift itself is tracked as **sc-15571**.
 //! See [`t2v::generate_t2v_from_components`] for the table and the limits of the claim.
 //! **i2v/v2v conditioning** (S7) is now wired (see [`generate`] / [`t2v`] above); its real-weight
 //! watchable-clip coherence overlaps the S13 real-weight validation.

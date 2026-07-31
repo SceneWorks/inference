@@ -42,8 +42,9 @@ fn synthetic_weights(arch: &Sd3Arch) -> Weights {
         })
         .collect();
     let path = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_synthetic_{}.safetensors",
-        entries.len()
+        "mlx_gen_sd3_synthetic_{}_{}.safetensors",
+        entries.len(),
+        std::process::id()
     ));
     Array::save_safetensors(
         entries.iter().map(|(k, v)| (k.as_str(), v)),
@@ -181,7 +182,10 @@ fn build_target_state_dict_errors_on_missing_tensor() {
         })
         .collect();
     entries.retain(|(k, _)| k != "proj_out.weight");
-    let path = std::env::temp_dir().join("mlx_gen_sd3_missing.safetensors");
+    let path = std::env::temp_dir().join(format!(
+        "mlx_gen_sd3_missing_{}.safetensors",
+        std::process::id()
+    ));
     Array::save_safetensors(
         entries.iter().map(|(k, v)| (k.as_str(), v)),
         None::<&HashMap<String, String>>,
@@ -237,8 +241,9 @@ fn validate_arch_reports_missing_extra_and_bad_shape() {
 /// single file + a `config.json`), the input the offline pre-quantizer consumes.
 fn write_dense_transformer_dir(arch: &Sd3Arch) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_e7_dense_{}",
-        expected_tensor_count(arch)
+        "mlx_gen_sd3_e7_dense_{}_{}",
+        expected_tensor_count(arch),
+        std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let entries: Vec<(String, Array)> = expected_transformer_tensors(arch)
@@ -293,7 +298,8 @@ fn prequantized_on_disk_round_trips_and_loads_packed() {
     let src = write_dense_transformer_dir(&arch);
 
     for bits in [8, 4] {
-        let dst = std::env::temp_dir().join(format!("mlx_gen_sd3_e7_q{bits}"));
+        let dst =
+            std::env::temp_dir().join(format!("mlx_gen_sd3_e7_q{bits}_{}", std::process::id()));
         std::fs::remove_dir_all(&dst).ok();
         quantize_sd3_dir(&arch, &src, &dst, bits, 64).unwrap();
 
@@ -348,7 +354,10 @@ fn safetensors_header_reads_shapes_without_body() {
     buf.extend_from_slice(&(header.len() as u64).to_le_bytes());
     buf.extend_from_slice(header);
     buf.extend_from_slice(&[7u8; 24]); // body must not be needed
-    let path = std::env::temp_dir().join("mlx_gen_sd3_hdr.safetensors");
+    let path = std::env::temp_dir().join(format!(
+        "mlx_gen_sd3_hdr_{}.safetensors",
+        std::process::id()
+    ));
     std::fs::File::create(&path)
         .unwrap()
         .write_all(&buf)
