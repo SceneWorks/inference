@@ -963,6 +963,14 @@ pub(crate) fn safety_check(
     MemorySafetyDecision::Accept
 }
 
+pub(crate) fn registered_safety_check(
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    safety_check(contract, context)
+}
+
 /// Open a request scope after `safety_check` accepted `context`.
 pub(crate) fn begin_request(
     provider_id: &'static str,

@@ -131,10 +131,13 @@ pub struct ModelRegistration {
 pub struct MemoryRegistration {
     pub provider_id: &'static str,
     pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
-    /// The provider's real admission check, callable before weights are loaded. This must be the same
-    /// function the loaded [`Generator`] delegates to; registry conformance uses it to prove that a
-    /// route-specific request is rejected at admission rather than later during generation.
-    pub safety_check: fn(&MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
+    /// The provider's real admission check, callable before weights are loaded. The load spec lets
+    /// tier-sensitive providers reproduce the loaded generator's exact check without opening any
+    /// weight files. This must be the same function the loaded [`Generator`] delegates to; registry
+    /// conformance uses it to prove that a route-specific request is rejected at admission rather
+    /// than later during generation.
+    pub safety_check:
+        fn(&LoadSpec, &MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
 }
 
 /// A transform provider's registration (parallel to [`ModelRegistration`]).

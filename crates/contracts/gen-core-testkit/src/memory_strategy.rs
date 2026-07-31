@@ -164,7 +164,7 @@ fn check_memory_registration(
             overlap,
             use_pid,
         );
-        let decision = (registration.safety_check)(&contract, &context);
+        let decision = (registration.safety_check)(spec, &contract, &context);
         let conforms = matches!(
             (expected, &decision),
             ("accept", MemorySafetyDecision::Accept)
@@ -293,6 +293,7 @@ mod tests {
     }
 
     fn route_aware_safety(
+        _spec: &LoadSpec,
         contract: &MemoryProviderContract,
         context: &MemoryRunContext,
     ) -> MemorySafetyDecision {
@@ -336,7 +337,9 @@ mod tests {
         let registration = MemoryRegistration {
             provider_id: "pid-provider",
             contract: pid_contract,
-            safety_check: default_memory_strategy_safety_check,
+            safety_check: |_spec, contract, context| {
+                default_memory_strategy_safety_check(contract, context)
+            },
         };
         let mut errors = Vec::new();
         check_memory_registration(

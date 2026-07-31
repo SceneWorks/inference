@@ -1289,16 +1289,27 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             .collect(),
         pid_decode_routes: None,
         load_shape: LoadShape::DeferredMaterialization,
-        // Candle Krea's current streamed-block realization lives inside its three-stage loader.
-        // This additive edge records that backend coupling without making phase release a shared
-        // rung-4 prerequisite; MLX therefore remains free to use Resident+Deferred.
-        additional_prerequisites: vec![(
+        // Every higher-rung Krea control is executed by `render_three_stage`: the provider reloads
+        // text, DiT, and VAE in disjoint phases whenever decode tiling, attention chunking, or
+        // transformer streaming is selected. Record that backend coupling on every affected rung so
+        // selection/evidence identity cannot omit a mechanism that physically executes. This remains
+        // provider-specific; MLX and other Candle providers keep the shared non-staged default.
+        additional_prerequisites: [
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
             MemoryStrategy::BoundedTransformerResidency,
-            MemoryStrategyPrerequisite::Rung {
-                rung: MemoryStrategy::StagedResidency,
-                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
-            },
-        )],
+        ]
+        .into_iter()
+        .map(|strategy| {
+            (
+                strategy,
+                MemoryStrategyPrerequisite::Rung {
+                    rung: MemoryStrategy::StagedResidency,
+                    scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                },
+            )
+        })
+        .collect(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1349,7 +1360,7 @@ fn registered_krea_turbo_memory_strategy_contract(
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: KREA_2_TURBO_ID,
     contract: registered_krea_turbo_memory_strategy_contract,
-    safety_check: gen_core::default_memory_strategy_safety_check,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
 };
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
@@ -1522,10 +1533,19 @@ mod tests {
         );
         assert!(
             contract.engages(
-                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
                 gen_core::MemoryStrategy::StagedResidency
             ),
             "Krea's additive backend prerequisite must preserve its current three-stage coupling"
+        );
+        assert_eq!(
+            contract.engaged_composition(gen_core::MemoryStrategy::BoundedAttention),
+            vec![
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategy::BoundedAttention,
+            ]
         );
 
         assert_eq!(
@@ -1545,6 +1565,7 @@ mod tests {
         assert_eq!(
             krea_generation_memory(contract, selected(gen_core::MemoryStrategy::BoundedDecode)),
             Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 ..Default::default()
             })
@@ -1555,6 +1576,7 @@ mod tests {
                 selected(gen_core::MemoryStrategy::BoundedAttention)
             ),
             Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 ..Default::default()

@@ -472,7 +472,7 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
         contract: |spec| {
             crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, spec)
         },
-        safety_check: crate::memory_strategy::safety_check,
+        safety_check: crate::memory_strategy::registered_safety_check,
     };
 
 #[cfg(test)]

@@ -131,7 +131,9 @@ mod tests {
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
-        let spec = candle_gen::LoadSpec::new(candle_gen::WeightsSource::Dir("/nonexistent".into()));
+        let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
         gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
     }
 

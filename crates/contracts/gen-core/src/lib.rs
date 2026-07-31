@@ -75,18 +75,20 @@ pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
-    default_memory_strategy_safety_check, MemoryAssetFacts, MemoryBackendRealization, MemoryBudget,
-    MemoryCacheSemantics, MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics,
-    MemoryComponentKind, MemoryConformanceState, MemoryDecodeRouteDomain, MemoryEvidence,
-    MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey, MemoryEvidenceVerdict,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
-    MemoryPeakBreakdown, MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision,
-    MemorySelection, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWarmRunSemantics,
-    MemoryWindowMaterialization, TransformerComponent, MEMORY_CALIBRATION_ABI,
+    adapter_stack_resident_bytes, default_memory_strategy_safety_check,
+    default_registered_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
+    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind, MemoryConformanceState,
+    MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
+    MemoryEvidenceKey, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown,
+    MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRejection, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
+    TransformerComponent, MEMORY_CALIBRATION_ABI,
 };
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,

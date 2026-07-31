@@ -107,7 +107,10 @@
 //! is an axis built ahead of that measurement, on the strength of a figure derived for a fix nobody has
 //! written.
 
-use crate::{Error, GenerationRequest, LoadShape, Precision, Quant, Result};
+use crate::{
+    weightsmeta::safetensors_path_bytes, AdapterSpec, Error, GenerationRequest, LoadShape,
+    Precision, Quant, Result,
+};
 
 /// Current ABI of the provider/evidence calibration handshake.
 ///
@@ -651,6 +654,37 @@ pub enum MemoryComponentKind {
     AdapterStack,
     IpAdapter,
     IdentityEncoder,
+}
+
+/// Whether adapter factors remain independently resident after a provider finishes loading.
+///
+/// Dense providers may fold the factors into their base weights, while packed quantized providers
+/// commonly preserve them as forward-time residuals because the packed base is immutable. Keeping
+/// this distinction typed prevents a fit gate from charging every adapter file as resident bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdapterResidencyMode {
+    Folded,
+    Additive,
+}
+
+/// Load-exact resident bytes for a single-stack adapter installation.
+///
+/// `Some(0)` is positive evidence that factors are folded and therefore add no independent
+/// residency. `None` means an additive stack was requested but at least one source could not be
+/// sized; callers must fail closed instead of guessing. Multi-expert providers should account for
+/// shared adapters once per simultaneously resident expert rather than calling this helper once for
+/// the whole model.
+pub fn adapter_stack_resident_bytes(
+    adapters: &[AdapterSpec],
+    mode: AdapterResidencyMode,
+) -> Option<u64> {
+    if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
+        return Some(0);
+    }
+    adapters.iter().try_fold(0_u64, |total, adapter| {
+        let bytes = safetensors_path_bytes(&adapter.path);
+        (bytes > 0).then(|| total.saturating_add(bytes))
+    })
 }
 
 impl MemoryComponentKind {
@@ -1320,6 +1354,18 @@ pub fn default_memory_strategy_safety_check(
     }
 }
 
+/// Registry adapter for [`default_memory_strategy_safety_check`].
+///
+/// The load specification is part of the weights-free registration callback so providers whose
+/// admission rules depend on the requested tier can reproduce their loaded generator's check.
+pub fn default_registered_memory_strategy_safety_check(
+    _spec: &crate::LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    default_memory_strategy_safety_check(contract, context)
+}
+
 fn validate_ranges(capability: &MemoryStrategyCapability, errors: &mut Vec<String>) {
     let ranges = &capability.parameters;
     for (name, values) in [
@@ -1921,6 +1967,41 @@ pub struct MemoryRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_residency_distinguishes_folded_additive_and_missing_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("gen-core-adapter-residency-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.safetensors");
+        let second = root.join("second.safetensors");
+        std::fs::write(&first, vec![0_u8; 11]).unwrap();
+        std::fs::write(&second, vec![0_u8; 17]).unwrap();
+        let adapters = vec![
+            AdapterSpec::new(first, 1.0, crate::AdapterKind::Lora),
+            AdapterSpec::new(second, 0.5, crate::AdapterKind::Lokr),
+        ];
+
+        assert_eq!(
+            adapter_stack_resident_bytes(&adapters, AdapterResidencyMode::Folded),
+            Some(0)
+        );
+        assert_eq!(
+            adapter_stack_resident_bytes(&adapters, AdapterResidencyMode::Additive),
+            Some(28)
+        );
+
+        let missing = vec![AdapterSpec::new(
+            root.join("missing.safetensors"),
+            1.0,
+            crate::AdapterKind::Lora,
+        )];
+        assert_eq!(
+            adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn mlx_backend() -> MemoryBackendRealization {
         MemoryBackendRealization::MlxMetal {
