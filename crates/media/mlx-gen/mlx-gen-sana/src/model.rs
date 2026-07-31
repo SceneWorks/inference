@@ -125,6 +125,7 @@ pub fn descriptor() -> ModelDescriptor {
             // offline by `crate::convert` and self-describing on load, so a `spec.quantize` is
             // advisory (the resolved tier dir dictates the actual precision; see [`load`]).
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
@@ -188,6 +189,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Gemma-2 TE are packed/packed-detected, DC-AE VAE dense. Advertise Q4/Q8 for standard
             // quant-tier routing; `spec.quantize` is advisory (resolved tier dir dictates precision).
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).

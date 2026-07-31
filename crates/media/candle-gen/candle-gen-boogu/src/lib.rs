@@ -317,6 +317,7 @@ pub fn descriptor() -> ModelDescriptor {
             // (`loader::linear_detect`, sc-9410, group-size-aware); `build` no-ops the requested quant.
             // Turbo + edit inherit this via `descriptor()`.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

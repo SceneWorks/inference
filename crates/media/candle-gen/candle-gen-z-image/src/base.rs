@@ -202,6 +202,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: false,
             // On-the-fly Q4/Q8 not wired on the candle base path yet (rejected at load, not dropped).
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

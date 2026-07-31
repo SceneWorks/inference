@@ -96,6 +96,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_lora: false,
             supports_lokr: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Bespoke-by-architecture (epic 7114, sc-7120, task 7185): SenseNova-U1 is NOT routed through
             // the unified curated-sampler framework. Its denoise threads each step through an
             // autoregressive backbone with a per-step-mutated `KvCache` (`predict_v` appends to the cache;

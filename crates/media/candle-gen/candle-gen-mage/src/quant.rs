@@ -6,10 +6,30 @@
 //! original direct-to-device path unchanged.
 
 use candle_core::{Device, Result, Tensor};
-use candle_gen::gen_core::Quant;
+use candle_gen::gen_core::{
+    effective_component_quant, ComponentPrecisionFloor, PrecisionFloorComponent, Quant,
+};
 use candle_gen::quant::{DenseLinear, QLinear};
 use candle_gen_boogu::loader::Weights;
 use candle_nn::Linear;
+
+/// Candle's binding declaration of the same two Mage q4 floors used by the MLX provider.
+pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[
+    ComponentPrecisionFloor {
+        component: PrecisionFloorComponent::TextEncoder,
+        selected_tier: Quant::Q4,
+        resident_tier: Quant::Q8,
+    },
+    ComponentPrecisionFloor {
+        component: PrecisionFloorComponent::TransformerHead,
+        selected_tier: Quant::Q4,
+        resident_tier: Quant::Q8,
+    },
+];
+
+pub(crate) fn component_quant(component: PrecisionFloorComponent, selected: Quant) -> Quant {
+    effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
+}
 
 /// Shape-inferred dense loader used by the Mage transformer before its optional fold.
 pub(crate) fn linear(weights: &Weights, base: &str, bias: bool) -> Result<QLinear> {
@@ -65,6 +85,26 @@ mod tests {
             quantize_onto(&mut linear, quant, &Device::Cpu).unwrap();
             assert!(linear.is_quantized(), "{quant:?} stayed dense");
             assert_eq!(linear.matmul_strategy(), Some(MatmulStrategy::DequantDense));
+        }
+    }
+
+    #[test]
+    fn q4_component_floors_are_descriptor_visible_and_shared_by_both_load_seams() {
+        let caps = crate::descriptor().capabilities;
+        assert_eq!(caps.component_precision_floors, COMPONENT_PRECISION_FLOORS);
+        assert_eq!(
+            component_quant(PrecisionFloorComponent::TextEncoder, Quant::Q4),
+            Quant::Q8
+        );
+        assert_eq!(
+            component_quant(PrecisionFloorComponent::TransformerHead, Quant::Q4),
+            Quant::Q8
+        );
+        for component in [
+            PrecisionFloorComponent::TextEncoder,
+            PrecisionFloorComponent::TransformerHead,
+        ] {
+            assert_eq!(component_quant(component, Quant::Q8), Quant::Q8);
         }
     }
 

@@ -1152,6 +1152,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // via the shared packed-detect loaders; the tiers are pre-quantized (no on-the-fly quant).
             // Tier ingestion (MLX layout + key remap) is sc-10026.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12733): the staged

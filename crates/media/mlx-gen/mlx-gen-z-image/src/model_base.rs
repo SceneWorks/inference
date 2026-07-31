@@ -68,6 +68,7 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Base is undistilled → full classifier-free guidance + negative prompting (the model card's
             // headline capabilities), unlike the guidance-distilled Turbo.
             supports_negative_prompt: true,

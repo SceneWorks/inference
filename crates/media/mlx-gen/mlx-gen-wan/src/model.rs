@@ -125,6 +125,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Cross-attention text K/V is cached across denoise steps.
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
@@ -729,6 +730,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
             requires_sigma_shift: false,
@@ -1638,6 +1640,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: true,
             requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap

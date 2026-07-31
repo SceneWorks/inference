@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::gen_core::Quant;
+use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
 use candle_gen::quant::QLinear;
 use candle_gen_boogu::loader::Weights;
 
@@ -415,7 +415,10 @@ impl MageTransformer {
         for block in &mut self.blocks {
             block.place(quant, device)?;
         }
-        place_linear(&mut self.final_mod, quant, device)?;
+        let final_mod_quant = quant.map(|selected| {
+            crate::quant::component_quant(PrecisionFloorComponent::TransformerHead, selected)
+        });
+        place_linear(&mut self.final_mod, final_mod_quant, device)?;
         place_linear(&mut self.output, quant, device)
     }
 

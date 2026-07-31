@@ -80,6 +80,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 8,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).

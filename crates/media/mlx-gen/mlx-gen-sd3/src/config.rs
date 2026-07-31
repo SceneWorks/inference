@@ -224,6 +224,7 @@ impl Sd3Variant {
                 // distilled Large-Turbo all support it; inpaint/mask remains a later story.
                 conditioning: vec![ConditioningKind::Reference],
                 supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
                 supports_lora: true,
                 supports_lokr: true,
                 samplers: {

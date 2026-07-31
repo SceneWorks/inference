@@ -10,6 +10,9 @@
 //! `AdaptableLinear::quantize`.
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::gen_core::{
+    effective_component_quant, ComponentPrecisionFloor, PrecisionFloorComponent, Quant,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -111,6 +114,22 @@ pub(crate) const LM_LAYER_PREFIX: &str = "model.language_model.layers.";
 /// which is not a trade worth taking on the tier that has to render correctly.
 pub(crate) const LM_LAYER_MIN_BITS: i32 = 8;
 
+/// The binding, descriptor-visible form of Mage's two q4 precision floors. The provider's
+/// load-time and offline packing seams resolve through this table, and SceneWorks reads the same
+/// declarations for effective-tier labels and evidence identity.
+pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[
+    ComponentPrecisionFloor {
+        component: PrecisionFloorComponent::TextEncoder,
+        selected_tier: Quant::Q4,
+        resident_tier: Quant::Q8,
+    },
+    ComponentPrecisionFloor {
+        component: PrecisionFloorComponent::TransformerHead,
+        selected_tier: Quant::Q4,
+        resident_tier: Quant::Q8,
+    },
+];
+
 /// The width `base` is actually packed at when tier `requested` was asked for.
 ///
 /// The **single seam** every packing path calls — the offline converter
@@ -119,12 +138,45 @@ pub(crate) const LM_LAYER_MIN_BITS: i32 = 8;
 /// is asserted end-to-end by `a_packed_tier_renders_identically_to_load_time_quantization`
 /// (max_abs 0).
 pub(crate) fn floor_bits(base: &str, requested: i32) -> i32 {
-    if base == FINAL_MOD_BASE {
-        requested.max(FINAL_MOD_MIN_BITS)
+    let selected = match requested {
+        4 => Quant::Q4,
+        8 => Quant::Q8,
+        _ => return requested,
+    };
+    let component = if base == FINAL_MOD_BASE {
+        Some(PrecisionFloorComponent::TransformerHead)
     } else if base.starts_with(LM_LAYER_PREFIX) {
-        requested.max(LM_LAYER_MIN_BITS)
+        Some(PrecisionFloorComponent::TextEncoder)
     } else {
-        requested
+        None
+    };
+    component.map_or(requested, |component| {
+        let documented_minimum = match component {
+            PrecisionFloorComponent::TextEncoder => LM_LAYER_MIN_BITS,
+            PrecisionFloorComponent::TransformerHead => FINAL_MOD_MIN_BITS,
+        };
+        effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
+            .bits()
+            .max(documented_minimum)
+    })
+}
+
+#[cfg(test)]
+mod descriptor_floor_tests {
+    use super::*;
+
+    #[test]
+    fn q4_floors_are_visible_through_every_mage_descriptor() {
+        for variant in crate::model::MageVariant::ALL {
+            assert_eq!(
+                crate::model::descriptor_for(variant)
+                    .capabilities
+                    .component_precision_floors,
+                COMPONENT_PRECISION_FLOORS
+            );
+        }
+        assert_eq!(floor_bits(FINAL_MOD_BASE, 4), 8);
+        assert_eq!(floor_bits(LM_LAYER_PREFIX, 4), 8);
     }
 }
 

@@ -64,7 +64,7 @@ impl MageEdit {
         let cfg_text = std::fs::read_to_string(root.join("transformer/config.json"))?;
         let cfg = MageConfig::from_json(&cfg_text)?;
         Ok(Self {
-            text: MageTextEncoder::load_multimodal(root, device)?,
+            text: MageTextEncoder::load_multimodal_with_quant(root, quant, device)?,
             transformer: MageTransformer::load_with_quant(
                 &root.join("transformer"),
                 &cfg,

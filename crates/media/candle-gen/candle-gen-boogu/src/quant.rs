@@ -23,6 +23,7 @@
 
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
+use candle_gen::gen_core::Quant;
 use candle_gen::quant as shared;
 
 /// A Linear projection that is **dense** (the loaded bf16 weight) or **packed** (loaded straight from
@@ -81,6 +82,23 @@ impl QLinear {
             }
             Self::Packed(l) => l.forward(x),
         }
+    }
+
+    /// Fold a dense projection to the requested GGUF tier on `device`; idempotent for an already
+    /// packed projection. Mage uses this to enforce its Q8 LM-layer floor even when the caller gives
+    /// Candle a dense upstream snapshot instead of the hosted pre-packed tier.
+    pub fn quantize_dequant_onto(
+        &mut self,
+        quant: Quant,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        let Self::Dense(linear) = self else {
+            return Ok(());
+        };
+        let mut packed = shared::QLinear::from_dense(shared::DenseLinear::Linear(linear.clone()));
+        packed.quantize_dequant_onto(quant, device)?;
+        *self = Self::Packed(packed);
+        Ok(())
     }
 
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by

@@ -54,6 +54,7 @@ fn generation_descriptor(
                 candle_gen::gen_core::Quant::Q4,
                 candle_gen::gen_core::Quant::Q8,
             ],
+            component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
             ..Default::default()
         },
     }

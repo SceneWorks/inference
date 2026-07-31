@@ -266,6 +266,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
             // VAE stay dense. All three variants share the quant path.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
             // pipeline, so it does not require the loader to pre-shift.

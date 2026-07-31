@@ -92,6 +92,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `LoadSpec::quantize` overlay is an advisory no-op on an already-packed tier (as with
             // sdxl/boogu/flux2-dev). bf16 tiers stay dense (Quant::None).
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

@@ -289,6 +289,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             supported_quants: &[],
+            component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
         },
     }

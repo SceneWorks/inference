@@ -161,6 +161,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: false,
             // SANA is the f32/bf16 weight path; no load-time quantization is wired yet.
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
@@ -217,6 +218,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             max_count: MAX_COUNT,
             mac_only: false,
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

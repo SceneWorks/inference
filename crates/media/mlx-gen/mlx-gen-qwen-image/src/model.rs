@@ -73,6 +73,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 8,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // Flow-match schedule uses the resolution-dependent sigma shift.
             requires_sigma_shift: true,

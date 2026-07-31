@@ -54,6 +54,7 @@ pub fn descriptor() -> ModelDescriptor {
             // paying for a load. Same expression the `ControlBranch` override
             // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,

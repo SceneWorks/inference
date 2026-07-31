@@ -183,6 +183,7 @@ mod explicit_registry_tests {
                 tier: mlx_gen::gen_core::MemoryNumericTier {
                     precision: mlx_gen::Precision::Bf16,
                     quant: Some(mlx_gen::Quant::Q4),
+                    component_precision_floors: &[],
                 },
             },
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,

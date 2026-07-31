@@ -1392,6 +1392,9 @@ fn validate_required_parameter(
 pub struct MemoryNumericTier {
     pub precision: Precision,
     pub quant: Option<Quant>,
+    /// The provider-declared component floors active for this numeric tier. Part of evidence/cache
+    /// identity: a uniform q4 run and a q4 run with q8 components are different numeric regimes.
+    pub component_precision_floors: &'static [crate::ComponentPrecisionFloor],
 }
 
 /// Shared-worker selection presented to the provider.
@@ -1884,6 +1887,7 @@ mod tests {
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
                 },
                 mode: "text_to_image".to_owned(),
                 overlay: None,
@@ -2175,6 +2179,7 @@ mod tests {
         let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: Some(Quant::Q4),
+            component_precision_floors: &[],
         };
         let mut selection = MemorySelection {
             strategy: MemoryStrategy::BoundedDecode,
@@ -2201,6 +2206,7 @@ mod tests {
         let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: None,
+            component_precision_floors: &[],
         };
         let mut selection = MemorySelection {
             strategy: MemoryStrategy::BoundedAttention,
@@ -2244,6 +2250,7 @@ mod tests {
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: None,
+                    component_precision_floors: &[],
                 },
                 mode: "text_to_image".to_owned(),
                 overlay: None,
@@ -2367,6 +2374,7 @@ mod tests {
             tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: None,
+                component_precision_floors: &[],
             },
         };
 
@@ -2473,6 +2481,7 @@ mod tests {
         MemoryNumericTier {
             precision: Precision::Bf16,
             quant: None,
+            component_precision_floors: &[],
         }
     }
 

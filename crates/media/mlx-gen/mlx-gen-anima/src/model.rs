@@ -54,6 +54,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // like SANA). The worker reads `supported_quants` for its capability advertisement
             // (gen-core sc-3723); every advertised tier actually loads, so this is honest.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload

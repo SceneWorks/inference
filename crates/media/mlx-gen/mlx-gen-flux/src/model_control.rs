@@ -78,6 +78,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // Control (required) — the structural hint (pose/canny/depth, input-agnostic).
             conditioning: vec![ConditioningKind::Control],
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
             supports_lora: true,
             supports_lokr: true,

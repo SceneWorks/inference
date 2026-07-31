@@ -63,10 +63,11 @@ pub use control::{
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, AudioEditMode, AudioEditRef, AudioParams, Capabilities, Conditioning,
-    ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
-    ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
+    default_seed, effective_component_quant, AudioEditMode, AudioEditRef, AudioParams,
+    Capabilities, ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef,
+    ControlKind, ConversationRole, ConversationSession, ConversationTurn, GenerationMemory,
+    GenerationOutput, GenerationPhase, GenerationRequest, Generator, KeyframeRef, Modality,
+    ModelDescriptor, PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SizeFloor,
     SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};

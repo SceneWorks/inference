@@ -1046,6 +1046,7 @@ mod tests {
             tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: Some(Quant::Q4),
+                component_precision_floors: &[],
             },
         }
     }

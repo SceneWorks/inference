@@ -53,6 +53,13 @@ fn context(
             tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: tier,
+                component_precision_floors: if tier == Some(Quant::Q4) {
+                    (REGISTRATION.descriptor)()
+                        .capabilities
+                        .component_precision_floors
+                } else {
+                    &[]
+                },
             },
         },
         calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,

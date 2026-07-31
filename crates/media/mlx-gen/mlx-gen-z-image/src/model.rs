@@ -69,6 +69,7 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Turbo is guidance-distilled: no CFG, no negative prompt.
             supports_negative_prompt: false,
             supports_guidance: false,

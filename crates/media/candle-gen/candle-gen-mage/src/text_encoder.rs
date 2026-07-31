@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Error, Result, Tensor};
+use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
 use candle_gen_boogu::loader::Weights;
 use candle_gen_boogu::text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 use candle_gen_boogu::vision::preprocess::preprocess_image;
@@ -28,14 +29,31 @@ pub struct MageTextEncoder {
 
 impl MageTextEncoder {
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
-        Self::load_inner(root, device, false)
+        Self::load_inner(root, device, false, None)
+    }
+
+    pub fn load_with_quant(root: &Path, quant: Option<Quant>, device: &Device) -> Result<Self> {
+        Self::load_inner(root, device, false, quant)
     }
 
     pub fn load_multimodal(root: &Path, device: &Device) -> Result<Self> {
-        Self::load_inner(root, device, true)
+        Self::load_inner(root, device, true, None)
     }
 
-    fn load_inner(root: &Path, device: &Device, multimodal: bool) -> Result<Self> {
+    pub fn load_multimodal_with_quant(
+        root: &Path,
+        quant: Option<Quant>,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::load_inner(root, device, true, quant)
+    }
+
+    fn load_inner(
+        root: &Path,
+        device: &Device,
+        multimodal: bool,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
         let dir = root.join("text_encoder");
         let weights = Weights::from_dir(&dir, device, DType::BF16)?;
         let cfg = BooguTextEncoderConfig {
@@ -46,12 +64,17 @@ impl MageTextEncoder {
             rms_norm_eps: 1e-6,
             rope_theta: TE_ROPE_THETA,
         };
-        let model = BooguTextEncoder::load(
+        let mut model = BooguTextEncoder::load(
             &weights,
             "model.language_model",
             &cfg,
             TXT_MAX_LENGTH + DROP_IDX_GEN,
         )?;
+        if let Some(selected) = quant {
+            let layer_quant =
+                crate::quant::component_quant(PrecisionFloorComponent::TextEncoder, selected);
+            model.quantize_layers_onto(layer_quant, device)?;
+        }
         let vision = if multimodal {
             Some(VisionTower::load(
                 &weights,
