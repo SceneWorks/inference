@@ -55,13 +55,15 @@ pub use gen_core::block_window::BlockPlan;
 
 /// Binds MLX's two operations to the shared driver: a fresh lazily-loaded [`Weights`] view per
 /// window, and `clear_cache()` to return the allocator's holdings after the window drops.
-struct MlxWindowBackend<F> {
+struct MlxWindowBackend<F, R> {
     open: F,
+    release: R,
 }
 
-impl<F> BlockWindowBackend for MlxWindowBackend<F>
+impl<F, R> BlockWindowBackend for MlxWindowBackend<F, R>
 where
     F: FnMut() -> Result<Weights>,
+    R: Fn(),
 {
     type View = Weights;
 
@@ -70,8 +72,29 @@ where
     }
 
     fn release(&self) {
-        mlx_rs::memory::clear_cache();
+        (self.release)();
     }
+}
+
+fn run_windowed_with_release<S>(
+    plan: &BlockPlan,
+    cancel: &CancelFlag,
+    init: S,
+    open: impl FnMut() -> Result<Weights>,
+    mut apply: impl FnMut(S, &mut Weights, Range<usize>) -> Result<S>,
+    materialize: impl Fn(&S) -> Result<()>,
+    release: impl Fn(),
+) -> Result<S> {
+    let mut backend = MlxWindowBackend { open, release };
+    gen_core::block_window::run_windowed(
+        &mut backend,
+        plan,
+        cancel,
+        init,
+        |state, view, range| apply(state, view, range).map_err(Into::into),
+        |state| materialize(state).map_err(Into::into),
+    )
+    .map_err(Into::into)
 }
 
 /// Run one denoise step's worth of block windows over MLX weights.
@@ -91,22 +114,95 @@ pub fn run_windowed<S>(
     mut apply: impl FnMut(S, &mut Weights, Range<usize>) -> Result<S>,
     materialize: impl Fn(&S) -> Result<()>,
 ) -> Result<S> {
-    let mut backend = MlxWindowBackend { open };
-    gen_core::block_window::run_windowed(
-        &mut backend,
+    run_windowed_with_release(
         plan,
         cancel,
         init,
-        |state, view, range| apply(state, view, range).map_err(Into::into),
-        |state| materialize(state).map_err(Into::into),
+        open,
+        |state, view, range| apply(state, view, range),
+        materialize,
+        mlx_rs::memory::clear_cache,
     )
-    .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Error;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The adapter must forward MLX's synchronization callback before it clears MLX's allocator
+    /// cache. `release` is injected here only so the otherwise-global clear is observable without
+    /// relying on process-wide allocator counters or real weights.
+    #[test]
+    fn mlx_adapter_materializes_before_releasing_each_window() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let open_log = Rc::clone(&log);
+        let apply_log = Rc::clone(&log);
+        let materialize_log = Rc::clone(&log);
+        let release_log = Rc::clone(&log);
+
+        let out = run_windowed_with_release(
+            &BlockPlan::new(2, 1).unwrap(),
+            &CancelFlag::default(),
+            0usize,
+            move || {
+                open_log.borrow_mut().push("open");
+                Ok(Weights::empty())
+            },
+            move |state, _view, _range| {
+                apply_log.borrow_mut().push("apply");
+                Ok(state + 1)
+            },
+            move |_| {
+                materialize_log.borrow_mut().push("materialize");
+                Ok(())
+            },
+            move || release_log.borrow_mut().push("clear_cache"),
+        )
+        .unwrap();
+
+        assert_eq!(out, 2);
+        assert_eq!(
+            log.borrow().as_slice(),
+            [
+                "open",
+                "apply",
+                "materialize",
+                "clear_cache",
+                "open",
+                "apply",
+                "materialize",
+                "clear_cache"
+            ]
+        );
+    }
+
+    /// The MLX error bridge and backend release must both run for cancellation raised during the
+    /// materialization callback, not only for a flag cancelled before the first view opened.
+    #[test]
+    fn mlx_adapter_releases_after_typed_cancel_during_materialize() {
+        let releases = Rc::new(RefCell::new(0usize));
+        let released = Rc::clone(&releases);
+        let err = run_windowed_with_release(
+            &BlockPlan::new(2, 1).unwrap(),
+            &CancelFlag::default(),
+            0usize,
+            || Ok(Weights::empty()),
+            |state, _view, _range| Ok(state),
+            |_| Err(Error::Canceled),
+            move || *released.borrow_mut() += 1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Canceled));
+        assert_eq!(
+            *releases.borrow(),
+            1,
+            "the active MLX window must be released"
+        );
+    }
 
     /// The cancellation path now crosses a crate boundary — `gen_core::Error::Canceled` has to come
     /// back as `mlx_gen::Error::Canceled`, not collapse into `Error::Msg`.

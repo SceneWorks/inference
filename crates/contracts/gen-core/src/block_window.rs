@@ -274,42 +274,94 @@ mod tests {
         assert!(BlockPlan::new(30, 0).is_err());
     }
 
-    /// A backend that records the lifecycle so the driver's ordering can be asserted without a GPU.
+    /// A backend that records both lifecycle ordering and modeled residency without a GPU.
+    ///
+    /// Dropping a view releases its live handle, but its modeled allocator cache remains resident
+    /// until `release`. Calling `release` before the view drops cannot clear that live allocation.
+    /// That distinction makes the tests below fail if either the explicit `drop(view)` or the
+    /// following release is removed or reordered.
+    #[derive(Default)]
+    struct RecorderState {
+        log: Vec<String>,
+        live_views: usize,
+        resident: usize,
+        peak_resident: usize,
+        releases: usize,
+    }
+
+    struct RecordingView {
+        state: Rc<RefCell<RecorderState>>,
+    }
+
+    impl Drop for RecordingView {
+        fn drop(&mut self) {
+            let mut state = self.state.borrow_mut();
+            state.live_views -= 1;
+            state.log.push("drop".into());
+        }
+    }
+
     #[derive(Default)]
     struct Recorder {
-        log: Rc<RefCell<Vec<String>>>,
+        state: Rc<RefCell<RecorderState>>,
         opens: usize,
     }
 
-    impl BlockWindowBackend for Recorder {
-        type View = usize;
-        fn open_view(&mut self) -> Result<usize> {
-            self.opens += 1;
-            self.log.borrow_mut().push("open".into());
-            Ok(self.opens)
+    impl Recorder {
+        fn log(&self) -> Vec<String> {
+            self.state.borrow().log.clone()
         }
+
+        fn resident(&self) -> usize {
+            self.state.borrow().resident
+        }
+
+        fn peak_resident(&self) -> usize {
+            self.state.borrow().peak_resident
+        }
+
+        fn releases(&self) -> usize {
+            self.state.borrow().releases
+        }
+    }
+
+    impl BlockWindowBackend for Recorder {
+        type View = RecordingView;
+
+        fn open_view(&mut self) -> Result<RecordingView> {
+            self.opens += 1;
+            let mut state = self.state.borrow_mut();
+            state.log.push("open".into());
+            state.live_views += 1;
+            state.resident += 1;
+            state.peak_resident = state.peak_resident.max(state.resident);
+            drop(state);
+            Ok(RecordingView {
+                state: Rc::clone(&self.state),
+            })
+        }
+
         fn release(&self) {
-            self.log.borrow_mut().push("release".into());
+            let mut state = self.state.borrow_mut();
+            state.log.push("release".into());
+            state.releases += 1;
+            state.resident = state.live_views;
         }
     }
 
     #[test]
     fn a_fresh_view_is_opened_per_window_and_released_after_materialize() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut backend = Recorder {
-            log: Rc::clone(&log),
-            opens: 0,
-        };
+        let mut backend = Recorder::default();
         let plan = BlockPlan::new(4, 2).unwrap();
-        let l = Rc::clone(&log);
+        let state = Rc::clone(&backend.state);
         run_windowed(
             &mut backend,
             &plan,
             &CancelFlag::default(),
             0usize,
-            |s, _v, r| Ok(s + r.len()),
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
             move |_| {
-                l.borrow_mut().push("materialize".into());
+                state.borrow_mut().log.push("materialize".into());
                 Ok(())
             },
         )
@@ -317,28 +369,32 @@ mod tests {
 
         // Two windows, and within each: open BEFORE apply, materialize BEFORE release.
         assert_eq!(
-            log.borrow().as_slice(),
+            backend.log().as_slice(),
             [
                 "open",
                 "materialize",
+                "drop",
                 "release",
                 "open",
                 "materialize",
+                "drop",
                 "release"
             ]
         );
         assert_eq!(backend.opens, 2, "a fresh view per window, not one reused");
+        assert_eq!(backend.resident(), 0, "the final window must be released");
+        assert_eq!(
+            backend.peak_resident(),
+            1,
+            "residency must not grow by window"
+        );
     }
 
     /// Cancellation must surface as the TYPED variant. A generic message reports a cancelled render
     /// as a failed job (sc-4481), and this driver is the seam where that is easiest to get wrong.
     #[test]
     fn cancellation_is_typed_and_still_releases() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut backend = Recorder {
-            log: Rc::clone(&log),
-            opens: 0,
-        };
+        let mut backend = Recorder::default();
         let cancel = CancelFlag::default();
         cancel.cancel();
 
@@ -347,7 +403,7 @@ mod tests {
             &BlockPlan::new(4, 2).unwrap(),
             &cancel,
             0usize,
-            |s, _v: &mut usize, _r| Ok(s),
+            |s, _v: &mut RecordingView, _r| Ok(s),
             |_| Ok(()),
         )
         .unwrap_err();
@@ -356,52 +412,168 @@ mod tests {
             matches!(err, Error::Canceled),
             "cancellation must be Error::Canceled, not a stringified message: {err:?}"
         );
-        assert_eq!(log.borrow().as_slice(), ["release"]);
+        assert_eq!(backend.log().as_slice(), ["release"]);
         assert_eq!(backend.opens, 0, "cancelled before opening anything");
+        assert_eq!(backend.resident(), 0);
     }
 
-    /// A failing window releases too — otherwise its half-materialized weights are inherited by the
-    /// next request.
+    /// Cancellation raised during materialization stays typed and releases that active window.
     #[test]
-    fn a_failed_window_still_releases() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut backend = Recorder {
-            log: Rc::clone(&log),
-            opens: 0,
-        };
+    fn cancellation_during_materialize_is_typed_and_releases_the_active_window() {
+        let mut backend = Recorder::default();
+        let cancel = CancelFlag::default();
+        let in_materialize = cancel.clone();
         let err = run_windowed(
+            &mut backend,
+            &BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            0usize,
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
+            move |_| {
+                in_materialize.cancel();
+                Err(Error::Canceled)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Canceled));
+        assert_eq!(backend.log().as_slice(), ["open", "drop", "release"]);
+        assert_eq!(backend.resident(), 0, "the active window must not leak");
+        assert_eq!(backend.releases(), 1);
+    }
+
+    /// Cancel between windows, then reuse the same backend for a correct warm run. The first run
+    /// leaves neither residency nor hidden window state for the second to inherit.
+    #[test]
+    fn cancellation_between_windows_releases_and_warm_reentry_is_clean() {
+        let mut backend = Recorder::default();
+        let cancel = CancelFlag::default();
+        let after_first = cancel.clone();
+        let err = run_windowed(
+            &mut backend,
+            &BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            0usize,
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
+            move |_| {
+                after_first.cancel();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Canceled));
+        assert_eq!(backend.opens, 1, "the second window must never open");
+        assert_eq!(
+            backend.resident(),
+            0,
+            "cancel must leave a clean window state"
+        );
+        assert_eq!(
+            backend.peak_resident(),
+            1,
+            "post-cancel residency must not grow"
+        );
+
+        let out = run_windowed(
             &mut backend,
             &BlockPlan::new(4, 2).unwrap(),
             &CancelFlag::default(),
             0usize,
-            |_s, _v: &mut usize, _r| Err(Error::Msg("boom".into())),
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
             |_| Ok(()),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, Error::Msg(ref m) if m == "boom"));
-        assert_eq!(log.borrow().as_slice(), ["open", "release"]);
+        assert_eq!(out, 4, "the warm run must execute both clean windows");
+        assert_eq!(backend.opens, 3, "one aborted plus two clean windows");
+        assert_eq!(backend.resident(), 0);
+        assert_eq!(
+            backend.peak_resident(),
+            1,
+            "warm re-entry must remain bounded"
+        );
     }
 
-    /// A failing `materialize` must release as well — the window is still live at that point.
+    /// A typed execute error releases the active view and allocator state, then a clean run on the
+    /// same backend starts from zero rather than inheriting the faulted window.
     #[test]
-    fn a_failed_materialize_still_releases() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut backend = Recorder {
-            log: Rc::clone(&log),
-            opens: 0,
-        };
+    fn execute_error_stays_typed_and_warm_reentry_is_clean() {
+        let mut backend = Recorder::default();
         let err = run_windowed(
             &mut backend,
             &BlockPlan::new(2, 1).unwrap(),
             &CancelFlag::default(),
             0usize,
-            |s, _v: &mut usize, _r| Ok(s),
-            |_| Err(Error::Msg("no eval".into())),
+            |_s, _v: &mut RecordingView, _r| Err(Error::MissingTensor("layers.0.weight".into())),
+            |_| Ok(()),
         )
         .unwrap_err();
 
-        assert!(matches!(err, Error::Msg(ref m) if m == "no eval"));
-        assert_eq!(log.borrow().as_slice(), ["open", "release"]);
+        assert!(matches!(err, Error::MissingTensor(ref key) if key == "layers.0.weight"));
+        assert_eq!(
+            backend.resident(),
+            0,
+            "execute failure must release its window"
+        );
+        assert_eq!(backend.peak_resident(), 1);
+
+        let out = run_windowed(
+            &mut backend,
+            &BlockPlan::new(2, 1).unwrap(),
+            &CancelFlag::default(),
+            0usize,
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(out, 2);
+        assert_eq!(backend.resident(), 0);
+        assert_eq!(
+            backend.peak_resident(),
+            1,
+            "post-fault residency must not grow"
+        );
+    }
+
+    /// A typed materialization error has the same cleanup and re-entry guarantee. This specifically
+    /// pins the synchronize-before-release half of the lifecycle rather than only execute failures.
+    #[test]
+    fn materialize_error_stays_typed_and_warm_reentry_is_clean() {
+        let mut backend = Recorder::default();
+        let err = run_windowed(
+            &mut backend,
+            &BlockPlan::new(2, 1).unwrap(),
+            &CancelFlag::default(),
+            0usize,
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
+            |_| Err(Error::Unsupported("materialize fault".into())),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Unsupported(ref message) if message == "materialize fault"));
+        assert_eq!(
+            backend.resident(),
+            0,
+            "materialize failure must release its window"
+        );
+        assert_eq!(backend.peak_resident(), 1);
+
+        let out = run_windowed(
+            &mut backend,
+            &BlockPlan::new(2, 1).unwrap(),
+            &CancelFlag::default(),
+            0usize,
+            |s, _v: &mut RecordingView, r| Ok(s + r.len()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(out, 2);
+        assert_eq!(backend.resident(), 0);
+        assert_eq!(
+            backend.peak_resident(),
+            1,
+            "post-fault residency must not grow"
+        );
     }
 }
