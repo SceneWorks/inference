@@ -132,11 +132,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("DC-AE decode tiling fidelity\n  {size}px, {steps} steps, seed 0");
 
-    // Baseline: no tiling. `decode_tiling` reads the env per decode, so unsetting it here is what
-    // selects the whole-image path.
-    std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+    // Baseline: whole-image, forced with `0`.
+    //
+    // This used to `remove_var`, on the reasoning that an unset variable selects the untiled path.
+    // That stopped being true when SANA made tiling the default under `Sequential` — which is the
+    // policy this example loads under (see `generate`). An unset variable now selects the provider
+    // default of 128 px, so the "whole-image baseline" was a 128-tiled render and every row below
+    // was reporting its difference from *that*.
+    //
+    // It failed loudly once you look: the 128 row came back max |Δ| 0, mean 0.000 — a tiled decode
+    // cannot be bit-identical to an untiled one, and it was identical because it was being compared
+    // against itself. Only `0` expresses whole-image now.
+    std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
     let baseline = generate(dir, size, steps)?;
-    println!("  baseline (whole-image decode) rendered");
+    println!("  baseline (whole-image decode, forced with MLX_GEN_SANA_DECODE_TILE=0) rendered");
     if let Some(out) = &out_dir {
         write_png(&baseline, &Path::new(out).join("baseline.png"))?;
     }
