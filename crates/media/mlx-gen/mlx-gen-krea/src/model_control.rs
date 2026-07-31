@@ -59,6 +59,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// (the base Turbo text phase + DiT/VAE + the pose control branch).
 pub struct KreaTurboControl {
     descriptor: ModelDescriptor,
+    memory_strategy: gen_core::MemoryProviderContract,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -124,6 +125,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     validate_control_spec(spec)?;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(
+            KREA_2_TURBO_CONTROL_ID,
+            spec,
+        )?,
         residency: build_control_residency(spec)?,
     }))
 }
@@ -261,6 +266,21 @@ impl ControlBranch for KreaTurboControl {
 }
 
 impl KreaTurboControl {
+    fn calibration_fault(
+        &self,
+        req: &GenerationRequest,
+        phase: gen_core::MemoryPhase,
+    ) -> Result<()> {
+        match req.memory {
+            Some(memory) if memory.calibration_error_phase == Some(phase) => {
+                Err(Error::Msg(format!(
+                    "{KREA_2_TURBO_CONTROL_ID}: injected memory-strategy calibration error at {phase:?}"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
     /// lifts `mlx_rs` device exceptions; the trait wrapper bridges into [`gen_core::Error`]). Renders
     /// `req.count` CFG-free Turbo images, one per pose per seed (`seed + n`), each pose-locked by the
@@ -293,28 +313,37 @@ impl KreaTurboControl {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &KreaText| maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain),
+            |text: &KreaText| {
+                let context =
+                    maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
+                // `Residency::run` materializes only under Sequential. For calibration fault
+                // injection, evaluate at the conditioning boundary here as well so Resident and
+                // Sequential exercise the same physical phase without changing ordinary renders.
+                if req.memory.is_some_and(|memory| {
+                    memory.calibration_error_phase == Some(gen_core::MemoryPhase::Conditioning)
+                }) {
+                    mlx_rs::transforms::eval([&context])?;
+                    self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
+                }
+                Ok(context)
+            },
             // Materialize the context while the text phase is still alive (Sequential only).
-            |ctx: &Array| Ok(mlx_rs::transforms::eval([ctx])?),
+            |ctx: &Array| {
+                mlx_rs::transforms::eval([ctx])?;
+                Ok(())
+            },
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
             // identically for both residencies.
             |heavy_owned, context, on_progress| {
+                self.calibration_fault(req, gen_core::MemoryPhase::Denoise)?;
                 let heavy = heavy_owned.as_ref();
                 let safe_gib = mlx_gen::memory::safe_budget_gib();
 
-                // Resolution lever (sc-11749) — the LAST-RESORT rung of the sc-11750 escalation ladder,
-                // the only one that costs image quality, so it engages only after the cheaper levers are
-                // spent: Sequential residency was already selected at load (the worker fit-gate, epic
-                // 10834 — `text_co_resident` reflects it), the pose branch was already packed-or-not at
-                // load (sc-11748 — `branch_tier`), and decode tiling engages just below (sc-11747). If the
-                // un-tileable DENOISE activation peak (candle #480's ~11 GiB @ 1024²) STILL exceeds this
-                // machine's `safe_budget_gib()` at the requested size, drop to the largest 16-aligned
-                // resolution that fits; a machine with headroom keeps the requested size (zero cost). The
-                // pose skeleton is re-preprocessed to these dims by `prepare_control` below (it resizes the
-                // control image to the render size), so the control latent stays consistent. Count-
-                // invariant (shape + tiers only) → decided ONCE. An infeasible render surfaces here as a
-                // catchable error, before the render, rather than an OOM mid-run.
-                let (render_width, render_height) = crate::memory::plan_control_resolution(
+                // Feasibility is evaluated at the requested geometry only. No provider path may rewrite
+                // width or height: an infeasible request is refused before control preprocessing or
+                // render. There is currently no provider-owned current measurement bundle from which to
+                // name a verified alternative, so `alternative` is truthfully absent.
+                let feasible = crate::memory::control_geometry_fits(
                     safe_gib,
                     &heavy_owned.cfg,
                     heavy.branch.num_blocks(),
@@ -323,18 +352,8 @@ impl KreaTurboControl {
                     req.width,
                     req.height,
                     text_co_resident,
-                )?;
-                if (render_width, render_height) != (req.width, req.height) {
-                    // Never a SILENT capability drop (the epic 8459 phantom-de-list lesson): announce the
-                    // last-resort reduction to stderr, like the residency re-quantize advisory.
-                    eprintln!(
-                        "{KREA_2_TURBO_CONTROL_ID}: reduced render resolution {}×{} → \
-                         {render_width}×{render_height} to fit the ~{safe_gib:.0} GiB unified-memory \
-                         budget (last-resort lever, after text offload + decode tiling + pose-branch \
-                         packing). A Mac with more memory renders at the requested size.",
-                        req.width, req.height
-                    );
-                }
+                );
+                crate::memory::require_control_geometry(req.width, req.height, feasible)?;
 
                 // Budget-gated decode tiling (sc-11747): estimate the Qwen-VAE decode peak from this
                 // render's shape + the resident-weight footprint (base tier + pose branch tier) and, if it
@@ -342,32 +361,35 @@ impl KreaTurboControl {
                 // single-pass (a machine with headroom pays zero tiling overhead). Count-invariant (shape
                 // + tiers only), so it is decided ONCE here and reused for every seed. An infeasible
                 // decode surfaces here as a catchable error, before the render, rather than an OOM mid-run.
-                let decode_tiling = crate::memory::plan_control_decode_tiling(
-                    safe_gib,
-                    &heavy_owned.cfg,
-                    heavy.branch.num_blocks(),
-                    heavy_owned.base_tier,
-                    heavy_owned.branch_tier,
-                    render_width,
-                    render_height,
-                    text_co_resident,
-                )?;
+                let decode_tiling = match req.memory {
+                    Some(memory) if memory.tile_vae_decode => {
+                        Some(crate::memory::requested_control_decode_tiling(memory)?)
+                    }
+                    _ => crate::memory::plan_control_decode_tiling(
+                        safe_gib,
+                        &heavy_owned.cfg,
+                        heavy.branch.num_blocks(),
+                        heavy_owned.base_tier,
+                        heavy_owned.branch_tier,
+                        req.width,
+                        req.height,
+                        text_co_resident,
+                    )?,
+                };
 
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
                 // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
-                let plan = heavy.heavy.prepare_control(
-                    &context,
-                    control_image,
-                    render_width,
-                    render_height,
-                )?;
+                let plan =
+                    heavy
+                        .heavy
+                        .prepare_control(&context, control_image, req.width, req.height)?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
-                        width: render_width,
-                        height: render_height,
+                        width: req.width,
+                        height: req.height,
                         steps,
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),
@@ -378,6 +400,7 @@ impl KreaTurboControl {
                         heavy.branch,
                         control_scale,
                         decode_tiling.as_ref(),
+                        req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
                         &req.cancel,
                         on_progress,
@@ -410,6 +433,28 @@ impl Generator for KreaTurboControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            KREA_2_TURBO_CONTROL_ID,
+            &self.memory_strategy,
+            context,
+        )
+    }
 }
 
 // Explicit registration for `krea_2_turbo_control`. The `impl Generator` stays hand-written
@@ -420,10 +465,41 @@ mlx_gen::register_generators! {
     footprint = crate::model::component_footprint
 }
 
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: KREA_2_TURBO_CONTROL_ID,
+        contract: |spec| {
+            crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, spec)
+        },
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
+
+    #[test]
+    fn generate_call_path_preserves_requested_geometry_through_render() {
+        let source = include_str!("model_control.rs");
+        let start = source
+            .find("let feasible = crate::memory::control_geometry_fits(")
+            .expect("requested-geometry feasibility gate");
+        let end = source[start..]
+            .find("Ok(GenerationOutput::Images(images))")
+            .map(|offset| start + offset)
+            .expect("render-loop end");
+        let path = &source[start..end];
+        assert!(path
+            .contains("crate::memory::require_control_geometry(req.width, req.height, feasible)?"));
+        assert!(
+            !path.contains("render_width") && !path.contains("render_height"),
+            "the admitted path must not introduce substitutable geometry variables"
+        );
+        assert!(path.contains(".prepare_control(&context, control_image, req.width, req.height)?"));
+        assert!(path.contains(
+            "let opts = TurboOptions {\n                        width: req.width,\n                        height: req.height,"
+        ));
+    }
 
     #[test]
     fn descriptor_is_krea_2_turbo_control() {

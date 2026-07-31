@@ -51,6 +51,7 @@ pub mod control;
 pub mod convert;
 pub mod loader;
 pub mod memory;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod multiphase;
@@ -66,7 +67,9 @@ pub mod vae;
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
 pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};
-pub use memory::{plan_control_adaptation, ControlLaneInputs};
+pub use memory::{
+    control_geometry_fits, plan_control_adaptation, require_control_geometry, ControlLaneInputs,
+};
 pub use model::{
     descriptor, edit_descriptor, load, load_edit, load_from_native_dit_file, load_raw,
     load_turbo_edit, raw_descriptor, turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID,
@@ -96,6 +99,7 @@ pub fn register_providers(
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_generator(model_control::CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -129,6 +133,89 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw"]);
+
+        let contract = registry
+            .memory_strategy_contract(
+                "krea_2_turbo_control",
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                    .with_control(mlx_gen::WeightsSource::File(
+                        "/nonexistent/control.safetensors".into(),
+                    ))
+                    .with_offload_policy(mlx_gen::OffloadPolicy::Sequential),
+            )
+            .unwrap()
+            .expect("Krea control memory contract");
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            crate::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            contract
+                .capability(mlx_gen::gen_core::MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            crate::memory_strategy::DECODE_TILE_EDGES
+        );
+        assert_eq!(
+            crate::memory_strategy::DECODE_TILE_EDGES,
+            [crate::memory_strategy::DECODE_TILE_EDGE],
+            "only the exact real-weight-verified 512 px decode edge may be advertised"
+        );
+        let routes = mlx_gen_pid::assert_decode_routes(
+            "krea_2_turbo_control",
+            crate::memory_strategy::DECODE_TILE_EDGES,
+            crate::memory_strategy::DECODE_OVERLAP,
+        );
+        assert_eq!(
+            routes.native_edges(),
+            crate::memory_strategy::DECODE_TILE_EDGES
+        );
+        gen_core_testkit::check_memory_strategy_contract(&contract)
+            .expect("Krea control memory contract conformance");
+
+        let context = mlx_gen::gen_core::MemoryRunContext {
+            selection: mlx_gen::gen_core::MemorySelection {
+                strategy: mlx_gen::gen_core::MemoryStrategy::BoundedDecode,
+                parameters: mlx_gen::gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(crate::memory_strategy::DECODE_TILE_EDGE),
+                    decode_overlap: Some(crate::memory_strategy::DECODE_OVERLAP),
+                    ..Default::default()
+                },
+                tier: mlx_gen::gen_core::MemoryNumericTier {
+                    precision: mlx_gen::Precision::Bf16,
+                    quant: Some(mlx_gen::Quant::Q4),
+                },
+            },
+            calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: crate::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+                .to_owned(),
+            mode: mlx_gen::gen_core::MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: true,
+            has_phases: false,
+            geometry: mlx_gen::gen_core::MemoryGeometry {
+                width: 768,
+                height: 768,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: Some("control:1".to_owned()),
+            budget: mlx_gen::gen_core::MemoryBudget {
+                total_bytes: u64::MAX,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: mlx_gen::gen_core::MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        };
+        assert!(matches!(
+            crate::memory_strategy::safety_check(&contract, &context),
+            mlx_gen::gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("PiD decode is not implemented")
+        ));
     }
 }
 

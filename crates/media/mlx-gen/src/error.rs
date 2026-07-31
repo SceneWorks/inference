@@ -37,6 +37,18 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// A pre-render refusal that preserves the requested geometry and carries only a verified
+    /// alternative geometry, if one exists.
+    #[error(
+        "geometry refused: {reason}; requested {requested_width}x{requested_height}; verified alternative: {alternative:?}"
+    )]
+    GeometryRefused {
+        reason: String,
+        requested_width: u32,
+        requested_height: u32,
+        alternative: Option<(u32, u32)>,
+    },
+
     /// A contextual message (config/validation/adapter-shape errors).
     #[error("{0}")]
     Msg(String),
@@ -68,6 +80,17 @@ impl From<Error> for gen_core::Error {
             Error::Io(io) => gen_core::Error::Io(io),
             Error::Canceled => gen_core::Error::Canceled,
             Error::Unsupported(s) => gen_core::Error::Unsupported(s),
+            Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
             Error::Msg(s) => gen_core::Error::Msg(s),
         }
     }
@@ -87,6 +110,17 @@ impl From<gen_core::Error> for Error {
             gen_core::Error::MissingTensor(s) => Error::MissingTensor(s),
             gen_core::Error::Io(io) => Error::Io(io),
             gen_core::Error::Unsupported(s) => Error::Unsupported(s),
+            gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
             gen_core::Error::Canceled => Error::Canceled,
             gen_core::Error::Msg(s) => Error::Msg(s),
         }
@@ -126,5 +160,26 @@ mod tests {
         }
         let back: gen_core::Error = down.into();
         assert!(matches!(back, gen_core::Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn geometry_refusal_round_trips_with_telemetry_fields_intact() {
+        let up: gen_core::Error = Error::GeometryRefused {
+            reason: "measured infeasible".into(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: Some((1024, 1024)),
+        }
+        .into();
+        let down: Error = up.into();
+        assert!(matches!(
+            down,
+            Error::GeometryRefused {
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+                ..
+            }
+        ));
     }
 }

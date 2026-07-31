@@ -34,7 +34,7 @@ use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, LatentDecoder, Progress, Result,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, Progress, Result,
     TimestepConvention,
 };
 
@@ -370,6 +370,7 @@ impl KreaHeavy {
             branch,
             control_scale,
             None,
+            None,
             opts,
             cancel,
             on_progress,
@@ -415,6 +416,7 @@ impl KreaHeavy {
         branch: &Krea2ControlBranch,
         control_scale: f32,
         decode_tiling: Option<&TilingConfig>,
+        calibration_error_phase: Option<mlx_gen::gen_core::MemoryPhase>,
         opts: &TurboOptions,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -444,6 +446,15 @@ impl KreaHeavy {
         )?;
 
         on_progress(Progress::Decoding);
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if calibration_error_phase == Some(mlx_gen::gen_core::MemoryPhase::Decode) {
+            return Err(Error::Msg(
+                "krea_2_turbo_control: injected memory-strategy calibration error at Decode"
+                    .to_owned(),
+            ));
+        }
         self.decode_latents_native_tiled(&lat, decode_tiling, cancel)
     }
 
