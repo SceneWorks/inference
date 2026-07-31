@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p mlx-gen-ios-catalog --example tiling_fidelity -- <snapshot_dir>
-//!     [--size N] [--steps N] [--tiles 512,256,128] [--out DIR]
+//!     [--size N] [--steps N] [--tiles 512,256,192,128] [--out DIR]
 //! ```
 //!
 //! # Why this exists separately from the parity test
@@ -110,7 +110,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut size = 1024u32;
     let mut steps = 4u32;
-    let mut tiles = vec![512i32, 256, 128];
+    let mut tiles = vec![512i32, 256, 192, 128];
     let mut out_dir: Option<String> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {

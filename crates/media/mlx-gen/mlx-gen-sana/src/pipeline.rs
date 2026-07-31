@@ -168,10 +168,37 @@ pub fn decode_to_image(
 }
 
 /// Default tile edge in **output** pixels, and its overlap. Measured: at 1024² this holds the
-/// sequential peak to 3294 MiB on the host and 2751 MiB on device, against 9177 MiB untiled.
+/// sequential peak to 3294 MiB on the host and 2733 MiB on device, against 9177 MiB untiled.
 /// A quarter-tile overlap is enough for the trapezoidal blend without paying for large redundant
 /// borders.
-pub const DECODE_TILE_EDGE: i32 = 128;
+///
+/// # Why 192, and not the 128 this shipped with
+///
+/// **192 is the largest edge that still reaches the minimum possible request peak.** Swept on real
+/// weights at 1024², `Sequential`:
+///
+/// | edge | 512 | 384 | 256 | **192** | 128 | 96 | 64 |
+/// |---|---:|---:|---:|---:|---:|---:|---:|
+/// | host peak (MiB) | 5146 | 4496 | 3465 | **3294** | 3294 | 3294 | 3294 |
+/// | mean \|Δ\| vs whole-image | 2.454 | 3.036 | 3.558 | **5.158** | 6.192 | 9.212 | 11.140 |
+///
+/// The peak **floors at 3294 MiB from 192 downward** — below it the denoise phase binds and a
+/// smaller tile buys nothing — while fidelity keeps degrading. So every edge under 192 pays image
+/// quality for no admission win, which is a strictly bad trade. 128 was exactly that trade, unknowingly.
+///
+/// The device agrees and then improves on the argument: 192 is not merely equal-cost, it is cheaper
+/// and faster, because a coarser grid is fewer per-tile dispatches.
+///
+/// | iPhone 17 Pro Max, 1024² | time | MLX peak | footprint | min headroom |
+/// |---|---:|---:|---:|---:|
+/// | **edge 192** | **29.2 s** | **2733 MiB** | **2860 MiB** | **3218 MiB** |
+/// | edge 128 | 34.9 s | 2839 MiB | 2904 MiB | 3147 MiB |
+///
+/// Going the other way costs real memory: 256 adds 171 MiB of peak and 347 MiB of footprint for a
+/// better image (3.558). That is a legitimate trade a caller may now make through
+/// `GenerationMemory::decode_tile_edge` — but not the default, because 4096 MiB is the budget an
+/// 8 GB device is assumed to have and edge 256 lands its footprint exactly on that line.
+pub const DECODE_TILE_EDGE: i32 = 192;
 /// Overlap for [`DECODE_TILE_EDGE`], in output pixels.
 pub const DECODE_OVERLAP: i32 = DECODE_TILE_EDGE / 4;
 
@@ -1337,6 +1364,28 @@ mod tests {
 
         let plan = resolved_decode_plan(None, true).expect("sequential tiles");
         assert_eq!(plan.source, DecodeTilingSource::SequentialDefault);
+    }
+
+    /// The default edge is a measured choice, not a round number — pin it.
+    ///
+    /// 192 is the **largest** edge that still reaches SANA's minimum request peak. The peak floors
+    /// at 3294 MiB from 192 downward (below it the denoise phase binds and a smaller tile buys
+    /// nothing) while fidelity keeps degrading, so every smaller edge pays image quality for no
+    /// admission win. On device 192 is also 16% faster and 106 MiB cheaper than the 128 this
+    /// shipped with, because a coarser grid is fewer per-tile dispatches.
+    ///
+    /// Moving it DOWN re-introduces that bad trade. Moving it UP costs real memory — 256 adds
+    /// 347 MiB of footprint, which lands exactly on the 4096 MiB budget an 8 GB device is assumed to
+    /// have. Either direction needs the sweep re-run, not a judgement call, which is what this test
+    /// is here to force.
+    #[test]
+    fn the_default_edge_is_the_largest_one_that_reaches_the_memory_floor() {
+        assert_eq!(
+            DECODE_TILE_EDGE, 192,
+            "changing the default decode edge requires re-running the memory and fidelity sweeps \
+             (mlx-gen-ios-catalog's image_budget and tiling_fidelity) — see the constant's docs"
+        );
+        assert_eq!(DECODE_OVERLAP, 48, "a quarter-tile overlap");
     }
 
     /// `tile_vae_decode: false` is not a request to tile — a `memory` block that says nothing about

@@ -1007,7 +1007,14 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     // evidence against the tiled decode. The second config stays because a second resolution
     // exercises a different allocation shape, and it is labelled so nobody reads its PNG as a
     // regression.
+    // 192 rides alongside 128 because the host sweep says they cost the SAME memory and 192 renders
+    // closer to the whole-image decode. SANA's request peak floors at 3294 MiB from edge 192 down —
+    // below that the denoise phase binds and a smaller tile buys nothing — while fidelity keeps
+    // degrading (mean |Δ| vs whole-image: 5.158 at 192, 6.192 at 128, 9.212 at 96). If the device
+    // agrees that the two are equal-cost, shipping 128 is paying image quality for no admission win.
+    // That is the pair of measurements the default change rests on, so both stay in the harness.
     const SHIPPING: &[(&str, u32, Option<u32>, bool)] = &[
+        ("1024 tile192", 1024, Some(192), false),
         ("1024 tile128", 1024, Some(128), false),
         ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256), false),
     ];
