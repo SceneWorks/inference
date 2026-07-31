@@ -75,13 +75,15 @@ pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
-    adapter_stack_resident_bytes, AdapterResidencyMode, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryBudget, MemoryCacheSemantics, MemoryCacheState, MemoryCalibrationIdentity,
-    MemoryCleanupSemantics, MemoryComponentKind, MemoryConformanceState, MemoryEvidence,
-    MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey, MemoryEvidenceVerdict,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
-    MemoryPeakBreakdown, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    adapter_stack_resident_bytes, default_memory_strategy_safety_check,
+    default_registered_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
+    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind, MemoryConformanceState,
+    MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
+    MemoryEvidenceKey, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown,
+    MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope, MemoryProviderContract,
     MemoryRejection, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,

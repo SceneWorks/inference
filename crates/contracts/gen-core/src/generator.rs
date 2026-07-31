@@ -10,8 +10,9 @@ use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
-    Error, MemoryPeakBreakdown, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, Result,
+    default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -55,22 +56,7 @@ pub trait Generator {
     /// resident baseline.
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
         match self.memory_strategy_contract() {
-            Some(contract) => match contract.validate_selection(&context.selection) {
-                Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
-                    MemorySafetyDecision::Accept
-                }
-                Ok(()) => MemorySafetyDecision::Reject {
-                    reason: format!(
-                        "{}: predicted peak {} exceeds effective budget {}",
-                        self.descriptor().id,
-                        context.predicted_peak_bytes,
-                        context.budget.effective_bytes()
-                    ),
-                },
-                Err(error) => MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                },
-            },
+            Some(contract) => default_memory_strategy_safety_check(contract, context),
             None if context.selection.strategy == MemoryStrategy::Resident => {
                 MemorySafetyDecision::Accept
             }

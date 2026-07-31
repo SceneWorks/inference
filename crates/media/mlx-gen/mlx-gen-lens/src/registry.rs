@@ -733,12 +733,14 @@ pub const TURBO_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID_TURBO,
         contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_TURBO, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
     };
 
 pub const BASE_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID_BASE,
         contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_BASE, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
     };
 mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;

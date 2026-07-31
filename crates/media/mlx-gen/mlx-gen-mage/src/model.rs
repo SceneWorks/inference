@@ -790,6 +790,38 @@ fn request_context_error(
     None
 }
 
+fn memory_strategy_safety_check_for(
+    provider_id: &str,
+    variant: MageVariant,
+    tier: Option<Quant>,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    if let Some(reason) = request_context_error(provider_id, variant, tier, contract, context) {
+        return MemorySafetyDecision::Reject { reason };
+    }
+    let safe_gb = match crate::memory::production_safe_budget_gb() {
+        Ok(safe_gb) => safe_gb,
+        Err(error) => {
+            return MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            }
+        }
+    };
+    match crate::memory::ensure_generation_fits(
+        tier,
+        context.geometry.width,
+        context.geometry.height,
+        context.geometry.batch,
+        safe_gb,
+    ) {
+        Ok(()) => MemorySafetyDecision::Accept,
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
 impl Generator for MageFlow {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -800,35 +832,13 @@ impl Generator for MageFlow {
     }
 
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
-        if let Some(reason) = request_context_error(
+        memory_strategy_safety_check_for(
             self.descriptor.id,
             self.variant,
             self.tier,
             &self.memory_strategy_contract,
             context,
-        ) {
-            return MemorySafetyDecision::Reject { reason };
-        }
-        let safe_gb = match crate::memory::production_safe_budget_gb() {
-            Ok(safe_gb) => safe_gb,
-            Err(error) => {
-                return MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
-            }
-        };
-        match crate::memory::ensure_generation_fits(
-            self.tier,
-            context.geometry.width,
-            context.geometry.height,
-            context.geometry.batch,
-            safe_gb,
-        ) {
-            Ok(()) => MemorySafetyDecision::Accept,
-            Err(error) => MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
-        }
+        )
     }
 
     fn begin_memory_strategy_request(
@@ -1058,21 +1068,38 @@ mage_registrations! {
 }
 
 macro_rules! mage_memory_registration {
-    ($name:ident, $id:literal) => {
+    ($name:ident, $variant:ident, $id:literal) => {
         pub const $name: mlx_gen::gen_core::MemoryRegistration =
             mlx_gen::gen_core::MemoryRegistration {
                 provider_id: $id,
                 contract: |spec| Ok(memory_strategy_contract_for_spec($id, spec)),
+                safety_check: |spec, contract, context| {
+                    memory_strategy_safety_check_for(
+                        $id,
+                        MageVariant::$variant,
+                        spec.quantize,
+                        contract,
+                        context,
+                    )
+                },
             };
     };
 }
 
-mage_memory_registration!(MEMORY_REGISTRATION, "mage_flow");
-mage_memory_registration!(MEMORY_REGISTRATION_BASE, "mage_flow_base");
-mage_memory_registration!(MEMORY_REGISTRATION_TURBO, "mage_flow_turbo");
-mage_memory_registration!(MEMORY_REGISTRATION_EDIT, "mage_flow_edit");
-mage_memory_registration!(MEMORY_REGISTRATION_EDIT_BASE, "mage_flow_edit_base");
-mage_memory_registration!(MEMORY_REGISTRATION_EDIT_TURBO, "mage_flow_edit_turbo");
+mage_memory_registration!(MEMORY_REGISTRATION, Rl, "mage_flow");
+mage_memory_registration!(MEMORY_REGISTRATION_BASE, Base, "mage_flow_base");
+mage_memory_registration!(MEMORY_REGISTRATION_TURBO, Turbo, "mage_flow_turbo");
+mage_memory_registration!(MEMORY_REGISTRATION_EDIT, Edit, "mage_flow_edit");
+mage_memory_registration!(
+    MEMORY_REGISTRATION_EDIT_BASE,
+    EditBase,
+    "mage_flow_edit_base"
+);
+mage_memory_registration!(
+    MEMORY_REGISTRATION_EDIT_TURBO,
+    EditTurbo,
+    "mage_flow_edit_turbo"
+);
 
 #[cfg(test)]
 mod tests {
@@ -1202,6 +1229,14 @@ mod tests {
             cache_state: MemoryCacheState::Warm,
             evidence_revision: "test".to_owned(),
         };
+        let mismatched_spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
+        let registered = (MEMORY_REGISTRATION.safety_check)(&mismatched_spec, &contract, &valid);
+        assert!(matches!(
+            registered,
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded BF16/Some(Q8)")
+        ));
         assert!(request_context_error(
             "mage_flow",
             MageVariant::Rl,

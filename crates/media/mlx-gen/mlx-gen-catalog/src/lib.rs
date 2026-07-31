@@ -119,6 +119,14 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+    }
+
+    #[test]
     fn cfg_capability_matrix_matches_the_registered_mlx_render_paths() {
         let registry = super::provider_registry().unwrap();
         let descriptor = |id: &str| {

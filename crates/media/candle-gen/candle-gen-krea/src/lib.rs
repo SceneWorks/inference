@@ -1287,6 +1287,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                 },
             })
             .collect(),
+        pid_decode_routes: None,
         load_shape: LoadShape::DeferredMaterialization,
         // Every higher-rung Krea control is executed by `render_three_stage`: the provider reloads
         // text, DiT, and VAE in disjoint phases whenever decode tiling, attention chunking, or
@@ -1359,6 +1360,7 @@ fn registered_krea_turbo_memory_strategy_contract(
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: KREA_2_TURBO_ID,
     contract: registered_krea_turbo_memory_strategy_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
 };
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.

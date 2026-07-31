@@ -37,6 +37,10 @@ wrong-dimension embedding, or produces the wrong stem count — fails):
   `audio_transform_conformance` / `AudioTransformProfile` (output cardinality by kind);
 - **`AudioEmbedder`** (CLAP-style joint audio↔text) — `audio_embedder_conformance` /
   `AudioEmbedderProfile` (same-dim, L2-normalized, finite vectors).
+- **Memory-strategy catalogs** — `memory_strategy_registry_conformance` walks every
+  `MemoryRegistration` weights-free. For each PiD-capable contract it proves matching-route decode
+  geometries are admitted and both cross-route geometries are rejected by the registered provider's
+  real `safety_check`.
 
 ## Usage
 
@@ -78,6 +82,9 @@ gen_core_testkit::audio_embedder_conformance(
     || registry.load_audio_embedder("clap", &spec).unwrap(),
     &gen_core_testkit::AudioEmbedderProfile::cheap(),
 );
+
+// complete platform catalog, no model weights loaded:
+gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
 ```
 
 The `*_conformance` entry points run every check and panic with the aggregated failures; the

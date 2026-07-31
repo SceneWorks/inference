@@ -143,6 +143,14 @@ pub(crate) fn safety_check(
     MemorySafetyDecision::Accept
 }
 
+pub(crate) fn registered_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    safety_check(contract, spec.precision, spec.quantize, context)
+}
+
 pub(crate) fn begin_request(
     provider_id: &'static str,
     contract: &MemoryProviderContract,

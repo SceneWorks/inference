@@ -493,6 +493,16 @@ pub fn memory_strategy_contract(
                 },
             })
             .collect(),
+        pid_decode_routes: Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
+            native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+                tile_edges: routes.native_edges().to_vec(),
+                tile_overlap: DECODE_OVERLAP,
+            },
+            pid: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+                tile_edges: mlx_gen_pid::DecodeRoutes::pid_edges(),
+                tile_overlap: mlx_gen_pid::DecodeRoutes::pid_overlap(),
+            },
+        }),
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
@@ -923,13 +933,12 @@ pub(crate) fn safety_check(
     if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
         let routes = match decode_routes(contract.provider_id.as_str()) {
             Ok(routes) => routes,
-            // Unreachable for a shipping load (the ladder is a `const`, proven disjoint by
-            // `no_native_decode_candidate_is_a_legal_pid_tile_edge`); a rejection rather than a panic
-            // if a future widening ever makes it reachable.
+            // Unreachable for a registered provider, but keep the safety check
+            // total so malformed third-party contracts reject without panic.
             Err(error) => {
                 return MemorySafetyDecision::Reject {
                     reason: error.to_string(),
-                }
+                };
             }
         };
         if let Err(reason) = routes.validate(
@@ -940,6 +949,7 @@ pub(crate) fn safety_check(
             return MemorySafetyDecision::Reject { reason };
         }
     }
+
     if !context.budget.fits(context.predicted_peak_bytes) {
         return MemorySafetyDecision::Reject {
             reason: format!(
@@ -951,6 +961,14 @@ pub(crate) fn safety_check(
         };
     }
     MemorySafetyDecision::Accept
+}
+
+pub(crate) fn registered_safety_check(
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    safety_check(contract, context)
 }
 
 /// Open a request scope after `safety_check` accepted `context`.
@@ -1832,26 +1850,11 @@ mod tests {
             scope.finish(MemoryRunOutcome::Complete).unwrap();
         }
 
-        // A selection built for the native route is rejected when the request uses PiD...
-        let mut ctx = context_for(MemoryStrategy::BoundedDecode, true);
-        ctx.selection.parameters.decode_tile_edge = Some(DECODE_TILE_EDGE);
-        ctx.selection.parameters.decode_overlap = Some(DECODE_OVERLAP);
-        match safety_check(&contract, &ctx) {
-            MemorySafetyDecision::Reject { reason } => {
-                assert!(reason.contains("PiD overlay"), "{reason}")
-            }
-            other => panic!("a native geometry under PiD must be rejected, got {other:?}"),
-        }
-        // ...and symmetrically, a PiD geometry without the overlay.
-        let mut ctx = context(MemoryStrategy::BoundedDecode);
-        ctx.selection.parameters.decode_tile_edge = Some(pid_edges[0]);
-        ctx.selection.parameters.decode_overlap = Some(PID_DECODE_OVERLAP);
-        match safety_check(&contract, &ctx) {
-            MemorySafetyDecision::Reject { reason } => {
-                assert!(reason.contains("native VAE"), "{reason}")
-            }
-            other => panic!("a PiD geometry without PiD must be rejected, got {other:?}"),
-        }
+        // The catalog-level registry conformance walk owns the two cross-route safety-check probes
+        // for every registered provider. Keeping a second direct copy here would make the walk's
+        // mutation proof non-discriminating. This provider test owns the complementary execution
+        // seam above: a matching route is admitted, and the request scope still refuses the other
+        // route's geometry instead of re-planning it.
 
         // Rungs 0-1 stay available on both routes (they own no decode parameters).
         for strategy in [MemoryStrategy::Resident, MemoryStrategy::StagedResidency] {

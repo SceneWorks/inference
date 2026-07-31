@@ -7,7 +7,7 @@ use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTran
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-use crate::memory_strategy::MemoryProviderContract;
+use crate::memory_strategy::{MemoryProviderContract, MemoryRunContext, MemorySafetyDecision};
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
@@ -131,6 +131,13 @@ pub struct ModelRegistration {
 pub struct MemoryRegistration {
     pub provider_id: &'static str,
     pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
+    /// The provider's real admission check, callable before weights are loaded. The load spec lets
+    /// tier-sensitive providers reproduce the loaded generator's exact check without opening any
+    /// weight files. This must be the same function the loaded [`Generator`] delegates to; registry
+    /// conformance uses it to prove that a route-specific request is rejected at admission rather
+    /// than later during generation.
+    pub safety_check:
+        fn(&LoadSpec, &MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
 }
 
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
@@ -402,6 +409,13 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Every adopted memory-strategy registration in this explicit catalog.
+    pub fn memory_strategy_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &MemoryRegistration> {
+        self.memory_strategy.iter()
+    }
+
     /// Reject a [`LoadSpec`] whose requested quant tier this platform's backend does not implement,
     /// as declared by [`ProviderRegistryBuilder::reject_quant`].
     ///

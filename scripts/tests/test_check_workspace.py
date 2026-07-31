@@ -111,6 +111,17 @@ class RustCommentStrippingTests(unittest.TestCase):
         source = "a();\n// comment\nb();\n"
         self.assertEqual(len(self.strip(source).splitlines()), len(source.splitlines()))
 
+    def test_optional_literal_blanking_preserves_real_calls_and_line_positions(self) -> None:
+        source = (
+            'const A: &str = "DecodeRoutes::new(x, y, z)";\n'
+            'const B: &str = r#"routes.validate(true, e, o)"#;\n'
+            "DecodeRoutes::new(a, b, c)\n"
+        )
+        stripped = self.gate.strip_rust_comments(source, strip_literals=True)
+        self.assertNotIn("routes.validate", stripped)
+        self.assertEqual(stripped.count("DecodeRoutes::new"), 1)
+        self.assertEqual(len(stripped.splitlines()), len(source.splitlines()))
+
 
 class PidDecodeRouteAdoptionTests(unittest.TestCase):
     """sc-15775: a PiD-eligible provider that adopts bounded decode must construct its native ladder
@@ -247,6 +258,108 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                     f"{self.ADOPTER_WITHOUT_ROUTES}\n{import_line}\n",
                     because="never calls the checked constructor",
                 )
+
+    def test_markers_inside_string_literals_do_not_satisfy_the_gate(self) -> None:
+        body = self.ADOPTER_WITHOUT_ROUTES + """
+            const FAKE: &str = r#"
+                DecodeRoutes::new(id, EDGES, OVERLAP);
+                decode_routes(id)?.validate(use_pid, edge, overlap);
+            "#;
+        """
+        self.assert_gate_fails(body, because="never calls the checked constructor")
+
+    def test_markers_confined_to_cfg_test_items_do_not_satisfy_the_gate(self) -> None:
+        fixtures = {
+            "module": """
+                #[cfg(test)]
+                mod tests {
+                    fn only_in_tests() {
+                        let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                        routes.validate(true, Some(2048), Some(256)).unwrap();
+                    }
+                }
+            """,
+            "function": """
+                #[cfg(test)]
+                /// Test-only evidence; this semicolon must not terminate the cfg item span.
+                fn fake_adoption() {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                }
+            """,
+            "composite all": """
+                #[cfg(all(feature = "fixture", test))]
+                fn feature_test_adoption() {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                }
+            """,
+            "const generic in function header": """
+                struct Foo<const N: usize>;
+                #[cfg(test)]
+                fn const_generic_test_adoption() -> Foo<{ 1 }> {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                    loop {}
+                }
+            """,
+            "const initializer branches": """
+                #[cfg(test)]
+                const FAKE: () = if true {
+                } else {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                };
+            """,
+        }
+        for label, fixture in fixtures.items():
+            with self.subTest(label=label):
+                self.assert_gate_fails(
+                    self.ADOPTER_WITHOUT_ROUTES + fixture,
+                    because="never calls the checked constructor",
+                )
+
+    def test_inner_cfg_test_file_cannot_supply_evidence(self) -> None:
+        body = "#![cfg(test)]\n" + self.ADOPTER_WITHOUT_ROUTES + self.CONSTRUCTS + self.ADMITS
+        self.assert_gate_fails(body, because="never calls the checked constructor")
+
+    def test_cfg_field_parser_overblanking_cannot_disarm_production_triggers(self) -> None:
+        body = """
+            struct Fields {
+                #[cfg(test)]
+                fixture_only: u8,
+            }
+        """ + self.ADOPTER_WITHOUT_ROUTES
+        self.assert_gate_fails(body, because="never calls the checked constructor")
+
+    def test_cfg_any_test_item_is_retained_when_a_production_feature_can_enable_it(self) -> None:
+        body = self.ADOPTER_WITHOUT_ROUTES + """
+            #[cfg(any(test, feature = "shipping"))]
+            fn production_adoption() {
+                let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                routes.validate(true, Some(2048), Some(256)).unwrap();
+            }
+        """
+        self.write_provider(body)
+        self.run_gate()
+
+    def test_fake_cfg_attributes_in_comments_and_strings_cannot_disarm_the_gate(self) -> None:
+        fixtures = {
+            "line comment": "// #[cfg(test)] fn fake() {",
+            "block comment": "/* #[cfg(test)] fn fake() { */",
+            "string": 'const FAKE_CFG: &str = "#[cfg(test)] fn fake() {";',
+            "raw string": 'const RAW_FAKE_CFG: &str = r#"#[cfg(test)] fn fake() {"#;',
+        }
+        for label, fake_attribute in fixtures.items():
+            with self.subTest(label=label):
+                self.write_provider(
+                    fake_attribute
+                    + "\n"
+                    + self.ADOPTER_WITHOUT_ROUTES
+                    + self.CONSTRUCTS
+                    + self.ADMITS
+                )
+                self.run_gate()
 
     def test_ranges_built_through_a_shared_helper_still_trigger_the_gate(self) -> None:
         """Review defeat (c): with only `decode_tile_edges` in the trigger set, an adopter whose
