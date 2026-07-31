@@ -138,13 +138,14 @@
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
-    Result as CoreResult, TransformerComponent,
+    safetensors_path_bytes, Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec,
+    MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes, Result as CoreResult,
+    TransformerComponent,
 };
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
@@ -332,6 +333,9 @@ pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
 /// the v3 calibration fingerprint prevents them from being read as resident+deferred evidence.
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
 
+/// Stable identity for the Fun-Controlnet-Union network held beside the base Z-Image model.
+pub const CONTROL_BRANCH_COMPONENT_ID: &str = "fun_controlnet_union";
+
 /// The one bounded-attention parameter this provider accepts: the shared
 /// [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`] (64 Mi score elements per attention call),
 /// the exact knob the Candle/CUDA Z-Image rung 3 measured in SC-15256 — reused verbatim so a
@@ -480,6 +484,10 @@ pub fn memory_strategy_contract(
                 MemoryFormulaVariable::PixelCount,
                 MemoryFormulaVariable::BatchCount,
                 MemoryFormulaVariable::ConditioningTokenCount,
+                // SC-16065: a control-variant load holds the Fun-Controlnet-Union network beside the
+                // base model. This term is zero for the base provider and load-bearing when `spec`
+                // carries the auxiliary checkpoint.
+                MemoryFormulaVariable::OverlayBytes,
                 MemoryFormulaVariable::DecodeTileArea,
                 MemoryFormulaVariable::AttentionChunkSize,
                 // SC-15754: transformer weight residency is now a *variable* of the peak, not a
@@ -491,19 +499,32 @@ pub fn memory_strategy_contract(
         calibration: Some(MemoryCalibrationIdentity::new(
             memory_calibration_fingerprint(spec.load_shape),
         )),
-        asset_facts: asset_facts(spec),
+        asset_facts: asset_facts(spec, streamable),
         runtime: MemoryRuntimeSemantics::default(),
     })
 }
 
-/// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] source has
-/// no component tree, so every field stays `0` (the truthful "unknown", not a guess).
-fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
-    let Ok(components) =
+/// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] base source
+/// has no component tree, so its base-model fields stay `0` (the truthful "unknown", not a guess);
+/// a separately addressed control checkpoint remains independently countable.
+fn asset_facts(spec: &LoadSpec, streamable: bool) -> MemoryAssetFacts {
+    let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-    else {
-        return MemoryAssetFacts::default();
-    };
+            .unwrap_or_default();
+    let control_bytes = spec.control.as_ref().map_or(0, |source| match source {
+        mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => {
+            safetensors_path_bytes(path)
+        }
+    });
+    let resident_components = (control_bytes > 0)
+        .then(|| MemoryResidentComponent {
+            id: CONTROL_BRANCH_COMPONENT_ID.to_owned(),
+            kind: MemoryComponentKind::ControlBranch,
+            resident_bytes: control_bytes,
+            bounded_by: streamable.then_some(MemoryStrategy::BoundedTransformerResidency),
+        })
+        .into_iter()
+        .collect();
     MemoryAssetFacts {
         base_bytes: components
             .text_encoder
@@ -512,11 +533,11 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
         conditioning_bytes: components.text_encoder,
         transformer_bytes: components.dit,
         decoder_bytes: components.vae,
-        // A PiD overlay is a separate student checkpoint outside the snapshot component tree, and it
-        // is only resident when a request sets `use_pid`. Reporting the base snapshot's bytes here
-        // would be wrong, and guessing the overlay's would be worse, so it stays 0 until per-model
-        // calibration measures it.
-        overlay_bytes: 0,
+        // The load-time control checkpoint is resident for every request made by a control-provider
+        // instance. A request-selected PiD decoder remains excluded: availability on `LoadSpec` does
+        // not mean the request selected it, so pricing it here would overstate the ordinary path.
+        overlay_bytes: control_bytes,
+        resident_components,
     }
 }
 
@@ -1007,6 +1028,68 @@ mod tests {
             contract.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
         );
+    }
+
+    /// SC-16065: the control branch is a second resident network, not the base DiT. This one test is
+    /// deliberately mutation-sensitive across all three required declaration legs: its byte count,
+    /// its typed component identity, and the formula term that makes those bytes affect admission.
+    #[test]
+    fn control_branch_is_a_decomposed_load_bearing_peak_component() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mlx-gen-z-image-sc-16065-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let control = root.join("control.safetensors");
+        const CONTROL_BYTES: u64 = 37;
+        std::fs::write(&control, vec![0_u8; CONTROL_BYTES as usize]).unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_control(WeightsSource::File(control));
+        let contract = memory_strategy_contract(crate::model_control::MODEL_ID, &spec).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_BYTES);
+        let component = contract
+            .asset_facts
+            .resident_components
+            .iter()
+            .find(|component| component.id == CONTROL_BRANCH_COMPONENT_ID)
+            .expect("Z-Image must declare the resident ControlNet as its own component");
+        assert_eq!(component.kind, MemoryComponentKind::ControlBranch);
+        assert_ne!(
+            component.kind,
+            MemoryComponentKind::Transformer(TransformerComponent::Dit),
+            "the ControlNet must not be reported as the base denoising transformer"
+        );
+        assert_eq!(component.resident_bytes, CONTROL_BYTES);
+        assert_eq!(
+            component.bounded_by,
+            Some(MemoryStrategy::BoundedTransformerResidency),
+            "the 15-block control stack is streamed by rung 4"
+        );
+        assert!(
+            contract.formula.uses(MemoryFormulaVariable::OverlayBytes),
+            "declared auxiliary bytes are inert unless the provider formula includes them"
+        );
+
+        const BASE_PEAK: u64 = 1_000;
+        let prediction = contract.predicted_peak_from_base(BASE_PEAK);
+        assert_eq!(
+            prediction.predicted_peak_bytes(),
+            BASE_PEAK + CONTROL_BYTES,
+            "zeroing the auxiliary bytes, removing its component, or dropping OverlayBytes from the \
+             formula must change this result"
+        );
+        assert_eq!(prediction.unattributed_bytes, BASE_PEAK);
+        assert_eq!(prediction.components, vec![component.clone()]);
     }
 
     /// SC-15775: the route domains are disjoint **by construction**, not by the current numbers
