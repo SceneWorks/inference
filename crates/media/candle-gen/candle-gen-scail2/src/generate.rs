@@ -79,8 +79,10 @@ pub struct Scail2Job<'a> {
 /// Round a requested dim down to a multiple of [`DIM_ALIGN`] (min one tile).
 ///
 /// The single source of truth for "what this pipeline actually renders at": [`crate::pipeline`]'s
-/// `reject_over_area` measures its area cap through this same function, so the admission gate can
-/// never judge a geometry the denoise loop would not produce (sc-16197).
+/// `reject_over_area` measures its area cap through this same function, so the admission gate cannot
+/// drift from the lattice the denoise loop snaps to (sc-16197). The gate applies it to the *requested*
+/// dims; that equals the rendered geometry for every request the descriptor's `SizeFloor` admits — see
+/// the note there for the `0×0` sentinel that sc-16199 revisits.
 pub(crate) fn align(value: u32) -> usize {
     (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
 }
