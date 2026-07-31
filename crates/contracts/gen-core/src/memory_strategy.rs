@@ -731,6 +731,18 @@ impl MemoryProviderContract {
             && matches!(self.support(rung), Some(MemoryStrategySupport::Implemented))
     }
 
+    /// Canonical, ordered set of strategy mechanisms active for one selection.
+    ///
+    /// Evidence records this exact set at measurement time. Walking [`MemoryStrategy::ALL`] keeps
+    /// the identity deterministic while routing every engagement decision through the provider
+    /// contract, including realization-specific prerequisite edges.
+    pub fn engaged_composition(&self, strategy: MemoryStrategy) -> Vec<MemoryStrategy> {
+        MemoryStrategy::ALL
+            .into_iter()
+            .filter(|rung| self.engages(strategy, *rung))
+            .collect()
+    }
+
     /// What one rung-4 window materialization does for this provider (SC-16090), or `None` if the
     /// realization has not stated it.
     ///
@@ -1337,6 +1349,7 @@ pub enum MemoryEvidenceVerdict {
     Unverified,
     Stale,
     FingerprintMismatch,
+    CompositionMismatch,
     OutOfEnvelope,
     Invalid,
 }
@@ -1392,6 +1405,8 @@ pub struct MemoryEvidenceKey {
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
     pub strategy: MemoryStrategy,
+    /// Exact, canonically ordered strategy set active when this evidence was measured.
+    pub engaged_composition: Vec<MemoryStrategy>,
     pub parameters: MemoryStrategyParameters,
 }
 
@@ -1438,6 +1453,18 @@ pub struct MemoryEvidence {
 impl MemoryEvidence {
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
+        if self.key.engaged_composition.is_empty()
+            || !self
+                .key
+                .engaged_composition
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            errors.push(
+                "evidence engaged composition must be a non-empty canonical strategy set"
+                    .to_owned(),
+            );
+        }
         if self.observed_peak_bytes.is_none() {
             errors.push("verified evidence requires an observed peak".to_owned());
         }
@@ -1474,6 +1501,18 @@ impl MemoryEvidence {
         &self,
         contract: &MemoryProviderContract,
     ) -> std::result::Result<(), MemoryEvidenceVerdict> {
+        if self.key.engaged_composition.is_empty()
+            || !self
+                .key
+                .engaged_composition
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(MemoryEvidenceVerdict::Invalid);
+        }
+        if self.key.engaged_composition != contract.engaged_composition(self.key.strategy) {
+            return Err(MemoryEvidenceVerdict::CompositionMismatch);
+        }
         if !self.key.strategy.is_optimized() {
             return Ok(());
         }
@@ -1619,6 +1658,7 @@ mod tests {
                     frames: 1,
                 },
                 strategy: MemoryStrategy::BoundedDecode,
+                engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
                 parameters: MemoryStrategyParameters {
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
@@ -1639,6 +1679,19 @@ mod tests {
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
 
+        let mut changed_composition = contract.clone();
+        changed_composition.additional_prerequisites.push((
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        ));
+        assert_eq!(
+            evidence.optimized_eligibility(&changed_composition),
+            Err(MemoryEvidenceVerdict::CompositionMismatch)
+        );
+
         evidence.dimensions.current_environment_verification = MemoryEvidenceVerdict::Stale;
         assert_eq!(
             evidence.optimized_eligibility(&contract),
@@ -1649,6 +1702,31 @@ mod tests {
         assert_eq!(
             evidence.optimized_eligibility(&contract),
             Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn engaged_composition_tracks_a_non_default_prerequisite_edge() {
+        let mut contract = adopted_contract();
+        assert_eq!(
+            contract.engaged_composition(MemoryStrategy::BoundedDecode),
+            vec![MemoryStrategy::Resident, MemoryStrategy::BoundedDecode,]
+        );
+
+        contract.additional_prerequisites.push((
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        ));
+        assert_eq!(
+            contract.engaged_composition(MemoryStrategy::BoundedDecode),
+            vec![
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+            ]
         );
     }
 
@@ -1940,6 +2018,7 @@ mod tests {
                     frames: 1,
                 },
                 strategy: MemoryStrategy::BoundedDecode,
+                engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
                 parameters: MemoryStrategyParameters {
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
