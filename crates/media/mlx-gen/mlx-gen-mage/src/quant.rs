@@ -161,6 +161,15 @@ pub(crate) fn floor_bits(base: &str, requested: i32) -> i32 {
     })
 }
 
+/// Load `{base}` as an [`AdaptableLinear`], packed when `{base}.scales` is present, else dense.
+///
+/// `bias` additionally loads the dense `{base}.bias`. Note the two distinct tensors: `{base}.bias`
+/// is the Linear's own additive bias (always dense, never quantized) while `{base}.biases` is the
+/// quantization zero-point that rides with a packed weight.
+pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
+    mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
+}
+
 #[cfg(test)]
 mod descriptor_floor_tests {
     use super::*;
@@ -178,13 +187,4 @@ mod descriptor_floor_tests {
         assert_eq!(floor_bits(FINAL_MOD_BASE, 4), 8);
         assert_eq!(floor_bits(LM_LAYER_PREFIX, 4), 8);
     }
-}
-
-/// Load `{base}` as an [`AdaptableLinear`], packed when `{base}.scales` is present, else dense.
-///
-/// `bias` additionally loads the dense `{base}.bias`. Note the two distinct tensors: `{base}.bias`
-/// is the Linear's own additive bias (always dense, never quantized) while `{base}.biases` is the
-/// quantization zero-point that rides with a packed weight.
-pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
-    mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
 }
