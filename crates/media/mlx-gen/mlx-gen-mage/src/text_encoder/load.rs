@@ -22,7 +22,7 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Result, WeightsSource};
 use mlx_gen_boogu::{VisionConfig, VisionTower};
 
 use crate::config::{
@@ -133,6 +133,29 @@ pub fn load_lm_dir(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
     Ok(model)
 }
 
+/// Deferred counterpart to [`load_lm_dir`]: retain only the embedding/final norm and reopen the
+/// component directory for each decoder-layer window.
+pub fn load_lm_dir_streamable(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
+    let dir = dir.as_ref();
+    let config_path = dir.join("config.json");
+    let published = std::fs::read_to_string(&config_path).map_err(|e| {
+        Error::Msg(format!(
+            "mage_flow text encoder: read {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let cfg = verify_text_config(&published)?;
+    let weights = Weights::from_dir(dir)?;
+    Qwen3VlTextEncoder::from_streamable_source(
+        &weights,
+        WeightsSource::Dir(dir.to_path_buf()),
+        LM_PREFIX,
+        &cfg,
+        TE_RMS_NORM_EPS,
+        TE_ROPE_THETA,
+    )
+}
+
 /// Load tokenizer + LM together.
 pub fn load(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
     load_dir(root.as_ref().join(COMPONENT_DIR))
@@ -144,6 +167,15 @@ pub fn load_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
     Ok(MageTextEncoder::new(
         load_tokenizer_dir(dir)?,
         load_lm_dir(dir)?,
+    ))
+}
+
+/// Load tokenizer plus a deferred, re-openable LM stack.
+pub fn load_dir_streamable(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    let dir = dir.as_ref();
+    Ok(MageTextEncoder::new(
+        load_tokenizer_dir(dir)?,
+        load_lm_dir_streamable(dir)?,
     ))
 }
 

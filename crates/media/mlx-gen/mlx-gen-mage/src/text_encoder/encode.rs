@@ -8,7 +8,7 @@ use mlx_rs::Array;
 
 use image::{imageops::FilterType, RgbImage};
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 use mlx_gen_boogu::vision::preprocess::preprocess_image;
 use mlx_gen_boogu::VisionTower;
 
@@ -86,6 +86,10 @@ impl MageTextEncoder {
         self.lm.quantized_linear_count()
     }
 
+    pub fn is_streamable(&self) -> bool {
+        self.lm.is_streamable()
+    }
+
     /// Pair an already-loaded tokenizer and LM. [`load`](super::load()) builds both from a snapshot.
     pub fn new(tokenizer: TextTokenizer, lm: Qwen3VlTextEncoder) -> Self {
         Self {
@@ -144,6 +148,18 @@ impl MageTextEncoder {
     /// the reference does (`pipeline.py:318-323`); per-segment isolation is what makes that
     /// equivalent to separate calls (see [`Qwen3VlTextEncoder::forward_packed`]).
     pub fn encode(&self, bodies: &[&str], kind: PromptKind) -> Result<Conditioning> {
+        self.encode_with_window(bodies, kind, None, &CancelFlag::default())
+    }
+
+    /// Encode with an optional rung-4 decoder-layer window. `None` is the ordinary API; a deferred
+    /// encoder still runs correctly through one all-covering window.
+    pub fn encode_with_window(
+        &self,
+        bodies: &[&str],
+        kind: PromptKind,
+        window: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> Result<Conditioning> {
         if bodies.is_empty() {
             return Err(Error::Msg(
                 "mage_flow text encoder: no prompts to encode".into(),
@@ -156,7 +172,12 @@ impl MageTextEncoder {
             lens.push(seg.len());
             ids.extend_from_slice(&seg);
         }
-        self.encode_packed_ids(&ids, &cu_seqlens_from_lens(&lens), kind.drop_idx())
+        let cu = cu_seqlens_from_lens(&lens);
+        let hidden = match window {
+            Some(window) => self.lm.forward_packed_windowed(&ids, &cu, window, cancel)?,
+            None => self.lm.forward_packed(&ids, &cu)?,
+        };
+        drop_system_prompt(&hidden, &lens, kind.drop_idx())
     }
 
     /// Encode pre-built packed token ids. Separated from [`encode`](Self::encode) because the edit

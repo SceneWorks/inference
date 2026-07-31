@@ -72,7 +72,7 @@ use mlx_rs::Array;
 
 use mlx_gen::nn::{build_mask, TokenEmbedding};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result, WeightsSource};
 
 use crate::config::QwenVlTextConfig;
 
@@ -91,6 +91,9 @@ pub struct Qwen3VlTextEncoder {
     head_dim: i32,
     rope_theta: f64,
     mrope_section: [i32; 3],
+    /// Present only for a deferred Sequential load. Such an encoder owns no resident decoder
+    /// layers; forwards dispatch through this re-openable source instead.
+    stream: Option<super::stream::TextEncoderBlockStream>,
 }
 
 impl Qwen3VlTextEncoder {
@@ -107,8 +110,14 @@ impl Qwen3VlTextEncoder {
         for layer in &mut self.layers {
             layer.quantize(layer_bits)?;
         }
+        if let Some(stream) = self.stream.as_mut() {
+            stream.set_quant_bits(bits);
+        }
         let got = self.quantized_linear_count();
-        let expected = 1 + self.layers.len() * 7;
+        let expected = 1 + self.stream.as_ref().map_or(
+            self.layers.len(),
+            super::stream::TextEncoderBlockStream::n_blocks,
+        ) * 7;
         if got != expected {
             return Err(mlx_gen::Error::Msg(format!(
                 "mage_flow: text encoder quantization packed {got}/{expected} required projections"
@@ -124,6 +133,9 @@ impl Qwen3VlTextEncoder {
                 .iter()
                 .map(Qwen3VlDecoderLayer::quantized_linear_count)
                 .sum::<usize>()
+            + self.stream.as_ref().map_or(0, |stream| {
+                usize::from(stream.has_quant_bits()) * stream.n_blocks() * 7
+            })
     }
 
     /// Load the LM under `prefix` — `"model.language_model"` for the published
@@ -159,6 +171,7 @@ impl Qwen3VlTextEncoder {
             head_dim: cfg.head_dim,
             rope_theta,
             mrope_section: cfg.mrope_section,
+            stream: None,
         })
     }
 
@@ -199,7 +212,71 @@ impl Qwen3VlTextEncoder {
             head_dim: cfg.head_dim,
             rope_theta,
             mrope_section: cfg.mrope_section,
+            stream: None,
         })
+    }
+
+    /// Build a deferred encoder from a re-openable source. Only the embedding and final norm stay
+    /// resident; the decoder stack is reconstructed through the shared block-window driver.
+    pub fn from_streamable_source(
+        w: &Weights,
+        source: WeightsSource,
+        prefix: &str,
+        cfg: &QwenVlTextConfig,
+        eps: f32,
+        rope_theta: f64,
+    ) -> Result<Self> {
+        Self::from_streamable_source_with_materialization(
+            w, source, prefix, cfg, eps, rope_theta, true,
+        )
+    }
+
+    /// Mutation control for the hardware residency gate. It deliberately leaves each carried
+    /// hidden state lazy across the window boundary, retaining prior windows' weights in its graph.
+    /// Production callers must use
+    /// [`Self::from_streamable_source`].
+    #[doc(hidden)]
+    pub fn from_streamable_source_without_carry_materialization(
+        w: &Weights,
+        source: WeightsSource,
+        prefix: &str,
+        cfg: &QwenVlTextConfig,
+        eps: f32,
+        rope_theta: f64,
+    ) -> Result<Self> {
+        Self::from_streamable_source_with_materialization(
+            w, source, prefix, cfg, eps, rope_theta, false,
+        )
+    }
+
+    fn from_streamable_source_with_materialization(
+        w: &Weights,
+        source: WeightsSource,
+        prefix: &str,
+        cfg: &QwenVlTextConfig,
+        eps: f32,
+        rope_theta: f64,
+        materialize_carry: bool,
+    ) -> Result<Self> {
+        let stream = super::stream::TextEncoderBlockStream::new(source, prefix, *cfg, eps);
+        Ok(Self {
+            embed_tokens: embedding(w, &join(prefix, "embed_tokens"))?,
+            layers: Vec::new(),
+            norm: w.require(&join(prefix, "norm.weight"))?.clone(),
+            eps,
+            head_dim: cfg.head_dim,
+            rope_theta,
+            mrope_section: cfg.mrope_section,
+            stream: Some(if materialize_carry {
+                stream
+            } else {
+                stream.without_carry_materialization()
+            }),
+        })
+    }
+
+    pub fn is_streamable(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// The 36 decoder blocks, in order. Public for the deepstack-injecting edit path (sc-14048).
@@ -223,6 +300,19 @@ impl Qwen3VlTextEncoder {
     /// Attention is causal over the whole `s`, so this is **one** packed segment — callers with
     /// several prompts go through [`Qwen3VlTextEncoder::forward_packed`](Self::forward_packed).
     pub fn forward_embeds(&self, hidden: &Array, pos: &MRopePositions) -> Result<Array> {
+        // A streamable encoder intentionally owns no resident layers. One all-covering window keeps
+        // the ordinary API correct; without this guard it would return the normalized token
+        // embedding and silently discard the prompt-transformer stack.
+        if self.layers.is_empty() {
+            if let Some(stream) = self.stream.as_ref() {
+                return self.forward_embeds_windowed(
+                    hidden,
+                    pos,
+                    stream.n_blocks(),
+                    &CancelFlag::default(),
+                );
+            }
+        }
         let sh = hidden.shape();
         let (b, s) = (sh[0], sh[1]);
         if b != 1 {
@@ -253,6 +343,55 @@ impl Qwen3VlTextEncoder {
             h = layer.forward(&h, &cos, &sin, &mask)?;
         }
         self.final_norm(&h)
+    }
+
+    /// Run the language stack through the shared rung-4 window driver.
+    pub fn forward_embeds_windowed(
+        &self,
+        hidden: &Array,
+        pos: &MRopePositions,
+        window: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "mage_flow: text-encoder window requested without a re-openable weights source"
+                    .into(),
+            )
+        })?;
+        let sh = hidden.shape();
+        let (b, s) = (sh[0], sh[1]);
+        if b != 1 {
+            return Err(Error::Msg(format!(
+                "mage_flow text encoder: expected a single packed row, got batch {b}"
+            )));
+        }
+        if pos.len() != s as usize {
+            return Err(Error::Msg(format!(
+                "mage_flow text encoder: {} M-RoPE positions for {s} token(s)",
+                pos.len()
+            )));
+        }
+        let (cos, sin) = mrope_cos_sin(
+            pos,
+            self.head_dim,
+            self.rope_theta,
+            self.mrope_section,
+            hidden.dtype(),
+        )?;
+        let ones = Array::from_slice(&vec![1i32; s as usize], &[1, s]);
+        let mask = build_mask(&ones, 1, s)?;
+        let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), window)?;
+        let out = super::stream::run_windowed_layers(
+            stream,
+            &plan,
+            cancel,
+            hidden.clone(),
+            &cos,
+            &sin,
+            &mask,
+        )?;
+        self.final_norm(&out)
     }
 
     /// Run the Qwen3-VL language stack with merged vision features spliced at each image-token run.
@@ -367,6 +506,28 @@ impl Qwen3VlTextEncoder {
         Ok(out.reshape(&[ids.len() as i32, -1])?)
     }
 
+    pub fn forward_segment_windowed(
+        &self,
+        ids: &[i32],
+        window: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        if ids.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow text encoder: cannot encode an empty token sequence".into(),
+            ));
+        }
+        let ids_arr = Array::from_slice(ids, &[1, ids.len() as i32]);
+        let hidden = self.embed(&ids_arr)?;
+        let out = self.forward_embeds_windowed(
+            &hidden,
+            &MRopePositions::text(ids.len()),
+            window,
+            cancel,
+        )?;
+        Ok(out.reshape(&[ids.len() as i32, -1])?)
+    }
+
     /// Encode a **packed** batch: `ids` is the flat concatenation of every segment and
     /// `cu_seqlens` `[B+1]` its cumulative boundaries (`cu_seqlens[0] == 0`,
     /// `cu_seqlens[B] == ids.len()`). Returns the full `[Total_L, hidden]` post-final-norm state,
@@ -379,6 +540,27 @@ impl Qwen3VlTextEncoder {
         let mut start = 0usize;
         for len in lens {
             parts.push(self.forward_segment(&ids[start..start + len])?);
+            start += len;
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("checked non-empty"));
+        }
+        let refs: Vec<&Array> = parts.iter().collect();
+        Ok(concatenate_axis(&refs, 0)?)
+    }
+
+    pub fn forward_packed_windowed(
+        &self,
+        ids: &[i32],
+        cu_seqlens: &[i32],
+        window: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let lens = seq_lens_from_cu(cu_seqlens, ids.len())?;
+        let mut parts = Vec::with_capacity(lens.len());
+        let mut start = 0usize;
+        for len in lens {
+            parts.push(self.forward_segment_windowed(&ids[start..start + len], window, cancel)?);
             start += len;
         }
         if parts.len() == 1 {

@@ -34,7 +34,7 @@
 //! `crates/media/mlx-gen/tools/`.
 
 use image::{imageops::FilterType, RgbImage};
-use mlx_gen::{Error, Progress, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 use mlx_rs::{Array, Dtype};
 
@@ -182,6 +182,18 @@ fn load_time_quant_bits(dir: &Path, requested: Option<i32>, model_id: &str) -> R
     }
 }
 
+/// Whether a text-encoder window can materialize bytes directly in device format.
+///
+/// Dense bf16 tensors already satisfy that obligation. Q4/Q8 satisfy it only when the component is
+/// an offline-packed artifact; runtime quantization inside every window would be a repeated format
+/// conversion and is therefore not a conforming rung-4 realization.
+pub(crate) fn text_encoder_window_is_transfer_only(
+    dir: &Path,
+    requested: Option<i32>,
+) -> Result<bool> {
+    Ok(load_time_quant_bits(dir, requested, "mage_flow")?.is_none())
+}
+
 impl MageFlowPipeline {
     /// Load a published diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`).
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
@@ -220,6 +232,17 @@ impl MageFlowPipeline {
         quant_bits: Option<i32>,
         part: crate::vae::VaePart,
     ) -> Result<Self> {
+        Self::load_components_with_text_stream(dirs, quant_bits, part, false)
+    }
+
+    /// Production loader with an optional deferred text stack. The caller owns the policy/load-shape
+    /// gate; edit loads stay resident because their vision/deepstack path drives LM layers directly.
+    pub(crate) fn load_components_with_text_stream(
+        dirs: &MageComponentDirs,
+        quant_bits: Option<i32>,
+        part: crate::vae::VaePart,
+        stream_text_encoder: bool,
+    ) -> Result<Self> {
         const MODEL_ID: &str = "mage_flow";
         // Resolve every tier decision BEFORE loading, so a mismatched tier fails fast instead of
         // after an 8 GB read.
@@ -231,13 +254,29 @@ impl MageFlowPipeline {
         let mut pipeline = Self {
             text_encoder: if multimodal {
                 crate::text_encoder::load_multimodal_dir(&dirs.text_encoder)?
+            } else if stream_text_encoder {
+                crate::text_encoder::load_dir_streamable(&dirs.text_encoder)?
             } else {
                 crate::text_encoder::load_dir(&dirs.text_encoder)?
             },
             transformer: MageTransformer::load(&dirs.transformer)?,
             vae: crate::vae::load(&dirs.vae, part, Dtype::Bfloat16)?,
         };
-        if let Some(bits) = te_bits {
+        if stream_text_encoder && !multimodal {
+            if te_bits.is_some() {
+                return Err(Error::Msg(
+                    "mage_flow: text-encoder windows require dense bf16 or an offline-packed Q4/Q8 \
+                     component; per-window runtime quantization is not a transfer-only rung-4 \
+                     realization"
+                        .into(),
+                ));
+            }
+            // Packed projections arrive in device format. Recording the requested tier is a no-op
+            // for their values and replays the same quant floor when each layer is reopened.
+            if let Some(bits) = quant_bits {
+                pipeline.text_encoder.quantize(bits)?;
+            }
+        } else if let Some(bits) = te_bits {
             pipeline.text_encoder.quantize(bits)?;
         }
         if let Some(bits) = dit_bits {
@@ -527,6 +566,32 @@ impl MageFlowPipeline {
         renormalize: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<BatchGenerationTrace> {
+        self.generate_batch_trace_with_encoder_window(
+            samples,
+            steps,
+            cfg,
+            gs_key,
+            renormalize,
+            None,
+            &CancelFlag::default(),
+            on_progress,
+        )
+    }
+
+    /// Request-scoped generation with the rung-4 text-encoder window selected by the provider
+    /// contract. Kept separate so direct crate APIs retain their historical resident signature.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_batch_trace_with_encoder_window(
+        &self,
+        samples: &[GenerationSample<'_>],
+        steps: usize,
+        cfg: f32,
+        gs_key: &GsKey,
+        renormalize: bool,
+        encoder_window: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<BatchGenerationTrace> {
         let packs = plan_generation_packs(samples)?;
         let sigmas = mage_flow_sigmas(steps)?;
         let total_steps = steps
@@ -543,7 +608,12 @@ impl MageFlowPipeline {
             if uses_cfg(cfg) {
                 texts.extend(pack_samples.iter().map(|sample| sample.negative_prompt));
             }
-            let conditioning = self.text_encoder.encode(&texts, PromptKind::Gen)?;
+            let conditioning = self.text_encoder.encode_with_window(
+                &texts,
+                PromptKind::Gen,
+                encoder_window,
+                cancel,
+            )?;
             let sample_count = pack_samples.len();
             let positive_lens = conditioning.seq_lens[..sample_count]
                 .iter()

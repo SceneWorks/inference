@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
+use mlx_gen::{CancelFlag, WeightsSource};
 use mlx_gen_mage::config::QwenVlTextConfig;
 use mlx_gen_mage::text_encoder::{MRopePositions, Qwen3VlTextEncoder};
 
@@ -241,6 +242,66 @@ fn packed_segments_are_isolated_from_each_other() {
         max_abs(&b_first_seg, &want_b),
         0.0,
         "segment order changed a segment's own encode"
+    );
+}
+
+/// SC-15800: the streamed stack changes only when layer weights are resident, never the
+/// arithmetic. Exercise several windows against the committed torch-derived micro checkpoint so
+/// this is a default-lane gate rather than a hardware-only assertion.
+#[test]
+fn streamed_windows_are_bit_identical_and_unscoped_forward_runs_every_layer() {
+    let cfg = micro_cfg();
+    let weights = micro_weights();
+    let resident = Qwen3VlTextEncoder::from_weights(&weights, PREFIX, &cfg, EPS, THETA).unwrap();
+    let streamed = Qwen3VlTextEncoder::from_streamable_source(
+        &weights,
+        WeightsSource::File(MICRO.into()),
+        PREFIX,
+        &cfg,
+        EPS,
+        THETA,
+    )
+    .unwrap();
+    assert!(streamed.is_streamable());
+
+    let ids: Vec<i32> = weights
+        .require("io.input_ids")
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Int32)
+        .unwrap()
+        .as_slice::<i32>()
+        .to_vec();
+    let expected = resident.forward_segment(&ids).unwrap();
+    mlx_rs::transforms::eval([&expected]).unwrap();
+
+    for window in [1usize, 2, cfg.num_layers] {
+        let got = streamed
+            .forward_segment_windowed(&ids, window, &CancelFlag::default())
+            .unwrap();
+        mlx_rs::transforms::eval([&got]).unwrap();
+        assert_eq!(
+            max_abs(&expected, &got),
+            0.0,
+            "window={window} changed conditioning arithmetic"
+        );
+    }
+
+    // Highest-severity guard: a streamable encoder owns no resident layers. Its ordinary forward
+    // must dispatch through one all-covering window instead of returning the bare embedding.
+    let unscoped = streamed.forward_segment(&ids).unwrap();
+    mlx_rs::transforms::eval([&unscoped]).unwrap();
+    assert_eq!(max_abs(&expected, &unscoped), 0.0);
+
+    let ids_array = Array::from_slice(&ids, &[1, ids.len() as i32]);
+    let bare = streamed
+        .final_norm(&streamed.embed(&ids_array).unwrap())
+        .unwrap()
+        .reshape(&[ids.len() as i32, cfg.hidden_size])
+        .unwrap();
+    mlx_rs::transforms::eval([&bare]).unwrap();
+    assert!(
+        max_abs(&expected, &bare) > 1e-3,
+        "mutation control cannot distinguish the full stack from an embedding-only forward"
     );
 }
 

@@ -31,6 +31,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     env:
       MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
+      MAGE_COMPONENTS_ROOT: ${{ vars.MAGE_COMPONENTS_ROOT }}
       MAGE_REQUEST_SCOPE_QUANT: bf16
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -50,6 +51,12 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage
           --test request_memory_scope_real_weights -- --ignored --nocapture
+      - name: Measure Mage text-encoder windows at every tier
+        run: |
+          for tier in bf16 q8 q4; do
+            MAGE_REQUEST_SCOPE_QUANT="$tier" cargo test --locked --release -p mlx-gen-mage \
+              --test text_encoder_window_real_weights -- --ignored --nocapture --test-threads=1
+          done
 
   mlx-llm:
     name: MLX LLM real weights
@@ -79,6 +86,7 @@ jobs:
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
+      MAGE_COMPONENTS_ROOT: ${{ vars.MAGE_COMPONENTS_ROOT }}
       MAGE_EDIT_SNAPSHOT: ${{ vars.MAGE_EDIT_SNAPSHOT }}
       MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.MAGE_EDIT_BASE_SNAPSHOT }}
       MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.MAGE_EDIT_TURBO_SNAPSHOT }}
@@ -270,6 +278,14 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage
           --test request_memory_scope_real_weights -- --ignored --nocapture
+      - name: Measure Mage text-encoder windows at every tier
+        env:
+          MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ env.MAGE_SNAPSHOT }}
+        run: |
+          for tier in bf16 q8 q4; do
+            MAGE_REQUEST_SCOPE_QUANT="$tier" cargo test --locked --release -p mlx-gen-mage \
+              --test text_encoder_window_real_weights -- --ignored --nocapture --test-threads=1
+          done
       - name: Run Mage-Flow instruction-edit parity
         run: |
           status=0

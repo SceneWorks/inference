@@ -29,14 +29,16 @@
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, GenerationMemory,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryMode, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, Result as CoreResult,
+    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision,
+    MemorySelection, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    WeightsSource,
+    Generator, Image, LoadShape, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Result, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -47,12 +49,25 @@ use crate::pipeline::MageComponentDirs;
 use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
+pub const STREAMING_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "mage-flow-generation-peak-v2-sequential-deferred-text-window";
+pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
+pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::TextEncoder;
+// Kept false on the measurement branch. The Apple/Metal evidence run must land the per-tier request
+// envelope and justify TRANSFORMER_WINDOW_SIZES before the provider publishes rung 4.
+const STREAMING_CALIBRATION_AVAILABLE: bool = false;
 
-/// Mage's first shared-contract adoption is intentionally resident-only. The exact measured
-/// request estimator and fail-closed wired-memory boundary are exposed now; SC-15509 owns adding
-/// verified optimized rungs and their provider implementation.
+/// Compatibility contract for callers that have only a tier. Without the load policy, shape, and
+/// resolved component format, the text-encoder rung necessarily remains unavailable.
 pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> MemoryProviderContract {
-    memory_strategy_contract_with_adapters(provider_id, tier, &[])
+    memory_strategy_contract_with_adapters(
+        provider_id,
+        tier,
+        &[],
+        OffloadPolicy::Resident,
+        LoadShape::EagerMaterialization,
+        false,
+    )
 }
 
 /// Build the load-exact Mage contract. Mage installs every adapter as a forward-time residual after
@@ -63,14 +78,37 @@ pub fn memory_strategy_contract_for_spec(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> MemoryProviderContract {
-    memory_strategy_contract_with_adapters(provider_id, spec.quantize, &spec.adapters)
+    memory_strategy_contract_for_spec_with_text_stream(provider_id, spec, false)
+}
+
+fn memory_strategy_contract_for_spec_with_text_stream(
+    provider_id: &str,
+    spec: &LoadSpec,
+    transfer_only_text_stream: bool,
+) -> MemoryProviderContract {
+    memory_strategy_contract_with_adapters(
+        provider_id,
+        spec.quantize,
+        &spec.adapters,
+        spec.offload_policy,
+        spec.load_shape,
+        transfer_only_text_stream,
+    )
 }
 
 fn memory_strategy_contract_with_adapters(
     provider_id: &str,
     tier: Option<Quant>,
     adapters: &[mlx_gen::AdapterSpec],
+    offload_policy: OffloadPolicy,
+    load_shape: LoadShape,
+    transfer_only_text_stream: bool,
 ) -> MemoryProviderContract {
+    let streamable = STREAMING_CALIBRATION_AVAILABLE
+        && transfer_only_text_stream
+        && !provider_id.starts_with("mage_flow_edit")
+        && matches!(offload_policy, OffloadPolicy::Sequential)
+        && matches!(load_shape, LoadShape::DeferredMaterialization);
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -89,6 +127,10 @@ fn memory_strategy_contract_with_adapters(
         MemoryFormulaVariable::PixelCount,
         MemoryFormulaVariable::BatchCount,
     ];
+    if streamable {
+        variables.push(MemoryFormulaVariable::ConditioningTokenCount);
+        variables.push(MemoryFormulaVariable::TransformerWindowSize);
+    }
     let adapter_bytes = adapter_stack_resident_bytes(adapters, AdapterResidencyMode::Additive);
     contract.formula = if let Some(adapter_bytes) = adapter_bytes.filter(|bytes| *bytes > 0) {
         variables.push(MemoryFormulaVariable::OverlayBytes);
@@ -106,9 +148,43 @@ fn memory_strategy_contract_with_adapters(
     } else {
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
-    ));
+    contract.strategies = MemoryStrategy::ALL
+        .into_iter()
+        .map(|strategy| MemoryStrategyCapability {
+            strategy,
+            support: if strategy == MemoryStrategy::Resident
+                || (strategy == MemoryStrategy::BoundedTransformerResidency && streamable)
+            {
+                MemoryStrategySupport::Implemented
+            } else {
+                MemoryStrategySupport::Missing
+            },
+            parameters: if strategy == MemoryStrategy::BoundedTransformerResidency && streamable {
+                MemoryParameterRanges {
+                    transformer_window_sizes: TRANSFORMER_WINDOW_SIZES.to_vec(),
+                    transformer_window_components: vec![TRANSFORMER_WINDOW_COMPONENT],
+                    ..Default::default()
+                }
+            } else {
+                MemoryParameterRanges::default()
+            },
+        })
+        .collect();
+    contract.load_shape = load_shape;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        transformer_window_materialization: streamable,
+        ..Default::default()
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(if streamable {
+        STREAMING_MEMORY_CALIBRATION_FINGERPRINT
+    } else {
+        MEMORY_CALIBRATION_FINGERPRINT
+    }));
     contract.asset_facts.base_bytes =
         (crate::memory::generation_resident_gb(tier) * 1_000_000_000.0).round() as u64;
     contract
@@ -137,9 +213,13 @@ impl MageMemoryScope {
 
 impl MemoryRequestScope for MageMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        if self.selection.strategy != MemoryStrategy::Resident {
+        if !matches!(
+            self.selection.strategy,
+            MemoryStrategy::Resident | MemoryStrategy::BoundedTransformerResidency
+        ) {
             return Err(CoreError::Unsupported(
-                "mage_flow: optimized memory strategies are not implemented yet".into(),
+                "mage_flow: only resident and text-encoder block-window strategies are implemented"
+                    .into(),
             ));
         }
         if request.width != self.geometry.width
@@ -157,7 +237,16 @@ impl MemoryRequestScope for MageMemoryScope {
                 self.geometry.batch
             )));
         }
-        request.memory = Some(GenerationMemory::default());
+        request.memory = Some(if self.selection.strategy == MemoryStrategy::Resident {
+            GenerationMemory::default()
+        } else {
+            GenerationMemory {
+                stream_transformer_blocks: true,
+                transformer_window_size: self.selection.parameters.transformer_window_size,
+                transformer_window_component: Some(self.selection.parameters.window_component()),
+                ..Default::default()
+            }
+        });
         Ok(())
     }
 
@@ -188,12 +277,20 @@ impl MemoryRequestScope for MageMemoryScope {
 
     fn materialize_transformer_window(
         &mut self,
-        _first_block: u32,
-        _block_count: u32,
+        first_block: u32,
+        block_count: u32,
     ) -> CoreResult<()> {
-        Err(CoreError::Unsupported(
-            "mage_flow: bounded transformer residency is reserved for SC-15509".into(),
-        ))
+        let Some(window) = self.selection.parameters.transformer_window_size else {
+            return Err(CoreError::Unsupported(
+                "mage_flow: transformer-window hook used without an admitted window".into(),
+            ));
+        };
+        if block_count == 0 || block_count > window || first_block >= 36 {
+            return Err(CoreError::Unsupported(format!(
+                "mage_flow: invalid encoder window first={first_block} count={block_count} for size {window}"
+            )));
+        }
+        Ok(())
     }
 
     fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
@@ -563,8 +660,19 @@ fn assemble(
     } else {
         crate::vae::VaePart::Decode
     };
-    let mut pipeline =
-        MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
+    let stream_text_encoder = !variant.is_edit()
+        && matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && crate::pipeline::text_encoder_window_is_transfer_only(
+            &dirs.text_encoder,
+            spec.quantize.map(Quant::bits),
+        )?;
+    let mut pipeline = MageFlowPipeline::load_components_with_text_stream(
+        &dirs,
+        spec.quantize.map(Quant::bits),
+        part,
+        stream_text_encoder,
+    )?;
     // Install LoRA/LoKr adapters AFTER the per-component tier quantization (sc-15328), matching the
     // Chroma/FLUX composition: the adapter is a forward-time residual over the quantized base, so a
     // Q4/Q8 tier and a bf16 tier take the same path. No-op when `spec.adapters` is empty; any
@@ -574,7 +682,11 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec),
+        memory_strategy_contract: memory_strategy_contract_for_spec_with_text_stream(
+            variant.id(),
+            spec,
+            stream_text_encoder,
+        ),
         pipeline,
     }))
 }
@@ -739,15 +851,17 @@ fn request_context_error(
             context.mode
         ));
     }
+    let expected_calibration = contract.calibration.as_ref();
     if context.calibration_abi != mlx_gen::gen_core::MEMORY_CALIBRATION_ABI
-        || context.calibration_fingerprint != MEMORY_CALIBRATION_FINGERPRINT
+        || expected_calibration
+            .is_none_or(|identity| context.calibration_fingerprint != identity.fingerprint)
     {
         return Some(format!(
             "{provider_id}: request calibration identity {}/{:?} does not match provider {}/{:?}",
             context.calibration_abi,
             context.calibration_fingerprint,
             mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            MEMORY_CALIBRATION_FINGERPRINT
+            expected_calibration.map(|identity| identity.fingerprint.as_str())
         ));
     }
     if let Err(error) = contract.validate_selection(&context.selection) {
@@ -917,9 +1031,20 @@ impl Generator for MageFlow {
                 seed: seed.wrapping_add(index as i64),
             })
             .collect::<Vec<_>>();
+        let encoder_window =
+            resolve_encoder_window(req, self.pipeline.text_encoder.is_streamable())?;
         let traces = self
             .pipeline
-            .generate_batch_trace(&samples, steps as usize, cfg, &key, false, on_progress)?
+            .generate_batch_trace_with_encoder_window(
+                &samples,
+                steps as usize,
+                cfg,
+                &key,
+                false,
+                encoder_window,
+                &req.cancel,
+                on_progress,
+            )?
             .samples;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -942,6 +1067,32 @@ impl Generator for MageFlow {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+fn resolve_encoder_window(req: &GenerationRequest, streamable: bool) -> Result<Option<usize>> {
+    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+        return Ok(None);
+    };
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != TransformerComponent::TextEncoder {
+        return Err(Error::Msg(format!(
+            "mage_flow implements rung 4 only for TextEncoder, got {component:?}"
+        )));
+    }
+    if !streamable {
+        return Err(Error::Msg(
+            "mage_flow text-encoder window requires a Sequential + DeferredMaterialization load"
+                .into(),
+        ));
+    }
+    let window = memory.transformer_window_size.ok_or_else(|| {
+        Error::Msg("mage_flow text-encoder window selected without a window size".into())
+    })?;
+    usize::try_from(window)
+        .ok()
+        .filter(|window| *window > 0)
+        .map(Some)
+        .ok_or_else(|| Error::Msg("mage_flow text-encoder window must be greater than zero".into()))
 }
 
 fn edit_references(req: &GenerationRequest) -> Result<Vec<image::RgbImage>> {
@@ -1078,6 +1229,10 @@ mage_memory_registration!(MEMORY_REGISTRATION_EDIT_TURBO, "mage_flow_edit_turbo"
 mod tests {
     use super::*;
 
+    fn q4_spec() -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q4)
+    }
+
     #[test]
     fn memory_strategy_contract_is_truthful_resident_only_mlx_adoption() {
         use mlx_gen::gen_core::{MemoryStrategySupport, MEMORY_CALIBRATION_ABI};
@@ -1156,6 +1311,74 @@ mod tests {
             .formula
             .uses(MemoryFormulaVariable::OverlayBytes));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_calibrated_transfer_only_sequential_deferred_generation_loads_publish_the_window() {
+        use mlx_gen::gen_core::MemoryStrategySupport;
+
+        for (policy, shape, transfer_only, implemented) in [
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+                true,
+                true,
+            ),
+            (
+                OffloadPolicy::Resident,
+                LoadShape::DeferredMaterialization,
+                true,
+                false,
+            ),
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::EagerMaterialization,
+                true,
+                false,
+            ),
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+                false,
+                false,
+            ),
+        ] {
+            let mut spec = q4_spec().with_offload_policy(policy);
+            spec.load_shape = shape;
+            let contract = memory_strategy_contract_for_spec_with_text_stream(
+                "mage_flow",
+                &spec,
+                transfer_only,
+            );
+            let rung = contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert_eq!(
+                matches!(rung.support, MemoryStrategySupport::Implemented),
+                implemented && STREAMING_CALIBRATION_AVAILABLE,
+                "policy={policy:?} shape={shape:?} transfer_only={transfer_only}"
+            );
+            if implemented && STREAMING_CALIBRATION_AVAILABLE {
+                assert_eq!(
+                    rung.parameters.transformer_window_components,
+                    vec![TransformerComponent::TextEncoder]
+                );
+                assert_eq!(rung.parameters.transformer_window_sizes, vec![1]);
+                assert!(contract.lifecycle.transformer_window_materialization);
+                assert!(contract.conformance_errors().is_empty());
+            }
+        }
+
+        let mut edit = q4_spec().with_offload_policy(OffloadPolicy::Sequential);
+        edit.load_shape = LoadShape::DeferredMaterialization;
+        let contract =
+            memory_strategy_contract_for_spec_with_text_stream("mage_flow_edit", &edit, true);
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Missing)
+        ));
     }
 
     #[test]
