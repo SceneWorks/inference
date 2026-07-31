@@ -190,6 +190,11 @@ impl LensPipeline {
 }
 
 impl LensText {
+    /// Whether this phase was constructed with the Sequential-only re-openable encoder stack.
+    pub fn is_streamable(&self) -> bool {
+        self.encoder.is_streamable()
+    }
+
     /// Load the text-encode phase (sc-11030) — the tokenizer + the gpt-oss MoE text encoder — from a
     /// Lens snapshot's `tokenizer/` + `text_encoder/`. `quant` (Q4/Q8) quantizes the encoder's MoE
     /// experts at load (sc-3172): the ~38 GB / 20 B-param bulk → ~12 GB, the per-layer dequant the only
@@ -197,10 +202,41 @@ impl LensText {
     /// this loads without touching the DiT — the split that lets `Sequential` drop the encoder before
     /// the DiT is loaded.
     pub fn load(root: &std::path::Path, dtype: Dtype, quant: Option<Quant>) -> Result<Self> {
+        Self::load_with_streaming(root, dtype, quant, false)
+    }
+
+    /// Sequential-only loader for rung 4's text-encoder component scope. Resident callers continue
+    /// through [`Self::load`] and retain the warm layer stack across requests.
+    pub fn load_streamable(
+        root: &std::path::Path,
+        dtype: Dtype,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        Self::load_with_streaming(root, dtype, quant, true)
+    }
+
+    fn load_with_streaming(
+        root: &std::path::Path,
+        dtype: Dtype,
+        quant: Option<Quant>,
+        streamable: bool,
+    ) -> Result<Self> {
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
         let enc_cfg = GptOssConfig::lens();
-        let enc_w = Weights::from_dir(root.join("text_encoder"))?;
-        let encoder = LensTextEncoder::from_weights_quant(enc_w, &enc_cfg, dtype, quant)?;
+        let text_encoder_dir = root.join("text_encoder");
+        let enc_w = Weights::from_dir(&text_encoder_dir)?;
+        let encoder = if streamable {
+            LensTextEncoder::from_streamable_source(
+                enc_w,
+                mlx_gen::WeightsSource::Dir(text_encoder_dir),
+                &enc_cfg,
+                dtype,
+                crate::text_encoder::encoder::DEFAULT_SELECTED_LAYERS.to_vec(),
+                quant,
+            )?
+        } else {
+            LensTextEncoder::from_weights_quant(enc_w, &enc_cfg, dtype, quant)?
+        };
         Ok(Self {
             tokenizer,
             encoder,
@@ -218,11 +254,19 @@ impl LensText {
         prompt: &str,
         date: &str,
         cancel: Option<&CancelFlag>,
+        window: Option<usize>,
     ) -> Result<(Vec<Array>, Array)> {
         let out = self.tokenizer.encode(prompt, date)?;
         let l = out.ids.len();
         let input_ids = Array::from_slice(&out.ids, &[1, l as i32]);
-        let layers = self.encoder.encode(&input_ids, cancel)?; // num_text_layers × [1, L, 2880]
+        let layers = match window {
+            Some(window) => self.encoder.encode_windowed(
+                &input_ids,
+                window,
+                cancel.unwrap_or(&CancelFlag::default()),
+            )?,
+            None => self.encoder.encode(&input_ids, cancel)?,
+        }; // num_text_layers × [1, L, 2880]
 
         let offset = TXT_OFFSET as i32;
         if l as i32 > offset {
@@ -256,7 +300,20 @@ impl LensText {
         date: &str,
         cancel: Option<&CancelFlag>,
     ) -> Result<(Vec<Array>, Array)> {
-        let (pos_feats, pos_mask) = self.encode_one(prompt, date, cancel)?;
+        self.encode_prompt_windowed(prompt, negative_prompt, date, cancel, None)
+    }
+
+    /// [`Self::encode_prompt`] with an optional rung-4 text-encoder window. The option is resolved at
+    /// the generator boundary so direct struct/training callers remain resident by default.
+    pub fn encode_prompt_windowed(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        date: &str,
+        cancel: Option<&CancelFlag>,
+        window: Option<usize>,
+    ) -> Result<(Vec<Array>, Array)> {
+        let (pos_feats, pos_mask) = self.encode_one(prompt, date, cancel, window)?;
         let s_pos = pos_feats[0].shape()[1];
 
         // Honor a cancel between the positive and negative MoE encodes (F-019) — each is a full
@@ -274,7 +331,7 @@ impl LensText {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             (zeros, mlx_rs::ops::zeros_like(&pos_mask)?)
         } else {
-            self.encode_one(negative_prompt, date, cancel)?
+            self.encode_one(negative_prompt, date, cancel, window)?
         };
         let s_neg = neg_feats[0].shape()[1];
 
