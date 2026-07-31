@@ -17,6 +17,7 @@
 //! (`lora_unet_<flattened path>.lora_down/up.weight` + `.alpha`).
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 
 pub use safetensors::Dtype;
@@ -167,6 +168,125 @@ impl CheckpointMeta {
             data: &self.buffers[loc.shard][loc.start..loc.end],
         })
     }
+}
+
+/// One tensor's header-only footprint. Unlike [`TensorView`], this never retains or reads the data
+/// region, so it is safe for multi-gigabyte provider checkpoints used by pre-load admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetensorsTensorHeader {
+    pub name: String,
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+    pub data_bytes: u64,
+}
+
+/// Read tensor shapes/dtypes/byte ranges from one safetensors file or one sharded directory without
+/// reading tensor data. Directory duplicate-key semantics match [`CheckpointMeta::from_dir`]: files
+/// are sorted and the later shard wins.
+pub fn safetensors_path_tensor_headers(
+    path: impl AsRef<Path>,
+) -> Result<Vec<SafetensorsTensorHeader>> {
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+
+    fn read_file(path: &Path) -> Result<Vec<SafetensorsTensorHeader>> {
+        let mut file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut prefix = [0_u8; 8];
+        file.read_exact(&mut prefix)?;
+        let header_len = u64::from_le_bytes(prefix);
+        if header_len > MAX_HEADER_SIZE {
+            return Err(Error::Msg(format!(
+                "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
+                path.display()
+            )));
+        }
+        let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
+            Error::Msg(format!(
+                "safetensors header too large in {}",
+                path.display()
+            ))
+        })?;
+        if data_start > file_len {
+            return Err(Error::Msg(format!(
+                "safetensors header in {} extends past the file",
+                path.display()
+            )));
+        }
+        let header_len = usize::try_from(header_len).map_err(|_| {
+            Error::Msg(format!(
+                "safetensors header too large in {}",
+                path.display()
+            ))
+        })?;
+        let mut header = vec![0_u8; header_len];
+        file.read_exact(&mut header)?;
+        let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+            .map_err(|error| {
+                Error::Msg(format!("safetensors header in {}: {error}", path.display()))
+            })?;
+        let available = file_len - data_start;
+        json.into_iter()
+            .filter(|(name, _)| name != "__metadata__")
+            .map(|(name, value)| {
+                let info: safetensors::tensor::TensorInfo =
+                    serde_json::from_value(value).map_err(|error| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                let (start, end) = info.data_offsets;
+                let end_u64 = u64::try_from(end).map_err(|_| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has an unrepresentable end offset",
+                        path.display()
+                    ))
+                })?;
+                if start > end || end_u64 > available {
+                    return Err(Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has invalid offsets [{start}, {end})",
+                        path.display()
+                    )));
+                }
+                let data_bytes = u64::try_from(end - start).map_err(|_| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has an unrepresentable byte length",
+                        path.display()
+                    ))
+                })?;
+                Ok(SafetensorsTensorHeader {
+                    name,
+                    dtype: info.dtype,
+                    shape: info.shape,
+                    data_bytes,
+                })
+            })
+            .collect()
+    }
+
+    let path = path.as_ref();
+    if path.is_file() {
+        return read_file(path);
+    }
+    let mut files = std::fs::read_dir(path)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("safetensors"))
+        .filter(|path| !is_hidden_file(path))
+        .collect::<Vec<_>>();
+    files.sort();
+    if files.is_empty() {
+        return Err(Error::Msg(format!(
+            "no .safetensors files in {}",
+            path.display()
+        )));
+    }
+    let mut tensors = BTreeMap::new();
+    for file in files {
+        for tensor in read_file(&file)? {
+            tensors.insert(tensor.name.clone(), tensor);
+        }
+    }
+    Ok(tensors.into_values().collect())
 }
 
 /// Sum the on-disk bytes of every `.safetensors` weight file under `dir` (recursively), **without
@@ -872,6 +992,29 @@ mod tests {
         assert!(meta.tensor("missing").is_none());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn header_only_reader_rejects_oversized_sparse_header_before_allocation() {
+        const OVERSIZED_HEADER: u64 = 100_000_001;
+        let path = std::env::temp_dir().join(format!(
+            "gencore_oversized_header_{}.safetensors",
+            std::process::id()
+        ));
+        std::fs::write(&path, OVERSIZED_HEADER.to_le_bytes()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8 + OVERSIZED_HEADER)
+            .unwrap();
+
+        let error = safetensors_path_tensor_headers(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("100000000-byte maximum"), "{error}");
+
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

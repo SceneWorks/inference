@@ -138,14 +138,14 @@
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    safetensors_path_bytes, Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec,
-    MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes, Result as CoreResult,
-    TransformerComponent,
+    safetensors_path_tensor_headers, Error as CoreError, GenerationMemory, GenerationRequest,
+    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
+    Result as CoreResult, TransformerComponent,
 };
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
@@ -334,7 +334,9 @@ pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
 
 /// Stable identity for the Fun-Controlnet-Union network held beside the base Z-Image model.
-pub const CONTROL_BRANCH_COMPONENT_ID: &str = "fun_controlnet_union";
+pub const CONTROL_STACK_COMPONENT_ID: &str = "fun_controlnet_union.control_layers";
+pub const CONTROL_PERSISTENT_COMPONENT_ID: &str = "fun_controlnet_union.persistent";
+const CONTROL_STACK_PREFIX: &str = "control_layers.";
 
 /// The one bounded-attention parameter this provider accepts: the shared
 /// [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`] (64 Mi score elements per attention call),
@@ -418,6 +420,37 @@ pub fn memory_strategy_contract(
     // Bound once: the declaration is checked at construction, so building it twice inside the
     // capability map would re-run the check and re-allocate for no gain.
     let routes = decode_routes(provider_id)?;
+    let (asset_facts, resident_components) = asset_facts(spec, streamable)?;
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        // SC-16065: a control-variant load holds the Fun-Controlnet-Union network beside the
+        // base model. This term is zero for the base provider and load-bearing when `spec`
+        // carries the auxiliary checkpoint.
+        MemoryFormulaVariable::OverlayBytes,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+        // SC-15754: transformer weight residency is now a *variable* of the peak, not a
+        // constant folded into `AssetBytes` — at window 1 the trunk contributes one block
+        // instead of thirty.
+        MemoryFormulaVariable::TransformerWindowSize,
+    ];
+    let formula = if resident_components.is_empty() {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components,
+        }
+    };
     Ok(MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -473,33 +506,11 @@ pub fn memory_strategy_contract(
             attention_chunking: true,
             transformer_window_materialization: streamable,
         },
-        formula: MemoryFormulaKind::PhaseEnvelope {
-            phases: vec![
-                MemoryPhase::Conditioning,
-                MemoryPhase::Denoise,
-                MemoryPhase::Decode,
-            ],
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::BatchCount,
-                MemoryFormulaVariable::ConditioningTokenCount,
-                // SC-16065: a control-variant load holds the Fun-Controlnet-Union network beside the
-                // base model. This term is zero for the base provider and load-bearing when `spec`
-                // carries the auxiliary checkpoint.
-                MemoryFormulaVariable::OverlayBytes,
-                MemoryFormulaVariable::DecodeTileArea,
-                MemoryFormulaVariable::AttentionChunkSize,
-                // SC-15754: transformer weight residency is now a *variable* of the peak, not a
-                // constant folded into `AssetBytes` — at window 1 the trunk contributes one block
-                // instead of thirty.
-                MemoryFormulaVariable::TransformerWindowSize,
-            ],
-        },
+        formula,
         calibration: Some(MemoryCalibrationIdentity::new(
             memory_calibration_fingerprint(spec.load_shape),
         )),
-        asset_facts: asset_facts(spec, streamable),
+        asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
     })
 }
@@ -507,38 +518,118 @@ pub fn memory_strategy_contract(
 /// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] base source
 /// has no component tree, so its base-model fields stay `0` (the truthful "unknown", not a guess);
 /// a separately addressed control checkpoint remains independently countable.
-fn asset_facts(spec: &LoadSpec, streamable: bool) -> MemoryAssetFacts {
+fn asset_facts(
+    spec: &LoadSpec,
+    streamable: bool,
+) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
     let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
             .unwrap_or_default();
-    let control_bytes = spec.control.as_ref().map_or(0, |source| match source {
-        mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => {
-            safetensors_path_bytes(path)
-        }
+    let resident_components = match &spec.control {
+        Some(source) => control_resident_components(source, spec.quantize, streamable)?,
+        None => Vec::new(),
+    };
+    let control_bytes = resident_components.iter().fold(0_u64, |total, component| {
+        total.saturating_add(component.resident_bytes)
     });
-    let resident_components = (control_bytes > 0)
-        .then(|| MemoryResidentComponent {
-            id: CONTROL_BRANCH_COMPONENT_ID.to_owned(),
-            kind: MemoryComponentKind::ControlBranch,
-            resident_bytes: control_bytes,
-            bounded_by: streamable.then_some(MemoryStrategy::BoundedTransformerResidency),
-        })
-        .into_iter()
-        .collect();
-    MemoryAssetFacts {
-        base_bytes: components
-            .text_encoder
-            .saturating_add(components.dit)
-            .saturating_add(components.vae),
-        conditioning_bytes: components.text_encoder,
-        transformer_bytes: components.dit,
-        decoder_bytes: components.vae,
-        // The load-time control checkpoint is resident for every request made by a control-provider
-        // instance. A request-selected PiD decoder remains excluded: availability on `LoadSpec` does
-        // not mean the request selected it, so pricing it here would overstate the ordinary path.
-        overlay_bytes: control_bytes,
+    Ok((
+        MemoryAssetFacts {
+            base_bytes: components
+                .text_encoder
+                .saturating_add(components.dit)
+                .saturating_add(components.vae),
+            conditioning_bytes: components.text_encoder,
+            transformer_bytes: components.dit,
+            decoder_bytes: components.vae,
+            // The load-time control checkpoint is resident for every request made by a control-provider
+            // instance. A request-selected PiD decoder remains excluded: availability on `LoadSpec` does
+            // not mean the request selected it, so pricing it here would overstate the ordinary path.
+            overlay_bytes: control_bytes,
+        },
         resident_components,
+    ))
+}
+
+/// Exact post-load tensor bytes for the ControlNet at this [`LoadSpec`]'s numeric tier. Dense
+/// tensors retain their safetensors payload size. A Q4/Q8 request packs each group-aligned Linear
+/// weight to u32 codes plus bf16 scale/bias tables, exactly matching `AdaptableLinear::quantize`;
+/// non-packable leaves such as the 33-channel patch embedder remain dense. Existing packed triples
+/// are counted as stored rather than projected a second time.
+fn control_resident_components(
+    source: &mlx_gen::WeightsSource,
+    quant: Option<mlx_gen::gen_core::Quant>,
+    streamable: bool,
+) -> CoreResult<Vec<MemoryResidentComponent>> {
+    let path = match source {
+        mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => path,
+    };
+    let tensors = safetensors_path_tensor_headers(path)?;
+    let packed_bases = tensors
+        .iter()
+        .filter_map(|tensor| tensor.name.strip_suffix(".scales"))
+        .collect::<std::collections::HashSet<_>>();
+    let bits = quant.map(|quant| quant.bits());
+    let mut stack_bytes = 0_u64;
+    let mut persistent_bytes = 0_u64;
+    for tensor in &tensors {
+        let base = tensor.name.strip_suffix(".weight");
+        let projected_bytes = match (base, bits, tensor.shape.as_slice()) {
+            (Some(base), Some(bits), [out, input])
+                if !packed_bases.contains(base)
+                    && *input >= crate::quant::GROUP_SIZE as usize
+                    && *input % crate::quant::GROUP_SIZE as usize == 0 =>
+            {
+                let out = u64::try_from(*out).map_err(|_| {
+                    CoreError::Msg("control tensor output dimension overflow".into())
+                })?;
+                let input = u64::try_from(*input).map_err(|_| {
+                    CoreError::Msg("control tensor input dimension overflow".into())
+                })?;
+                let packed_weight = out
+                    .checked_mul(input)
+                    .and_then(|elements| elements.checked_mul(bits as u64))
+                    .map(|packed_bits| packed_bits / 8)
+                    .ok_or_else(|| {
+                        CoreError::Msg("control quantized weight size overflow".into())
+                    })?;
+                let group_entries = out
+                    .checked_mul(input / crate::quant::GROUP_SIZE as u64)
+                    .ok_or_else(|| {
+                        CoreError::Msg("control quantization table size overflow".into())
+                    })?;
+                let table_bytes = group_entries.checked_mul(4).ok_or_else(|| {
+                    CoreError::Msg("control quantization table size overflow".into())
+                })?;
+                packed_weight
+                    .checked_add(table_bytes)
+                    .ok_or_else(|| CoreError::Msg("control resident size overflow".into()))?
+            }
+            _ => tensor.data_bytes,
+        };
+        if tensor.name.starts_with(CONTROL_STACK_PREFIX) {
+            stack_bytes = stack_bytes.saturating_add(projected_bytes);
+        } else {
+            persistent_bytes = persistent_bytes.saturating_add(projected_bytes);
+        }
     }
+    let mut components = Vec::with_capacity(2);
+    if stack_bytes > 0 {
+        components.push(MemoryResidentComponent {
+            id: CONTROL_STACK_COMPONENT_ID.to_owned(),
+            kind: MemoryComponentKind::ControlBranch,
+            resident_bytes: stack_bytes,
+            bounded_by: streamable.then_some(MemoryStrategy::BoundedTransformerResidency),
+        });
+    }
+    if persistent_bytes > 0 {
+        components.push(MemoryResidentComponent {
+            id: CONTROL_PERSISTENT_COMPONENT_ID.to_owned(),
+            kind: MemoryComponentKind::ControlBranch,
+            resident_bytes: persistent_bytes,
+            bounded_by: None,
+        });
+    }
+    Ok(components)
 }
 
 /// The shared ladder → this provider's existing per-request execution controls.
@@ -1035,6 +1126,7 @@ mod tests {
     /// its typed component identity, and the formula term that makes those bytes affect admission.
     #[test]
     fn control_branch_is_a_decomposed_load_bearing_peak_component() {
+        use safetensors::{serialize, tensor::TensorView, Dtype};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nonce = SystemTime::now()
@@ -1047,34 +1139,62 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let control = root.join("control.safetensors");
-        const CONTROL_BYTES: u64 = 37;
-        std::fs::write(&control, vec![0_u8; CONTROL_BYTES as usize]).unwrap();
+        let stack_weight = vec![0_u8; 2 * 64 * 2];
+        let patch_weight = vec![0_u8; 2 * 33 * 2];
+        let patch_bias = vec![0_u8; 2 * 2];
+        let stack = TensorView::new(Dtype::BF16, vec![2, 64], &stack_weight).unwrap();
+        let patch = TensorView::new(Dtype::BF16, vec![2, 33], &patch_weight).unwrap();
+        let bias = TensorView::new(Dtype::BF16, vec![2], &patch_bias).unwrap();
+        let bytes = serialize(
+            [
+                ("control_layers.0.attn.to_q.weight", stack),
+                ("control_all_x_embedder.2-2.weight", patch),
+                ("control_all_x_embedder.2-2.bias", bias),
+            ],
+            &None,
+        )
+        .unwrap();
+        std::fs::write(&control, bytes).unwrap();
 
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(Quant::Q4)
             .with_control(WeightsSource::File(control));
         let contract = memory_strategy_contract(crate::model_control::MODEL_ID, &spec).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(crate::control_transformer::CONTROL_LAYERS_PLACES.len(), 15);
 
-        assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_BYTES);
+        // The 2x64 stack Linear is packed to 64 bytes of Q4 codes plus two 2x1 bf16 tables
+        // (8 bytes). The non-divisible 2x33 patch weight and its bias stay dense (136 bytes).
+        const STACK_RESIDENT_BYTES: u64 = 72;
+        const PERSISTENT_RESIDENT_BYTES: u64 = 136;
+        const CONTROL_RESIDENT_BYTES: u64 = STACK_RESIDENT_BYTES + PERSISTENT_RESIDENT_BYTES;
+        assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_RESIDENT_BYTES);
         let component = contract
-            .asset_facts
-            .resident_components
+            .resident_components()
             .iter()
-            .find(|component| component.id == CONTROL_BRANCH_COMPONENT_ID)
-            .expect("Z-Image must declare the resident ControlNet as its own component");
+            .find(|component| component.id == CONTROL_STACK_COMPONENT_ID)
+            .expect("Z-Image must declare the 15-block ControlNet stack as its own component");
         assert_eq!(component.kind, MemoryComponentKind::ControlBranch);
         assert_ne!(
             component.kind,
             MemoryComponentKind::Transformer(TransformerComponent::Dit),
             "the ControlNet must not be reported as the base denoising transformer"
         );
-        assert_eq!(component.resident_bytes, CONTROL_BYTES);
+        assert_eq!(component.resident_bytes, STACK_RESIDENT_BYTES);
         assert_eq!(
             component.bounded_by,
             Some(MemoryStrategy::BoundedTransformerResidency),
             "the 15-block control stack is streamed by rung 4"
         );
+        let persistent = contract
+            .resident_components()
+            .iter()
+            .find(|component| component.id == CONTROL_PERSISTENT_COMPONENT_ID)
+            .expect("the patch embedder and two-block refiner remain separately attributable");
+        assert_eq!(persistent.kind, MemoryComponentKind::ControlBranch);
+        assert_eq!(persistent.resident_bytes, PERSISTENT_RESIDENT_BYTES);
+        assert_eq!(persistent.bounded_by, None);
         assert!(
             contract.formula.uses(MemoryFormulaVariable::OverlayBytes),
             "declared auxiliary bytes are inert unless the provider formula includes them"
@@ -1084,12 +1204,12 @@ mod tests {
         let prediction = contract.predicted_peak_from_base(BASE_PEAK);
         assert_eq!(
             prediction.predicted_peak_bytes(),
-            BASE_PEAK + CONTROL_BYTES,
+            BASE_PEAK + CONTROL_RESIDENT_BYTES,
             "zeroing the auxiliary bytes, removing its component, or dropping OverlayBytes from the \
              formula must change this result"
         );
         assert_eq!(prediction.unattributed_bytes, BASE_PEAK);
-        assert_eq!(prediction.components, vec![component.clone()]);
+        assert_eq!(prediction.components, contract.resident_components());
     }
 
     /// SC-15775: the route domains are disjoint **by construction**, not by the current numbers

@@ -123,9 +123,6 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
         transformer_bytes: components.dit,
         decoder_bytes: components.vae,
         overlay_bytes,
-        // Compatibility declaration: Krea's existing aggregate accounting remains byte-identical;
-        // adopting typed control-branch decomposition is not required by SC-16065.
-        resident_components: Vec::new(),
     }
 }
 

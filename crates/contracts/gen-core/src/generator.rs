@@ -10,8 +10,8 @@ use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
-    Error, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, Result,
+    Error, MemoryPeakBreakdown, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -35,6 +35,19 @@ pub trait Generator {
     /// `None`, which is the compatibility-safe resident-only/unverified state.
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         None
+    }
+
+    /// Canonical construction of a full provider peak from a caller's base-model estimate.
+    /// Non-adopting providers and contracts without typed auxiliary components preserve the input
+    /// scalar byte-for-byte.
+    fn predicted_memory_peak_from_base(
+        &self,
+        base_predicted_peak_bytes: u64,
+    ) -> MemoryPeakBreakdown {
+        self.memory_strategy_contract().map_or(
+            MemoryPeakBreakdown::from_unattributed(base_predicted_peak_bytes),
+            |contract| contract.predicted_peak_from_base(base_predicted_peak_bytes),
+        )
     }
 
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot

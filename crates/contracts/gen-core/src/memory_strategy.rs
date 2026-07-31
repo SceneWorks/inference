@@ -424,6 +424,15 @@ pub enum MemoryFormulaKind {
         phases: Vec<MemoryPhase>,
         variables: Vec<MemoryFormulaVariable>,
     },
+    /// A phase envelope which separately declares resident component contributions. This is a new
+    /// formula shape instead of a field on [`MemoryAssetFacts`], so every existing provider keeps
+    /// its source-compatible contract literal and adopts the component axis only by choosing this
+    /// variant.
+    ComponentPhaseEnvelope {
+        phases: Vec<MemoryPhase>,
+        variables: Vec<MemoryFormulaVariable>,
+        resident_components: Vec<MemoryResidentComponent>,
+    },
 }
 
 impl MemoryFormulaKind {
@@ -431,9 +440,19 @@ impl MemoryFormulaKind {
     pub fn uses(&self, variable: MemoryFormulaVariable) -> bool {
         match self {
             Self::AssetBytesPlusHeadroom => variable == MemoryFormulaVariable::AssetBytes,
-            Self::Affine { variables } | Self::PhaseEnvelope { variables, .. } => {
-                variables.contains(&variable)
-            }
+            Self::Affine { variables }
+            | Self::PhaseEnvelope { variables, .. }
+            | Self::ComponentPhaseEnvelope { variables, .. } => variables.contains(&variable),
+        }
+    }
+
+    fn resident_components(&self) -> &[MemoryResidentComponent] {
+        match self {
+            Self::ComponentPhaseEnvelope {
+                resident_components,
+                ..
+            } => resident_components,
+            _ => &[],
         }
     }
 }
@@ -606,7 +625,6 @@ impl MemoryCalibrationIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryComponentKind {
     Transformer(TransformerComponent),
-    Decoder,
     ControlBranch,
     AdapterStack,
     IpAdapter,
@@ -647,48 +665,29 @@ pub struct MemoryPeakBreakdown {
 }
 
 impl MemoryPeakBreakdown {
+    pub const fn from_unattributed(predicted_peak_bytes: u64) -> Self {
+        Self {
+            predicted_peak_bytes,
+            unattributed_bytes: predicted_peak_bytes,
+            components: Vec::new(),
+        }
+    }
+
     pub const fn predicted_peak_bytes(&self) -> u64 {
         self.predicted_peak_bytes
     }
 }
 
 /// Provider-owned, load-exact asset facts used as formula inputs.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryAssetFacts {
     pub base_bytes: u64,
     pub conditioning_bytes: u64,
     pub transformer_bytes: u64,
     pub decoder_bytes: u64,
-    /// Compatibility aggregate for auxiliary resident networks. An adopting provider also declares
-    /// each contribution in [`resident_components`](Self::resident_components); legacy providers may
-    /// leave the component list empty without changing their pre-SC-16065 prediction.
+    /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
+    /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
     pub overlay_bytes: u64,
-    pub resident_components: Vec<MemoryResidentComponent>,
-}
-
-impl MemoryAssetFacts {
-    fn auxiliary_components(&self) -> impl Iterator<Item = &MemoryResidentComponent> {
-        self.resident_components
-            .iter()
-            .filter(|component| component.kind.is_auxiliary())
-    }
-
-    /// Load-exact bytes attributable to auxiliary component declarations.
-    pub fn auxiliary_resident_bytes(&self) -> u64 {
-        self.auxiliary_components().fold(0_u64, |total, component| {
-            total.saturating_add(component.resident_bytes)
-        })
-    }
-
-    /// Resident bytes safe to credit to a warm provider. A legacy declaration with no component
-    /// list preserves the old `base_bytes` meaning; an adopter adds the separately declared overlay.
-    pub fn total_resident_bytes(&self) -> u64 {
-        if self.auxiliary_components().next().is_some() {
-            self.base_bytes.saturating_add(self.overlay_bytes)
-        } else {
-            self.base_bytes
-        }
-    }
 }
 
 /// Cache keys must include every axis that can change residency or execution.
@@ -787,11 +786,7 @@ impl MemoryProviderContract {
     /// [`MemoryFormulaVariable::OverlayBytes`] makes the compatibility aggregate load-bearing. A
     /// pre-SC-16065 provider has no typed components, so this returns the byte-identical input scalar.
     pub fn predicted_peak_from_base(&self, base_predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
-        let components: Vec<_> = if self.formula.uses(MemoryFormulaVariable::OverlayBytes) {
-            self.asset_facts.auxiliary_components().cloned().collect()
-        } else {
-            Vec::new()
-        };
+        let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
         let auxiliary_bytes = if components.is_empty() {
             0
         } else {
@@ -807,11 +802,7 @@ impl MemoryProviderContract {
     /// Decompose a scalar which already includes this provider's auxiliary residency. The scalar is
     /// never rewritten; this is the inspection seam for run contexts and evidence records.
     pub fn decompose_predicted_peak(&self, predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
-        let components: Vec<_> = if self.formula.uses(MemoryFormulaVariable::OverlayBytes) {
-            self.asset_facts.auxiliary_components().cloned().collect()
-        } else {
-            Vec::new()
-        };
+        let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
         let auxiliary_bytes = if components.is_empty() {
             0
         } else {
@@ -821,6 +812,37 @@ impl MemoryProviderContract {
             predicted_peak_bytes,
             unattributed_bytes: predicted_peak_bytes.saturating_sub(auxiliary_bytes),
             components,
+        }
+    }
+
+    fn auxiliary_components(&self) -> impl Iterator<Item = &MemoryResidentComponent> {
+        self.formula
+            .resident_components()
+            .iter()
+            .filter(|component| component.kind.is_auxiliary())
+    }
+
+    /// Typed resident component declarations, empty for every non-adopting provider.
+    pub fn resident_components(&self) -> &[MemoryResidentComponent] {
+        self.formula.resident_components()
+    }
+
+    /// Load-exact bytes attributable to auxiliary component declarations.
+    pub fn auxiliary_resident_bytes(&self) -> u64 {
+        self.auxiliary_components().fold(0_u64, |total, component| {
+            total.saturating_add(component.resident_bytes)
+        })
+    }
+
+    /// Resident bytes safe to credit to a warm provider. A legacy declaration preserves the old
+    /// `base_bytes` meaning; an adopter adds the separately declared overlay.
+    pub fn total_resident_bytes(&self) -> u64 {
+        if self.auxiliary_components().next().is_some() {
+            self.asset_facts
+                .base_bytes
+                .saturating_add(self.asset_facts.overlay_bytes)
+        } else {
+            self.asset_facts.base_bytes
         }
     }
 
@@ -1023,7 +1045,7 @@ impl MemoryProviderContract {
         }
 
         let mut component_ids = std::collections::HashSet::new();
-        for component in &self.asset_facts.resident_components {
+        for component in self.formula.resident_components() {
             if component.id.trim().is_empty() {
                 errors.push("resident component id must be non-empty".to_owned());
             } else if !component_ids.insert(component.id.as_str()) {
@@ -1047,7 +1069,7 @@ impl MemoryProviderContract {
                 }
             }
         }
-        let auxiliary_bytes = self.asset_facts.auxiliary_resident_bytes();
+        let auxiliary_bytes = self.auxiliary_resident_bytes();
         if auxiliary_bytes > 0 {
             if auxiliary_bytes != self.asset_facts.overlay_bytes {
                 errors.push(format!(
@@ -1822,10 +1844,21 @@ mod tests {
 
     #[test]
     fn compatibility_default_never_advertises_an_optimized_rung() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<MemoryAssetFacts>();
+        let legacy_literal = MemoryAssetFacts {
+            base_bytes: 1,
+            conditioning_bytes: 2,
+            transformer_bytes: 3,
+            decoder_bytes: 4,
+            overlay_bytes: 5,
+        };
+        assert_eq!(legacy_literal.overlay_bytes, 5);
+
         let contract = MemoryProviderContract::compatibility_default("legacy", mlx_backend());
         assert!(contract.conformance_errors().is_empty());
         assert!(contract.calibration.is_none());
-        assert!(contract.asset_facts.resident_components.is_empty());
+        assert!(contract.formula.resident_components().is_empty());
         assert_eq!(contract.asset_facts.overlay_bytes, 0);
         let prediction = contract.predicted_peak_from_base(123);
         assert_eq!(prediction.predicted_peak_bytes(), 123);
