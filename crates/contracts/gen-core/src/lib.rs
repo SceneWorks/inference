@@ -28,7 +28,6 @@ pub mod license;
 mod macros;
 pub mod media;
 pub mod memory_strategy;
-pub mod mempolicy;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
@@ -86,7 +85,6 @@ pub use memory_strategy::{
     MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
     TransformerComponent, MEMORY_CALIBRATION_ABI,
 };
-pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
     ImageEmbedderRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
