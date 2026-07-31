@@ -8,21 +8,37 @@
 //! `get_peak_memory` is the high-water mark of the **first** only.
 //!
 //! An operating system that kills processes for using too much memory does not make that
-//! distinction. Darwin's `phys_footprint` — the quantity iOS jetsam reads — counts both. So a
-//! configuration can report a comfortable peak and still be at the kill threshold, and the gap is
-//! not small: a Z-Image 1024² render measured `get_peak_memory` at 3102 MiB and a peak footprint of
-//! **6488 MiB**, against a 6136 MiB per-process cap on the target device. It was killed on device
-//! four times while the metric said it had 3 GB to spare.
+//! distinction. Darwin's `phys_footprint` — the quantity iOS jetsam reads — counts both. A Z-Image
+//! 1024² render on an iPhone held `active + cache` at a conserved **6068 MiB** across every sample,
+//! the cache absorbing exactly what active released, and was killed with 4 MiB of headroom while
+//! `get_peak_memory` reported 2901 MiB against a 6136 MiB cap. The peak was not wrong; it was
+//! answering a different question than the one jetsam asks.
 //!
-//! Worse for ranking, the two disagree in *order*. Of three configurations measured on the same
-//! host, the one with the **lowest** `get_peak_memory` had the **highest** footprint and was the
-//! only one the device refused:
+//! # What this measures, and what it does NOT predict
 //!
-//! | configuration | `get_peak_memory` | peak footprint | device |
-//! |---|---:|---:|---|
-//! | SANA 1024, tile 128 | 3294 MiB | 3749 MiB | ran |
-//! | SANA 512, tile 256 | 3453 MiB | 5995 MiB | ran |
-//! | Z-Image 1024, tile 256 | **3102 MiB** | **6488 MiB** | killed |
+//! **This is not a device footprint estimate.** MLX sizes its cache limit from the system's
+//! recommended working set, so on a 64 GB Mac the cache grows almost without bound and this probe
+//! reports how much MLX retains when nothing forces it to give anything back. Those numbers get very
+//! large and are **not monotone in the obvious parameters** — a Z-Image 1024² decode measures
+//! 16002 MiB at a 512 px tile and 6488 MiB at 256 px, but 43157 MiB at 640 px (reproducible to
+//! ±0.2%, not noise: different tile sizes land in different allocator size classes and retain
+//! differently).
+//!
+//! What a capped process actually uses is:
+//!
+//! ```text
+//! footprint ≈ peak_active + min(cache the workload wants, cache limit)
+//! ```
+//!
+//! which on iOS with the limit bound is `peak_active + cache_limit`. Measured: Z-Image is 3102 MiB
+//! peak active on host, and on device 2901 active + 1024 cache = 3925, against 3990 derived from the
+//! observed minimum headroom.
+//!
+//! So use the two numbers for different questions. **`get_peak_memory` is the predictive one** — the
+//! irreducible working set, which must fit under the cap (host reads ~10-20% high). **This probe
+//! answers whether bounding is required**: a footprint far above the cap means MLX will fill the cap
+//! with reclaimable cache and be killed unless its limit is set, and a footprint under the cap means
+//! it will not (SANA at 3749 MiB never needed bounding; Z-Image at 6488-43157 always did).
 //!
 //! # Why sampling, and not a read at the end
 //!

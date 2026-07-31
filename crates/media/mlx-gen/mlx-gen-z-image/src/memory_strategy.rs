@@ -196,6 +196,32 @@ pub const DECODE_OVERLAP: u32 = 64;
 ///    (4.645 at 448 is *worse* than 4.363 at 512). Paying image quality for no admission win is a
 ///    strictly bad trade.
 ///
+/// > **Reason 2 no longer holds once rung 4 is engaged (2026-07-30), and reason 1 alone now carries
+/// > the rejection.** The 4.898 GiB request peak was measured with rung 4 DISENGAGED, so denoise
+/// > bound the request and no decode edge could move it. With rung 4 carrying denoise down to
+/// > ~1.795 GiB the **decode becomes the binding phase**, and the edge moves the request peak
+/// > directly. Swept on real weights at 1024², rung 4 `w=1`, reported as peak active:
+/// >
+/// > | edge | 768 | 640 | 512 | 448 | 384 | 320 | 256 |
+/// > |---|---:|---:|---:|---:|---:|---:|---:|
+/// > | request peak (MiB) | 8283 | 5934 | 4468 | 4756 | 3989 | 4148 | 3102 |
+/// >
+/// > The non-monotonicity this doc already recorded is reproduced exactly (4468 MiB = 4.363 GiB at
+/// > 512, 4756 = 4.645 at 448), which is the check that the two sweeps measure the same thing. What
+/// > changes is the conclusion: edge 256 lands **1366 MiB below** edge 512, and 384 lands 479 below.
+/// >
+/// > Whether that is an *admission* win depends on the device. On a 12 GB phone (~6136 MiB cap) edge
+/// > 512 already fits with the cache bounded (4468 + 1024 = 5492), so the rejected edges buy nothing
+/// > that matters. On an 8 GB device (~4096 MiB) edge 512 does **not** fit (5492) and edge 256
+/// > roughly does (4126) — so there the rejected edges are the difference between shipping and not.
+/// >
+/// > This does **not** readmit them: reason 1 is a quality argument, independently measured, and
+/// > `GenerationMemory`'s levers are documented as quality-preserving. But "paying image quality for
+/// > no admission win is a strictly bad trade" is now "paying image quality for admission on an 8 GB
+/// > device", which is a real trade and the selector's call to make rather than this file's. Changing
+/// > the published set is a capability-surface decision (see `CONTRIBUTING.md`) and belongs to
+/// > SC-15510's owner, not to the measurement that reopened it.
+///
 /// The separation is clean rather than marginal: the admitted set tops out at 48/255 and the rejected
 /// set starts at 64/255, a 33% gap, which is what the sweep's bound is set from.
 ///

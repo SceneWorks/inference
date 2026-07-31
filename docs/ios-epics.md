@@ -989,30 +989,28 @@ The 8 GB case is tight enough that the device session decides it, not the host h
 > capped and the identity closes. Re-measured device figures under that regime are the first ones
 > that can be compared to the cap directly.
 >
-> **And the host can now predict a device kill — a two-number test replaces the old rule.** The
-> harness reports `peak MLX footprint` = max(`active + cache`) on every platform. Measured on the
-> host against the 12 GB device's 6136 MiB cap:
+> **A two-number test replaces the old rule.** The harness reports `peak MLX footprint` =
+> max(`active + cache`) alongside `get_peak_memory`, on every platform.
 >
-> | config | host MLX peak | host peak footprint | vs cap | device |
-> |---|---:|---:|:--:|---|
-> | SANA 1024 tile128 | 3294 | **3749** | under | survived |
-> | SANA 512 tile256 | 3453 | **5995** | just under | survived |
-> | z-image 1024 tile256 | 3102 | **6488** | **over** | **died** |
+> * **Peak active** (`get_peak_memory`) is the **predictive** number: the irreducible working set,
+>   which must fit under the cap. The host reads ~10–20% high (z-image 3102 host / 2901 device; SANA
+>   3294 / 2733), so it is a usable upper bound.
+> * **Peak footprint** answers a *different* question — whether **bounding is required**. Above the
+>   cap means MLX will fill the cap with reclaimable cache and be killed unless its limit is set;
+>   below means it will not. SANA at 3749 MiB never needed bounding. z-image always did.
 >
-> z-image has the **lowest** MLX peak of the three and was the only one killed. The metric this
-> document used throughout ranked it the safest of the three; the footprint ranks it fatal, and the
-> footprint is right.
+> What a capped process actually uses is `peak_active + min(cache wanted, cache limit)` — on iOS with
+> the limit bound, `peak_active + cache_limit`. z-image: 2901 + 1024 = 3925, against 3990 derived
+> from the observed minimum headroom. That is the number to budget with.
 >
-> So, replacing "host ≫ cap is a valid NO; host < cap is never a YES":
->
-> * **Peak active** (`get_peak_memory`) is the irreducible working set. It must fit under the cap —
->   if it does not, no amount of tuning admits the configuration.
-> * **Peak footprint** (`active + cache`) is what MLX wants when unconstrained. Under the cap means
->   it fits with no tuning; over the cap means it fits **only** with the cache bounded.
->
-> z-image is active 3102 (fits) and footprint 6488 (requires bounding) — which is exactly the
-> behaviour the device showed across five runs. Both numbers are now printed by every host and device
-> run, so the comparison needs no reconstruction.
+> > **Correction (same day).** This block first claimed the host footprint *predicts* a device kill,
+> > on the strength of three configurations (SANA 3749/5995, z-image 6488) where it lined up against
+> > the 6136 MiB cap. A tile-edge sweep showed that was coincidence: the same z-image render measures
+> > 16002 MiB at a 512 px tile and **43157 MiB** at 640 px, reproducible to ±0.2%. On a 64 GB Mac
+> > MLX's cache limit is enormous, so host footprint measures *unconstrained retention*, not what a
+> > capped process would use — and it is not monotone in tile size, because different sizes land in
+> > different allocator size classes. The over/under-the-cap **classification** survives and is what
+> > the rule above uses; the magnitude is not a prediction and must not be read as one.
 >
 > **Re-measured: the 8 GB claim tightens but survives.** `image_budget` now returns the footprint as
 > its verdict quantity (a budget is a claim about what the OS tolerates, and the OS tolerates
