@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::{adapter_stack_resident_bytes, AdapterResidencyMode};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
@@ -442,9 +443,24 @@ impl Wan {
         // resident during denoise under both `Resident` and `Sequential` — the TE/VAE are staged out
         // either way; `Sequential` only additionally `clear_cache`-flushes their dead buffers — so the
         // single-DiT byte count is already the correct budget for both policies.
+        let adapter_bytes = adapter_stack_resident_bytes(
+            &self.adapters,
+            if self.config.quantization.is_some() {
+                AdapterResidencyMode::Additive
+            } else {
+                AdapterResidencyMode::Folded
+            },
+        )
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: cannot size every additive adapter before the denoise fit gate",
+                self.descriptor.id
+            ))
+        })?;
         preflight_denoise_memory_guard(
             self.descriptor.id,
-            dit_resident_bytes(&[self.root.join("model.safetensors")], self.quant),
+            dit_resident_bytes(&[self.root.join("model.safetensors")], self.quant)
+                .saturating_add(adapter_bytes),
             seq_len(lat, cfg.patch_size),
             cfg.dim,
             !cfg_disabled,
@@ -1221,13 +1237,25 @@ impl Wan14b {
             &[self.root.join("high_noise_model.safetensors")],
             self.quant,
         );
+        let adapter_mode = if self.config.quantization.is_some() {
+            AdapterResidencyMode::Additive
+        } else {
+            AdapterResidencyMode::Folded
+        };
+        let (low_adapter_bytes, high_adapter_bytes) =
+            wan14b_adapter_bytes_per_expert(&self.adapters, adapter_mode).ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: cannot size every additive adapter before the denoise fit gate",
+                    self.descriptor.id
+                ))
+            })?;
         preflight_denoise_memory_guard(
             self.descriptor.id,
             wan14b_denoise_resident_bytes(
                 self.offload_policy,
                 req.sampler.as_deref(),
-                low_bytes,
-                high_bytes,
+                low_bytes.saturating_add(low_adapter_bytes),
+                high_bytes.saturating_add(high_adapter_bytes),
             ),
             seq_len(lat, cfg.patch_size),
             cfg.dim,
@@ -1575,6 +1603,32 @@ fn wan14b_denoise_resident_bytes(
     }
 }
 
+/// Load-exact adapter residency for each Wan A14B expert. Packed Q4/Q8 snapshots retain additive
+/// residuals; dense snapshots fold factors and therefore add no independent bytes. A shared adapter
+/// is installed once on each expert, while an expert-tagged adapter contributes only to its target.
+/// `None` keeps the preflight fail-closed when any additive source cannot be sized.
+fn wan14b_adapter_bytes_per_expert(
+    adapters: &[AdapterSpec],
+    mode: AdapterResidencyMode,
+) -> Option<(u64, u64)> {
+    if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
+        return Some((0, 0));
+    }
+    adapters
+        .iter()
+        .try_fold((0_u64, 0_u64), |(low, high), adapter| {
+            let bytes = mlx_gen::gen_core::weightsmeta::safetensors_path_bytes(&adapter.path);
+            if bytes == 0 {
+                return None;
+            }
+            Some(match adapter.moe_expert {
+                None => (low.saturating_add(bytes), high.saturating_add(bytes)),
+                Some(MoeExpert::Low) => (low.saturating_add(bytes), high),
+                Some(MoeExpert::High) => (low, high.saturating_add(bytes)),
+            })
+        })
+}
+
 /// The single conditioning reference image for I2V (the first video frame), if present.
 fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
     req.conditioning.iter().find_map(|c| match c {
@@ -1862,6 +1916,55 @@ mod tests {
                 < wan14b_denoise_resident_bytes(Resident, Some("uni_pc"), lo, hi),
             "the swap must budget strictly less than both-resident"
         );
+    }
+
+    #[test]
+    fn wan14b_adapter_residency_tracks_packed_folded_and_expert_routing() {
+        let root =
+            std::env::temp_dir().join(format!("wan14b-adapter-residency-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let shared = root.join("shared.safetensors");
+        let low = root.join("low.safetensors");
+        let high = root.join("high.safetensors");
+        std::fs::write(&shared, vec![0_u8; 10]).unwrap();
+        std::fs::write(&low, vec![0_u8; 20]).unwrap();
+        std::fs::write(&high, vec![0_u8; 30]).unwrap();
+        let adapters = vec![
+            AdapterSpec::new(shared, 1.0, mlx_gen::AdapterKind::Lora),
+            AdapterSpec::new(low, 1.0, mlx_gen::AdapterKind::Lora).with_moe_expert(MoeExpert::Low),
+            AdapterSpec::new(high, 1.0, mlx_gen::AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::High),
+        ];
+
+        assert_eq!(
+            wan14b_adapter_bytes_per_expert(&adapters, AdapterResidencyMode::Folded),
+            Some((0, 0)),
+            "dense factors are folded into the base experts"
+        );
+        assert_eq!(
+            wan14b_adapter_bytes_per_expert(&adapters, AdapterResidencyMode::Additive),
+            Some((30, 40)),
+            "packed factors remain resident on their routed experts"
+        );
+        assert_eq!(
+            wan14b_denoise_resident_bytes(OffloadPolicy::Resident, None, 100 + 30, 200 + 40),
+            370
+        );
+        assert_eq!(
+            wan14b_denoise_resident_bytes(OffloadPolicy::Sequential, None, 100 + 30, 200 + 40),
+            240
+        );
+
+        let missing = vec![AdapterSpec::new(
+            root.join("missing.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        )];
+        assert_eq!(
+            wan14b_adapter_bytes_per_expert(&missing, AdapterResidencyMode::Additive),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn wan_5b() -> Wan {
