@@ -420,9 +420,17 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 **A second image model runs on iPhone.** Z-Image-Turbo q4, 1024×1024, on the iPhone 17 Pro Max:
 
 ```text
-1024px full ladder (rung 4 w=1): 229.1s, MLX peak 2901 MiB,
-process RSS peak 832 MiB, 6063 MiB still available, pixel range 0..255
+1024px full ladder (rung 4 w=1): 208.1s, MLX peak 2901 MiB, process RSS peak 855 MiB,
+6063 MiB still available, peak MLX footprint 3925 MiB, min headroom 2119 MiB
 ```
+
+Re-measured after merging `main` through #340 ("decouple deferred materialization from residency"),
+which required one harness change — see [below](#340-made-rung-4-ask-for-its-load-shape). The memory
+figures are unchanged to the megabyte (2901 peak, 3925 footprint); the time improved from 229.1 s.
+
+**The footprint number is the model closing.** `peak_active + cache_limit = 2901 + 1024 = 3925`, and
+3925 is what the device measured — the prediction from the [two-number
+test](#the-229-s-is-the-model-not-the-configuration-2026-07-30) is exact here, not approximate.
 
 It was jetsam-killed four times first, and the diagnosis went through two wrong answers worth
 recording, because both were reached from real measurements.
@@ -527,9 +535,9 @@ That leaves resolution as the only real lever, and the model already sits at 4 s
 | output | time | MLX peak | headroom left |
 |---|---:|---:|---:|
 | 512px | **60.6 s** | 2836 MiB | 5374 MiB |
-| 1024px | 229.1 s | 2901 MiB | 2146 MiB |
+| 1024px | 208.1 s | 2901 MiB | 2119 MiB |
 
-Time scales **3.78×** for 4× the pixels — tracking the latent-position count almost exactly, which is
+Time scales **3.43×** for 4× the pixels — tracking the latent-position count almost exactly, which is
 what the `SPATIAL_SCALE`-8 explanation predicts (and slightly sub-quadratic, so this is
 bandwidth-bound rather than attention-bound at these sizes).
 
@@ -537,6 +545,29 @@ bandwidth-bound rather than attention-bound at these sizes).
 designed — rung 4 bounds denoise residency per block and rung 2 bounds the decode per tile, so
 neither scales with resolution. On this model, on this device, **resolution buys time, not memory**,
 and the fit question and the latency question are therefore independent.
+
+#### #340 made rung 4 ask for its load shape
+
+Merging `main` broke the z-image device lane, and **only the device lane** — the host run and every
+unit test still passed, because the harness had been getting the requirement for free:
+
+```text
+FAILED generate failed: unsupported: z_image_turbo: bounded transformer residency needs a
+deferred-materialization load shape — this generator eagerly materializes the trunk, so a
+window would add memory rather than bound it. Load with LoadShape::DeferredMaterialization.
+```
+
+Rung 4 used to infer deferred materialization from `OffloadPolicy::Sequential`. #340 separated them,
+correctly: a Sequential load can still eagerly materialize its trunk, and a window over an
+already-materialized stack *adds* memory instead of bounding it. The fix is one field on the
+`LoadSpec`.
+
+**Failing closed is the part worth keeping.** The alternative is a silent rung-4 no-op that writes a
+"bounded" row into calibration evidence for a run that bounded nothing — the same false-green class
+as an unforwarded env knob or a hardcoded configuration label, except here the contract refuses it
+instead of reporting it. Post-fix host numbers reproduce pre-merge exactly (3102 MiB, 14.5 s), so
+#340 changed the requirement and not the behaviour, and the device re-run confirms it (2901 MiB peak,
+unchanged; 208.1 s, from 229.1).
 
 **Status: a fit result, not yet a usable one at 1024px.** Catalog inclusion
 (`mlx-gen-ios-catalog` is deliberately SANA-only) remains a separate decision and is not implied by
