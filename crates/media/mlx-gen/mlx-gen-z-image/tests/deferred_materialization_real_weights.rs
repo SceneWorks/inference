@@ -107,7 +107,7 @@ fn spec(arm: Arm) -> LoadSpec {
     spec
 }
 
-fn request(component: Option<TransformerComponent>) -> GenerationRequest {
+fn request(component: Option<TransformerComponent>, stage_residency: bool) -> GenerationRequest {
     GenerationRequest {
         prompt: "a red fox in a snowy forest, photograph".into(),
         width: env_u32("ZIMAGE_SIZE", 512),
@@ -115,10 +115,11 @@ fn request(component: Option<TransformerComponent>) -> GenerationRequest {
         count: 1,
         seed: Some(1234),
         steps: Some(env_u32("ZIMAGE_STEPS", 1)),
-        memory: component.map(|component| GenerationMemory {
-            stream_transformer_blocks: true,
-            transformer_window_size: Some(1),
-            transformer_window_component: Some(component),
+        memory: (component.is_some() || stage_residency).then(|| GenerationMemory {
+            stage_residency,
+            stream_transformer_blocks: component.is_some(),
+            transformer_window_size: component.map(|_| 1),
+            transformer_window_component: component,
             ..Default::default()
         }),
         ..Default::default()
@@ -208,7 +209,7 @@ fn image_delta(left: &Image, right: &Image) -> u8 {
 #[test]
 #[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn deferred_materialization_is_independent_from_staged_residency() {
-    let req = request(None);
+    let req = request(None, false);
     println!(
         "\nSC-15998 decoupled residency/materialization A/B — {}x{} @ {} step(s)",
         req.width,
@@ -238,7 +239,10 @@ fn deferred_materialization_is_independent_from_staged_residency() {
 
     for arm in ARMS {
         let generator = mlx_gen_z_image::load(&spec(*arm)).expect("load z_image_turbo");
-        let req = request(arm.component);
+        let req = request(
+            arm.component,
+            matches!(arm.offload, OffloadPolicy::Sequential),
+        );
         let cold = run_once(generator.as_ref(), &req);
         let warm = run_once(generator.as_ref(), &req);
         println!(
@@ -342,11 +346,11 @@ fn deferred_materialization_is_independent_from_staged_residency() {
     let generator = mlx_gen_z_image::load(&spec(mixed_arm)).expect("load mixed-scope generator");
     let text_encoder_only = run_once(
         generator.as_ref(),
-        &request(Some(TransformerComponent::TextEncoder)),
+        &request(Some(TransformerComponent::TextEncoder), false),
     );
     let both_after_text_encoder = run_once(
         generator.as_ref(),
-        &request(Some(TransformerComponent::Both)),
+        &request(Some(TransformerComponent::Both), false),
     );
     let clean_both_peak = rung4_both_peak.expect("Both arm");
     let clean_both_retained = rung4_both_retained.expect("Both retained");

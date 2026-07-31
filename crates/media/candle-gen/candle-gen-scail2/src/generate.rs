@@ -32,7 +32,7 @@ use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
 
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride, and
 /// the 28-channel mask pools 8×, so both the full and half grids stay integer + even.
-const DIM_ALIGN: u32 = 32;
+pub(crate) const DIM_ALIGN: u32 = 32;
 
 /// The loaded SCAIL-2 components (resident in the [`crate::pipeline::Scail2`] generator's cache). All
 /// run f32 (the DiT's high-token-length NaN avoidance, and z16 VAE / UMT5 / CLIP are f32 anyway).
@@ -54,7 +54,9 @@ pub struct CharacterRef<'a> {
 }
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
-/// `GenerationRequest` onto). All images are decoded + resized to `(width, height)` here.
+/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the
+/// 32-pixel render lattice; [`generate`] rejects an invalid job rather than silently changing its geometry.
+/// All images are decoded + resized to `(width, height)` here.
 pub struct Scail2Job<'a> {
     pub prompt: &'a str,
     pub negative_prompt: &'a str,
@@ -76,8 +78,32 @@ pub struct Scail2Job<'a> {
     pub segment_overlap: usize,
 }
 
-/// Round a requested dim down to a multiple of [`DIM_ALIGN`] (min one tile).
-fn align(value: u32) -> usize {
+/// Validate the exact render geometry carried by the public [`Scail2Job`] API.
+///
+/// Direct callers do not carry the explicit-versus-resolved origin available to the provider
+/// adapter, so this lower-level API accepts exact render geometry only.
+fn validate_job_geometry(width: u32, height: u32) -> CResult<(usize, usize)> {
+    if width < DIM_ALIGN
+        || height < DIM_ALIGN
+        || !width.is_multiple_of(DIM_ALIGN)
+        || !height.is_multiple_of(DIM_ALIGN)
+    {
+        return Err(CandleError::Msg(format!(
+            "scail2: Scail2Job width/height must be non-zero multiples of {DIM_ALIGN} \
+             (got {width}×{height})"
+        )));
+    }
+    Ok((width as usize, height as usize))
+}
+
+/// Project a dimension onto the SCAIL-2 render lattice for the provider's area calculation.
+///
+/// Since sc-16198, the provider rejects off-grid explicit requests before the area gate, so this is
+/// a no-op for every reachable explicit request. Keeping the lattice projection in the area helper
+/// preserves sc-16197's rendered-geometry rule for direct helper probes and any future resolved-size
+/// path. The public low-level [`generate`] API does not call this function: it requires exact geometry
+/// through [`validate_job_geometry`].
+pub(crate) fn align(value: u32) -> usize {
     (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
 }
 
@@ -310,7 +336,9 @@ pub fn generate(
         )));
     }
     let dev = comps.dit.device();
-    let (tw, th) = (align(job.width), align(job.height));
+    // This is the exact geometry all image and latent paths consume. Keeping validation in the
+    // conversion makes it impossible for the public job API to snap before rendering.
+    let (tw, th) = validate_job_geometry(job.width, job.height)?;
     let cfg_disabled = job.guidance <= 1.0;
 
     // --- decode + resize all pixel inputs to (tw, th) ---
@@ -499,11 +527,29 @@ pub fn generate(
 mod tests {
     use super::{
         build_segments, image_to_chw_host, segment_step_progress, stack_frames, stack_masks,
-        vae_align, Image, Interp, TEMPORAL_STRIDE,
+        vae_align, validate_job_geometry, Image, Interp, TEMPORAL_STRIDE,
     };
     use crate::preprocess::extract_and_compress_mask_to_latent;
     use crate::resize::{downsample_half, interpolate};
     use candle_gen::candle_core::{Device, Tensor};
+
+    #[test]
+    fn public_job_geometry_is_exact_or_rejected() {
+        assert_eq!(
+            validate_job_geometry(1280, 704).expect("on-grid geometry is exact"),
+            (1280, 704)
+        );
+        for (width, height) in [(1280, 730), (730, 1280), (0, 704), (704, 0)] {
+            let err = validate_job_geometry(width, height)
+                .expect_err("the public low-level job must never be silently snapped")
+                .to_string();
+            assert!(
+                err.contains("non-zero multiples of 32")
+                    && err.contains(&format!("{width}×{height}")),
+                "got: {err}"
+            );
+        }
+    }
 
     /// The pre-sc-12517 ordering: upload the native-sized normalized tensor to `dev`, then call the
     /// host-backed resize, which reads it back and recreates the output on `dev`.
