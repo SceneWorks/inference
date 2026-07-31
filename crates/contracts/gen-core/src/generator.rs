@@ -1512,11 +1512,17 @@ pub enum SizeFloor {
     /// variant as "the resolved geometry is bounded by `min_size..=max_size`": whether a provider
     /// re-checks after resolving is per-provider and is **not advertised here**.
     ///
-    /// Today none does. SCAIL-2, the only descriptor setting this variant, resolves from its
-    /// driving-video frames and renders that size unchecked — a 4K clip resolves to `3840x2160`
-    /// against declared bounds of `32..=1280` and is rendered (sc-16167). Bounding the resolved
-    /// size, and deciding whether an over-envelope clip is refused or resolved to a verified
-    /// alternative, is that story's work.
+    /// SCAIL-2, the only descriptor setting this variant, does re-check as of sc-16167 — it refuses
+    /// a resolved geometry outside `min_size..=max_size` or over its area cap before the render,
+    /// naming the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own
+    /// guarantee, made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a
+    /// provider that sets it later. A consumer needing the bound must still read the provider, or
+    /// treat the resolved size as unbounded.
+    ///
+    /// Note "SCAIL-2" there means the **MLX** provider. `candle-gen-scail2` serves the same model id
+    /// and declares [`SizeFloor::RangeChecked`], so it refuses the `0x0` sentinel outright rather
+    /// than resolving it — its own resolve-from-the-clip branch is unreachable. One model id, two
+    /// answers; reconciling them is sc-16199.
     ResolvedDownstream,
 }
 

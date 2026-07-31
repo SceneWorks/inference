@@ -60,12 +60,30 @@ pub fn reject_over_area(
     dh: u32,
     max_area: usize,
 ) -> Result<()> {
+    reject_over_area_dims(id, req.width, req.height, dw, dh, max_area)
+}
+
+/// [`reject_over_area`] over an explicit `width`/`height` instead of `req`'s, for a provider whose
+/// rendered geometry is **not** the one on the request.
+///
+/// SCAIL-2 resolves `width`/`height == 0` from its driving-video frames (sc-16167), so `req.width`
+/// is the sentinel `0` and reading it would measure the wrong geometry — `0` area passes every cap.
+/// The two entry points share this body so the cap means the same thing whether the geometry was
+/// typed or resolved; there is no second copy of the alignment or the message to drift.
+pub fn reject_over_area_dims(
+    id: &str,
+    width: u32,
+    height: u32,
+    dw: u32,
+    dh: u32,
+    max_area: usize,
+) -> Result<()> {
     if max_area == 0 {
         return Ok(());
     }
     let (w, h) = (
-        align_dim(req.width, 1, dw as usize),
-        align_dim(req.height, 1, dh as usize),
+        align_dim(width, 1, dw as usize),
+        align_dim(height, 1, dh as usize),
     );
     let area = w as usize * h as usize;
     if area > max_area {

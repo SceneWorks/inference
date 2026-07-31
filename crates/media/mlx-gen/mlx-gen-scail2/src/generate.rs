@@ -71,7 +71,10 @@ const SCAIL2_MEM_DEFAULT: DitMemoryConfig = DitMemoryConfig {
 };
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride,
 /// and the 28-channel mask pools 8×, so both the full and half grids must stay integer + even.
-const DIM_ALIGN: u32 = 32;
+///
+/// `pub(crate)` because the geometry gate in `pipeline.rs` (sc-16167) must judge the rendered
+/// geometry on the same lattice [`align`] snaps it to, not on the pre-alignment request.
+pub(crate) const DIM_ALIGN: u32 = 32;
 
 /// One masked character reference (the primary subject or an extra character): an RGB image paired
 /// with its color-coded segmentation mask.
