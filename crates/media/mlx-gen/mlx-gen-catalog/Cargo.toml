@@ -42,3 +42,6 @@ mlx-gen-sensenova = { path = "../mlx-gen-sensenova" }
 mlx-gen-svd = { path = "../mlx-gen-svd" }
 mlx-gen-wan = { path = "../mlx-gen-wan" }
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+
+[dev-dependencies]
+gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../../contracts/gen-core-testkit" }

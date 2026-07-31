@@ -26,7 +26,9 @@ contract is backend-independent.
   overlays layered onto a base model at load time.
 - **The explicit provider registry** — `ProviderRegistryBuilder` → `build()` (rejects
   duplicate ids per kind) → an immutable `ProviderRegistry` with resolve-by-id `load_*`
-  methods and a weights-free `descriptor_conformance_errors()` sweep.
+  methods and weights-free conformance sweeps. Memory-strategy registrations publish both their
+  contract constructor and real admission `safety_check`; PiD-capable contracts declare exact
+  native/PiD decode domains so catalog tests can exercise route safety without loading weights.
 - **Pure host-side policy** — tokenizer text↔ids, PIL-compatible image resize (`imageops`),
   VAE tiling, guidance/sampling policy, and the LR schedule — the math that must match the
   reference exactly and has no reason to live in a tensor backend.

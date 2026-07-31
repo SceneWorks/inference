@@ -175,15 +175,14 @@ PID_RUNG_TWO_MARKERS = (
 
 _RAW_STRING_START = re.compile(r'(?:b?r)(#*)"')
 
-_CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
-_CFG_TEST_MOD = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+_CFG_ATTR_START = re.compile(r"#\s*(!?)\s*\[\s*cfg\s*\(")
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
 
 
-def strip_rust_comments(source: str) -> str:
+def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
     """Blank out Rust comments so a source-text policy check cannot be satisfied by a comment.
 
     Comments become runs of spaces (newlines preserved) rather than being deleted, so line and column
@@ -191,9 +190,16 @@ def strip_rust_comments(source: str) -> str:
 
     String and character literals are honoured, because ``"// not a comment"`` and ``"/* nor this */"``
     are real code — including raw strings (``r"..."``, ``r#"..."#``, ``br#"..."#``), whose whole purpose
-    is to contain otherwise-significant characters. Block comments nest, as they do in Rust. ``'a``
-    lifetimes are distinguished from ``'a'`` char literals.
+    is to contain otherwise-significant characters. When ``strip_literals`` is true, their spans are
+    blanked too, so a policy looking for call syntax cannot be satisfied by a diagnostic or test
+    fixture string. Block comments nest, as they do in Rust. ``'a`` lifetimes are distinguished from
+    ``'a'`` char literals.
     """
+    def emit_literal(literal: str) -> str:
+        if not strip_literals:
+            return literal
+        return "".join("\n" if char == "\n" else " " for char in literal)
+
     out: list[str] = []
     index = 0
     length = len(source)
@@ -228,7 +234,7 @@ def strip_rust_comments(source: str) -> str:
             terminator = '"' + raw.group(1)
             end = source.find(terminator, raw.end())
             end = length if end < 0 else end + len(terminator)
-            out.append(source[index:end])
+            out.append(emit_literal(source[index:end]))
             index = end
             continue
         if char == '"':
@@ -241,7 +247,7 @@ def strip_rust_comments(source: str) -> str:
                     end += 1
                     break
                 end += 1
-            out.append(source[index:end])
+            out.append(emit_literal(source[index:end]))
             index = end
             continue
         if char == "'":
@@ -249,13 +255,13 @@ def strip_rust_comments(source: str) -> str:
             if source.startswith("'\\", index):
                 end = source.find("'", index + 2)
                 end = length if end < 0 else end + 1
-                out.append(source[index:end])
+                out.append(emit_literal(source[index:end]))
                 index = end
                 continue
             # `'a'` is a char literal; `'a` (no closing quote) is a lifetime, so emit just the tick and
             # let the identifier be scanned normally.
             if index + 2 < length and source[index + 2] == "'":
-                out.append(source[index : index + 3])
+                out.append(emit_literal(source[index : index + 3]))
                 index += 3
                 continue
             out.append(char)
@@ -478,17 +484,185 @@ def _match_brace(text: str, open_index: int) -> int:
     return n
 
 
-def _cfg_test_spans(text: str) -> list[tuple[int, int]]:
-    """Character spans of ``#[cfg(test)] mod ... { ... }`` blocks, so the production-source scan
-    ignores test code that legitimately reuses the pinned env-var names as passed-in test paths."""
-    spans: list[tuple[int, int]] = []
-    for attribute in _CFG_TEST_ATTR.finditer(text):
-        module = _CFG_TEST_MOD.match(text, attribute.end())
-        if module is None:
+def _split_cfg_args(expression: str) -> list[str]:
+    """Split one cfg predicate's arguments at top-level commas."""
+    args: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(expression):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(expression[start:index].strip())
+            start = index + 1
+    args.append(expression[start:].strip())
+    return [arg for arg in args if arg]
+
+
+def _cfg_truth_without_test(expression: str) -> tuple[bool, bool]:
+    """Return ``(can_be_false, can_be_true)`` with the Rust ``test`` cfg fixed false.
+
+    Other predicates are treated as independently unknown. That is deliberately conservative: an
+    item is removed from a production scan only when its cfg expression cannot possibly be true in
+    a non-test build.
+    """
+    expression = expression.strip()
+    if expression == "test":
+        return True, False
+    call = re.fullmatch(r"(all|any|not)\s*\((.*)\)", expression, re.DOTALL)
+    if call is None:
+        return True, True
+    kind, body = call.groups()
+    values = [_cfg_truth_without_test(arg) for arg in _split_cfg_args(body)]
+    if kind == "all":
+        return any(can_false for can_false, _ in values), all(
+            can_true for _, can_true in values
+        )
+    if kind == "any":
+        return all(can_false for can_false, _ in values), any(
+            can_true for _, can_true in values
+        )
+    if len(values) != 1:
+        return True, True
+    can_false, can_true = values[0]
+    return can_true, can_false
+
+
+def _cfg_attributes_requiring_test(text: str) -> list[tuple[int, int, bool]]:
+    """Attributes whose cfg expression cannot be true when ``test`` is false.
+
+    The third tuple member identifies inner ``#![...]`` attributes, which gate the enclosing
+    module/file rather than a following construct.
+    """
+    attributes: list[tuple[int, int, bool]] = []
+    for start in _CFG_ATTR_START.finditer(text):
+        open_paren = start.end() - 1
+        depth = 1
+        cursor = open_paren + 1
+        while cursor < len(text) and depth:
+            if text[cursor] == "(":
+                depth += 1
+            elif text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
             continue
-        end = _match_brace(text, module.end() - 1)
-        spans.append((attribute.start(), end))
+        close_paren = cursor - 1
+        after = cursor
+        while after < len(text) and text[after].isspace():
+            after += 1
+        if after >= len(text) or text[after] != "]":
+            continue
+        _, can_be_true = _cfg_truth_without_test(text[open_paren + 1 : close_paren])
+        if not can_be_true:
+            attributes.append((start.start(), after + 1, start.group(1) == "!"))
+    return attributes
+
+
+def _cfg_item_end(syntax: str, start: int) -> int | None:
+    """Find the end of the Rust item following a cfg attribute.
+
+    ``syntax`` has comments and literals blanked, so only Rust delimiters remain. Braces inside a
+    function header (notably const-generic arguments such as ``Foo<{ 1 }>``) are skipped; only a
+    top-level brace starts the item's body.
+    """
+    prefix = syntax[start:]
+    prefix = re.sub(r"^\s*(?:#\s*\[[^\]]*\]\s*)*", "", prefix)
+    prefix = re.sub(r"^pub(?:\s*\([^)]*\))?\s+", "", prefix)
+    # These constructs own every brace in their initializer/type/path and end at a semicolon. A
+    # function body, including `const fn`, ends at its top-level brace instead.
+    semicolon_item = re.match(r"(?:const(?!\s+fn\b)|static|type|use|let)\b", prefix) is not None
+
+    paren_depth = 0
+    bracket_depth = 0
+    angle_depth = 0
+    cursor = start
+    while cursor < len(syntax):
+        char = syntax[cursor]
+        if char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif char == "<" and paren_depth == 0 and bracket_depth == 0:
+            angle_depth += 1
+        elif (
+            char == ">"
+            and paren_depth == 0
+            and bracket_depth == 0
+            and not (cursor > 0 and syntax[cursor - 1] == "-")
+        ):
+            angle_depth = max(0, angle_depth - 1)
+        elif char == "{":
+            end = _match_brace(syntax, cursor)
+            if (
+                not semicolon_item
+                and paren_depth == 0
+                and bracket_depth == 0
+                and angle_depth == 0
+            ):
+                return end
+            cursor = end
+            continue
+        elif (
+            char == ";"
+            and paren_depth == 0
+            and bracket_depth == 0
+            and angle_depth == 0
+        ):
+            return cursor + 1
+        cursor += 1
+    return None
+
+
+def _cfg_test_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of items that cannot compile outside a Rust test build.
+
+    This covers functions and other items as well as modules, including predicates such as
+    ``cfg(all(test, feature = "fixture"))``. An ``any(test, feature = "shipping")`` item is retained
+    because it can compile in production when the other predicate is true.
+    """
+    spans: list[tuple[int, int]] = []
+    syntax = strip_rust_comments(text, strip_literals=True)
+    for attribute_start, attribute_end, inner in _cfg_attributes_requiring_test(syntax):
+        if inner:
+            # File-scope inner cfg gates the rest of the file. An inline-module inner cfg could be
+            # narrowed to that module's closing brace, but blanking farther is safely fail-closed:
+            # trigger discovery deliberately uses a separate cfg-unblanked syntax stream.
+            spans.append((attribute_start, len(text)))
+            continue
+        # Additional attributes and visibility modifiers are intentionally included in the scan
+        # from the cfg attribute onward.
+        end = _cfg_item_end(syntax, attribute_end)
+        if end is None:
+            continue
+        spans.append((attribute_start, end))
     return spans
+
+
+def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Blank selected source spans while preserving newlines and character offsets."""
+    if not spans:
+        return text
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    out: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        out.append(text[cursor:start])
+        out.append("".join("\n" if char == "\n" else " " for char in text[start:end]))
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 def _line_of(text: str, index: int) -> int:
@@ -568,21 +742,25 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
     * the crate's comment-stripped sources contain a *call* to the checked constructor, and
     * a *call* to ``validate`` on a route-named receiver.
 
-    Both are call-syntax matches on comment-stripped text, which is what closes the three defeats the
+    Both are call-syntax matches on production code with comments and literals blanked, which closes
+    the three defeats the
     adversarial review found in the first revision (a ``// TODO`` mentioning ``DecodeRoutes``, an unused
     ``use``, and a trigger set narrow enough to miss a helper-built ``MemoryParameterRanges``).
 
-    It remains a *static text* check, and two residual gaps are worth naming rather than implying away:
+    It remains a *static text* check, so its limits are named rather than implied away:
 
     1. It cannot prove the ``validate`` call is reached on every admission path — only that one exists.
-       Wiring ``validate`` into ``safety_check`` is what a behavioural, registry-driven walk would
-       verify; that needs two new pieces of shared contract surface (a safety-check fn pointer on
-       ``MemoryRegistration``, and a way to declare PiD eligibility) and is tracked separately.
+       The weights-free registry conformance walk verifies that behaviour directly through
+       ``MemoryRegistration::safety_check`` and the contract's ``pid_decode_routes`` declaration.
     2. The rung-2 trigger is a *text* proxy for the semantic fact "this provider's contract publishes
        non-empty ``decode_tile_edges``". A provider could in principle delegate every textual trace of
        rung 2 — the ranges, the strategy name, and its ``configure_decode`` hook — to another crate. The
-       same behavioural walk is what covers that; the trigger set is deliberately wide (fail-closed) to
-       shrink the window in the meantime.
+       registry walk covers the semantic declaration; the trigger set remains deliberately wide
+       (fail-closed) as an earlier diagnostic.
+
+    String/character literals and constructs that cannot compile without the Rust ``test`` cfg are
+    excluded from evidence matching. Trigger matching uses a separate cfg-unblanked syntax stream,
+    so a parser overmatch can fail closed but cannot silently disarm the gate.
     """
     packages_by_id = {package["id"]: package for package in metadata["packages"]}
     violations: list[str] = []
@@ -597,27 +775,32 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         manifest_dir = Path(package["manifest_path"]).parent
         if not manifest_dir.is_dir():
             continue
-        # Comments are stripped BEFORE any matching, on both the trigger conditions and the evidence:
-        # a commented-out `register_memory_strategy` must not arm the gate, and a `// TODO: use
-        # DecodeRoutes` must not disarm it.
-        joined = strip_rust_comments(
-            "\n".join(
-                path.read_text(encoding="utf-8")
-                for path in sorted(manifest_dir.rglob("*.rs"))
-                if IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts)
-            )
-        )
-        if "register_memory_strategy" not in joined:
+        # Comments/literals are stripped before all matching. Trigger discovery deliberately does
+        # NOT use cfg-item blanking: if that lightweight parser ever overblanks an unusual Rust
+        # construct, the gate fails loudly for missing evidence instead of silently disarming itself
+        # by erasing a real registration or rung-2 marker.
+        trigger_sources: list[str] = []
+        evidence_sources: list[str] = []
+        for path in sorted(manifest_dir.rglob("*.rs")):
+            if not IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts):
+                continue
+            source = path.read_text(encoding="utf-8")
+            trigger_sources.append(strip_rust_comments(source, strip_literals=True))
+            production = _blank_spans(source, _cfg_test_spans(source))
+            evidence_sources.append(strip_rust_comments(production, strip_literals=True))
+        triggers = "\n".join(trigger_sources)
+        evidence = "\n".join(evidence_sources)
+        if "register_memory_strategy" not in triggers:
             continue
-        if not any(marker in joined for marker in PID_RUNG_TWO_MARKERS):
+        if not any(marker in triggers for marker in PID_RUNG_TWO_MARKERS):
             continue
         missing: list[str] = []
-        if not any(marker in joined for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS):
+        if not any(marker in evidence for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS):
             spellings = " or ".join(
                 f"`{marker}`" for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS
             )
             missing.append(f"never calls the checked constructor ({spellings})")
-        if not PID_DECODE_ROUTE_ADMISSION_CALL.search(joined):
+        if not PID_DECODE_ROUTE_ADMISSION_CALL.search(evidence):
             missing.append("never calls `validate` on a declared route set to gate admission")
         if not missing:
             continue

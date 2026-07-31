@@ -129,6 +129,13 @@ pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
 #[cfg(test)]
 mod tests {
     #[test]
+    fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
+        let registry = super::provider_registry().unwrap();
+        let spec = candle_gen::LoadSpec::new(candle_gen::WeightsSource::Dir("/nonexistent".into()));
+        gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+    }
+
+    #[test]
     fn cfg_capability_matrix_matches_the_registered_candle_render_paths() {
         let registry = super::provider_registry().unwrap();
         let descriptor = |id: &str| {

@@ -356,6 +356,28 @@ pub struct MemoryParameterRanges {
     pub transformer_window_components: Vec<TransformerComponent>,
 }
 
+/// One decode route's exact tile domain.
+///
+/// A route owns one overlap and one or more tile edges. Keeping the pair together matters for
+/// conformance: the route-blind [`MemoryParameterRanges`] publishes the union of all edges and
+/// overlaps, while admission must reject a geometry assembled for a different route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDecodeRouteDomain {
+    pub tile_edges: Vec<u32>,
+    pub tile_overlap: u32,
+}
+
+/// Native-VAE and PiD decode domains for a provider that can execute either route.
+///
+/// `None` on [`MemoryProviderContract::pid_decode_routes`] means the provider has no PiD route. This
+/// backend-neutral declaration is deliberately expressed only in contract geometry: `gen-core`
+/// knows about the request's `use_pid` choice, but it does not depend on the MLX PiD implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryPidDecodeRoutes {
+    pub native: MemoryDecodeRouteDomain,
+    pub pid: MemoryDecodeRouteDomain,
+}
+
 /// Concrete parameters selected for one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryStrategyParameters {
@@ -734,6 +756,10 @@ pub struct MemoryProviderContract {
     pub provider_id: String,
     pub backend: MemoryBackendRealization,
     pub strategies: Vec<MemoryStrategyCapability>,
+    /// Exact native/PiD route split when this provider supports PiD decode. The ordinary strategy
+    /// ranges publish the union; this declaration makes the route distinction visible to weights-free
+    /// registry conformance and provider admission checks.
+    pub pid_decode_routes: Option<MemoryPidDecodeRoutes>,
     /// The load-time materialization shape this concrete provider instance was built with.
     pub load_shape: LoadShape,
     /// Realization-specific constraints appended to the shared graph. Providers cannot remove or
@@ -770,6 +796,7 @@ impl MemoryProviderContract {
                     parameters: MemoryParameterRanges::default(),
                 })
                 .collect(),
+            pid_decode_routes: None,
             load_shape: LoadShape::EagerMaterialization,
             additional_prerequisites: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities::default(),
@@ -973,6 +1000,9 @@ impl MemoryProviderContract {
         }
         if implemented(MemoryStrategy::BoundedDecode) && !self.lifecycle.decode_tiling {
             errors.push("BoundedDecode requires the decode_tiling hook".to_owned());
+        }
+        if let Some(routes) = &self.pid_decode_routes {
+            validate_pid_decode_routes(self, routes, &mut errors);
         }
         if implemented(MemoryStrategy::BoundedAttention) && !self.lifecycle.attention_chunking {
             errors.push("BoundedAttention requires the attention_chunking hook".to_owned());
@@ -1183,6 +1213,110 @@ impl MemoryProviderContract {
         }
         validate_selected_parameters(selection, self)
             .map_err(|message| Error::Unsupported(format!("{}: {message}", self.provider_id)))
+    }
+}
+
+fn validate_pid_decode_routes(
+    contract: &MemoryProviderContract,
+    routes: &MemoryPidDecodeRoutes,
+    errors: &mut Vec<String>,
+) {
+    let Some(bounded_decode) = contract.capability(MemoryStrategy::BoundedDecode) else {
+        errors.push("PiD decode routes require a BoundedDecode capability".to_owned());
+        return;
+    };
+    if !matches!(bounded_decode.support, MemoryStrategySupport::Implemented) {
+        errors.push("PiD decode routes require BoundedDecode to be Implemented".to_owned());
+    }
+
+    for (label, domain) in [("native", &routes.native), ("PiD", &routes.pid)] {
+        if domain.tile_edges.is_empty() {
+            errors.push(format!(
+                "{label} decode route must declare at least one tile edge"
+            ));
+        }
+        if domain.tile_edges.contains(&0) {
+            errors.push(format!("{label} decode route contains a zero tile edge"));
+        }
+        let mut unique = domain.tile_edges.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != domain.tile_edges.len() {
+            errors.push(format!(
+                "{label} decode route contains duplicate tile edges"
+            ));
+        }
+        if domain.tile_overlap == 0 {
+            errors.push(format!(
+                "{label} decode route must declare a non-zero overlap"
+            ));
+        }
+    }
+
+    if routes.native.tile_overlap == routes.pid.tile_overlap
+        && routes
+            .native
+            .tile_edges
+            .iter()
+            .any(|edge| routes.pid.tile_edges.contains(edge))
+    {
+        errors.push("native and PiD decode route geometries must be disjoint".to_owned());
+    }
+
+    let mut declared_edges = bounded_decode.parameters.decode_tile_edges.clone();
+    declared_edges.sort_unstable();
+    declared_edges.dedup();
+    let mut route_edges = routes
+        .native
+        .tile_edges
+        .iter()
+        .chain(&routes.pid.tile_edges)
+        .copied()
+        .collect::<Vec<_>>();
+    route_edges.sort_unstable();
+    route_edges.dedup();
+    if declared_edges != route_edges {
+        errors.push(format!(
+            "BoundedDecode tile edges {declared_edges:?} must equal the native/PiD route union \
+             {route_edges:?}"
+        ));
+    }
+
+    let mut declared_overlaps = bounded_decode.parameters.decode_overlaps.clone();
+    declared_overlaps.sort_unstable();
+    declared_overlaps.dedup();
+    let mut route_overlaps = vec![routes.native.tile_overlap, routes.pid.tile_overlap];
+    route_overlaps.sort_unstable();
+    route_overlaps.dedup();
+    if declared_overlaps != route_overlaps {
+        errors.push(format!(
+            "BoundedDecode overlaps {declared_overlaps:?} must equal the native/PiD route union \
+             {route_overlaps:?}"
+        ));
+    }
+}
+
+/// The shared safety behavior for an adopted provider with no additional admission rules.
+///
+/// Provider registrations can point at this function without loading a [`Generator`](crate::Generator).
+/// Providers with extra safety rules expose their own function with the same signature.
+pub fn default_memory_strategy_safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    match contract.validate_selection(&context.selection) {
+        Ok(()) if context.budget.fits(context.predicted_peak_bytes) => MemorySafetyDecision::Accept,
+        Ok(()) => MemorySafetyDecision::Reject {
+            reason: format!(
+                "{}: predicted peak {} exceeds effective budget {}",
+                contract.provider_id,
+                context.predicted_peak_bytes,
+                context.budget.effective_bytes()
+            ),
+        },
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -1815,6 +1949,7 @@ mod tests {
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,
+            pid_decode_routes: None,
             load_shape: LoadShape::DeferredMaterialization,
             additional_prerequisites: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities {
@@ -1843,6 +1978,49 @@ mod tests {
             asset_facts: MemoryAssetFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
+    }
+
+    fn pid_contract() -> MemoryProviderContract {
+        let mut contract = adopted_contract();
+        contract.strategies[2].parameters.decode_tile_edges = vec![512, 2048];
+        contract.strategies[2].parameters.decode_overlaps = vec![64, 256];
+        contract.pid_decode_routes = Some(MemoryPidDecodeRoutes {
+            native: MemoryDecodeRouteDomain {
+                tile_edges: vec![512],
+                tile_overlap: 64,
+            },
+            pid: MemoryDecodeRouteDomain {
+                tile_edges: vec![2048],
+                tile_overlap: 256,
+            },
+        });
+        contract
+    }
+
+    #[test]
+    fn pid_decode_routes_must_be_disjoint_and_match_the_published_ranges() {
+        let valid = pid_contract();
+        assert!(valid.conformance_errors().is_empty());
+
+        let mut overlapping = valid.clone();
+        overlapping.pid_decode_routes.as_mut().unwrap().pid = MemoryDecodeRouteDomain {
+            tile_edges: vec![512],
+            tile_overlap: 64,
+        };
+        let errors = overlapping.conformance_errors();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must be disjoint")));
+
+        let mut under_declared = valid;
+        under_declared.strategies[2]
+            .parameters
+            .decode_tile_edges
+            .retain(|edge| *edge != 2048);
+        let errors = under_declared.conformance_errors();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must equal the native/PiD route union")));
     }
 
     #[test]

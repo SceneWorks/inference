@@ -39,6 +39,9 @@ candle-gen-svd = { path = "../candle-gen-svd" }
 candle-gen-wan = { path = "../candle-gen-wan" }
 candle-gen-z-image = { path = "../candle-gen-z-image" }
 
+[dev-dependencies]
+gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../../contracts/gen-core-testkit" }
+
 [features]
 default = []
 metal = [

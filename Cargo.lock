@@ -507,6 +507,7 @@ dependencies = [
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]
@@ -2158,6 +2159,7 @@ dependencies = [
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]

@@ -65,6 +65,7 @@ pub fn memory_strategy_contract(
                 },
             })
             .collect(),
+        pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
