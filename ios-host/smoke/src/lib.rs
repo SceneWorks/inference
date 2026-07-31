@@ -1257,7 +1257,7 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
     };
 
     use runtime_ios::gen_core::{
-        GenerationMemory, GenerationOutput, GenerationRequest, LoadSpec as GenLoadSpec,
+        GenerationMemory, GenerationOutput, GenerationRequest, LoadShape, LoadSpec as GenLoadSpec,
         OffloadPolicy, Progress, WeightsSource,
     };
 
@@ -1266,11 +1266,26 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
     let started = Instant::now();
 
     let run = || -> Result<String, String> {
-        // `Sequential` + a `Dir` source are what make rung 4 AVAILABLE at all — z-image declares it
-        // Missing for single-file/ComfyUI loads, because streaming rebuilds blocks from the snapshot
-        // per window and an in-memory `Weights` has no re-openable source.
+        // Three things make rung 4 available, and they are now three separate statements.
+        //
+        // `Sequential` + a `Dir` source were always required — streaming rebuilds blocks from the
+        // snapshot per window, and an in-memory `Weights` has no re-openable source, so z-image
+        // declares rung 4 Missing for single-file/ComfyUI loads.
+        //
+        // `LoadShape::DeferredMaterialization` is the third, and it is new (#340, "decouple deferred
+        // materialization from residency"). It used to be inferred from `Sequential`; it is now asked
+        // for explicitly, because the two are genuinely independent — a Sequential load can still
+        // eagerly materialize its trunk, and a window over an already-materialized stack ADDS memory
+        // instead of bounding it. Without this the generate fails closed:
+        //
+        //   unsupported: z_image_turbo: bounded transformer residency needs a
+        //   deferred-materialization load shape ...
+        //
+        // Failing closed is the right design — the alternative is a silent rung-4 no-op that writes
+        // a "bounded" row into calibration evidence for a run that bounded nothing.
         let spec = GenLoadSpec {
             offload_policy: OffloadPolicy::Sequential,
+            load_shape: LoadShape::DeferredMaterialization,
             ..GenLoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
         };
         // Resolution is a knob because the 1024px answer was "killed" and the next question is
