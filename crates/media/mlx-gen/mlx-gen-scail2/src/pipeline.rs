@@ -251,8 +251,14 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
 /// largest in-envelope geometry at the source aspect ([`suggest_in_envelope`]), so the caller re-sends
 /// with an explicit `width`/`height` and keeps the same driving clip — `run` resizes the driving
 /// frames to the target either way. That suggestion is a statement about what this engine will
-/// *accept*, not a measured memory fit; when sc-15807 lands a measured
-/// `Error::GeometryRefused { alternative }`, this is the call site that carries it.
+/// *accept*, not a measured memory fit.
+///
+/// sc-15807 is building the typed carrier for exactly this shape (inference#333, draft at time of
+/// writing): `Error::GeometryRefused { reason, requested_width, requested_height, alternative:
+/// Option<(u32, u32)> }`. [`suggest_in_envelope`] already returns that `Option<(u32, u32)>`, so the
+/// upgrade here is swapping the [`Error::Msg`] below for that variant — the refusal itself, and the
+/// decision to refuse rather than downscale, do not change. What changes is that the alternative
+/// stops being prose a caller has to parse.
 fn reject_unrenderable_geometry(
     caps: &Capabilities,
     req: &GenerationRequest,
