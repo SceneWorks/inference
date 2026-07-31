@@ -282,6 +282,27 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                 self.write_provider(body)
                 self.run_gate(depends_on_pid=depends_on_pid)
 
+    def test_required_configure_decode_hook_that_only_rejects_is_not_rung_two_adoption(self) -> None:
+        """A rung-4-only adopter must implement the trait method, but cannot emit a tile."""
+        self.write_provider(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "impl MemoryRequestScope for Scope {\n"
+            "  fn configure_decode(&mut self, _e: u32, _o: u32, _g: MemoryGeometry) "
+            "-> CoreResult<()> { Err(CoreError::Unsupported(\"not implemented\".into())) }\n"
+            "}\n"
+        )
+        self.run_gate()
+
+    def test_rejection_followed_by_reachable_code_is_still_rung_two_adoption(self) -> None:
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "impl MemoryRequestScope for Scope {\n"
+            "  fn configure_decode(&mut self, _e: u32, _o: u32, _g: MemoryGeometry) "
+            "-> CoreResult<()> { Err(CoreError::Unsupported(\"no\".into())); bounded_decode_call() }\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
     def test_a_commented_out_registration_does_not_arm_the_gate(self) -> None:
         """Comments are stripped before the TRIGGER too, not only before the evidence."""
         self.write_provider(
