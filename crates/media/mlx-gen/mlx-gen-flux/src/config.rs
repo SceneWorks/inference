@@ -87,6 +87,7 @@ impl FluxVariant {
                 // The Redux/Depth/Fill/Control variants remain later ports.
                 conditioning: vec![ConditioningKind::Reference],
                 supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
                 supports_lora: true,
                 supports_lokr: true,
                 // The curated unified-framework integrator menu (epic 7114 P3) + the legacy

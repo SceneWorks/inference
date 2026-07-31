@@ -97,6 +97,7 @@ pub fn descriptor() -> ModelDescriptor {
             // conflicts with a packed snapshot's own tier is a hard error rather than a silent downgrade
             // (`load::resolve_load_time_quant`). Both are what this slice advertises.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // The AR regime is built on a rolling causal KV cache (sc-8436 S3 / sc-8438 S5).
             supports_kv_cache: true,
             requires_sigma_shift: false,

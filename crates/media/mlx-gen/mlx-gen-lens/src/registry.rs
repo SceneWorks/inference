@@ -153,6 +153,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Q4/Q8 quantize the gpt-oss encoder's MoE experts (sc-3172 — the ~38 GB / 20 B-param
             // bulk → ~12 GB) and the DiT's linears (sc-3175) at load.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,

@@ -789,6 +789,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
             // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
@@ -1495,6 +1496,7 @@ mod tests {
         let tier = gen_core::MemoryNumericTier {
             precision: gen_core::Precision::Bf16,
             quant: Some(Quant::Q4),
+            component_precision_floors: &[],
         };
         let parameters = gen_core::MemoryStrategyParameters {
             decode_tile_edge: Some(512),
@@ -1603,6 +1605,7 @@ mod tests {
                     tier: gen_core::MemoryNumericTier {
                         precision: gen_core::Precision::Bf16,
                         quant: Some(Quant::Q4),
+                        component_precision_floors: &[],
                     },
                 },
             )
@@ -1680,6 +1683,7 @@ mod tests {
                 tier: gen_core::MemoryNumericTier {
                     precision: gen_core::Precision::Bf16,
                     quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
                 },
             },
         )

@@ -719,6 +719,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged

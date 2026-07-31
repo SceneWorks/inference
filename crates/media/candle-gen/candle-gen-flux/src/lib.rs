@@ -291,6 +291,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
             mac_only: false,
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,

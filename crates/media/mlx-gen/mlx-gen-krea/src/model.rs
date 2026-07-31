@@ -127,6 +127,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The turnkey ships pre-packed Q8/Q4 ([`crate::convert::assemble_quantized_snapshot`]);
             // load-time quantize over a dense bf16 build is a no-op on an already-packed snapshot.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).

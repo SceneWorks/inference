@@ -62,6 +62,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base FLUX.2 path — native default + curated.

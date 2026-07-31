@@ -131,6 +131,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: LANGUAGES.to_vec(),
             audio_edit_modes: vec![],
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

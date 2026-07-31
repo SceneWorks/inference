@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::gen_core::Quant;
+use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
 use candle_gen::quant::QLinear;
 use candle_gen_boogu::loader::Weights;
 
@@ -376,7 +376,13 @@ impl MageTransformer {
         } else {
             device.clone()
         };
-        let weights = Weights::from_dir(dir, &staging, DType::BF16)?;
+        let mut weights = Weights::from_dir(dir, &staging, DType::BF16)?;
+        // Dense snapshots stage on CPU and fold each projection directly onto the target. Physical
+        // q4/q8 tiers are already packed: reopen their mmap on the target so `from_packed_gs` builds
+        // each resident GGUF tensor there rather than leaving an idempotent packed projection on CPU.
+        if quant.is_some() && weights.packed().is_some() {
+            weights = Weights::from_dir(dir, device, DType::BF16)?;
+        }
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
             blocks.push(Block::load(
@@ -415,7 +421,10 @@ impl MageTransformer {
         for block in &mut self.blocks {
             block.place(quant, device)?;
         }
-        place_linear(&mut self.final_mod, quant, device)?;
+        let final_mod_quant = quant.map(|selected| {
+            crate::quant::component_quant(PrecisionFloorComponent::TransformerHead, selected)
+        });
+        place_linear(&mut self.final_mod, final_mod_quant, device)?;
         place_linear(&mut self.output, quant, device)
     }
 

@@ -83,6 +83,13 @@ impl Attention {
         })
     }
 
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.q_proj.quantize_dequant_onto(quant, device)?;
+        self.k_proj.quantize_dequant_onto(quant, device)?;
+        self.v_proj.quantize_dequant_onto(quant, device)?;
+        self.o_proj.quantize_dequant_onto(quant, device)
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[s, head_dim/2]` (the text 1-D or image 3-D MRoPE table);
     /// `mask`: additive causal `[b, 1, s, s]`.
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
@@ -146,6 +153,12 @@ impl Mlp {
         })
     }
 
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.gate.quantize_dequant_onto(quant, device)?;
+        self.up.quantize_dequant_onto(quant, device)?;
+        self.down.quantize_dequant_onto(quant, device)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // `forward_upcast` (sc-12828): bf16-stored projections, f32 hidden — see `Attention::forward`.
         let gated = (self.gate.forward_upcast(x)?.silu()? * self.up.forward_upcast(x)?)?;
@@ -171,6 +184,11 @@ impl DecoderLayer {
             mlp: Mlp::load(w, &format!("{prefix}.mlp"))?,
             eps: cfg.rms_norm_eps,
         })
+    }
+
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.attn.quantize_onto(quant, device)?;
+        self.mlp.quantize_onto(quant, device)
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
@@ -221,6 +239,19 @@ impl BooguTextEncoder {
             rope_theta: cfg.rope_theta,
             device: w.device().clone(),
         })
+    }
+
+    /// Quantize the 36 decoder layers in place while leaving the token embedding at the artifact's
+    /// own width. Already-packed layers are an idempotent no-op.
+    pub fn quantize_layers_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize_onto(quant, device)?;
+        }
+        Ok(())
     }
 
     /// `input_ids`: `[1, S]` u32. Returns `last_hidden_state` `[1, S, 4096]` (f32) — all layers run,

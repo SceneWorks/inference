@@ -104,6 +104,7 @@ pub fn descriptor() -> ModelDescriptor {
             // dense bf16 build is a no-op on an already-packed snapshot. The DiT + Qwen3-VL text
             // tower are quantized; the FLUX.1 VAE + (edit-only) vision tower stay dense.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840): under Sequential the

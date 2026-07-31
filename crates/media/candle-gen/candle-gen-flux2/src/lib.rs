@@ -811,6 +811,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // TE to fit the memory ceiling; klein (sc-11031) folds only the 9B DiT and keeps the Qwen3
             // TE dense bf16 (epic 8506 DENSE_TE, `Pipeline::te_quant`).
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,

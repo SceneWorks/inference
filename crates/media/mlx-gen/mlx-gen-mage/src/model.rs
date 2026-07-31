@@ -350,6 +350,7 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
             supports_lokr: true,
             // Q4/Q8 tiers are sc-14046; `&[]` means dense-only, which is what the scaffold is.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
             // A platform request has one geometry/prompt and `count` independent seeds. The
@@ -1084,6 +1085,7 @@ mod tests {
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
+                    component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
                 },
             },
             calibration_abi: MEMORY_CALIBRATION_ABI,
@@ -1180,6 +1182,7 @@ mod tests {
             tier: mlx_gen::gen_core::MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: Some(Quant::Q4),
+                component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
             },
         };
         let geometry = MemoryGeometry {

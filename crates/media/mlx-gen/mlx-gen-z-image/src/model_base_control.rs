@@ -60,6 +60,7 @@ pub fn descriptor() -> ModelDescriptor {
             // paying for a load. Same expression the `ControlBranch` override
             // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Base is undistilled → full classifier-free guidance + negative prompting (mirrors the
             // base `z_image` descriptor), unlike the guidance-distilled Turbo control variant.
             supports_negative_prompt: true,

@@ -696,6 +696,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_count: 8,
             mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,

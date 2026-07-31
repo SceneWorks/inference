@@ -1574,6 +1574,63 @@ impl SizeFloor {
     }
 }
 
+/// A model component whose resident numeric tier may deliberately differ from the tier selected for
+/// the model as a whole.
+///
+/// This vocabulary is intentionally shared with SceneWorks' tier-integrity ledger. Providers use it
+/// to expose precision floors to callers before weights are loaded, so tier selection, telemetry,
+/// and memory-evidence identity do not have to infer provider-local packing exceptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrecisionFloorComponent {
+    TextEncoder,
+    TransformerHead,
+}
+
+impl PrecisionFloorComponent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "textEncoder",
+            Self::TransformerHead => "transformerHead",
+        }
+    }
+}
+
+/// One worker-visible component precision floor.
+///
+/// When `selected_tier` is requested, the named component is resident at no less than
+/// `resident_tier`. A provider that raises a component above the selected tier must declare that
+/// substitution here; callers include the declaration in labels and memory evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentPrecisionFloor {
+    pub component: PrecisionFloorComponent,
+    pub selected_tier: Quant,
+    pub resident_tier: Quant,
+}
+
+impl ComponentPrecisionFloor {
+    pub const fn applies_to(self, selected: Quant) -> bool {
+        matches!(
+            (self.selected_tier, selected),
+            (Quant::Q4, Quant::Q4) | (Quant::Q8, Quant::Q8) | (Quant::Nvfp4, Quant::Nvfp4)
+        )
+    }
+}
+
+/// Resolve the quant tier a provider must use for one component from its advertised floor table.
+/// Providers and callers share this function so the load path cannot apply a different substitution
+/// from the one visible in descriptor introspection.
+pub fn effective_component_quant(
+    floors: &[ComponentPrecisionFloor],
+    component: PrecisionFloorComponent,
+    selected: Quant,
+) -> Quant {
+    floors
+        .iter()
+        .copied()
+        .find(|floor| floor.component == component && floor.applies_to(selected))
+        .map_or(selected, |floor| floor.resident_tier)
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).
@@ -1693,6 +1750,10 @@ pub struct Capabilities {
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
+    /// Component-local numeric floors applied above the selected model tier. Empty means that a q4
+    /// load is uniformly q4 across every packable component. This is a binding provider contract:
+    /// callers use it for effective-tier labels and memory-evidence identity.
+    pub component_precision_floors: &'static [ComponentPrecisionFloor],
     // Loader hints.
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
@@ -2267,6 +2328,32 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_component_cannot_be_raised_without_a_visible_floor_declaration() {
+        assert_eq!(
+            effective_component_quant(&[], PrecisionFloorComponent::TextEncoder, Quant::Q4),
+            Quant::Q4
+        );
+        let declared = [ComponentPrecisionFloor {
+            component: PrecisionFloorComponent::TextEncoder,
+            selected_tier: Quant::Q4,
+            resident_tier: Quant::Q8,
+        }];
+        assert_eq!(
+            effective_component_quant(&declared, PrecisionFloorComponent::TextEncoder, Quant::Q4),
+            Quant::Q8
+        );
+        assert_eq!(
+            effective_component_quant(
+                &declared,
+                PrecisionFloorComponent::TransformerHead,
+                Quant::Q4
+            ),
+            Quant::Q4,
+            "an unrelated component cannot inherit another component's floor"
+        );
+    }
 
     #[test]
     fn generation_memory_is_opt_in_and_quality_preserving_levers_default_off() {
