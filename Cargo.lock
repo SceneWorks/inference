@@ -2402,6 +2402,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run --release -p mlx-gen-ios-catalog --example image_budget -- <snapshot_dir>
 //!     [--budget-mib N] [--steps N] [--size N] [--count N] [--resident-only]
+//!     [--tile EDGE] [--overlap PX]
 //! ```
 //!
 //! The media counterpart to `mlx-llm`'s `memory_budget`, and the reason it exists separately: a
@@ -31,7 +32,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Progress, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Progress,
+    WeightsSource,
 };
 use mlx_rs::memory;
 
@@ -56,6 +58,7 @@ fn measure(
     size: u32,
     steps: u32,
     count: u32,
+    tile: Option<(u32, u32)>,
     label: &str,
 ) -> Result<(usize, f64), Box<dyn std::error::Error>> {
     println!("\n{label}");
@@ -93,8 +96,34 @@ fn measure(
         count,
         steps: Some(steps),
         seed: Some(0),
+        // The REQUEST path, deliberately, and not `MLX_GEN_SANA_DECODE_TILE`. The env override
+        // derives its overlap as `edge / 4` with no way to say otherwise, so every sweep driven
+        // through it measures a different overlap at every edge. A contract ladder publishes ONE
+        // overlap (`mlx_gen_pid::DecodeRoutes` carries a single `native_overlap`), so the sweep that
+        // calibrates it has to be able to hold the overlap fixed while the edge moves.
+        memory: tile.map(|(edge, overlap)| GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(edge),
+            decode_overlap: Some(overlap),
+            ..Default::default()
+        }),
         ..Default::default()
     };
+
+    // Read the geometry back off the resolver instead of asserting it. `MLX_GEN_SANA_DECODE_TILE`
+    // beats the request by design, so a stale env var from an earlier run in the same shell would
+    // silently re-measure `edge / 4` under a row labelled with the overlap asked for here. Printing
+    // the winning SOURCE is what makes that visible rather than plausible.
+    match mlx_gen_sana::pipeline::resolved_decode_plan(
+        request.memory,
+        policy == OffloadPolicy::Sequential,
+    ) {
+        Some(plan) => println!(
+            "  decode geometry   TILED edge={} overlap={} (chosen by {:?})",
+            plan.edge, plan.overlap, plan.source
+        ),
+        None => println!("  decode geometry   WHOLE-IMAGE"),
+    }
 
     // Weights fault in lazily, so peak is only real after an actual generation — measuring at load
     // time reports a reassuring and useless number.
@@ -164,7 +193,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = args
         .next()
-        .ok_or("usage: image_budget <snapshot_dir> [--budget-mib N] [--steps N] [--size N] [--count N] [--resident-only]")?;
+        .ok_or("usage: image_budget <snapshot_dir> [--budget-mib N] [--steps N] [--size N] [--count N] [--resident-only] [--tile EDGE] [--overlap PX]")?;
 
     let mut budget_mib = DEFAULT_BUDGET_MIB;
     let mut steps = 4u32; // SANA is few-step; 4 exercises the loop without dominating the runtime.
@@ -178,8 +207,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut resident_only = false;
     let mut sequential_only = false;
     let mut no_cache = false;
+    // The decode geometry to sweep, driven through the REQUEST rather than the env override so the
+    // overlap is expressible independently of the edge (see `measure`). Two separate `Option`s so
+    // `--overlap 48 --tile 512` and the reverse mean the same thing — a sweep loop sets one of them
+    // per iteration, and an order-dependent parse would make half the rows measure something else.
+    let mut tile_edge: Option<u32> = None;
+    let mut tile_overlap: Option<u32> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--tile" => tile_edge = Some(args.next().ok_or("--tile needs a value")?.parse()?),
+            "--overlap" => {
+                tile_overlap = Some(args.next().ok_or("--overlap needs a value")?.parse()?)
+            }
             "--budget-mib" => {
                 budget_mib = args.next().ok_or("--budget-mib needs a value")?.parse()?
             }
@@ -202,6 +241,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let dir = Path::new(&dir);
+    // `--overlap` without `--tile` is a mistake worth naming: it looks like it set the geometry and
+    // sets nothing, because the request block only exists when an edge is named.
+    if tile_overlap.is_some() && tile_edge.is_none() {
+        return Err("--overlap needs a --tile to apply to".into());
+    }
+    let tile = tile_edge.map(|edge| (edge, tile_overlap.unwrap_or(edge / 4)));
     let budget_bytes = budget_mib * 1024 * 1024;
     println!(
         "iOS image-generation budget\n  budget {budget_mib} MiB ({:.1} GiB) -- an 8 GB device's \
@@ -227,6 +272,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             size,
             steps,
             count,
+            tile,
             "RESIDENT (all components co-resident)",
         )?)
     };
@@ -240,6 +286,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             size,
             steps,
             count,
+            tile,
             "SEQUENTIAL (encode -> drop encoder -> denoise -> shed DiT -> decode)",
         )?)
     };

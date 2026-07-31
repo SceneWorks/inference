@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p mlx-gen-ios-catalog --example tiling_fidelity -- <snapshot_dir>
-//!     [--size N] [--steps N] [--tiles 512,256,192,128] [--out DIR]
+//!     [--size N] [--steps N] [--tiles 512,256,192,128] [--overlap PX] [--out DIR]
 //! ```
 //!
 //! # Why this exists separately from the parity test
@@ -26,7 +26,8 @@
 use std::path::Path;
 
 use mlx_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
+    Progress, WeightsSource,
 };
 
 fn main() {
@@ -69,7 +70,19 @@ fn diff(a: &Image, b: &Image) -> Diff {
     }
 }
 
-fn generate(dir: &Path, size: u32, steps: u32) -> Result<Image, Box<dyn std::error::Error>> {
+/// Render once. `tile` names the decode geometry through the **request**; `None` leaves whatever the
+/// env override / residency default selects (which is how the whole-image baseline is taken).
+///
+/// The request path rather than `MLX_GEN_SANA_DECODE_TILE`, because the env override derives its
+/// overlap as `edge / 4` with no way to say otherwise — and this example's whole job is to attribute a
+/// pixel difference to one variable at a time. A sweep that moved the edge and the overlap together
+/// cannot say which of them the difference came from.
+fn generate(
+    dir: &Path,
+    size: u32,
+    steps: u32,
+    tile: Option<(u32, u32)>,
+) -> Result<Image, Box<dyn std::error::Error>> {
     let spec = LoadSpec {
         // Sequential is the iOS policy, and the one whose peak this whole effort is bounding.
         offload_policy: OffloadPolicy::Sequential,
@@ -85,8 +98,23 @@ fn generate(dir: &Path, size: u32, steps: u32) -> Result<Image, Box<dyn std::err
         // Fixed seed: the tiled and whole-image runs must denoise to the SAME latent, or the
         // comparison measures sampling variance instead of the decode.
         seed: Some(0),
+        memory: tile.map(|(edge, overlap)| GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(edge),
+            decode_overlap: Some(overlap),
+            ..Default::default()
+        }),
         ..Default::default()
     };
+    // Read the geometry back rather than trusting the argument: this example has already shipped one
+    // wrong table because the knob it set was not the knob the run used.
+    match mlx_gen_sana::pipeline::resolved_decode_plan(request.memory, true) {
+        Some(plan) => println!(
+            "    decode: TILED edge={} overlap={} (chosen by {:?})",
+            plan.edge, plan.overlap, plan.source
+        ),
+        None => println!("    decode: WHOLE-IMAGE"),
+    }
     let mut noop = |_: Progress| {};
     match generator.generate(&request, &mut noop)? {
         GenerationOutput::Images(mut images) if !images.is_empty() => Ok(images.remove(0)),
@@ -110,7 +138,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut size = 1024u32;
     let mut steps = 4u32;
-    let mut tiles = vec![512i32, 256, 192, 128];
+    let mut tiles = vec![512i32, 384, 256, 192, 128];
+    // ONE overlap across the whole sweep, matching what the contract ladder publishes
+    // (`memory_strategy::DECODE_OVERLAP`, carried by `mlx_gen_pid::DecodeRoutes` as a single
+    // `native_overlap`). Held fixed so the edge is the only variable moving down the table.
+    let mut overlap = 48u32;
     let mut out_dir: Option<String> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -124,13 +156,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(str::parse)
                     .collect::<Result<_, _>>()?
             }
+            "--overlap" => overlap = args.next().ok_or("--overlap needs a value")?.parse()?,
             "--out" => out_dir = Some(args.next().ok_or("--out needs a value")?),
             other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
     let dir = Path::new(&dir);
 
-    println!("DC-AE decode tiling fidelity\n  {size}px, {steps} steps, seed 0");
+    println!("DC-AE decode tiling fidelity\n  {size}px, {steps} steps, seed 0, overlap {overlap} (fixed)");
 
     // Baseline: whole-image, forced with `0`.
     //
@@ -144,8 +177,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // cannot be bit-identical to an untiled one, and it was identical because it was being compared
     // against itself. Only `0` expresses whole-image now.
     std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
-    let baseline = generate(dir, size, steps)?;
+    let baseline = generate(dir, size, steps, None)?;
     println!("  baseline (whole-image decode, forced with MLX_GEN_SANA_DECODE_TILE=0) rendered");
+    // The override has to come back OFF before the tiled rows, or it would beat every request block
+    // below and silently re-render the baseline seven times. `remove_var` is correct here and was
+    // wrong for the baseline — the same call means different things on the two sides of this line,
+    // which is exactly why the baseline is now forced with an explicit `0`.
+    std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
     if let Some(out) = &out_dir {
         write_png(&baseline, &Path::new(out).join("baseline.png"))?;
     }
@@ -155,8 +193,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "tile", "max |Δ|", "mean |Δ|", ">8/255", ">32/255"
     );
     for tile in &tiles {
-        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", tile.to_string());
-        let tiled = generate(dir, size, steps)?;
+        let tiled = generate(dir, size, steps, Some((*tile as u32, overlap)))?;
         let d = diff(&baseline, &tiled);
         println!(
             "  {tile:>6}  {:>7}  {:>8.3}  {:>8.2}%  {:>8.2}%",
@@ -166,7 +203,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             write_png(&tiled, &Path::new(out).join(format!("tile_{tile}.png")))?;
         }
     }
-    std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
 
     println!(
         "\n  A convolutional boundary artifact concentrates at seams and shrinks with overlap.\n  \

@@ -226,6 +226,11 @@ pub struct Sana {
     /// `true` for SANA-Sprint (CFG-free SCM few-step) — read at encode time (before the heavy bundle is
     /// available under `Sequential`) to gate the uncond forward and resolve the default guidance.
     sprint: bool,
+    /// The shared memory-strategy contract (SC-15449) for the id and [`LoadSpec`] this generator was
+    /// loaded with. Held rather than rebuilt per call because it is load-exact on both axes: the
+    /// component byte sums come from the resolved snapshot, and the offload policy selects the
+    /// calibration identity.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
 }
 
 /// Construct a SANA generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -262,6 +267,7 @@ fn load_from(
         descriptor,
         residency,
         sprint,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(id, spec)?,
     }))
 }
 
@@ -412,10 +418,48 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-mlx_gen::impl_generator!(Sana {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `impl_generator!` because this provider also implements the shared
+// memory-strategy hooks (SC-15449); `descriptor` / `validate` / `generate` are the identical plain
+// delegation the macro would have emitted.
+impl Generator for Sana {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        // `self.descriptor.id`, not a constant: one struct serves both `sana_1600m` and
+        // `sana_sprint_1600m`, and a scope that reported the wrong id would attribute a Sprint run's
+        // rejections to the base provider.
+        crate::memory_strategy::begin_request(self.descriptor.id, &self.memory_strategy, context)
+    }
+}
 
 impl Sana {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -587,6 +631,24 @@ mlx_gen::register_generators! {
     pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint;
     footprint = component_footprint
 }
+
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load,
+/// so the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+    };
+
+/// Sprint's own registration. Its declaration is identical to the base id's — the scheduler and the
+/// guidance axis are not memory seams — but the registry is keyed by provider id, so a selector
+/// asking about `sana_sprint_1600m` must find an entry rather than falling through to the
+/// resident-only compatibility default.
+pub const SPRINT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: SPRINT_MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(SPRINT_MODEL_ID, spec),
+    };
 
 #[cfg(test)]
 mod tests {

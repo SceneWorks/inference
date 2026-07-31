@@ -43,6 +43,7 @@
 pub mod config;
 pub mod convert;
 pub mod dc_ae;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub(crate) mod quant;
@@ -64,12 +65,19 @@ pub use text_encoder::{
 pub use transformer::SanaTransformer;
 
 /// Add all MLX Sana generators to an explicit media registry builder.
+///
+/// The two `register_memory_strategy` calls are what make the SC-15449 contract resolvable **before**
+/// a load: a worker sizing a request needs the ladder and the calibration identity while it is still
+/// deciding whether to load at all. Without them a selector sees the resident-only compatibility
+/// default and can never choose the bounded decode this provider does implement.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::BASE_REGISTRATION)
         .register_generator(model::SPRINT_REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_strategy(model::SPRINT_MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Sana provider catalog.
