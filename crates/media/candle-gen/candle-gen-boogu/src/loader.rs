@@ -180,7 +180,14 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         } else {
             None
         };
-        return QLinear::packed(&wq, &scales, &biases, dense_bias, cfg.group_size as usize);
+        return QLinear::packed(
+            &wq,
+            &scales,
+            &biases,
+            dense_bias,
+            cfg.group_size as usize,
+            cfg.bits,
+        );
     }
     Ok(QLinear::dense(linear(w, base, bias)?))
 }

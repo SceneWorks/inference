@@ -33,7 +33,14 @@ pub enum QLinear {
     Dense(Linear),
     /// Loaded directly from the MLX-packed tier through the shared module — the resident `Q4_1` weight
     /// **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast path).
-    Packed(shared::QLinear),
+    Packed {
+        linear: shared::QLinear,
+        /// Bit width declared by the packed component's `config.json`. This stays beside the
+        /// repacked GGUF weight so a consumer with a component precision floor can reject an
+        /// already-packed tier that is below that floor instead of silently treating every packed
+        /// projection as idempotent.
+        bits: i32,
+    },
 }
 
 impl QLinear {
@@ -51,11 +58,13 @@ impl QLinear {
         biases: &Tensor,
         bias: Option<Tensor>,
         group_size: usize,
+        bits: i32,
     ) -> Result<Self> {
         let device = wq.device().clone();
-        Ok(Self::Packed(shared::QLinear::from_packed_gs(
-            wq, scales, biases, bias, group_size, &device,
-        )?))
+        Ok(Self::Packed {
+            linear: shared::QLinear::from_packed_gs(wq, scales, biases, bias, group_size, &device)?,
+            bits,
+        })
     }
 
     /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
@@ -63,7 +72,7 @@ impl QLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
+            Self::Packed { linear, .. } => linear.forward(x),
         }
     }
 
@@ -80,24 +89,37 @@ impl QLinear {
                 let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
                 Linear::new(w, b).forward(x)
             }
-            Self::Packed(l) => l.forward(x),
+            Self::Packed { linear, .. } => linear.forward(x),
         }
     }
 
-    /// Fold a dense projection to the requested GGUF tier on `device`; idempotent for an already
-    /// packed projection. Mage uses this to enforce its Q8 LM-layer floor even when the caller gives
-    /// Candle a dense upstream snapshot instead of the hosted pre-packed tier.
+    /// Fold a dense projection to the requested GGUF tier on `device`. An already-packed projection
+    /// is accepted only when its declared bit width meets or exceeds the request. Mage uses this to
+    /// enforce its Q8 LM-layer floor for both dense upstream snapshots and pre-packed tiers; a stale
+    /// or custom uniform-Q4 text encoder now fails at load instead of being reported as Q8.
     pub fn quantize_dequant_onto(
         &mut self,
         quant: Quant,
         device: &candle_gen::candle_core::Device,
     ) -> Result<()> {
-        let Self::Dense(linear) = self else {
+        if let Self::Packed { bits, .. } = self {
+            if *bits < quant.bits() {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "boogu: packed {bits}-bit linear is below the requested {}-bit component precision floor",
+                    quant.bits()
+                )));
+            }
             return Ok(());
+        }
+        let Self::Dense(linear) = self else {
+            unreachable!()
         };
         let mut packed = shared::QLinear::from_dense(shared::DenseLinear::Linear(linear.clone()));
         packed.quantize_dequant_onto(quant, device)?;
-        *self = Self::Packed(packed);
+        *self = Self::Packed {
+            linear: packed,
+            bits: quant.bits(),
+        };
         Ok(())
     }
 
@@ -105,7 +127,7 @@ impl QLinear {
     /// the loaders + tests to assert a packed tier fired the packed path (not a silent dense fallback).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
+        matches!(self, Self::Packed { .. })
     }
 }
 
@@ -220,7 +242,7 @@ mod tests {
         let (out_dim, in_dim) = (128usize, 256usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
 
-        let packed = QLinear::packed(&wq, &s, &b, None, G)?;
+        let packed = QLinear::packed(&wq, &s, &b, None, G, 4)?;
         assert!(packed.is_packed(), "group-32 triple ⇒ packed load");
         let dense = QLinear::dense(Linear::new(
             Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
@@ -233,6 +255,21 @@ mod tests {
         assert!(
             cos > 0.99999,
             "group-32 packed vs affine-grid cosine {cos:.6}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_q4_linear_cannot_satisfy_a_q8_component_floor() -> Result<()> {
+        let dev = Device::Cpu;
+        let (wq, s, b, _) = q4_packed(64, 128);
+        let mut packed = QLinear::packed(&wq, &s, &b, None, G, 4)?;
+        let error = packed
+            .quantize_dequant_onto(candle_gen::gen_core::Quant::Q8, &dev)
+            .expect_err("a packed q4 linear must not silently satisfy a q8 floor");
+        assert!(
+            error.to_string().contains("below the requested 8-bit"),
+            "unexpected error: {error}"
         );
         Ok(())
     }

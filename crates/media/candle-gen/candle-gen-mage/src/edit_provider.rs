@@ -13,7 +13,7 @@ use candle_transformers::models::z_image::sampling::postprocess_image;
 
 use crate::config::LATENT_CHANNELS;
 use crate::rope::{ImgShape, PackLayout};
-use crate::{scheduler, MageConfig, MageTextEncoder, MageTransformer, MageVae};
+use crate::{scheduler, MageComponentDirs, MageConfig, MageTextEncoder, MageTransformer, MageVae};
 use candle_gen::gen_core::Quant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,17 +61,25 @@ impl MageEdit {
     }
 
     pub fn load_with_quant(root: &Path, quant: Option<Quant>, device: &Device) -> Result<Self> {
-        let cfg_text = std::fs::read_to_string(root.join("transformer/config.json"))?;
+        Self::load_components(&MageComponentDirs::flat(root), quant, device)
+    }
+
+    pub(crate) fn load_components(
+        dirs: &MageComponentDirs,
+        quant: Option<Quant>,
+        device: &Device,
+    ) -> Result<Self> {
+        let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
         let cfg = MageConfig::from_json(&cfg_text)?;
         Ok(Self {
-            text: MageTextEncoder::load_multimodal_with_quant(root, quant, device)?,
-            transformer: MageTransformer::load_with_quant(
-                &root.join("transformer"),
-                &cfg,
+            text: MageTextEncoder::load_component_with_quant(
+                &dirs.text_encoder,
+                true,
                 quant,
                 device,
             )?,
-            vae: MageVae::load_full(&root.join("vae"), device)?,
+            transformer: MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?,
+            vae: MageVae::load_full(&dirs.vae, device)?,
             device: device.clone(),
         })
     }

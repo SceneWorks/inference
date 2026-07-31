@@ -29,15 +29,15 @@ pub struct MageTextEncoder {
 
 impl MageTextEncoder {
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
-        Self::load_inner(root, device, false, None)
+        Self::load_inner(&root.join("text_encoder"), device, false, None)
     }
 
     pub fn load_with_quant(root: &Path, quant: Option<Quant>, device: &Device) -> Result<Self> {
-        Self::load_inner(root, device, false, quant)
+        Self::load_inner(&root.join("text_encoder"), device, false, quant)
     }
 
     pub fn load_multimodal(root: &Path, device: &Device) -> Result<Self> {
-        Self::load_inner(root, device, true, None)
+        Self::load_inner(&root.join("text_encoder"), device, true, None)
     }
 
     pub fn load_multimodal_with_quant(
@@ -45,17 +45,25 @@ impl MageTextEncoder {
         quant: Option<Quant>,
         device: &Device,
     ) -> Result<Self> {
-        Self::load_inner(root, device, true, quant)
+        Self::load_inner(&root.join("text_encoder"), device, true, quant)
+    }
+
+    pub(crate) fn load_component_with_quant(
+        dir: &Path,
+        multimodal: bool,
+        quant: Option<Quant>,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::load_inner(dir, device, multimodal, quant)
     }
 
     fn load_inner(
-        root: &Path,
+        dir: &Path,
         device: &Device,
         multimodal: bool,
         quant: Option<Quant>,
     ) -> Result<Self> {
-        let dir = root.join("text_encoder");
-        let weights = Weights::from_dir(&dir, device, DType::BF16)?;
+        let weights = Weights::from_dir(dir, device, DType::BF16)?;
         let cfg = BooguTextEncoderConfig {
             num_layers: TE_LAYERS,
             num_heads: TE_HEADS,
