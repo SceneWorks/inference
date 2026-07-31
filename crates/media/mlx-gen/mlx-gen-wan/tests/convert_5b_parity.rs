@@ -17,10 +17,29 @@ use mlx_gen::weights::Weights;
 use mlx_gen_wan::convert::convert_ti2v_5b;
 use mlx_rs::ops::array_eq;
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 fn golden_dir() -> PathBuf {
     if let Ok(d) = std::env::var("WAN_TI2V_5B_DIR") {
         return PathBuf::from(d);
     }
+    // Deliberately `$HOME` and NOT `converted_root()`: the goldens live in the SceneWorks app
+    // support tree, a different store from the `.cache/mlx-gen-models` one the conversions write to.
+    // `WAN_TI2V_5B_DIR` above is this path's override, so it is already the fallback shape.
     let home = std::env::var("HOME").unwrap();
     PathBuf::from(home)
         .join("Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b")
@@ -115,13 +134,13 @@ fn ti2v_5b_convert_matches_golden() {
 fn ti2v_5b_materialize_bf16_snapshot() {
     let ckpt = checkpoint_dir();
     assert!(ckpt.is_dir(), "checkpoint dir missing: {}", ckpt.display());
-    let home = PathBuf::from(std::env::var("HOME").unwrap());
-    let out = home.join(".cache/mlx-gen-models/wan_2_2_ti2v_5b_mlx_bf16");
+    let home = converted_root();
+    let out = home.join("wan_2_2_ti2v_5b_mlx_bf16");
     eprintln!("converting {} → {}", ckpt.display(), out.display());
     convert_ti2v_5b(&ckpt, &out).unwrap();
 
     // Copy the shared UMT5 tokenizer from the cached I2V-A14B bf16 snapshot (converter doesn't emit it).
-    let tok_src = home.join(".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16/tokenizer.json");
+    let tok_src = home.join("wan2_2_i2v_a14b_mlx_bf16/tokenizer.json");
     assert!(
         tok_src.is_file(),
         "tokenizer source missing: {} (need a cached Wan bf16 snapshot)",

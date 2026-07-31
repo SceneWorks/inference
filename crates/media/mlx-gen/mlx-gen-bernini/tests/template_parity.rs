@@ -23,9 +23,24 @@ const FIXTURE: &str = concat!(
     "/tests/fixtures/template_golden.safetensors"
 );
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 fn snapshot() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/mlx-gen-models/bernini_planner_mlx_bf16")
+    converted_root().join("bernini_planner_mlx_bf16")
 }
 
 fn want_i32(w: &Weights, key: &str) -> Vec<i32> {

@@ -73,6 +73,16 @@ must load. `deny.toml` bans the same network clients for defense in depth. Expli
 test env vars (`MLX_LLM_TEST_MODEL`, per-crate `*_SNAPSHOT`/`*_SNAPSHOT_DIR`) stay allowed — the
 lint targets cache-location *derivation*, not passed-in paths.
 
+`check_snapshot_path_derivation` extends that boundary into **test harnesses**, where the same defect
+survived unlinted: a resolver that reads `$HOME` with no override anywhere in its chain means
+pointing a variable at a real store reads somewhere else, so the row skips or mis-resolves *while
+still reporting green*. It fails a `$HOME` read in a function that also joins a store-shaped literal
+and reads no other env var — all three conditions, because dropping any one re-flags the legitimate
+`env::var(NAME).unwrap_or_else(|_| home.join(…))` fallback the passing harnesses use. The fix shape
+is **adding the override, not deleting the path**: keep `$HOME` as the default for a *derived cache*
+the tests build themselves (`MLX_GEN_CONVERTED_ROOT`, `LTX_GOLDEN_ROOT`), and hard-fail with the
+epic-13657 message for a *provided input* (`BOOGU_VISION_TEST_IMAGE`).
+
 ## Architecture — explicit composition (the core invariant)
 
 Read `docs/architecture/inference-rearchitecture.md` before changing composition. Dependency

@@ -639,6 +639,95 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         )
 
 
+# A path literal shaped like a model/cache store — the thing a `$HOME` read is being used to build.
+# Deliberately narrow: a `$HOME` read that joins nothing store-shaped (a bare `home()` accessor, a
+# `~/` expander) is not the defect and must not be flagged, or the lint gets switched off.
+SNAPSHOT_STORE_LITERAL = re.compile(
+    r'"\.cache/|"Library/Application Support/|"Repos/|"\.\w+/models'
+)
+HOME_READ = re.compile(r'env::var(?:_os)?\("HOME"\)')
+# Any env read that is NOT `"HOME"` — a named override, or one whose name arrives as a binding
+# (`env::var(var)`, `env::var(format!(…))`). Its presence means the chain HAS an override.
+NON_HOME_ENV_READ = re.compile(r'env::var(?:_os)?\(\s*(?!"HOME")')
+
+
+def _enclosing_fn(lines: list[str], index: int) -> tuple[int, list[str]]:
+    """The `fn` containing line ``index``, as (start line, body lines)."""
+    for start in range(index, -1, -1):
+        if re.match(r"\s*(pub\s+)?(async\s+)?fn\s+\w+", lines[start]):
+            depth, cursor, opened = 0, start, False
+            while cursor < len(lines):
+                depth += lines[cursor].count("{") - lines[cursor].count("}")
+                if "{" in lines[cursor]:
+                    opened = True
+                if opened and depth <= 0:
+                    return start, lines[start : cursor + 1]
+                cursor += 1
+            return start, lines[start:]
+    return index, [lines[index]]
+
+
+def check_snapshot_path_derivation(root: Path) -> None:
+    """Fail when a snapshot/cache path is derived from ``$HOME`` with no override in the chain.
+
+    ``check_rust_sources`` already bans HF-cache *references* under epic 13657, but only in
+    production ``src/``. The same defect survived in test harnesses, where nothing linted it: a
+    resolver that reads ``$HOME`` unconditionally means pointing an env var at a real store reads
+    somewhere else entirely, and the suite skips or mis-resolves **while still reporting green**.
+    That is the failure mode worth a gate — a red row says "fix me", a silently-skipped one says
+    nothing at all.
+
+    Two shapes hide behind a naive ``grep`` for ``env::var("HOME")`` and only one is a defect:
+
+    * **Fallback** — an override is read first and ``$HOME`` is only the default. Harmless, and the
+      shape this repo's own passing harnesses use.
+    * **Derivation** — no override anywhere in the resolution chain.
+
+    What this enforces, precisely, and no more: a ``$HOME`` read in a function that **also** joins a
+    store-shaped literal (``SNAPSHOT_STORE_LITERAL``) and reads **no** other env var. All three
+    conditions are needed. Dropping the store-literal one re-flags every bare ``fn home()`` accessor
+    and every ``~/``-expander; dropping the env-read one re-flags every legitimate
+    ``env::var(NAME).unwrap_or_else(|_| home.join(…))``.
+
+    Two residual gaps, named rather than implied away:
+
+    1. It is **function-scoped**, so a resolver that reads its override in one function and joins
+       ``$HOME`` in another reads as a derivation. No such site exists today — the accessor shapes
+       in `mlx-gen-scail2` and `mlx-gen-krea-realtime` join nothing and are excluded by the store
+       literal — but a future one would need the override moved into the joining function, or an
+       exemption argued here.
+    2. It cannot tell a *derived cache* (correctly given a ``$HOME`` fallback) from a *provided
+       input* (which should hard-fail with the epic-13657 message). Both satisfy it. Which of the
+       two a path is remains a judgement the author makes; see `mlx-gen-boogu`'s
+       ``BOOGU_VISION_TEST_IMAGE`` for the required shape and `converted_root()` for the fallback.
+    """
+    violations: list[str] = []
+    for path in sorted(root.rglob("*.rs")):
+        relative = path.relative_to(root)
+        if not IGNORED_TREE_PARTS.isdisjoint(relative.parts):
+            continue
+        lines = strip_rust_comments(path.read_text(encoding="utf-8")).split("\n")
+        for index, line in enumerate(lines):
+            if not HOME_READ.search(line):
+                continue
+            start, body = _enclosing_fn(lines, index)
+            text = "\n".join(body)
+            if not SNAPSHOT_STORE_LITERAL.search(text):
+                continue
+            if NON_HOME_ENV_READ.search(text):
+                continue
+            violations.append(f"{relative}:{start + 1}: {lines[start].strip()}")
+
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "a snapshot/cache path is derived from $HOME with no env override in the resolution "
+            "chain, so pointing a variable at a real store cannot reach it and the row skips while "
+            "looking green. Add the override (keep $HOME as the default for a derived cache; hard-"
+            "fail with the epic-13657 message for a provided input):\n  " + joined
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -655,6 +744,7 @@ def main() -> int:
         check_network_clients(metadata)
         check_rust_sources(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
+        check_snapshot_path_derivation(ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
         return 1
@@ -662,7 +752,8 @@ def main() -> int:
     print(
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
-        "intentional tokenizer split, no network clients, no HF-cache references)"
+        "intentional tokenizer split, no network clients, no HF-cache references, "
+        "no $HOME-derived snapshot paths)"
     )
     return 0
 

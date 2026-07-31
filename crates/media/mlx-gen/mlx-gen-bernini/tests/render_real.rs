@@ -11,6 +11,22 @@ use mlx_gen_wan::convert::assemble_bernini_renderer_snapshot;
 
 const MODEL_ID: &str = "bernini_renderer";
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
     let snaps = PathBuf::from(home)
@@ -24,12 +40,12 @@ fn hf_snapshot(repo: &str) -> Option<PathBuf> {
 
 /// Assemble the converted renderer snapshot once (reused across reruns), returning its dir.
 fn ensure_snapshot() -> PathBuf {
-    let home = PathBuf::from(std::env::var("HOME").unwrap());
-    let snapshot = home.join(".cache/mlx-gen-models/bernini_renderer_mlx_bf16");
+    let home = converted_root();
+    let snapshot = home.join("bernini_renderer_mlx_bf16");
     if !snapshot.join("high_noise_model.safetensors").is_file() {
         let pkg = hf_snapshot("ByteDance/Bernini-Diffusers")
             .expect("ByteDance/Bernini-Diffusers snapshot in the HF cache");
-        let base = home.join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16");
+        let base = home.join("wan2_2_t2v_a14b_mlx_bf16");
         assert!(
             base.join("high_noise_model.safetensors").is_file(),
             "converted base Wan2.2-T2V-A14B snapshot required at {}",
