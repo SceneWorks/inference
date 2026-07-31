@@ -221,7 +221,7 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
 /// The range half, by contrast, is new **only** on the sentinel path: an explicit out-of-range size
 /// was already refused by the shared floor above, which exempts `0x0` and nothing else.
 ///
-/// # Explicit-grid parity and the remaining sentinel difference
+/// # Explicit-grid and sentinel parity
 ///
 /// The **area** halves now agree: both measure the lattice-aligned geometry — what actually renders.
 /// candle used to measure `req.width * req.height` raw, so a request between the two, e.g. `1280x730`
@@ -233,9 +233,8 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
 /// lattice-aligned geometry here because this function also checks a size resolved from the driving
 /// clip, whose source-media geometry may be off-grid.
 ///
-/// The backends do still disagree about the **sentinel itself**, which neither story changes:
-/// candle declares `SizeFloor::RangeCheckedOnGrid` and so refuses `0x0` at `validate`, leaving its
-/// own resolve-from-the-clip branch unreachable dead code (sc-16199).
+/// sc-16199 subsequently brought the Candle sibling onto this same safe sentinel contract: both
+/// backends now resolve `0x0` from the driving clip and bound the resolved geometry before rendering.
 ///
 /// The paired [`reject_off_grid`](mlx_gen_wan::pipeline::reject_off_grid) from the `model_vace.rs`
 /// site cannot be applied to this *resolved* geometry unchanged: it would refuse an ordinary
