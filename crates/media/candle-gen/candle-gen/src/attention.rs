@@ -328,8 +328,8 @@ where
 /// rather than from the shared planner. Compiled out entirely in release; `RUST_TEST_THREADS=1` is
 /// forced repo-wide (`.cargo/config.toml`), so a process-global counter is safe. Mirrors
 /// `mlx_gen::attention`'s probe so the two backends' conformance tests read the same way.
-#[cfg(test)]
-mod chunk_probe {
+#[cfg(any(test, feature = "testkit"))]
+pub mod chunk_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -348,12 +348,12 @@ mod chunk_probe {
 #[cfg(test)]
 use chunk_probe::{last_chunk_count, reset as reset_chunk_count};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 fn record_chunk_count(n: usize) {
     chunk_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 #[inline(always)]
 fn record_chunk_count(_n: usize) {}
 
