@@ -12,8 +12,8 @@
 //!
 //! ## Branch quantization is not a lever — it is how packing works
 //!
-//! Packing the Krea pose-control branch to the base tier used to be the last rung of a per-lane
-//! escalation ladder (`Lever::BranchQuant`, sc-11748): a constrained machine engaged residency
+//! Packing the Krea pose-control branch to the base tier used to be the last rung of a provider-local
+//! escalation ladder (the former branch-quantization step, sc-11748): a constrained machine engaged residency
 //! flips and decode tiling first, clawing back single-digit GiB, while the branch sat resident at
 //! **bf16** the entire time. The size of that unrequested precision is a shape fact, not a
 //! measurement: the branch's projections are **3.30 B params ≈ 6.6 GB bf16**, and the packed
@@ -22,7 +22,7 @@
 //! carried a bf16 branch held **~3.3 GB** it never asked for, and a q4 render **~4.9 GB**. That is
 //! the invariant above, implemented as an escalation step, and it is deleted. The branch's tier is
 //! now a pure function of the base tier — [`control_branch_tier`] — decided once at load with no
-//! reference to the device budget.
+//! reference to the device budget. The obsolete provider-local ladder was deleted by sc-15808.
 //!
 //! Those weight-side deltas are the only branch figures this module will quote. The catalog's
 //! `candle.control.branchPackSaveGb` (q8 −8.4, q4 −10.2 GB) are **not** weight-side quantities —

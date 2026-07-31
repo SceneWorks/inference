@@ -78,11 +78,12 @@ struct ControlHeavyOwned {
     heavy: KreaHeavy,
     branch: Krea2ControlBranch,
     /// The effective base-DiT quant tier (`None` = dense bf16). Captured at load so the render-time
-    /// decode-tiling budget gate (sc-11747) can weigh the resident-weight footprint without re-deriving
-    /// it from the (post-quant) modules.
+    /// geometry safety check can weigh the resident-weight footprint without re-deriving it from the
+    /// (post-quant) modules.
     base_tier: Option<Quant>,
-    /// The tier the pose branch was actually packed to at load (sc-11748) — `Some` only when the
-    /// branch-quant lever engaged, else `None` (bf16). Feeds the same decode-tiling gate.
+    /// The tier the pose branch was actually packed to at load (sc-15799): it follows the base tier,
+    /// with the declared q4 → q8 floor, and is `None` only for a dense branch. Feeds the same geometry
+    /// safety check.
     branch_tier: Option<Quant>,
     /// Architecture config, retained for the decode-tiling cost model (block/hidden/FFN widths).
     cfg: Krea2Config,
@@ -101,6 +102,17 @@ impl ControlHeavyOwned {
             heavy: &self.heavy,
             branch: &self.branch,
         }
+    }
+}
+
+fn selected_decode_tiling(
+    memory: Option<gen_core::GenerationMemory>,
+) -> Result<Option<mlx_gen::tiling::TilingConfig>> {
+    match memory {
+        Some(memory) if memory.tile_vae_decode => Ok(Some(
+            crate::memory::requested_control_decode_tiling(memory)?,
+        )),
+        _ => Ok(None),
     }
 }
 
@@ -300,7 +312,7 @@ impl KreaTurboControl {
 
         // Under `Resident` the phase-A Qwen3-VL encoder stays warm through the decode, so its footprint
         // co-resides in the decode peak; under `Sequential` it was dropped before the heavy phase. The
-        // decode-tiling budget gate (sc-11747) needs to know which, so capture it here (before the
+        // selected-shape geometry check needs to know which, so capture it here (before the
         // `residency.run` borrow) to avoid capturing `self` in the heavy closure below.
         let text_co_resident = !self.residency.is_sequential();
 
@@ -339,6 +351,15 @@ impl KreaTurboControl {
                 let heavy = heavy_owned.as_ref();
                 let safe_gib = mlx_gen::memory::safe_budget_gib();
 
+                // Apply only the bounded-decode parameters selected upstream from promoted evidence.
+                // Resident and staged-residency requests remain single-pass: this provider must not run
+                // a second live-budget selector and silently upgrade either strategy to bounded decode.
+                let decode_tiling = selected_decode_tiling(req.memory)?;
+                let decode_tile_edge = decode_tiling
+                    .as_ref()
+                    .and_then(|tiling| tiling.spatial.as_ref())
+                    .map(|spatial| spatial.tile_px as u32);
+
                 // Feasibility is evaluated at the requested geometry only. No provider path may rewrite
                 // width or height: an infeasible request is refused before control preprocessing or
                 // render. There is currently no provider-owned current measurement bundle from which to
@@ -352,30 +373,9 @@ impl KreaTurboControl {
                     req.width,
                     req.height,
                     text_co_resident,
+                    decode_tile_edge,
                 );
                 crate::memory::require_control_geometry(req.width, req.height, feasible)?;
-
-                // Budget-gated decode tiling (sc-11747): estimate the Qwen-VAE decode peak from this
-                // render's shape + the resident-weight footprint (base tier + pose branch tier) and, if it
-                // exceeds this machine's `safe_budget_gib()`, size the largest tile that fits — else run
-                // single-pass (a machine with headroom pays zero tiling overhead). Count-invariant (shape
-                // + tiers only), so it is decided ONCE here and reused for every seed. An infeasible
-                // decode surfaces here as a catchable error, before the render, rather than an OOM mid-run.
-                let decode_tiling = match req.memory {
-                    Some(memory) if memory.tile_vae_decode => {
-                        Some(crate::memory::requested_control_decode_tiling(memory)?)
-                    }
-                    _ => crate::memory::plan_control_decode_tiling(
-                        safe_gib,
-                        &heavy_owned.cfg,
-                        heavy.branch.num_blocks(),
-                        heavy_owned.base_tier,
-                        heavy_owned.branch_tier,
-                        req.width,
-                        req.height,
-                        text_co_resident,
-                    )?,
-                };
 
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
@@ -477,6 +477,32 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
+
+    #[test]
+    fn decode_tiling_follows_only_the_selected_generation_memory() {
+        assert!(selected_decode_tiling(None).unwrap().is_none());
+        assert!(
+            selected_decode_tiling(Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }))
+            .unwrap()
+            .is_none(),
+            "staged residency must not be upgraded by a provider-local budget decision"
+        );
+
+        let selected = selected_decode_tiling(Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(crate::memory_strategy::DECODE_TILE_EDGE),
+            decode_overlap: Some(crate::memory_strategy::DECODE_OVERLAP),
+            ..Default::default()
+        }))
+        .unwrap()
+        .expect("the upstream bounded-decode selection must be applied");
+        let spatial = selected.spatial.unwrap();
+        assert_eq!(spatial.tile_px, 512);
+        assert_eq!(spatial.overlap_px, 64);
+    }
 
     #[test]
     fn generate_call_path_preserves_requested_geometry_through_render() {

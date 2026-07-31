@@ -38,7 +38,7 @@
 //!
 //! 1. **The ladder never trades cost against cost.** The shared selector walks
 //!    [`MemoryStrategy::ALL`] and takes the *first* rung whose measured peak fits the live budget —
-//!    the cheapest sufficient rung, the same shape [`crate::mempolicy`] uses for its lever ladder.
+//!    the cheapest sufficient rung. This is the one authoritative least-cost decision path.
 //!    Rung 4 is therefore reached only when no cheaper rung is *selectable*, so it never wins over a
 //!    cheaper rung that fits: a cost multiplier on it cannot flip that comparison in either
 //!    direction. Its alternative is no render — usually a rejection, or an `Unverified` verdict where

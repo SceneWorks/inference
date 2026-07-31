@@ -1,10 +1,10 @@
-//! Krea 2 pose-control **memory-adaptation estimators** (sc-11750) — the per-lane peak estimators that
-//! plug the Krea control lane into the shared, backend-neutral escalation policy
-//! ([`mlx_gen::gen_core::mempolicy`]). This module holds the Krea/Qwen-VAE cost model; the escalation
-//! order + budget comparison live in gen-core.
+//! Krea 2 pose-control **memory estimators** — the provider-owned Krea/Qwen-VAE cost model used by
+//! the real-weight calibration harness and defensive selected-shape validation. The promoted integer-byte evidence
+//! produced from that harness is submitted to SceneWorks' worker-owned `select_strategy`; this module
+//! deliberately contains no budget-to-strategy decision.
 //!
-//! Two shape-derived peaks drive the plan (both **excluding** the phase-A Qwen3-VL text encoder, whose
-//! footprint the policy carries once as the residency lever):
+//! Two shape-derived peaks are exposed (both **excluding** the phase-A Qwen3-VL text encoder, whose
+//! footprint is accounted for separately when a caller models co-residency):
 //!   * the **control-denoise** peak — the resident heavy weights (base DiT + the pose branch, at the tier
 //!     [`mlx_gen::gen_core::tier_integrity::control_branch_tier`] assigns it, + the VAE, all held through
 //!     the heavy phase) plus the per-step activation working set of the concatenated single-stream forward
@@ -33,9 +33,8 @@
 //! only tiles/adapts slightly sooner — the Wan sc-4998 / PiD sc-10087 guard): each is rounded up so the
 //! estimate stays ≥ the measured peak (within ≤ ~1.16× at every tested point).
 
-use mlx_gen::gen_core::mempolicy::{plan_memory_adaptation, LaneLevers, MemoryPlan, StagePeaks};
 use mlx_gen::gen_core::tier_integrity::control_branch_tier;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingConfig, VaeTiling};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{Error, Quant, Result};
 
 use crate::config::Krea2Config;
@@ -175,8 +174,8 @@ pub fn qwen_vae_decode_peak_ex_text_gib(
 }
 
 /// The **tiled** Qwen-VAE decode floor (GiB, ex-text): resident heavy weights + the un-shrinkable
-/// full-output buffers + one minimal tile. The least [`plan_memory_adaptation`]'s decode-tiling lever
-/// can drive the decode peak toward (`budgeted_plan` then sizes the actual tile). Pure.
+/// full-output buffers + one minimal tile. This is the lower envelope against which calibrated,
+/// explicitly parameterized bounded-decode candidates are measured. Pure.
 pub fn qwen_vae_decode_tiled_floor_ex_text_gib(
     cfg: &Krea2Config,
     branch_blocks: usize,
@@ -191,156 +190,6 @@ pub fn qwen_vae_decode_tiled_floor_ex_text_gib(
         + RESIDENT_OVERHEAD_GIB
         + (DECODE_ACCUM_BYTES_PER_PIXEL * px) / GIB
         + DECODE_MIN_TILE_GIB
-}
-
-/// Candidate spatial tile sizes (OUTPUT px, multiples of the Qwen-Image VAE's ×8 spatial scale, blended
-/// with a 64 px overlap) offered to [`budgeted_plan`] for the tiled decode. Ordered largest-first for
-/// readability only — the selector keeps the largest-volume tile that fits regardless of position. The
-/// grid spans near-full (768) down to a small 256 tile so a constrained budget always has a fitting
-/// option; on Metal the decode spike is modest (~5.2 KB/px, sc-11847), so even large tiles shave the
-/// peak toward the un-tileable floor.
-const QWEN_DECODE_SPATIAL_PX: [i32; 7] = [768, 640, 512, 448, 384, 320, 256];
-
-/// **Budget-gated** tiling for the Krea control-lane Qwen-VAE decode (sc-11747) — the still-image
-/// analogue of Wan's `auto_tiling_budgeted_z16`. Estimates the decode peak from the render shape and
-/// returns the tiling the render-time decode should use:
-///   • `Ok(None)`    — the single-pass decode already fits `safe_gib` (small image / large-memory Mac);
-///                     the caller runs [`QwenVae::decode`](mlx_gen_qwen_image::vae::QwenVae::decode), so
-///                     single-pass is reached ONLY when safe and a machine with headroom pays ZERO
-///                     tiling overhead (the sc-11750 guarantee).
-///   • `Ok(Some(c))` — tiling is required; `c` sizes the LARGEST tile whose estimated peak ≤ `safe_gib`
-///                     (largest ⇒ fewest tiles ⇒ least overlap recompute ⇒ fastest within budget).
-///   • `Err(..)`     — infeasible even tiled (the resident weights + output buffers alone, or every
-///                     candidate tile, exceed `safe_gib`): a **catchable** error surfaced BEFORE the
-///                     decode, so the caller reports it rather than the OS/GPU killing the process
-///                     mid-decode. On the control lane the cheaper residency / branch-quant levers
-///                     (applied at load) should already have made this feasible; this is the backstop.
-///
-/// The decode `peak_cost` is the Krea/Qwen cost model — and unlike Wan's video cost model it MUST carry
-/// the resident heavy weights, because on Metal they DOMINATE the decode peak (sc-11847: the ~5.2 KB/px
-/// spike is only ~6 GiB @ 1024², the resident weights are the other ~16+ GiB); omitting them would let
-/// the single-pass gate under-count and never tile. The model is: `resident heavy (base DiT + branch) +
-/// fixed overhead (+ co-resident text) + the full-output f32 accumulators (unshrinkable) + the per-TILE
-/// conv spike`. Every constant is shared with the single-pass / tiled-floor estimators above, so this
-/// gate agrees with the [`plan_control_adaptation`] policy on whether single-pass fits.
-///
-/// `text_co_resident` adds the phase-A Qwen3-VL encoder footprint when it stays resident through the
-/// decode (the `Resident` path); under `Sequential` it is dropped before the heavy phase, matching the
-/// `*_ex_text_gib` semantics. `safe_gib` is injected ([`mlx_gen::memory::safe_budget_gib`] at the call
-/// site) so the gate is unit-testable without a device.
-#[allow(clippy::too_many_arguments)]
-pub fn plan_control_decode_tiling(
-    safe_gib: f64,
-    cfg: &Krea2Config,
-    branch_blocks: usize,
-    base_tier: Option<Quant>,
-    branch_tier: Option<Quant>,
-    width: u32,
-    height: u32,
-    text_co_resident: bool,
-) -> Result<Option<TilingConfig>> {
-    let heavy_gib =
-        (base_dit_bytes(cfg, base_tier) + branch_bytes(cfg, branch_blocks, branch_tier)) / GIB;
-    let resident_text = if text_co_resident {
-        text_resident_gib(base_tier)
-    } else {
-        0.0
-    };
-    let resident = heavy_gib + RESIDENT_OVERHEAD_GIB + resident_text;
-
-    // peak_cost(out_f, out_h, out_w, tile_f, tile_h, tile_w): the still-image decode has out_f = 1; a
-    // zero tile yields the accumulator-only floor (`budgeted_plan`'s AccumulatorsExceedBudget probe).
-    let peak_cost = move |_of: i64, oh: i64, ow: i64, _tf: i64, th: i64, tw: i64| {
-        let out_px = (oh * ow) as f64;
-        let tile_px = (th * tw) as f64;
-        resident
-            + (DECODE_ACCUM_BYTES_PER_PIXEL * out_px) / GIB
-            + (DECODE_SPIKE_BYTES_PER_PIXEL * tile_px) / GIB
-    };
-    let candidates = TileCandidates {
-        spatial_px: &QWEN_DECODE_SPATIAL_PX,
-        spatial_overlap_px: 64,
-        temporal: &[], // still image — no temporal axis to tile
-        temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
-    };
-    budgeted_plan(
-        VaeTiling::QWEN_IMAGE,
-        height as i32,
-        width as i32,
-        1, // out_frames
-        safe_gib,
-        candidates,
-        peak_cost,
-    )
-    .map_err(|e| Error::Msg(format!("krea_2 control Qwen-VAE decode: {e}")))
-}
-
-/// Everything the Krea control lane needs to decide its memory-adaptation plan against a device budget.
-/// The caller fills this from the load spec + request; [`plan_control_adaptation`] turns it into a
-/// [`MemoryPlan`] via the shared policy.
-#[derive(Clone, Copy, Debug)]
-pub struct ControlLaneInputs<'a> {
-    /// Architecture config (block count, hidden width, FFN width).
-    pub cfg: &'a Krea2Config,
-    /// Copied branch blocks `N` (`Krea2ControlBranch::num_blocks`; the S0 recipe is 7).
-    pub branch_blocks: usize,
-    /// The base DiT / text-encoder quant tier — `None` = dense bf16, `Some(Q4/Q8)` = packed (sc-11727).
-    pub base_tier: Option<Quant>,
-    /// Requested render size.
-    pub width: u32,
-    pub height: u32,
-    /// Whether the lane can drop to `OffloadPolicy::Sequential` (the Krea control lane wires it).
-    pub supports_sequential: bool,
-}
-
-/// Decide the Krea control lane's memory-adaptation plan (sc-11750): assemble the per-lane
-/// [`StagePeaks`] estimator + [`LaneLevers`] and run them through the shared
-/// [`plan_memory_adaptation`]. `safe_gib` is the device budget ([`mlx_gen::memory::safe_budget_gib`]);
-/// the returned [`MemoryPlan`] tells the caller which non-geometry levers to apply and whether the
-/// requested geometry fits at all.
-///
-/// The pose branch's tier is **not** one of those levers (sc-15799): it is [`control_branch_tier`] of
-/// the base tier, so every peak below is estimated with the branch already at the tier it will actually
-/// load at. There is no branch-quant saving left for the policy to spend.
-pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> MemoryPlan {
-    let levers = LaneLevers {
-        text_resident_gib: text_resident_gib(inputs.base_tier),
-        supports_sequential: inputs.supports_sequential,
-    };
-    // Tier integrity: the branch follows the base tier, with the declared q4 → q8 floor. Same value the
-    // loader packs to, so the estimate describes the configuration that will actually be resident.
-    let branch_tier = control_branch_tier(inputs.base_tier);
-
-    plan_memory_adaptation(
-        safe_gib,
-        levers,
-        StagePeaks {
-            denoise_ex_text_gib: control_denoise_peak_ex_text_gib(
-                inputs.cfg,
-                inputs.branch_blocks,
-                inputs.base_tier,
-                branch_tier,
-                inputs.width,
-                inputs.height,
-            ),
-            decode_ex_text_gib: qwen_vae_decode_peak_ex_text_gib(
-                inputs.cfg,
-                inputs.branch_blocks,
-                inputs.base_tier,
-                branch_tier,
-                inputs.width,
-                inputs.height,
-            ),
-            decode_tiled_floor_ex_text_gib: Some(qwen_vae_decode_tiled_floor_ex_text_gib(
-                inputs.cfg,
-                inputs.branch_blocks,
-                inputs.base_tier,
-                branch_tier,
-                inputs.width,
-                inputs.height,
-            )),
-        },
-    )
 }
 
 /// Map a base-DiT quant width to the [`Quant`] tier it names (`4 → Q4`, `8 → Q8`); any other width is
@@ -373,15 +222,15 @@ pub fn control_branch_quant_bits(base_bits: Option<i32>) -> Option<i32> {
 
 /// Test whether the requested render geometry fits after the non-geometry strategies have engaged.
 /// This is deliberately a predicate: it cannot return a substitute width or height.
-///   * the **un-tileable DENOISE** activation peak — the sc-11749 target (candle #480's ~11 GiB @ 1024²);
-///     resolution is the only lever that shrinks it once residency + branch quant are spent, and
-///   * the **tiled Qwen-VAE DECODE** floor — the best the decode can reach at this resolution (decode
-///     tiling runs next), so the resolution lever never fires for a spike tiling alone would absorb.
+///   * the **un-tileable DENOISE** activation peak — the sc-11749 target (candle #480's ~11 GiB @ 1024²),
+///     and
+///   * the Qwen-VAE decode peak for the strategy already selected upstream: the selected tile edge for
+///     bounded decode, single-pass peak otherwise.
 ///
 /// Both peaks are computed at the ACTUAL `base_tier`/`branch_tier` (a resident weight can't be re-packed
 /// mid-render), so this never assumes a quant saving the loaded model can't realize — unlike the
-/// load-time [`plan_control_adaptation`], which estimates the branch bf16 and treats packing as a future
-/// lever. `text_co_resident` adds the phase-A Qwen3-VL encoder footprint when it stays resident (the
+/// deleted load-time planner, which estimated the branch bf16 and treated packing as a future lever.
+/// `text_co_resident` adds the phase-A Qwen3-VL encoder footprint when it stays resident (the
 /// `Resident` path); under `Sequential` it was dropped before the heavy phase, matching the
 /// `*_ex_text_gib` estimators.
 ///
@@ -397,26 +246,30 @@ pub fn control_geometry_fits(
     width: u32,
     height: u32,
     text_co_resident: bool,
+    decode_tile_edge: Option<u32>,
 ) -> bool {
     let text = if text_co_resident {
         text_resident_gib(base_tier)
     } else {
         0.0
     };
-    // A resolution fits when BOTH the un-tileable denoise peak and the tiled decode floor (decode tiling
-    // engages next, sc-11747) are within budget at that size — the text encoder counted only when it
-    // stays co-resident (`Resident`; `Sequential` dropped it before the heavy phase).
+    // A resolution fits when both the un-tileable denoise peak and the SELECTED decode shape are within
+    // budget — the provider validates that selection but never changes it. The text encoder is counted
+    // only when it stays co-resident (`Resident`; `Sequential` dropped it before the heavy phase).
     let denoise =
         control_denoise_peak_ex_text_gib(cfg, branch_blocks, base_tier, branch_tier, width, height)
             + text;
-    let decode = qwen_vae_decode_tiled_floor_ex_text_gib(
-        cfg,
-        branch_blocks,
-        base_tier,
-        branch_tier,
-        width,
-        height,
-    ) + text;
+    let decode = if let Some(tile_edge) = decode_tile_edge {
+        let heavy = base_dit_bytes(cfg, base_tier) + branch_bytes(cfg, branch_blocks, branch_tier);
+        let output_px = width as f64 * height as f64;
+        let tile_px = tile_edge as f64 * tile_edge as f64;
+        (heavy / GIB)
+            + RESIDENT_OVERHEAD_GIB
+            + (DECODE_ACCUM_BYTES_PER_PIXEL * output_px) / GIB
+            + (DECODE_SPIKE_BYTES_PER_PIXEL * tile_px) / GIB
+    } else {
+        qwen_vae_decode_peak_ex_text_gib(cfg, branch_blocks, base_tier, branch_tier, width, height)
+    } + text;
     denoise <= safe_gib && decode <= safe_gib
 }
 
@@ -466,24 +319,6 @@ pub fn requested_control_decode_tiling(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core::mempolicy::Lever;
-    use mlx_gen::OffloadPolicy;
-
-    fn inputs(base_tier: Option<Quant>) -> ControlLaneInputs<'static> {
-        // `Krea2Config` is not `'static`; the tests build one and leak it once (test-only) so the
-        // `'a` borrow lives long enough for the `'static` return. Simpler than threading a lifetime
-        // through every case.
-        static CFG: std::sync::OnceLock<Krea2Config> = std::sync::OnceLock::new();
-        let cfg = CFG.get_or_init(Krea2Config::turbo);
-        ControlLaneInputs {
-            cfg,
-            branch_blocks: 7,
-            base_tier,
-            width: 1024,
-            height: 1024,
-            supports_sequential: true,
-        }
-    }
 
     /// The first-principles weight counts land on the published anchors: ~11 B base params, and a bf16
     /// branch of ~6 GB (candle #480 ~6.6 GB) — proof the cost model is grounded, not arbitrary.
@@ -527,162 +362,6 @@ mod tests {
         );
     }
 
-    /// Large-memory Mac (128 GB → ~100 GiB safe): the fast path — NOTHING engages, full res, Resident,
-    /// single-pass decode. The sc-11750 regression guard, end to end through the Krea estimators (not
-    /// just the synthetic gen-core model). Note the branch tier is NOT part of the fast path any more
-    /// (sc-15799): a q4 base packs its branch to q8 on this machine too, because that is what the tier
-    /// choice means, not a concession to a tight budget.
-    #[test]
-    fn large_memory_mac_engages_nothing() {
-        let plan = plan_control_adaptation(100.0, inputs(Some(Quant::Q4)));
-        assert!(plan.engaged.is_empty(), "no lever on a big Mac: {plan:?}");
-        assert_eq!(plan.residency, OffloadPolicy::Resident);
-        assert!(!plan.tile_decode);
-        assert!(plan.feasible);
-    }
-
-    /// What the repack BUYS (sc-15799): a 32 GB Mac (~24 GiB usable) now runs a q4 control render fully
-    /// resident with a monolithic decode — nothing engages. It could not before, because the bf16 branch
-    /// put the decode peak (~24.5 GiB ex-text on measured MLX, sc-11847) over the budget on its own. The
-    /// old ladder reached that saving only at its LAST rung, after staging the text phase and tiling the
-    /// decode; tier integrity has it from the start, and at strictly better quality than a q4 branch.
-    #[test]
-    fn q8_branch_lets_a_constrained_mac_run_fully_resident() {
-        let cfg = Krea2Config::turbo();
-        let plan = plan_control_adaptation(24.0, inputs(Some(Quant::Q4)));
-        assert!(
-            plan.engaged.is_empty() && plan.feasible,
-            "a q8 branch must fit 24 GiB with no lever: {plan:?}"
-        );
-        // The same render with the branch left dense does NOT fit — the regression this guards.
-        let dense_branch_peak =
-            qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024)
-                + text_resident_gib(Some(Quant::Q4));
-        assert!(
-            dense_branch_peak > 24.0,
-            "a bf16 branch must NOT fit 24 GiB, else this test proves nothing: {dense_branch_peak:.2}"
-        );
-    }
-
-    /// A 24 GB Mac (~18 GiB usable) with a q4 base: levers engage in cost order and the render fits.
-    /// The single-pass decode peak (21.55 GiB ex-text with the q8 branch) is over budget even once the
-    /// text phase is dropped → residency then decode tiling must engage.
-    #[test]
-    fn constrained_mac_engages_levers_in_cost_order_and_fits() {
-        let plan = plan_control_adaptation(18.0, inputs(Some(Quant::Q4)));
-        assert!(
-            plan.feasible,
-            "a 24GB Mac must fit a q4 control render: {plan:?}"
-        );
-        assert!(
-            !plan.engaged.is_empty(),
-            "something must engage under 18 GiB"
-        );
-        // Cost order: whatever engaged is ascending (never resolution before tiling, etc.).
-        let mut sorted = plan.engaged.clone();
-        sorted.sort();
-        assert_eq!(
-            plan.engaged, sorted,
-            "levers must be cost-ordered: {plan:?}"
-        );
-        // The single-pass decode peak is the binding peak over budget → decode tiling is engaged.
-        assert!(
-            plan.tile_decode,
-            "decode tiling must engage on a 24GB Mac: {plan:?}"
-        );
-        assert!(
-            plan.projected_peak_gib <= 18.0,
-            "projected peak over budget: {plan:?}"
-        );
-    }
-
-    /// Only non-geometry strategies can appear in a memory plan.
-    #[test]
-    fn adaptation_plan_has_no_geometry_lever() {
-        let plan = plan_control_adaptation(18.0, inputs(Some(Quant::Q4)));
-        assert!(plan
-            .engaged
-            .iter()
-            .all(|lever| matches!(lever, Lever::SequentialResidency | Lever::VaeDecodeTiling)));
-    }
-
-    // ── sc-11747: the render-time decode-tiling gate (`plan_control_decode_tiling`). ───────────────
-
-    /// A large-memory Mac (or any small render) → single-pass fits → `None`, so the caller runs the
-    /// untiled decode and pays ZERO tiling overhead (the sc-11750 fast-path guarantee).
-    #[test]
-    fn decode_tiling_gate_none_when_single_pass_fits() {
-        let cfg = Krea2Config::turbo();
-        let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
-        // A budget comfortably above the single-pass peak → no tiling.
-        let plan =
-            plan_control_decode_tiling(sp + 2.0, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-                .unwrap();
-        assert!(plan.is_none(), "single-pass fits → must not tile: {plan:?}");
-    }
-
-    /// A constrained budget under the single-pass peak but above the tiled floor → tiling engages with a
-    /// spatial tile, and the selector guarantees the chosen tile's estimated peak ≤ the budget.
-    #[test]
-    fn decode_tiling_gate_tiles_when_single_pass_over_budget() {
-        let cfg = Krea2Config::turbo();
-        let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
-        // A few GiB under single-pass: the 1024² decode spike (~6 GiB) means a smaller tile fits here.
-        let safe = sp - 3.0;
-        let plan =
-            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-                .unwrap()
-                .expect("single-pass over budget must tile");
-        assert!(
-            plan.spatial.is_some(),
-            "a 1024² decode over budget must tile the spatial axis: {plan:?}"
-        );
-        assert!(
-            plan.temporal.is_none(),
-            "a still image has no temporal axis to tile: {plan:?}"
-        );
-    }
-
-    /// Co-resident text (the `Resident` path) RAISES the decode peak, so a budget that fits single-pass
-    /// ex-text can tip into tiling once the text encoder is counted. Proves the `text_co_resident` term
-    /// is wired.
-    #[test]
-    fn decode_tiling_gate_counts_coresident_text() {
-        let cfg = Krea2Config::turbo();
-        let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
-        // Just above the ex-text single-pass peak: fits with text dropped, over budget with it resident.
-        let safe = sp + 1.0;
-        let seq =
-            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-                .unwrap();
-        assert!(
-            seq.is_none(),
-            "ex-text single-pass fits under Sequential: {seq:?}"
-        );
-        let resident =
-            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, true)
-                .unwrap();
-        assert!(
-            resident.is_some(),
-            "co-resident text pushes the decode over budget → must tile: {resident:?}"
-        );
-    }
-
-    /// Infeasible even tiled (a budget below the resident weights + output-buffer floor) → a catchable
-    /// `Err`, surfaced before the decode rather than an OS/GPU kill mid-decode.
-    #[test]
-    fn decode_tiling_gate_errs_when_infeasible() {
-        let cfg = Krea2Config::turbo();
-        let err =
-            plan_control_decode_tiling(1.0, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-                .unwrap_err()
-                .to_string();
-        assert!(
-            err.contains("Qwen-VAE decode"),
-            "over-budget decode must surface a catchable, tagged error: {err}"
-        );
-    }
-
     // ── sc-15799: the load-time branch TIER (`control_branch_quant_bits`) — not a lever. ───────────
 
     /// A dense bf16 base carries a dense branch: it is already at the selected tier, so there is nothing
@@ -703,39 +382,142 @@ mod tests {
         assert_eq!(control_branch_quant_bits(Some(4)), Some(8));
     }
 
-    /// The plan's peaks are estimated with the branch at its integrity tier, so a q4 base projects a
+    /// The provider's peaks are estimated with the branch at its integrity tier, so a q4 base projects a
     /// LOWER peak than it did when the branch was left bf16 — the ~3.3 GB of unrequested precision the
     /// old ladder carried until its last rung (6.6 GB bf16 → ~3.3 GB at the q8 floor; NOT the retracted
     /// 8.4 GB, which exceeds the whole branch). Guards against a regression that re-estimates the branch
     /// dense while the loader packs it (an under- or over-prediction of the real resident set).
     #[test]
-    fn plan_peaks_use_the_integrity_branch_tier_not_bf16() {
+    fn provider_peaks_use_the_integrity_branch_tier_not_bf16() {
         let cfg = Krea2Config::turbo();
-        let integrity = plan_control_adaptation(100.0, inputs(Some(Quant::Q4))).projected_peak_gib;
+        let branch_tier = control_branch_tier(Some(Quant::Q4));
+        let integrity =
+            control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), branch_tier, 1024, 1024)
+                .max(qwen_vae_decode_peak_ex_text_gib(
+                    &cfg,
+                    7,
+                    Some(Quant::Q4),
+                    branch_tier,
+                    1024,
+                    1024,
+                ))
+                + text_resident_gib(Some(Quant::Q4));
         let dense_branch =
             control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024).max(
                 qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024),
             ) + text_resident_gib(Some(Quant::Q4));
         assert!(
             integrity < dense_branch,
-            "the plan must price the q8 branch it will load ({integrity:.2}), not a bf16 one \
+            "the provider estimate must price the q8 branch it will load ({integrity:.2}), not a bf16 one \
              ({dense_branch:.2})"
         );
+    }
+
+    /// Fast, recorded-data companion to the ignored real-weight calibration harness. The sc-11847
+    /// Metal measurements are the expensive source of truth; keeping their six published points in a
+    /// normal unit test makes lowering any calibrated coefficient or resident floor fail without
+    /// requiring weights. The live harness remains authoritative when the execution shape changes.
+    fn assert_never_under_shoot(estimate_gib: f64, measured_gib: f64, label: &str) {
+        assert!(
+            estimate_gib >= measured_gib,
+            "{label} estimate {estimate_gib:.3} under-shot recorded {measured_gib:.3} GiB"
+        );
+    }
+
+    #[test]
+    fn sc_11847_recorded_points_remain_never_under_shoot() {
+        struct Point {
+            tier: Option<Quant>,
+            size: u32,
+            measured_denoise_gib: f64,
+            measured_decode_gib: f64,
+        }
+
+        let points = [
+            Point {
+                tier: None,
+                size: 512,
+                measured_denoise_gib: 33.63,
+                measured_decode_gib: 34.81,
+            },
+            Point {
+                tier: None,
+                size: 768,
+                measured_denoise_gib: 33.65,
+                measured_decode_gib: 35.46,
+            },
+            Point {
+                tier: None,
+                size: 1024,
+                measured_denoise_gib: 34.41,
+                measured_decode_gib: 38.85,
+            },
+            Point {
+                tier: Some(Quant::Q4),
+                size: 512,
+                measured_denoise_gib: 16.29,
+                measured_decode_gib: 18.30,
+            },
+            Point {
+                tier: Some(Quant::Q4),
+                size: 768,
+                measured_denoise_gib: 16.58,
+                measured_decode_gib: 18.73,
+            },
+            Point {
+                tier: Some(Quant::Q4),
+                size: 1024,
+                measured_denoise_gib: 17.36,
+                measured_decode_gib: 22.12,
+            },
+        ];
+        let cfg = Krea2Config::turbo();
+        for point in points {
+            // sc-11847 measured before tier integrity repacked the pose branch, so `None` recreates
+            // that exact dense-branch calibration shape for both base tiers.
+            let denoise =
+                control_denoise_peak_ex_text_gib(&cfg, 7, point.tier, None, point.size, point.size);
+            let decode =
+                qwen_vae_decode_peak_ex_text_gib(&cfg, 7, point.tier, None, point.size, point.size);
+            assert_never_under_shoot(
+                denoise,
+                point.measured_denoise_gib,
+                &format!("{:?} {}² denoise", point.tier, point.size),
+            );
+            assert_never_under_shoot(
+                decode,
+                point.measured_decode_gib,
+                &format!("{:?} {}² decode", point.tier, point.size),
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "under-shot recorded")]
+    fn sc_11847_guard_kills_removed_resident_overhead_mutant() {
+        let cfg = Krea2Config::turbo();
+        let mutant = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024)
+            - RESIDENT_OVERHEAD_GIB;
+        assert_never_under_shoot(mutant, 22.12, "q4 1024² decode mutant");
     }
 
     #[test]
     fn geometry_feasibility_checks_only_the_requested_shape() {
         let cfg = Krea2Config::turbo();
+        let selected_decode = qwen_vae_decode_tiled_floor_ex_text_gib(
+            &cfg,
+            7,
+            Some(Quant::Q4),
+            Some(Quant::Q4),
+            1024,
+            1024,
+        ) - DECODE_MIN_TILE_GIB
+            + (DECODE_SPIKE_BYTES_PER_PIXEL
+                * crate::memory_strategy::DECODE_TILE_EDGE.pow(2) as f64)
+                / GIB;
         let full_peak =
             control_denoise_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), Some(Quant::Q4), 1024, 1024)
-                .max(qwen_vae_decode_tiled_floor_ex_text_gib(
-                    &cfg,
-                    7,
-                    Some(Quant::Q4),
-                    Some(Quant::Q4),
-                    1024,
-                    1024,
-                ));
+                .max(selected_decode);
         assert!(control_geometry_fits(
             full_peak,
             &cfg,
@@ -745,6 +527,7 @@ mod tests {
             1024,
             1024,
             false,
+            Some(crate::memory_strategy::DECODE_TILE_EDGE),
         ));
         assert!(!control_geometry_fits(
             full_peak - 0.01,
@@ -755,7 +538,22 @@ mod tests {
             1024,
             1024,
             false,
+            Some(crate::memory_strategy::DECODE_TILE_EDGE),
         ));
+        assert!(
+            !control_geometry_fits(
+                full_peak,
+                &cfg,
+                7,
+                Some(Quant::Q4),
+                Some(Quant::Q4),
+                1024,
+                1024,
+                false,
+                None,
+            ),
+            "a resident or staged request must be checked against single-pass decode, not silently tiled"
+        );
     }
 
     #[test]

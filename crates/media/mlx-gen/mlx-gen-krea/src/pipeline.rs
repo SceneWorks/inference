@@ -363,7 +363,8 @@ impl KreaHeavy {
         // Single-image convenience; the count loop in [`crate::model_control`] calls `prepare_control`
         // + `render_control_from` directly so the pose encode + prep are shared across seeds (F-073).
         // This convenience path (KreaPipeline delegator + weight-gated tests) always decodes single-pass
-        // (`None`); the budget-gated tiled decode is threaded by the `Generator` seam (`model_control`).
+        // (`None`); a worker-selected bounded decode is threaded by the `Generator` seam
+        // (`model_control`).
         let plan = self.prepare_control(context, control_image, opts.width, opts.height)?;
         self.render_control_from(
             &plan,

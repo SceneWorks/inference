@@ -1,6 +1,6 @@
 //! sc-11747 (epic 8459): **e2e budget-fit + decode-parity** for the Krea 2 pose-control tiled Qwen-VAE
-//! decode. This story's acceptance (folded in from sc-11865): prove that once the decode-tiling lever
-//! engages, a real `krea_2_turbo_control` q4/1024² render actually FITS a ~24 GiB budget, and that the
+//! decode. This story's acceptance (folded in from sc-11865): prove that once the shared selector's
+//! bounded-decode strategy engages, a real `krea_2_turbo_control` q4/1024² render actually FITS a ~24 GiB budget, and that the
 //! tiled decode reconstructs the untiled image (no blend seams → coherent + pose-locked).
 //!
 //! **No 32 GB Mac needed** — the budget is EMULATED on any large-memory Metal Mac by lowering the MLX
@@ -23,9 +23,10 @@
 //!   --ignored --nocapture
 //! ```
 
-use mlx_gen_krea::memory::plan_control_decode_tiling;
-use mlx_gen_krea::{load_vae, Krea2Config};
+use mlx_gen_krea::load_vae;
+use mlx_gen_krea::memory_strategy::{DECODE_OVERLAP, DECODE_TILE_EDGE};
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::tiling::{SpatialTiling, TilingConfig};
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
@@ -38,9 +39,6 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-
-/// The S0 recipe branch-block count (the overlay ships N=7).
-const BRANCH_BLOCKS: usize = 7;
 
 /// The emulated device budget: a 32 GB Mac's ~24 GiB usable unified memory — the story's target point.
 const EMULATED_SAFE_GIB: f64 = 24.0;
@@ -124,25 +122,9 @@ fn q4_1024_control_render_fits_emulated_24gib_budget() {
          per-buffer cap clamped it)"
     );
 
-    // (a) The gate engages at this budget for a q4/1024² decode (Sequential ⇒ no co-resident text).
-    let cfg = Krea2Config::turbo();
-    let tiling = plan_control_decode_tiling(
-        safe,
-        &cfg,
-        BRANCH_BLOCKS,
-        Some(Quant::Q4),
-        None,
-        1024,
-        1024,
-        false,
-    )
-    .expect("decode-tiling gate must not error at ~24 GiB");
-    assert!(
-        tiling.is_some(),
-        "decode tiling must engage for q4/1024² at a ~24 GiB budget"
-    );
-
-    // Drive a real render under the emulated budget and measure the concurrent peak.
+    // Drive the shared selector's bounded-decode result through a real render under the emulated
+    // budget and measure the concurrent peak. The provider applies these exact parameters and makes
+    // no second budget decision.
     let spec = LoadSpec::new(WeightsSource::Dir(base_dir()))
         .with_control(WeightsSource::File(overlay()))
         .with_offload_policy(OffloadPolicy::Sequential)
@@ -163,6 +145,13 @@ fn q4_1024_control_render_fits_emulated_24gib_budget() {
             kind: ControlKind::Pose,
             scale: Some(0.6),
         }],
+        memory: Some(GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(DECODE_TILE_EDGE),
+            decode_overlap: Some(DECODE_OVERLAP),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
