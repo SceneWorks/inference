@@ -57,13 +57,8 @@ pub struct QwenEditPaths {
     /// Lightning distill, stacked ahead of any user adapters. **Empty** = the production (non-distilled)
     /// edit path: the transformer loads via the mmap fast path, byte-identical to before.
     pub adapters: Vec<AdapterSpec>,
-    /// Component-residency policy (epic 10765 Phase 1c follow-up, sc-10968). `Sequential` routes
-    /// [`QwenEdit::generate`] through the phased load→encode→DROP→load path (load the VL encoder + VAE
-    /// encoder, VL-encode the prompt + VAE-encode the references, then DROP the VL encoder before the DiT
-    /// loads), capping peak VRAM at the cost of a per-request reload; `Resident` (default) loads all four
-    /// components once at [`QwenEdit::load`] and keeps them, like the pre-sc-10968 behavior. The worker's
-    /// edit fit-gate sets this when it predicts the resident sum won't fit but the sequential working set
-    /// will (mirrors the txt2img `LoadSpec::offload_policy`, sc-10867).
+    /// Legacy load-time policy retained for source compatibility. Image residency is request-scoped;
+    /// [`QwenEditRequest::stage_residency`] is the sole lifecycle authority.
     pub offload_policy: OffloadPolicy,
 }
 
@@ -83,6 +78,8 @@ pub struct QwenEditRequest {
     /// negative branch — the distill LoRA is CFG-distilled). The matching distill LoRA must be supplied
     /// via [`QwenEditPaths::adapters`]. `false` = the production multi-step true-CFG path.
     pub lightning: bool,
+    /// Release the text/VAE-encode phase before loading the DiT/VAE-decode phase for this request.
+    pub stage_residency: bool,
     pub cancel: CancelFlag,
 }
 
@@ -97,6 +94,7 @@ impl Default for QwenEditRequest {
             guidance: 4.0,
             seed: 0,
             lightning: false,
+            stage_residency: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -277,9 +275,9 @@ struct EditHeavy {
 }
 
 impl QwenEdit {
-    /// Load the Qwen-Image-Edit components from a snapshot dir. Under the default `Resident` policy all
-    /// four heavy components load now; under `Sequential` (sc-10968) they are deferred to the per-phase
-    /// residency loaders, and only the cheap tokenizer / processor / `zero_cond_t` load here.
+    /// Load the cheap tokenizer / processor / `zero_cond_t` and retain request-scoped component
+    /// loaders. The first warm request caches all four components; a staged request loads the
+    /// vision/VAE encoders and render bundle in separate phases.
     pub fn load(paths: &QwenEditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let root = paths.root.clone();
@@ -294,7 +292,6 @@ impl QwenEdit {
         )
         .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
 
-        let policy = candle_gen::effective_offload_policy(paths.offload_policy);
         let resident_root = root.clone();
         let resident_device = device.clone();
         let resident_adapters = paths.adapters.clone();
@@ -303,9 +300,8 @@ impl QwenEdit {
         let heavy_root = root.clone();
         let heavy_device = device.clone();
         let heavy_adapters = paths.adapters.clone();
-        let residency = candle_gen::Residency::from_policy_with_resident(
-            policy,
-            move || {
+        let residency = candle_gen::Residency::request_scoped_with_resident(
+            move |_| {
                 Ok((
                     EditText {
                         vl_encoder: load_vision_language_encoder(&resident_root, &resident_device)?,
@@ -332,7 +328,7 @@ impl QwenEdit {
                     },
                 ))
             },
-            move || {
+            move |_| {
                 Ok(EditText {
                     vl_encoder: load_vision_language_encoder(&text_root, &text_device)?,
                     vae_encoder: QwenVaeEncoder::new(component_vb(
@@ -343,7 +339,7 @@ impl QwenEdit {
                     )?)?,
                 })
             },
-            move |_| {
+            move |_, _| {
                 Ok(EditHeavy {
                     transformer: load_transformer(
                         &heavy_root,
@@ -354,7 +350,7 @@ impl QwenEdit {
                     vae: QwenVae::new(component_vb(&heavy_root, "vae", ENC_DTYPE, &heavy_device)?)?,
                 })
             },
-        )?;
+        );
 
         Ok(Self {
             zero_cond_t: read_zero_cond_t(&root)?,
@@ -545,14 +541,16 @@ impl QwenEdit {
         references: &[Image],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        self.residency.run(
+        self.residency.run_request_scoped(
+            req.stage_residency,
+            false,
             &req.cancel,
-            &self.device,
             false,
             on_progress,
             |text| self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references),
+            |_| Ok(self.device.synchronize()?),
             |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
-                self.denoise_and_decode(
+                let result = self.denoise_and_decode(
                     &heavy.transformer,
                     &heavy.vae,
                     req,
@@ -561,7 +559,8 @@ impl QwenEdit {
                     &static_latents,
                     &cond_grids,
                     on_progress,
-                )
+                );
+                candle_gen::synchronize_result(&self.device, result)
             },
         )
     }
@@ -681,9 +680,8 @@ mod tests {
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c follow-up, sc-10968) — the edit sibling of
-    /// `qwen_image_probed_generate_for_offload_ab`. ONE probed reference edit whose mode is either the
-    /// `CANDLE_GEN_OFFLOAD` env (the override) or `QWEN_OFFLOAD_MODE=spec-sequential` →
-    /// `QwenEditPaths::offload_policy` (the worker-facing contract); prints the device peak VRAM and writes
+    /// `qwen_image_probed_generate_for_offload_ab`. ONE probed reference edit whose residency is carried
+    /// by `QwenEditRequest::stage_residency`; prints the device peak VRAM and writes
     /// the raw RGB pixels to `QWEN_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and
     /// compare: the pixel files must be byte-identical (parity) and the sequential peak materially lower
     /// (the Qwen2.5-VL encoder + VAE encoder dropped before the DiT loads). Two processes are REQUIRED —
@@ -708,14 +706,8 @@ mod tests {
         let out = std::env::var("QWEN_OUT").expect("set QWEN_OUT to the pixel-dump path");
         let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
 
-        // Two ways to select sequential residency, both exercised by the A/B runner: the env override, or
-        // `QWEN_OFFLOAD_MODE=spec-sequential` → `QwenEditPaths::offload_policy` (the worker contract).
-        let spec_mode = std::env::var("QWEN_OFFLOAD_MODE").unwrap_or_default();
-        let offload_policy = if spec_mode == "spec-sequential" {
-            OffloadPolicy::Sequential
-        } else {
-            OffloadPolicy::Resident
-        };
+        let stage_residency =
+            std::env::var("QWEN_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
 
         // `QWEN_EDIT_LIGHTNING=1` → the CFG-off 4-step distill path (sc-11066): fold the lightx2v LoRA and
         // run `lightning:true` at guidance 1.0. Otherwise the base true-CFG 8-step path (the sc-11019
@@ -741,6 +733,7 @@ mod tests {
             guidance: if lightning { 1.0 } else { 4.0 },
             seed: 42,
             lightning,
+            stage_residency,
             ..Default::default()
         };
 
@@ -749,7 +742,7 @@ mod tests {
         let model = QwenEdit::load(&QwenEditPaths {
             root,
             adapters,
-            offload_policy,
+            offload_policy: OffloadPolicy::Resident,
         })
         .expect("load QwenEdit");
         probe.end_load(load_phase);
@@ -762,11 +755,8 @@ mod tests {
         let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
+        let mode = if stage_residency {
+            "request-staged"
         } else {
             "resident"
         };

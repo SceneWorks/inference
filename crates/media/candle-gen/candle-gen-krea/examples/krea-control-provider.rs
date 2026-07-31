@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adapters: Vec::new(),
         branch_tier: a.branch_tier,
         chunk_attention,
-        // `CANDLE_GEN_OFFLOAD=sequential` overrides this resident default for the two-process peak A/B.
+        // Legacy compatibility only; set `Krea2ControlRequest::stage_residency` per request.
         offload_policy: OffloadPolicy::Resident,
     })?;
     eprintln!(
@@ -143,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         text_style_gain: None,
         seed: a.seed,
         tile_vae_decode,
+        stage_residency: false,
         cancel: CancelFlag::new(),
     };
     let mut on_progress = |p: Progress| {

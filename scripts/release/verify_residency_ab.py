@@ -23,7 +23,7 @@ def read_peak(path: Path, expected_mode: str) -> int:
 
 def verify(resident_log: Path, sequential_log: Path, min_reduction_mib: int) -> tuple[int, int]:
     resident = read_peak(resident_log, "resident")
-    sequential = read_peak(sequential_log, "spec-sequential")
+    sequential = read_peak(sequential_log, "request-staged")
     reduction = resident - sequential
     if reduction < min_reduction_mib:
         raise RuntimeError(

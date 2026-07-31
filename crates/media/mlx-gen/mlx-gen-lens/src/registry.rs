@@ -365,7 +365,10 @@ impl LensGenerator {
             },
             // Materialize the features + mask while the encoder is still alive (Sequential only) — MLX
             // is lazy, so un-evaluated outputs keep the encoder referenced and the drop frees nothing.
-            |(features, mask): &(Vec<Array>, Array)| {
+            |encoded: Option<&(Vec<Array>, Array)>| {
+                let Some((features, mask)) = encoded else {
+                    return Ok(());
+                };
                 let mut to_eval: Vec<&Array> = features.iter().collect();
                 to_eval.push(mask);
                 mlx_rs::transforms::eval(to_eval)?;

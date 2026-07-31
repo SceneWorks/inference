@@ -419,7 +419,10 @@ impl ZImageTurboControl {
             // Materialize the post-cast `cap` while the encoder is still alive (Sequential only) — MLX
             // is lazy, so an un-evaluated `cap` keeps the encoder referenced through the graph and the
             // drop would free nothing.
-            |cap| Ok(mlx_rs::transforms::eval([cap])?),
+            |cap| match cap {
+                Some(cap) => Ok(mlx_rs::transforms::eval([cap])?),
+                None => Ok(()),
+            },
             // ── Phase B (denoise): heavy bundle + cap → evaluated latents.
             |heavy: &ZImageControlHeavyOwned, cap, on_progress| {
                 pipeline::calibration_fault(
@@ -674,7 +677,7 @@ mod tests {
                         panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
                     });
             assert!(
-                res.is_sequential(),
+                res.with_resident_parts(|_, _| ()).is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }

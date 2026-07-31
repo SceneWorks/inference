@@ -739,7 +739,10 @@ impl Flux2 {
             // MLX is lazy, so an un-evaluated embed keeps the encoder referenced and the drop would free
             // nothing. `text_ids` are host-derived position ids (TE-independent), so evaling the embeds
             // is sufficient.
-            |(prompt_embeds, _text_ids, negative)| {
+            |encoded| {
+                let Some((prompt_embeds, _text_ids, negative)) = encoded else {
+                    return Ok(());
+                };
                 match negative {
                     Some((neg_embeds, _)) => eval([prompt_embeds, neg_embeds])?,
                     None => eval([prompt_embeds])?,

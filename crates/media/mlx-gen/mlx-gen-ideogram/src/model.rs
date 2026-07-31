@@ -355,7 +355,8 @@ impl Ideogram4 {
                 text.encode(&ids)
             },
             // Materialize the Qwen3-VL embeds while the encoder is still alive (Sequential only).
-            |te_out: &Array| {
+            |te_out: Option<&Array>| {
+                let Some(te_out) = te_out else { return Ok(()) };
                 mlx_rs::transforms::eval([te_out])?;
                 Ok(())
             },

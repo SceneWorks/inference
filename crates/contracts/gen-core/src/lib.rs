@@ -29,6 +29,7 @@ mod macros;
 pub mod media;
 pub mod memory_strategy;
 pub mod registry;
+pub mod residency;
 pub mod runtime;
 pub mod sampling;
 pub mod sdxl_ldm;
@@ -91,6 +92,7 @@ pub use registry::{
     ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
+pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
     LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant,

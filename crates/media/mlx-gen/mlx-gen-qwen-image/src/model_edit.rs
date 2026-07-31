@@ -381,7 +381,10 @@ impl QwenImageEdit {
             // Materialize pos (+neg) while the VL encoder is still alive (Sequential only) — this forces
             // the vision-tower AND LM forwards, else the outputs keep the encoder referenced and the
             // drop would free nothing.
-            |(pos, neg)| {
+            |encoded| {
+                let Some((pos, neg)) = encoded else {
+                    return Ok(());
+                };
                 match neg {
                     Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
                     None => mlx_rs::transforms::eval([pos])?,
