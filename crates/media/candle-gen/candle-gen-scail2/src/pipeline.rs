@@ -104,7 +104,9 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: DIM_ALIGN,
+            },
         },
     }
 }
@@ -246,10 +248,14 @@ impl Generator for Scail2 {
         // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
         reject_multi_reference(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
-        reject_over_area(self.descriptor.id, req)?;
         self.descriptor
             .capabilities
-            .validate_request(self.descriptor.id, req)
+            .validate_request(self.descriptor.id, req)?;
+        // The advertised explicit grid runs before the lattice-projected area gate. Otherwise an
+        // off-grid request in the old raw-vs-aligned band (1280x730) could still report only an area
+        // verdict here while MLX reports the grid rule, even though both descriptors promise the
+        // same exact-or-rejected behavior (sc-16198).
+        reject_over_area(self.descriptor.id, req)
     }
 
     fn generate(
@@ -303,34 +309,16 @@ fn reject_zero_steps(id: &str, req: &GenerationRequest) -> gen_core::Result<()> 
 /// lane (`wan14b.rs`, sc-9028 / F-044); the incident class F-090 (sc-11215) left this lane open. `max_size`
 /// alone only bounds each edge, so 1280×1280 (both ≤ 1280) slips through without the area check.
 ///
-/// **sc-16197 — the cap is measured on the geometry that actually renders**: each edge floored onto
-/// the [`DIM_ALIGN`] lattice by the very [`align`] the denoise loop calls
-/// ([`crate::generate::generate`]), not the raw `req.width × req.height`. Judging the raw product
-/// refused requests this engine would then have rendered at a perfectly legal size — `1280×730` is
-/// 934 400 px as typed but renders at `1280×704` = 901 120, comfortably inside the cap. `mlx-gen-wan`
-/// settled this reading for the family (its `over_area_is_judged_on_the_aligned_geometry`) and
-/// `mlx-gen-scail2` inherited it in sc-16167; this is candle joining them, so one manifest entry means
-/// one thing on both backends.
+/// sc-16197 made this helper measure the lattice-projected geometry rather than the raw product.
+/// `1280×730`, for example, projects to `1280×704`. sc-16198 then advertised that same
+/// [`DIM_ALIGN`] lattice through [`SizeFloor::RangeCheckedOnGrid`] and runs the shared floor before
+/// this helper, so every provider request that reaches this point is already on-grid and [`align`] is
+/// a no-op. Direct helper tests retain the off-grid rows to pin the rendered-geometry area rule
+/// independently.
 ///
-/// The divergence band exists at all only because SCAIL-2 — alone in the wan family — has no off-grid
-/// rejection: its siblings (`wan14b.rs`, `model_vace.rs`) refuse a non-multiple size *before* the area
-/// check, so their raw and aligned areas are always equal. Whether SCAIL-2 should refuse an off-lattice
-/// explicit size rather than snap it is sc-16198; this gate is correct either way, because on-lattice
-/// input makes the alignment a no-op.
-///
-/// [`align`]'s min-one-tile floor (a sub-32 edge snaps *up* to 32 rather than down to 0) is carried
-/// deliberately — it is what renders — and cannot hide an over-area request: it applies only to an edge
-/// below one lattice step, and it only ever *raises* the measured area. It does move the `0×0` sentinel
-/// from 0 px to 1 024 px, both far under the cap, so that path is unchanged in outcome.
-///
-/// This gate reads `req` rather than the resolved dims, which is only sound because the descriptor
-/// declares [`SizeFloor::RangeChecked`]: `validate_request` refuses any edge below `min_size`, so `0×0`
-/// never reaches [`Scail2::run`]'s resolve-from-the-driving-clip branch and the gate is never asked
-/// about a geometry it cannot see. Were that floor relaxed (sc-16199 revisits exactly this), the
-/// sentinel would measure 32×32 here while rendering at the clip's own size — so
-/// `descriptor_declares_the_size_floor_this_gate_depends_on` pins the dependency rather than leaving it
-/// implicit. `mlx-gen-wan` solves the same hazard structurally, with a dims-taking
-/// `reject_over_area_dims`, because on that backend the sentinel *is* reachable.
+/// The `0×0` sentinel is still refused by Candle's floor. If sc-16199 makes it reachable, this
+/// request-taking helper must be replaced with a resolved-dimensions gate so it cannot measure
+/// `32×32` while the clip resolves to a much larger geometry.
 fn reject_over_area(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
     let (w, h) = (align(req.width), align(req.height));
     let area = w * h;
@@ -479,6 +467,32 @@ mod tests {
         // lands (sc-5583) — advertising it silently dropped the extra characters (sc-8985).
         assert!(!d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.samplers.contains(&"unipc"));
+        assert_eq!(
+            d.capabilities.size_floor.explicit_size_multiple(),
+            Some(DIM_ALIGN)
+        );
+    }
+
+    #[test]
+    fn explicit_off_grid_size_is_refused_weights_free() {
+        for (width, height) in [(1280, 730), (730, 1280)] {
+            let req = GenerationRequest {
+                width,
+                height,
+                count: 1,
+                ..Default::default()
+            };
+
+            let err = descriptor()
+                .capabilities
+                .validate_request(MODEL_ID, &req)
+                .expect_err("an explicit off-grid size must be refused before loading")
+                .to_string();
+            assert!(
+                err.contains("multiples of 32") && err.contains(&format!("{width}×{height}")),
+                "the refusal must name the required grid and requested size, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -589,13 +603,11 @@ mod tests {
         assert!(reject_over_area(MODEL_ID, &small).is_ok());
     }
 
-    /// The cap measures the geometry the pipeline **renders**, not the one that was typed (sc-16197).
+    /// The helper projects onto the render lattice before measuring the cap (sc-16197).
     ///
-    /// SCAIL-2 snaps every edge down to the [`DIM_ALIGN`] lattice before rendering and — alone in the
-    /// wan family — refuses no off-grid request first (sc-16198), so raw and aligned areas genuinely
-    /// diverge here. Measuring the raw product refused requests that render legally; the rows below
-    /// are exactly that band, and each one is over the cap *as typed*, so a regression to the raw
-    /// measurement turns this test RED rather than leaving it green for the wrong reason.
+    /// The area helper projects every edge down to the [`DIM_ALIGN`] lattice. The provider now
+    /// rejects these off-grid requests before calling it (sc-16198), but direct rows still pin the
+    /// sc-16197 arithmetic independently: a regression to the raw product turns this test RED.
     ///
     /// Every row appears in **both orientations**. The fix aligns two edges, and a landscape-only
     /// table gates only one of them: with `1280` and `1216` already on the lattice, dropping the
@@ -617,7 +629,8 @@ mod tests {
             (1216, 760, 1216, 736),
             (760, 1216, 736, 1216),
         ] {
-            // The gate's alignment is `generate`'s own, so it cannot drift from what renders.
+            // Pin the area helper's retained projection arithmetic independently of provider
+            // validation and low-level generation.
             assert_eq!(
                 (align(w), align(h)),
                 (aw, ah),
@@ -677,10 +690,9 @@ mod tests {
         assert!(reject_over_area(MODEL_ID, &req(1, 30000)).is_err());
     }
 
-    /// [`reject_over_area`] measures the **requested** dims, which equal the rendered ones only
-    /// because [`SizeFloor::RangeChecked`] refuses every edge below `min_size` — so the `0×0`
-    /// sentinel can never reach [`Scail2::run`]'s resolve-from-the-driving-clip branch, where the
-    /// rendered geometry would be the clip's rather than the request's.
+    /// [`reject_over_area`] measures the **requested** dims, which are exact render dims because
+    /// [`SizeFloor::RangeCheckedOnGrid`] refuses both off-grid geometry and the `0×0` sentinel before
+    /// this helper can run.
     ///
     /// That is a cross-crate dependency (the floor lives in gen-core's `validate_request`), and
     /// sc-16199 exists to revisit this very declaration. Pinning it here means relaxing the floor
@@ -690,7 +702,9 @@ mod tests {
     fn descriptor_declares_the_size_floor_this_gate_depends_on() {
         assert_eq!(
             descriptor().capabilities.size_floor,
-            SizeFloor::RangeChecked
+            SizeFloor::RangeCheckedOnGrid {
+                multiple: DIM_ALIGN
+            }
         );
         let sentinel = GenerationRequest {
             prompt: "a character".into(),

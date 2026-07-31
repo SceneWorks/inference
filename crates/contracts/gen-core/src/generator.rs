@@ -1502,6 +1502,12 @@ pub enum SizeFloor {
     /// `width`/`height` must lie within `min_size..=max_size`. The common case.
     #[default]
     RangeChecked,
+    /// The ordinary range check plus a required grid for every explicit `width`/`height`.
+    ///
+    /// A request is accepted only when both dimensions are multiples of `multiple`. This is
+    /// advertised here, rather than hidden in provider code, so a weights-free consumer can predict
+    /// whether the engine will render the exact geometry it was asked for.
+    RangeCheckedOnGrid { multiple: u32 },
     /// `width`/`height == 0` is a "resolve from the driving media" sentinel, and the shared range
     /// check does not apply **to that pair of values** (F-158). Any other size — including a
     /// half-sentinel like `0x512` — is still range-checked normally.
@@ -1512,18 +1518,43 @@ pub enum SizeFloor {
     /// variant as "the resolved geometry is bounded by `min_size..=max_size`": whether a provider
     /// re-checks after resolving is per-provider and is **not advertised here**.
     ///
-    /// SCAIL-2, the only descriptor setting this variant, does re-check as of sc-16167 — it refuses
-    /// a resolved geometry outside `min_size..=max_size` or over its area cap before the render,
-    /// naming the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own
-    /// guarantee, made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a
-    /// provider that sets it later. A consumer needing the bound must still read the provider, or
-    /// treat the resolved size as unbounded.
+    /// SCAIL-2, the only descriptor using this resolved-downstream policy family, sets
+    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] and does re-check as of sc-16167 — it refuses a
+    /// resolved geometry outside `min_size..=max_size` or over its area cap before the render, naming
+    /// the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own guarantee,
+    /// made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a provider that
+    /// sets it later. A consumer needing the bound must still read the provider, or treat the
+    /// resolved size as unbounded.
     ///
     /// Note "SCAIL-2" there means the **MLX** provider. `candle-gen-scail2` serves the same model id
-    /// and declares [`SizeFloor::RangeChecked`], so it refuses the `0x0` sentinel outright rather
-    /// than resolving it — its own resolve-from-the-clip branch is unreachable. One model id, two
-    /// answers; reconciling them is sc-16199.
+    /// and declares [`SizeFloor::RangeCheckedOnGrid`], so it refuses the `0x0` sentinel outright
+    /// rather than resolving it — its own resolve-from-the-clip branch is unreachable. One model id,
+    /// two answers; reconciling them is sc-16199.
     ResolvedDownstream,
+    /// [`ResolvedDownstream`](Self::ResolvedDownstream), with an additional grid requirement for
+    /// **explicit** dimensions.
+    ///
+    /// The `0x0` sentinel remains exempt because the caller did not choose the source-media
+    /// geometry; the provider may align that resolved geometry as part of its documented downstream
+    /// policy. Any non-sentinel request must already land on `multiple`, so it is either rendered
+    /// exactly or rejected before generation. SCAIL-2 uses this to preserve ordinary `640x360`
+    /// driving clips while refusing an explicit `1280x730` instead of silently rendering
+    /// `1280x704` (sc-16198).
+    ResolvedDownstreamExplicitGrid { multiple: u32 },
+}
+
+impl SizeFloor {
+    /// The required multiple for explicit dimensions, when this floor advertises one.
+    ///
+    /// `None` means the shared floor has no grid opinion; a provider may still layer a model-local
+    /// rule. Consumers can call this without loading weights.
+    pub fn explicit_size_multiple(self) -> Option<u32> {
+        match self {
+            Self::RangeChecked | Self::ResolvedDownstream => None,
+            Self::RangeCheckedOnGrid { multiple }
+            | Self::ResolvedDownstreamExplicitGrid { multiple } => Some(multiple),
+        }
+    }
 }
 
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
@@ -1548,12 +1579,15 @@ pub struct Capabilities {
     pub max_count: u32,
     pub mac_only: bool,
     /// How this model's size range is enforced — and therefore whether
-    /// `min_size`/`max_size` are a bound a caller may rely on.
+    /// `min_size`/`max_size` are a bound a caller may rely on, plus any explicit-size grid the
+    /// provider advertises.
     ///
     /// `Default` is [`SizeFloor::RangeChecked`], so every existing descriptor keeps
     /// today's behaviour with no edit. A provider whose `width`/`height == 0` means
     /// "resolve from the driving media" sets [`SizeFloor::ResolvedDownstream`]
-    /// instead — SCAIL-2 sizes from its driving-video frames.
+    /// instead — SCAIL-2 sizes from its driving-video frames and uses
+    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] to advertise that only explicit sizes must
+    /// already sit on its tile grid.
     ///
     /// # Why this is on `Capabilities` rather than only in the provider
     ///
@@ -1685,7 +1719,8 @@ impl Capabilities {
     /// - `steps` (when supplied) must be `>= 1` — an explicit `0` would run a 0-step denoise and
     ///   VAE-decode pure noise (F-007); the schedule builders' `.max(1)` clamps document this as the
     ///   real floor,
-    /// - `width`/`height` within `min_size..=max_size`,
+    /// - `width`/`height` within `min_size..=max_size` and, when advertised by [`SizeFloor`], on the
+    ///   required explicit-size grid,
     /// - `negative_prompt` / `guidance` / `true_cfg` only when the matching `supports_*` flag is set,
     ///   and `guidance` / `true_cfg` must be finite (a NaN would poison the guidance math, F-053),
     /// - `sampler` / `scheduler` / `guidance_method` (when supplied) must name an advertised entry,
@@ -1704,9 +1739,9 @@ impl Capabilities {
     /// steps out of range, non-finite guidance) return [`Error::Msg`].
     ///
     /// `id` is the model's descriptor id, used in error messages. Model-specific constraints — an
-    /// empty-prompt rejection, size-alignment (multiple-of-N), frame-count divisibility,
-    /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
-    /// floor, not a replacement for them.
+    /// empty-prompt rejection, a size-alignment rule not advertised by [`SizeFloor`], frame-count
+    /// divisibility, sampler→solver mapping — are layered on top by each model's own `validate`;
+    /// this is the shared floor, not a replacement for them.
     pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
         // The size check is gated on the ADVERTISED floor rather than on the caller picking the
         // right entry point — that is what lets a weights-free consumer hold a `Capabilities` and
@@ -1724,19 +1759,41 @@ impl Capabilities {
         // driving media" convention, it is a malformed request, and it must still be rejected.
         let is_sentinel = req.width == 0 && req.height == 0;
         let check_size = match self.size_floor {
-            SizeFloor::RangeChecked => true,
-            SizeFloor::ResolvedDownstream => !is_sentinel,
+            SizeFloor::RangeChecked | SizeFloor::RangeCheckedOnGrid { .. } => true,
+            SizeFloor::ResolvedDownstream | SizeFloor::ResolvedDownstreamExplicitGrid { .. } => {
+                !is_sentinel
+            }
         };
-        self.validate_request_inner(id, req, check_size)
+        self.validate_request_inner(id, req, check_size)?;
+
+        if !is_sentinel {
+            if let Some(multiple) = self.size_floor.explicit_size_multiple() {
+                if multiple == 0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: descriptor advertises an invalid explicit-size multiple of 0"
+                    )));
+                }
+                if !req.width.is_multiple_of(multiple) || !req.height.is_multiple_of(multiple) {
+                    return Err(Error::Msg(format!(
+                        "{id}: width/height must be multiples of {multiple} (got {}×{})",
+                        req.width, req.height
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// The shared floor **minus the size-range check** — for providers with a "match the driving-media
-    /// size" convention (`width`/`height == 0` is a resolve-downstream sentinel, e.g. SCAIL-2 sizing
-    /// from the driving-video frames), where the size range would wrongly reject the sentinel. Every
-    /// other floor check still runs unconditionally: count / steps / frame / fps / duration caps,
-    /// negative-prompt / guidance / true_cfg support gating, finiteness (F-053), sampler / scheduler /
-    /// guidance_method membership, and the conditioning allowlist. A provider that calls this must
-    /// range-check its resolved size itself (F-158).
+    /// The shared floor **minus the advertised spatial checks** (range and any explicit-size grid) —
+    /// for providers with a "match the driving-media size" convention (`width`/`height == 0` is a
+    /// resolve-downstream sentinel, e.g. SCAIL-2 sizing from the driving-video frames), where those
+    /// checks would wrongly reject the sentinel. Every non-spatial floor check still runs
+    /// unconditionally: count / steps / frame / fps / duration caps, negative-prompt / guidance /
+    /// true_cfg support gating, finiteness (F-053), sampler / scheduler / guidance_method membership,
+    /// and the conditioning allowlist. Prefer [`validate_request`](Self::validate_request) with a
+    /// [`SizeFloor::ResolvedDownstream`] variant so non-sentinel requests retain advertised spatial
+    /// validation. A provider that calls this lower-level escape hatch must range-check its resolved
+    /// size itself (F-158).
     pub fn validate_request_skip_size(&self, id: &str, req: &GenerationRequest) -> Result<()> {
         self.validate_request_inner(id, req, false)
     }
@@ -2426,6 +2483,72 @@ mod tests {
                 "{w}x{h} ({why}) must still be rejected under ResolvedDownstream"
             );
         }
+    }
+
+    #[test]
+    fn advertised_explicit_grid_rejects_only_off_grid_explicit_sizes() {
+        let ranged = Capabilities {
+            size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 32 },
+            ..caps()
+        };
+        let resolved = Capabilities {
+            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid { multiple: 32 },
+            ..caps()
+        };
+
+        for c in [&ranged, &resolved] {
+            assert!(c
+                .validate_request(
+                    "m",
+                    &GenerationRequest {
+                        width: 512,
+                        height: 480,
+                        ..base_req()
+                    }
+                )
+                .is_ok());
+            for (width, height) in [(512, 481), (513, 480)] {
+                let err = c
+                    .validate_request(
+                        "m",
+                        &GenerationRequest {
+                            width,
+                            height,
+                            ..base_req()
+                        },
+                    )
+                    .expect_err("an explicit off-grid size must be refused")
+                    .to_string();
+                assert!(
+                    err.contains("multiples of 32") && err.contains(&format!("{width}×{height}")),
+                    "got: {err}"
+                );
+            }
+        }
+
+        assert!(ranged
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    width: 0,
+                    height: 0,
+                    ..base_req()
+                }
+            )
+            .is_err());
+        assert!(resolved
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    width: 0,
+                    height: 0,
+                    ..base_req()
+                }
+            )
+            .is_ok());
+        assert_eq!(ranged.size_floor.explicit_size_multiple(), Some(32));
+        assert_eq!(resolved.size_floor.explicit_size_multiple(), Some(32));
+        assert_eq!(SizeFloor::RangeChecked.explicit_size_multiple(), None);
     }
 
     /// The default variant is unaffected — a descriptor that says nothing behaves exactly as before.

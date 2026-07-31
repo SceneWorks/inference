@@ -84,7 +84,9 @@ pub struct CharacterRef<'a> {
 }
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
-/// `GenerationRequest` onto). All images are decoded + resized to `(width, height)` here.
+/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the
+/// 32-pixel render lattice; [`generate`] rejects an invalid job rather than silently changing its geometry.
+/// All images are decoded + resized to `(width, height)` here.
 pub struct Scail2Job<'a> {
     pub prompt: &'a str,
     pub negative_prompt: &'a str,
@@ -110,11 +112,13 @@ pub struct Scail2Job<'a> {
     pub segment_overlap: usize,
 }
 
-/// Round a requested dim to a multiple of [`DIM_ALIGN`] (down, with a min-one-tile floor — this
-/// differs from wan/bernini's `align_dim`, which has no floor and would yield 0 for a sub-tile
-/// request). The adjustment is **surfaced** (sc-6983) rather than applied silently: a 720→704 crop
-/// is otherwise an invisible behavior change. The caller stays infallible (no reject).
-fn align(value: u32) -> usize {
+/// Align a **resolved driving-clip** dimension to [`DIM_ALIGN`] (down, with a min-one-tile floor —
+/// this differs from wan/bernini's `align_dim`, which has no floor and would yield 0 for a sub-tile
+/// value). Explicit sizes are rejected before reaching this function unless already on-grid
+/// ([`SizeFloor::ResolvedDownstreamExplicitGrid`](mlx_gen::SizeFloor::ResolvedDownstreamExplicitGrid),
+/// sc-16198); only source-media geometry the caller did not choose may be adjusted here. The
+/// adjustment remains announced for diagnostics.
+pub(crate) fn align(value: u32) -> usize {
     let aligned = (value / DIM_ALIGN).max(1) * DIM_ALIGN;
     if aligned != value {
         eprintln!(
@@ -123,6 +127,25 @@ fn align(value: u32) -> usize {
         );
     }
     aligned as usize
+}
+
+/// Validate the exact render geometry carried by the public [`Scail2Job`] API.
+///
+/// Provider requests are checked by their advertised capability floor, and auto-sized provider
+/// requests are aligned while their source-media origin is still known. Direct callers have neither
+/// context, so this lower-level API accepts exact render geometry only.
+fn validate_job_geometry(width: u32, height: u32) -> Result<(usize, usize)> {
+    if width < DIM_ALIGN
+        || height < DIM_ALIGN
+        || !width.is_multiple_of(DIM_ALIGN)
+        || !height.is_multiple_of(DIM_ALIGN)
+    {
+        return Err(Error::Msg(format!(
+            "scail2: Scail2Job width/height must be non-zero multiples of {DIM_ALIGN} \
+             (got {width}×{height})"
+        )));
+    }
+    Ok((width as usize, height as usize))
 }
 
 /// Decode an `Image` (RGB24 `u8`) → `[3, th, tw]` f32 in `[-1, 1]`, resizing if its native size
@@ -290,6 +313,10 @@ pub fn generate(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    // Validate before touching media, adapter files, or model weights. This is also the exact
+    // geometry all image and latent paths consume, so the public job API cannot fall back to
+    // `align` and snap.
+    let (tw, th) = validate_job_geometry(job.width, job.height)?;
     if job.driving_frames.is_empty() {
         return Err(Error::Msg("scail2: a driving video is required".into()));
     }
@@ -341,7 +368,6 @@ pub fn generate(
             )));
         }
     }
-    let (tw, th) = (align(job.width), align(job.height));
     let cfg_disabled = job.guidance <= 1.0;
     // Experimental bf16 compute opt-in (sc-5681; see the DiT block below). Read once here so the
     // per-segment NaN guard (F-096) keys off the same flag.
@@ -758,6 +784,78 @@ mod tests {
         // short-clip job must not be newly rejected over fields it doesn't use.
         validate_segment_params(13, 81, 81).expect("single-window job ignores window params");
         validate_segment_params(10, 10, 3).expect("total == segment_len is single-window");
+    }
+
+    #[test]
+    fn public_job_geometry_is_exact_or_rejected() {
+        assert_eq!(
+            validate_job_geometry(1280, 704).expect("on-grid geometry is exact"),
+            (1280, 704)
+        );
+        for (width, height) in [(1280, 730), (730, 1280), (0, 704), (704, 0)] {
+            let err = validate_job_geometry(width, height)
+                .expect_err("the public low-level job must never be silently snapped")
+                .to_string();
+            assert!(
+                err.contains("non-zero multiples of 32")
+                    && err.contains(&format!("{width}×{height}")),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_generate_rejects_geometry_before_adapter_io() {
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        let frames = [image.clone()];
+        let masks = [image.clone()];
+        let job = Scail2Job {
+            prompt: "p",
+            negative_prompt: "",
+            width: 1280,
+            height: 730,
+            reference: CharacterRef {
+                image: &image,
+                mask: &image,
+            },
+            additional: Vec::new(),
+            driving_frames: &frames,
+            driving_masks: &masks,
+            replace_flag: false,
+            seed: 0,
+            steps: 1,
+            shift: 5.0,
+            guidance: 1.0,
+            sampler: SolverKind::UniPC,
+            fps: 16,
+            segment_len: 81,
+            segment_overlap: 5,
+        };
+        let inaccessible = AdapterSpec::new(
+            std::path::PathBuf::from("/sc16198-missing/adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        );
+        let mut noop = |_: Progress| {};
+        let err = generate(
+            Path::new("/sc16198-missing/snapshot"),
+            &Scail2Config::default(),
+            &job,
+            None,
+            &[inaccessible],
+            &CancelFlag::default(),
+            &mut noop,
+        )
+        .expect_err("invalid public job geometry must fail before adapter or snapshot I/O")
+        .to_string();
+        assert!(
+            err.contains("non-zero multiples of 32") && err.contains("1280×730"),
+            "geometry must be the first error, got: {err}"
+        );
     }
 
     /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.

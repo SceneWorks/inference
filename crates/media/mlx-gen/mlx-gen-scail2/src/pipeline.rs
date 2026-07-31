@@ -23,7 +23,7 @@ use mlx_gen_wan::pipeline::reject_over_area_dims;
 use mlx_gen_wan::SolverKind;
 
 use crate::config::Scail2Config;
-use crate::generate::{CharacterRef, Scail2Job, DIM_ALIGN};
+use crate::generate::{align, CharacterRef, Scail2Job, DIM_ALIGN};
 
 /// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
 const SEGMENT_LEN: usize = 81;
@@ -48,14 +48,14 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
-            // ADVERTISED, not merely implemented. `generate` already routes through
-            // `validate_request_skip_size` because `width`/`height == 0` means
-            // "size from the driving-video frames" and the range check would
-            // wrongly reject that sentinel. Until this field existed, a consumer
-            // holding these `Capabilities` had no way to learn it, so a caller
-            // mirroring the shared floor to type-check before a load rejected a
-            // request this model renders.
-            size_floor: SizeFloor::ResolvedDownstream,
+            // ADVERTISED, not merely implemented. `width`/`height == 0` means "size from the
+            // driving-video frames", so the shared floor exempts that sentinel while applying the
+            // provider's downstream envelope check. Explicit dimensions are different: the caller
+            // chose them, so the same descriptor advertises the exact 32-pixel grid and the shared
+            // floor rejects an off-grid request before a load (sc-16198).
+            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
+                multiple: DIM_ALIGN,
+            },
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
@@ -221,31 +221,28 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
 /// The range half, by contrast, is new **only** on the sentinel path: an explicit out-of-range size
 /// was already refused by the shared floor above, which exempts `0x0` and nothing else.
 ///
-/// # Where this still differs from candle
+/// # Explicit-grid parity and the remaining sentinel difference
 ///
 /// The **area** halves now agree: both measure the lattice-aligned geometry — what actually renders.
 /// candle used to measure `req.width * req.height` raw, so a request between the two, e.g. `1280x730`
 /// (934 400 raw, 901 120 once `730` floors to `704`), was refused there and accepted here; sc-16197
-/// moved `candle-gen-scail2`'s `reject_over_area` onto its own `align`, the reading `mlx-gen-wan`
-/// settled for the family in `over_area_is_judged_on_the_aligned_geometry`. The two alignments still
-/// differ *below* one lattice step — [`align_dim`](mlx_gen_wan::pipeline::align_dim) floors a sub-32
-/// edge to `0` where candle's `align` carries a min-one-tile floor and raises it to `32` — but each
-/// backend's range check refuses such an edge before the area is ever compared, so no request can
-/// observe it.
+/// moved `candle-gen-scail2`'s area helper onto its render lattice.
+///
+/// sc-16198 then removed the observable explicit-request band: both backends advertise the 32-pixel
+/// grid and reject an off-grid explicit size before either area calculation. MLX still measures
+/// lattice-aligned geometry here because this function also checks a size resolved from the driving
+/// clip, whose source-media geometry may be off-grid.
 ///
 /// The backends do still disagree about the **sentinel itself**, which neither story changes:
-/// candle declares `SizeFloor::RangeChecked` and so refuses `0x0` at `validate`, leaving its own
-/// resolve-from-the-clip branch unreachable dead code (sc-16199).
+/// candle declares `SizeFloor::RangeCheckedOnGrid` and so refuses `0x0` at `validate`, leaving its
+/// own resolve-from-the-clip branch unreachable dead code (sc-16199).
 ///
-/// Also deliberately **not** taken from the `model_vace.rs` site this mirrors: its paired
-/// [`reject_off_grid`](mlx_gen_wan::pipeline::reject_off_grid), which refuses an off-lattice size
-/// outright instead of snapping it. That is what makes vace's raw and aligned areas identical and so
-/// leaves it no divergence band. It cannot be adopted here unchanged: on the resolved path it would
-/// refuse an ordinary `640x360` driving clip that renders fine at `640x352` today, since a clip's
-/// native size has no reason to sit on a 32 lattice. Whether SCAIL-2 should refuse off-grid
-/// **explicit** sizes while keeping the snap for resolved ones is sc-16198 — until it lands,
-/// [`crate::generate::align`] still snaps and announces only to stderr, which is the sc-6983 debt this
-/// function pays down for the envelope but not for the lattice.
+/// The paired [`reject_off_grid`](mlx_gen_wan::pipeline::reject_off_grid) from the `model_vace.rs`
+/// site cannot be applied to this *resolved* geometry unchanged: it would refuse an ordinary
+/// `640x360` driving clip that renders at `640x352`, even though the caller never chose that size.
+/// The asymmetry is now explicit in
+/// [`SizeFloor::ResolvedDownstreamExplicitGrid`](mlx_gen::gen_core::SizeFloor::ResolvedDownstreamExplicitGrid):
+/// explicit sizes are exact-or-rejected; resolved source-media sizes retain the alignment.
 ///
 /// Deliberately a refusal, not a downscale. Silently rendering a geometry the caller did not ask for
 /// is the exact shape epic 15448 exists to eliminate, and `resolve_capped_dims`' silent refit was
@@ -386,12 +383,13 @@ impl Scail2 {
         // scail2 supports a "match the driving-video size" convention (`width`/`height == 0` → resolved
         // from the driving frames below), which the floor's size-range check would wrongly reject. That
         // exemption used to be hand-rolled here as `if req.width > 0 && req.height > 0 { … } else {
-        // validate_request_skip_size }`; it is now ADVERTISED as `SizeFloor::ResolvedDownstream` on the
-        // descriptor, so this single call applies exactly that policy — and a weights-free consumer
-        // holding these `Capabilities` computes the same verdict this line does, instead of having to
-        // guess which entry point the provider happens to call. Every other floor check is unchanged
-        // and still fires on the auto-size path: count/frame caps, sampler membership, the conditioning
-        // allowlist, support gating, and the F-053 finiteness guard.
+        // validate_request_skip_size }`; it is now ADVERTISED as
+        // `SizeFloor::ResolvedDownstreamExplicitGrid` on the descriptor, so this single call applies
+        // exactly that policy — and a weights-free consumer holding these `Capabilities` computes
+        // the same verdict this line does, instead of having to guess which entry point the provider
+        // happens to call. Every other floor check is unchanged and still fires on the auto-size
+        // path: count/frame caps, sampler membership, the conditioning allowlist, support gating,
+        // and the F-053 finiteness guard.
         //
         // The advertised floor is also **stricter** than the branch it replaces, deliberately. `0 > 0`
         // is false, so the old condition sent a HALF-sentinel (`0x512`, `4096x0`) down the
@@ -427,16 +425,31 @@ impl Scail2 {
             )
         })?;
 
-        // Target size: the request's (aligned to 32 in the core), else the driving frame's native size.
+        // Explicit geometry is already on the advertised 32-pixel grid. A `0x0` sentinel first
+        // resolves to the driving frame's native size, then is aligned below while that source-media
+        // origin is still known.
         let first: &Image = driving
             .frames
             .first()
             .ok_or_else(|| Error::Msg("scail2: the ControlClip has no driving frames".into()))?;
-        let (width, height) = resolve_target_size(req, first);
+        let (resolved_width, resolved_height) = resolve_target_size(req, first);
         // The second half of `SizeFloor::ResolvedDownstream` (sc-16167). `impl_generator!`'s
         // `generate` does not call `validate`, so this must run here and not only there — the same
         // reason the shared floor is re-checked at the top of this function.
-        reject_unrenderable_geometry(&self.descriptor.capabilities, req, width, height)?;
+        reject_unrenderable_geometry(
+            &self.descriptor.capabilities,
+            req,
+            resolved_width,
+            resolved_height,
+        )?;
+        // Preserve the source-media origin distinction exactly once: a sentinel-resolved geometry
+        // may be floored to the render lattice, while an explicit off-grid request has already been
+        // rejected by the advertised floor above. `Scail2Job` itself accepts exact geometry only.
+        let (width, height) = if req.width == 0 && req.height == 0 {
+            (align(resolved_width) as u32, align(resolved_height) as u32)
+        } else {
+            (resolved_width, resolved_height)
+        };
 
         let neg = req.negative_prompt.clone().unwrap_or_default();
         let job = Scail2Job {
@@ -618,6 +631,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_off_grid_size_is_refused() {
+        let m = unloaded();
+        for (width, height) in [(1280, 730), (730, 1280)] {
+            let req = GenerationRequest {
+                width,
+                height,
+                count: 1,
+                ..Default::default()
+            };
+
+            let err = Generator::validate(&m, &req)
+                .expect_err("an explicit off-grid size must be refused before generation")
+                .to_string();
+            assert!(
+                err.contains("multiples of 32") && err.contains(&format!("{width}×{height}")),
+                "the refusal must name the required grid and requested size, got: {err}"
+            );
+        }
+        assert_eq!(
+            descriptor()
+                .capabilities
+                .size_floor
+                .explicit_size_multiple(),
+            Some(DIM_ALIGN)
+        );
+    }
+
     /// All three size verdicts a caller can obtain must be the **same** verdict.
     ///
     /// The point of putting `size_floor` on [`Capabilities`] is that a consumer can type-check a
@@ -655,6 +696,8 @@ mod tests {
             (0, 512),
             (512, 0),
             (32, 1280),
+            (1280, 730),
+            (730, 1280),
         ] {
             let req = GenerationRequest {
                 width: w,
@@ -820,6 +863,11 @@ mod tests {
 
         for (w, h, why) in [
             (832, 480, "the model's default bucket"),
+            (
+                640,
+                360,
+                "an ordinary off-grid source clip whose resolved geometry is aligned downstream",
+            ),
             (1280, 704, "the widest advertised bucket"),
             (
                 1280,
