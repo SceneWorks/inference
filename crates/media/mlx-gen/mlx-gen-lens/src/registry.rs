@@ -57,6 +57,58 @@ const BASE_DEFAULTS: Defaults = Defaults {
     guidance: crate::schedule::BASE.guidance_scale,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEncoderStorage {
+    PackedAffine,
+    Mxfp4,
+    DenseBf16,
+    Unknown,
+}
+
+/// Classify the Lens text encoder's on-disk representation from its provider-owned config.
+///
+/// Packed affine takes precedence because the re-hosted q4/q8 turnkeys intentionally retain the
+/// upstream `quantization_config.quant_method = "mxfp4"` provenance while adding the load-bearing
+/// `quantization.bits` marker for their converted weights. Missing or unrecognized metadata stays
+/// `Unknown` so footprint accounting remains conservative instead of silently under-predicting an
+/// MXFP4 source.
+fn text_encoder_storage(root: &Path) -> Result<TextEncoderStorage> {
+    if mlx_gen::quant::packed_quant_bits(root, "text_encoder")?.is_some() {
+        return Ok(TextEncoderStorage::PackedAffine);
+    }
+
+    let config_path = root.join("text_encoder").join("config.json");
+    let bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TextEncoderStorage::Unknown)
+        }
+        Err(err) => {
+            return Err(Error::Msg(format!(
+                "lens text encoder: read {}: {err}",
+                config_path.display()
+            )))
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+        Error::Msg(format!(
+            "lens text encoder: parse {}: {err}",
+            config_path.display()
+        ))
+    })?;
+    if config
+        .pointer("/quantization_config/quant_method")
+        .and_then(serde_json::Value::as_str)
+        == Some("mxfp4")
+    {
+        return Ok(TextEncoderStorage::Mxfp4);
+    }
+    if config.get("dtype").and_then(serde_json::Value::as_str) == Some("bfloat16") {
+        return Ok(TextEncoderStorage::DenseBf16);
+    }
+    Ok(TextEncoderStorage::Unknown)
+}
+
 /// Lens' identity + capabilities for `id` — constructible without loading weights (registry
 /// introspection). Advertises the wired + parity-proven surface: T2I with negative-prompt /
 /// guidance CFG, no conditioning, LoRA + LoKr (DiT joint-attention, sc-3174), and Q4/Q8 load-time
@@ -557,13 +609,18 @@ pub(crate) fn component_footprint(
         mlx_gen::WeightsSource::Dir(root) => root,
         mlx_gen::WeightsSource::File(_) => return Ok(footprint),
     };
-    let packed_turnkey = mlx_gen::quant::packed_quant_bits(root, "text_encoder")?.is_some();
-    if spec.quantize.is_none() && !packed_turnkey {
+    let storage = text_encoder_storage(root)?;
+    if spec.quantize.is_none()
+        && matches!(
+            storage,
+            TextEncoderStorage::Mxfp4 | TextEncoderStorage::Unknown
+        )
+    {
         // sc-11924: the dense Lens snapshot stores the gpt-oss MoE experts as MXFP4 but the loader
         // materializes them at bf16. The 1024² real-weight calibration measured 30.07 GiB resident
-        // for the encoder (vs 12.83 GiB on disk). Keep this provider-specific: measured q4/q8 and
-        // packed turnkeys retain their disk-derived footprint, while other bf16 families receive no
-        // blanket uplift.
+        // for the encoder (vs 12.83 GiB on disk). Keep this provider- and FORMAT-specific: measured
+        // q4/q8 and packed turnkeys retain their disk-derived footprint, an explicit bf16-on-disk
+        // encoder is not inflated, and unknown metadata stays conservative so it cannot hide MXFP4.
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         footprint.text_encoder = footprint.text_encoder.max((30.07 * GIB).ceil() as u64);
     }
@@ -582,15 +639,18 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn footprint_spec(quantize: Option<mlx_gen::Quant>) -> (std::path::PathBuf, LoadSpec) {
         let tier = if quantize.is_some() { "q8" } else { "dense" };
         let root = std::env::temp_dir().join(format!(
-            "mlx_gen_lens_sc11924_{}_{}",
+            "mlx_gen_lens_sc16014_{}_{}_{}",
             std::process::id(),
-            tier
+            tier,
+            FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir(&root).expect("tempdir");
         for (component, bytes) in [("text_encoder", 13), ("transformer", 11), ("vae", 3)] {
             let dir = root.join(component);
@@ -602,14 +662,51 @@ mod tests {
         (root, spec)
     }
 
+    fn write_text_encoder_config(root: &std::path::Path, body: &str) {
+        std::fs::write(root.join("text_encoder").join("config.json"), body)
+            .expect("text encoder config");
+    }
+
     #[test]
     fn dense_footprint_accounts_for_mxfp4_materialization() {
         let (root, spec) = footprint_spec(None);
+        write_text_encoder_config(
+            &root,
+            r#"{"dtype":"bfloat16","quantization_config":{"quant_method":"mxfp4"}}"#,
+        );
         let fp = component_footprint(&spec).expect("footprint");
         let gib: f64 = 1024.0 * 1024.0 * 1024.0;
         assert_eq!(fp.text_encoder, (30.07 * gib).ceil() as u64);
         assert_eq!(fp.dit, 11);
         assert_eq!(fp.vae, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bf16_on_disk_footprint_is_not_inflated_as_mxfp4() {
+        let (root, spec) = footprint_spec(None);
+        write_text_encoder_config(&root, r#"{"dtype":"bfloat16"}"#);
+        assert_eq!(
+            component_footprint(&spec).expect("footprint"),
+            mlx_gen::PerComponentBytes {
+                text_encoder: 13,
+                dit: 11,
+                vae: 3,
+            },
+            "an explicit bf16-on-disk encoder has no MXFP4 materialization delta"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unknown_storage_remains_conservative() {
+        let (root, spec) = footprint_spec(None);
+        let gib: f64 = 1024.0 * 1024.0 * 1024.0;
+        assert_eq!(
+            component_footprint(&spec).expect("footprint").text_encoder,
+            (30.07 * gib).ceil() as u64,
+            "missing format metadata must not hide a possible MXFP4 materialization"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
