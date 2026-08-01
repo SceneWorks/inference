@@ -334,6 +334,18 @@ impl T5TextEncoder {
         Ok(())
     }
 
+    /// Quantize the large attention/FFN Linear surface while retaining the token-embedding and
+    /// relative-position-bias tables at their source precision. Chroma uses this sensitivity-
+    /// calibration policy for its packed auxiliary artifacts; hosted evidence determines whether
+    /// retaining those two boundary tables sufficiently reduces perturbation through the 24-layer
+    /// residual stream while the packed Linear surface removes the full dense-T5 residency.
+    pub fn quantize_linears(&mut self, bits: i32) -> Result<()> {
+        for block in &mut self.blocks {
+            block.quantize_linears(bits)?;
+        }
+        Ok(())
+    }
+
     /// `tokens`: `[1, L]` int32. Returns T5 sequence embeddings `[1, L, 4096]`.
     pub fn forward(&self, tokens: &Array) -> Result<Array> {
         self.forward_masked(tokens, None)
@@ -378,6 +390,12 @@ impl T5Block {
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize(bits)?;
+        self.ff.quantize(bits)?;
+        Ok(())
+    }
+
+    fn quantize_linears(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize_linears(bits)?;
         self.ff.quantize(bits)?;
         Ok(())
     }
@@ -450,6 +468,14 @@ impl T5Attention {
         self.v.quantize(bits, None)?;
         self.o.quantize(bits, None)?;
         self.rel_bias.quantize(bits)?;
+        Ok(())
+    }
+
+    fn quantize_linears(&mut self, bits: i32) -> Result<()> {
+        self.q.quantize(bits, None)?;
+        self.k.quantize(bits, None)?;
+        self.v.quantize(bits, None)?;
+        self.o.quantize(bits, None)?;
         Ok(())
     }
 }
