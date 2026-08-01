@@ -1313,6 +1313,7 @@ impl Generator for LensGenerator {
 /// the merge).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id,
         family: "lens",

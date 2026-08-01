@@ -520,6 +520,7 @@ fn task_to_vit_mode(task: &str) -> Option<VitMode> {
 /// Stable identity + advertised capabilities for the full Bernini pipeline.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "bernini",

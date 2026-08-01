@@ -117,6 +117,7 @@ pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightL
 /// The 44k provider's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         // Same five named component ids as the 16k provider (epic 13657, sc-13666) — `clip` /
         // `synchformer` / `dit` / `vae` / `vocoder`. The ids match; the underlying checkpoints differ
         // (the `large_44k_v2` MM-DiT + 44k mel-VAE from `hkchengrex/MMAudio`, and — unlike the 16k

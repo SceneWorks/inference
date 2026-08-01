@@ -84,6 +84,7 @@ fn generation_descriptor(
     supports_negative_prompt: bool,
 ) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         id,
         family: config::FAMILY,
         backend: "candle",
@@ -463,6 +464,7 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         id: variant.id(),
         family: config::FAMILY,
         backend: "candle",

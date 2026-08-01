@@ -19,7 +19,7 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
-    Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, Progress, Result,
+    Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result,
     TimestepConvention,
 };
 
@@ -459,6 +459,7 @@ pub fn denoise_with_progress(
     height: u32,
     start_step: usize,
     cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     denoise_with_progress_windowed(
@@ -476,6 +477,7 @@ pub fn denoise_with_progress(
         AttentionBudget::UNBOUNDED,
         None,
         cancel,
+        preview,
         on_progress,
     )
 }
@@ -496,6 +498,7 @@ pub(crate) fn denoise_with_progress_windowed(
     attention_budget: AttentionBudget,
     window_size: Option<usize>,
     cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
@@ -504,12 +507,20 @@ pub(crate) fn denoise_with_progress_windowed(
     // RAII guard (F-006) instead of leaking the process-global toggle on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    // Preview (`PreviewSink`): emitted from this closure rather than from the engine-agnostic
+    // sampler core, because only the provider knows the packed latent layout to project. The
+    // closure sees the PRE-step latent, so frame 1 is essentially pure noise — the develop starts
+    // grainy by construction. Numbering is by schedule position, not evaluation count; see
+    // `preview::PreviewCounter`.
+    let previews = crate::preview::PreviewCounter::new(sliced);
     // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+        crate::preview::emit_preview(preview, &previews, sliced, sigma, latents, width, height);
         let pos = transformer.forward_windowed(
             latents,
             pos_embeds,
@@ -545,7 +556,7 @@ pub(crate) fn denoise_with_progress_windowed(
     run_flow_sampler(
         sampler_name,
         TimestepConvention::Sigma,
-        &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
+        sliced,
         latents,
         seed,
         cancel,
@@ -702,6 +713,7 @@ pub fn denoise_edit_with_progress(
     width: u32,
     height: u32,
     cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     denoise_edit_with_progress_windowed(
@@ -720,6 +732,7 @@ pub fn denoise_edit_with_progress(
         AttentionBudget::UNBOUNDED,
         None,
         cancel,
+        preview,
         on_progress,
     )
 }
@@ -741,6 +754,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     attention_budget: AttentionBudget,
     window_size: Option<usize>,
     cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
@@ -749,10 +763,14 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    // Preview: identical to `denoise_with_progress`. The noise-prefix latent handed to this closure
+    // IS the developing image — the reference tail is static conditioning and is not projected.
+    let previews = crate::preview::PreviewCounter::new(sigmas);
     // Each step concatenates the noise latents with the (static) packed reference latents so the RoPE
     // spans `[noise] + references`, then slices the velocity back to the noise prefix. `None` joint
     // mask (as in T2I): the spliced prompt embeds are full-valid.
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+        crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents, width, height);
         let noise_seq = latents.shape()[1];
         let hidden = concatenate_axis(&[latents, static_image_latents], 1)?;
         let pos = slice_seq(

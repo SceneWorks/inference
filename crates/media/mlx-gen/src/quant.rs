@@ -51,7 +51,14 @@ pub fn packed_quant_bits(root: &Path, component: &str) -> Result<Option<i32>> {
         )));
     }
 
-    let config_path = root.join(component_path).join("config.json");
+    packed_quant_bits_at(&root.join(component_path))
+}
+
+/// [`packed_quant_bits`] against a component directory that is already resolved — for a caller
+/// holding the component path itself rather than a snapshot root plus a component name (the
+/// offline pre-quantize converters, which are handed `…/transformer` directly).
+pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
+    let config_path = component_dir.join("config.json");
     let bytes = match std::fs::read(&config_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),

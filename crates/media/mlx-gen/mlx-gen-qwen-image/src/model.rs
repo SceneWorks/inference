@@ -44,6 +44,7 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// the `lightning` sampler (sc-2909); an unset sampler is the production flow-match path.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
@@ -507,6 +508,7 @@ impl QwenImage {
                             attention_budget,
                             block_window,
                             &req.cancel,
+                            &req.preview,
                             progress,
                         )?;
                         crate::pipeline::calibration_fault(

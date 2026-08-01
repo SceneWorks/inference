@@ -141,6 +141,7 @@ fn edit_pipeline_matches_fork() {
         w,
         h,
         &CancelFlag::default(),
+        &mlx_gen::PreviewSink::default(),
         &mut |_| {},
     )
     .unwrap();
@@ -475,6 +476,7 @@ fn edit_pipeline_q8_matches_fork() {
         w,
         h,
         &CancelFlag::default(),
+        &mlx_gen::PreviewSink::default(),
         &mut |_| {},
     )
     .unwrap();

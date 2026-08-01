@@ -50,6 +50,7 @@ pub const MODEL_ID: &str = "z_image_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: Some(accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
         family: "z-image",
@@ -160,10 +161,6 @@ pub(crate) fn accepted_kinds() -> AcceptedControlKinds {
 impl ControlBranch for ZImageControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        accepted_kinds()
     }
 
     /// Fun-Union accepts pose/canny/depth; only the catch-all `Other` reaches this rejection, so the

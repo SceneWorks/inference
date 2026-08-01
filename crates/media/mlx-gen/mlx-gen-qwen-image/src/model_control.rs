@@ -55,6 +55,7 @@ pub const MODEL_ID: &str = "qwen_image_control";
 /// conditioning. LoRA/LoKr (character identity) is on the base transformer.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: Some(accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
@@ -334,10 +335,6 @@ fn accepted_kinds() -> AcceptedControlKinds {
 impl ControlBranch for QwenImageControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        accepted_kinds()
     }
 
     /// Fun-Union accepts pose/canny/depth; only the catch-all `Other` reaches this rejection, so the

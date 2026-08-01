@@ -379,6 +379,7 @@ impl Generator for ZImageGenerator {
 /// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "z-image",

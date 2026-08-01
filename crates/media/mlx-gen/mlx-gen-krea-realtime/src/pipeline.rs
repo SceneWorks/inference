@@ -47,6 +47,7 @@ const DEFAULT_FRAMES: u32 = 81;
 /// fixed Self-Forcing few-step sampler; a rolling causal KV cache).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "krea_realtime",
