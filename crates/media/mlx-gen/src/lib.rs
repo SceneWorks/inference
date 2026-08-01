@@ -37,6 +37,7 @@ pub mod img2img;
 pub mod memory;
 pub mod mllm;
 pub mod nn;
+pub mod preview;
 pub mod quant;
 pub mod residency;
 pub mod sampler;
