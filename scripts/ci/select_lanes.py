@@ -22,8 +22,20 @@ LANES = (
     "real_weights",
 )
 
+
 def _under(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
+
+
+def _is_sa3_reference_fixture(path: str) -> bool:
+    """Whether *path* is inside one of the committed SA3 reference-artifact roots."""
+    parts = PurePosixPath(path).parts
+    if len(parts) < 4 or ".." in parts or parts[:2] != ("docs", "migration"):
+        return False
+    fixture_root = parts[2]
+    return fixture_root == "sa3-reference" or (
+        fixture_root.startswith("sa3-") and fixture_root.endswith("-reference")
+    )
 
 
 def _all(lanes: dict[str, bool]) -> None:
@@ -52,6 +64,18 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
         return lanes
 
     for path in normalized:
+        # SA3's non-ignored parity/oracle targets read committed safetensors/JSON artifacts from
+        # these migration subdirectories. A fixture-only edit is executable Rust test input, not a
+        # prose-only change, and must exercise every platform that builds the Candle audio family.
+        if _is_sa3_reference_fixture(path):
+            lanes.update(
+                candle_cpu=True,
+                macos_metal=True,
+                windows_cuda=True,
+                docs=True,
+            )
+            continue
+
         if path.startswith("docs/") or path in {
             ".github/CODEOWNERS",
             ".gitignore",
