@@ -57,6 +57,58 @@ const BASE_DEFAULTS: Defaults = Defaults {
     guidance: crate::schedule::BASE.guidance_scale,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEncoderStorage {
+    PackedAffine,
+    Mxfp4,
+    DenseBf16,
+    Unknown,
+}
+
+/// Classify the Lens text encoder's on-disk representation from its provider-owned config.
+///
+/// Packed affine takes precedence because the re-hosted q4/q8 turnkeys intentionally retain the
+/// upstream `quantization_config.quant_method = "mxfp4"` provenance while adding the load-bearing
+/// `quantization.bits` marker for their converted weights. Missing or unrecognized metadata stays
+/// `Unknown` so footprint accounting remains conservative instead of silently under-predicting an
+/// MXFP4 source.
+fn text_encoder_storage(root: &Path) -> Result<TextEncoderStorage> {
+    if mlx_gen::quant::packed_quant_bits(root, "text_encoder")?.is_some() {
+        return Ok(TextEncoderStorage::PackedAffine);
+    }
+
+    let config_path = root.join("text_encoder").join("config.json");
+    let bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TextEncoderStorage::Unknown)
+        }
+        Err(err) => {
+            return Err(Error::Msg(format!(
+                "lens text encoder: read {}: {err}",
+                config_path.display()
+            )))
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+        Error::Msg(format!(
+            "lens text encoder: parse {}: {err}",
+            config_path.display()
+        ))
+    })?;
+    if config
+        .pointer("/quantization_config/quant_method")
+        .and_then(serde_json::Value::as_str)
+        == Some("mxfp4")
+    {
+        return Ok(TextEncoderStorage::Mxfp4);
+    }
+    if config.get("dtype").and_then(serde_json::Value::as_str) == Some("bfloat16") {
+        return Ok(TextEncoderStorage::DenseBf16);
+    }
+    Ok(TextEncoderStorage::Unknown)
+}
+
 /// Lens' identity + capabilities for `id` — constructible without loading weights (registry
 /// introspection). Advertises the wired + parity-proven surface: T2I with negative-prompt /
 /// guidance CFG, no conditioning, LoRA + LoKr (DiT joint-attention, sc-3174), and Q4/Q8 load-time
@@ -102,6 +154,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Q4/Q8 quantize the gpt-oss encoder's MoE experts (sc-3172 — the ~38 GB / 20 B-param
             // bulk → ~12 GB) and the DiT's linears (sc-3175) at load.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
@@ -137,6 +190,10 @@ pub fn descriptor_base() -> ModelDescriptor {
 pub struct LensGenerator {
     descriptor: ModelDescriptor,
     defaults: Defaults,
+    precision: Precision,
+    quant: Option<Quant>,
+    streamable_text_encoder: bool,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     /// Component-residency strategy (sc-11030; hoisted to the shared seam in sc-11125), selected from
     /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the gpt-oss text encoder + DiT + VAE warm
     /// for the whole job and across jobs; `Sequential` holds only the per-phase loader closures and
@@ -172,6 +229,39 @@ impl LensHeavyOwned {
     }
 }
 
+/// Measured production domain for the 24-layer Lens encoder. Keeping the resolver explicit makes a
+/// hand-built request fail closed rather than silently accepting an uncalibrated window.
+const TEXT_ENCODER_WINDOW_DOMAIN: &[u32] = &[crate::memory_strategy::TEXT_ENCODER_WINDOW];
+
+fn resolve_encoder_window(req: &GenerationRequest, streamable: bool) -> Result<Option<usize>> {
+    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+        return Ok(None);
+    };
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != mlx_gen::gen_core::TransformerComponent::TextEncoder {
+        return Err(Error::Unsupported(format!(
+            "lens: rung 4 implements the TextEncoder component only; requested {component:?}"
+        )));
+    }
+    if !streamable {
+        return Err(Error::Unsupported(
+            "lens: text-encoder streaming requires a dense BF16, Sequential, deferred-materialization \
+             directory load; other loads do not advertise the measured production rung"
+                .to_owned(),
+        ));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(crate::memory_strategy::TEXT_ENCODER_WINDOW);
+    if !TEXT_ENCODER_WINDOW_DOMAIN.contains(&window) {
+        return Err(Error::Unsupported(format!(
+            "lens: transformer_window_size={window} is outside the measured production domain \
+             {TEXT_ENCODER_WINDOW_DOMAIN:?}"
+        )));
+    }
+    Ok(Some(window as usize))
+}
+
 /// Build a [`LensGenerator`] from a [`LoadSpec`] with the given per-variant defaults.
 ///
 /// `spec.weights` is a `microsoft/Lens-Turbo` (or `microsoft/Lens`) snapshot dir (the diffusers
@@ -184,9 +274,14 @@ impl LensHeavyOwned {
 /// drop the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both
 /// use the same per-phase loaders, so the components are byte-identical.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> {
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(defaults.id, spec)?;
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
+        precision: spec.precision,
+        quant: spec.quantize,
+        streamable_text_encoder: crate::memory_strategy::is_streamable_spec(spec),
+        memory_strategy,
         residency: build_residency(spec, defaults.id)?,
     }))
 }
@@ -273,7 +368,11 @@ fn load_text_phase(spec: &LoadSpec, root: &Path, dtype: Dtype, model_id: &str) -
     if let Some(q) = spec.quantize {
         mlx_gen::quant::needs_load_time_quant(root, "text_encoder", q.bits(), model_id)?;
     }
-    LensText::load(root, dtype, spec.quantize)
+    if crate::memory_strategy::is_streamable_spec(spec) {
+        LensText::load_streamable(root, dtype, spec.quantize)
+    } else {
+        LensText::load(root, dtype, spec.quantize)
+    }
 }
 
 /// Load the heavy render phase — DiT (+ LoRA/LoKr merge, then Q4/Q8) + VAE + the optional PiD overlay —
@@ -319,10 +418,53 @@ fn load_heavy_phase(
     Ok(LensHeavyOwned { heavy, pid })
 }
 
-mlx_gen::impl_generator!(LensGenerator {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Generator for LensGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.defaults.id,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
 
 impl LensGenerator {
     /// The rich-`Result` body behind [`Generator::validate`].
@@ -351,6 +493,7 @@ impl LensGenerator {
         let total = steps as u32;
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+        let encoder_window = resolve_encoder_window(req, self.streamable_text_encoder)?;
 
         // Phase A: prompt → embeds (sc-11030; sc-11125). Under `Sequential` the shared seam loads the
         // gpt-oss encoder, encodes, materializes, then DROPS it + `clear_cache()` so its ~13 GB frees
@@ -362,11 +505,20 @@ impl LensGenerator {
             req.use_pid,
             on_progress,
             |text: &LensText| {
-                text.encode_prompt(&req.prompt, negative, DEFAULT_DATE, Some(&req.cancel))
+                text.encode_prompt_windowed(
+                    &req.prompt,
+                    negative,
+                    DEFAULT_DATE,
+                    Some(&req.cancel),
+                    encoder_window,
+                )
             },
             // Materialize the features + mask while the encoder is still alive (Sequential only) — MLX
             // is lazy, so un-evaluated outputs keep the encoder referenced and the drop frees nothing.
-            |(features, mask): &(Vec<Array>, Array)| {
+            |encoded: Option<&(Vec<Array>, Array)>| {
+                let Some((features, mask)) = encoded else {
+                    return Ok(());
+                };
                 let mut to_eval: Vec<&Array> = features.iter().collect();
                 to_eval.push(mask);
                 mlx_rs::transforms::eval(to_eval)?;
@@ -555,13 +707,18 @@ pub(crate) fn component_footprint(
         mlx_gen::WeightsSource::Dir(root) => root,
         mlx_gen::WeightsSource::File(_) => return Ok(footprint),
     };
-    let packed_turnkey = mlx_gen::quant::packed_quant_bits(root, "text_encoder")?.is_some();
-    if spec.quantize.is_none() && !packed_turnkey {
+    let storage = text_encoder_storage(root)?;
+    if spec.quantize.is_none()
+        && matches!(
+            storage,
+            TextEncoderStorage::Mxfp4 | TextEncoderStorage::Unknown
+        )
+    {
         // sc-11924: the dense Lens snapshot stores the gpt-oss MoE experts as MXFP4 but the loader
         // materializes them at bf16. The 1024² real-weight calibration measured 30.07 GiB resident
-        // for the encoder (vs 12.83 GiB on disk). Keep this provider-specific: measured q4/q8 and
-        // packed turnkeys retain their disk-derived footprint, while other bf16 families receive no
-        // blanket uplift.
+        // for the encoder (vs 12.83 GiB on disk). Keep this provider- and FORMAT-specific: measured
+        // q4/q8 and packed turnkeys retain their disk-derived footprint, an explicit bf16-on-disk
+        // encoder is not inflated, and unknown metadata stays conservative so it cannot hide MXFP4.
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         footprint.text_encoder = footprint.text_encoder.max((30.07 * GIB).ceil() as u64);
     }
@@ -572,6 +729,20 @@ mlx_gen::register_generators! {
     pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
     footprint = component_footprint
 }
+
+pub const TURBO_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID_TURBO,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_TURBO, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const BASE_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID_BASE,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_BASE, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
 mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
     footprint = component_footprint
@@ -580,15 +751,192 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// Measurement-only construction for the Q4 non-win record. Production goes through
+    /// `is_streamable_spec` and correctly refuses to advertise Q4; this test deliberately injects
+    /// the streamable text-phase loader so the rejected tier's request-level result stays
+    /// reproducible without opening a production bypass.
+    fn q4_measurement_generator(spec: &LoadSpec) -> Result<LensGenerator> {
+        let spec_text = spec.clone();
+        let spec_heavy = spec.clone();
+        let residency = Residency::from_policy(
+            mlx_gen::OffloadPolicy::Sequential,
+            move || {
+                let (root, dtype) = resolve_root(&spec_text)?;
+                if let Some(q) = spec_text.quantize {
+                    mlx_gen::quant::needs_load_time_quant(
+                        &root,
+                        "text_encoder",
+                        q.bits(),
+                        MODEL_ID_TURBO,
+                    )?;
+                }
+                LensText::load_streamable(&root, dtype, spec_text.quantize)
+            },
+            move |use_pid| {
+                let (root, dtype) = resolve_root(&spec_heavy)?;
+                load_heavy_phase(&spec_heavy, &root, dtype, use_pid, MODEL_ID_TURBO)
+            },
+        )?;
+        Ok(LensGenerator {
+            descriptor: descriptor_turbo(),
+            defaults: TURBO_DEFAULTS,
+            precision: spec.precision,
+            quant: spec.quantize,
+            streamable_text_encoder: true,
+            memory_strategy: crate::memory_strategy::memory_strategy_contract(
+                MODEL_ID_TURBO,
+                spec,
+            )?,
+            residency,
+        })
+    }
+
+    #[test]
+    #[ignore = "SC-15800 Q4 request non-win; needs an explicit LENS_DIR q4 turnkey and Apple/Metal"]
+    fn q4_request_non_improvement_remains_reproducible_but_unadvertised() {
+        use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
+        use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+
+        let root = std::path::PathBuf::from(
+            std::env::var("LENS_DIR").expect("set LENS_DIR to the explicit Lens q4 tier"),
+        );
+        assert_eq!(root.file_name().and_then(|name| name.to_str()), Some("q4"));
+        let spec = LoadSpec::new(WeightsSource::Dir(root))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(Quant::Q4);
+        assert!(matches!(
+            crate::memory_strategy::memory_strategy_contract(MODEL_ID_TURBO, &spec)
+                .unwrap()
+                .capability(mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .map(|capability| &capability.support),
+            Some(mlx_gen::gen_core::MemoryStrategySupport::Missing)
+        ));
+
+        let run = |window: Option<u32>| {
+            let generator = q4_measurement_generator(&spec).unwrap();
+            let request = GenerationRequest {
+                prompt: "a red fox crossing a snowy clearing at dawn, documentary photograph"
+                    .into(),
+                width: 256,
+                height: 256,
+                count: 1,
+                steps: Some(1),
+                guidance: Some(1.0),
+                seed: Some(15800),
+                memory: window.map(|window| GenerationMemory {
+                    stream_transformer_blocks: true,
+                    transformer_window_size: Some(window),
+                    transformer_window_component: Some(TransformerComponent::TextEncoder),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            clear_cache();
+            reset_peak_memory();
+            let output = generator.generate_impl(&request, &mut |_| {}).unwrap();
+            let peak = get_peak_memory() as u64;
+            let image = match output {
+                GenerationOutput::Images(mut images) => images.pop().unwrap(),
+                other => panic!("expected image output, got {other:?}"),
+            };
+            drop(generator);
+            clear_cache();
+            (peak, image)
+        };
+
+        let (unscoped_peak, unscoped_image) = run(None);
+        let (window_peak, window_image) = run(Some(crate::memory_strategy::TEXT_ENCODER_WINDOW));
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        println!(
+            "SC-15800 Lens Q4 request peak: unscoped={:.3} GiB text-w=1={:.3} GiB",
+            unscoped_peak as f64 / gib,
+            window_peak as f64 / gib
+        );
+        assert_eq!(unscoped_image.pixels, window_image.pixels);
+        assert!(
+            window_peak <= unscoped_peak + unscoped_peak / 20,
+            "the measurement path unexpectedly raised Q4 request peak by more than 5%"
+        );
+    }
+
+    fn window_request(
+        component: mlx_gen::gen_core::TransformerComponent,
+        window: Option<u32>,
+    ) -> GenerationRequest {
+        GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stream_transformer_blocks: true,
+                transformer_window_size: window,
+                transformer_window_component: Some(component),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_sequential_accepts_the_text_encoder_scope() {
+        let request = window_request(
+            mlx_gen::gen_core::TransformerComponent::TextEncoder,
+            Some(1),
+        );
+        assert_eq!(resolve_encoder_window(&request, true).unwrap(), Some(1));
+        let error = resolve_encoder_window(&request, false).unwrap_err();
+        assert!(
+            error.to_string().contains("dense BF16, Sequential"),
+            "Resident refusal must name the policy reason: {error}"
+        );
+    }
+
+    #[test]
+    fn lens_refuses_unimplemented_dit_and_out_of_domain_windows() {
+        for component in [
+            mlx_gen::gen_core::TransformerComponent::Dit,
+            mlx_gen::gen_core::TransformerComponent::Both,
+        ] {
+            let error = resolve_encoder_window(&window_request(component, Some(1)), true)
+                .expect_err("Lens implements only the text-encoder component");
+            assert!(error.to_string().contains("TextEncoder component only"));
+        }
+        let error = resolve_encoder_window(
+            &window_request(
+                mlx_gen::gen_core::TransformerComponent::TextEncoder,
+                Some(3),
+            ),
+            true,
+        )
+        .expect_err("an unswept window must fail closed");
+        assert!(error
+            .to_string()
+            .contains("outside the measured production domain"));
+    }
+
+    #[test]
+    fn an_unselected_request_does_not_stream_and_the_default_is_explicit() {
+        assert_eq!(
+            resolve_encoder_window(&GenerationRequest::default(), true).unwrap(),
+            None
+        );
+        let request = window_request(mlx_gen::gen_core::TransformerComponent::TextEncoder, None);
+        assert_eq!(
+            resolve_encoder_window(&request, true).unwrap(),
+            Some(crate::memory_strategy::TEXT_ENCODER_WINDOW as usize)
+        );
+    }
 
     fn footprint_spec(quantize: Option<mlx_gen::Quant>) -> (std::path::PathBuf, LoadSpec) {
         let tier = if quantize.is_some() { "q8" } else { "dense" };
         let root = std::env::temp_dir().join(format!(
-            "mlx_gen_lens_sc11924_{}_{}",
+            "mlx_gen_lens_sc16014_{}_{}_{}",
             std::process::id(),
-            tier
+            tier,
+            FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir(&root).expect("tempdir");
         for (component, bytes) in [("text_encoder", 13), ("transformer", 11), ("vae", 3)] {
             let dir = root.join(component);
@@ -600,14 +948,51 @@ mod tests {
         (root, spec)
     }
 
+    fn write_text_encoder_config(root: &std::path::Path, body: &str) {
+        std::fs::write(root.join("text_encoder").join("config.json"), body)
+            .expect("text encoder config");
+    }
+
     #[test]
     fn dense_footprint_accounts_for_mxfp4_materialization() {
         let (root, spec) = footprint_spec(None);
+        write_text_encoder_config(
+            &root,
+            r#"{"dtype":"bfloat16","quantization_config":{"quant_method":"mxfp4"}}"#,
+        );
         let fp = component_footprint(&spec).expect("footprint");
         let gib: f64 = 1024.0 * 1024.0 * 1024.0;
         assert_eq!(fp.text_encoder, (30.07 * gib).ceil() as u64);
         assert_eq!(fp.dit, 11);
         assert_eq!(fp.vae, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bf16_on_disk_footprint_is_not_inflated_as_mxfp4() {
+        let (root, spec) = footprint_spec(None);
+        write_text_encoder_config(&root, r#"{"dtype":"bfloat16"}"#);
+        assert_eq!(
+            component_footprint(&spec).expect("footprint"),
+            mlx_gen::PerComponentBytes {
+                text_encoder: 13,
+                dit: 11,
+                vae: 3,
+            },
+            "an explicit bf16-on-disk encoder has no MXFP4 materialization delta"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unknown_storage_remains_conservative() {
+        let (root, spec) = footprint_spec(None);
+        let gib: f64 = 1024.0 * 1024.0 * 1024.0;
+        assert_eq!(
+            component_footprint(&spec).expect("footprint").text_encoder,
+            (30.07 * gib).ceil() as u64,
+            "missing format metadata must not hide a possible MXFP4 materialization"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

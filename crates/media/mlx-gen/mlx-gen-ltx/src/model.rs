@@ -249,6 +249,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Quantization is checkpoint-driven (split_model.json); load() rejects on-the-fly
             // spec.quantize that disagrees with the manifest. No on-the-fly re-quant available.
             supported_quants: &[],
+            component_precision_floors: &[],
             // Curated unified solvers (epic 7114, sc-7122): LTX exposes the SAMPLER axis but NO scheduler
             // (matching ComfyUI) — it keeps its baked distilled σ schedule (8+3 steps) and only swaps the
             // integrator (over the two-stream `MlxAvLatentOps`, joint video+audio). LTX is distilled, so

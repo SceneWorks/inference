@@ -29,6 +29,7 @@ mod macros;
 pub mod media;
 pub mod memory_strategy;
 pub mod registry;
+pub mod residency;
 pub mod runtime;
 pub mod sampling;
 pub mod sdxl_ldm;
@@ -62,10 +63,11 @@ pub use control::{
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, AudioEditMode, AudioEditRef, AudioParams, Capabilities, Conditioning,
-    ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
-    ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
+    default_seed, effective_component_quant, ActivationMemoryAnchor, AudioEditMode, AudioEditRef,
+    AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning, ConditioningKind,
+    ControlClipRef, ControlKind, ConversationRole, ConversationSession, ConversationTurn,
+    GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest, Generator, KeyframeRef,
+    Modality, ModelDescriptor, PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SizeFloor,
     SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
@@ -73,24 +75,29 @@ pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
-    MemoryAssetFacts, MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics,
-    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryConformanceState,
-    MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
-    MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges,
-    MemoryParityContract, MemoryParityResult, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryRunContext,
+    adapter_stack_resident_bytes, default_memory_strategy_safety_check,
+    default_registered_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
+    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind, MemoryConformanceState,
+    MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
+    MemoryEvidenceKey, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown,
+    MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRejection, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
-    TransformerComponent, MEMORY_CALIBRATION_ABI,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyEngagementExclusion,
+    MemoryStrategyParameters, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    MemoryWarmRunSemantics, MemoryWindowMaterialization, TransformerComponent,
+    MEMORY_CALIBRATION_ABI,
 };
 pub use registry::{
-    AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
-    ImageEmbedderRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
-    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
-    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
+    CaptionerRegistration, ImageEmbedderRegistration, MemoryRegistration, ModelRegistration,
+    PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration,
+    TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
+pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
     LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
@@ -100,7 +107,10 @@ pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
-pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
+pub use weightsmeta::{
+    safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,
+    SafetensorsTensorHeader,
+};
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
 // dependency is INVERTED: gen-core CONSUMES `core-llm` — the same way mlx-gen re-exports gen-core via

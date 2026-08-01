@@ -546,6 +546,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: true,
             requires_sigma_shift: false,
             // Bernini is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds NO

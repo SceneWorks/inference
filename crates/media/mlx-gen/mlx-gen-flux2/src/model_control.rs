@@ -67,6 +67,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base FLUX.2 path — native default + curated.
@@ -373,7 +374,10 @@ impl Flux2DevControl {
             req.use_pid,
             on_progress,
             |text: &Flux2TextOwned| Self::encode(tokenizer, text, &req.prompt),
-            |(prompt_embeds, _text_ids)| {
+            |encoded| {
+                let Some((prompt_embeds, _text_ids)) = encoded else {
+                    return Ok(());
+                };
                 eval([prompt_embeds])?;
                 Ok(())
             },

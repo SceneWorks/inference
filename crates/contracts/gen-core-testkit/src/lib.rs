@@ -69,7 +69,10 @@ pub use captioner::{
     captioner_conformance, check_captioner_cancellation, check_captioner_progress,
     check_captioner_registry, check_captioner_validate, CaptionerProfile,
 };
-pub use memory_strategy::{check_memory_strategy_contract, memory_strategy_conformance};
+pub use memory_strategy::{
+    check_memory_strategy_contract, check_memory_strategy_registry, memory_strategy_conformance,
+    memory_strategy_registry_conformance,
+};
 pub use trainer::{
     check_trainer_cancellation, check_trainer_progress, check_trainer_registry,
     check_trainer_validate, trainer_conformance, TrainerProfile,

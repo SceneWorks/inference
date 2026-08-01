@@ -105,6 +105,7 @@ pub fn descriptor() -> ModelDescriptor {
             // dense bf16 build is a no-op on an already-packed snapshot. The DiT + Qwen3-VL text
             // tower are quantized; the FLUX.1 VAE + (edit-only) vision tower stay dense.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840): under Sequential the
@@ -371,7 +372,10 @@ impl Boogu {
             // ── Phase A: true-CFG mllm conditioning (Sequential loads the mllm, encodes, materializes,
             // drops it + clear_cache before the DiT/VAE load; Resident borrows the warm encoder).
             |enc: &BooguEncoders| enc.encode_base(&self.tokenizer, &req.prompt, guidance),
-            |c: &BooguBaseCond| c.materialize(),
+            |c: Option<&BooguBaseCond>| match c {
+                Some(c) => c.materialize(),
+                None => Ok(()),
+            },
             // ── Phase B: denoise/decode from the heavy DiT/VAE bundle over the count loop.
             |heavy: &BooguHeavy, c, on_progress| {
                 // PiD decode overlay (sc-7846) + `from_ldm` early-stop (sc-8048): the img2img start
@@ -471,7 +475,10 @@ impl Boogu {
             |enc: &BooguEncoders| {
                 enc.encode_edit(&self.tokenizer, &references, &req.prompt, &edit_opts)
             },
-            |c: &BooguBaseCond| c.materialize(),
+            |c: Option<&BooguBaseCond>| match c {
+                Some(c) => c.materialize(),
+                None => Ok(()),
+            },
             |heavy: &BooguHeavy, c, on_progress| {
                 // Edit always starts the output from pure noise (the references shape the DiT sequence,
                 // not the init latent), so there is no img2img start-step; `flow_capture_for_request`
@@ -546,7 +553,10 @@ impl Boogu {
             req.use_pid,
             on_progress,
             |enc: &BooguEncoders| enc.encode_turbo(&self.tokenizer, &req.prompt),
-            |(cond, mask): &(Array, Array)| {
+            |encoded: Option<&(Array, Array)>| {
+                let Some((cond, mask)) = encoded else {
+                    return Ok(());
+                };
                 mlx_rs::transforms::eval([cond, mask])?;
                 Ok(())
             },

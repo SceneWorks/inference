@@ -55,6 +55,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // like SANA). The worker reads `supported_quants` for its capability advertisement
             // (gen-core sc-3723); every advertised tier actually loads, so this is honest.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
@@ -226,7 +227,10 @@ impl Anima {
             // Materialize the masked Qwen3 states + T5 ids (cond + optional uncond) while the TE is still
             // alive (Sequential only) — MLX is lazy, so an un-evaluated `source` keeps the TE referenced
             // and dropping it would free nothing. The T5 weights are host data (no eval).
-            |(cond, uncond): &(AnimaCondInputs, Option<AnimaCondInputs>)| {
+            |encoded: Option<&(AnimaCondInputs, Option<AnimaCondInputs>)>| {
+                let Some((cond, uncond)) = encoded else {
+                    return Ok(());
+                };
                 let mut arrays = vec![&cond.source, &cond.t5_ids];
                 if let Some(u) = uncond {
                     arrays.push(&u.source);

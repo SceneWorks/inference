@@ -156,24 +156,46 @@ pub fn load_vae(root: &Path) -> Result<QwenVae> {
 /// `to_out.0`→`attn_to_out.0`, `{img,txt}_mod.1`→`{img,txt}_mod_linear`, the
 /// `{img,txt}_mlp.net.{0.proj,2}` feed-forwards → `{img,txt}_ff.mlp_{in,out}`. Everything else
 /// matches 1:1 and is left in place. Applied across all 60 blocks by substring match.
+const TRANSFORMER_RENAMES: &[(&str, &str)] = &[
+    (".attn.to_out.0.", ".attn.attn_to_out.0."),
+    (".img_mod.1.", ".img_mod_linear."),
+    (".txt_mod.1.", ".txt_mod_linear."),
+    (".img_mlp.net.0.proj.", ".img_ff.mlp_in."),
+    (".img_mlp.net.2.", ".img_ff.mlp_out."),
+    (".txt_mlp.net.0.proj.", ".txt_ff.mlp_in."),
+    (".txt_mlp.net.2.", ".txt_ff.mlp_out."),
+];
+
 pub fn remap_transformer_keys(w: &mut Weights) {
-    const RENAMES: &[(&str, &str)] = &[
-        (".attn.to_out.0.", ".attn.attn_to_out.0."),
-        (".img_mod.1.", ".img_mod_linear."),
-        (".txt_mod.1.", ".txt_mod_linear."),
-        (".img_mlp.net.0.proj.", ".img_ff.mlp_in."),
-        (".img_mlp.net.2.", ".img_ff.mlp_out."),
-        (".txt_mlp.net.0.proj.", ".txt_ff.mlp_in."),
-        (".txt_mlp.net.2.", ".txt_ff.mlp_out."),
-    ];
     let keys: Vec<String> = w.keys().map(String::from).collect();
     for k in keys {
-        for (from, to) in RENAMES {
+        for (from, to) in TRANSFORMER_RENAMES {
             if k.contains(from) {
                 w.alias(&k, &k.replace(from, to));
                 break;
             }
         }
+    }
+}
+
+/// Remove the on-disk side of aliases for one already-built block. `remove_accessed` drains the
+/// internal names read by the constructor, but `Weights::alias` deliberately retains the original
+/// diffusers key. A streamed view must drop those twin handles too or every window retains seven
+/// Linears' weights after the block has finished. An omitted constructor read remains observable:
+/// its unaccessed internal alias is deliberately not removed here.
+pub(crate) fn remove_transformer_source_aliases(w: &mut Weights, block_prefix: &str) {
+    let keys: Vec<String> = w
+        .keys()
+        .filter(|key| {
+            key.starts_with(block_prefix)
+                && TRANSFORMER_RENAMES
+                    .iter()
+                    .any(|(source, _)| key.contains(source))
+        })
+        .map(String::from)
+        .collect();
+    for key in keys {
+        w.remove(&key);
     }
 }
 

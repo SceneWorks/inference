@@ -137,6 +137,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // SELECT (which subdir the caller resolved), not an on-the-fly quantize. bf16 resolves
             // to `None` and loads dense. Same contract as flux1/qwen/kolors.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // The backbone uses a KV cache for the AR prefix + denoise.
             supports_kv_cache: true,
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).

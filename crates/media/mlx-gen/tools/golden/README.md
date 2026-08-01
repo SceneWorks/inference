@@ -18,6 +18,57 @@ weights and a Mac with Metal, which is exactly why the tests that read them are 
 Default-running tests only depend on committed inputs; anything needing un-committable inputs is
 `#[ignore]`d. So a fresh clone's `cargo test` is green without this directory.
 
+## These goldens are single-host. That is the intent, not a gap.
+
+**Read this before treating a missing golden as something to fix.**
+
+On any machine that is not the one a golden was dumped on, the row that reads it fails in **0.00 s**
+on `Weights::from_file(GOLDEN)` — before any weights load, any device, any work. On a fresh clone
+that is *every* row: this directory ships `README.md` and `CHECKSUMS.txt` and nothing else. As of
+this writing that is **119 distinct golden artifacts, referenced by 110 test files across 22
+crates**.
+
+The "Regenerating" section above says the goldens are regenerable, and in principle they are. In
+practice a second party with the licensed weights and a Metal Mac still cannot reproduce one,
+because two of the three inputs are named by *location* rather than derivable:
+
+- **the frozen `mflux` fork at `~/repos/mflux`** — a private checkout, not a published artifact, and
+  the only place the reference implementation exists;
+- **the reference venv at `~/Repos/mflux/.venv-0320`** — python 3.12 + diffusers 0.37.1 +
+  transformers 5.10.1 + torch 2.12.0, *plus* MLX 0.32.0 **built from source** at
+  `MACOSX_DEPLOYMENT_TARGET=15.0`. There is no lockfile and no build script; the pip wheel is
+  explicitly not a valid substitute on M3-class-or-newer hosts.
+
+So the honest statement is the one this section exists to make: **these rows are single-host and are
+not currently intended to be reproducible elsewhere.** A missing golden off-host is the expected
+state, not an accident and not a gap for a downstream consumer to close.
+
+### What that means if you are gating on real-weight conformance
+
+A consumer running these suites to gate an engine pin (SceneWorks issue #311 was filed by one) must
+treat every golden-backed row as **contributing nothing to that gate off-host**. The failure mode is
+quiet in the direction that matters: a 0.00 s failure or a skipped row still *looks* like a line of
+coverage in the run output, so counting rows overstates what was actually verified. Count only rows
+whose inputs you can supply.
+
+### What would change this, and why it has not
+
+Three routes were considered (#311). None is done, and the reason is recorded here so it is not
+re-litigated from scratch:
+
+1. **Publish the dumps** — an HF dataset repo, or release assets keyed to the MLX version this
+   README already says the goldens are sensitive to. The blocker is that a golden is a derived work
+   of licensed multi-GB weights, so republishing it is a licensing question per source model, not an
+   infrastructure one.
+2. **Publish a reproducible recipe for the reference venv** — a lockfile or an exact build script,
+   so `~/Repos/mflux/.venv-0320` becomes derivable. This is the cheapest of the three and the one
+   worth doing first, but it is only half a fix while the `mflux` fork itself is unpublished.
+3. **Say so explicitly** — this section. It does not add coverage; it stops the absence reading as
+   an accident, which is the part that was actively misleading.
+
+Route 3 landing does not close 1 or 2. If you need these rows to execute off-host, they are still
+the work.
+
 ## Regenerating
 
 > **sc-12896 (MLX 0.32.0): use the version-matched NON-NAX env.** Goldens must be dumped with

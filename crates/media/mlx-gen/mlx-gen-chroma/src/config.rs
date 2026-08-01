@@ -108,6 +108,7 @@ impl ChromaVariant {
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
                 supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
                 // LoRA/LoKr via the shared core adapter seam (sc-3842), over the diffusers/peft
                 // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
                 supports_lora: true,

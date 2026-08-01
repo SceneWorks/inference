@@ -193,6 +193,7 @@ impl Flux2Variant {
                 supports_lora: true,
                 supports_lokr: true,
                 supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
                 // Curated unified-framework integrator menu (epic 7114 P3). An unset `req.sampler` is
                 // the curated Euler over the resolution-shifted flow schedule.
                 samplers: curated_sampler_names(),

@@ -46,6 +46,8 @@
 //!   bounds peak unified memory under `Sequential`; the img2img, PiD-decode (`mlx-gen-pid`) and
 //!   `from_ldm` early-stop seams thread through it.
 
+pub mod block_memory_strategy;
+mod block_stream;
 pub mod config;
 pub mod control;
 pub mod convert;
@@ -87,15 +89,30 @@ pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};
 pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae};
 
+/// sc-16195 Apple-Silicon warm sweep: Krea 2 Turbo q8 and dense both peaked below 7.67 GiB
+/// at 1024². Activations stay bf16 across weight tiers; Raw/Edit are distinct unmeasured routes.
+pub const TURBO_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: KREA_2_TURBO_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 8_235_599_791,
+        },
+    };
+
 /// Add all MLX Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::TURBO_REGISTRATION)
+        .register_activation_memory(TURBO_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::RAW_REGISTRATION)
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
+        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
@@ -108,6 +125,36 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    #[test]
+    fn every_base_variant_resolves_the_rung_four_contract_through_the_registry() {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        for id in [
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+        ] {
+            let contract = registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must register a memory contract"));
+            assert_eq!(contract.provider_id, id);
+            let rung = contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert_eq!(rung.support, MemoryStrategySupport::Implemented, "{id}");
+            assert_eq!(
+                rung.parameters.transformer_window_sizes,
+                [crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE]
+            );
+        }
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -183,6 +230,7 @@ mod explicit_registry_tests {
                 tier: mlx_gen::gen_core::MemoryNumericTier {
                     precision: mlx_gen::Precision::Bf16,
                     quant: Some(mlx_gen::Quant::Q4),
+                    component_precision_floors: &[],
                 },
             },
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,

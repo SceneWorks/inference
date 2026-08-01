@@ -8,8 +8,13 @@
 //! `reference/dump_boogu_vision_golden.py`.
 //!
 //! `#[ignore]` — needs the Base snapshot (`mllm/`) + the golden + the test image:
-//!   BOOGU_BASE_DIR=<snapshot> CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
+//!   BOOGU_BASE_DIR=<snapshot> BOOGU_VISION_GOLDEN=<safetensors> BOOGU_VISION_TEST_IMAGE=<png> \
 //!     cargo test -p mlx-gen-boogu --test vision_parity -- --ignored --nocapture
+//!
+//! `BOOGU_VISION_TEST_IMAGE` is required rather than defaulted; `BOOGU_VISION_GOLDEN` still falls
+//! back to a path in one developer's worktree, which is the same unreproducibility this repo tracks
+//! in issue #311 for `tools/golden`. Left as-is here because it already takes an override — the
+//! sweep that added the one above targeted resolution chains with no override at all.
 
 use std::path::PathBuf;
 
@@ -100,8 +105,22 @@ fn vision_tower_matches_reference() {
 #[ignore = "needs the golden + test image (dump_boogu_vision_golden.py)"]
 fn preprocess_matches_reference() {
     let g = Weights::from_file(golden_path()).expect("golden — run dump_boogu_vision_golden.py");
-    let img_path = PathBuf::from(std::env::var("HOME").expect("HOME"))
-        .join("Repos/mlx-gen-wt-boogu/reference/outputs/boogu_mlx_t2i_apple_512_s28.png");
+    // REQUIRED, not a `$HOME` fallback — deliberately unlike the rest of this sweep.
+    //
+    // This used to resolve `~/Repos/mlx-gen-wt-boogu/reference/outputs/…`, a path inside one
+    // developer's git worktree. That is not a derived cache anyone can rebuild: it is a reference
+    // render that exists on exactly one machine, so giving it an override with the old path as the
+    // default would make it *look* steerable while still resolving to a file nobody else has.
+    // Failing with the name of the variable to set is the honest form of the same information.
+    let img_path = PathBuf::from(
+        std::env::var("BOOGU_VISION_TEST_IMAGE").unwrap_or_else(|_| {
+            panic!(
+                "set BOOGU_VISION_TEST_IMAGE to the reference render this parity compares against \
+             (reference/dump_boogu_vision_golden.py emits it); inference never self-fetches or \
+             derives a cache location (epic 13657)"
+            )
+        }),
+    );
     let img = image::open(&img_path)
         .unwrap_or_else(|e| panic!("open {}: {e}", img_path.display()))
         .to_rgb8();

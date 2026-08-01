@@ -165,6 +165,7 @@ pub fn descriptor() -> ModelDescriptor {
             // engages off-Mac (the resolved q4/q8 turnkey subdir self-describes; `build` no-ops the
             // requested quant — see below). Both quality + turbo share this via `descriptor_turbo`.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

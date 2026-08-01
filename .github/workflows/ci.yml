@@ -46,6 +46,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      - name: Validate append-only code-review finding allocations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/check-review-findings.py --base "$BASE_SHA"
       - name: Expand changed paths through workspace dependencies
         id: select
         env:
@@ -469,6 +473,20 @@ jobs:
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos
+      # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
+      # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
+      # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
+      # test is live per invocation. Only build parallelism is uncapped, which is what we want.
+      # The flake that prompted the question was never seen on this lane — it was reproduced
+      # locally and is cross-PROCESS: two `cargo test` runs on one machine share a single
+      # `$TMPDIR`, and fixtures written to a hardcoded name there got truncated or removed under
+      # each other (`SafeTensors(NotFile)`, and torn reads as "Invalid json header length"). The
+      # fix was to key every temp fixture on `std::process::id()` (sc-16057). No in-run cap could
+      # have fixed that on any runner, and `-j 1` in particular bounds only BUILD jobs, so it
+      # neither caused nor cured it — it would just slow the lane down.
+      # NB the `macos-nax` lane below IS self-hosted, so it does share `$TMPDIR` between jobs; it
+      # is safe only because no hardcoded fixture path remains in the crates it runs (mlx-llm,
+      # runtime-macos). Keep it that way if that lane's package set ever grows.
       - name: Test MLX packages
         run: >-
           cargo test --locked --lib --tests

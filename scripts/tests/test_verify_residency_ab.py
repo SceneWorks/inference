@@ -18,7 +18,7 @@ class VerifyResidencyAbTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             resident = self.write_log(root, "resident.log", "resident", 24000)
-            sequential = self.write_log(root, "sequential.log", "spec-sequential", 15000)
+            sequential = self.write_log(root, "sequential.log", "request-staged", 15000)
             self.assertEqual(verify(resident, sequential, 512), (24000, 15000))
 
     def test_rejects_wrong_mode_and_insufficient_reduction(self) -> None:
@@ -26,9 +26,9 @@ class VerifyResidencyAbTests(unittest.TestCase):
             root = Path(temporary)
             resident = self.write_log(root, "resident.log", "resident", 16000)
             wrong = self.write_log(root, "wrong.log", "resident", 14000)
-            with self.assertRaisesRegex(RuntimeError, "expected mode=spec-sequential"):
-                read_peak(wrong, "spec-sequential")
-            sequential = self.write_log(root, "sequential.log", "spec-sequential", 15700)
+            with self.assertRaisesRegex(RuntimeError, "expected mode=request-staged"):
+                read_peak(wrong, "request-staged")
+            sequential = self.write_log(root, "sequential.log", "request-staged", 15700)
             with self.assertRaisesRegex(RuntimeError, "required at least 512"):
                 verify(resident, sequential, 512)
 

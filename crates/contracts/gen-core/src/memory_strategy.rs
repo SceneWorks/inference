@@ -90,24 +90,27 @@
 //!
 //! ## What that leaves undeclared, stated rather than glossed
 //!
-//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization — which ships today — does have
-//! a host cost, and this decision does **not** surface its size. Its per-window conversion allocates
-//! anonymous host memory per projection and frees it again: on the order of the block's unpacked codes
-//! for q4, and for q8 a **full dense f32 grid** (`repack::dequant_mlx_q8_gs`), which for a
-//! 3840 × 15360 projection is a few hundred MiB. Those are transients, not held for the request, and
-//! they are **not measured** — SC-15791 states plainly that q8 host memory is unverified. So on a
-//! low-RAM host a rung-4 Candle selection today carries an unquantified host transient that no gate
-//! sees. That is a consequence of the non-conforming realization, and SC-16096 both removes the
-//! conversion and owes the host measurement; it is recorded here so it is not mistaken for zero.
+//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization does have a host cost, and this
+//! decision does **not** surface its size. The original packed Candle realization converted each
+//! window from MLX-affine source tensors, allocating anonymous host memory per projection: on the
+//! order of the block's unpacked codes for q4, and for q8 a **full dense f32 grid**
+//! (`repack::dequant_mlx_q8_gs`), which for a 3840 × 15360 projection is a few hundred MiB. Those
+//! transients were not held for the request and SC-15791 did not measure them. SC-16096 replaced that
+//! Krea/Lens path with content-addressed device-format sidecars; SC-16510 completed the same transition
+//! for streamed Z-Image blocks. No current media provider declares `HostFormatConversion`, but the
+//! variant remains so a future converting realization must describe itself honestly rather than claim
+//! a device-format transfer.
 //!
 //! **Revisit trigger — deliberately broad enough to catch that case.** The axis is owed if a
 //! realization is measured to need host memory proportional to the model that a fit gate would have to
 //! account for: whether it is held for the request or transient, reclaimable or not, and whether or not
-//! a device-format alternative exists. SC-16096 must raise it rather than absorb it. What is *not* owed
-//! is an axis built ahead of that measurement, on the strength of a figure derived for a fix nobody has
-//! written.
+//! a device-format alternative exists. A provider that crosses that threshold must raise the contract
+//! question rather than absorb it. What is *not* owed is an axis built ahead of that measurement.
 
-use crate::{Error, GenerationRequest, LoadShape, Precision, Quant, Result};
+use crate::{
+    weightsmeta::safetensors_path_bytes, AdapterSpec, Error, GenerationRequest, LoadShape,
+    Precision, Quant, Result,
+};
 
 /// Current ABI of the provider/evidence calibration handshake.
 ///
@@ -115,6 +118,9 @@ use crate::{Error, GenerationRequest, LoadShape, Precision, Quant, Result};
 /// formula inputs or lifecycle semantics are interpreted; the fingerprint changes whenever one
 /// provider changes tensor layout, quantization floors, execution structure, or another detail that
 /// invalidates its measurements.
+///
+/// SC-16065 is additive and deliberately did not bump this value: existing variables retain their
+/// meanings, while typed auxiliary components opt into the existing `OverlayBytes` input.
 pub const MEMORY_CALIBRATION_ABI: u32 = 1;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
@@ -353,6 +359,28 @@ pub struct MemoryParameterRanges {
     pub transformer_window_components: Vec<TransformerComponent>,
 }
 
+/// One decode route's exact tile domain.
+///
+/// A route owns one overlap and one or more tile edges. Keeping the pair together matters for
+/// conformance: the route-blind [`MemoryParameterRanges`] publishes the union of all edges and
+/// overlaps, while admission must reject a geometry assembled for a different route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDecodeRouteDomain {
+    pub tile_edges: Vec<u32>,
+    pub tile_overlap: u32,
+}
+
+/// Native-VAE and PiD decode domains for a provider that can execute either route.
+///
+/// `None` on [`MemoryProviderContract::pid_decode_routes`] means the provider has no PiD route. This
+/// backend-neutral declaration is deliberately expressed only in contract geometry: `gen-core`
+/// knows about the request's `use_pid` choice, but it does not depend on the MLX PiD implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryPidDecodeRoutes {
+    pub native: MemoryDecodeRouteDomain,
+    pub pid: MemoryDecodeRouteDomain,
+}
+
 /// Concrete parameters selected for one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryStrategyParameters {
@@ -421,6 +449,37 @@ pub enum MemoryFormulaKind {
         phases: Vec<MemoryPhase>,
         variables: Vec<MemoryFormulaVariable>,
     },
+    /// A phase envelope which separately declares resident component contributions. This is a new
+    /// formula shape instead of a field on [`MemoryAssetFacts`], so every existing provider keeps
+    /// its source-compatible contract literal and adopts the component axis only by choosing this
+    /// variant.
+    ComponentPhaseEnvelope {
+        phases: Vec<MemoryPhase>,
+        variables: Vec<MemoryFormulaVariable>,
+        resident_components: Vec<MemoryResidentComponent>,
+    },
+}
+
+impl MemoryFormulaKind {
+    /// Whether this formula consumes `variable`.
+    pub fn uses(&self, variable: MemoryFormulaVariable) -> bool {
+        match self {
+            Self::AssetBytesPlusHeadroom => variable == MemoryFormulaVariable::AssetBytes,
+            Self::Affine { variables }
+            | Self::PhaseEnvelope { variables, .. }
+            | Self::ComponentPhaseEnvelope { variables, .. } => variables.contains(&variable),
+        }
+    }
+
+    fn resident_components(&self) -> &[MemoryResidentComponent] {
+        match self {
+            Self::ComponentPhaseEnvelope {
+                resident_components,
+                ..
+            } => resident_components,
+            _ => &[],
+        }
+    }
 }
 
 /// What one rung-4 window materialization physically does on a realization (SC-16090).
@@ -584,6 +643,97 @@ impl MemoryCalibrationIdentity {
     }
 }
 
+/// Typed identity of one resident network component.
+///
+/// [`TransformerComponent`] keeps its original three meanings exactly; the wrapper lets the same
+/// component axis name a network that is not one of the base model's transformers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryComponentKind {
+    Transformer(TransformerComponent),
+    ControlBranch,
+    AdapterStack,
+    IpAdapter,
+    IdentityEncoder,
+}
+
+/// Whether adapter factors remain independently resident after a provider finishes loading.
+///
+/// Dense providers may fold the factors into their base weights, while packed quantized providers
+/// commonly preserve them as forward-time residuals because the packed base is immutable. Keeping
+/// this distinction typed prevents a fit gate from charging every adapter file as resident bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdapterResidencyMode {
+    Folded,
+    Additive,
+}
+
+/// Load-exact resident bytes for a single-stack adapter installation.
+///
+/// `Some(0)` is positive evidence that factors are folded and therefore add no independent
+/// residency. `None` means an additive stack was requested but at least one source could not be
+/// sized; callers must fail closed instead of guessing. Multi-expert providers should account for
+/// shared adapters once per simultaneously resident expert rather than calling this helper once for
+/// the whole model.
+pub fn adapter_stack_resident_bytes(
+    adapters: &[AdapterSpec],
+    mode: AdapterResidencyMode,
+) -> Option<u64> {
+    if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
+        return Some(0);
+    }
+    adapters.iter().try_fold(0_u64, |total, adapter| {
+        let bytes = safetensors_path_bytes(&adapter.path);
+        (bytes > 0).then(|| total.saturating_add(bytes))
+    })
+}
+
+impl MemoryComponentKind {
+    pub const fn is_auxiliary(self) -> bool {
+        matches!(
+            self,
+            Self::ControlBranch | Self::AdapterStack | Self::IpAdapter | Self::IdentityEncoder
+        )
+    }
+}
+
+/// Load-exact resident bytes for one named component.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryResidentComponent {
+    /// Stable provider-local identity. The kind is intentionally not the identity: MultiControlNet
+    /// may hold several distinct [`MemoryComponentKind::ControlBranch`] components at once.
+    pub id: String,
+    pub kind: MemoryComponentKind,
+    pub resident_bytes: u64,
+    /// The rung that bounds this component's residency, if any. `None` means it remains fully
+    /// resident for every strategy the provider declares.
+    pub bounded_by: Option<MemoryStrategy>,
+}
+
+/// A scalar predicted peak with the resident auxiliary contributions exposed separately.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryPeakBreakdown {
+    predicted_peak_bytes: u64,
+    /// The part of the peak not attributable to a separately declared auxiliary network. This
+    /// includes base-model residency and calibrated transients; the contract does not invent a split
+    /// that the provider did not declare.
+    pub unattributed_bytes: u64,
+    pub components: Vec<MemoryResidentComponent>,
+}
+
+impl MemoryPeakBreakdown {
+    pub const fn from_unattributed(predicted_peak_bytes: u64) -> Self {
+        Self {
+            predicted_peak_bytes,
+            unattributed_bytes: predicted_peak_bytes,
+            components: Vec::new(),
+        }
+    }
+
+    pub const fn predicted_peak_bytes(&self) -> u64 {
+        self.predicted_peak_bytes
+    }
+}
+
 /// Provider-owned, load-exact asset facts used as formula inputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryAssetFacts {
@@ -591,6 +741,8 @@ pub struct MemoryAssetFacts {
     pub conditioning_bytes: u64,
     pub transformer_bytes: u64,
     pub decoder_bytes: u64,
+    /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
+    /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
     pub overlay_bytes: u64,
 }
 
@@ -632,17 +784,35 @@ impl Default for MemoryRuntimeSemantics {
     }
 }
 
+/// A provider-verified exception to the shared cumulative cost-order composition.
+///
+/// This can remove only a default engagement edge. It cannot remove a prerequisite, and the provider
+/// must name the calibration or executable proof that established the cheaper composition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryStrategyEngagementExclusion {
+    pub selection: MemoryStrategy,
+    pub excluded_rung: MemoryStrategy,
+    pub evidence: String,
+}
+
 /// Static provider contract returned before weights are loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryProviderContract {
     pub provider_id: String,
     pub backend: MemoryBackendRealization,
     pub strategies: Vec<MemoryStrategyCapability>,
+    /// Exact native/PiD route split when this provider supports PiD decode. The ordinary strategy
+    /// ranges publish the union; this declaration makes the route distinction visible to weights-free
+    /// registry conformance and provider admission checks.
+    pub pid_decode_routes: Option<MemoryPidDecodeRoutes>,
     /// The load-time materialization shape this concrete provider instance was built with.
     pub load_shape: LoadShape,
     /// Realization-specific constraints appended to the shared graph. Providers cannot remove or
     /// replace [`MemoryStrategy::requires`].
     pub additional_prerequisites: Vec<(MemoryStrategy, MemoryStrategyPrerequisite)>,
+    /// Documented, provider-verified exceptions to the shared cumulative cost-order default.
+    /// Prerequisite edges remain authoritative and cannot be removed through this list.
+    pub default_engagement_exclusions: Vec<MemoryStrategyEngagementExclusion>,
     pub lifecycle: MemoryLifecycleCapabilities,
     pub formula: MemoryFormulaKind,
     /// `None` is the compatibility default for a provider that has not adopted calibration yet.
@@ -674,13 +844,81 @@ impl MemoryProviderContract {
                     parameters: MemoryParameterRanges::default(),
                 })
                 .collect(),
+            pid_decode_routes: None,
             load_shape: LoadShape::EagerMaterialization,
             additional_prerequisites: Vec::new(),
+            default_engagement_exclusions: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities::default(),
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
             asset_facts: MemoryAssetFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
+        }
+    }
+
+    /// Add load-exact auxiliary residency to a provider's existing base prediction.
+    ///
+    /// Both declaration legs are required: typed components make the total decomposable, while
+    /// [`MemoryFormulaVariable::OverlayBytes`] makes the compatibility aggregate load-bearing. A
+    /// pre-SC-16065 provider has no typed components, so this returns the byte-identical input scalar.
+    pub fn predicted_peak_from_base(&self, base_predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
+        let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
+        let auxiliary_bytes = if components.is_empty() {
+            0
+        } else {
+            self.asset_facts.overlay_bytes
+        };
+        MemoryPeakBreakdown {
+            predicted_peak_bytes: base_predicted_peak_bytes.saturating_add(auxiliary_bytes),
+            unattributed_bytes: base_predicted_peak_bytes,
+            components,
+        }
+    }
+
+    /// Decompose a scalar which already includes this provider's auxiliary residency. The scalar is
+    /// never rewritten; this is the inspection seam for run contexts and evidence records.
+    pub fn decompose_predicted_peak(&self, predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
+        let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
+        let auxiliary_bytes = if components.is_empty() {
+            0
+        } else {
+            self.asset_facts.overlay_bytes
+        };
+        MemoryPeakBreakdown {
+            predicted_peak_bytes,
+            unattributed_bytes: predicted_peak_bytes.saturating_sub(auxiliary_bytes),
+            components,
+        }
+    }
+
+    fn auxiliary_components(&self) -> impl Iterator<Item = &MemoryResidentComponent> {
+        self.formula
+            .resident_components()
+            .iter()
+            .filter(|component| component.kind.is_auxiliary())
+    }
+
+    /// Typed resident component declarations, empty for every non-adopting provider.
+    pub fn resident_components(&self) -> &[MemoryResidentComponent] {
+        self.formula.resident_components()
+    }
+
+    /// Load-exact bytes attributable to auxiliary component declarations.
+    pub fn auxiliary_resident_bytes(&self) -> u64 {
+        self.auxiliary_components().fold(0_u64, |total, component| {
+            total.saturating_add(component.resident_bytes)
+        })
+    }
+
+    /// Resident bytes safe to credit to a warm provider. A legacy declaration preserves the old
+    /// `base_bytes` meaning; an adopter adds the separately declared overlay.
+    pub fn total_resident_bytes(&self) -> u64 {
+        if self.auxiliary_components().next().is_some() {
+            self.asset_facts
+                .base_bytes
+                .saturating_add(self.asset_facts.overlay_bytes)
+        } else {
+            self.asset_facts.base_bytes
         }
     }
 
@@ -727,7 +965,11 @@ impl MemoryProviderContract {
                 } if required == rung
             )
         });
-        (strategy.engages(rung) || required_by_realization)
+        let excludes_default = self
+            .default_engagement_exclusions
+            .iter()
+            .any(|exclusion| exclusion.selection == strategy && exclusion.excluded_rung == rung);
+        ((strategy.engages(rung) && !excludes_default) || required_by_realization)
             && matches!(self.support(rung), Some(MemoryStrategySupport::Implemented))
     }
 
@@ -791,6 +1033,53 @@ impl MemoryProviderContract {
                 Some(MemoryStrategySupport::Implemented)
             )
         };
+        let mut exclusions = std::collections::HashSet::new();
+        for exclusion in &self.default_engagement_exclusions {
+            if !exclusions.insert((exclusion.selection, exclusion.excluded_rung)) {
+                errors.push(format!(
+                    "duplicate default engagement exclusion {:?} -> {:?}",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if exclusion.evidence.trim().is_empty() {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} has no verification evidence",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if !exclusion.selection.engages(exclusion.excluded_rung) {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} does not remove a shared cost-order edge",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if exclusion.selection == exclusion.excluded_rung
+                || exclusion.excluded_rung == MemoryStrategy::Resident
+            {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} cannot remove the selected strategy or resident baseline",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if !implemented(exclusion.selection) || !implemented(exclusion.excluded_rung) {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} requires both strategies to be implemented",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if self.requires(exclusion.selection).any(|prerequisite| {
+                matches!(
+                    prerequisite,
+                    MemoryStrategyPrerequisite::Rung { rung, .. }
+                        if rung == exclusion.excluded_rung
+                )
+            }) {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} cannot remove a prerequisite edge",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+        }
         if implemented(MemoryStrategy::StagedResidency) {
             for phase in [
                 MemoryPhase::Conditioning,
@@ -811,6 +1100,9 @@ impl MemoryProviderContract {
         }
         if implemented(MemoryStrategy::BoundedDecode) && !self.lifecycle.decode_tiling {
             errors.push("BoundedDecode requires the decode_tiling hook".to_owned());
+        }
+        if let Some(routes) = &self.pid_decode_routes {
+            validate_pid_decode_routes(self, routes, &mut errors);
         }
         if implemented(MemoryStrategy::BoundedAttention) && !self.lifecycle.attention_chunking {
             errors.push("BoundedAttention requires the attention_chunking hook".to_owned());
@@ -880,6 +1172,47 @@ impl MemoryProviderContract {
             }
             validate_ranges(capability, &mut errors);
             validate_owned_parameter_domain(capability, &mut errors);
+        }
+
+        let mut component_ids = std::collections::HashSet::new();
+        for component in self.formula.resident_components() {
+            if component.id.trim().is_empty() {
+                errors.push("resident component id must be non-empty".to_owned());
+            } else if !component_ids.insert(component.id.as_str()) {
+                errors.push(format!(
+                    "resident component id {:?} must be unique",
+                    component.id
+                ));
+            }
+            if component.resident_bytes == 0 {
+                errors.push(format!(
+                    "resident component {:?} must declare non-zero bytes",
+                    component.id
+                ));
+            }
+            if let Some(strategy) = component.bounded_by {
+                if !implemented(strategy) {
+                    errors.push(format!(
+                        "resident component {:?} is bounded by {strategy:?}, but that strategy is not implemented",
+                        component.id
+                    ));
+                }
+            }
+        }
+        let auxiliary_bytes = self.auxiliary_resident_bytes();
+        if auxiliary_bytes > 0 {
+            if auxiliary_bytes != self.asset_facts.overlay_bytes {
+                errors.push(format!(
+                    "overlay_bytes {} must equal declared auxiliary component bytes {}",
+                    self.asset_facts.overlay_bytes, auxiliary_bytes
+                ));
+            }
+            if !self.formula.uses(MemoryFormulaVariable::OverlayBytes) {
+                errors.push(
+                    "a provider with auxiliary resident components must include OverlayBytes in its formula"
+                        .to_owned(),
+                );
+            }
         }
 
         if let Some(calibration) = &self.calibration {
@@ -981,6 +1314,122 @@ impl MemoryProviderContract {
         validate_selected_parameters(selection, self)
             .map_err(|message| Error::Unsupported(format!("{}: {message}", self.provider_id)))
     }
+}
+
+fn validate_pid_decode_routes(
+    contract: &MemoryProviderContract,
+    routes: &MemoryPidDecodeRoutes,
+    errors: &mut Vec<String>,
+) {
+    let Some(bounded_decode) = contract.capability(MemoryStrategy::BoundedDecode) else {
+        errors.push("PiD decode routes require a BoundedDecode capability".to_owned());
+        return;
+    };
+    if !matches!(bounded_decode.support, MemoryStrategySupport::Implemented) {
+        errors.push("PiD decode routes require BoundedDecode to be Implemented".to_owned());
+    }
+
+    for (label, domain) in [("native", &routes.native), ("PiD", &routes.pid)] {
+        if domain.tile_edges.is_empty() {
+            errors.push(format!(
+                "{label} decode route must declare at least one tile edge"
+            ));
+        }
+        if domain.tile_edges.contains(&0) {
+            errors.push(format!("{label} decode route contains a zero tile edge"));
+        }
+        let mut unique = domain.tile_edges.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != domain.tile_edges.len() {
+            errors.push(format!(
+                "{label} decode route contains duplicate tile edges"
+            ));
+        }
+        if domain.tile_overlap == 0 {
+            errors.push(format!(
+                "{label} decode route must declare a non-zero overlap"
+            ));
+        }
+    }
+
+    if routes.native.tile_overlap == routes.pid.tile_overlap
+        && routes
+            .native
+            .tile_edges
+            .iter()
+            .any(|edge| routes.pid.tile_edges.contains(edge))
+    {
+        errors.push("native and PiD decode route geometries must be disjoint".to_owned());
+    }
+
+    let mut declared_edges = bounded_decode.parameters.decode_tile_edges.clone();
+    declared_edges.sort_unstable();
+    declared_edges.dedup();
+    let mut route_edges = routes
+        .native
+        .tile_edges
+        .iter()
+        .chain(&routes.pid.tile_edges)
+        .copied()
+        .collect::<Vec<_>>();
+    route_edges.sort_unstable();
+    route_edges.dedup();
+    if declared_edges != route_edges {
+        errors.push(format!(
+            "BoundedDecode tile edges {declared_edges:?} must equal the native/PiD route union \
+             {route_edges:?}"
+        ));
+    }
+
+    let mut declared_overlaps = bounded_decode.parameters.decode_overlaps.clone();
+    declared_overlaps.sort_unstable();
+    declared_overlaps.dedup();
+    let mut route_overlaps = vec![routes.native.tile_overlap, routes.pid.tile_overlap];
+    route_overlaps.sort_unstable();
+    route_overlaps.dedup();
+    if declared_overlaps != route_overlaps {
+        errors.push(format!(
+            "BoundedDecode overlaps {declared_overlaps:?} must equal the native/PiD route union \
+             {route_overlaps:?}"
+        ));
+    }
+}
+
+/// The shared safety behavior for an adopted provider with no additional admission rules.
+///
+/// Provider registrations can point at this function without loading a [`Generator`](crate::Generator).
+/// Providers with extra safety rules expose their own function with the same signature.
+pub fn default_memory_strategy_safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    match contract.validate_selection(&context.selection) {
+        Ok(()) if context.budget.fits(context.predicted_peak_bytes) => MemorySafetyDecision::Accept,
+        Ok(()) => MemorySafetyDecision::Reject {
+            reason: format!(
+                "{}: predicted peak {} exceeds effective budget {}",
+                contract.provider_id,
+                context.predicted_peak_bytes,
+                context.budget.effective_bytes()
+            ),
+        },
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Registry adapter for [`default_memory_strategy_safety_check`].
+///
+/// The load specification is part of the weights-free registration callback so providers whose
+/// admission rules depend on the requested tier can reproduce their loaded generator's check.
+pub fn default_registered_memory_strategy_safety_check(
+    _spec: &crate::LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    default_memory_strategy_safety_check(contract, context)
 }
 
 fn validate_ranges(capability: &MemoryStrategyCapability, errors: &mut Vec<String>) {
@@ -1189,6 +1638,9 @@ fn validate_required_parameter(
 pub struct MemoryNumericTier {
     pub precision: Precision,
     pub quant: Option<Quant>,
+    /// The provider-declared component floors active for this numeric tier. Part of evidence/cache
+    /// identity: a uniform q4 run and a q4 run with q8 components are different numeric regimes.
+    pub component_precision_floors: &'static [crate::ComponentPrecisionFloor],
 }
 
 /// Shared-worker selection presented to the provider.
@@ -1272,6 +1724,15 @@ pub struct MemoryRunContext {
     pub predicted_peak_bytes: u64,
     pub cache_state: MemoryCacheState,
     pub evidence_revision: String,
+}
+
+impl MemoryRunContext {
+    pub fn predicted_peak_breakdown(
+        &self,
+        contract: &MemoryProviderContract,
+    ) -> MemoryPeakBreakdown {
+        contract.decompose_predicted_peak(self.predicted_peak_bytes)
+    }
 }
 
 /// Defense-in-depth result. It can accept or reject; it cannot replace the worker's selection.
@@ -1451,6 +1912,13 @@ pub struct MemoryEvidence {
 }
 
 impl MemoryEvidence {
+    pub fn predicted_peak_breakdown(
+        &self,
+        contract: &MemoryProviderContract,
+    ) -> MemoryPeakBreakdown {
+        contract.decompose_predicted_peak(self.predicted_peak_bytes)
+    }
+
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         if self.key.engaged_composition.is_empty()
@@ -1566,6 +2034,41 @@ pub struct MemoryRejection {
 mod tests {
     use super::*;
 
+    #[test]
+    fn adapter_residency_distinguishes_folded_additive_and_missing_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("gen-core-adapter-residency-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.safetensors");
+        let second = root.join("second.safetensors");
+        std::fs::write(&first, vec![0_u8; 11]).unwrap();
+        std::fs::write(&second, vec![0_u8; 17]).unwrap();
+        let adapters = vec![
+            AdapterSpec::new(first, 1.0, crate::AdapterKind::Lora),
+            AdapterSpec::new(second, 0.5, crate::AdapterKind::Lokr),
+        ];
+
+        assert_eq!(
+            adapter_stack_resident_bytes(&adapters, AdapterResidencyMode::Folded),
+            Some(0)
+        );
+        assert_eq!(
+            adapter_stack_resident_bytes(&adapters, AdapterResidencyMode::Additive),
+            Some(28)
+        );
+
+        let missing = vec![AdapterSpec::new(
+            root.join("missing.safetensors"),
+            1.0,
+            crate::AdapterKind::Lora,
+        )];
+        assert_eq!(
+            adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn mlx_backend() -> MemoryBackendRealization {
         MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -1593,8 +2096,10 @@ mod tests {
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,
+            pid_decode_routes: None,
             load_shape: LoadShape::DeferredMaterialization,
             additional_prerequisites: Vec::new(),
+            default_engagement_exclusions: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities {
                 phases: vec![
                     MemoryPhase::Conditioning,
@@ -1623,11 +2128,71 @@ mod tests {
         }
     }
 
+    fn pid_contract() -> MemoryProviderContract {
+        let mut contract = adopted_contract();
+        contract.strategies[2].parameters.decode_tile_edges = vec![512, 2048];
+        contract.strategies[2].parameters.decode_overlaps = vec![64, 256];
+        contract.pid_decode_routes = Some(MemoryPidDecodeRoutes {
+            native: MemoryDecodeRouteDomain {
+                tile_edges: vec![512],
+                tile_overlap: 64,
+            },
+            pid: MemoryDecodeRouteDomain {
+                tile_edges: vec![2048],
+                tile_overlap: 256,
+            },
+        });
+        contract
+    }
+
+    #[test]
+    fn pid_decode_routes_must_be_disjoint_and_match_the_published_ranges() {
+        let valid = pid_contract();
+        assert!(valid.conformance_errors().is_empty());
+
+        let mut overlapping = valid.clone();
+        overlapping.pid_decode_routes.as_mut().unwrap().pid = MemoryDecodeRouteDomain {
+            tile_edges: vec![512],
+            tile_overlap: 64,
+        };
+        let errors = overlapping.conformance_errors();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must be disjoint")));
+
+        let mut under_declared = valid;
+        under_declared.strategies[2]
+            .parameters
+            .decode_tile_edges
+            .retain(|edge| *edge != 2048);
+        let errors = under_declared.conformance_errors();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must equal the native/PiD route union")));
+    }
+
     #[test]
     fn compatibility_default_never_advertises_an_optimized_rung() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<MemoryAssetFacts>();
+        let legacy_literal = MemoryAssetFacts {
+            base_bytes: 1,
+            conditioning_bytes: 2,
+            transformer_bytes: 3,
+            decoder_bytes: 4,
+            overlay_bytes: 5,
+        };
+        assert_eq!(legacy_literal.overlay_bytes, 5);
+
         let contract = MemoryProviderContract::compatibility_default("legacy", mlx_backend());
         assert!(contract.conformance_errors().is_empty());
         assert!(contract.calibration.is_none());
+        assert!(contract.formula.resident_components().is_empty());
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        let prediction = contract.predicted_peak_from_base(123);
+        assert_eq!(prediction.predicted_peak_bytes(), 123);
+        assert_eq!(prediction.unattributed_bytes, 123);
+        assert!(prediction.components.is_empty());
         for strategy in MemoryStrategy::ALL {
             let support = &contract.capability(strategy).unwrap().support;
             if strategy == MemoryStrategy::Resident {
@@ -1648,6 +2213,7 @@ mod tests {
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
                 },
                 mode: "text_to_image".to_owned(),
                 overlay: None,
@@ -1939,6 +2505,7 @@ mod tests {
         let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: Some(Quant::Q4),
+            component_precision_floors: &[],
         };
         let mut selection = MemorySelection {
             strategy: MemoryStrategy::BoundedDecode,
@@ -1965,6 +2532,7 @@ mod tests {
         let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: None,
+            component_precision_floors: &[],
         };
         let mut selection = MemorySelection {
             strategy: MemoryStrategy::BoundedAttention,
@@ -2008,6 +2576,7 @@ mod tests {
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: None,
+                    component_precision_floors: &[],
                 },
                 mode: "text_to_image".to_owned(),
                 overlay: None,
@@ -2131,6 +2700,7 @@ mod tests {
             tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: None,
+                component_precision_floors: &[],
             },
         };
 
@@ -2237,6 +2807,7 @@ mod tests {
         MemoryNumericTier {
             precision: Precision::Bf16,
             quant: None,
+            component_precision_floors: &[],
         }
     }
 
@@ -2513,5 +3084,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("irrelevant"));
+    }
+
+    #[test]
+    fn a_verified_exclusion_defeats_only_the_default_engagement_edge() {
+        let mut contract = adopted_contract();
+        contract
+            .default_engagement_exclusions
+            .push(MemoryStrategyEngagementExclusion {
+                selection: MemoryStrategy::BoundedAttention,
+                excluded_rung: MemoryStrategy::BoundedDecode,
+                evidence: "direct calibration: attention chunking is independent of decode tiling"
+                    .to_owned(),
+            });
+        assert!(contract.conformance_errors().is_empty());
+        assert!(!contract.engages(
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedDecode
+        ));
+        assert_eq!(
+            contract.engaged_composition(MemoryStrategy::BoundedAttention),
+            vec![MemoryStrategy::Resident, MemoryStrategy::BoundedAttention]
+        );
+        contract
+            .validate_selection(&MemorySelection {
+                strategy: MemoryStrategy::BoundedAttention,
+                parameters: MemoryStrategyParameters {
+                    attention_chunk_size: Some(256),
+                    ..Default::default()
+                },
+                tier: bf16(),
+            })
+            .expect("the documented cheaper composition must validate without decode parameters");
+
+        contract.default_engagement_exclusions[0].evidence.clear();
+        assert!(contract
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("has no verification evidence")));
     }
 }

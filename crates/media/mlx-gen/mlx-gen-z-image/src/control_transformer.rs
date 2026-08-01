@@ -50,7 +50,8 @@ pub(crate) struct ControlPrepared {
 /// Channel count of the VAE-encoded control context (16 control latent + 1 mask + 16 inpaint).
 pub const CONTROL_IN_DIM: i32 = 33;
 /// Base `layers` indices the 15 control layers inject into (the fork's `CONTROL_LAYERS_PLACES`).
-const CONTROL_LAYERS_PLACES: [usize; 15] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28];
+pub(crate) const CONTROL_LAYERS_PLACES: [usize; 15] =
+    [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28];
 /// Base `noise_refiner` indices the 2 control refiner blocks inject into.
 const CONTROL_REFINER_PLACES: [usize; 2] = [0, 1];
 

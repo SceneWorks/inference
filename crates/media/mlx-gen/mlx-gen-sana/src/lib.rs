@@ -63,6 +63,15 @@ pub use text_encoder::{
 };
 pub use transformer::SanaTransformer;
 
+/// sc-16209 Apple-Silicon warm sweep: Sana Sprint q8 peaked below 13.04 GiB at 1024².
+pub const SPRINT_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: SPRINT_MODEL_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 14_001_593_385,
+        },
+    };
+
 /// Add all MLX Sana generators to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
@@ -70,6 +79,7 @@ pub fn register_providers(
     registry
         .register_generator(model::BASE_REGISTRATION)
         .register_generator(model::SPRINT_REGISTRATION)
+        .register_activation_memory(SPRINT_ACTIVATION_MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Sana provider catalog.

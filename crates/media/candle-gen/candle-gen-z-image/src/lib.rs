@@ -32,6 +32,7 @@ mod comfyui;
 // one home for what the three entry points (pipeline/edit/control) used to triplicate.
 mod common;
 mod dit;
+mod memory_strategy;
 mod pipeline;
 // The packed-load seam (sc-9408, sc-9089 umbrella): re-exports the shared `candle_gen::quant::QLinear`
 // (F-025 / sc-9005) + the thin dense-or-packed `QEmbedding` wrapper over the shared module, plus the
@@ -99,10 +100,16 @@ pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRE
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(REGISTRATION)
-        .register_generator(base::REGISTRATION)
-        .register_trainer(training::REGISTRATION)
+        .register_generator(base::REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
+        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION);
+    registry.register_trainer(training::REGISTRATION)
 }
 
 /// Build the complete explicit Candle Z-Image provider catalog.
@@ -116,8 +123,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PidWeights, Progress, SizeFloor,
-    WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, SizeFloor, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -167,9 +173,9 @@ pub struct ZImageGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
-    /// Effective component-residency policy selected at load. Sequential bypasses both component
-    /// caches and rebuilds/drops Qwen3, DiT, and VAE in explicit per-request phases.
-    offload_policy: OffloadPolicy,
+    /// Serializes cache use with request-staged eviction. Without this guard a warm request could
+    /// retain cloned component Arcs while a concurrent staged request attempted to shed the cache.
+    lifecycle: Mutex<()>,
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
     /// generator instance; empty ⇒ the stock unadapted build.
     adapters: Vec<AdapterSpec>,
@@ -180,6 +186,9 @@ pub struct ZImageGenerator {
     /// the DiT/TE/VAE from the in-place remapped ComfyUI single-files rather than a diffusers snapshot
     /// dir. Set only by [`load_from_comfyui_components`]; the registry `load` leaves it `None`.
     comfyui: Option<std::sync::Arc<comfyui::ComfyuiSources>>,
+    /// Executable shared-memory contract for registry-loaded CUDA providers. Bespoke ComfyUI loads
+    /// deliberately leave this absent because their fused component source is not block-addressable.
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
     /// Cached components + the accel-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache, never
     /// across the denoise.
@@ -227,6 +236,26 @@ impl Generator for ZImageGenerator {
         &self.descriptor
     }
 
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(MODEL_ID, contract, context)?;
+        Ok(Some(Box::new(memory_strategy::ZImageMemoryScope::new(
+            MODEL_ID,
+            self.device.clone(),
+            contract,
+            context,
+        ))))
+    }
+
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // The shared capability floor: the descriptor advertises a single `Reference` (img2img, sc-11783)
         // but no guidance and no negative prompt, so guidance / negative / a MultiReference / any other
@@ -262,6 +291,7 @@ impl Generator for ZImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
         // heavy components come from the cache.
@@ -277,7 +307,19 @@ impl Generator for ZImageGenerator {
             ),
         };
 
-        if self.offload_policy == OffloadPolicy::Sequential {
+        if let Some(memory) = req.memory.as_ref().filter(|memory| {
+            memory.stage_residency
+                || memory.tile_vae_decode
+                || memory.chunk_attention
+                || memory.stream_transformer_blocks
+        }) {
+            if !memory.stage_residency {
+                return Err(gen_core::Error::Unsupported(
+                    "z_image_turbo: bounded decode, attention, and transformer residency require \
+                     request-scoped staged residency"
+                        .into(),
+                ));
+            }
             if self.comfyui.is_some() {
                 return Err(gen_core::Error::Unsupported(
                     "z_image_turbo: sequential residency is unavailable for bespoke ComfyUI \
@@ -292,6 +334,13 @@ impl Generator for ZImageGenerator {
                         .into(),
                 ));
             }
+            // A warm request may have populated either cache. Synchronize before releasing those
+            // weights, then let the request-owned three-stage route load/drop each phase in turn.
+            self.device
+                .synchronize()
+                .map_err(candle_gen::CandleError::from)?;
+            drop(candle_gen::lock_recover(&self.components).take());
+            drop(candle_gen::lock_recover(&self.vae_encoder).take());
             let images = pipe.render_sequential(req, on_progress)?;
             return Ok(GenerationOutput::Images(images));
         }
@@ -365,6 +414,7 @@ pub fn descriptor() -> ModelDescriptor {
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
             mac_only: false,
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
@@ -429,19 +479,23 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
-    let offload_policy = candle_gen::effective_offload_policy(spec.offload_policy);
+    #[cfg(feature = "cuda")]
+    let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
+    #[cfg(not(feature = "cuda"))]
+    let memory_strategy = None;
     Ok(Box::new(ZImageGenerator {
         descriptor: descriptor(),
         root,
         device,
         dtype: DType::BF16,
-        offload_policy,
+        lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
         // rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
         comfyui: None,
+        memory_strategy,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
@@ -478,10 +532,11 @@ pub fn load_from_comfyui_components(
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
-        offload_policy: OffloadPolicy::Resident,
+        lifecycle: Mutex::new(()),
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
+        memory_strategy: None,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
@@ -504,10 +559,11 @@ pub fn load_from_comfyui_checkpoint(
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
-        offload_policy: OffloadPolicy::Resident,
+        lifecycle: Mutex::new(()),
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
+        memory_strategy: None,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
@@ -516,6 +572,64 @@ pub fn load_from_comfyui_checkpoint(
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
 // the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+
+#[cfg(feature = "cuda")]
+fn registered_turbo_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(MODEL_ID, spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_base_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(base::MODEL_ID, spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_turbo_control_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::control_contract("z_image_turbo_control", spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_base_control_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::control_contract("z_image_control", spec)
+}
+
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID,
+    contract: registered_turbo_memory_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: base::MODEL_ID,
+    contract: registered_base_memory_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: "z_image_turbo_control",
+        contract: registered_turbo_control_memory_contract,
+        safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    };
+
+#[cfg(feature = "cuda")]
+const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: "z_image_control",
+        contract: registered_base_control_memory_contract,
+        safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    };
 
 #[cfg(test)]
 mod tests {
@@ -684,19 +798,22 @@ mod tests {
             .is_ok());
     }
 
-    /// The worker-facing `LoadSpec::offload_policy` selects the staged route. A pre-cancel must return
-    /// before touching the deliberately missing snapshot, proving the policy is active rather than
+    /// The request-scoped memory contract selects the staged route. A pre-cancel must return before
+    /// touching the deliberately missing snapshot, proving the request authority is active rather than
     /// silently serving the resident cache path.
     #[test]
-    fn sequential_policy_is_active_and_honors_pre_cancel_before_load() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
+    fn request_staging_is_active_and_honors_pre_cancel_before_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let generator = load(&spec).expect("lazy sequential generator");
         let cancel = gen_core::CancelFlag::default();
         cancel.cancel();
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
             cancel,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(matches!(
@@ -709,13 +826,16 @@ mod tests {
     /// Sequential requests reject it explicitly before any snapshot access instead of retaining it
     /// through denoise and making the advertised peak false.
     #[test]
-    fn sequential_policy_rejects_pid_explicitly_before_load() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
+    fn request_staging_rejects_pid_explicitly_before_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let generator = load(&spec).expect("lazy sequential generator");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
             use_pid: true,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let error = generator.generate(&req, &mut |_| {}).unwrap_err();

@@ -26,12 +26,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::safetensors::MmapedSafetensors;
-use candle_core::{DType, Device, Error, Result};
+use candle_core::{DType, Device, Error, Result, Tensor};
 use fs2::FileExt;
 use safetensors::tensor::{Dtype as SafeDtype, View};
 use sha2::{Digest, Sha256};
 
 use super::{repack_packed_weight, PackedConfig};
+use crate::gen_core::CancelFlag;
 
 const CACHE_DIR: &str = ".candle-device-format-v1";
 const PREPARE_LOCK: &str = ".prepare.lock";
@@ -73,6 +74,58 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
     ) -> Result<Self> {
+        Self::prepare_impl(source, component_dir, packed, device, None, None)
+    }
+
+    /// Cancellation-aware preparation for request-time component opens. Hashing checks between
+    /// bounded chunks and conversion checks between independently addressed projections.
+    pub fn prepare_cancelable(
+        source: &MmapedSafetensors,
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<Self> {
+        Self::prepare_impl(source, component_dir, packed, device, Some(cancel), None)
+    }
+
+    /// Prepare only packed projections whose full tensor base starts with `base_prefix`.
+    ///
+    /// This is the bounded-residency variant for providers whose streamed stack is one prefix inside
+    /// a larger component. It avoids hashing and materializing sidecars for weights that remain
+    /// resident, while retaining the same content address and cache lifecycle as [`Self::prepare`].
+    pub fn prepare_prefix_cancelable(
+        source: &MmapedSafetensors,
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: &CancelFlag,
+        base_prefix: &str,
+    ) -> Result<Self> {
+        if base_prefix.is_empty() {
+            return Err(Error::Msg(
+                "device-format sidecar: base prefix must not be empty".to_owned(),
+            ));
+        }
+        Self::prepare_impl(
+            source,
+            component_dir,
+            packed,
+            device,
+            Some(cancel),
+            Some(base_prefix),
+        )
+    }
+
+    fn prepare_impl(
+        source: &MmapedSafetensors,
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: Option<&CancelFlag>,
+        base_prefix: Option<&str>,
+    ) -> Result<Self> {
+        check_cancel(cancel)?;
         let bits = usize::try_from(packed.bits).map_err(|_| {
             Error::Msg(format!(
                 "device-format sidecar: invalid packed bit width {}",
@@ -109,24 +162,46 @@ impl PackedWeightSidecars {
             .write(true)
             .truncate(false)
             .open(cache_dir.join(PREPARE_LOCK))?;
-        FileExt::lock_exclusive(&prepare_lock).map_err(|e| {
-            Error::Msg(format!(
-                "device-format sidecar: lock {}: {e}",
-                cache_dir.display()
-            ))
-        })?;
+        if cancel.is_some() {
+            loop {
+                check_cancel(cancel)?;
+                match FileExt::try_lock_exclusive(&prepare_lock) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        return Err(Error::Msg(format!(
+                            "device-format sidecar: lock {}: {error}",
+                            cache_dir.display()
+                        )))
+                    }
+                }
+            }
+        } else {
+            FileExt::lock_exclusive(&prepare_lock).map_err(|e| {
+                Error::Msg(format!(
+                    "device-format sidecar: lock {}: {e}",
+                    cache_dir.display()
+                ))
+            })?;
+        }
 
         let mut bases: Vec<String> = source
             .tensors()
             .into_iter()
             .filter_map(|(name, _)| name.strip_suffix(".scales").map(str::to_owned))
+            .filter(|base| base_prefix.is_none_or(|prefix| base.starts_with(prefix)))
             .collect();
         bases.sort();
         bases.dedup();
         if bases.is_empty() {
+            let selection = base_prefix
+                .map(|prefix| format!(" matching prefix `{prefix}`"))
+                .unwrap_or_default();
             return Err(Error::Msg(format!(
-                "device-format sidecar: packed component {} has no `.scales` triples",
-                component_dir.display()
+                "device-format sidecar: packed component {} has no `.scales` triples{selection}",
+                component_dir.display(),
             )));
         }
 
@@ -136,6 +211,7 @@ impl PackedWeightSidecars {
         let mut source_bytes_hashed = 0u64;
         let mut sidecar_bytes = 0u64;
         for base in bases {
+            check_cancel(cancel)?;
             let weight_key = format!("{base}.weight");
             let scales_key = format!("{base}.scales");
             let biases_key = format!("{base}.biases");
@@ -150,68 +226,87 @@ impl PackedWeightSidecars {
                     "device-format sidecar: `{scales_key}` has no `{biases_key}` sibling: {e}"
                 ))
             })?;
-            let (out_dim, in_dim) =
+            let projections =
                 validate_source_shapes(&base, &weight, &scales, &biases, bits, group_size)?;
 
-            let source_digest = source_digest(
-                &base,
-                bits,
-                group_size,
-                [
-                    (&weight_key, &weight),
-                    (&scales_key, &scales),
-                    (&biases_key, &biases),
-                ],
-            );
-            source_bytes_hashed = source_bytes_hashed
-                .saturating_add(weight.data().len() as u64)
-                .saturating_add(scales.data().len() as u64)
-                .saturating_add(biases.data().len() as u64);
-            let source_hex = hex(&source_digest);
-            let dtype = if bits == 4 {
-                GgmlDType::Q4_1
-            } else {
-                GgmlDType::Q8_0
-            };
-            let dtype_name = if bits == 4 { "q4_1" } else { "q8_0" };
-            let payload_bytes = payload_len(dtype, out_dim, in_dim)?;
-            let path = cache_dir.join(format!("{source_hex}.{dtype_name}.safetensors"));
+            for projection in projections {
+                let entry_base = sidecar_entry_key(&base, projection.index);
+                let source_digest = match projection.index {
+                    None => source_digest(
+                        &base,
+                        bits,
+                        group_size,
+                        [
+                            (&weight_key, &weight),
+                            (&scales_key, &scales),
+                            (&biases_key, &biases),
+                        ],
+                        cancel,
+                    )?,
+                    Some(index) => source_slice_digest(
+                        &entry_base,
+                        bits,
+                        group_size,
+                        index,
+                        [
+                            (&weight_key, &weight),
+                            (&scales_key, &scales),
+                            (&biases_key, &biases),
+                        ],
+                        cancel,
+                    )?,
+                };
+                check_cancel(cancel)?;
+                source_bytes_hashed =
+                    source_bytes_hashed.saturating_add(projection.source_bytes as u64);
+                let source_hex = hex(&source_digest);
+                let dtype = if bits == 4 {
+                    GgmlDType::Q4_1
+                } else {
+                    GgmlDType::Q8_0
+                };
+                let dtype_name = if bits == 4 { "q4_1" } else { "q8_0" };
+                let payload_bytes = payload_len(dtype, projection.out_dim, projection.in_dim)?;
+                let path = cache_dir.join(format!("{source_hex}.{dtype_name}.safetensors"));
 
-            let valid = validate_sidecar(&path, payload_bytes)?;
-            if valid {
-                reused += 1;
-            } else {
-                build_sidecar(
-                    source,
-                    &path,
-                    &source_hex,
-                    &base,
-                    bits,
-                    group_size,
-                    out_dim,
-                    in_dim,
-                    dtype,
-                    device,
-                )?;
-                if !validate_sidecar(&path, payload_bytes)? {
-                    return Err(Error::Msg(format!(
-                        "device-format sidecar: freshly written artifact {} failed validation",
-                        path.display()
-                    )));
+                let valid = validate_sidecar(&path, payload_bytes)?;
+                if valid {
+                    reused += 1;
+                } else {
+                    build_sidecar(
+                        source,
+                        &path,
+                        &source_hex,
+                        &base,
+                        projection.index,
+                        bits,
+                        group_size,
+                        projection.out_dim,
+                        projection.in_dim,
+                        dtype,
+                        device,
+                    )?;
+                    check_cancel(cancel)?;
+                    if !validate_sidecar(&path, payload_bytes)? {
+                        return Err(Error::Msg(format!(
+                            "device-format sidecar: freshly written artifact {} failed validation",
+                            path.display()
+                        )));
+                    }
+                    created += 1;
                 }
-                created += 1;
+                sidecar_bytes = sidecar_bytes.saturating_add(payload_bytes as u64);
+                entries.insert(
+                    entry_base,
+                    SidecarEntry {
+                        path,
+                        dtype,
+                        out_dim: projection.out_dim,
+                        in_dim: projection.in_dim,
+                        payload_bytes,
+                    },
+                );
             }
-            sidecar_bytes = sidecar_bytes.saturating_add(payload_bytes as u64);
-            entries.insert(
-                base,
-                SidecarEntry {
-                    path,
-                    dtype,
-                    out_dim,
-                    in_dim,
-                    payload_bytes,
-                },
-            );
         }
 
         Ok(Self {
@@ -268,6 +363,12 @@ impl PackedWeightSidecars {
         QTensor::new(storage, (entry.out_dim, entry.in_dim))
     }
 
+    /// Materialize one slice of a rank-3 packed projection (for example one MoE expert).
+    /// Rank-2 callers continue to use [`Self::load`].
+    pub fn load_slice(&self, base: &str, index: usize, device: &Device) -> Result<QTensor> {
+        self.load(&sidecar_entry_key(base, Some(index)), device)
+    }
+
     pub fn contains(&self, base: &str) -> bool {
         self.entries.contains_key(base)
     }
@@ -298,6 +399,21 @@ impl PackedWeightSidecars {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceProjection {
+    index: Option<usize>,
+    out_dim: usize,
+    in_dim: usize,
+    source_bytes: usize,
+}
+
+fn sidecar_entry_key(base: &str, index: Option<usize>) -> String {
+    match index {
+        Some(index) => format!("{base}[{index}]"),
+        None => base.to_owned(),
+    }
+}
+
 fn validate_source_shapes(
     base: &str,
     weight: &safetensors::tensor::TensorView<'_>,
@@ -305,26 +421,32 @@ fn validate_source_shapes(
     biases: &safetensors::tensor::TensorView<'_>,
     bits: usize,
     group_size: usize,
-) -> Result<(usize, usize)> {
+) -> Result<Vec<SourceProjection>> {
     if weight.dtype() != SafeDtype::U32 {
         return Err(Error::Msg(format!(
             "device-format sidecar: `{base}.weight` must be U32, got {:?}",
             weight.dtype()
         )));
     }
-    let [out_dim, weight_cols] = weight.shape() else {
-        return Err(Error::Msg(format!(
-            "device-format sidecar: `{base}.weight` must be rank 2, got {:?}",
-            weight.shape()
-        )));
+    let (leading, out_dim, weight_cols) = match weight.shape() {
+        [out_dim, weight_cols] => (None, *out_dim, *weight_cols),
+        [leading, out_dim, weight_cols] => (Some(*leading), *out_dim, *weight_cols),
+        shape => {
+            return Err(Error::Msg(format!(
+                "device-format sidecar: `{base}.weight` must be rank 2 or 3, got {shape:?}"
+            )))
+        }
     };
-    let [scale_rows, scale_cols] = scales.shape() else {
-        return Err(Error::Msg(format!(
-            "device-format sidecar: `{base}.scales` must be rank 2, got {:?}",
-            scales.shape()
-        )));
+    let (scale_leading, scale_rows, scale_cols) = match scales.shape() {
+        [rows, cols] => (None, *rows, *cols),
+        [leading, rows, cols] => (Some(*leading), *rows, *cols),
+        shape => {
+            return Err(Error::Msg(format!(
+                "device-format sidecar: `{base}.scales` must be rank 2 or 3, got {shape:?}"
+            )))
+        }
     };
-    if biases.shape() != scales.shape() || scale_rows != out_dim {
+    if biases.shape() != scales.shape() || leading != scale_leading || scale_rows != out_dim {
         return Err(Error::Msg(format!(
             "device-format sidecar: invalid `{base}` triple shapes: weight {:?}, scales {:?}, \
              biases {:?}",
@@ -347,7 +469,77 @@ fn validate_source_shapes(
             scales.shape()
         )));
     }
-    Ok((*out_dim, in_dim))
+    let slices = leading.unwrap_or(1);
+    let source_bytes = weight
+        .data()
+        .len()
+        .checked_add(scales.data().len())
+        .and_then(|bytes| bytes.checked_add(biases.data().len()))
+        .and_then(|bytes| bytes.checked_div(slices))
+        .ok_or_else(|| {
+            Error::Msg("device-format sidecar: source byte count overflow".to_owned())
+        })?;
+    Ok((0..slices)
+        .map(|index| SourceProjection {
+            index: leading.map(|_| index),
+            out_dim,
+            in_dim,
+            source_bytes,
+        })
+        .collect())
+}
+
+fn source_slice_digest<'a>(
+    base: &str,
+    bits: usize,
+    group_size: usize,
+    index: usize,
+    views: [(&str, &safetensors::tensor::TensorView<'a>); 3],
+    cancel: Option<&CancelFlag>,
+) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(FORMAT_DOMAIN);
+    hash.update((base.len() as u64).to_le_bytes());
+    hash.update(base.as_bytes());
+    hash.update((bits as u64).to_le_bytes());
+    hash.update((group_size as u64).to_le_bytes());
+    for (name, view) in views {
+        let (data, shape) = source_slice(view, index)?;
+        let dtype = format!("{:?}", view.dtype());
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
+        hash.update((dtype.len() as u64).to_le_bytes());
+        hash.update(dtype.as_bytes());
+        hash.update((shape.len() as u64).to_le_bytes());
+        for &dim in shape {
+            hash.update((dim as u64).to_le_bytes());
+        }
+        hash.update((data.len() as u64).to_le_bytes());
+        hash_source_bytes(&mut hash, data, cancel)?;
+    }
+    Ok(hash.finalize().into())
+}
+
+fn source_slice<'a>(
+    view: &'a safetensors::tensor::TensorView<'a>,
+    index: usize,
+) -> Result<(&'a [u8], &'a [usize])> {
+    let [leading, ..] = view.shape() else {
+        return Err(Error::Msg(
+            "device-format sidecar: sliced projection must have a leading dimension".to_owned(),
+        ));
+    };
+    if index >= *leading || *leading == 0 || !view.data().len().is_multiple_of(*leading) {
+        return Err(Error::Msg(format!(
+            "device-format sidecar: invalid slice {index} for shape {:?}",
+            view.shape()
+        )));
+    }
+    let bytes = view.data().len() / *leading;
+    Ok((
+        &view.data()[index * bytes..(index + 1) * bytes],
+        &view.shape()[1..],
+    ))
 }
 
 fn source_digest<'a>(
@@ -355,7 +547,8 @@ fn source_digest<'a>(
     bits: usize,
     group_size: usize,
     views: [(&str, &safetensors::tensor::TensorView<'a>); 3],
-) -> [u8; 32] {
+    cancel: Option<&CancelFlag>,
+) -> Result<[u8; 32]> {
     let mut hash = Sha256::new();
     hash.update(FORMAT_DOMAIN);
     hash.update((base.len() as u64).to_le_bytes());
@@ -373,9 +566,28 @@ fn source_digest<'a>(
             hash.update((dim as u64).to_le_bytes());
         }
         hash.update((view.data().len() as u64).to_le_bytes());
-        hash.update(view.data());
+        hash_source_bytes(&mut hash, view.data(), cancel)?;
     }
-    hash.finalize().into()
+    Ok(hash.finalize().into())
+}
+
+fn check_cancel(cancel: Option<&CancelFlag>) -> Result<()> {
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        Err(Error::Msg(
+            "device-format sidecar preparation cancelled".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn hash_source_bytes(hash: &mut Sha256, bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<()> {
+    const CANCEL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    for chunk in bytes.chunks(CANCEL_CHUNK_BYTES) {
+        check_cancel(cancel)?;
+        hash.update(chunk);
+    }
+    Ok(())
 }
 
 fn payload_len(dtype: GgmlDType, out_dim: usize, in_dim: usize) -> Result<usize> {
@@ -408,6 +620,7 @@ fn build_sidecar(
     final_path: &Path,
     source_hex: &str,
     base: &str,
+    slice: Option<usize>,
     bits: usize,
     group_size: usize,
     out_dim: usize,
@@ -416,13 +629,21 @@ fn build_sidecar(
     device: &Device,
 ) -> Result<()> {
     let cpu = Device::Cpu;
-    let wq = source.load(&format!("{base}.weight"), &cpu)?;
-    let scales = source
-        .load(&format!("{base}.scales"), &cpu)?
-        .to_dtype(DType::F32)?;
-    let biases = source
-        .load(&format!("{base}.biases"), &cpu)?
-        .to_dtype(DType::F32)?;
+    let load = |suffix: &str| -> Result<Tensor> {
+        let view = source.get(&format!("{base}.{suffix}"))?;
+        match slice {
+            Some(index) => {
+                let (data, shape) = source_slice(&view, index)?;
+                Tensor::from_raw_buffer(data, safe_dtype(view.dtype())?, shape, &cpu)
+            }
+            None => {
+                Tensor::from_raw_buffer(view.data(), safe_dtype(view.dtype())?, view.shape(), &cpu)
+            }
+        }
+    };
+    let wq = load("weight")?;
+    let scales = load("scales")?.to_dtype(DType::F32)?;
+    let biases = load("biases")?.to_dtype(DType::F32)?;
     // This is intentionally the old production conversion, on the old target device, once. Q8's
     // CUDA quantizer can therefore produce exactly the bytes the pre-change path consumed.
     let qtensor = repack_packed_weight(&wq, &scales, &biases, group_size, device)?;
@@ -444,7 +665,7 @@ fn build_sidecar(
     let mut metadata = HashMap::new();
     metadata.insert("format".to_string(), "candle-device-format-v1".to_string());
     metadata.insert("source_sha256".to_string(), source_hex.to_string());
-    metadata.insert("source_base".to_string(), base.to_string());
+    metadata.insert("source_base".to_string(), sidecar_entry_key(base, slice));
     metadata.insert("source_bits".to_string(), bits.to_string());
     metadata.insert("source_group_size".to_string(), group_size.to_string());
     metadata.insert("target_dtype".to_string(), format!("{dtype:?}"));
@@ -509,6 +730,19 @@ fn build_sidecar(
     }
 }
 
+fn safe_dtype(dtype: SafeDtype) -> Result<DType> {
+    match dtype {
+        SafeDtype::U8 => Ok(DType::U8),
+        SafeDtype::U32 => Ok(DType::U32),
+        SafeDtype::F16 => Ok(DType::F16),
+        SafeDtype::BF16 => Ok(DType::BF16),
+        SafeDtype::F32 => Ok(DType::F32),
+        other => Err(Error::Msg(format!(
+            "device-format sidecar: unsupported source dtype {other:?}"
+        ))),
+    }
+}
+
 fn validate_sidecar(path: &Path, payload_bytes: usize) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
@@ -569,7 +803,7 @@ mod tests {
     use super::*;
     use crate::quant::{pack_mlx_affine, repack_packed_weight};
     use candle_core::safetensors;
-    use candle_core::Tensor;
+    use candle_core::{IndexOp, Tensor};
 
     struct TestDir(PathBuf);
 
@@ -610,6 +844,99 @@ mod tests {
     fn open(path: &Path) -> Result<MmapedSafetensors> {
         // SAFETY: immutable test fixture for the lifetime of the mapping.
         unsafe { MmapedSafetensors::new(path) }
+    }
+
+    #[test]
+    fn pre_cancelled_prepare_stops_before_creating_the_cache() -> Result<()> {
+        let dir = TestDir::new("cancelled");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source = open(&source_path)?;
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let error = PackedWeightSidecars::prepare_cancelable(
+            &source,
+            &dir.0,
+            PackedConfig {
+                bits: 4,
+                group_size: 64,
+            },
+            &Device::Cpu,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!dir.0.join(CACHE_DIR).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_interrupts_waiting_for_the_cross_process_prepare_lock() -> Result<()> {
+        let dir = TestDir::new("cancelled-lock");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source = open(&source_path)?;
+        let cache_dir = dir.0.join(CACHE_DIR);
+        fs::create_dir_all(&cache_dir)?;
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(cache_dir.join(PREPARE_LOCK))?;
+        FileExt::lock_exclusive(&held)?;
+        let cancel = CancelFlag::new();
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            trigger.cancel();
+        });
+        let error = PackedWeightSidecars::prepare_cancelable(
+            &source,
+            &dir.0,
+            PackedConfig {
+                bits: 4,
+                group_size: 64,
+            },
+            &Device::Cpu,
+            &cancel,
+        )
+        .unwrap_err();
+        canceller.join().unwrap();
+        FileExt::unlock(&held)?;
+        assert!(error.to_string().contains("cancelled"));
+        Ok(())
+    }
+
+    fn write_rank3_source(dir: &Path, bits: usize) -> Result<PathBuf> {
+        let mut weights = Vec::new();
+        let mut scales = Vec::new();
+        let mut biases = Vec::new();
+        for expert in 0..3 {
+            let values: Vec<f32> = (0..2 * 64)
+                .map(|i| ((i * 13 + expert * 7) % 37) as f32 / 11.0)
+                .collect();
+            let dense = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
+            let (weight, scale, bias) = pack_mlx_affine(&dense, bits, 64)?;
+            weights.push(weight);
+            scales.push(scale);
+            biases.push(bias);
+        }
+        let tensors = HashMap::from([
+            (
+                "layers.0.experts.proj.weight".to_string(),
+                Tensor::stack(&weights, 0)?,
+            ),
+            (
+                "layers.0.experts.proj.scales".to_string(),
+                Tensor::stack(&scales, 0)?,
+            ),
+            (
+                "layers.0.experts.proj.biases".to_string(),
+                Tensor::stack(&biases, 0)?,
+            ),
+        ]);
+        let path = dir.join("experts.safetensors");
+        safetensors::save(&tensors, &path)?;
+        Ok(path)
     }
 
     fn assert_q4_or_q8(bits: usize) -> Result<()> {
@@ -666,6 +993,82 @@ mod tests {
     #[test]
     fn q8_sidecar_is_byte_exact_and_reused_without_source_conversion() -> Result<()> {
         assert_q4_or_q8(8)
+    }
+
+    #[test]
+    fn prefix_preparation_excludes_resident_component_weights() -> Result<()> {
+        let dir = TestDir::new("prefix");
+        let values: Vec<f32> = (0..2 * 64).map(|i| (i % 29) as f32 / 9.0).collect();
+        let dense = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
+        let (layer_w, layer_s, layer_b) = pack_mlx_affine(&dense, 4, 64)?;
+        let (resident_w, resident_s, resident_b) = pack_mlx_affine(&dense, 4, 64)?;
+        let path = dir.0.join("model.safetensors");
+        safetensors::save(
+            &HashMap::from([
+                ("layers.0.proj.weight".to_owned(), layer_w),
+                ("layers.0.proj.scales".to_owned(), layer_s),
+                ("layers.0.proj.biases".to_owned(), layer_b),
+                ("noise_refiner.0.proj.weight".to_owned(), resident_w),
+                ("noise_refiner.0.proj.scales".to_owned(), resident_s),
+                ("noise_refiner.0.proj.biases".to_owned(), resident_b),
+            ]),
+            &path,
+        )?;
+        let source = open(&path)?;
+        let cache = PackedWeightSidecars::prepare_prefix_cancelable(
+            &source,
+            &dir.0,
+            PackedConfig {
+                bits: 4,
+                group_size: 64,
+            },
+            &Device::Cpu,
+            &CancelFlag::default(),
+            "layers.",
+        )?;
+        assert_eq!(cache.created_count(), 1);
+        assert!(cache.contains("layers.0.proj"));
+        assert!(!cache.contains("noise_refiner.0.proj"));
+        Ok(())
+    }
+
+    #[test]
+    fn rank3_moe_slices_are_independently_addressed_and_byte_exact() -> Result<()> {
+        for bits in [4, 8] {
+            let dir = TestDir::new(if bits == 4 { "moe-q4" } else { "moe-q8" });
+            let path = write_rank3_source(&dir.0, bits)?;
+            let source = open(&path)?;
+            let cache = PackedWeightSidecars::prepare(
+                &source,
+                &dir.0,
+                PackedConfig {
+                    bits: bits as i32,
+                    group_size: 64,
+                },
+                &Device::Cpu,
+            )?;
+            assert_eq!(cache.created_count(), 3);
+            let weight = source.load("layers.0.experts.proj.weight", &Device::Cpu)?;
+            let scales = source.load("layers.0.experts.proj.scales", &Device::Cpu)?;
+            let biases = source.load("layers.0.experts.proj.biases", &Device::Cpu)?;
+            for expert in 0..3 {
+                let expected = repack_packed_weight(
+                    &weight.i(expert)?,
+                    &scales.i(expert)?,
+                    &biases.i(expert)?,
+                    64,
+                    &Device::Cpu,
+                )?
+                .data()?
+                .into_owned();
+                let got = cache
+                    .load_slice("layers.0.experts.proj", expert, &Device::Cpu)?
+                    .data()?
+                    .into_owned();
+                assert_eq!(got, expected, "q{bits} expert {expert}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

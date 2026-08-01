@@ -10,8 +10,9 @@ use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, PreviewSink, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
-    Error, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, Result,
+    default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -37,27 +38,25 @@ pub trait Generator {
         None
     }
 
+    /// Canonical construction of a full provider peak from a caller's base-model estimate.
+    /// Non-adopting providers and contracts without typed auxiliary components preserve the input
+    /// scalar byte-for-byte.
+    fn predicted_memory_peak_from_base(
+        &self,
+        base_predicted_peak_bytes: u64,
+    ) -> MemoryPeakBreakdown {
+        self.memory_strategy_contract().map_or(
+            MemoryPeakBreakdown::from_unattributed(base_predicted_peak_bytes),
+            |contract| contract.predicted_peak_from_base(base_predicted_peak_bytes),
+        )
+    }
+
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
     /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
     /// resident baseline.
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
         match self.memory_strategy_contract() {
-            Some(contract) => match contract.validate_selection(&context.selection) {
-                Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
-                    MemorySafetyDecision::Accept
-                }
-                Ok(()) => MemorySafetyDecision::Reject {
-                    reason: format!(
-                        "{}: predicted peak {} exceeds effective budget {}",
-                        self.descriptor().id,
-                        context.predicted_peak_bytes,
-                        context.budget.effective_bytes()
-                    ),
-                },
-                Err(error) => MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                },
-            },
+            Some(contract) => default_memory_strategy_safety_check(contract, context),
             None if context.selection.strategy == MemoryStrategy::Resident => {
                 MemorySafetyDecision::Accept
             }
@@ -1567,18 +1566,16 @@ pub enum SizeFloor {
     /// variant as "the resolved geometry is bounded by `min_size..=max_size`": whether a provider
     /// re-checks after resolving is per-provider and is **not advertised here**.
     ///
-    /// SCAIL-2, the only descriptor using this resolved-downstream policy family, sets
-    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] and does re-check as of sc-16167 — it refuses a
+    /// SCAIL-2, the only model using this resolved-downstream policy family, sets
+    /// [`SizeFloor::ResolvedDownstreamExplicitGrid`] on both backends and does re-check — it refuses a
     /// resolved geometry outside `min_size..=max_size` or over its area cap before the render, naming
     /// the largest in-envelope geometry at the source aspect. But that is SCAIL-2's own guarantee,
-    /// made in `mlx-gen-scail2`, **not** something this variant asserts on behalf of a provider that
+    /// made by each SCAIL-2 provider, **not** something this variant asserts on behalf of a provider that
     /// sets it later. A consumer needing the bound must still read the provider, or treat the
     /// resolved size as unbounded.
     ///
-    /// Note "SCAIL-2" there means the **MLX** provider. `candle-gen-scail2` serves the same model id
-    /// and declares [`SizeFloor::RangeCheckedOnGrid`], so it refuses the `0x0` sentinel outright
-    /// rather than resolving it — its own resolve-from-the-clip branch is unreachable. One model id,
-    /// two answers; reconciling them is sc-16199.
+    /// The Candle provider adopted the same safe sentinel policy in sc-16199; before that change it
+    /// declared [`SizeFloor::RangeCheckedOnGrid`] and its resolve-from-the-clip branch was unreachable.
     ResolvedDownstream,
     /// [`ResolvedDownstream`](Self::ResolvedDownstream), with an additional grid requirement for
     /// **explicit** dimensions.
@@ -1604,6 +1601,78 @@ impl SizeFloor {
             | Self::ResolvedDownstreamExplicitGrid { multiple } => Some(multiple),
         }
     }
+}
+
+/// A model component whose resident numeric tier may deliberately differ from the tier selected for
+/// the model as a whole.
+///
+/// This vocabulary is intentionally shared with SceneWorks' tier-integrity ledger. Providers use it
+/// to expose precision floors to callers before weights are loaded, so tier selection, telemetry,
+/// and memory-evidence identity do not have to infer provider-local packing exceptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrecisionFloorComponent {
+    TextEncoder,
+    TransformerHead,
+}
+
+impl PrecisionFloorComponent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "textEncoder",
+            Self::TransformerHead => "transformerHead",
+        }
+    }
+}
+
+/// One worker-visible component precision floor.
+///
+/// When `selected_tier` is requested, the named component is resident at no less than
+/// `resident_tier`. A provider that raises a component above the selected tier must declare that
+/// substitution here; callers include the declaration in labels and memory evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentPrecisionFloor {
+    pub component: PrecisionFloorComponent,
+    pub selected_tier: Quant,
+    pub resident_tier: Quant,
+}
+
+impl ComponentPrecisionFloor {
+    pub const fn applies_to(self, selected: Quant) -> bool {
+        matches!(
+            (self.selected_tier, selected),
+            (Quant::Q4, Quant::Q4) | (Quant::Q8, Quant::Q8) | (Quant::Nvfp4, Quant::Nvfp4)
+        )
+    }
+}
+
+/// Resolve the quant tier a provider must use for one component from its advertised floor table.
+/// Providers and callers share this function so the load path cannot apply a different substitution
+/// from the one visible in descriptor introspection.
+pub fn effective_component_quant(
+    floors: &[ComponentPrecisionFloor],
+    component: PrecisionFloorComponent,
+    selected: Quant,
+) -> Quant {
+    floors
+        .iter()
+        .copied()
+        .find(|floor| floor.component == component && floor.applies_to(selected))
+        .map_or(selected, |floor| floor.resident_tier)
+}
+
+/// Provider-owned warm activation transient measured at 1024×1024, in bytes.
+///
+/// `bytes_1024` is the bare engine allocation (`peak − resident`) for one warm image. It excludes
+/// model weights and OS/application reserve; consumers add those independently and may scale this
+/// anchor for request geometry. A route-wide anchor is valid only when measurements establish that
+/// its activation high-water is tier-independent. A provider with storage- or tier-dependent
+/// activation memory must omit this route-only carrier until a spec-aware contract exists. Distinct
+/// edit/control routes retain their own provider ids and must register separately. Providers publish
+/// only real on-device measurements at or above the observed high-water mark; no registration means
+/// "unmeasured".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivationMemoryAnchor {
+    pub bytes_1024: u64,
 }
 
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
@@ -1725,6 +1794,10 @@ pub struct Capabilities {
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
+    /// Component-local numeric floors applied above the selected model tier. Empty means that a q4
+    /// load is uniformly q4 across every packable component. This is a binding provider contract:
+    /// callers use it for effective-tier labels and memory-evidence identity.
+    pub component_precision_floors: &'static [ComponentPrecisionFloor],
     // Loader hints.
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
@@ -2299,6 +2372,32 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_component_cannot_be_raised_without_a_visible_floor_declaration() {
+        assert_eq!(
+            effective_component_quant(&[], PrecisionFloorComponent::TextEncoder, Quant::Q4),
+            Quant::Q4
+        );
+        let declared = [ComponentPrecisionFloor {
+            component: PrecisionFloorComponent::TextEncoder,
+            selected_tier: Quant::Q4,
+            resident_tier: Quant::Q8,
+        }];
+        assert_eq!(
+            effective_component_quant(&declared, PrecisionFloorComponent::TextEncoder, Quant::Q4),
+            Quant::Q8
+        );
+        assert_eq!(
+            effective_component_quant(
+                &declared,
+                PrecisionFloorComponent::TransformerHead,
+                Quant::Q4
+            ),
+            Quant::Q4,
+            "an unrelated component cannot inherit another component's floor"
+        );
+    }
 
     #[test]
     fn generation_memory_is_opt_in_and_quality_preserving_levers_default_off() {

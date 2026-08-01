@@ -130,9 +130,13 @@ fn resolve_root(variant: ChromaVariant, spec: &LoadSpec) -> Result<&Path> {
 /// together. Factored so the `Resident` and `Sequential` paths build byte-identical encoders.
 fn load_text_only(variant: ChromaVariant, spec: &LoadSpec) -> Result<ChromaTextOwned> {
     let root = resolve_root(variant, spec)?;
+    let mut t5 = loader::load_t5_encoder(root)?;
+    if let Some(q) = spec.quantize {
+        t5.quantize(q.bits())?;
+    }
     Ok(ChromaTextOwned {
         tokenizer: loader::load_tokenizer()?,
-        t5: loader::load_t5_encoder(root)?,
+        t5,
     })
 }
 
@@ -146,7 +150,7 @@ fn load_heavy(variant: ChromaVariant, spec: &LoadSpec, load_pid: bool) -> Result
     let root = resolve_root(variant, spec)?;
     let cfg = ChromaTransformerConfig::default();
     let mut transformer = loader::load_transformer(root, cfg)?;
-    let vae = loader::load_vae(root)?;
+    let mut vae = loader::load_vae(root)?;
 
     // Q4/Q8 over the DiT's heavy block linears (sc-3841 / sc-8777). Two paths, both correct:
     //   * **Pre-quantized packed tier** (the hosted Q4/Q8 turnkeys): the block Linears load already
@@ -155,9 +159,11 @@ fn load_heavy(variant: ChromaVariant, spec: &LoadSpec, load_pid: bool) -> Result
     //   * **Dense snapshot + `spec.quantize`**: the block Linears load dense, then this `.quantize()`
     //     packs them in place (byte-identical to the packed tier). If a packed base ever reaches here
     //     it no-ops (`AdaptableLinear::quantize` only acts on a dense base).
-    // T5/VAE stay f32 in every tier (their quant is a measurably-0% memory-only win and not wired).
+    // T5 and VAE use the same two paths: shipping artifacts packed-detect directly; a dense source
+    // with `spec.quantize` is packed in place for byte-identical converter/load-time behavior.
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
+        vae.quantize(q.bits())?;
     }
     // Install LoRA/LoKr adapters AFTER quantization (forward-time residual over the quantized base;
     // sc-3842). No-op when empty; any unmatched target errors loudly (never silently dropped).
@@ -744,6 +750,9 @@ impl Chroma {
             // nothing. The masks are tokenizer-derived (independent of T5), so evaling the embeds is
             // sufficient.
             |encoded| {
+                let Some(encoded) = encoded else {
+                    return Ok(());
+                };
                 match &encoded.neg {
                     Some((neg_embeds, _)) => {
                         mlx_rs::transforms::eval([&encoded.pos_embeds, neg_embeds])?

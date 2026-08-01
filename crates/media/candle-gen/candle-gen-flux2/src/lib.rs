@@ -67,7 +67,7 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -295,12 +295,15 @@ impl Pipeline {
     /// so it reuses the TE's freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE). Same per-tier
     /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
-        self.load_one_quantizable(
-            "transformer",
-            self.quant,
-            |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
-            |m, q, d| Ok(m.quantize(q, d)?),
-        )
+        match &self.comfyui_dit {
+            Some(dit_file) => self.load_comfyui_dit(dit_file),
+            None => self.load_one_quantizable(
+                "transformer",
+                self.quant,
+                |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
+                |m, q, d| Ok(m.quantize(q, d)?),
+            ),
+        }
     }
 
     /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
@@ -450,7 +453,7 @@ impl Pipeline {
             // In-place ComfyUI DiT (sc-10680): the Mistral TE is NOT in the single DiT file, so it comes
             // from the snapshot through the same per-tier quant path (`load_te_seq` is the TE-only
             // quantizable loader); the DiT is dequanted + quantized from the in-place file.
-            Some(dit_file) => (self.load_te_seq()?, self.load_comfyui_dit(dit_file)?),
+            Some(_) => (self.load_te_seq()?, self.load_dit_seq()?),
             None => self.load_te_and_dit()?,
         };
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
@@ -750,13 +753,22 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let images = self.residency.run(
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
-            &self.pipe.device,
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_phase(text, req),
-            |heavy, encoded, on_progress| self.pipe.render_phase(heavy, req, encoded, on_progress),
+            |_| Ok(self.pipe.device.synchronize()?),
+            |heavy, encoded, on_progress| {
+                let result = self.pipe.render_phase(heavy, req, encoded, on_progress);
+                candle_gen::synchronize_result(&self.pipe.device, result)
+            },
         )?;
         Ok(GenerationOutput::Images(images))
     }
@@ -800,6 +812,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // TE to fit the memory ceiling; klein (sc-11031) folds only the 9B DiT and keeps the Qwen3
             // TE dense bf16 (epic 8506 DENSE_TE, `Pipeline::te_quant`).
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
@@ -830,35 +843,31 @@ pub fn descriptor_dev() -> ModelDescriptor {
     descriptor(Flux2Variant::Dev)
 }
 
-fn generator_from_pipeline(
-    pipe: Pipeline,
-    policy: OffloadPolicy,
-) -> gen_core::Result<Box<dyn Generator>> {
+fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator>> {
     let variant = pipe.variant;
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
-    let residency = Flux2Residency::from_policy_with_resident(
-        policy,
-        move || {
+    let residency = Flux2Residency::request_scoped_with_resident(
+        move |_| {
             let comps = resident_pipe.load_components()?;
             Ok((
                 TextPhase::Resident(comps.clone()),
                 HeavyPhase::Resident(comps),
             ))
         },
-        move || {
+        move |_| {
             Ok(TextPhase::Sequential(Box::new((
                 text_pipe.load_te_seq()?,
                 text_pipe.build_tokenizer()?,
             ))))
         },
-        move |use_pid| {
+        move |use_pid, _| {
             Ok(HeavyPhase::Sequential(Box::new(
                 heavy_pipe.load_heavy_seq(use_pid)?,
             )))
         },
-    )?;
+    );
     Ok(Box::new(Flux2Generator {
         descriptor: descriptor(variant),
         pipe,
@@ -902,8 +911,7 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
     }
     let device = candle_gen::default_device()?;
     let pipe = Pipeline::load(variant, quant, &root, &device, spec.pid.clone());
-    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
-    generator_from_pipeline(pipe, policy)
+    generator_from_pipeline(pipe)
 }
 
 /// Construct a lazy candle FLUX.2-**dev** generator that reads its **DiT** in place from an existing
@@ -923,7 +931,7 @@ pub fn load_from_comfyui_dit(
     let device = candle_gen::default_device()?;
     let root = snapshot_dir.into();
     let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
-    generator_from_pipeline(pipe, OffloadPolicy::Resident)
+    generator_from_pipeline(pipe)
 }
 
 /// Registry load hook for `flux2_klein_9b`.
@@ -1339,6 +1347,26 @@ mod tests {
     }
 
     #[test]
+    fn staged_comfyui_dit_loader_preserves_the_selected_single_file() {
+        let selected = PathBuf::from("/selected/flux2-comfyui.safetensors");
+        let pipe = Pipeline::load_comfyui(
+            None,
+            Path::new("/missing-snapshot"),
+            &Device::Cpu,
+            selected.clone(),
+        );
+        let error = pipe
+            .load_dit_seq()
+            .err()
+            .expect("the selected fixture path is deliberately absent")
+            .to_string();
+        assert!(
+            error.contains(&selected.display().to_string()),
+            "request staging must read the selected ComfyUI DiT, got: {error}"
+        );
+    }
+
+    #[test]
     fn load_rejects_single_file_source() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/flux2.safetensors".into()));
         let err = load_klein(&spec)
@@ -1348,40 +1376,22 @@ mod tests {
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
 
-    /// The sequential-residency offload contract (epic 10765 Phase 1c, sc-10868): `with_offload_policy`
-    /// is captured at load (not rejected), and the env override + spec policy select the phased path.
-    /// Loading stays lazy, so this asserts the plumbing on CPU without any weights or a GPU: a
-    /// `Sequential` spec builds a generator (the shared residency route is selected at load,
-    /// exercised end-to-end by the cuda A/B below), and the default spec stays `Resident`.
+    /// Image construction is lazy and the legacy load policy no longer selects lifecycle behavior.
     #[test]
-    fn offload_policy_is_captured_not_rejected() {
-        // Default (no policy set) → Resident: the generator builds, the cached `render` path is default.
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
-        assert!(load_dev(&spec).is_ok());
-        assert!(load_klein(&spec).is_ok());
-
-        // `Sequential` is honored, not rejected — for both variants (dev's Mistral TE is the big win; the
-        // klein path is wired identically). The weights are never touched (lazy build).
-        let seq = LoadSpec::new(WeightsSource::Dir("/snap".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
-        assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
-        assert!(load_dev(&seq).is_ok());
-        assert!(load_klein(&seq).is_ok());
-
-        // The `CANDLE_GEN_OFFLOAD` override's semantics (spelling / case / whitespace) are asserted where
-        // the reader lives — `candle_gen::residency` — rather than re-tested per engine (sc-12089). This
-        // block used to set the process-global var here and `remove_var` it on the way out, which silently
-        // clobbered an ambient export rather than restoring it; the assertions moved, so the mutation goes
-        // with them.
+    fn load_policy_is_not_a_residency_authority() {
+        let resident = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let legacy_staged = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential);
+        for spec in [&resident, &legacy_staged] {
+            assert!(load_dev(spec).is_ok());
+            assert!(load_klein(spec).is_ok());
+        }
     }
 
     /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008
     /// klein). Loads `label`'s snapshot from the `dir_env` env var and runs ONE probed 1024²
-    /// generation whose residency mode is chosen by the same two seams `generate` reads —
-    /// `CANDLE_GEN_OFFLOAD=sequential` (the env override, sc-10769) or `FLUX2_OFFLOAD_MODE=spec-sequential`
-    /// → `LoadSpec::offload_policy` (the worker-facing contract, sc-10821, with `CANDLE_GEN_OFFLOAD`
-    /// UNSET) — then prints the device peak VRAM (`SEQ_AB` line) and writes the raw RGB pixels to
+    /// generation whose residency mode is carried by `GenerationMemory::stage_residency`, calibrated
+    /// with `FLUX2_OFFLOAD_MODE=request-staged`; it prints the device peak VRAM (`SEQ_AB` line) and writes the raw RGB pixels to
     /// `FLUX2_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and compare: the pixel
     /// files must be byte-identical (parity) and the sequential peak materially lower (the dense text
     /// encoder dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc caching
@@ -1416,10 +1426,8 @@ mod tests {
                 _ => spec,
             };
         }
-        let spec_mode = std::env::var("FLUX2_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-        }
+        let stage_residency =
+            std::env::var("FLUX2_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
@@ -1427,6 +1435,10 @@ mod tests {
             steps: Some(steps),
             seed: Some(42),
             count: 1,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
@@ -1443,11 +1455,8 @@ mod tests {
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
+        let mode = if stage_residency {
+            "request-staged"
         } else {
             "resident"
         };

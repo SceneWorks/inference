@@ -22,7 +22,7 @@ pub use text_encoder::MageTextEncoder;
 pub use transformer::MageTransformer;
 pub use vae::MageVae;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{io::Read, io::Seek, io::SeekFrom};
 
@@ -31,6 +31,52 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 use sha2::{Digest, Sha256};
+
+/// Caller-provisioned shared component ids. These match the MLX provider and the SceneWorks
+/// manifest: each per-variant tier contains only the transformer, while the bit-identical text
+/// encoder and VAE are staged once from the shared components mirror.
+pub const COMPONENT_TEXT_ENCODER: &str = "text_encoder";
+pub const COMPONENT_VAE: &str = "vae";
+pub const REQUIRED_COMPONENTS: &[&str] = &[COMPONENT_TEXT_ENCODER, COMPONENT_VAE];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MageComponentDirs {
+    pub(crate) transformer: PathBuf,
+    pub(crate) text_encoder: PathBuf,
+    pub(crate) vae: PathBuf,
+}
+
+impl MageComponentDirs {
+    pub(crate) fn flat(root: &Path) -> Self {
+        Self {
+            transformer: root.join("transformer"),
+            text_encoder: root.join("text_encoder"),
+            vae: root.join("vae"),
+        }
+    }
+}
+
+/// Resolve SceneWorks' split layout while retaining the upstream flat-snapshot fallback. Unknown
+/// component ids and file-valued directory components fail at load time instead of surfacing as a
+/// misleading missing-weight error during the first render.
+fn resolve_component_dirs(root: &Path, spec: &LoadSpec) -> gen_core::Result<MageComponentDirs> {
+    gen_core::reject_unknown_components(spec, REQUIRED_COMPONENTS, config::FAMILY)?;
+    let staged = |id: &str, fallback: &str| -> gen_core::Result<PathBuf> {
+        match spec.components.get(id) {
+            Some(WeightsSource::Dir(dir)) => Ok(dir.clone()),
+            Some(WeightsSource::File(file)) => Err(gen_core::Error::Msg(format!(
+                "mage_flow: the '{id}' component must be staged as a directory, got the file {}",
+                file.display()
+            ))),
+            None => Ok(root.join(fallback)),
+        }
+    };
+    Ok(MageComponentDirs {
+        transformer: root.join("transformer"),
+        text_encoder: staged(COMPONENT_TEXT_ENCODER, "text_encoder")?,
+        vae: staged(COMPONENT_VAE, "vae")?,
+    })
+}
 
 fn generation_descriptor(
     id: &'static str,
@@ -43,7 +89,7 @@ fn generation_descriptor(
         family: config::FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        required_components: &[],
+        required_components: REQUIRED_COMPONENTS,
         capabilities: Capabilities {
             supports_negative_prompt,
             supports_guidance,
@@ -55,6 +101,7 @@ fn generation_descriptor(
                 candle_gen::gen_core::Quant::Q4,
                 candle_gen::gen_core::Quant::Q8,
             ],
+            component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
             ..Default::default()
         },
     }
@@ -74,7 +121,7 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 
 pub struct MageGenerator {
     descriptor: ModelDescriptor,
-    root: PathBuf,
+    component_dirs: MageComponentDirs,
     device: candle_core::Device,
     quant: Option<candle_gen::gen_core::Quant>,
     default_steps: u32,
@@ -85,6 +132,7 @@ pub struct MageGenerator {
 pub struct MageEditGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    component_dirs: MageComponentDirs,
     variant: MageEditVariant,
     device: candle_core::Device,
     quant: Option<candle_gen::gen_core::Quant>,
@@ -95,7 +143,7 @@ impl MageEditGenerator {
     fn components(&self) -> gen_core::Result<Arc<MageEdit>> {
         candle_gen::cached(&self.components, || {
             verify_edit_checkpoint(&self.root, self.variant)?;
-            MageEdit::load_with_quant(&self.root, self.quant, &self.device)
+            MageEdit::load_components(&self.component_dirs, self.quant, &self.device)
                 .map(Arc::new)
                 .map_err(candle_gen::CandleError::from)
         })
@@ -293,7 +341,7 @@ fn resolve_edit_references(
 impl MageGenerator {
     fn components(&self) -> gen_core::Result<Arc<MagePipeline>> {
         candle_gen::cached(&self.components, || {
-            MagePipeline::load_with_quant(&self.root, self.quant, &self.device)
+            MagePipeline::load_components(&self.component_dirs, self.quant, &self.device)
                 .map(Arc::new)
                 .map_err(candle_gen::CandleError::from)
         })
@@ -380,6 +428,7 @@ fn load_generation_variant(
             ))
         }
     };
+    let component_dirs = resolve_component_dirs(&root, spec)?;
     if !spec.adapters.is_empty()
         || spec.control.is_some()
         || !spec.extra_controls.is_empty()
@@ -392,7 +441,7 @@ fn load_generation_variant(
     let device = candle_gen::default_device()?;
     Ok(Box::new(MageGenerator {
         descriptor,
-        root,
+        component_dirs,
         device,
         quant: spec.quantize,
         default_steps,
@@ -420,7 +469,7 @@ pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
         family: config::FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        required_components: &[],
+        required_components: REQUIRED_COMPONENTS,
         capabilities: Capabilities {
             supports_negative_prompt: !matches!(variant, MageEditVariant::EditTurbo),
             supports_guidance: !matches!(variant, MageEditVariant::EditTurbo),
@@ -439,6 +488,7 @@ pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
                 candle_gen::gen_core::Quant::Q4,
                 candle_gen::gen_core::Quant::Q8,
             ],
+            component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
             ..Default::default()
         },
     }
@@ -485,10 +535,12 @@ fn load_edit_variant(
             )))
         }
     };
+    let component_dirs = resolve_component_dirs(&root, spec)?;
     let device = candle_gen::default_device()?;
     Ok(Box::new(MageEditGenerator {
         descriptor: edit_descriptor(variant),
         root,
+        component_dirs,
         variant,
         device,
         quant: spec.quantize,
@@ -671,5 +723,59 @@ mod registry_tests {
         );
         spec.quantize = Some(Quant::Nvfp4);
         assert!(load(&spec).is_err(), "unsupported NVFP4 must fail loudly");
+    }
+
+    #[test]
+    fn all_six_descriptors_publish_the_same_components_and_precision_floors() {
+        for descriptor in [
+            descriptor(),
+            descriptor_base(),
+            descriptor_turbo(),
+            descriptor_edit(),
+            descriptor_edit_base(),
+            descriptor_edit_turbo(),
+        ] {
+            assert_eq!(descriptor.required_components, REQUIRED_COMPONENTS);
+            assert_eq!(
+                descriptor.capabilities.component_precision_floors,
+                quant::COMPONENT_PRECISION_FLOORS,
+                "{} hid a load-time precision raise from the worker",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
+    fn split_component_layout_and_flat_fallback_resolve_identically_for_every_variant() {
+        let root = PathBuf::from("/variant/q4");
+        let flat = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert_eq!(
+            resolve_component_dirs(&root, &flat).unwrap(),
+            MageComponentDirs::flat(&root)
+        );
+
+        let split = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir("/shared/q8/text_encoder".into()),
+            )
+            .with_component(COMPONENT_VAE, WeightsSource::Dir("/shared/bf16/vae".into()));
+        assert_eq!(
+            resolve_component_dirs(&root, &split).unwrap(),
+            MageComponentDirs {
+                transformer: root.join("transformer"),
+                text_encoder: "/shared/q8/text_encoder".into(),
+                vae: "/shared/bf16/vae".into(),
+            }
+        );
+
+        let invalid = LoadSpec::new(WeightsSource::Dir(root.clone())).with_component(
+            COMPONENT_TEXT_ENCODER,
+            WeightsSource::File("/shared/text_encoder.safetensors".into()),
+        );
+        assert!(resolve_component_dirs(&root, &invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("must be staged as a directory"));
     }
 }

@@ -13,8 +13,8 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
-    Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
+    curated_scheduler_names, default_seed, schedule_sigmas, ActivationMemoryAnchor, AlphaSchedule,
+    Capabilities, Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
     Quant, Residency, Result, Scheduler, SizeFloor, Solver, TcdSampler, WeightsSource,
@@ -190,6 +190,7 @@ pub fn descriptor() -> ModelDescriptor {
             // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
             // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
@@ -771,7 +772,10 @@ impl Sdxl {
             // Materialize the conditioning + pooled while the encoders are still alive (Sequential
             // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
             // graph and the drop would free nothing (cf. Wan's `encode_text_staged`).
-            |enc| Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+            |enc| match enc {
+                Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+                None => Ok(()),
+            },
             // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD) and run the
             // denoise/decode body once against the `heavy` borrow — identical for both residencies.
             // `on_progress` is threaded through the seam (F-179) and shadows the outer sink here.
@@ -1312,6 +1316,16 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// sc-16195 Apple-Silicon warm sweep: q8 and dense both peaked at 14.039 GiB at 1024².
+/// The 14.05 GiB family ceiling is deliberately upward-rounded.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: ActivationMemoryAnchor {
+            bytes_1024: 15_086_072_628,
+        },
+    };
 
 #[cfg(test)]
 mod tests {

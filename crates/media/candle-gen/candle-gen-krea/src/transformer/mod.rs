@@ -20,6 +20,7 @@ pub mod block;
 pub mod rope;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::quant::Nvfp4Context;
 use candle_gen::BlockPlan;
 
@@ -29,6 +30,22 @@ use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
 use crate::quant::QLinear;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
 use rope::RopeTables;
+
+fn request_attention_plan<'a>(
+    scores_budget: usize,
+    cancel: &'a candle_gen::gen_core::CancelFlag,
+) -> AttentionPlan<'a> {
+    let max_score_elements = if scores_budget == usize::MAX {
+        u64::MAX
+    } else {
+        scores_budget as u64
+    };
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements,
+        false,
+    ))
+    .with_cancel(cancel)
+}
 
 /// The Krea 2 single-stream DiT.
 pub struct Krea2Transformer {
@@ -542,6 +559,7 @@ impl Krea2Transformer {
         let img_len = ht * wt;
         let latent_ch = cfg.in_channels / (p * p);
         let cap_len = context.dim(1)?;
+        let attention_plan = request_attention_plan(attention_scores_budget, cancel);
 
         // Image patch embed + shared timestep/text front-end.
         let img = self.embed_image(latent)?; // [b, img_len, hidden]
@@ -556,12 +574,12 @@ impl Krea2Transformer {
             TransformerBlocks::Resident(blocks) => {
                 for blk in blocks {
                     candle_gen::check_cancel(cancel)?;
-                    combined = blk.forward_with_attention_budget(
+                    combined = blk.forward_with_attention_plan(
                         &combined,
                         &tvec,
                         &rcos,
                         &rsin,
-                        attention_scores_budget,
+                        attention_plan,
                     )?;
                 }
             }
@@ -588,12 +606,12 @@ impl Krea2Transformer {
                             // grace the worker's bounded wind-down does not have. At the shipped
                             // window of 1 the two coincide; this keeps that true if it ever widens.
                             candle_gen::check_cancel(cancel)?;
-                            state = block.forward_with_attention_budget(
+                            state = block.forward_with_attention_plan(
                                 &state,
                                 &tvec,
                                 &rcos,
                                 &rsin,
-                                attention_scores_budget,
+                                attention_plan,
                             )?;
                         }
                         Ok(state)
@@ -671,6 +689,7 @@ impl Krea2Transformer {
         let latent_ch = cfg.in_channels / (p * p);
         let n_refs = refs.len();
         let cap_len = context.dim(1)?;
+        let attention_plan = request_attention_plan(attention_scores_budget, cancel);
 
         // Target + reference image tokens (references must share the target grid — VAE-encoded at the
         // target resolution). All go through the identical `img_in` projection.
@@ -703,13 +722,7 @@ impl Krea2Transformer {
             ));
         };
         combined = fold_block_sequence(blocks.len(), cancel, combined, |i, combined| {
-            Ok(blocks[i].forward_with_attention_budget(
-                &combined,
-                &tvec,
-                &rcos,
-                &rsin,
-                attention_scores_budget,
-            )?)
+            blocks[i].forward_with_attention_plan(&combined, &tvec, &rcos, &rsin, attention_plan)
         })?;
 
         // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.

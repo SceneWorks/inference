@@ -116,6 +116,7 @@ impl ChromaVariant {
                 // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
                 mac_only: false,
                 supported_quants: &[],
+                component_precision_floors: &[],
                 supports_kv_cache: false,
                 // The static-shift / beta sigma schedule is applied inside the candle pipeline, so the
                 // worker needs no sigma-shift loader hint (matches the candle FLUX/Z-Image slices).

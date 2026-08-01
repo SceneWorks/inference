@@ -27,6 +27,7 @@ image = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+safetensors = { workspace = true }
 # Backend-neutral contract conformance suite (sc-4481): the macos-mlx lane runs z_image_turbo
 # through it as the "one real family" the testkit AC requires. Weight-gated (#[ignore]).
 sceneworks-gen-core-testkit = { workspace = true }

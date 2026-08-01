@@ -109,10 +109,12 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Device, Tensor};
+#[cfg(test)]
+use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
-    Progress, Quant, SizeFloor, WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
+    SizeFloor, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -209,9 +211,6 @@ pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
-    /// Effective load policy retained so per-generation memory levers can select the physical
-    /// three-stage Turbo path only when the consumer actually requested sequential residency.
-    offload_policy: OffloadPolicy,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
@@ -369,6 +368,7 @@ fn krea_generation_memory(
         MemoryStrategy::BoundedTransformerResidency,
     );
     Some(gen_core::GenerationMemory {
+        stage_residency: contract.engages(selection.strategy, MemoryStrategy::StagedResidency),
         tile_vae_decode: contract.engages(selection.strategy, MemoryStrategy::BoundedDecode),
         chunk_attention: contract.engages(selection.strategy, MemoryStrategy::BoundedAttention),
         stream_transformer_blocks,
@@ -447,14 +447,6 @@ impl Generator for KreaGenerator {
                         .to_owned(),
                 ));
             }
-            if context.selection.strategy.is_optimized()
-                && self.offload_policy != OffloadPolicy::Sequential
-            {
-                return Err(gen_core::Error::Unsupported(
-                    "krea_2_turbo: optimized memory strategies require a sequential load"
-                        .to_owned(),
-                ));
-            }
             if let gen_core::MemorySafetyDecision::Reject { reason } =
                 self.memory_strategy_safety_check(context)
             {
@@ -524,16 +516,30 @@ impl Generator for KreaGenerator {
         };
         let reference = img2img_reference(req);
 
-        if let Some(memory) = req.memory.as_ref() {
+        let has_higher_rung_controls = req.memory.as_ref().is_some_and(|memory| {
+            gen_core::GenerationMemory {
+                stage_residency: false,
+                ..*memory
+            } != gen_core::GenerationMemory::default()
+        });
+        if has_higher_rung_controls {
+            let memory = req
+                .memory
+                .as_ref()
+                .expect("higher-rung controls require a GenerationMemory block");
+            // A request that is already cancelled must stop before capability checks or any
+            // request-scoped component transition. This preserves the cancellation contract for
+            // every descriptor, including variants that do not support the selected memory rung.
+            candle_gen::check_cancel(&req.cancel)?;
             if self.descriptor.id != KREA_2_TURBO_ID
-                || self.offload_policy != OffloadPolicy::Sequential
+                || !self.descriptor.capabilities.supports_sequential_offload
                 || reference.is_some()
                 || req.phases.is_some()
                 || req.use_pid
             {
                 return Err(gen_core::Error::Unsupported(format!(
-                    "{}: per-generation memory adaptation is supported only for sequential, \
-                     native-VAE, ordinary Turbo text-to-image requests",
+                    "{}: per-generation memory adaptation is supported only for native-VAE, \
+                     ordinary Turbo text-to-image requests",
                     self.descriptor.id
                 )));
             }
@@ -552,13 +558,18 @@ impl Generator for KreaGenerator {
                     )));
                 }
             }
-            let images = pipeline::render_three_stage(
-                &self.root,
-                &self.device,
-                &self.adapters,
-                req,
-                on_progress,
-            )?;
+            // Keep Krea's established text → DiT → VAE phase bodies disjoint. The shared owner
+            // contributes the request-scoped warm-cache transition; this pipeline retains the
+            // three-stage execution needed by every cumulative memory rung.
+            let images = self.residency.run_exclusive_staged(&req.cancel, || {
+                pipeline::render_three_stage(
+                    &self.root,
+                    &self.device,
+                    &self.adapters,
+                    req,
+                    on_progress,
+                )
+            })?;
             return Ok(GenerationOutput::Images(images));
         }
 
@@ -586,9 +597,15 @@ impl Generator for KreaGenerator {
             .map(|r| multiphase::any_phase_uses_cfg(r))
             .unwrap_or(false);
 
-        let images = self.residency.run(
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let synchronize = |result| candle_gen::synchronize_result(&self.device, result);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
-            &self.device,
             req.use_pid,
             on_progress,
             |text| match text {
@@ -615,6 +632,7 @@ impl Generator for KreaGenerator {
                     pipeline::encode_residency(text, raw, req)?,
                 )),
             },
+            |_| Ok(self.device.synchronize()?),
             |heavy, encoded, on_progress| match (heavy, encoded) {
                 // Multi-phase render (sc-13887): drive the resolved phases over the ONE global Raw schedule
                 // through a job-local re-adapted DiT (the shared resident is never mutated). `Sequential`
@@ -626,7 +644,7 @@ impl Generator for KreaGenerator {
                     let resolved = mp_resolved
                         .as_ref()
                         .expect("multi-phase encode implies a resolved plan");
-                    pipeline::render_multiphase(
+                    synchronize(pipeline::render_multiphase(
                         heavy.vae(),
                         &self.root,
                         &self.device,
@@ -636,7 +654,7 @@ impl Generator for KreaGenerator {
                         negative.as_ref(),
                         req,
                         on_progress,
-                    )
+                    ))
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident)
                     if mp_resolved.is_some() =>
@@ -647,7 +665,7 @@ impl Generator for KreaGenerator {
                     let comps = &resident.components;
                     let (context, negative) =
                         pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)?;
-                    pipeline::render_multiphase(
+                    synchronize(pipeline::render_multiphase(
                         comps.vae(),
                         &self.root,
                         &self.device,
@@ -657,31 +675,31 @@ impl Generator for KreaGenerator {
                         negative.as_ref(),
                         req,
                         on_progress,
-                    )
+                    ))
                 }
                 (KreaHeavyPhase::Sequential(heavy), KreaEncoded::Edit(context)) => {
-                    pipeline::render_edit_residency(
+                    synchronize(pipeline::render_edit_residency(
                         heavy,
                         context,
                         req,
                         &edit_references,
                         &self.device,
                         on_progress,
-                    )
+                    ))
                 }
                 (KreaHeavyPhase::Sequential(heavy), KreaEncoded::Sequential(context)) => {
-                    pipeline::render_residency(
+                    synchronize(pipeline::render_residency(
                         heavy,
                         context,
                         req,
                         reference,
                         &self.device,
                         on_progress,
-                    )
+                    ))
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident) => {
                     let comps = &resident.components;
-                    if edit {
+                    let result = if edit {
                         let edit = resident.edit_components()?;
                         pipeline::render_edit(
                             comps,
@@ -720,7 +738,8 @@ impl Generator for KreaGenerator {
                         )
                     } else {
                         pipeline::render(comps, req, &self.device, on_progress)
-                    }
+                    };
+                    synchronize(result)
                 }
                 _ => unreachable!("residency phase variants are constructed in matching pairs"),
             },
@@ -771,6 +790,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
             // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
@@ -1036,7 +1056,6 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         )));
     }
     let device = candle_gen::default_device()?;
-    let policy = effective_residency_policy(spec.offload_policy, convrot_dit.is_some());
     let resident_root = root.clone();
     let resident_device = device.clone();
     let resident_adapters = spec.adapters.clone();
@@ -1051,11 +1070,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // sc-12425: the sequential heavy phase must know whether to load the int8-ConvRot DiT (from the
     // single file) or the snapshot's dense/packed `transformer/`. Absent this the sequential path loaded
     // `root/transformer` unconditionally — the wrong DiT for a ConvRot request — which is why ConvRot
-    // was pinned Resident (`effective_residency_policy`) rather than dropping its 15.6 GB f32 TE.
+    // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
-    let residency = candle_gen::Residency::from_policy_with_resident(
-        policy,
-        move || {
+    let residency = candle_gen::Residency::request_scoped_with_resident(
+        move |_| {
             let components = match resident_convrot.as_ref() {
                 Some(convrot_dit) => pipeline::load_components_convrot(
                     &resident_root,
@@ -1080,13 +1098,13 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                 })),
             ))
         },
-        move || {
+        move |_| {
             Ok(KreaTextPhase::Sequential(Box::new(pipeline::load_text(
                 &text_root,
                 &text_device,
             )?)))
         },
-        move |use_pid| {
+        move |use_pid, _| {
             let heavy = match heavy_convrot.as_ref() {
                 // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
                 // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
@@ -1104,33 +1122,17 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             };
             Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
         },
-    )?;
+    );
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
         residency,
-        offload_policy: policy,
         root,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
         // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
         has_diff_patch: crate::adapters::any_diff_patch(&spec.adapters),
         adapters: spec.adapters.clone(),
     }))
-}
-
-/// The residency policy this generator runs — the request's `offload_policy` after the
-/// `CANDLE_GEN_OFFLOAD` override (`candle_gen::effective_offload_policy`).
-///
-/// `_has_convrot` is taken but no longer changes the answer (sc-12425). ConvRot USED to be forced
-/// `Resident` here, because the sequential heavy loader read `root/transformer/` and could not source
-/// the int8 single-file DiT; [`pipeline::load_residency_heavy_convrot`] now sources it, so ConvRot drops
-/// its 15.6 GB f32 text encoder after encoding like every other Turbo request (measured 42.9 → ~29 GB
-/// peak, sc-12381). The parameter (and the test pinning it no longer matters) stays so a future reader
-/// cannot quietly re-add the special-case: the Turbo descriptor advertises `supports_sequential_offload`,
-/// so a ConvRot generator that silently ran `Resident` would make the worker's fit-gate predict a staged
-/// peak it never achieves — the sc-10840 lockstep violation the descriptor's own comment warns against.
-fn effective_residency_policy(requested: OffloadPolicy, _has_convrot: bool) -> OffloadPolicy {
-    candle_gen::effective_offload_policy(requested)
 }
 
 /// Construct a lazy candle Krea 2 **Turbo** generator. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -1188,7 +1190,7 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
     base_snapshot_dir: impl AsRef<std::path::Path>,
-    descriptor: ModelDescriptor,
+    mut descriptor: ModelDescriptor,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let root = base_snapshot_dir.as_ref().to_path_buf();
     let device = candle_gen::default_device()?;
@@ -1205,11 +1207,13 @@ pub fn load_from_native_dit_file(
             img2img_encoder: Mutex::new(None),
         })),
     );
+    // This source has no phase-local native-DiT reloader. Prevent the selector from choosing a
+    // request-scoped staged strategy that would otherwise fall back to the snapshot's different DiT.
+    descriptor.capabilities.supports_sequential_offload = false;
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
         residency,
-        offload_policy: OffloadPolicy::Resident,
         root,
         // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
         adapters: Vec::new(),
@@ -1284,17 +1288,30 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                 },
             })
             .collect(),
+        pid_decode_routes: None,
         load_shape: LoadShape::DeferredMaterialization,
-        // Candle Krea's current streamed-block realization lives inside its three-stage loader.
-        // This additive edge records that backend coupling without making phase release a shared
-        // rung-4 prerequisite; MLX therefore remains free to use Resident+Deferred.
-        additional_prerequisites: vec![(
+        // Every higher-rung Krea control is executed by `render_three_stage`: the provider reloads
+        // text, DiT, and VAE in disjoint phases whenever decode tiling, attention chunking, or
+        // transformer streaming is selected. Record that backend coupling on every affected rung so
+        // selection/evidence identity cannot omit a mechanism that physically executes. This remains
+        // provider-specific; MLX and other Candle providers keep the shared non-staged default.
+        additional_prerequisites: [
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
             MemoryStrategy::BoundedTransformerResidency,
-            MemoryStrategyPrerequisite::Rung {
-                rung: MemoryStrategy::StagedResidency,
-                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
-            },
-        )],
+        ]
+        .into_iter()
+        .map(|strategy| {
+            (
+                strategy,
+                MemoryStrategyPrerequisite::Rung {
+                    rung: MemoryStrategy::StagedResidency,
+                    scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                },
+            )
+        })
+        .collect(),
+        default_engagement_exclusions: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1345,6 +1362,129 @@ fn registered_krea_turbo_memory_strategy_contract(
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: KREA_2_TURBO_ID,
     contract: registered_krea_turbo_memory_strategy_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+};
+
+/// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
+/// route. The worker owns measured evidence and live-budget selection; this declaration owns which
+/// controls the provider can actually execute.
+#[cfg(any(feature = "cuda", test))]
+fn build_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::MemoryProviderContract {
+    use gen_core::{
+        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
+        MemoryPrerequisiteScope, MemoryProviderContract, MemoryStrategy,
+        MemoryStrategyEngagementExclusion, MemoryStrategyPrerequisite, MemoryStrategySupport,
+        MemoryWindowMaterialization,
+    };
+
+    let mut contract = MemoryProviderContract::compatibility_default(
+        "krea_2_turbo_control",
+        MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: false,
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+    );
+    contract.load_shape = LoadShape::EagerMaterialization;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: true,
+        attention_chunking: true,
+        transformer_window_materialization: false,
+    };
+    contract.formula = MemoryFormulaKind::PhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::OverlayBytes,
+        ],
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        "sc-16013-krea-control-direct-1024-v1",
+    ));
+    for capability in &mut contract.strategies {
+        capability.support = match capability.strategy {
+            MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedDecode => {
+                capability.parameters = MemoryParameterRanges {
+                    decode_tile_edges: vec![512],
+                    decode_overlaps: vec![128],
+                    ..Default::default()
+                };
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedAttention => {
+                capability.parameters = MemoryParameterRanges {
+                    attention_chunk_sizes: vec![128 * 1024 * 1024],
+                    ..Default::default()
+                };
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedTransformerResidency => {
+                MemoryStrategySupport::StructurallyNotApplicable {
+                    reason: "the Krea control provider has no transformer-window execution path"
+                        .to_owned(),
+                }
+            }
+        };
+    }
+    contract.additional_prerequisites = [
+        MemoryStrategy::BoundedDecode,
+        MemoryStrategy::BoundedAttention,
+    ]
+    .into_iter()
+    .map(|strategy| {
+        (
+            strategy,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        )
+    })
+    .collect();
+    if spec.quantize != Some(Quant::Q4) {
+        // SC-16013's direct 1024² calibration found no decode-tail peak on q8, bf16, or
+        // INT8-ConvRot. Attention chunking is independently executable there, so forcing tiled decode
+        // underneath it adds a speed cost with no measured memory saving. Q4 retains the cumulative
+        // composition because its staged 29.6 → 22.4 GiB decode saving is directly measured.
+        contract
+            .default_engagement_exclusions
+            .push(MemoryStrategyEngagementExclusion {
+            selection: MemoryStrategy::BoundedAttention,
+            excluded_rung: MemoryStrategy::BoundedDecode,
+            evidence:
+                "sc-16013-krea-control-direct-1024-v1: non-q4 decode tail is not the measured peak"
+                    .to_owned(),
+        });
+    }
+    contract
+}
+
+#[cfg(feature = "cuda")]
+fn registered_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_krea_control_memory_strategy_contract(spec))
+}
+
+#[cfg(feature = "cuda")]
+const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: "krea_2_turbo_control",
+    contract: registered_krea_control_memory_strategy_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
 };
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
@@ -1356,7 +1496,11 @@ pub fn register_providers(
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION);
     #[cfg(feature = "cuda")]
-    let registry = registry.register_memory_strategy(TURBO_MEMORY_REGISTRATION);
+    let registry = registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        // The direct CUDA control runtime composes the registered Krea base with a native control
+        // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
+        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION);
     registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
@@ -1407,6 +1551,23 @@ mod explicit_registry_tests {
             )));
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
 
+            let control_contract = registry
+                .memory_strategy_contract("krea_2_turbo_control", &spec)
+                .unwrap()
+                .expect("Krea control must register its CUDA memory-strategy contract");
+            assert_eq!(
+                control_contract.calibration.as_ref().unwrap().fingerprint,
+                "sc-16013-krea-control-direct-1024-v1"
+            );
+            assert!(matches!(
+                control_contract
+                    .capability(candle_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                candle_gen::gen_core::MemoryStrategySupport::StructurallyNotApplicable { .. }
+            ));
+            gen_core_testkit::check_memory_strategy_contract(&control_contract).unwrap();
+
             let edit_default = candle_gen::gen_core::MemoryProviderContract::compatibility_default(
                 super::KREA_2_EDIT_ID,
                 contract.backend.clone(),
@@ -1431,6 +1592,38 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn krea_control_memory_contract_publishes_the_executable_surface() {
+        let dense = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = build_krea_control_memory_strategy_contract(&dense);
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::StructurallyNotApplicable { .. }
+        ));
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        ));
+        assert!(!contract.engages(
+            gen_core::MemoryStrategy::BoundedAttention,
+            gen_core::MemoryStrategy::BoundedDecode
+        ));
+
+        let q4 = dense.with_quant(Quant::Q4);
+        let q4_contract = build_krea_control_memory_strategy_contract(&q4);
+        assert!(q4_contract.engages(
+            gen_core::MemoryStrategy::BoundedAttention,
+            gen_core::MemoryStrategy::BoundedDecode
+        ));
+    }
 
     /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
     ///
@@ -1493,6 +1686,7 @@ mod tests {
         let tier = gen_core::MemoryNumericTier {
             precision: gen_core::Precision::Bf16,
             quant: Some(Quant::Q4),
+            component_precision_floors: &[],
         };
         let parameters = gen_core::MemoryStrategyParameters {
             decode_tile_edge: Some(512),
@@ -1516,10 +1710,19 @@ mod tests {
         );
         assert!(
             contract.engages(
-                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
                 gen_core::MemoryStrategy::StagedResidency
             ),
             "Krea's additive backend prerequisite must preserve its current three-stage coupling"
+        );
+        assert_eq!(
+            contract.engaged_composition(gen_core::MemoryStrategy::BoundedAttention),
+            vec![
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategy::BoundedAttention,
+            ]
         );
 
         assert_eq!(
@@ -1531,11 +1734,15 @@ mod tests {
                 contract,
                 selected(gen_core::MemoryStrategy::StagedResidency)
             ),
-            Some(gen_core::GenerationMemory::default())
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            })
         );
         assert_eq!(
             krea_generation_memory(contract, selected(gen_core::MemoryStrategy::BoundedDecode)),
             Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 ..Default::default()
             })
@@ -1546,6 +1753,7 @@ mod tests {
                 selected(gen_core::MemoryStrategy::BoundedAttention)
             ),
             Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 ..Default::default()
@@ -1557,6 +1765,7 @@ mod tests {
                 selected(gen_core::MemoryStrategy::BoundedTransformerResidency)
             ),
             Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
@@ -1597,6 +1806,7 @@ mod tests {
                     tier: gen_core::MemoryNumericTier {
                         precision: gen_core::Precision::Bf16,
                         quant: Some(Quant::Q4),
+                        component_precision_floors: &[],
                     },
                 },
             )
@@ -1674,6 +1884,7 @@ mod tests {
                 tier: gen_core::MemoryNumericTier {
                     precision: gen_core::Precision::Bf16,
                     quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
                 },
             },
         )
@@ -2301,95 +2512,17 @@ mod tests {
 
     // --- Sequential component residency — sc-12089 / epic 10765 Phase 1c ---
 
-    /// Pin `CANDLE_GEN_OFFLOAD` to a known value for the duration of a test, restoring the prior value
-    /// on drop.
-    ///
-    /// Both properties matter and neither is optional here:
-    ///
-    /// * **Pinning.** `candle_gen::sequential_offload_enabled` reads a process-global var, and the route
-    ///   assertions below turn on the `Resident` default reaching `sequential() == false`. An ambient
-    ///   `CANDLE_GEN_OFFLOAD=sequential` — which is exactly what a developer running the two-process A/B
-    ///   has exported in that shell — would otherwise turn them red for a reason that has nothing to do
-    ///   with the code under test.
-    /// * **Restoring on `Drop`, not at the end of the body.** A failing assertion unwinds; a restore
-    ///   written as the last statement would be skipped, leaking the mutation into every later test in
-    ///   the binary (they run in-process and single-threaded — `.cargo/config.toml` force-pins
-    ///   `RUST_TEST_THREADS=1`, F-160). One red test would then cascade into several.
-    struct OffloadEnvGuard(Option<String>);
-
-    impl OffloadEnvGuard {
-        /// Pin the var to `value` (`None` ⇒ unset) until the guard drops.
-        fn set(value: Option<&str>) -> Self {
-            let prior = std::env::var(candle_gen::OFFLOAD_ENV).ok();
-            match value {
-                Some(v) => std::env::set_var(candle_gen::OFFLOAD_ENV, v),
-                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
-            }
-            Self(prior)
-        }
-    }
-
-    impl Drop for OffloadEnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var(candle_gen::OFFLOAD_ENV, v),
-                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
-            }
-        }
-    }
-
-    /// The offload contract (sc-12089): `with_offload_policy` is CAPTURED at load and never rejected —
-    /// on every id. Loading stays lazy, so this asserts the plumbing on
-    /// CPU with no weights and no GPU; the phased route itself is selected inside `generate` and
-    /// exercised end-to-end by the cuda A/B harness below.
-    ///
-    /// The env override's own semantics (spelling, case, whitespace) are asserted where the reader now
-    /// lives — `candle_gen::residency`'s `offload_env_reads_sequential_case_insensitively` — rather than
-    /// re-tested per engine.
+    /// Image construction stays lazy and ignores the legacy load-time policy; the request owns the
+    /// decision. This is weight-free because no loader runs until `generate`.
     #[test]
-    fn offload_policy_is_captured_not_rejected() {
-        let _env = OffloadEnvGuard::set(None);
-
-        // Resident remains lazy, but its cache now lives inside the shared residency owner.
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
-        assert!(load(&spec).is_ok());
-        assert!(load_raw(&spec).is_ok());
-
-        // `Sequential` is honored, not rejected — for all registered variants. Weights are never touched.
-        let seq = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+    fn image_load_policy_is_not_a_residency_authority() {
+        let resident = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let legacy_staged = LoadSpec::new(WeightsSource::Dir("/snap".into()))
             .with_offload_policy(OffloadPolicy::Sequential);
-        assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
-        assert!(load(&seq).is_ok());
-        assert!(load_raw(&seq).is_ok());
-        // Edit now selects the same deferred phase loaders; construction remains weights-free.
-        assert!(load_edit(&seq).is_ok());
-    }
-
-    /// The env override reaches THIS engine's route decision (sc-12089) — the seam the two-process A/B
-    /// harness drives when it cannot set a `LoadSpec`. The reader's own parsing is asserted in
-    /// `candle_gen::residency`; what this pins is that krea consults it at all, and that it can flip a
-    /// `Resident`-specced generator onto the phased path.
-    #[test]
-    fn env_override_selects_the_phased_route_on_a_resident_spec() {
-        // One scope per guard: a second `let _env` would SHADOW the first rather than replace it, and
-        // both would then live to the end of the body — restoring correctly only by accident of LIFO drop
-        // order. Explicit scopes make each pin end where it is meant to.
-        {
-            let _env = OffloadEnvGuard::set(Some("sequential"));
-            assert!(
-                effective_residency_policy(OffloadPolicy::Resident, false)
-                    == OffloadPolicy::Sequential,
-                "CANDLE_GEN_OFFLOAD=sequential must select the phased path regardless of the spec"
-            );
-        }
-        {
-            let _env = OffloadEnvGuard::set(None);
-            assert!(
-                effective_residency_policy(OffloadPolicy::Resident, false)
-                    == OffloadPolicy::Resident,
-                "with the override unset, a Resident spec stays resident"
-            );
+        for spec in [&resident, &legacy_staged] {
+            assert!(load(spec).is_ok());
+            assert!(load_raw(spec).is_ok());
+            assert!(load_edit(spec).is_ok());
         }
     }
 
@@ -2413,46 +2546,22 @@ mod tests {
         KreaGenerator {
             descriptor,
             device: candle_gen::default_device().expect("a default device"),
-            residency: candle_gen::Residency::sequential(
-                || {
+            residency: candle_gen::Residency::request_scoped(
+                |_| {
                     Err(candle_gen::CandleError::Msg(
                         "test text loader must not run".into(),
                     ))
                 },
-                |_| {
+                |_, _| {
                     Err(candle_gen::CandleError::Msg(
                         "test heavy loader must not run".into(),
                     ))
                 },
             ),
-            offload_policy: OffloadPolicy::Sequential,
             root: "/snap".into(),
             adapters: Vec::new(),
             has_diff_patch: false,
         }
-    }
-
-    #[test]
-    fn constrained_memory_route_requires_sequential_plain_turbo_t2i() {
-        let mut generator = sequential_generator(descriptor());
-        generator.offload_policy = OffloadPolicy::Resident;
-        let req = GenerationRequest {
-            prompt: "test".into(),
-            memory: Some(gen_core::GenerationMemory::default()),
-            ..Default::default()
-        };
-        let error = generator.generate(&req, &mut |_| {}).unwrap_err();
-        assert!(
-            error.to_string().contains("only for sequential"),
-            "unexpected error: {error}"
-        );
-
-        let raw = sequential_generator(raw_descriptor());
-        let error = raw.generate(&req, &mut |_| {}).unwrap_err();
-        assert!(
-            error.to_string().contains("only for sequential"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -2491,8 +2600,6 @@ mod tests {
     /// multi-GB load inside `generate`, ahead of the first cancellable step.
     #[test]
     fn cancelled_sequential_request_returns_before_loading_anything() {
-        let _env = OffloadEnvGuard::set(None);
-
         let cancel = gen_core::runtime::CancelFlag::new();
         cancel.cancel();
         let req = GenerationRequest {
@@ -2500,6 +2607,10 @@ mod tests {
             width: 1024,
             height: 1024,
             cancel: cancel.clone(),
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -2533,93 +2644,76 @@ mod tests {
         );
     }
 
-    /// The route guard (sc-12089). Two properties, and the second is the load-bearing one:
-    ///
-    /// 1. `Sequential` selects the phased path on Turbo/Raw/Edit; `Resident` (the default) never does.
-    /// 2. **An advertising id takes the phased path for EVERY request it accepts** — txt2img, img2img,
-    ///    and grounded edit. Because `supports_sequential_offload` is per-engine, a request-shape-dependent
-    ///    deferral would silently break the fit-gate's staged-peak prediction and OOM the admitted job.
-    ///    The only deferral is ConvRot, selected uniformly by the load spec rather than request shape.
     #[test]
-    fn sequential_route_covers_every_request_an_advertising_id_accepts() {
-        // The `Resident` assertions below read the process-global override through `sequential()`; pin it
-        // off so an A/B runner's ambient export cannot turn them red (see `OffloadEnvGuard`).
-        let _env = OffloadEnvGuard::set(None);
-
-        let plain = GenerationRequest {
+    fn rung_one_reaches_the_shared_staged_loader_for_every_advertised_krea_shape() {
+        let staged = || GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
-            width: 1024,
-            height: 1024,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let img2img = GenerationRequest {
-            prompt: "a red apple".into(),
-            width: 1024,
-            height: 1024,
-            conditioning: vec![Conditioning::Reference {
-                image: ref_image(64, 64),
-                strength: Some(0.5),
-            }],
-            ..Default::default()
-        };
+        let mut cases = vec![
+            (descriptor(), staged()),
+            (raw_descriptor(), staged()),
+            (
+                descriptor(),
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: Some(0.5),
+                    }],
+                    ..staged()
+                },
+            ),
+            (
+                edit_descriptor(),
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: None,
+                    }],
+                    ..staged()
+                },
+            ),
+            (
+                descriptor(),
+                GenerationRequest {
+                    use_pid: true,
+                    ..staged()
+                },
+            ),
+            (
+                raw_descriptor(),
+                GenerationRequest {
+                    phases: Some(vec![gen_core::GenerationPhase {
+                        steps: 1,
+                        ..Default::default()
+                    }]),
+                    ..staged()
+                },
+            ),
+        ];
 
-        // Every (id, request-shape) pair the advertising ids accept takes the phased path — no shape
-        // silently falls back to resident while the descriptor claims otherwise.
-        for descriptor in [descriptor(), raw_descriptor()] {
-            assert!(descriptor.capabilities.supports_sequential_offload);
-            for _req in [&plain, &img2img] {
-                assert!(
-                    effective_residency_policy(OffloadPolicy::Sequential, false)
-                        == OffloadPolicy::Sequential,
-                    "{} must honor Sequential for every request it accepts",
-                    descriptor.id
-                );
-            }
+        for (descriptor, request) in cases.drain(..) {
+            let generator = sequential_generator(descriptor.clone());
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .expect_err("the fake text loader must fail");
+            assert!(
+                error.to_string().contains("test text loader must not run"),
+                "{} must reach rung-one staging for this request shape, got {error:?}",
+                descriptor.id
+            );
         }
-
-        let edit_req = GenerationRequest {
-            prompt: "make the person smile".into(),
-            width: 1024,
-            height: 1024,
-            conditioning: vec![Conditioning::Reference {
-                image: ref_image(64, 64),
-                strength: None,
-            }],
-            ..Default::default()
-        };
-        let edit = edit_descriptor();
-        edit.capabilities
-            .validate_request(edit.id, &edit_req)
-            .expect("the edit descriptor accepts grounded reference conditioning");
-        assert!(edit.capabilities.supports_sequential_offload);
-        assert_eq!(
-            effective_residency_policy(OffloadPolicy::Sequential, false),
-            OffloadPolicy::Sequential
-        );
-
-        // `Resident` (the default) never takes it — that is the whole opt-in contract.
-        assert_eq!(
-            effective_residency_policy(OffloadPolicy::Resident, false),
-            OffloadPolicy::Resident
-        );
-
-        // ConvRot NO LONGER defers (sc-12425): `load_residency_heavy_convrot` sources the int8 single
-        // file on the sequential path, so a ConvRot request drops its 15.6 GB f32 TE like every other
-        // Turbo request. It MUST follow the policy — the Turbo descriptor advertises
-        // `supports_sequential_offload`, and a ConvRot generator silently running Resident would make the
-        // fit-gate under-predict its peak (the sc-10840 lockstep violation).
-        assert_eq!(
-            effective_residency_policy(OffloadPolicy::Sequential, true),
-            OffloadPolicy::Sequential
-        );
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-12089) — the candle twin of the MLX
     /// krea A/B (sc-11101), mirroring the candle-gen-flux harness (sc-10769).
     ///
-    /// ONE probed generation whose residency mode is chosen by the same two seams `generate` reads:
-    /// `CANDLE_GEN_OFFLOAD=sequential` (the env override) or `KREA_OFFLOAD_MODE=spec-sequential` →
-    /// `LoadSpec::offload_policy` (the worker-facing contract, with `CANDLE_GEN_OFFLOAD` unset). Prints
+    /// ONE probed generation whose residency mode is carried by the request memory contract and
+    /// calibrated with `KREA_OFFLOAD_MODE=request-staged`. Prints
     /// the device peak VRAM and writes the raw RGB pixels to `KREA_OUT`.
     ///
     /// **Run it TWICE in SEPARATE processes** (resident vs sequential) and compare: the pixel files must
@@ -2676,7 +2770,7 @@ mod tests {
             spec = spec.with_adapters(vec![AdapterSpec::new(lora.into(), 1.0, AdapterKind::Lora)]);
         }
         // sc-12425: `KREA_CONVROT_DIT` measures the community INT8-ConvRot lane by riding the DiT single
-        // file on `text_encoder` (the `convrot_selector` seam). Run resident vs spec-sequential in two
+        // file on `text_encoder` (the `convrot_selector` seam). Run resident vs request-staged in two
         // processes: sequential must drop the 15.6 GB f32 Qwen3-VL TE before the int8 DiT loads, taking
         // the ~42.9 GB resident peak (sc-12381) down toward the DiT phase alone.
         if let Ok(convrot) = std::env::var("KREA_CONVROT_DIT") {
@@ -2686,11 +2780,9 @@ mod tests {
             );
             spec.text_encoder = Some(WeightsSource::File(convrot.into()));
         }
-        let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
+        let stage_residency =
+            std::env::var("KREA_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
         let memory_mode = std::env::var("KREA_MEMORY_RUNG").unwrap_or_default();
-        if spec_mode == "spec-sequential" || !memory_mode.is_empty() {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-        }
         // Square edge (default 768, the sc-11101 MLX A/B's resolution so the two backends compare).
         // Set `KREA_AB_RES=1024` to match the condition the manifest's `candle.vramGbByTier` q4 was
         // measured at (RTX PRO 6000, 1024²/8-step) — the activation transient scales with pixel count and
@@ -2723,18 +2815,28 @@ mod tests {
             Vec::new()
         };
         let memory = match memory_mode.as_str() {
+            "" if stage_residency => Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             "" => None,
-            "three-stage" => Some(gen_core::GenerationMemory::default()),
+            "three-stage" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             "tiled-vae" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 ..Default::default()
             }),
             "chunked-attention" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 ..Default::default()
             }),
             "streamed-blocks" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
@@ -2782,8 +2884,7 @@ mod tests {
                 !raw && !edit && memory.is_some(),
                 "KREA_SWAP_DIR is supported only by the constrained ordinary Turbo probe"
             );
-            let swap_spec = LoadSpec::new(WeightsSource::Dir(swap_dir.into()))
-                .with_offload_policy(OffloadPolicy::Sequential);
+            let swap_spec = LoadSpec::new(WeightsSource::Dir(swap_dir.into()));
             let swap = load(&swap_spec).expect("load KREA_SWAP_DIR");
             let mut swap_req = req.clone();
             swap_req.steps = Some(1);
@@ -2897,13 +2998,10 @@ mod tests {
         let img = img.expect("at least one repeated image");
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
         let mode = if !memory_mode.is_empty() {
             memory_mode.as_str()
-        } else if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
+        } else if stage_residency {
+            "request-staged"
         } else {
             "resident"
         };

@@ -59,6 +59,8 @@ pub struct Krea2Transformer {
     txt_in_l2: AdaptableLinear,
     text_fusion: TextFusionTransformer,
     blocks: Vec<SingleStreamBlock>,
+    /// Re-openable description of `transformer_blocks`, present only for deferred snapshot loads.
+    block_stream: Option<crate::block_stream::KreaBlockStream>,
     final_norm: RmsScale,
     final_linear: AdaptableLinear,
     final_sstable: Array, // [1, 2, hidden]
@@ -119,10 +121,51 @@ impl Krea2Transformer {
                     )
                 })
                 .collect::<Result<_>>()?,
+            block_stream: None,
             final_norm: RmsScale::from_weights(w, "final_layer.norm.weight", eps)?,
             final_linear: lin(w, "final_layer.linear", true)?,
             final_sstable,
         })
+    }
+
+    /// Arm bounded transformer residency for a re-openable transformer snapshot.
+    pub(crate) fn with_block_stream(mut self, source: mlx_gen::WeightsSource) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::new(
+            source,
+            self.cfg.clone(),
+        ));
+        self
+    }
+
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let Some(size) = window_size else {
+            return Ok(None);
+        };
+        if self.block_stream.is_none() {
+            return Err(mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency needs a deferred, re-openable snapshot load"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.blocks.len(), size)?,
+            cancel,
+        }))
+    }
+
+    /// Re-snapshot the forward-time adapter stacks after a load or a job-local multi-phase reapply.
+    pub(crate) fn capture_block_adapters(&mut self) {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.capture_adapters(&mut self.blocks);
+        }
+    }
+
+    fn disarm_block_stream(&mut self) {
+        self.block_stream = None;
     }
 
     /// Velocity prediction.
@@ -286,6 +329,15 @@ impl Krea2Transformer {
         timestep: &Array,
         prep: &EditPrep,
     ) -> Result<Array> {
+        self.forward_prepared_edit_windowed(noise_latent, timestep, prep, None)
+    }
+
+    fn edit_joint_inputs(
+        &self,
+        noise_latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+    ) -> Result<(Array, Array, Array)> {
         let cfg = &self.cfg;
         let dt = self.dtype;
 
@@ -310,18 +362,7 @@ impl Krea2Transformer {
             parts.push(rt);
         }
         parts.push(&img);
-        let mut combined = concatenate_axis(&parts, 1)?;
-
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &tvec, &prep.rcos, &prep.rsin)?;
-        }
-
-        // Final layer, then slice the noise tokens — the contiguous tail after text + references.
-        let out = self.final_layer(&combined, &t)?; // [b, cap+refs+img_len, in_channels]
-        let img_len = prep.ht * prep.wt;
-        let head = prep.cap_len + prep.n_refs * img_len;
-        let img_out = split_axis1(&out, head)?.swap_remove(1); // [b, img_len, in_channels]
-        unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        Ok((concatenate_axis(&parts, 1)?, t, tvec))
     }
 
     /// Velocity prediction from a precomputed [`JointPrep`] — runs the per-step compute only: image
@@ -334,11 +375,83 @@ impl Krea2Transformer {
         prep: &JointPrep,
     ) -> Result<Array> {
         let j = self.joint_inputs(latent, timestep, prep)?;
-        let mut combined = j.combined.clone();
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &j.tvec, &j.rcos, &j.rsin)?;
-        }
+        let combined = self.run_blocks(j.combined.clone(), &j.tvec, &j.rcos, &j.rsin, None)?;
         self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Prepared text-to-image/img2img forward with an optional shared block-residency window.
+    pub(crate) fn forward_prepared_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks(j.combined.clone(), &j.tvec, &j.rcos, &j.rsin, window)?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
+    pub(crate) fn forward_prepared_edit_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        let (mut combined, t, tvec) = self.edit_joint_inputs(latent, timestep, prep)?;
+        combined = self.run_blocks(combined, &tvec, &prep.rcos, &prep.rsin, window)?;
+        let out = self.final_layer(&combined, &t)?;
+        let img_len = prep.ht * prep.wt;
+        let head = prep.cap_len + prep.n_refs * img_len;
+        let img_out = split_axis1(&out, head)?.swap_remove(1);
+        unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+    }
+
+    fn run_blocks(
+        &self,
+        mut combined: Array,
+        tvec: &Array,
+        rcos: &Array,
+        rsin: &Array,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        let Some(window) = window else {
+            for block in &self.blocks {
+                combined = block.forward(&combined, tvec, rcos, rsin)?;
+            }
+            return Ok(combined);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            combined,
+            || stream.open(),
+            |state, view, range| {
+                let mut current = state;
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    current = block.forward(&current, tvec, rcos, rsin)?;
+                }
+                Ok(current)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
     }
 
     /// Velocity prediction with **per-single-stream-block gradient checkpointing** (sc-7577, training
@@ -493,6 +606,7 @@ impl Krea2Transformer {
     /// whole-block checkpointing is on (the block recompute already covers attention). Inference never
     /// calls it (attention stays the un-checkpointed fused SDPA).
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.disarm_block_stream();
         for b in &mut self.blocks {
             b.set_sdpa_checkpoint(on);
         }
@@ -533,6 +647,7 @@ impl Krea2Transformer {
     /// single-stream blocks, final layer, scale-shift tables — is cast. Destructive for a narrowing
     /// cast (f32→bf16); reload for f32. Inference never calls this.
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.disarm_block_stream();
         for l in [
             &mut self.img_in,
             &mut self.time_embed_l1,
@@ -575,6 +690,9 @@ impl Krea2Transformer {
     /// block (the 256 targets [`crate::convert::transformer_quant_targets`] packs). The embedders,
     /// `time_mod_proj`, `txt_in`, `projector`, and `final_layer` stay dense, matching the converter.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.set_quant_bits(bits);
+        }
         self.text_fusion.quantize(bits)?;
         for b in &mut self.blocks {
             b.quantize(bits)?;

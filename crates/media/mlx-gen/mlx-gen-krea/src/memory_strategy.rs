@@ -65,8 +65,10 @@ pub fn memory_strategy_contract(
                 },
             })
             .collect(),
+        pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
+        default_engagement_exclusions: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -206,6 +208,14 @@ pub fn safety_check(
         };
     }
     MemorySafetyDecision::Accept
+}
+
+pub fn registered_safety_check(
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    safety_check(contract, context)
 }
 
 pub fn begin_request(

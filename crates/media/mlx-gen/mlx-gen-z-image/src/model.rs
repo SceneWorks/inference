@@ -11,9 +11,10 @@ use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
-    Residency, Result, SizeFloor, StagedHeavy, WeightsSource,
+    ActivationMemoryAnchor, Capabilities, ConditioningKind, Error, FlowMatchEuler,
+    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, StagedHeavy,
+    WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use mlx_rs::Dtype;
@@ -70,6 +71,7 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Turbo is guidance-distilled: no CFG, no negative prompt.
             supports_negative_prompt: false,
             supports_guidance: false,
@@ -604,7 +606,10 @@ impl ZImageTurbo {
             },
             // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an
             // un-evaluated `cap` keeps the encoder referenced through the graph and the drop frees nothing.
-            |cap| Ok(mlx_rs::transforms::eval([cap])?),
+            |cap| match cap {
+                Some(cap) => Ok(mlx_rs::transforms::eval([cap])?),
+                None => Ok(()),
+            },
             // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
             // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
             |heavy: &ZImageHeavyOwned, cap, on_progress| {
@@ -757,12 +762,23 @@ mlx_gen::register_generators! {
     footprint = component_footprint
 }
 
+/// sc-16195 Apple-Silicon warm sweep: q4 peaked at 14.043 GiB at 1024². Rounded upward
+/// to a 14.05 GiB family anchor; activations remain bf16 across weight tiers.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: ActivationMemoryAnchor {
+            bytes_1024: 15_086_072_628,
+        },
+    };
+
 /// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
 /// the worker can select a strategy from the static declaration plus its own measured evidence.
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
         contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
     };
 
 #[cfg(test)]
@@ -982,7 +998,7 @@ mod tests {
                 panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
             });
             assert!(
-                res.is_sequential(),
+                res.with_resident_parts(|_, _| ()).is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }

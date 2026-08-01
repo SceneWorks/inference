@@ -91,6 +91,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: false,
             supported_quants: &[] as &[Quant],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
@@ -105,7 +106,9 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeCheckedOnGrid {
+            // Match the MLX sibling: `0×0` resolves from the driving clip, while every explicit
+            // request remains exact-or-rejected on SCAIL-2's 32-pixel render lattice (sc-16199).
+            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
                 multiple: DIM_ALIGN,
             },
         },
@@ -252,11 +255,11 @@ impl Generator for Scail2 {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
-        // The advertised explicit grid runs before the lattice-projected area gate. Otherwise an
-        // off-grid request in the old raw-vs-aligned band (1280x730) could still report only an area
-        // verdict here while MLX reports the grid rule, even though both descriptors promise the
-        // same exact-or-rejected behavior (sc-16198).
-        reject_over_area(self.descriptor.id, req)
+        // The shared floor can validate an explicit size but cannot see what the `0×0` sentinel
+        // resolves to. Bound that driving-frame geometry here so preflight and render agree.
+        resolve_pre_flight_size(req).map_or(Ok(()), |(width, height)| {
+            reject_unrenderable_geometry(&self.descriptor.capabilities, req, width, height)
+        })
     }
 
     fn generate(
@@ -303,6 +306,132 @@ fn reject_zero_steps(id: &str, req: &GenerationRequest) -> gen_core::Result<()> 
     Ok(())
 }
 
+/// The geometry the pipeline will render: explicit dimensions where non-zero, otherwise the first
+/// driving frame. Only the exact `0×0` pair reaches this policy through the advertised floor; the
+/// per-axis form keeps this helper identical to the assignment in [`Scail2::run`].
+fn resolve_target_size(req: &GenerationRequest, first: &Image) -> (u32, u32) {
+    (
+        if req.width > 0 {
+            req.width
+        } else {
+            first.width
+        },
+        if req.height > 0 {
+            req.height
+        } else {
+            first.height
+        },
+    )
+}
+
+/// [`resolve_target_size`] for preflight, where conditioning may not have been assembled yet.
+fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
+    if req.width > 0 && req.height > 0 {
+        return Some((req.width, req.height));
+    }
+    req.control_clip()
+        .and_then(|clip| clip.frames.first())
+        .map(|first| resolve_target_size(req, first))
+}
+
+/// Resolve, bound, and lattice-project the geometry consumed by [`Scail2Job`].
+fn resolve_render_size(
+    caps: &Capabilities,
+    req: &GenerationRequest,
+    first: &Image,
+) -> gen_core::Result<(u32, u32)> {
+    let (width, height) = resolve_target_size(req, first);
+    reject_unrenderable_geometry(caps, req, width, height)?;
+    if req.width == 0 && req.height == 0 {
+        Ok((align(width) as u32, align(height) as u32))
+    } else {
+        Ok((width, height))
+    }
+}
+
+/// Reject a requested or driving-video-resolved geometry outside SCAIL-2's advertised edge and area
+/// envelope. The area is measured after projection onto the same lattice the render uses; source
+/// media can be off-grid, while explicit off-grid requests have already failed the shared floor.
+fn reject_unrenderable_geometry(
+    caps: &Capabilities,
+    req: &GenerationRequest,
+    width: u32,
+    height: u32,
+) -> gen_core::Result<()> {
+    let origin = if req.width == 0 && req.height == 0 {
+        "resolved from the driving video"
+    } else {
+        "requested"
+    };
+    let outside_range = width < caps.min_size
+        || width > caps.max_size
+        || height < caps.min_size
+        || height > caps.max_size;
+    let area = reject_over_area(MODEL_ID, width, height);
+    if !outside_range && area.is_ok() {
+        return Ok(());
+    }
+
+    let reason = if outside_range {
+        format!(
+            "each edge must be within {}..={}",
+            caps.min_size, caps.max_size
+        )
+    } else {
+        let (aligned_width, aligned_height) = (align(width), align(height));
+        let aligned_area = aligned_width * aligned_height;
+        format!(
+            "the rendered {aligned_width}×{aligned_height} is {aligned_area} px, over the max area \
+             {MAX_AREA_14B} px"
+        )
+    };
+    let advice = match suggest_in_envelope(width, height, caps.min_size, caps.max_size) {
+        Some((suggested_width, suggested_height)) => format!(
+            "pass an explicit width/height — the largest geometry this engine accepts at this \
+             aspect is {suggested_width}×{suggested_height} (the same driving clip is resized to \
+             whatever target you set)"
+        ),
+        None => "pass an explicit width/height inside the advertised range".to_string(),
+    };
+    Err(gen_core::Error::Msg(format!(
+        "{MODEL_ID}: {width}×{height} ({origin}) is outside this model's advertised size envelope — \
+         {reason}; {advice}"
+    )))
+}
+
+/// Largest on-lattice geometry at the source aspect that fits the advertised edge and area bounds.
+/// Integer arithmetic avoids a float round-trip dropping an extra lattice step at `x.999…`.
+fn suggest_in_envelope(
+    width: u32,
+    height: u32,
+    min_size: u32,
+    max_size: u32,
+) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let step = u64::from(DIM_ALIGN);
+    let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    let floor = min_size.max(DIM_ALIGN);
+    let mut suggested_width = clamp(u64::from(width.min(max_size)) / step * step);
+    while suggested_width >= floor {
+        let numerator = u64::from(suggested_width) * u64::from(height);
+        let denominator = u64::from(width);
+        let rounded_up = clamp(numerator.div_ceil(denominator * step) * step);
+        let rounded_down = clamp(numerator / denominator / step * step);
+        for suggested_height in [rounded_up, rounded_down] {
+            if suggested_height >= min_size
+                && suggested_height <= max_size
+                && suggested_width as usize * suggested_height as usize <= MAX_AREA_14B
+            {
+                return Some((suggested_width, suggested_height));
+            }
+        }
+        suggested_width -= DIM_ALIGN;
+    }
+    None
+}
+
 /// Reject an over-area request loudly instead of letting the 14B DiT run for minutes and OOM. SCAIL-2's
 /// DiT runs **f32** (≈ 56 GiB resident) with a packed conditioning sequence >2× the plain token count,
 /// so a far-over-envelope request (e.g. 1280×1280×81) validates and dies with an opaque CUDA OOM at the
@@ -312,28 +441,23 @@ fn reject_zero_steps(id: &str, req: &GenerationRequest) -> gen_core::Result<()> 
 ///
 /// sc-16197 made this helper measure the lattice-projected geometry rather than the raw product.
 /// `1280×730`, for example, projects to `1280×704`. sc-16198 then advertised that same
-/// [`DIM_ALIGN`] lattice through [`SizeFloor::RangeCheckedOnGrid`] and runs the shared floor before
-/// this helper, so every provider request that reaches this point is already on-grid and [`align`] is
-/// a no-op. Direct helper tests retain the off-grid rows to pin the rendered-geometry area rule
-/// independently.
-///
-/// The `0×0` sentinel is still refused by Candle's floor. If sc-16199 makes it reachable, this
-/// request-taking helper must be replaced with a resolved-dimensions gate so it cannot measure
-/// `32×32` while the clip resolves to a much larger geometry.
-fn reject_over_area(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
-    let (w, h) = (align(req.width), align(req.height));
+/// [`DIM_ALIGN`] lattice through the descriptor's explicit-size policy. Sentinel-resolved source
+/// geometry can be off-grid, so [`reject_unrenderable_geometry`] also calls this helper before the
+/// render projects it to the lattice.
+fn reject_over_area(id: &str, width: u32, height: u32) -> gen_core::Result<()> {
+    let (w, h) = (align(width), align(height));
     let area = w * h;
     if area > MAX_AREA_14B {
         // Report the geometry the gate measured, and name the snap when it happened. Quoting the raw
         // product alone would send an off-lattice caller hunting for an off-by-one that isn't there.
         // (The wording is candle-only: `mlx-gen-scail2` reaches the same end by naming the requested
         // geometry in the head of its message and the rendered one in the reason clause.)
-        let snapped = if (w, h) == (req.width as usize, req.height as usize) {
+        let snapped = if (w, h) == (width as usize, height as usize) {
             String::new()
         } else {
             format!(
                 " (the requested {}×{} snaps onto the {DIM_ALIGN}-px lattice)",
-                req.width, req.height
+                width, height
             )
         };
         return Err(gen_core::Error::Msg(format!(
@@ -386,16 +510,10 @@ impl Scail2 {
         let first: &Image = driving.frames.first().ok_or_else(|| {
             CandleError::Msg("scail2: the ControlClip has no driving frames".into())
         })?;
-        let width = if req.width > 0 {
-            req.width
-        } else {
-            first.width
-        };
-        let height = if req.height > 0 {
-            req.height
-        } else {
-            first.height
-        };
+        // The shared floor exempts `0×0` because it cannot inspect the driving clip. Resolve and
+        // enforce the edge/area envelope before loading components, then project source media to the
+        // same render lattice used by the MLX sibling.
+        let (width, height) = resolve_render_size(&self.descriptor.capabilities, req, first)?;
 
         let neg = req.negative_prompt.clone().unwrap_or_default();
         let job = Scail2Job {
@@ -471,6 +589,12 @@ mod tests {
         assert_eq!(
             d.capabilities.size_floor.explicit_size_multiple(),
             Some(DIM_ALIGN)
+        );
+        assert_eq!(
+            d.capabilities.size_floor,
+            SizeFloor::ResolvedDownstreamExplicitGrid {
+                multiple: DIM_ALIGN
+            }
         );
     }
 
@@ -571,7 +695,8 @@ mod tests {
             height: 1280,
             ..Default::default()
         };
-        let err = reject_over_area(MODEL_ID, &over).expect_err("over-area must be rejected");
+        let err = reject_over_area(MODEL_ID, over.width, over.height)
+            .expect_err("over-area must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("max area"), "message names the cap: {msg}");
         // Both edges are already on the lattice, so nothing was snapped and the message must not
@@ -595,13 +720,13 @@ mod tests {
             height: 720,
             ..over.clone()
         };
-        assert!(reject_over_area(MODEL_ID, &at_cap).is_ok());
+        assert!(reject_over_area(MODEL_ID, at_cap.width, at_cap.height).is_ok());
         let small = GenerationRequest {
             width: 512,
             height: 512,
             ..over
         };
-        assert!(reject_over_area(MODEL_ID, &small).is_ok());
+        assert!(reject_over_area(MODEL_ID, small.width, small.height).is_ok());
     }
 
     /// The helper projects onto the render lattice before measuring the cap (sc-16197).
@@ -616,12 +741,6 @@ mod tests {
     /// its own area rows the same way.
     #[test]
     fn over_area_is_judged_on_the_aligned_geometry() {
-        let req = |w, h| GenerationRequest {
-            prompt: "a character".into(),
-            width: w,
-            height: h,
-            ..Default::default()
-        };
         for (w, h, aw, ah) in [
             // The story's headline row: 934 400 raw, 901 120 rendered.
             (1280u32, 730u32, 1280usize, 704usize),
@@ -645,7 +764,7 @@ mod tests {
                 aw * ah <= MAX_AREA_14B,
                 "{aw}×{ah} must be inside the cap once aligned"
             );
-            reject_over_area(MODEL_ID, &req(w, h))
+            reject_over_area(MODEL_ID, w, h)
                 .unwrap_or_else(|e| panic!("{w}×{h} renders at {aw}×{ah}, inside the cap: {e}"));
         }
 
@@ -659,7 +778,7 @@ mod tests {
         ] {
             assert_eq!((align(w), align(h)), (aw, ah));
             assert!(aw * ah > MAX_AREA_14B, "{aw}×{ah} is over the cap");
-            let err = reject_over_area(MODEL_ID, &req(w, h))
+            let err = reject_over_area(MODEL_ID, w, h)
                 .expect_err("942 080 px is over the cap even after aligning");
             let msg = err.to_string();
             assert!(
@@ -677,50 +796,138 @@ mod tests {
         // The cap stays a strict `>`: 960×960 is on-lattice and EXACTLY `MAX_AREA_14B`, so aligning
         // changes nothing and it must still pass. (The mirror of `mlx-gen-scail2`'s own 960×960 row.)
         assert_eq!(960 * 960, MAX_AREA_14B);
-        assert!(reject_over_area(MODEL_ID, &req(960, 960)).is_ok());
+        assert!(reject_over_area(MODEL_ID, 960, 960).is_ok());
 
         // [`align`]'s min-one-tile floor is load-bearing for the paragraph in `reject_over_area`'s
         // doc that reasons about it: a sub-lattice edge snaps UP to one tile, so the measured area
         // can only ever grow, and the `0×0` sentinel measures 32×32 = 1024 px rather than 0. Drop
         // the `.max(1)` and the doc's argument silently stops being true.
         assert_eq!((align(0), align(1), align(31)), (32, 32, 32));
-        assert!(reject_over_area(MODEL_ID, &req(0, 0)).is_ok());
+        assert!(reject_over_area(MODEL_ID, 0, 0).is_ok());
         // …and that raise is not a hole: an edge under one tile still refuses when the OTHER edge
         // carries it past the cap. `1×30000` → `32×29984` = 959 488 px.
         assert_eq!((align(1), align(30000)), (32, 29984));
-        assert!(reject_over_area(MODEL_ID, &req(1, 30000)).is_err());
+        assert!(reject_over_area(MODEL_ID, 1, 30000).is_err());
     }
 
-    /// [`reject_over_area`] measures the **requested** dims, which are exact render dims because
-    /// [`SizeFloor::RangeCheckedOnGrid`] refuses both off-grid geometry and the `0×0` sentinel before
-    /// this helper can run.
-    ///
-    /// That is a cross-crate dependency (the floor lives in gen-core's `validate_request`), and
-    /// sc-16199 exists to revisit this very declaration. Pinning it here means relaxing the floor
-    /// turns this test RED at the site that depends on it, instead of silently opening a gap where an
-    /// auto-sized 4K clip measures 1 024 px and renders 8.2 Mpx.
-    #[test]
-    fn descriptor_declares_the_size_floor_this_gate_depends_on() {
-        assert_eq!(
-            descriptor().capabilities.size_floor,
-            SizeFloor::RangeCheckedOnGrid {
-                multiple: DIM_ALIGN
-            }
-        );
-        let sentinel = GenerationRequest {
+    fn unloaded() -> Scail2 {
+        Scail2 {
+            descriptor: descriptor(),
+            config: Scail2Config::default(),
+            root: PathBuf::from("/nonexistent-scail2-snapshot"),
+            device: Device::Cpu,
+            adapters: Vec::new(),
+            components: Mutex::new(None),
+        }
+    }
+
+    fn img(width: u32, height: u32) -> Image {
+        Image {
+            width,
+            height,
+            pixels: Vec::new(),
+        }
+    }
+
+    fn auto_sized(width: u32, height: u32) -> GenerationRequest {
+        GenerationRequest {
             prompt: "a character".into(),
             width: 0,
             height: 0,
+            count: 1,
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(64, 64),
+                    strength: None,
+                },
+                Conditioning::Mask { image: img(64, 64) },
+                Conditioning::ControlClip {
+                    frames: vec![img(width, height)],
+                    mask: vec![img(width, height)],
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: Default::default(),
+                },
+            ],
             ..Default::default()
-        };
-        // The area gate itself passes the sentinel (32×32 once aligned) — the floor is what stops it.
-        assert!(reject_over_area(MODEL_ID, &sentinel).is_ok());
+        }
+    }
+
+    #[test]
+    fn sentinel_is_advertised_without_weakening_explicit_size_validation() {
+        let caps = descriptor().capabilities;
         assert!(
-            descriptor()
-                .capabilities
-                .validate_request(MODEL_ID, &sentinel)
-                .is_err(),
-            "the capability floor must refuse 0×0, or the area gate is measuring the wrong geometry"
+            caps.validate_request(MODEL_ID, &auto_sized(832, 480))
+                .is_ok(),
+            "0×0 must advertise the resolve-from-driving-video convention"
+        );
+        for (width, height) in [(0, 512), (512, 0), (1280, 730)] {
+            let req = GenerationRequest {
+                width,
+                height,
+                count: 1,
+                ..Default::default()
+            };
+            assert!(
+                caps.validate_request(MODEL_ID, &req).is_err(),
+                "{width}×{height} is not the sentinel or an explicit on-grid size"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_size_bounds_the_resolved_geometry_in_preflight_and_render() {
+        let m = unloaded();
+
+        Generator::validate(&m, &auto_sized(832, 480))
+            .expect("an in-envelope driving clip must clear preflight");
+
+        for (width, height, suggestion, reason) in [
+            (3840, 2160, "1280×704", "outside the edge bounds"),
+            (
+                1280,
+                1280,
+                "960×960",
+                "inside the edge bounds but over the area cap",
+            ),
+        ] {
+            let over = auto_sized(width, height);
+            let preflight = Generator::validate(&m, &over)
+                .expect_err("unsafe resolved geometry must fail before model loading")
+                .to_string();
+            assert!(
+                preflight.contains("advertised size envelope")
+                    && preflight.contains(&format!("{width}×{height}"))
+                    && preflight.contains("resolved from the driving video")
+                    && preflight.contains(suggestion),
+                "the preflight refusal must name the unsafe resolved geometry and a usable \
+                 alternative ({reason}): {preflight}"
+            );
+
+            let rendered = m
+                .run(&over, &mut |_| {})
+                .expect_err("the render path must independently bound resolved geometry")
+                .to_string();
+            assert!(
+                rendered.contains("advertised size envelope")
+                    && rendered.contains(&format!("{width}×{height}")),
+                "the render refusal must come from the resolved-geometry gate ({reason}): \
+                 {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_size_projects_source_media_onto_the_render_lattice() {
+        let req = auto_sized(640, 360);
+        let first = req
+            .control_clip()
+            .and_then(|clip| clip.frames.first())
+            .expect("fixture has a driving frame");
+        assert_eq!(
+            resolve_render_size(&descriptor().capabilities, &req, first)
+                .expect("640×360 is inside the advertised envelope"),
+            (640, 352)
         );
     }
 

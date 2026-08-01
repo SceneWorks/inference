@@ -85,6 +85,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
             // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
@@ -356,7 +357,8 @@ impl Ideogram4 {
                 text.encode(&ids)
             },
             // Materialize the Qwen3-VL embeds while the encoder is still alive (Sequential only).
-            |te_out: &Array| {
+            |te_out: Option<&Array>| {
+                let Some(te_out) = te_out else { return Ok(()) };
                 mlx_rs::transforms::eval([te_out])?;
                 Ok(())
             },

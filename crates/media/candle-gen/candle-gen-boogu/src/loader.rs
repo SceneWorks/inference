@@ -331,6 +331,28 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mixed_q4_component_infers_a_q8_projection_from_its_shapes() -> Result<()> {
+        let dev = Device::Cpu;
+        let dense = Tensor::randn(0f32, 1f32, (64usize, 128usize), &dev)?;
+        let (wq, scales, biases) = candle_gen::quant::pack_mlx_affine(&dense, 8, G)?;
+        let mut map = HashMap::new();
+        map.insert("layers.0.q_proj.weight".into(), wq);
+        map.insert("layers.0.q_proj.scales".into(), scales);
+        map.insert("layers.0.q_proj.biases".into(), biases);
+
+        let dir = std::env::temp_dir().join(format!("sc16025_mixed_width_{}", std::process::id()));
+        // The component marker remains q4 even though this floor-target projection is q8.
+        write_component(&dir, map, true);
+        let weights = Weights::from_dir(&dir, &dev, DType::F32)?;
+        assert_eq!(weights.packed().map(|cfg| cfg.bits), Some(4));
+        let mut projection = linear_detect(&weights, "layers.0.q_proj", false)?;
+        projection.quantize_dequant_onto(candle_gen::gen_core::Quant::Q8, &dev)?;
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
     /// **The vision-tower dense guard errors loudly on a stray `.scales` (sc-9410, Issue 1 branch c).**
     /// The Qwen3-VL vision tower is bf16 in every hosted boogu tier, so it loads dense via
     /// `linear_guard_dense`. But it shares the packed `mllm/` config with the packed TE, so if a future

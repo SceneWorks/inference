@@ -78,10 +78,7 @@ use candle_gen::gen_core::{
     LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress, Quant, SizeFloor,
     WeightsSource,
 };
-use candle_gen::{
-    check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
-    Result as CResult,
-};
+use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
@@ -582,9 +579,8 @@ pub struct WanGenerator {
     /// LoRA/LoKr adapters applied to the DiT at first load (sc-10095) — folded (dense) or additive
     /// (packed q4/q8 tier).
     adapters: Vec<AdapterSpec>,
-    /// Component-residency policy (epic 12732, sc-12757), resolved once at load via
-    /// [`effective_offload_policy`] (honoring both `LoadSpec::offload_policy` and the family-wide
-    /// `CANDLE_GEN_OFFLOAD=sequential` A/B override). [`OffloadPolicy::Resident`] keeps the cached
+    /// Video component-residency policy (epic 12732, sc-12757), copied from `LoadSpec` at load.
+    /// [`OffloadPolicy::Resident`] keeps the cached
     /// [`Components`] warm; [`OffloadPolicy::Sequential`] drives the staged
     /// [`Pipeline::render_sequential`] (TE-offload + DiT-drop-before-VAE), bounding the denoise peak by
     /// keeping the ~11 GB bf16 UMT5 encoder (sc-12778) off-GPU. The resident [`components`](Self::components) cache
@@ -724,6 +720,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged
@@ -781,9 +778,8 @@ fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
         ));
     }
     let device = candle_gen::default_device()?;
-    // Resolve the residency policy once (sc-12757): honors both `spec.offload_policy` and the
-    // family-wide `CANDLE_GEN_OFFLOAD=sequential` A/B override.
-    let offload = effective_offload_policy(spec.offload_policy);
+    // Video retains the explicit load-time policy contract (sc-12757).
+    let offload = spec.offload_policy;
     Ok(WanGenerator {
         descriptor: descriptor(),
         root,
@@ -1201,8 +1197,7 @@ mod tests {
         );
     }
 
-    /// The load path resolves the residency policy from `LoadSpec::offload_policy` via
-    /// [`effective_offload_policy`]: the default spec stays `Resident` (cached-components, unchanged
+    /// The load path copies the residency policy from `LoadSpec::offload_policy`: the default spec stays `Resident` (cached-components, unchanged
     /// path), an explicit `Sequential` spec flips the generator onto the staged `render_sequential`.
     #[test]
     fn load_resolves_offload_policy_from_spec() {

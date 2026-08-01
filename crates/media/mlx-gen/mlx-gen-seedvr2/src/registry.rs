@@ -69,6 +69,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_count: 8,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5198)
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.

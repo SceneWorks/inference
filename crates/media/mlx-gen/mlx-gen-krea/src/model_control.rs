@@ -338,7 +338,8 @@ impl KreaTurboControl {
                 Ok(context)
             },
             // Materialize the context while the text phase is still alive (Sequential only).
-            |ctx: &Array| {
+            |ctx: Option<&Array>| {
+                let Some(ctx) = ctx else { return Ok(()) };
                 mlx_rs::transforms::eval([ctx])?;
                 Ok(())
             },
@@ -392,6 +393,7 @@ impl KreaTurboControl {
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
+                        transformer_window_size: None,
                     };
                     let img = heavy.heavy.render_control_from(
                         &plan,
@@ -469,6 +471,7 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
         contract: |spec| {
             crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, spec)
         },
+        safety_check: crate::memory_strategy::registered_safety_check,
     };
 
 #[cfg(test)]

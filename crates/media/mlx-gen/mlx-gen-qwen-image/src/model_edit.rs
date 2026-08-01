@@ -35,8 +35,8 @@ use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, qwen_schedulers,
-    resolve_run_params, PID_BACKBONE,
+    create_noise, decode_and_collect, denoise_edit_with_progress_windowed, qwen_samplers,
+    qwen_schedulers, resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
@@ -82,6 +82,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 8,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
@@ -117,6 +118,9 @@ pub struct QwenImageEdit {
     /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
     /// the error-safe cache flush.
     residency: Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>,
+    memory_strategy: gen_core::MemoryProviderContract,
+    precision: Precision,
+    quant: Option<Quant>,
 }
 
 /// The heavy render-phase components (the edit MMDiT transformer, the VAE, and the optional PiD
@@ -182,6 +186,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         tokenizer,
         processor: QwenImageProcessor::default(),
         residency: build_residency(spec)?,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        precision: spec.precision,
+        quant: spec.quantize,
     }))
 }
 
@@ -243,6 +250,10 @@ fn load_vl_encoder_only(root: &Path) -> Result<QwenVisionLanguageEncoder> {
 fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHeavyOwned> {
     // Edit-2511 transformer (zero_cond_t on): clean-timestep modulation for the conditioning tokens.
     let mut transformer = loader::load_transformer_edit(root)?;
+    if crate::memory_strategy::is_streamable_spec(spec) {
+        transformer =
+            transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
+    }
     if let Some(q) = spec.quantize {
         // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
         // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
@@ -255,6 +266,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHe
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
+    transformer.capture_block_adapters();
     // Optional PiD overlay, loaded only when the spec carries it AND this generate uses it (`load_pid`,
     // F-177) — Resident passes `true`, Sequential passes `req.use_pid` so a non-PiD generate skips the
     // student + its Gemma-2 caption encoder entirely.
@@ -350,6 +362,35 @@ impl Generator for QwenImageEdit {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
 }
 
 impl QwenImageEdit {
@@ -362,12 +403,20 @@ impl QwenImageEdit {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let block_window = crate::memory_strategy::resolve_window_size(req, &self.memory_strategy)?;
+        let attention_budget = crate::pipeline::attention_budget(req);
+        let decode_tiling = crate::pipeline::decode_tiling(req);
 
         // Shared step/sampler/guidance/seed resolution (F-117): `req.sampler == "lightning"` selects
         // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
         // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
         let params = resolve_run_params(req, out_w, out_h);
+        crate::pipeline::calibration_fault(
+            req,
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            MODEL_ID,
+        )?;
 
         // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
         // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
@@ -382,7 +431,10 @@ impl QwenImageEdit {
             // Materialize pos (+neg) while the VL encoder is still alive (Sequential only) — this forces
             // the vision-tower AND LM forwards, else the outputs keep the encoder referenced and the
             // drop would free nothing.
-            |(pos, neg)| {
+            |encoded| {
+                let Some((pos, neg)) = encoded else {
+                    return Ok(());
+                };
                 match neg {
                     Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
                     None => mlx_rs::transforms::eval([pos])?,
@@ -394,7 +446,6 @@ impl QwenImageEdit {
             |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
-
                 let references = reference_images(req);
                 let last = *references.last().expect("validated non-empty");
 
@@ -440,13 +491,15 @@ impl QwenImageEdit {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let decoder: &dyn LatentDecoder = match &pid_decoder {
-                    Some(d) => d,
-                    None => heavy.vae,
-                };
                 let denoise_sigmas = &params.sigmas[..keep];
                 let images = decode_and_collect(
-                    decoder,
+                    heavy.vae,
+                    pid_decoder
+                        .as_ref()
+                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    decode_tiling.as_ref(),
+                    req,
+                    MODEL_ID,
                     req.count,
                     params.base_seed,
                     out_w,
@@ -454,7 +507,7 @@ impl QwenImageEdit {
                     on_progress,
                     |seed, progress| {
                         let noise = create_noise(seed, out_w, out_h)?;
-                        denoise_edit_with_progress(
+                        let latents = denoise_edit_with_progress_windowed(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
                             denoise_sigmas,
@@ -467,10 +520,18 @@ impl QwenImageEdit {
                             params.guidance,
                             out_w,
                             out_h,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
                             &req.preview,
                             progress,
-                        )
+                        )?;
+                        crate::pipeline::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            MODEL_ID,
+                        )?;
+                        Ok(latents)
                     },
                 )?;
                 Ok(GenerationOutput::Images(images))
@@ -555,6 +616,13 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
 
 #[cfg(test)]
 mod tests {

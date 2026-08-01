@@ -105,8 +105,6 @@ pub use ref_backbone::FluxRefBackbone;
 mod ip_validate;
 
 use candle_gen::candle_core::DType;
-#[cfg(all(test, feature = "cuda"))]
-use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, SizeFloor, WeightsSource,
@@ -234,14 +232,21 @@ impl Generator for FluxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let images = self.residency.run(
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
-            self.pipe.device(),
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_residency(text, &req.prompt),
+            |_| Ok(self.pipe.device().synchronize()?),
             |heavy, encoded, on_progress| {
-                self.pipe.render_residency(req, heavy, encoded, on_progress)
+                let result = self.pipe.render_residency(req, heavy, encoded, on_progress);
+                candle_gen::synchronize_result(self.pipe.device(), result)
             },
         )?;
         Ok(GenerationOutput::Images(images))
@@ -287,6 +292,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
             mac_only: false,
             supported_quants: &[],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
@@ -352,21 +358,19 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
     let pipe = Pipeline::load(variant, &root, &device, DType::BF16, spec.pid.clone());
-    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
-    let residency = candle_gen::Residency::from_policy_with_resident(
-        policy,
-        move || {
+    let residency = candle_gen::Residency::request_scoped_with_resident(
+        move |_| {
             Ok((
                 resident_pipe.load_text_residency()?,
                 resident_pipe.load_heavy_residency(true)?,
             ))
         },
-        move || text_pipe.load_text_residency(),
-        move |use_pid| heavy_pipe.load_heavy_residency(use_pid),
-    )?;
+        move |_| text_pipe.load_text_residency(),
+        move |use_pid, _| heavy_pipe.load_heavy_residency(use_pid),
+    );
     Ok(Box::new(FluxGenerator {
         variant,
         descriptor: descriptor_for(variant),
@@ -618,7 +622,7 @@ mod tests {
     }
 
     /// Shared real-weight sequential-residency A/B body for FLUX.1 dev and schnell (sc-12138). Runs ONE
-    /// probed generation whose mode is the `CANDLE_GEN_OFFLOAD` env the generator reads, writes raw RGB
+    /// probed generation whose mode is carried by `GenerationMemory::stage_residency`, writes raw RGB
     /// pixels to `FLUX_OUT`, and prints the device peak. Run it TWICE in SEPARATE processes (resident vs
     /// sequential): pixels must be byte-identical and the sequential peak materially lower because the
     /// ~9 GB T5-XXL drops before the DiT loads. Separate processes are required because candle's cudarc
@@ -634,15 +638,9 @@ mod tests {
             panic!("set {dir_env} to a real-file (hardlink-staged) {label} snapshot")
         });
         let out = std::env::var("FLUX_OUT").expect("set FLUX_OUT to the pixel-dump path");
-        // Two ways to select sequential residency, both exercised by the A/B runner:
-        //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769), OR
-        //   - `FLUX_OFFLOAD_MODE=spec-sequential` → drive it through `LoadSpec::offload_policy`
-        //     (the worker-facing contract, sc-10821), with CANDLE_GEN_OFFLOAD UNSET.
-        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
-        let spec_mode = std::env::var("FLUX_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-        }
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        let stage_residency =
+            std::env::var("FLUX_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
@@ -650,6 +648,10 @@ mod tests {
             steps: Some(steps),
             seed: Some(42),
             count: 1,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
@@ -666,11 +668,8 @@ mod tests {
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
+        let mode = if stage_residency {
+            "request-staged"
         } else {
             "resident"
         };

@@ -16,10 +16,12 @@
 //! Edit, requiring the matching distillation LoRA via `spec.adapters`.
 
 pub mod adapters;
+mod block_stream;
 pub mod control_transformer;
 pub mod convert;
 pub mod image_processor;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod model_edit;
@@ -57,14 +59,29 @@ pub use vl_tokenizer::{
     EditInputs,
 };
 
+/// sc-16195 Apple-Silicon warm sweep: base Qwen-Image q8 peaked at 7.661 GiB at 1024².
+/// Rounded upward to 7.67 GiB and applies across weight tiers because activations stay bf16.
+/// Control/Edit are distinct unmeasured routes.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 8_235_599_791,
+        },
+    };
+
 /// Add all MLX Qwen-Image generators to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_control::REGISTRATION)
         .register_generator(model_edit::REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_edit::MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Qwen-Image provider catalog.
@@ -86,5 +103,26 @@ mod explicit_registry_tests {
             explicit,
             ["qwen_image", "qwen_image_control", "qwen_image_edit"]
         );
+    }
+
+    #[test]
+    fn every_variant_resolves_its_memory_strategy_contract() {
+        use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/qwen".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        for id in ["qwen_image", "qwen_image_control", "qwen_image_edit"] {
+            let contract = registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must register a memory-strategy contract"));
+            assert_eq!(contract.provider_id, id);
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                super::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+            );
+        }
     }
 }

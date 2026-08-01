@@ -104,6 +104,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // dequant-dense forward (CPU-capable — NOT the CUDA-only int8 fast GEMM); conditioner /
             // Qwen3 TE / VAE stay dense bf16. A pre-packed tier is a real, loadable snapshot.
             supported_quants: ANIMA_QUANTS,
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: false,

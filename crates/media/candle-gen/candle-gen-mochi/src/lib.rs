@@ -114,6 +114,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: false,
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6) — NOT on-the-fly requant.
             supported_quants: &[] as &[Quant],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,

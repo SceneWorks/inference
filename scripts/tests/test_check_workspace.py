@@ -111,6 +111,17 @@ class RustCommentStrippingTests(unittest.TestCase):
         source = "a();\n// comment\nb();\n"
         self.assertEqual(len(self.strip(source).splitlines()), len(source.splitlines()))
 
+    def test_optional_literal_blanking_preserves_real_calls_and_line_positions(self) -> None:
+        source = (
+            'const A: &str = "DecodeRoutes::new(x, y, z)";\n'
+            'const B: &str = r#"routes.validate(true, e, o)"#;\n'
+            "DecodeRoutes::new(a, b, c)\n"
+        )
+        stripped = self.gate.strip_rust_comments(source, strip_literals=True)
+        self.assertNotIn("routes.validate", stripped)
+        self.assertEqual(stripped.count("DecodeRoutes::new"), 1)
+        self.assertEqual(len(stripped.splitlines()), len(source.splitlines()))
+
 
 class PidDecodeRouteAdoptionTests(unittest.TestCase):
     """sc-15775: a PiD-eligible provider that adopts bounded decode must construct its native ladder
@@ -248,6 +259,108 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                     because="never calls the checked constructor",
                 )
 
+    def test_markers_inside_string_literals_do_not_satisfy_the_gate(self) -> None:
+        body = self.ADOPTER_WITHOUT_ROUTES + """
+            const FAKE: &str = r#"
+                DecodeRoutes::new(id, EDGES, OVERLAP);
+                decode_routes(id)?.validate(use_pid, edge, overlap);
+            "#;
+        """
+        self.assert_gate_fails(body, because="never calls the checked constructor")
+
+    def test_markers_confined_to_cfg_test_items_do_not_satisfy_the_gate(self) -> None:
+        fixtures = {
+            "module": """
+                #[cfg(test)]
+                mod tests {
+                    fn only_in_tests() {
+                        let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                        routes.validate(true, Some(2048), Some(256)).unwrap();
+                    }
+                }
+            """,
+            "function": """
+                #[cfg(test)]
+                /// Test-only evidence; this semicolon must not terminate the cfg item span.
+                fn fake_adoption() {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                }
+            """,
+            "composite all": """
+                #[cfg(all(feature = "fixture", test))]
+                fn feature_test_adoption() {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                }
+            """,
+            "const generic in function header": """
+                struct Foo<const N: usize>;
+                #[cfg(test)]
+                fn const_generic_test_adoption() -> Foo<{ 1 }> {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                    loop {}
+                }
+            """,
+            "const initializer branches": """
+                #[cfg(test)]
+                const FAKE: () = if true {
+                } else {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                };
+            """,
+        }
+        for label, fixture in fixtures.items():
+            with self.subTest(label=label):
+                self.assert_gate_fails(
+                    self.ADOPTER_WITHOUT_ROUTES + fixture,
+                    because="never calls the checked constructor",
+                )
+
+    def test_inner_cfg_test_file_cannot_supply_evidence(self) -> None:
+        body = "#![cfg(test)]\n" + self.ADOPTER_WITHOUT_ROUTES + self.CONSTRUCTS + self.ADMITS
+        self.assert_gate_fails(body, because="never calls the checked constructor")
+
+    def test_cfg_field_parser_overblanking_cannot_disarm_production_triggers(self) -> None:
+        body = """
+            struct Fields {
+                #[cfg(test)]
+                fixture_only: u8,
+            }
+        """ + self.ADOPTER_WITHOUT_ROUTES
+        self.assert_gate_fails(body, because="never calls the checked constructor")
+
+    def test_cfg_any_test_item_is_retained_when_a_production_feature_can_enable_it(self) -> None:
+        body = self.ADOPTER_WITHOUT_ROUTES + """
+            #[cfg(any(test, feature = "shipping"))]
+            fn production_adoption() {
+                let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                routes.validate(true, Some(2048), Some(256)).unwrap();
+            }
+        """
+        self.write_provider(body)
+        self.run_gate()
+
+    def test_fake_cfg_attributes_in_comments_and_strings_cannot_disarm_the_gate(self) -> None:
+        fixtures = {
+            "line comment": "// #[cfg(test)] fn fake() {",
+            "block comment": "/* #[cfg(test)] fn fake() { */",
+            "string": 'const FAKE_CFG: &str = "#[cfg(test)] fn fake() {";',
+            "raw string": 'const RAW_FAKE_CFG: &str = r#"#[cfg(test)] fn fake() {"#;',
+        }
+        for label, fake_attribute in fixtures.items():
+            with self.subTest(label=label):
+                self.write_provider(
+                    fake_attribute
+                    + "\n"
+                    + self.ADOPTER_WITHOUT_ROUTES
+                    + self.CONSTRUCTS
+                    + self.ADMITS
+                )
+                self.run_gate()
+
     def test_ranges_built_through_a_shared_helper_still_trigger_the_gate(self) -> None:
         """Review defeat (c): with only `decode_tile_edges` in the trigger set, an adopter whose
         `MemoryParameterRanges` came from a shared helper never armed the gate at all. The executable
@@ -282,6 +395,27 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                 self.write_provider(body)
                 self.run_gate(depends_on_pid=depends_on_pid)
 
+    def test_required_configure_decode_hook_that_only_rejects_is_not_rung_two_adoption(self) -> None:
+        """A rung-4-only adopter must implement the trait method, but cannot emit a tile."""
+        self.write_provider(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "impl MemoryRequestScope for Scope {\n"
+            "  fn configure_decode(&mut self, _e: u32, _o: u32, _g: MemoryGeometry) "
+            "-> CoreResult<()> { Err(CoreError::Unsupported(\"not implemented\".into())) }\n"
+            "}\n"
+        )
+        self.run_gate()
+
+    def test_rejection_followed_by_reachable_code_is_still_rung_two_adoption(self) -> None:
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "impl MemoryRequestScope for Scope {\n"
+            "  fn configure_decode(&mut self, _e: u32, _o: u32, _g: MemoryGeometry) "
+            "-> CoreResult<()> { Err(CoreError::Unsupported(\"no\".into())); bounded_decode_call() }\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
     def test_a_commented_out_registration_does_not_arm_the_gate(self) -> None:
         """Comments are stripped before the TRIGGER too, not only before the evidence."""
         self.write_provider(
@@ -309,3 +443,108 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SnapshotPathDerivationTests(unittest.TestCase):
+    """`check_snapshot_path_derivation` must separate a `$HOME` *derivation* from a `$HOME`
+    *fallback*, because a naive grep for `env::var("HOME")` cannot: 102 files matched that grep when
+    the gate was written and only 15 carried the defect."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def check(self, source: str):
+        """Run the gate over a temp tree containing exactly `source`, returning the failure or None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "crate" / "tests").mkdir(parents=True)
+            (root / "crate" / "tests" / "real_weights.rs").write_text(source, encoding="utf-8")
+            try:
+                self.gate.check_snapshot_path_derivation(root)
+            except AssertionError as error:
+                return str(error)
+            return None
+
+    def test_a_derived_snapshot_path_with_no_override_fails(self) -> None:
+        failure = self.check(
+            'fn snapshot() -> PathBuf {\n'
+            '    PathBuf::from(std::env::var("HOME").unwrap())\n'
+            '        .join(".cache/mlx-gen-models/bernini_full_mlx_bf16")\n'
+            '}\n'
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("real_weights.rs:1", failure)
+
+    def test_an_override_with_a_home_fallback_passes(self) -> None:
+        self.assertIsNone(
+            self.check(
+                'fn converted_root() -> PathBuf {\n'
+                '    std::env::var("MLX_GEN_CONVERTED_ROOT")\n'
+                '        .map(PathBuf::from)\n'
+                '        .unwrap_or_else(|_| {\n'
+                '            PathBuf::from(std::env::var("HOME").expect("HOME"))\n'
+                '                .join(".cache/mlx-gen-models")\n'
+                '        })\n'
+                '}\n'
+            )
+        )
+
+    def test_a_bare_home_accessor_is_not_the_defect(self) -> None:
+        """The `mlx-gen-scail2` / `mlx-gen-krea-realtime` shape: the helper joins nothing, and its
+        callers wrap it in an override. Flagging it would make the gate wrong on 4 live files."""
+        self.assertIsNone(
+            self.check(
+                'fn home() -> PathBuf {\n'
+                '    PathBuf::from(std::env::var("HOME").unwrap())\n'
+                '}\n'
+                'fn snapshot_dir() -> PathBuf {\n'
+                '    std::env::var("SCAIL2_SNAPSHOT_DIR")\n'
+                '        .map(PathBuf::from)\n'
+                '        .unwrap_or_else(|_| home().join(".cache/scail2-mlx-convert"))\n'
+                '}\n'
+            )
+        )
+
+    def test_a_tilde_expander_is_not_the_defect(self) -> None:
+        """The `mlx-gen-wan` shape: `$HOME` expands a `~/` prefix on a value that already came from
+        an override, so the override is upstream of the read rather than absent."""
+        self.assertIsNone(
+            self.check(
+                'fn env_path(var: &str) -> Option<PathBuf> {\n'
+                '    std::env::var_os(var).map(|s| {\n'
+                '        let s = s.to_string_lossy();\n'
+                '        if let Some(rest) = s.strip_prefix("~/") {\n'
+                '            if let Some(home) = std::env::var_os("HOME") {\n'
+                '                return PathBuf::from(format!("{}/{rest}", home.to_string_lossy()));\n'
+                '            }\n'
+                '        }\n'
+                '        PathBuf::from(s.to_string())\n'
+                '    })\n'
+                '}\n'
+            )
+        )
+
+    def test_an_override_named_by_a_computed_string_still_counts(self) -> None:
+        """The `mlx-gen-mochi` shape: `env::var(format!("MOCHI_Q{bits}_DIR"))`. The override is real
+        even though no literal variable name appears, which is why the gate tests for *any* non-HOME
+        env read rather than for a name."""
+        self.assertIsNone(
+            self.check(
+                'fn tier_dir(bits: u32) -> PathBuf {\n'
+                '    if let Ok(d) = std::env::var(format!("MOCHI_Q{bits}_DIR")) {\n'
+                '        return PathBuf::from(d);\n'
+                '    }\n'
+                '    PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/mochi-tiers")\n'
+                '}\n'
+            )
+        )
+
+    def test_a_commented_out_override_does_not_disarm_the_gate(self) -> None:
+        self.assertIsNotNone(
+            self.check(
+                'fn snapshot() -> PathBuf {\n'
+                '    // std::env::var("SOME_OVERRIDE")\n'
+                '    PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/models/x")\n'
+                '}\n'
+            )
+        )

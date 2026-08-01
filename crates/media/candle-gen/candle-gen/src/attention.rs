@@ -48,8 +48,9 @@
 //! both backends and the epic's per-backend calibration evidence is comparable rather than two
 //! coincidentally-equal literals.
 //!
-//! The public `sdpa_budgeted_*` signatures still take a plain `budget: usize`, so the ~20 consumer
-//! crates need no edits — only `query_block`'s body moved.
+//! The original `sdpa_budgeted_*` signatures still take a plain `budget: usize`, so the ~20 consumer
+//! crates that do not select rung 3 need no edits. The plan-carrying `sdpa_planned_*` entry points add
+//! request-scoped between-chunk cancellation without imposing it on unbounded or training paths.
 //!
 //! The kernels must NOT merge, and that is measured rather than assumed: candle's `attention_basic`
 //! **materializes** `[B,H,Sq,Sk]`, so bounding it is worth **−32%** on the Z-Image denoise phase
@@ -57,28 +58,14 @@
 //! worth **−1.7%** on its denoise phase (SC-15615). One planner, two kernels roughly an order of
 //! magnitude apart in value; neither magnitude may be inferred from the other.
 //!
-//! ## Why this module does not take [`gen_core::attention_budget::AttentionPlan`]
+//! ## Request-scoped cancellation (SC-16007)
 //!
 //! gen-core pairs the budget with a cancel flag in `AttentionPlan` because a bounded call splits one
 //! previously atomic kernel launch into N, and those boundaries are the only place a cancel can land
-//! *inside* a transformer forward. That shape is deliberately **not** carried across here yet, for
-//! reasons that are candle's own rather than inherited from the MLX twin:
-//!
-//! - **Candle's cancellation lands outside the forward, at three sites that already exist.** Per denoise
-//!   step in [`crate::sampler`] (`run_flow_sampler` and the DPM/ancestral run loops each test
-//!   `cancel.is_cancelled()` before the model eval), per decode tile through [`crate::check_cancel`]
-//!   inside the [`crate::vae_tiling`] callback, and per load phase in [`crate::residency`]. All three
-//!   raise [`crate::CandleError::Canceled`], which the `From` bridge lifts to `gen_core::Error::Canceled`
-//!   — a *cancelled* job, not a failed one (sc-4481).
-//! - **A between-chunk check would be a genuine granularity gain, and it is a behaviour change.**
-//!   Candle's DiT forward carries no cancel check today (`candle-gen-z-image/src/packed_dit.rs` has
-//!   none), so on a 4-step Z-Image-Turbo render the finest in-denoise granularity is one whole step.
-//!   Adding one is worth doing, but it means threading a plan through `sdpa_budgeted_*` and every
-//!   provider's `forward_with_attention_budget` (~39 call sites across ~20 crates), whereas this
-//!   refactor is behaviour-preserving by construction. Tracked as **SC-16007**, not folded in here.
-//!
-//! [`AttentionBudget`] and [`CONSTRAINED_ATTN_SCORES_BUDGET`] are re-exported below because they *are*
-//! the shared planner; `AttentionPlan` is not, because nothing on this backend consumes it yet.
+//! *inside* a transformer forward. [`sdpa_planned_bhsd`] and [`sdpa_planned_flat`] check that flag
+//! before each bounded chunk and return the typed [`crate::CandleError::Canceled`]. The unbounded fast
+//! path performs the original single kernel launch and never consults the flag. Raw-budget overloads
+//! attach no flag, preserving the old behavior for correctness guards and training code.
 
 use candle_core::{Result, Tensor, D};
 
@@ -90,7 +77,9 @@ use candle_core::{Result, Tensor, D};
 /// independently on both backends. It is not a contract-wide constant: candle's Krea lane measured and
 /// publishes 128 Mi (`candle_gen_krea::pipeline::CONSTRAINED_ATTN_SCORES_BUDGET`), and the
 /// i32-overflow guard below runs the same planner at 1e9. What is shared is the planner, not the number.
-pub use gen_core::attention_budget::{AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET};
+pub use gen_core::attention_budget::{
+    AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
+};
 
 /// Max elements in a single attention scores tensor before the query rows are chunked. candle CUDA
 /// kernels index elements with **i32**, so a scores/probs tensor exceeding `i32::MAX` (~2.147e9)
@@ -114,6 +103,7 @@ pub const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
 /// `the_delegation_reproduces_the_sc9116_guard_arithmetic` pins that the delegation is boundary-for-
 /// boundary what this crate computed before the hoist, and
 /// `candle_chunk_boundaries_match_the_shared_cross_backend_table` pins it against the shared table.
+#[cfg(test)]
 fn query_block(rows_per_query: usize, sq: usize, budget: usize) -> usize {
     // `usize::MAX` is this crate's un-chunked sentinel (the trainers and every unbounded call site pass
     // it). Map it to the planner's own `u64::MAX` sentinel explicitly rather than via `as`, which would
@@ -126,6 +116,15 @@ fn query_block(rows_per_query: usize, sq: usize, budget: usize) -> usize {
     // The result is bounded above by `sq`, which came from a `usize`, so the narrowing is exact.
     AttentionBudget::from_score_elements(budget, false)
         .query_block_rows(rows_per_query as u64, sq as u64) as usize
+}
+
+fn budget_from_usize(budget: usize) -> AttentionBudget {
+    let budget = if budget == usize::MAX {
+        u64::MAX
+    } else {
+        budget as u64
+    };
+    AttentionBudget::from_score_elements(budget, false)
 }
 
 /// i32-overflow-safe SDPA over the 4-D shape `q,k,v: [B, H, Sq, D]` (k/v key length `Sk` may differ
@@ -156,13 +155,60 @@ pub fn sdpa_budgeted_bhsd(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
+    sdpa_bhsd_impl(
+        q,
+        k,
+        v,
+        scale,
+        mask,
+        softmax,
+        budget_from_usize(budget),
+        || Ok::<(), candle_core::Error>(()),
+    )
+}
+
+/// Request-scoped variant of [`sdpa_budgeted_bhsd`]. A bounded plan checks its cancel flag before
+/// every chunk launch and returns [`crate::CandleError::Canceled`] when tripped. An unbounded plan is
+/// exactly the historical one-call fast path and does not inspect the flag.
+pub fn sdpa_planned_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    sdpa_bhsd_impl(q, k, v, scale, mask, softmax, plan.budget, || {
+        if plan.is_cancelled() {
+            Err(crate::CandleError::Canceled)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sdpa_bhsd_impl<E>(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    budget: AttentionBudget,
+    mut before_chunk: impl FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<Tensor, E>
+where
+    E: From<candle_core::Error>,
+{
     let (b, h, sq, _d) = q.dims4()?;
     let sk = k.dim(2)?;
     let q = q.contiguous()?;
     let k_t = k.transpose(2, 3)?.contiguous()?;
     let v = v.contiguous()?;
 
-    let block = query_block(b * h * sk, sq, budget);
+    let block = budget.query_block_rows((b * h * sk) as u64, sq as u64) as usize;
     if block >= sq {
         record_chunk_count(1);
         let mut scores = (q.matmul(&k_t)? * scale)?;
@@ -170,12 +216,13 @@ pub fn sdpa_budgeted_bhsd(
             scores = scores.broadcast_add(m)?;
         }
         let probs = softmax(&scores)?;
-        return probs.matmul(&v);
+        return Ok(probs.matmul(&v)?);
     }
 
     let mut blocks = Vec::new();
     let mut start = 0;
     while start < sq {
+        before_chunk()?;
         let len = block.min(sq - start);
         let mut scores = (q.narrow(2, start, len)?.matmul(&k_t)? * scale)?;
         if let Some(m) = mask {
@@ -193,7 +240,7 @@ pub fn sdpa_budgeted_bhsd(
         start += len;
     }
     record_chunk_count(blocks.len());
-    Tensor::cat(&blocks, 2) // [B,H,Sq,D]
+    Ok(Tensor::cat(&blocks, 2)?) // [B,H,Sq,D]
 }
 
 /// i32-overflow-safe SDPA over the 3-D shape `q,k,v: [N, Sq, D]`, returning `[N, Sq, D]`. `N` folds the
@@ -209,23 +256,60 @@ pub fn sdpa_budgeted_flat(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
+    sdpa_flat_impl(q, k, v, scale, softmax, budget_from_usize(budget), || {
+        Ok::<(), candle_core::Error>(())
+    })
+}
+
+/// Request-scoped variant of [`sdpa_budgeted_flat`], with the same typed between-chunk cancellation
+/// contract as [`sdpa_planned_bhsd`].
+pub fn sdpa_planned_flat(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    sdpa_flat_impl(q, k, v, scale, softmax, plan.budget, || {
+        if plan.is_cancelled() {
+            Err(crate::CandleError::Canceled)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn sdpa_flat_impl<E>(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    budget: AttentionBudget,
+    mut before_chunk: impl FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<Tensor, E>
+where
+    E: From<candle_core::Error>,
+{
     let (n, sq, _d) = q.dims3()?;
     let sk = k.dim(1)?;
     let q = q.contiguous()?;
     let k_t = k.transpose(D::Minus1, D::Minus2)?.contiguous()?;
     let v = v.contiguous()?;
 
-    let block = query_block(n * sk, sq, budget);
+    let block = budget.query_block_rows((n * sk) as u64, sq as u64) as usize;
     if block >= sq {
         record_chunk_count(1);
         let scores = (q.matmul(&k_t)? * scale)?;
         let probs = softmax(&scores)?;
-        return probs.matmul(&v);
+        return Ok(probs.matmul(&v)?);
     }
 
     let mut blocks = Vec::new();
     let mut start = 0;
     while start < sq {
+        before_chunk()?;
         let len = block.min(sq - start);
         let scores = (q.narrow(1, start, len)?.matmul(&k_t)? * scale)?;
         let probs = softmax(&scores)?;
@@ -233,7 +317,7 @@ pub fn sdpa_budgeted_flat(
         start += len;
     }
     record_chunk_count(blocks.len());
-    Tensor::cat(&blocks, 1) // [N,Sq,D]
+    Ok(Tensor::cat(&blocks, 1)?) // [N,Sq,D]
 }
 
 /// Test-only observation of how many chunks the last `sdpa_budgeted_*` call actually ran.
@@ -244,8 +328,8 @@ pub fn sdpa_budgeted_flat(
 /// rather than from the shared planner. Compiled out entirely in release; `RUST_TEST_THREADS=1` is
 /// forced repo-wide (`.cargo/config.toml`), so a process-global counter is safe. Mirrors
 /// `mlx_gen::attention`'s probe so the two backends' conformance tests read the same way.
-#[cfg(test)]
-mod chunk_probe {
+#[cfg(any(test, feature = "testkit"))]
+pub mod chunk_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -264,12 +348,12 @@ mod chunk_probe {
 #[cfg(test)]
 use chunk_probe::{last_chunk_count, reset as reset_chunk_count};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 fn record_chunk_count(n: usize) {
     chunk_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 #[inline(always)]
 fn record_chunk_count(_n: usize) {}
 
@@ -612,5 +696,71 @@ mod tests {
         let ragged = sdpa_budgeted_flat(&q, &k, &v, 0.5, sm, 63).unwrap();
         assert_chunks(3);
         approx_eq(&single, &ragged);
+    }
+
+    #[test]
+    fn a_cancel_stops_only_bounded_planned_calls_with_typed_error() {
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let budget = AttentionBudget::from_score_elements((b * h * s * 3) as u64, false);
+
+        let cancel = gen_core::CancelFlag::default();
+        cancel.cancel();
+        let error = sdpa_planned_bhsd(
+            &q,
+            &k,
+            &v,
+            0.5,
+            None,
+            softmax_last_dim,
+            AttentionPlan::budgeted(budget).with_cancel(&cancel),
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
+
+        let live = gen_core::CancelFlag::default();
+        let planned = sdpa_planned_bhsd(
+            &q,
+            &k,
+            &v,
+            0.5,
+            None,
+            softmax_last_dim,
+            AttentionPlan::budgeted(budget).with_cancel(&live),
+        )
+        .unwrap();
+        let legacy = sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            0.5,
+            None,
+            softmax_last_dim,
+            budget.max_score_elements() as usize,
+        )
+        .unwrap();
+        approx_eq(&planned, &legacy);
+
+        let unbounded = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+        assert!(sdpa_planned_bhsd(&q, &k, &v, 0.5, None, softmax_last_dim, unbounded).is_ok());
+
+        let q = q.reshape((b * h, s, d)).unwrap();
+        let k = k.reshape((b * h, s, d)).unwrap();
+        let v = v.reshape((b * h, s, d)).unwrap();
+        let error = sdpa_planned_flat(
+            &q,
+            &k,
+            &v,
+            0.5,
+            softmax_last_dim,
+            AttentionPlan::budgeted(budget).with_cancel(&cancel),
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::CandleError::Canceled));
     }
 }

@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
@@ -110,21 +111,46 @@ impl DiT {
         }
     }
 
-    pub(crate) fn forward_with_attention_budget(
+    #[cfg(test)]
+    pub(crate) fn forward_with_attention_plan(
         &self,
         x: &Tensor,
         t: &Tensor,
         cap_feats: &Tensor,
         cap_mask: &Tensor,
-        attention_scores_budget: usize,
-    ) -> candle_gen::candle_core::Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_with_memory(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            attention_plan,
+            crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW,
+        )
+    }
+
+    pub(crate) fn forward_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
         match self {
-            // The dense stock model has no explicit budget seam. Its resident behavior stays
-            // unchanged; every sequential tier is loaded through the vendored arm below.
-            Self::Dense(m) => m.forward(x, t, cap_feats, cap_mask),
-            Self::Packed(m) => {
-                m.forward_with_attention_budget(x, t, cap_feats, cap_mask, attention_scores_budget)
-            }
+            // The stock dense DiT has no bounded-attention seam. It remains the unchunked fast path,
+            // so a cancel flag attached to the plan is intentionally not consulted here.
+            Self::Dense(m) => Ok(m.forward(x, t, cap_feats, cap_mask)?),
+            Self::Packed(m) => m.forward_with_memory(
+                x,
+                t,
+                cap_feats,
+                cap_mask,
+                attention_plan,
+                transformer_window,
+            ),
         }
     }
 }
@@ -170,6 +196,14 @@ const Z_IMAGE_VAE_TILING: VaeTiling = VaeTiling {
 /// candle's `budget: usize` kernels take — gen-core owns the number.
 const CONSTRAINED_ATTN_SCORES_BUDGET: usize =
     candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as usize;
+
+fn request_attention_plan(req: &GenerationRequest, max_score_elements: usize) -> AttentionPlan<'_> {
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements as u64,
+        false,
+    ))
+    .with_cancel(&req.cancel)
+}
 
 fn check_decode_tile(cancel: &CancelFlag) -> Result<()> {
     candle_gen::check_cancel(cancel)
@@ -277,8 +311,8 @@ pub(crate) struct Components {
 /// but owning it here gives the phase one unambiguous lifetime and avoids a process cache silently
 /// retaining an encoder handle after its embeddings have been materialized.
 pub(crate) struct TextPhase {
-    text_encoder: TextEnc,
-    tokenizer: TextTokenizer,
+    pub(crate) text_encoder: TextEnc,
+    pub(crate) tokenizer: TextTokenizer,
 }
 
 /// Execute the three accelerator-residency phases with explicit scopes. Synchronization happens
@@ -397,7 +431,24 @@ impl Pipeline {
     /// Load only the DiT denoiser through the vendored implementation. Unlike the resident aggregate,
     /// the sequential ladder must use this path for both packed and dense tiers so its explicit
     /// attention-score budget is honored by bf16 as well as q4/q8.
-    pub(crate) fn load_transformer(&self, use_accelerated_attn: bool) -> Result<DiT> {
+    pub(crate) fn load_transformer(
+        &self,
+        use_accelerated_attn: bool,
+        stream_transformer_blocks: bool,
+    ) -> Result<DiT> {
+        self.load_transformer_cancelable(
+            use_accelerated_attn,
+            stream_transformer_blocks,
+            &CancelFlag::default(),
+        )
+    }
+
+    fn load_transformer_cancelable(
+        &self,
+        use_accelerated_attn: bool,
+        stream_transformer_blocks: bool,
+        cancel: &CancelFlag,
+    ) -> Result<DiT> {
         if self.comfyui.is_some() {
             return Err(CandleError::Msg(
                 "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
@@ -406,8 +457,52 @@ impl Pipeline {
         }
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let vb = self.component_vb("transformer")?;
-        let mut dit = PackedDit::new(&dit_cfg, vb)?;
+        if stream_transformer_blocks && !self.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "z-image transformer streaming does not yet support load-time adapters".into(),
+            ));
+        }
+        let packed = self.component_packed_config("transformer")?;
+        let (vb, sidecars) = if stream_transformer_blocks {
+            if let Some(packed) = packed {
+                use candle_gen::candle_core::safetensors::MmapedSafetensors;
+                use candle_gen::quant::PackedWeightSidecars;
+
+                let files = self.component_files("transformer")?;
+                // SAFETY: read-only mmap of the immutable component files. The same mapping backs
+                // the resident tensors and hashes the packed `layers.N` sources during preparation.
+                let source = unsafe { MmapedSafetensors::multi(&files)? };
+                let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
+                    &source,
+                    &self.root.join("transformer"),
+                    packed,
+                    &self.device,
+                    cancel,
+                    "layers.",
+                );
+                // The shared cache layer reports cancellation through candle-core because it is
+                // reusable below provider boundaries. Restore the provider's typed cancellation
+                // before `?` can erase it into a generic backend error.
+                if cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let sidecars = prepared?;
+                let vb =
+                    VarBuilder::from_backend(Box::new(source), self.dtype, self.device.clone());
+                (vb, Some(Arc::new(sidecars)))
+            } else {
+                (self.component_vb("transformer")?, None)
+            }
+        } else {
+            (self.component_vb("transformer")?, None)
+        };
+        let mut dit = if let Some(sidecars) = sidecars {
+            PackedDit::new_block_streamed_with_sidecars(&dit_cfg, vb, sidecars)?
+        } else if stream_transformer_blocks {
+            PackedDit::new_block_streamed(&dit_cfg, vb)?
+        } else {
+            PackedDit::new(&dit_cfg, vb)?
+        };
         if !self.adapters.is_empty() {
             crate::adapters::install_additive(&mut dit, &self.adapters)?;
         }
@@ -623,11 +718,20 @@ impl Pipeline {
     /// missing weights, no diagnostic). A well-formed config with no `quantization` block is a dense tier
     /// → `Ok(false)` (sc-9426, F-073 sibling).
     pub(crate) fn component_is_packed(&self, sub: &str) -> Result<bool> {
+        Ok(self.component_packed_config(sub)?.is_some())
+    }
+
+    /// Read the full packed descriptor so sidecar preparation uses the tier's declared bit width and
+    /// group size instead of re-inferring either from tensor shapes.
+    fn component_packed_config(
+        &self,
+        sub: &str,
+    ) -> Result<Option<candle_gen::quant::PackedConfig>> {
         let path = self.root.join(sub).join("config.json");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             // No config.json at all → legitimate dense / fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             // Present but unreadable (permissions, partial download) → surface, don't swallow.
             Err(e) => {
                 return Err(CandleError::Msg(format!(
@@ -643,7 +747,7 @@ impl Pipeline {
                 path.display()
             ))
         })?;
-        Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
+        Ok(candle_gen::quant::PackedConfig::from_config(&v))
     }
 
     /// Build a VAE [`VarBuilder`] for a **packed** tier by dequantizing the 8 packed mid-block attention
@@ -805,6 +909,7 @@ impl Pipeline {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
@@ -837,7 +942,13 @@ impl Pipeline {
             |text| self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
             // sc-9032: accelerated attention is not currently wired; match the resident path's
             // effective false value exactly.
-            || self.load_transformer(false),
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
             |transformer, cap, on_progress| {
                 self.denoise_sequential(
                     req,
@@ -855,7 +966,119 @@ impl Pipeline {
                     .map(|latent| {
                         candle_gen::check_cancel(&req.cancel)?;
                         on_progress(Progress::Decoding);
-                        self.decode_tiled(vae, latent, &req.cancel)
+                        if memory.tile_vae_decode {
+                            self.decode_tiled(
+                                vae,
+                                latent,
+                                &req.cancel,
+                                memory
+                                    .decode_tile_edge
+                                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                                memory
+                                    .decode_overlap
+                                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                            )
+                        } else {
+                            self.decode(vae, None, latent)
+                        }
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Base/full-CFG twin of [`Self::render_sequential`]. It preserves the base schedule and both
+    /// conditional forwards while giving the same request-scoped memory controls authority over
+    /// decode tiling, attention chunking, and transformer windows.
+    pub(crate) fn render_base_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
+        let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
+        let reference = resolve_reference(req)?;
+        let start_step = match &reference {
+            Some((_, strength)) => init_time_step(steps, *strength),
+            None => 0,
+        };
+
+        let clean = if start_step > 0 {
+            candle_gen::check_cancel(&req.cancel)?;
+            on_progress(Progress::Loading(LoadPhase::Renderer));
+            let encoder = self.load_vae_encoder()?;
+            let encoded = match reference {
+                Some((image, _)) => self.encode_reference(&encoder, image, req.width, req.height),
+                None => unreachable!("start_step > 0 implies a reference"),
+            };
+            let sync = self.device.synchronize();
+            drop(encoder);
+            let encoded = encoded?;
+            sync?;
+            Some(encoded)
+        } else {
+            None
+        };
+
+        run_three_stage(
+            &req.cancel,
+            &self.device,
+            on_progress,
+            || self.load_text_phase(),
+            |text| {
+                let cap = self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt)?;
+                let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+                let neg_cap = if guidance != 1.0 {
+                    Some(self.uncond_embeddings(
+                        &text.text_encoder,
+                        &text.tokenizer,
+                        req.negative_prompt.as_deref().unwrap_or(""),
+                    )?)
+                } else {
+                    None
+                };
+                Ok((cap, neg_cap))
+            },
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
+            |transformer, (cap, neg_cap), on_progress| {
+                self.denoise_base_sequential(
+                    req,
+                    transformer,
+                    &cap,
+                    neg_cap.as_ref(),
+                    clean.as_ref(),
+                    start_step,
+                    on_progress,
+                )
+            },
+            || self.load_vae(),
+            |vae, latents, on_progress| {
+                latents
+                    .iter()
+                    .map(|latent| {
+                        candle_gen::check_cancel(&req.cancel)?;
+                        on_progress(Progress::Decoding);
+                        if memory.tile_vae_decode {
+                            self.decode_tiled(
+                                vae,
+                                latent,
+                                &req.cancel,
+                                memory
+                                    .decode_tile_edge
+                                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                                memory
+                                    .decode_overlap
+                                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                            )
+                        } else {
+                            self.decode(vae, None, latent)
+                        }
                     })
                     .collect()
             },
@@ -873,6 +1096,16 @@ impl Pipeline {
         start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -917,14 +1150,115 @@ impl Pipeline {
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     Ok(transformer
-                        .forward_with_attention_budget(
+                        .forward_with_memory(
                             latents,
                             &t_tensor,
                             &cap_feats,
                             &cap_mask,
-                            CONSTRAINED_ATTN_SCORES_BUDGET,
+                            request_attention_plan(req, attention_budget),
+                            transformer_window,
                         )?
                         .neg()?)
+                },
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_base_sequential(
+        &self,
+        req: &GenerationRequest,
+        transformer: &DiT,
+        cap: &Tensor,
+        neg_cap: Option<&Tensor>,
+        clean: Option<&Tensor>,
+        start_step: usize,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Tensor>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
+            let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
+            scheduler.set_timesteps(steps, None);
+            let native: Vec<f32> = scheduler.sigmas.iter().map(|&sigma| sigma as f32).collect();
+            let sigmas = candle_gen::resolve_flow_schedule(
+                req.scheduler.as_deref(),
+                (BASE_SCHEDULE_SHIFT as f32).ln(),
+                steps,
+                &native,
+            );
+            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let x_t = match clean {
+                Some(clean) => {
+                    let sigma_start = sigmas[start] as f64;
+                    (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+                }
+                None => noise,
+            };
+            let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
+            let cap_feats = prepared.cap_feats;
+            let cap_mask = prepared.cap_mask;
+            let uncond = match neg_cap {
+                Some(neg) => {
+                    let prepared = prepare_inputs(&x_t, std::slice::from_ref(neg), &self.device)?;
+                    Some((prepared.cap_feats, prepared.cap_mask))
+                }
+                None => None,
+            };
+
+            candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas[start..],
+                prepared.latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, t| -> Result<Tensor> {
+                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
+                    let plan = request_attention_plan(req, attention_budget);
+                    let v_cond = transformer
+                        .forward_with_memory(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            plan,
+                            transformer_window,
+                        )?
+                        .neg()?;
+                    match uncond.as_ref() {
+                        Some((neg_feats, neg_mask)) => {
+                            let v_uncond = transformer
+                                .forward_with_memory(
+                                    latents,
+                                    &t_tensor,
+                                    neg_feats,
+                                    neg_mask,
+                                    plan,
+                                    transformer_window,
+                                )?
+                                .neg()?;
+                            let delta = (&v_cond - &v_uncond)?;
+                            Ok((v_uncond + (delta * guidance as f64)?)?)
+                        }
+                        None => Ok(v_cond),
+                    }
                 },
             )
         })
@@ -938,8 +1272,18 @@ impl Pipeline {
         vae: &AutoEncoderKL,
         latents: &Tensor,
         cancel: &CancelFlag,
+        tile_edge: u32,
+        overlap: u32,
     ) -> Result<Image> {
-        let cfg = TilingConfig::spatial_only(512, 128);
+        let tile_edge = i32::try_from(tile_edge).map_err(|_| {
+            candle_gen::CandleError::Msg(format!(
+                "z-image decode tile edge {tile_edge} exceeds i32"
+            ))
+        })?;
+        let overlap = i32::try_from(overlap).map_err(|_| {
+            candle_gen::CandleError::Msg(format!("z-image decode overlap {overlap} exceeds i32"))
+        })?;
+        let cfg = TilingConfig::spatial_only(tile_edge, overlap);
         let decoded = candle_gen::vae_tiling::decode_tiled(
             Z_IMAGE_VAE_TILING,
             "z-image AutoencoderKL",
@@ -1281,6 +1625,44 @@ mod tests {
         assert_eq!(budget.query_block_rows(h * 32, 32), 32);
     }
 
+    #[test]
+    fn constrained_request_pipeline_seam_returns_typed_canceled_without_output() {
+        use candle_gen::candle_core::Device;
+        use candle_gen::candle_nn::{VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let mut cfg = DitConfig::z_image_turbo();
+        cfg.dim = 128;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.n_layers = 2;
+        cfg.n_refiner_layers = 1;
+        cfg.cap_feat_dim = 64;
+        cfg.set_use_accelerated_attn(false);
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let transformer = DiT::Packed(Box::new(PackedDit::new(&cfg, vb).unwrap()));
+
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &device).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &device).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &device).unwrap();
+        let timestep = Tensor::from_vec(vec![0.5f32], (1,), &device).unwrap();
+
+        let request = GenerationRequest::default();
+        request.cancel.cancel();
+        let output = transformer.forward_with_attention_plan(
+            &prepared.latents,
+            &timestep,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+            request_attention_plan(&request, 2),
+        );
+        let error = output.expect_err("a canceled constrained request must produce no DiT output");
+        assert!(matches!(error, CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
+    }
+
     struct DropTag {
         name: &'static str,
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -1519,6 +1901,44 @@ mod tests {
         assert!(
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streamed_sidecar_preparation_preserves_typed_cancellation() {
+        let dir =
+            std::env::temp_dir().join(format!("sc16510_cancel_sidecar_{}", std::process::id()));
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([(
+                "fixture".to_owned(),
+                Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            transformer.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let pipeline = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[], None);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let error = match pipeline.load_transformer_cancelable(false, true, &cancel) {
+            Ok(_) => panic!("a canceled sidecar preparation must not construct a transformer"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
+        assert!(
+            !transformer.join(".candle-device-format-v1").exists(),
+            "pre-cancellation must stop before creating the cache"
         );
 
         std::fs::remove_dir_all(&dir).ok();

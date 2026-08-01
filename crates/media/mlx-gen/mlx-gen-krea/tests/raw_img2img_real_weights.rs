@@ -103,6 +103,7 @@ fn opts(seed: u64) -> TurboOptions {
         seed,
         sampler: None,
         scheduler: None,
+        transformer_window_size: None,
     }
 }
 

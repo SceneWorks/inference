@@ -15,7 +15,27 @@ use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
 use crate::nvfp4_dit::DitPlan;
 use crate::quant::QLinear;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::quant::AdaptLinear;
+
+fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
+    let max_score_elements = if budget == usize::MAX {
+        u64::MAX
+    } else {
+        budget as u64
+    };
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements,
+        false,
+    ))
+}
+
+fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_gen::candle_core::Error::Msg(other.to_string()),
+    })
+}
 
 /// Join a module prefix with a leaf name.
 fn join(prefix: &str, name: &str) -> String {
@@ -41,46 +61,93 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 
 /// Bidirectional, unmasked scaled-dot-product attention. `q`/`k`/`v`: `[b, h, s, hd]`.
 ///
-/// i32-overflow guard (sc-9116): the image-token scores `[b, h, s, s]` reach `~24·16384² ≈ 6.4e9 >
-/// i32::MAX` at a 2048² render, silently corrupting the tail rows on the candle CUDA kernels. The
-/// On the constrained-memory rung, complete heads are chunked first. Keeping the full query axis
+/// i32-overflow guard (sc-9116): the image-token scores `[b, h, s, s]` reach `48·16384² ≈ 12.9e9 >
+/// i32::MAX` at a 2048² render, silently corrupting the tail rows on the candle CUDA kernels. On the
+/// constrained-memory rung, complete heads are chunked first. Keeping the full query axis
 /// preserves the exact CUDA GEMM shape (and therefore byte identity) at 1024². If one head alone still
 /// exceeds the budget (the 2048² overflow case), the shared helper additionally chunks query rows.
+#[cfg(test)]
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, scores_budget: usize) -> Result<Tensor> {
+    into_candle_core(sdpa_planned(
+        q,
+        k,
+        v,
+        scale,
+        plan_from_budget(scores_budget),
+    ))
+}
+
+fn sdpa_planned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
     let (b, h, sq, _d) = q.dims4()?;
     let sk = k.dim(2)?;
-    let full_scores = b.saturating_mul(h).saturating_mul(sq).saturating_mul(sk);
-    if full_scores <= scores_budget || h == 1 {
-        return candle_gen::sdpa_budgeted_bhsd(
-            q,
-            k,
-            v,
-            scale,
-            None,
-            softmax_last_dim,
-            scores_budget,
-        );
+    let head_plan = plan
+        .budget
+        .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
+    if !head_plan.chunks_heads() {
+        record_head_chunk_count(1);
+        return candle_gen::sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan);
     }
 
-    let scores_per_head = b.saturating_mul(sq).saturating_mul(sk).max(1);
-    let heads_per_chunk = (scores_budget / scores_per_head).clamp(1, h);
+    // Pure shared-planner delegation above: this site intentionally owns no budget arithmetic. Head
+    // chunks preserve the full query GEMM shape and can reconstruct bit-exactly; the shared query-row
+    // kernel below is only a fallback when one planned head still exceeds the budget, and is compared
+    // with tolerance because narrowing query rows changes the GEMM M dimension.
+    let heads_per_chunk = head_plan.heads_per_chunk() as usize;
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < h {
+        if plan.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
         let len = heads_per_chunk.min(h - start);
-        chunks.push(candle_gen::sdpa_budgeted_bhsd(
+        chunks.push(candle_gen::sdpa_planned_bhsd(
             &q.narrow(1, start, len)?,
             &k.narrow(1, start, len)?,
             &v.narrow(1, start, len)?,
             scale,
             None,
             softmax_last_dim,
-            scores_budget,
+            plan,
         )?);
         start += len;
     }
-    Tensor::cat(&chunks, 1)
+    record_head_chunk_count(chunks.len());
+    Ok(Tensor::cat(&chunks, 1)?)
 }
+
+#[cfg(test)]
+mod head_chunk_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn last_chunk_count() -> usize {
+        LAST_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub fn reset() {
+        LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn record(n: usize) {
+        LAST_CHUNK_COUNT.store(n, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn record_head_chunk_count(n: usize) {
+    head_chunk_probe::record(n);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_head_chunk_count(_n: usize) {}
 
 // ── `+1` RMSNorm ────────────────────────────────────────────────────────────────────────────
 /// Reference `RMSNorm`: `F.rms_norm(x.float(), weight = scale.float() + 1.0)` then cast back. The
@@ -204,6 +271,17 @@ impl GatedAttention {
         rope: Option<(&Tensor, &Tensor)>,
         scores_budget: usize,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(x, rope, plan_from_budget(scores_budget)))
+    }
+
+    /// Request-scoped attention forward. A bounded plan checks cancellation between both the
+    /// head-chunks used by Krea at 1024² and any query-row chunks used by the shared kernel.
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        rope: Option<(&Tensor, &Tensor)>,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
@@ -229,12 +307,12 @@ impl GatedAttention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let o = sdpa(&q, &k, &v, self.scale, scores_budget)?;
+        let o = sdpa_planned(&q, &k, &v, self.scale, attention_plan)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         // Sigmoid gate the attention output, then the shared output projection.
         let gated = (o * sigmoid(&gate)?)?;
-        self.o.forward(&gated)
+        Ok(self.o.forward(&gated)?)
     }
 
     /// Visit the five gated-attention projections under `{prefix}` (`to_q/to_k/to_v/to_gate/to_out.0`) —
@@ -510,6 +588,24 @@ impl SingleStreamBlock {
         sin: &Tensor,
         scores_budget: usize,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            x,
+            tvec,
+            cos,
+            sin,
+            plan_from_budget(scores_budget),
+        ))
+    }
+
+    /// Request-scoped variant of [`Self::forward_with_attention_budget`].
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let m = tvec.broadcast_add(&self.scale_shift_table)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
@@ -520,9 +616,9 @@ impl SingleStreamBlock {
             .forward(x)?
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
-        let attn =
-            self.attn
-                .forward_with_attention_budget(&pre, Some((cos, sin)), scores_budget)?;
+        let attn = self
+            .attn
+            .forward_with_attention_plan(&pre, Some((cos, sin)), attention_plan)?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
         let post = self
@@ -531,7 +627,7 @@ impl SingleStreamBlock {
             .broadcast_mul(&(postscale + 1.0)?)?
             .broadcast_add(postshift)?;
         let mlp = self.mlp.forward(&post)?;
-        &x + mlp.broadcast_mul(postgate)?
+        Ok((&x + mlp.broadcast_mul(postgate)?)?)
     }
 
     /// Visit the block's attention + SwiGLU projections under `{prefix}.attn` / `{prefix}.ff` — sc-11105.
@@ -682,18 +778,137 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
 
-    /// The constrained rung first chunks complete heads. The reconstructed tensor must reproduce the
-    /// ordinary attention result exactly; otherwise the memory ladder would change the render.
+    fn reset_probes() {
+        head_chunk_probe::reset();
+        candle_gen::attention::chunk_probe::reset();
+    }
+
+    fn assert_chunks(heads: usize, queries: usize) {
+        assert_eq!(head_chunk_probe::last_chunk_count(), heads);
+        assert_eq!(
+            candle_gen::attention::chunk_probe::last_chunk_count(),
+            queries
+        );
+    }
+
+    fn approx_eq(a: &Tensor, b: &Tensor) {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "{x} != {y} within 1e-5");
+        }
+    }
+
+    /// The production 128 Mi boundary is literal and delegated to gen-core. Krea's native 1024² grid
+    /// has 4096 image tokens and 48 DiT heads; the real-caption harness records about 4118 combined
+    /// tokens. Both keep the full query axis. At the 2048² image-token floor, one head already exceeds
+    /// the budget and the query fallback is required.
     #[test]
-    fn explicit_attention_budget_matches_unchunked() {
+    fn production_head_boundaries_preserve_the_axis_distinction() {
+        let budget = candle_gen::attention::AttentionBudget::from_score_elements(
+            crate::pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64,
+            false,
+        );
+        let at_1024 = budget.head_chunks(1, 48, 4096, 4096);
+        assert!(at_1024.chunks_heads());
+        assert_eq!(at_1024.heads_per_chunk(), 8);
+        assert_eq!(
+            budget.query_block_rows(8 * 4096, 4096),
+            4096,
+            "the 1024² head-chunked path must leave the full query axis intact"
+        );
+
+        let with_caption = budget.head_chunks(1, 48, 4118, 4118);
+        assert!(with_caption.chunks_heads());
+        assert_eq!(with_caption.heads_per_chunk(), 7);
+        assert_eq!(budget.query_block_rows(7 * 4118, 4118), 4118);
+
+        let at_2048 = budget.head_chunks(1, 48, 16384, 16384);
+        assert!(at_2048.chunks_heads());
+        assert_eq!(at_2048.heads_per_chunk(), 1);
+        assert_eq!(budget.query_block_rows(16384, 16384), 8192);
+    }
+
+    /// A scaled execution of the 1024² plan: two complete-head calls, each with one full-query call.
+    /// The executed probes make this fail if either boundary is computed and ignored.
+    #[test]
+    fn head_chunking_executes_and_is_bit_exact_with_full_queries() {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 4, 7, 4), &device).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (1, 4, 7, 4), &device).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (1, 4, 7, 4), &device).unwrap();
+        reset_probes();
+        let full = sdpa(&q, &k, &v, 0.5, usize::MAX).unwrap();
+        assert_chunks(1, 1);
+        reset_probes();
+        let chunked = sdpa(&q, &k, &v, 0.5, 2 * 7 * 7).unwrap();
+        assert_chunks(2, 1);
+        let full = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let chunked = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(full, chunked);
+    }
+
+    #[test]
+    fn planned_head_chunks_honor_typed_cancel_but_unbounded_ignores_it() {
         let device = Device::Cpu;
         let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
         let k = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
         let v = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+
+        let bounded = AttentionPlan::budgeted(AttentionBudget::from_score_elements(7 * 7, false))
+            .with_cancel(&cancel);
+        let error = sdpa_planned(&q, &k, &v, 0.5, bounded).unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+
+        let unbounded = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+        assert!(sdpa_planned(&q, &k, &v, 0.5, unbounded).is_ok());
+    }
+
+    /// When one head exceeds the budget, the head path stays at one head per outer chunk and the
+    /// shared query kernel runs four row chunks. Changing the query GEMM M dimension is only
+    /// tolerance-equivalent, never asserted byte-exact (SC-15943).
+    #[test]
+    fn single_head_over_budget_executes_tolerant_query_fallback() {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        reset_probes();
         let full = sdpa(&q, &k, &v, 0.5, usize::MAX).unwrap();
-        let chunked = sdpa(&q, &k, &v, 0.5, 7 * 7).unwrap();
-        let full = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let chunked = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(full, chunked);
+        assert_chunks(1, 1);
+        reset_probes();
+        let fallback = sdpa(&q, &k, &v, 0.5, 20).unwrap();
+        assert_chunks(2, 4);
+        approx_eq(&full, &fallback);
+    }
+
+    /// Both shared fast-path decisions execute one outer delegation. The single-head case remains
+    /// distinguishable from a clamped head loop through `HeadChunkPlan::chunks_heads` and still
+    /// exercises query fallback when its one head is over budget.
+    #[test]
+    fn in_budget_and_single_head_early_paths_are_executed() {
+        let device = Device::Cpu;
+        let q2 = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        reset_probes();
+        sdpa(&q2, &q2, &q2, 0.5, 2 * 7 * 7).unwrap();
+        assert_chunks(1, 1);
+        let in_budget =
+            candle_gen::attention::AttentionBudget::from_score_elements((2 * 7 * 7) as u64, false)
+                .head_chunks(1, 2, 7, 7);
+        assert!(!in_budget.chunks_heads());
+        assert_eq!(in_budget.heads_per_chunk(), 2);
+
+        let q1 = Tensor::randn(0f32, 1f32, (1, 1, 7, 4), &device).unwrap();
+        reset_probes();
+        sdpa(&q1, &q1, &q1, 0.5, 20).unwrap();
+        assert_chunks(1, 4);
+
+        let budget = candle_gen::attention::AttentionBudget::from_score_elements(20, false);
+        let one_head = budget.head_chunks(1, 1, 7, 7);
+        assert!(!one_head.chunks_heads());
+        assert_eq!(one_head.heads_per_chunk(), 1);
     }
 }

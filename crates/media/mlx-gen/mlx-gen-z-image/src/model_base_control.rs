@@ -61,6 +61,7 @@ pub fn descriptor() -> ModelDescriptor {
             // paying for a load. Same expression the `ControlBranch` override
             // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             // Base is undistilled → full classifier-free guidance + negative prompting (mirrors the
             // base `z_image` descriptor), unlike the guidance-distilled Turbo control variant.
             supports_negative_prompt: true,
@@ -263,7 +264,10 @@ impl ZImageControl {
                 Ok((cap, neg_cap))
             },
             // Materialize cap (+neg_cap) while the encoder is still alive (Sequential only).
-            |(cap, neg_cap)| {
+            |encoded| {
+                let Some((cap, neg_cap)) = encoded else {
+                    return Ok(());
+                };
                 match neg_cap {
                     Some(neg) => mlx_rs::transforms::eval([cap, neg])?,
                     None => mlx_rs::transforms::eval([cap])?,
@@ -413,6 +417,7 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
         contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
     };
 
 #[cfg(test)]
@@ -514,7 +519,7 @@ mod tests {
                 panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
             });
             assert!(
-                res.is_sequential(),
+                res.with_resident_parts(|_, _| ()).is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }

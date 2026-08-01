@@ -1600,6 +1600,23 @@ mod tests {
             "convrot online-rotation vs canonical cosine {cos:.5}"
         );
 
+        // SC-16453: the composable control DiT must select this same native ConvRot projection rather
+        // than handing the I8 tensor to its dense/adapter loader. This is the exact boundary the first
+        // real strict-pose probe exposed (`unsupported safetensor dtype I8`). Forward parity proves the
+        // wrapper retains the online rotation rather than merely carrying a ConvRot-looking enum tag.
+        let control =
+            crate::train_dit::lora_proj_packed(&w, "transformer_blocks.0.attn.to_q", false)?;
+        assert!(
+            control.is_convrot(),
+            "the control-inference projection loader must preserve ConvRot identity"
+        );
+        let control_got = control.forward(&x)?.to_dtype(DType::F32)?;
+        let control_cos = cosine(&control_got, &want);
+        assert!(
+            control_cos > 0.99,
+            "control ConvRot online-rotation vs canonical cosine {control_cos:.5}"
+        );
+
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         Ok(())
     }

@@ -77,7 +77,10 @@ pub use loader::{
 // chroma/flux2/qwen-image VAE mid-blocks) share ONE guarded copy. candle CUDA kernels index elements
 // with i32; a scores tensor over `i32::MAX` silently corrupts its tail at large render sizes.
 pub mod attention;
-pub use attention::{sdpa_budgeted_bhsd, sdpa_budgeted_flat, ATTN_SCORES_BUDGET};
+pub use attention::{
+    sdpa_budgeted_bhsd, sdpa_budgeted_flat, sdpa_planned_bhsd, sdpa_planned_flat,
+    ATTN_SCORES_BUDGET,
+};
 
 // Shared Qwen3-VL text-encoder grounding helpers (sc-11205 / F-118): the MRoPE / vision-splice
 // machinery (`Rotary` 1-D RoPE table, GQA `repeat_kv`, `<|image_pad|>` `image_blocks`, the vision-embed
@@ -166,8 +169,8 @@ pub use sync::{cached, lock_recover};
 // schedule and each omitted the same two things.
 pub mod residency;
 pub use residency::{
-    check_cancel, effective_offload_policy, run_sequential, run_three_stage_sequential,
-    sequential_offload_enabled, Residency, OFFLOAD_ENV,
+    check_cancel, run_sequential, run_three_stage_sequential, synchronize_result, Residency,
+    StagedHeavy,
 };
 
 // Driver memory-pool introspection (sc-12818, widened by SC-15792). Gated on `cuda` alone rather

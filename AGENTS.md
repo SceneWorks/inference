@@ -35,6 +35,8 @@ constants. Preserve existing public crate names, provider IDs, serialized fields
 and weight keys unless making an explicit compatibility change. Keep contract
 crates tensor-neutral. Compose media providers through family/platform catalogs;
 do not introduce `inventory` registrations, global loaders, or force-link anchors.
+Review authors and remediation work must also follow the repository-wide
+[code-review finding reference convention](CONTRIBUTING.md#code-review-finding-references).
 
 ## Testing Guidelines
 

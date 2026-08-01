@@ -182,10 +182,19 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     } else {
         loader::load_tokenizer(root)?
     };
+    let memory_numeric_tier = mlx_gen::gen_core::MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    };
+    let selected_weight_bytes = mlx_gen::gen_core::safetensors_path_bytes(root);
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
+        memory_strategy: crate::memory_strategy::contract_for_variant(variant),
+        memory_numeric_tier: Some(memory_numeric_tier),
+        selected_weight_bytes,
         tokenizer: Some(tokenizer),
         residency: build_residency(variant, spec)?,
     }))
@@ -333,6 +342,11 @@ pub struct Flux2 {
     descriptor: ModelDescriptor,
     variant: Flux2Variant,
     config: Flux2Config,
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    /// Exact load-time tier and selected snapshot footprint used by provider-owned admission.
+    /// Test-only instances have no load artifact, so their tier remains unknown.
+    memory_numeric_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
+    selected_weight_bytes: u64,
     /// The (small, always-warm) tokenizer. `None` only for the weightless `new_for_tests` instances;
     /// the production load path always populates it.
     tokenizer: Option<TextTokenizer>,
@@ -352,6 +366,9 @@ impl Flux2 {
             descriptor: variant.descriptor(),
             variant,
             config: variant.config(),
+            memory_strategy: crate::memory_strategy::contract_for_variant(variant),
+            memory_numeric_tier: None,
+            selected_weight_bytes: 0,
             tokenizer: None,
             residency: Residency::sequential(
                 || {
@@ -643,10 +660,60 @@ pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32)
     Ok(x)
 }
 
-mlx_gen::impl_generator!(Flux2 {
-    validate: |s, req| validate_request(&s.descriptor, s.variant.is_edit(), s.variant.is_kv(), req),
-    generate: generate_impl,
-});
+impl Generator for Flux2 {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(
+            &self.descriptor,
+            self.variant.is_edit(),
+            self.variant.is_kv(),
+            req,
+        )
+        .map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.memory_strategy.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{} has no memory-strategy contract", self.descriptor.id),
+            },
+            |contract| {
+                let Some(expected_tier) = self.memory_numeric_tier else {
+                    return mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                        reason: format!(
+                            "{} has no loaded numeric tier for memory admission",
+                            self.descriptor.id
+                        ),
+                    };
+                };
+                crate::memory_strategy::safety_check(
+                    contract,
+                    context,
+                    expected_tier,
+                    self.selected_weight_bytes,
+                )
+            },
+        )
+    }
+}
 
 /// Resolve the classifier-free negative branch for a request.
 ///
@@ -739,7 +806,10 @@ impl Flux2 {
             // MLX is lazy, so an un-evaluated embed keeps the encoder referenced and the drop would free
             // nothing. `text_ids` are host-derived position ids (TE-independent), so evaling the embeds
             // is sufficient.
-            |(prompt_embeds, _text_ids, negative)| {
+            |encoded| {
+                let Some((prompt_embeds, _text_ids, negative)) = encoded else {
+                    return Ok(());
+                };
                 match negative {
                     Some((neg_embeds, _)) => eval([prompt_embeds, neg_embeds])?,
                     None => eval([prompt_embeds])?,
@@ -1131,6 +1201,13 @@ mlx_gen::register_generators! {
     pub(crate) const DEV_EDIT_REGISTRATION = descriptor_dev_edit => load_dev_edit;
     footprint = component_footprint
 }
+
+pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: crate::config::FLUX2_DEV_EDIT_ID,
+        contract: crate::memory_strategy::registered_contract,
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
 
 #[cfg(test)]
 mod tests {

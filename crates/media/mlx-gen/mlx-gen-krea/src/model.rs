@@ -128,6 +128,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The turnkey ships pre-packed Q8/Q4 ([`crate::convert::assemble_quantized_snapshot`]);
             // load-time quantize over a dense bf16 build is a no-op on an already-packed snapshot.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
@@ -216,6 +217,10 @@ pub fn turbo_edit_descriptor() -> ModelDescriptor {
 /// Raw = full-CFG undistilled; edit = the Raw pipeline routed to the Kontext edit entrypoint).
 pub struct Krea {
     descriptor: ModelDescriptor,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    precision: Precision,
+    quant: Option<Quant>,
+    streamable_transformer: bool,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen3-VL-4B
     /// text phase + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
@@ -363,6 +368,10 @@ pub(crate) fn build_native_krea(
     descriptor: ModelDescriptor,
 ) -> Result<Krea> {
     let base = base_snapshot_dir.as_ref();
+    let native_spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+        .with_adapters(adapters.to_vec());
+    let memory_strategy =
+        crate::block_memory_strategy::memory_strategy_contract(descriptor.id, &native_spec)?;
     // Architecture config from the resident turnkey (the single file ships no config.json); the
     // community merge shares the published Krea 2 architecture exactly.
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
@@ -380,6 +389,10 @@ pub(crate) fn build_native_krea(
     let residency = Residency::resident(text, KreaHeavyOwned { heavy, pid: None });
     Ok(Krea {
         descriptor,
+        memory_strategy,
+        precision: native_spec.precision,
+        quant: native_spec.quantize,
+        streamable_transformer: false,
         residency,
         adapters: adapters.to_vec(),
         has_diff_patch: adapters_have_diff_patch(adapters),
@@ -393,9 +406,15 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
+    let memory_strategy =
+        crate::block_memory_strategy::memory_strategy_contract(descriptor.id, spec)?;
     let residency = build_residency(spec, descriptor.id)?;
     Ok(Box::new(Krea {
         descriptor,
+        memory_strategy,
+        precision: spec.precision,
+        quant: spec.quantize,
+        streamable_transformer: crate::block_memory_strategy::is_streamable_spec(spec),
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
@@ -407,12 +426,41 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
 /// input. Best-effort: a header we cannot read yields `false` here, but the same file is read for real
 /// by the load-time [`KreaHeavy::apply_adapters`], which surfaces the genuine error loudly — so an
 /// unreadable file never silently slips a diff-patch through into a wrong multi-phase render.
-fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
+pub(crate) fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
     specs.iter().any(|spec| {
         mlx_gen::gen_core::weightsmeta::CheckpointMeta::from_file(&spec.path)
             .map(|meta| mlx_gen::adapters::loader::has_diff_patch_key_names(meta.keys()))
             .unwrap_or(false)
     })
+}
+
+fn resolve_transformer_window(req: &GenerationRequest, streamable: bool) -> Result<Option<usize>> {
+    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+        return Ok(None);
+    };
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != mlx_gen::gen_core::TransformerComponent::Dit {
+        return Err(Error::Unsupported(format!(
+            "krea: rung 4 implements the DiT component only; requested {component:?}"
+        )));
+    }
+    if !streamable {
+        return Err(Error::Unsupported(
+            "krea: bounded transformer residency requires a Sequential, deferred-materialization, \
+             re-openable snapshot load without a dense diff-patch adapter"
+                .to_owned(),
+        ));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE);
+    if window != crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE {
+        return Err(Error::Unsupported(format!(
+            "krea: transformer_window_size={window} is outside the measured domain {:?}",
+            [crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE]
+        )));
+    }
+    Ok(Some(window as usize))
 }
 
 /// The policy→[`Residency`] dispatch every Krea variant shares (sc-11101; routed through the single
@@ -518,7 +566,10 @@ fn load_krea_heavy(
     id: &str,
     load_pid: bool,
 ) -> Result<KreaHeavyOwned> {
-    let mut heavy = KreaHeavy::from_snapshot(root)?;
+    let mut heavy = KreaHeavy::from_snapshot_with_stream(
+        root,
+        crate::block_memory_strategy::is_streamable_spec(spec),
+    )?;
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
     }
@@ -540,14 +591,55 @@ fn load_krea_heavy(
     Ok(KreaHeavyOwned { heavy, pid })
 }
 
-mlx_gen::impl_generator!(Krea {
-    validate: |s, req| {
-        validate_request(&s.descriptor, req)?;
-        // The load-time diff-patch guard needs `s` (the free `validate_request` can't see it).
-        ensure_multiphase_allowed_for(s.descriptor.id, s.has_diff_patch, req)
-    },
-    generate: generate_impl,
-});
+impl Generator for Krea {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::block_memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::block_memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req)?;
+        ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
 
 impl Krea {
     /// Text-encode the prompt (and, for true CFG, the negative) per the residency (sc-11101). `Resident`
@@ -628,6 +720,7 @@ impl Krea {
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
         // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
@@ -754,7 +847,8 @@ impl Krea {
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
-            |ctx: &KreaContexts| {
+            |ctx: Option<&KreaContexts>| {
+                let Some(ctx) = ctx else { return Ok(()) };
                 match &ctx.neg {
                     Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
                     None => mlx_rs::transforms::eval([&ctx.pos])?,
@@ -803,6 +897,7 @@ impl Krea {
                             seed: base_seed.wrapping_add(n as u64),
                             sampler: req.sampler.clone(),
                             scheduler: req.scheduler.clone(),
+                            transformer_window_size,
                         };
                         images.push(heavy.heavy.render_multiphase(
                             &plans,
@@ -885,6 +980,7 @@ impl Krea {
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
+                        transformer_window_size,
                     };
                     // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
                     // both residencies, so a Sequential job (text phase already dropped) is byte-identical
@@ -1169,6 +1265,9 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(mlx_gen::PerComponentBytes::default());
+    }
     mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
@@ -1181,6 +1280,24 @@ mlx_gen::register_generators! {
     pub(crate) const TURBO_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+macro_rules! memory_registration {
+    ($name:ident, $provider_id:expr) => {
+        pub const $name: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| {
+                    crate::block_memory_strategy::memory_strategy_contract($provider_id, spec)
+                },
+                safety_check: crate::block_memory_strategy::registered_safety_check,
+            };
+    };
+}
+
+memory_registration!(TURBO_MEMORY_REGISTRATION, KREA_2_TURBO_ID);
+memory_registration!(RAW_MEMORY_REGISTRATION, KREA_2_RAW_ID);
+memory_registration!(EDIT_MEMORY_REGISTRATION, KREA_2_EDIT_ID);
+memory_registration!(TURBO_EDIT_MEMORY_REGISTRATION, KREA_2_TURBO_EDIT_ID);
 mlx_gen::register_generators! {
     pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw;
     footprint = component_footprint

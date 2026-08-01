@@ -95,7 +95,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
@@ -234,39 +234,10 @@ impl Pipeline {
         // `group_size` from `transformer/config.json` (default 64 when dense/absent, never silent dense
         // — `candle_gen::quant::PackedConfig` resolves a missing group_size to 64).
         let te = QwenTextEncoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
-        let transformer = match &self.comfyui_dit {
-            // In-place ComfyUI DiT single-file (sc-10670): remap keys + upcast fp8→bf16 into an
-            // in-memory tensor map, then build via `VarBuilder::from_tensors` (the same in-memory path
-            // the packed/adapter loads use). Dense bf16 after the upcast, so the default group size.
-            Some(dit_file) => {
-                let dit_map = candle_gen::candle_core::safetensors::load(dit_file, &Device::Cpu)?;
-                let dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
-                let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
-                // Dense bf16 after the upcast — the group size is inert on the dense path (no `.scales`
-                // siblings in the map), so the shared default.
-                QwenTransformer::new_gs(&self.dit_cfg, dit_vb, candle_gen::quant::MLX_GROUP_SIZE)?
-            }
-            None => {
-                let gs = transformer_group_size(&self.root.join("transformer"));
-                QwenTransformer::new_gs(
-                    &self.dit_cfg,
-                    self.component_vb("transformer", DIT_DTYPE)?,
-                    gs,
-                )?
-            }
-        };
-        let vae = match &self.comfyui_vae {
-            // In-place ComfyUI VAE single-file (sc-10830): remap the native WAN-VAE keys to the
-            // diffusers schema in memory, then build via `VarBuilder::from_tensors` at ENC_DTYPE — the
-            // f32 upcast happens on `get` (the map's bf16 → f32), byte-matching the snapshot VAE mmap.
-            Some(vae_file) => {
-                let vae_map = candle_gen::candle_core::safetensors::load(vae_file, &Device::Cpu)?;
-                let vae_map = comfyui::remap_vae_wan_to_diffusers(vae_map)?;
-                let vae_vb = VarBuilder::from_tensors(vae_map, ENC_DTYPE, &self.device);
-                QwenVae::new(vae_vb)?
-            }
-            None => QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?,
-        };
+        // Warm and request-staged loads share these source-aware component loaders so a ComfyUI
+        // generator cannot switch back to snapshot weights when a constrained request arrives.
+        let transformer = self.load_transformer_seq()?;
+        let vae = self.load_vae_seq()?;
         let tokenizer = control_common::load_tokenizer(&self.root, &self.te_cfg, "qwen-image")?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native QwenVae.
@@ -451,18 +422,52 @@ impl Pipeline {
     /// packed-detect load (`transformer_group_size` → `QwenTransformer::new_gs`) as
     /// [`load_components`](Self::load_components).
     fn load_transformer_seq(&self) -> CResult<QwenTransformer> {
-        let gs = transformer_group_size(&self.root.join("transformer"));
-        Ok(QwenTransformer::new_gs(
-            &self.dit_cfg,
-            self.component_vb("transformer", DIT_DTYPE)?,
-            gs,
-        )?)
+        match &self.comfyui_dit {
+            Some(dit_file) => {
+                let dit_map = candle_gen::candle_core::safetensors::load(dit_file, &Device::Cpu)
+                    .map_err(|error| {
+                        CandleError::Msg(format!(
+                            "qwen-image comfyui: load DiT {}: {error}",
+                            dit_file.display()
+                        ))
+                    })?;
+                let dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
+                let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
+                Ok(QwenTransformer::new_gs(
+                    &self.dit_cfg,
+                    dit_vb,
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                )?)
+            }
+            None => {
+                let gs = transformer_group_size(&self.root.join("transformer"));
+                Ok(QwenTransformer::new_gs(
+                    &self.dit_cfg,
+                    self.component_vb("transformer", DIT_DTYPE)?,
+                    gs,
+                )?)
+            }
+        }
     }
 
     /// Load ONLY the VAE for the sequential path (sc-10867). Small relative to the DiT, so it stays
     /// co-resident with the DiT through decode (splitting them further buys ~nothing).
     fn load_vae_seq(&self) -> CResult<QwenVae> {
-        Ok(QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?)
+        match &self.comfyui_vae {
+            Some(vae_file) => {
+                let vae_map = candle_gen::candle_core::safetensors::load(vae_file, &Device::Cpu)
+                    .map_err(|error| {
+                        CandleError::Msg(format!(
+                            "qwen-image comfyui: load VAE {}: {error}",
+                            vae_file.display()
+                        ))
+                    })?;
+                let vae_map = comfyui::remap_vae_wan_to_diffusers(vae_map)?;
+                let vae_vb = VarBuilder::from_tensors(vae_map, ENC_DTYPE, &self.device);
+                Ok(QwenVae::new(vae_vb)?)
+            }
+            None => Ok(QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?),
+        }
     }
 
     /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
@@ -585,13 +590,22 @@ impl Generator for QwenImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let images = self.residency.run(
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
-            &self.pipe.device,
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_phase(text, req),
-            |heavy, encoded, on_progress| self.pipe.render_phase(heavy, req, encoded, on_progress),
+            |_| Ok(self.pipe.device.synchronize()?),
+            |heavy, encoded, on_progress| {
+                let result = self.pipe.render_phase(heavy, req, encoded, on_progress);
+                candle_gen::synchronize_result(&self.pipe.device, result)
+            },
         )?;
         Ok(GenerationOutput::Images(images))
     }
@@ -635,6 +649,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 8,
             mac_only: false,
             supported_quants: &[] as &[Quant],
+            component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: true,
@@ -654,29 +669,25 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-fn generator_from_pipeline(
-    pipe: Pipeline,
-    policy: OffloadPolicy,
-) -> gen_core::Result<Box<dyn Generator>> {
+fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator>> {
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
-    let residency = QwenResidency::from_policy_with_resident(
-        policy,
-        move || {
+    let residency = QwenResidency::request_scoped_with_resident(
+        move |_| {
             let comps = resident_pipe.load_components()?;
             Ok((
                 TextPhase::Resident(comps.clone()),
                 HeavyPhase::Resident(comps),
             ))
         },
-        move || Ok(TextPhase::Sequential(Box::new(text_pipe.load_te_seq()?))),
-        move |use_pid| {
+        move |_| Ok(TextPhase::Sequential(Box::new(text_pipe.load_te_seq()?))),
+        move |use_pid, _| {
             Ok(HeavyPhase::Sequential(Box::new(
                 heavy_pipe.load_heavy_seq(use_pid)?,
             )))
         },
-    )?;
+    );
     Ok(Box::new(QwenImageGenerator {
         descriptor: descriptor(),
         pipe,
@@ -715,8 +726,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let device = candle_gen::default_device()?;
     let pipe = Pipeline::load(&root, &device, spec.pid.clone());
-    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
-    generator_from_pipeline(pipe, policy)
+    generator_from_pipeline(pipe)
 }
 
 /// Construct a lazy candle Qwen-Image generator that reads its **DiT** (and optionally its **VAE**) in
@@ -743,7 +753,7 @@ pub fn load_from_comfyui_dit(
         transformer_file.into(),
         vae_file,
     );
-    generator_from_pipeline(pipe, OffloadPolicy::Resident)
+    generator_from_pipeline(pipe)
 }
 
 candle_gen::register_generators! {
@@ -840,8 +850,38 @@ mod tests {
         assert_eq!(g.descriptor().backend, "candle");
     }
 
+    #[test]
+    fn staged_comfyui_loaders_preserve_both_selected_single_files() {
+        let dit = PathBuf::from("/selected/qwen-comfyui-dit.safetensors");
+        let vae = PathBuf::from("/selected/qwen-comfyui-vae.safetensors");
+        let pipe = Pipeline::load_comfyui(
+            Path::new("/missing-snapshot"),
+            &Device::Cpu,
+            dit.clone(),
+            Some(vae.clone()),
+        );
+        let dit_error = pipe
+            .load_transformer_seq()
+            .err()
+            .expect("the selected DiT fixture path is deliberately absent")
+            .to_string();
+        assert!(
+            dit_error.contains(&dit.display().to_string()),
+            "request staging must read the selected ComfyUI DiT, got: {dit_error}"
+        );
+        let vae_error = pipe
+            .load_vae_seq()
+            .err()
+            .expect("the selected VAE fixture path is deliberately absent")
+            .to_string();
+        assert!(
+            vae_error.contains(&vae.display().to_string()),
+            "request staging must read the selected ComfyUI VAE, got: {vae_error}"
+        );
+    }
+
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10867). ONE probed generation whose
-    /// mode is the `CANDLE_GEN_OFFLOAD` env the generator reads; prints the device peak VRAM and writes
+    /// mode is the request's `GenerationMemory::stage_residency`; prints the device peak VRAM and writes
     /// the raw RGB pixels to `QWEN_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and
     /// compare: the pixel files must be byte-identical (parity) and the sequential peak materially lower
     /// (the ~8 GB Qwen2.5-VL encoder dropped before the DiT loads). Two processes are REQUIRED — candle's
@@ -855,15 +895,9 @@ mod tests {
         let dir = std::env::var("QWEN_IMAGE_SNAPSHOT")
             .expect("set QWEN_IMAGE_SNAPSHOT to a real-file (hardlink-staged) Qwen-Image snapshot");
         let out = std::env::var("QWEN_OUT").expect("set QWEN_OUT to the pixel-dump path");
-        // Two ways to select sequential residency, both exercised by the A/B runner:
-        //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769/sc-10867), OR
-        //   - `QWEN_OFFLOAD_MODE=spec-sequential` → drive it through `LoadSpec::offload_policy`
-        //     (the worker-facing contract, sc-10821/sc-10867), with CANDLE_GEN_OFFLOAD UNSET.
-        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
-        let spec_mode = std::env::var("QWEN_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-        }
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        let stage_residency =
+            std::env::var("QWEN_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
@@ -871,6 +905,10 @@ mod tests {
             steps: Some(8),
             seed: Some(42),
             count: 1,
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
@@ -887,11 +925,8 @@ mod tests {
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
+        let mode = if stage_residency {
+            "request-staged"
         } else {
             "resident"
         };

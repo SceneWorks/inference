@@ -25,6 +25,7 @@
 
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_gen::candle_nn::{RmsNorm, VarBuilder};
+use std::sync::Arc;
 
 // The projection type is the shared residual-capable [`candle_gen::quant::AdaptLinear`] (sc-11105),
 // aliased to the crate-local `QLinear` name so every `linear_detect` call site below stays unchanged.
@@ -34,7 +35,61 @@ use candle_gen::candle_nn::{RmsNorm, VarBuilder};
 // With no adapter attached the forward is byte-identical to the bare base, so the dense-parity test and
 // every packed load are unchanged. (The crate's other packed seams — `packed_te`, the VAE dequant — keep
 // using the plain `crate::quant::QLinear` enum; only the DiT needs the residual surface.)
-use candle_gen::quant::AdaptLinear as QLinear;
+use candle_gen::block_window::BlockPlan;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+use candle_gen::quant::{AdaptLinear as QLinear, PackedWeightSidecars};
+
+/// Load one projection in a streamed block. Packed triples must resolve through the prepared
+/// device-format cache; dense tensors keep the exact historical `VarBuilder` path.
+fn streamed_linear_detect(
+    in_dim: usize,
+    out_dim: usize,
+    vb: &VarBuilder,
+    base: &str,
+    bias: bool,
+    sidecars: &PackedWeightSidecars,
+    sidecar_prefix: &str,
+) -> Result<QLinear> {
+    let scales_key = format!("{base}.scales");
+    if !vb.contains_tensor(&scales_key) {
+        return QLinear::linear_detect(in_dim, out_dim, vb, base, bias);
+    }
+
+    let sidecar_base = format!("{sidecar_prefix}.{base}");
+    if !sidecars.contains(&sidecar_base) {
+        candle_gen::candle_core::bail!(
+            "z-image streamed packed projection `{sidecar_base}` has no prepared device-format \
+             sidecar"
+        );
+    }
+    let dense_bias = if bias {
+        Some(vb.get(out_dim, &format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    let qtensor = sidecars.load(&sidecar_base, vb.device())?;
+    let packed = candle_gen::quant::QLinear::from_qtensor_dequant(Arc::new(qtensor), dense_bias);
+    Ok(QLinear::from_packed(packed, in_dim, out_dim))
+}
+
+fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
+    let max_score_elements = if budget == usize::MAX {
+        u64::MAX
+    } else {
+        budget as u64
+    };
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements,
+        false,
+    ))
+}
+
+fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_gen::candle_core::Error::Msg(other.to_string()),
+    })
+}
 
 // Reused verbatim from candle-transformers — frozen sub-modules + the patchify/RoPE helpers that hold
 // no packed projection (identical reuse to `crate::dit`). Vendoring these would add drift for zero
@@ -127,6 +182,23 @@ struct ZImageAttention {
 
 impl ZImageAttention {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_sidecars(cfg, vb, None)
+    }
+
+    fn new_streamed(
+        cfg: &Config,
+        vb: VarBuilder,
+        sidecars: &PackedWeightSidecars,
+        sidecar_prefix: &str,
+    ) -> Result<Self> {
+        Self::new_with_sidecars(cfg, vb, Some((sidecars, sidecar_prefix)))
+    }
+
+    fn new_with_sidecars(
+        cfg: &Config,
+        vb: VarBuilder,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         let dim = cfg.dim;
         let n_heads = cfg.n_heads;
         let head_dim = cfg.head_dim();
@@ -134,10 +206,16 @@ impl ZImageAttention {
         // Packed bases are the full dotted key prefixes (the `.scales` siblings live directly under
         // `attention.to_q` … `attention.to_out.0`), so the detect uses the base string — never `.pp()`
         // past the sibling (the key-remap trap for `to_out.0`).
-        let to_q = QLinear::linear_detect(dim, n_heads * head_dim, &vb, "to_q", false)?;
-        let to_k = QLinear::linear_detect(dim, cfg.n_kv_heads * head_dim, &vb, "to_k", false)?;
-        let to_v = QLinear::linear_detect(dim, cfg.n_kv_heads * head_dim, &vb, "to_v", false)?;
-        let to_out = QLinear::linear_detect(n_heads * head_dim, dim, &vb, "to_out.0", false)?;
+        let load = |in_dim, out_dim, base| match sidecars {
+            Some((sidecars, prefix)) => {
+                streamed_linear_detect(in_dim, out_dim, &vb, base, false, sidecars, prefix)
+            }
+            None => QLinear::linear_detect(in_dim, out_dim, &vb, base, false),
+        };
+        let to_q = load(dim, n_heads * head_dim, "to_q")?;
+        let to_k = load(dim, cfg.n_kv_heads * head_dim, "to_k")?;
+        let to_v = load(dim, cfg.n_kv_heads * head_dim, "to_v")?;
+        let to_out = load(n_heads * head_dim, dim, "to_out.0")?;
 
         // The stock `QkNorm::new(head_dim, eps, vb.clone())` loads `attention.norm_q`/`norm_k` as
         // siblings of the projections (NOT nested under a `qk_norm` prefix) — reproduce exactly.
@@ -159,14 +237,14 @@ impl ZImageAttention {
         })
     }
 
-    fn forward_with_attention_budget(
+    fn forward_with_attention_plan(
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
         let q = self.to_q.forward(hidden_states)?;
@@ -191,11 +269,10 @@ impl ZImageAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let context =
-            self.attention_dispatch(&q, &k, &v, attention_mask, scale, attention_scores_budget)?;
+        let context = self.attention_dispatch(&q, &k, &v, attention_mask, scale, attention_plan)?;
 
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
-        self.to_out.forward(&context)
+        Ok(self.to_out.forward(&context)?)
     }
 
     /// Visit the four attention projections (`{prefix}.to_q/to_k/to_v/to_out.0`) — the surface the
@@ -225,12 +302,12 @@ impl ZImageAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         scale: f64,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         if self.use_accelerated_attn && q.device().is_metal() {
-            self.attention_metal(q, k, v, mask, scale)
+            Ok(self.attention_metal(q, k, v, mask, scale)?)
         } else {
-            self.attention_basic(q, k, v, mask, scale, attention_scores_budget)
+            self.attention_basic(q, k, v, mask, scale, attention_plan)
         }
     }
 
@@ -254,8 +331,8 @@ impl ZImageAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         scale: f64,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         // Build the optional additive `[B,1,1,seq]` mask up front. i32-overflow guard (sc-9116): the
         // image-token scores `[B, n, seq, seq]` reach `~24·16384² ≈ 6.4e9 > i32::MAX` at a 2048² render
         // (this is the CPU/CUDA `basic` fallback — the Metal path uses candle's fused `sdpa`), so chunk
@@ -267,14 +344,14 @@ impl ZImageAttention {
             }
             None => None,
         };
-        candle_gen::sdpa_budgeted_bhsd(
+        candle_gen::sdpa_planned_bhsd(
             q,
             k,
             v,
             scale,
             m.as_ref(),
             candle_gen::candle_nn::ops::softmax_last_dim,
-            attention_scores_budget,
+            attention_plan,
         )
     }
 
@@ -309,6 +386,44 @@ impl FeedForward {
             w1: QLinear::linear_detect(dim, hidden_dim, &vb, "w1", false)?,
             w2: QLinear::linear_detect(hidden_dim, dim, &vb, "w2", false)?,
             w3: QLinear::linear_detect(dim, hidden_dim, &vb, "w3", false)?,
+        })
+    }
+
+    fn new_streamed(
+        dim: usize,
+        hidden_dim: usize,
+        vb: VarBuilder,
+        sidecars: &PackedWeightSidecars,
+        sidecar_prefix: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            w1: streamed_linear_detect(
+                dim,
+                hidden_dim,
+                &vb,
+                "w1",
+                false,
+                sidecars,
+                sidecar_prefix,
+            )?,
+            w2: streamed_linear_detect(
+                hidden_dim,
+                dim,
+                &vb,
+                "w2",
+                false,
+                sidecars,
+                sidecar_prefix,
+            )?,
+            w3: streamed_linear_detect(
+                dim,
+                hidden_dim,
+                &vb,
+                "w3",
+                false,
+                sidecars,
+                sidecar_prefix,
+            )?,
         })
     }
 
@@ -395,11 +510,48 @@ struct ZImageTransformerBlock {
 
 impl ZImageTransformerBlock {
     fn new(cfg: &Config, modulation: bool, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_sidecars(cfg, modulation, vb, None)
+    }
+
+    fn new_streamed(
+        cfg: &Config,
+        modulation: bool,
+        vb: VarBuilder,
+        sidecars: &PackedWeightSidecars,
+        block_index: usize,
+    ) -> Result<Self> {
+        let block_prefix = format!("layers.{block_index}");
+        Self::new_with_sidecars(cfg, modulation, vb, Some((sidecars, &block_prefix)))
+    }
+
+    fn new_with_sidecars(
+        cfg: &Config,
+        modulation: bool,
+        vb: VarBuilder,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         let dim = cfg.dim;
         let hidden_dim = cfg.hidden_dim();
 
-        let attention = ZImageAttention::new(cfg, vb.pp("attention"))?;
-        let feed_forward = FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"))?;
+        let attention = match sidecars {
+            Some((sidecars, prefix)) => ZImageAttention::new_streamed(
+                cfg,
+                vb.pp("attention"),
+                sidecars,
+                &format!("{prefix}.attention"),
+            )?,
+            None => ZImageAttention::new(cfg, vb.pp("attention"))?,
+        };
+        let feed_forward = match sidecars {
+            Some((sidecars, prefix)) => FeedForward::new_streamed(
+                dim,
+                hidden_dim,
+                vb.pp("feed_forward"),
+                sidecars,
+                &format!("{prefix}.feed_forward"),
+            )?,
+            None => FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"))?,
+        };
 
         let attention_norm1 =
             candle_gen::candle_nn::rms_norm(dim, cfg.norm_eps, vb.pp("attention_norm1"))?;
@@ -411,13 +563,19 @@ impl ZImageTransformerBlock {
         let adaln_modulation = if modulation {
             let adaln_dim = dim.min(ADALN_EMBED_DIM);
             // Packed base `adaLN_modulation.0` (the `.0` is the linear; the stock nests via `.pp("0")`).
-            Some(QLinear::linear_detect(
-                adaln_dim,
-                4 * dim,
-                &vb.pp("adaLN_modulation"),
-                "0",
-                true,
-            )?)
+            let adaln = vb.pp("adaLN_modulation");
+            Some(match sidecars {
+                Some((sidecars, prefix)) => streamed_linear_detect(
+                    adaln_dim,
+                    4 * dim,
+                    &adaln,
+                    "0",
+                    true,
+                    sidecars,
+                    &format!("{prefix}.adaLN_modulation"),
+                )?,
+                None => QLinear::linear_detect(adaln_dim, 4 * dim, &adaln, "0", true)?,
+            })
         } else {
             None
         };
@@ -433,15 +591,15 @@ impl ZImageTransformerBlock {
         })
     }
 
-    fn forward_with_attention_budget(
+    fn forward_with_attention_plan(
         &self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln_input: Option<&Tensor>,
-        attention_scores_budget: usize,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
             let modulation = adaln.forward(adaln_input)?.unsqueeze(1)?;
@@ -456,12 +614,12 @@ impl ZImageTransformerBlock {
 
             let normed = self.attention_norm1.forward(x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward_with_attention_budget(
+            let attn_out = self.attention.forward_with_attention_plan(
                 &scaled,
                 attn_mask,
                 cos,
                 sin,
-                attention_scores_budget,
+                attention_plan,
             )?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
@@ -470,15 +628,15 @@ impl ZImageTransformerBlock {
             let scaled = normed.broadcast_mul(&scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            x + gate_mlp.broadcast_mul(&ffn_out)?
+            Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
             let normed = self.attention_norm1.forward(x)?;
-            let attn_out = self.attention.forward_with_attention_budget(
+            let attn_out = self.attention.forward_with_attention_plan(
                 &normed,
                 attn_mask,
                 cos,
                 sin,
-                attention_scores_budget,
+                attention_plan,
             )?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + attn_out)?;
@@ -486,7 +644,7 @@ impl ZImageTransformerBlock {
             let normed = self.ffn_norm1.forward(&x)?;
             let ffn_out = self.feed_forward.forward(&normed)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            x + ffn_out
+            Ok((x + ffn_out)?)
         }
     }
 
@@ -527,13 +685,49 @@ pub struct ZImageTransformer2DModel {
     cap_pad_token: Tensor,
     noise_refiner: Vec<ZImageTransformerBlock>,
     context_refiner: Vec<ZImageTransformerBlock>,
-    layers: Vec<ZImageTransformerBlock>,
+    layers: TransformerLayers,
     rope_embedder: RopeEmbedder,
     cfg: Config,
 }
 
+/// Main-stack residency for ladder rung 4. The front-end, refiners, and final projection remain
+/// resident; the 30 uniform `layers` blocks can instead be rebuilt from the retained read-only
+/// safetensors view one window at a time.
+enum TransformerLayers {
+    Resident(Vec<ZImageTransformerBlock>),
+    Streamed {
+        weights: VarBuilder<'static>,
+        sidecars: Option<Arc<PackedWeightSidecars>>,
+    },
+}
+
 impl ZImageTransformer2DModel {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_layers(cfg, vb, false, None)
+    }
+
+    /// Build the DiT with a host-backed main stack. This is the provider-side implementation of
+    /// bounded transformer residency: no `layers.N` tensor is transferred until its window runs.
+    pub fn new_block_streamed(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_layers(cfg, vb, true, None)
+    }
+
+    /// Build the streamed DiT with content-addressed device-format artifacts for every packed
+    /// `layers.N` projection. Dense tensors continue to load from `vb` unchanged.
+    pub fn new_block_streamed_with_sidecars(
+        cfg: &Config,
+        vb: VarBuilder<'static>,
+        sidecars: Arc<PackedWeightSidecars>,
+    ) -> Result<Self> {
+        Self::new_with_layers(cfg, vb, true, Some(sidecars))
+    }
+
+    fn new_with_layers(
+        cfg: &Config,
+        vb: VarBuilder<'static>,
+        stream_layers: bool,
+        sidecars: Option<Arc<PackedWeightSidecars>>,
+    ) -> Result<Self> {
         let device = vb.device();
         let dtype = vb.dtype();
 
@@ -584,14 +778,22 @@ impl ZImageTransformer2DModel {
             )?);
         }
 
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for i in 0..cfg.n_layers {
-            layers.push(ZImageTransformerBlock::new(
-                cfg,
-                true,
-                vb.pp("layers").pp(i),
-            )?);
-        }
+        let layers = if stream_layers {
+            TransformerLayers::Streamed {
+                weights: vb.clone(),
+                sidecars,
+            }
+        } else {
+            let mut layers = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                layers.push(ZImageTransformerBlock::new(
+                    cfg,
+                    true,
+                    vb.pp("layers").pp(i),
+                )?);
+            }
+            TransformerLayers::Resident(layers)
+        };
 
         let rope_embedder = RopeEmbedder::new(
             cfg.rope_theta,
@@ -615,6 +817,112 @@ impl ZImageTransformer2DModel {
             rope_embedder,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Narrow sibling seam for the bespoke Fun-ControlNet provider. Keeping the VACE injection math
+    /// in `control.rs` must not expose the packed transformer's weights or layer representation: these
+    /// helpers preserve the same packed attention path while containing future residency changes here.
+    pub(crate) fn control_config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub(crate) fn control_timestep_embedding(&self, t: &Tensor) -> Result<Tensor> {
+        self.t_embedder.forward(t)
+    }
+
+    pub(crate) fn control_embed_image(&self, patches: &Tensor) -> Result<Tensor> {
+        self.x_embedder.forward(patches)
+    }
+
+    pub(crate) fn control_rope(&self, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.rope_embedder.forward(position_ids)
+    }
+
+    pub(crate) fn control_refine_noise<F>(
+        &self,
+        mut hidden: Tensor,
+        attention_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln: &Tensor,
+        mut after_layer: F,
+    ) -> candle_gen::Result<Tensor>
+    where
+        F: FnMut(usize, Tensor) -> candle_gen::Result<Tensor>,
+    {
+        for (index, layer) in self.noise_refiner.iter().enumerate() {
+            hidden = layer.forward_with_attention_plan(
+                &hidden,
+                Some(attention_mask),
+                cos,
+                sin,
+                Some(adaln),
+                AttentionPlan::UNBOUNDED,
+            )?;
+            hidden = after_layer(index, hidden)?;
+        }
+        Ok(hidden)
+    }
+
+    pub(crate) fn control_embed_caption(&self, cap_feats: &Tensor) -> Result<Tensor> {
+        let normalized = self.cap_embedder_norm.forward(cap_feats)?;
+        self.cap_embedder_linear.forward(&normalized)
+    }
+
+    pub(crate) fn control_refine_context(
+        &self,
+        mut hidden: Tensor,
+        attention_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> candle_gen::Result<Tensor> {
+        for layer in &self.context_refiner {
+            hidden = layer.forward_with_attention_plan(
+                &hidden,
+                Some(attention_mask),
+                cos,
+                sin,
+                None,
+                AttentionPlan::UNBOUNDED,
+            )?;
+        }
+        Ok(hidden)
+    }
+
+    pub(crate) fn control_run_resident_layers<F>(
+        &self,
+        mut hidden: Tensor,
+        attention_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln: &Tensor,
+        mut after_layer: F,
+    ) -> candle_gen::Result<Tensor>
+    where
+        F: FnMut(usize, Tensor) -> candle_gen::Result<Tensor>,
+    {
+        let TransformerLayers::Resident(layers) = &self.layers else {
+            return Err(candle_gen::CandleError::Msg(
+                "z-image control: streamed base transformer is not supported by the eager control provider"
+                    .into(),
+            ));
+        };
+        for (index, layer) in layers.iter().enumerate() {
+            hidden = layer.forward_with_attention_plan(
+                &hidden,
+                Some(attention_mask),
+                cos,
+                sin,
+                Some(adaln),
+                AttentionPlan::UNBOUNDED,
+            )?;
+            hidden = after_layer(index, hidden)?;
+        }
+        Ok(hidden)
+    }
+
+    pub(crate) fn control_finish(&self, hidden: &Tensor, adaln: &Tensor) -> Result<Tensor> {
+        self.final_layer.forward(hidden, adaln)
     }
 
     /// Forward pass — returns the **raw** DiT velocity `(B, C, F, H, W)` (the pipeline negates it).
@@ -645,6 +953,47 @@ impl ZImageTransformer2DModel {
         cap_mask: &Tensor,
         attention_scores_budget: usize,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            plan_from_budget(attention_scores_budget),
+        ))
+    }
+
+    /// Request-scoped bounded forward. Only this path attaches a cancel flag; the raw-budget overload
+    /// above remains the compatibility surface for tests and non-request-scoped correctness guards.
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_with_memory(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            attention_plan,
+            self.cfg.n_layers.max(1),
+        )
+    }
+
+    /// Request-scoped forward with both the bounded-attention plan and the admitted transformer
+    /// window. Resident models ignore `transformer_window`; streamed models drive the shared Candle
+    /// block-window scheduler and materialize every block in a window before executing any of them.
+    pub fn forward_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
@@ -675,23 +1024,23 @@ impl ZImageTransformer2DModel {
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
 
         for layer in &self.noise_refiner {
-            x = layer.forward_with_attention_budget(
+            x = layer.forward_with_attention_plan(
                 &x,
                 Some(&x_attn_mask),
                 &x_cos,
                 &x_sin,
                 Some(&adaln_input),
-                attention_scores_budget,
+                attention_plan,
             )?;
         }
         for layer in &self.context_refiner {
-            cap = layer.forward_with_attention_budget(
+            cap = layer.forward_with_attention_plan(
                 &cap,
                 Some(&cap_attn_mask),
                 &cap_cos,
                 &cap_sin,
                 None,
-                attention_scores_budget,
+                attention_plan,
             )?;
         }
 
@@ -701,26 +1050,77 @@ impl ZImageTransformer2DModel {
         let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
 
         let mut unified = unified;
-        for layer in &self.layers {
-            unified = layer.forward_with_attention_budget(
-                &unified,
-                Some(&unified_attn_mask),
-                &unified_cos,
-                &unified_sin,
-                Some(&adaln_input),
-                attention_scores_budget,
-            )?;
+        match &self.layers {
+            TransformerLayers::Resident(layers) => {
+                for layer in layers {
+                    unified = layer.forward_with_attention_plan(
+                        &unified,
+                        Some(&unified_attn_mask),
+                        &unified_cos,
+                        &unified_sin,
+                        Some(&adaln_input),
+                        attention_plan,
+                    )?;
+                }
+            }
+            TransformerLayers::Streamed { weights, sidecars } => {
+                let block_plan = BlockPlan::new(self.cfg.n_layers, transformer_window)?;
+                let uncancelled = candle_gen::gen_core::CancelFlag::default();
+                let cancel = attention_plan.cancel.unwrap_or(&uncancelled);
+                unified = candle_gen::block_window::run_windowed(
+                    self.device(),
+                    &block_plan,
+                    cancel,
+                    unified,
+                    || Ok(weights.clone()),
+                    |mut state, view, range| {
+                        // Materialize the whole window before the first forward. Loading inside the
+                        // block loop would silently execute a window of one regardless of selection.
+                        let blocks = range
+                            .map(|index| {
+                                match sidecars.as_deref() {
+                                    Some(sidecars) => ZImageTransformerBlock::new_streamed(
+                                        &self.cfg,
+                                        true,
+                                        view.pp("layers").pp(index),
+                                        sidecars,
+                                        index,
+                                    ),
+                                    None => ZImageTransformerBlock::new(
+                                        &self.cfg,
+                                        true,
+                                        view.pp("layers").pp(index),
+                                    ),
+                                }
+                                .map_err(candle_gen::CandleError::from)
+                            })
+                            .collect::<candle_gen::Result<Vec<_>>>()?;
+                        for block in &blocks {
+                            candle_gen::check_cancel(cancel)?;
+                            state = block.forward_with_attention_plan(
+                                &state,
+                                Some(&unified_attn_mask),
+                                &unified_cos,
+                                &unified_sin,
+                                Some(&adaln_input),
+                                attention_plan,
+                            )?;
+                        }
+                        Ok(state)
+                    },
+                )?;
+            }
         }
 
         let x_out = unified.narrow(1, 0, img_seq_len)?;
         let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
-        unpatchify(
+        Ok(unpatchify(
             &x_out,
             orig_size,
             patch_size,
             f_patch_size,
             self.cfg.in_channels,
-        )
+        )?)
     }
 
     /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
@@ -739,6 +1139,12 @@ impl ZImageTransformer2DModel {
         &mut self,
         f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        if matches!(&self.layers, TransformerLayers::Streamed { .. }) {
+            return Err(candle_gen::CandleError::Msg(
+                "z-image adapters must be installed before selecting streamed transformer blocks"
+                    .to_owned(),
+            ));
+        }
         f("cap_embedder.1", &mut self.cap_embedder_linear)?;
         f("all_x_embedder.2-1", &mut self.x_embedder)?;
         self.t_embedder.visit_adaptable_mut("t_embedder", f)?;
@@ -748,8 +1154,10 @@ impl ZImageTransformer2DModel {
         for (i, blk) in self.context_refiner.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("context_refiner.{i}"), f)?;
         }
-        for (i, blk) in self.layers.iter_mut().enumerate() {
-            blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        if let TransformerLayers::Resident(layers) = &mut self.layers {
+            for (i, blk) in layers.iter_mut().enumerate() {
+                blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+            }
         }
         self.final_layer
             .visit_adaptable_mut("all_final_layer.2-1", f)?;
@@ -766,12 +1174,16 @@ mod parity_tests {
     //! coverage tracked by sc-9443 (the flux half lives in `candle-gen-flux` `packed_dit.rs`, where the
     //! diffusers→BFL layout difference additionally requires a load-time QKV remap).
     use super::*;
+    use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::{Device, Tensor};
     use candle_gen::candle_nn::{VarBuilder, VarMap};
+    use candle_gen::quant::{pack_mlx_affine, PackedConfig};
     use candle_transformers::models::z_image::preprocess::prepare_inputs;
     use candle_transformers::models::z_image::transformer::{
         Config, ZImageTransformer2DModel as StockModel,
     };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// A tiny Z-Image-shaped config (`head_dim` locked to 128 by `axes_dims=[32,48,48]`): a single head
     /// at `dim=128`, 2 main layers + 1 refiner each — exercises every vendored path cheaply on CPU.
@@ -785,6 +1197,93 @@ mod parity_tests {
         cfg.cap_feat_dim = 64;
         cfg.set_use_accelerated_attn(false);
         cfg
+    }
+
+    struct SidecarFixture(PathBuf);
+
+    impl SidecarFixture {
+        fn new(bits: usize) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "z-image-sc16510-sidecar-{}-{bits}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for SidecarFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_streamed_projection_uses_byte_exact_sidecar(bits: usize) -> Result<()> {
+        let fixture = SidecarFixture::new(bits);
+        let values: Vec<f32> = (0..4 * 64)
+            .map(|i| ((i * 17 + i / 11) % 47) as f32 / 13.0 - 1.0)
+            .collect();
+        let dense = Tensor::from_vec(values, (4, 64), &Device::Cpu)?;
+        let (weight, scales, biases) = pack_mlx_affine(&dense, bits, 64)?;
+        let bias = Tensor::from_vec(vec![0.25f32, -0.5, 0.75, -1.0], 4, &Device::Cpu)?;
+        let source_path = fixture.0.join("model.safetensors");
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([
+                ("layers.0.attention.to_q.weight".to_owned(), weight),
+                ("layers.0.attention.to_q.scales".to_owned(), scales),
+                ("layers.0.attention.to_q.biases".to_owned(), biases),
+                ("layers.0.attention.to_q.bias".to_owned(), bias),
+            ]),
+            &source_path,
+        )?;
+        // SAFETY: immutable fixture files live for the duration of the mapping.
+        let source = unsafe { MmapedSafetensors::new(&source_path)? };
+        let sidecars = PackedWeightSidecars::prepare_prefix_cancelable(
+            &source,
+            &fixture.0,
+            PackedConfig {
+                bits: bits as i32,
+                group_size: 64,
+            },
+            &Device::Cpu,
+            &candle_gen::gen_core::CancelFlag::default(),
+            "layers.",
+        )?;
+        assert_eq!(sidecars.created_count(), 1);
+        let vb = VarBuilder::from_backend(Box::new(source), DType::F32, Device::Cpu)
+            .pp("layers")
+            .pp(0)
+            .pp("attention");
+        let old = QLinear::linear_detect(64, 4, &vb, "to_q", true)?;
+        let missing =
+            streamed_linear_detect(64, 4, &vb, "to_q", true, &sidecars, "layers.1.attention")
+                .err()
+                .expect("a packed streamed projection must not fall back to source conversion");
+        assert!(missing
+            .to_string()
+            .contains("no prepared device-format sidecar"));
+        let prepared =
+            streamed_linear_detect(64, 4, &vb, "to_q", true, &sidecars, "layers.0.attention")?;
+        let input = Tensor::randn(0f32, 1f32, (3, 64), &Device::Cpu)?;
+        let old_output = old.forward(&input)?;
+        let prepared_output = prepared.forward(&input)?;
+        assert_eq!(
+            old_output.to_vec2::<f32>()?,
+            prepared_output.to_vec2::<f32>()?,
+            "q{bits} sidecar path changed the packed projection output"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_q4_projection_uses_byte_exact_device_format_sidecar() -> Result<()> {
+        assert_streamed_projection_uses_byte_exact_sidecar(4)
+    }
+
+    #[test]
+    fn streamed_q8_projection_uses_byte_exact_device_format_sidecar() -> Result<()> {
+        assert_streamed_projection_uses_byte_exact_sidecar(8)
     }
 
     #[test]
@@ -877,6 +1376,132 @@ mod parity_tests {
             diff < 1e-5,
             "query-chunked attention changed the DiT output by {diff}"
         );
+    }
+
+    #[test]
+    fn streamed_windows_match_resident_forward_including_ragged_tail() {
+        let dev = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.n_layers = 3;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        // Populate one immutable host-backed source, then build the streamed front/refiner shell from
+        // that same source. Two forces a 2+1 ragged tail; the larger published candidates exercise
+        // the all-covering window without changing the contract's production range.
+        let resident = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let expected = resident
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+
+        for window in [1, 2, 4, 8, 15, 30] {
+            let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb.clone()).unwrap();
+            let actual = streamed
+                .forward_with_memory(
+                    &prepared.latents,
+                    &t,
+                    &prepared.cap_feats,
+                    &prepared.cap_mask,
+                    plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+                    window,
+                )
+                .unwrap();
+            let diff = (expected.clone() - actual)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-5,
+                "streamed window {window} changed the DiT output by {diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_window_rejects_zero_and_preserves_typed_cancellation() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        // Populate all layer tensors once; the streamed model retains only the source view.
+        let _resident = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let zero = streamed
+            .forward_with_memory(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+                0,
+            )
+            .expect_err("a zero-width transformer window must be rejected");
+        assert!(zero.to_string().contains("window"));
+
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+        let plan = plan_from_budget(candle_gen::ATTN_SCORES_BUDGET).with_cancel(&cancel);
+        let canceled = streamed
+            .forward_with_memory(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan,
+                1,
+            )
+            .expect_err("a canceled streamed request must stop before producing output");
+        assert!(matches!(canceled, candle_gen::CandleError::Canceled));
+    }
+
+    #[test]
+    fn constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let model = ZImageTransformer2DModel::new(&cfg, vb).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let request = candle_gen::gen_core::GenerationRequest::default();
+        request.cancel.cancel();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(2, false))
+            .with_cancel(&request.cancel);
+        let error = model
+            .forward_with_attention_plan(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan,
+            )
+            .expect_err("a canceled constrained request must not complete the DiT forward");
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+        let contract_error: candle_gen::gen_core::Error = error.into();
+        assert!(matches!(
+            contract_error,
+            candle_gen::gen_core::Error::Canceled
+        ));
     }
 
     /// **Additive install on the vendored DiT (sc-11105).** A bare-dotted LoRA over two real `layers.0`
