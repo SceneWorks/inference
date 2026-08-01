@@ -35,6 +35,15 @@ pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256];
 pub const DECODE_OVERLAP: u32 = 64;
 pub const REJECTED_SUB_512_OVERLAP: u32 = 96;
 
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new(
+        provider_id,
+        DECODE_TILE_EDGES.iter().copied(),
+        DECODE_OVERLAP,
+    )
+    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
+}
+
 /// The shared 64-Mi score-element budget used by the MLX rung-3 kernel.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 /// SC-16353 measured 1/2/4/8 plus the unbounded 60-block control at 1024² across Q4/Q8/BF16.
@@ -108,6 +117,7 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let routes = decode_routes(provider_id)?;
     let streamable = is_streamable_spec(spec);
     // The optional control route owns a separate five-block attention branch which is not yet
     // windowed by the shared block loader.  It may use the native tiled VAE, but must not inherit
@@ -169,7 +179,7 @@ pub fn memory_strategy_contract(
     let mut implemented_scratch = vec![(
         MemoryStrategy::BoundedDecode,
         MemoryParameterRanges {
-            decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
+            decode_tile_edges: routes.native_edges().to_vec(),
             decode_overlaps: vec![DECODE_OVERLAP],
             ..Default::default()
         },
@@ -262,16 +272,6 @@ pub(crate) fn safety_check(
             reason: format!("{}: calibration handshake mismatch", contract.provider_id),
         };
     }
-    if context.use_pid
-        && contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: bounded decode covers the native Qwen VAE, not the PiD decoder",
-                contract.provider_id
-            ),
-        };
-    }
     if context.selection.tier.precision != precision || context.selection.tier.quant != quant {
         return MemorySafetyDecision::Reject {
             reason: format!(
@@ -284,6 +284,23 @@ pub(crate) fn safety_check(
         return MemorySafetyDecision::Reject {
             reason: error.to_string(),
         };
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        let routes = match decode_routes(&contract.provider_id) {
+            Ok(routes) => routes,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if let Err(reason) = routes.validate(
+            context.use_pid,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ) {
+            return MemorySafetyDecision::Reject { reason };
+        }
     }
     if !context.budget.fits(context.predicted_peak_bytes) {
         return MemorySafetyDecision::Reject {
@@ -320,6 +337,7 @@ pub(crate) fn begin_request(
     }
     Ok(Some(Box::new(QwenMemoryScope {
         provider_id,
+        decode_routes: decode_routes(provider_id)?,
         memory: qwen_generation_memory(contract, &context.selection),
         geometry: context.geometry,
         use_pid: context.use_pid,
@@ -371,6 +389,7 @@ pub(crate) fn qwen_generation_memory(
 
 struct QwenMemoryScope {
     provider_id: &'static str,
+    decode_routes: mlx_gen_pid::DecodeRoutes,
     memory: Option<GenerationMemory>,
     geometry: MemoryGeometry,
     use_pid: bool,
@@ -430,14 +449,9 @@ impl MemoryRequestScope for QwenMemoryScope {
         overlap: u32,
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
-        if DECODE_TILE_EDGES.contains(&tile_edge) && overlap == DECODE_OVERLAP {
-            Ok(())
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "{}: unsupported native Qwen VAE tile {tile_edge}/{overlap}",
-                self.provider_id
-            )))
-        }
+        self.decode_routes
+            .validate(self.use_pid, Some(tile_edge), Some(overlap))
+            .map_err(CoreError::Unsupported)
     }
 
     fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
@@ -526,6 +540,20 @@ mod tests {
             MemoryStrategy::BoundedTransformerResidency,
             MemoryStrategy::StagedResidency
         ));
+    }
+
+    #[test]
+    fn checked_decode_routes_keep_native_geometry_out_of_pid_requests() {
+        let routes = decode_routes("qwen_image").unwrap();
+        assert_eq!(routes.native_edges(), DECODE_TILE_EDGES);
+        routes
+            .validate(false, Some(DECODE_TILE_EDGE), Some(DECODE_OVERLAP))
+            .unwrap();
+        let error = routes
+            .validate(true, Some(DECODE_TILE_EDGE), Some(DECODE_OVERLAP))
+            .unwrap_err();
+        assert!(error.contains("PiD overlay"));
+        assert!(error.contains("not a"));
     }
 
     #[test]
