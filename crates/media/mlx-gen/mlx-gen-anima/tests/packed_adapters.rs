@@ -40,6 +40,9 @@
 
 mod common;
 
+#[path = "../../tests/support/atomic_cache.rs"]
+mod atomic_cache;
+
 use std::path::{Path, PathBuf};
 
 use mlx_rs::ops::{add, array_eq, matmul, multiply};
@@ -74,19 +77,18 @@ fn packed_split_files(bits: i32) -> PathBuf {
         .join(Variant::Base.dit_filename());
 
     if !dit_dst.is_file() {
-        std::fs::create_dir_all(dit_dst.parent().unwrap()).unwrap();
+        let staging = atomic_cache::prepare_staging(&dit_dst).expect("prepare packed DiT staging");
         let dit_src = real
             .join("diffusion_models")
             .join(Variant::Base.dit_filename());
         eprintln!("[sc-10578] packing {} → q{bits} …", dit_src.display());
-        quantize_anima_dit(&dit_src, &dit_dst, bits, 64).expect("quantize DiT");
+        quantize_anima_dit(&dit_src, &staging, bits, 64).expect("quantize DiT");
+        atomic_cache::publish(&staging, &dit_dst).expect("publish packed DiT");
     }
     // Symlink the components the converter leaves dense (idempotent).
     for sub in ["text_encoders", "vae"] {
         let dst = root.join(sub);
-        if !dst.exists() {
-            std::os::unix::fs::symlink(real.join(sub), &dst).unwrap();
-        }
+        atomic_cache::symlink_or_reuse(&real.join(sub), &dst).expect("publish component symlink");
     }
     root
 }

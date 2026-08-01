@@ -25,6 +25,10 @@ use mlx_gen_flux2::{
 };
 use mlx_rs::{random, Dtype};
 
+#[path = "../../tests/support/atomic_cache.rs"]
+#[allow(dead_code)] // the component-specific producer tests do not assemble symlinks
+mod atomic_cache;
+
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
 
@@ -55,13 +59,11 @@ fn dit_prequantize_loads_packed_and_forwards() {
             "converting dev DiT → Q{BITS} (group {GROUP_SIZE}) at {}",
             dst_transformer.display()
         );
-        quantize_flux2_dit(
-            &snap.join("transformer"),
-            &dst_transformer,
-            BITS,
-            GROUP_SIZE,
-        )
-        .expect("pre-quantize dev DiT");
+        let staging =
+            atomic_cache::prepare_staging(&dst_transformer).expect("prepare dev DiT staging dir");
+        quantize_flux2_dit(&snap.join("transformer"), &staging, BITS, GROUP_SIZE)
+            .expect("pre-quantize dev DiT");
+        atomic_cache::publish(&staging, &dst_transformer).expect("publish dev DiT");
     } else {
         println!("reusing pre-quantized DiT at {}", dst_transformer.display());
     }
@@ -118,8 +120,10 @@ fn te_prequantize_loads_packed_and_encodes() {
             "converting dev Mistral TE → Q{BITS} (group {GROUP_SIZE}) at {}",
             dst_te.display()
         );
-        quantize_flux2_text_encoder_dir(&snap.join("text_encoder"), &dst_te, BITS, GROUP_SIZE)
+        let staging = atomic_cache::prepare_staging(&dst_te).expect("prepare dev TE staging dir");
+        quantize_flux2_text_encoder_dir(&snap.join("text_encoder"), &staging, BITS, GROUP_SIZE)
             .expect("pre-quantize dev TE");
+        atomic_cache::publish(&staging, &dst_te).expect("publish dev TE");
     } else {
         println!("reusing pre-quantized TE at {}", dst_te.display());
     }

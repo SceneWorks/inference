@@ -1,20 +1,51 @@
-//! SC-16353: Qwen-Image MLX bounded-transformer-residency contract.
+//! Qwen-Image MLX shared memory-ladder contract (SC-15511, SC-16353).
 //!
-//! Qwen's current component loader couples the block stream to staged residency, so this provider
-//! adds `StagedResidency` as a realization-specific prerequisite on top of the shared
-//! `DeferredMaterialization` prerequisite. The capability is therefore load-exact: directory +
-//! Sequential + Deferred. Rungs 2 and 3 remain Missing until their owning Qwen family work lands.
+//! Rung 1 uses the existing staged `Residency` lifecycle; rung 2 drives the head-once/tail-tiled
+//! Qwen VAE over its measured production tile ladder; rung 3 threads the shared MLX attention
+//! planner through every one of the 60 joint-attention blocks; rung 4 uses the shared block-window
+//! primitive from SC-16353. The provider contract is the only selector surface.
 
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-mlx-dit-window-2026-08-01-v2";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-mlx-shared-ladder-2026-08-01-v1-deferred";
+pub const EAGER_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-mlx-shared-ladder-2026-08-01-v1-eager";
+
+pub const fn memory_calibration_fingerprint(load_shape: LoadShape) -> &'static str {
+    match load_shape {
+        LoadShape::EagerMaterialization => EAGER_MEMORY_CALIBRATION_FINGERPRINT,
+        LoadShape::DeferredMaterialization => MEMORY_CALIBRATION_FINGERPRINT,
+    }
+}
+
+/// Native Qwen-VAE production tile ladder in output pixels, measured against the exact untiled
+/// decode on the real bf16 VAE. SC-15511's same-process Metal A/B found overlap 96 increased the
+/// incremental active peak by 12 MiB at both 448- and 256-pixel tiles versus overlap 64, so only 64
+/// is shipped. A candidate is not a production range merely because it changes seam blending.
+pub const DECODE_TILE_EDGE: u32 = 512;
+pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256];
+pub const DECODE_OVERLAP: u32 = 64;
+pub const REJECTED_SUB_512_OVERLAP: u32 = 96;
+
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new(
+        provider_id,
+        DECODE_TILE_EDGES.iter().copied(),
+        DECODE_OVERLAP,
+    )
+    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
+}
+
+/// The shared 64-Mi score-element budget used by the MLX rung-3 kernel.
+pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 /// SC-16353 measured 1/2/4/8 plus the unbounded 60-block control at 1024² across Q4/Q8/BF16.
 /// Only window 1 materially lowered the denoise counter versus the same-stream unbounded control;
 /// windows above 1 were indistinguishable noise or worse and never moved the conditioning-bound
@@ -86,7 +117,12 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let routes = decode_routes(provider_id)?;
     let streamable = is_streamable_spec(spec);
+    // The optional control route owns a separate five-block attention branch which is not yet
+    // windowed by the shared block loader.  It may use the native tiled VAE, but must not inherit
+    // the base/edit route's rung-3 or rung-4 claims merely because those providers share a crate.
+    let has_unbounded_control_branch = provider_id == "qwen_image_control";
     let footprint = crate::model::component_footprint(spec)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
@@ -110,11 +146,13 @@ pub fn memory_strategy_contract(
             MemoryFormulaVariable::BatchCount,
             MemoryFormulaVariable::ConditioningTokenCount,
             MemoryFormulaVariable::OverlayBytes,
+            MemoryFormulaVariable::DecodeTileArea,
+            MemoryFormulaVariable::AttentionChunkSize,
             MemoryFormulaVariable::TransformerWindowSize,
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        memory_calibration_fingerprint(spec.load_shape),
     ));
     let overlay_bytes = spec.control.as_ref().and_then(source_bytes).unwrap_or(0);
     contract.asset_facts.base_bytes = footprint
@@ -133,9 +171,37 @@ pub fn memory_strategy_contract(
             MemoryPhase::Decode,
         ],
         synchronized_phase_release: matches!(spec.offload_policy, OffloadPolicy::Sequential),
-        transformer_window_materialization: streamable,
-        ..Default::default()
+        decode_tiling: true,
+        attention_chunking: !has_unbounded_control_branch,
+        transformer_window_materialization: streamable && !has_unbounded_control_branch,
     };
+
+    let mut implemented_scratch = vec![(
+        MemoryStrategy::BoundedDecode,
+        MemoryParameterRanges {
+            decode_tile_edges: routes.native_edges().to_vec(),
+            decode_overlaps: vec![DECODE_OVERLAP],
+            ..Default::default()
+        },
+    )];
+    if !has_unbounded_control_branch {
+        implemented_scratch.push((
+            MemoryStrategy::BoundedAttention,
+            MemoryParameterRanges {
+                attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
+                ..Default::default()
+            },
+        ));
+    }
+    for (strategy, parameters) in implemented_scratch {
+        let capability = contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == strategy)
+            .expect("compatibility contract contains every strategy");
+        capability.support = MemoryStrategySupport::Implemented;
+        capability.parameters = parameters;
+    }
 
     if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
         let staged = contract
@@ -145,7 +211,7 @@ pub fn memory_strategy_contract(
             .expect("compatibility contract contains every strategy");
         staged.support = MemoryStrategySupport::Implemented;
     }
-    if streamable {
+    if streamable && !has_unbounded_control_branch {
         let plan = mlx_gen::block_residency::BlockPlan::new(
             TRANSFORMER_BLOCKS as usize,
             TRANSFORMER_WINDOW_SIZE as usize,
@@ -206,14 +272,6 @@ pub(crate) fn safety_check(
             reason: format!("{}: calibration handshake mismatch", contract.provider_id),
         };
     }
-    if context.use_pid {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: the measured Qwen rung-4 contract covers native VAE decode, not PiD",
-                contract.provider_id
-            ),
-        };
-    }
     if context.selection.tier.precision != precision || context.selection.tier.quant != quant {
         return MemorySafetyDecision::Reject {
             reason: format!(
@@ -226,6 +284,23 @@ pub(crate) fn safety_check(
         return MemorySafetyDecision::Reject {
             reason: error.to_string(),
         };
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        let routes = match decode_routes(&contract.provider_id) {
+            Ok(routes) => routes,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if let Err(reason) = routes.validate(
+            context.use_pid,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ) {
+            return MemorySafetyDecision::Reject { reason };
+        }
     }
     if !context.budget.fits(context.predicted_peak_bytes) {
         return MemorySafetyDecision::Reject {
@@ -262,16 +337,63 @@ pub(crate) fn begin_request(
     }
     Ok(Some(Box::new(QwenMemoryScope {
         provider_id,
-        selection: context.selection,
+        decode_routes: decode_routes(provider_id)?,
+        memory: qwen_generation_memory(contract, &context.selection),
         geometry: context.geometry,
+        use_pid: context.use_pid,
+        transformer_window: contract
+            .engages(
+                context.selection.strategy,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .then_some(context.selection.parameters.transformer_window_size)
+            .flatten(),
         finished: false,
     })))
 }
 
+pub(crate) fn qwen_generation_memory(
+    contract: &MemoryProviderContract,
+    selection: &mlx_gen::gen_core::MemorySelection,
+) -> Option<GenerationMemory> {
+    if selection.strategy == MemoryStrategy::Resident {
+        return None;
+    }
+    let parameters = selection.parameters;
+    let stage_residency = contract.engages(selection.strategy, MemoryStrategy::StagedResidency);
+    let tile_vae_decode = contract.engages(selection.strategy, MemoryStrategy::BoundedDecode);
+    let chunk_attention = contract.engages(selection.strategy, MemoryStrategy::BoundedAttention);
+    let stream_transformer_blocks = contract.engages(
+        selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    );
+    Some(GenerationMemory {
+        stage_residency,
+        tile_vae_decode,
+        decode_tile_edge: tile_vae_decode
+            .then_some(parameters.decode_tile_edge)
+            .flatten(),
+        decode_overlap: tile_vae_decode
+            .then_some(parameters.decode_overlap)
+            .flatten(),
+        chunk_attention,
+        stream_transformer_blocks,
+        transformer_window_size: stream_transformer_blocks
+            .then_some(parameters.transformer_window_size)
+            .flatten(),
+        transformer_window_component: stream_transformer_blocks
+            .then(|| parameters.window_component()),
+        ..Default::default()
+    })
+}
+
 struct QwenMemoryScope {
     provider_id: &'static str,
-    selection: mlx_gen::gen_core::MemorySelection,
+    decode_routes: mlx_gen_pid::DecodeRoutes,
+    memory: Option<GenerationMemory>,
     geometry: MemoryGeometry,
+    use_pid: bool,
+    transformer_window: Option<u32>,
     finished: bool,
 }
 
@@ -288,6 +410,12 @@ impl QwenMemoryScope {
 
 impl MemoryRequestScope for QwenMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
+        if request.use_pid != self.use_pid {
+            return Err(CoreError::Unsupported(format!(
+                "{}: request use_pid={} does not match admitted use_pid={}",
+                self.provider_id, request.use_pid, self.use_pid
+            )));
+        }
         if request.width != self.geometry.width
             || request.height != self.geometry.height
             || request.count == 0
@@ -304,26 +432,7 @@ impl MemoryRequestScope for QwenMemoryScope {
                 self.geometry.batch
             )));
         }
-        request.memory = match self.selection.strategy {
-            MemoryStrategy::Resident => None,
-            MemoryStrategy::StagedResidency => Some(GenerationMemory {
-                stage_residency: true,
-                ..Default::default()
-            }),
-            MemoryStrategy::BoundedTransformerResidency => Some(GenerationMemory {
-                stage_residency: true,
-                stream_transformer_blocks: true,
-                transformer_window_size: self.selection.parameters.transformer_window_size,
-                transformer_window_component: Some(TransformerComponent::Dit),
-                ..Default::default()
-            }),
-            strategy => {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: strategy {strategy:?} is not implemented",
-                    self.provider_id
-                )))
-            }
-        };
+        request.memory = self.memory;
         Ok(())
     }
 
@@ -336,19 +445,24 @@ impl MemoryRequestScope for QwenMemoryScope {
 
     fn configure_decode(
         &mut self,
-        _tile_edge: u32,
-        _overlap: u32,
+        tile_edge: u32,
+        overlap: u32,
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
-        Err(CoreError::Unsupported(
-            "qwen-image: bounded decode is not declared by this slice".into(),
-        ))
+        self.decode_routes
+            .validate(self.use_pid, Some(tile_edge), Some(overlap))
+            .map_err(CoreError::Unsupported)
     }
 
-    fn configure_attention(&mut self, _chunk_size: u32) -> CoreResult<()> {
-        Err(CoreError::Unsupported(
-            "qwen-image: bounded attention is not declared by this slice".into(),
-        ))
+    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
+        if chunk_size == ATTENTION_CHUNK_SIZE {
+            Ok(())
+        } else {
+            Err(CoreError::Unsupported(format!(
+                "{}: attention chunk size must be {ATTENTION_CHUNK_SIZE}, got {chunk_size}",
+                self.provider_id
+            )))
+        }
     }
 
     fn materialize_transformer_window(
@@ -356,7 +470,7 @@ impl MemoryRequestScope for QwenMemoryScope {
         first_block: u32,
         block_count: u32,
     ) -> CoreResult<()> {
-        if self.selection.strategy != MemoryStrategy::BoundedTransformerResidency
+        if self.transformer_window != Some(TRANSFORMER_WINDOW_SIZE)
             || block_count != TRANSFORMER_WINDOW_SIZE
             || first_block >= TRANSFORMER_BLOCKS
         {
@@ -398,6 +512,18 @@ mod tests {
     fn sequential_deferred_directory_declares_the_exact_dit_window() {
         let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
         assert!(contract.conformance_errors().is_empty());
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
+        assert_eq!(decode.support, MemoryStrategySupport::Implemented);
+        assert_eq!(decode.parameters.decode_tile_edges, DECODE_TILE_EDGES);
+        assert_eq!(decode.parameters.decode_overlaps, vec![DECODE_OVERLAP]);
+        let attention = contract
+            .capability(MemoryStrategy::BoundedAttention)
+            .unwrap();
+        assert_eq!(attention.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            attention.parameters.attention_chunk_sizes,
+            vec![ATTENTION_CHUNK_SIZE]
+        );
         let rung = contract
             .capability(MemoryStrategy::BoundedTransformerResidency)
             .unwrap();
@@ -414,6 +540,144 @@ mod tests {
             MemoryStrategy::BoundedTransformerResidency,
             MemoryStrategy::StagedResidency
         ));
+    }
+
+    #[test]
+    fn checked_decode_routes_keep_native_geometry_out_of_pid_requests() {
+        let routes = decode_routes("qwen_image").unwrap();
+        assert_eq!(routes.native_edges(), DECODE_TILE_EDGES);
+        routes
+            .validate(false, Some(DECODE_TILE_EDGE), Some(DECODE_OVERLAP))
+            .unwrap();
+        let error = routes
+            .validate(true, Some(DECODE_TILE_EDGE), Some(DECODE_OVERLAP))
+            .unwrap_err();
+        assert!(error.contains("PiD overlay"));
+        assert!(error.contains("not a"));
+    }
+
+    #[test]
+    fn control_route_does_not_overstate_its_unbounded_side_branch() {
+        let contract = memory_strategy_contract("qwen_image_control", &spec()).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        for strategy in [
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ] {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Missing,
+                "the separate five-block control branch is not yet bounded"
+            );
+        }
+        assert!(!contract.lifecycle.attention_chunking);
+        assert!(!contract.lifecycle.transformer_window_materialization);
+    }
+
+    fn selection(strategy: MemoryStrategy) -> MemorySelection {
+        let mut parameters = MemoryStrategyParameters::default();
+        if matches!(
+            strategy,
+            MemoryStrategy::BoundedDecode
+                | MemoryStrategy::BoundedAttention
+                | MemoryStrategy::BoundedTransformerResidency
+        ) {
+            parameters.decode_tile_edge = Some(DECODE_TILE_EDGE);
+            parameters.decode_overlap = Some(DECODE_OVERLAP);
+        }
+        if matches!(
+            strategy,
+            MemoryStrategy::BoundedAttention | MemoryStrategy::BoundedTransformerResidency
+        ) {
+            parameters.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        }
+        if strategy == MemoryStrategy::BoundedTransformerResidency {
+            parameters.transformer_window_size = Some(TRANSFORMER_WINDOW_SIZE);
+            parameters.transformer_window_component = Some(TransformerComponent::Dit);
+        }
+        MemorySelection {
+            strategy,
+            parameters,
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+        }
+    }
+
+    #[test]
+    fn selections_translate_to_the_shared_cumulative_request_contract() {
+        let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
+        let resident = qwen_generation_memory(&contract, &selection(MemoryStrategy::Resident));
+        assert_eq!(resident, None);
+
+        let staged =
+            qwen_generation_memory(&contract, &selection(MemoryStrategy::StagedResidency)).unwrap();
+        assert!(staged.stage_residency);
+        assert!(!staged.tile_vae_decode);
+        assert!(!staged.chunk_attention);
+        assert!(!staged.stream_transformer_blocks);
+
+        let decode =
+            qwen_generation_memory(&contract, &selection(MemoryStrategy::BoundedDecode)).unwrap();
+        assert!(!decode.stage_residency);
+        assert!(decode.tile_vae_decode);
+        assert_eq!(decode.decode_tile_edge, Some(DECODE_TILE_EDGE));
+        assert_eq!(decode.decode_overlap, Some(DECODE_OVERLAP));
+        assert!(!decode.chunk_attention);
+
+        let attention =
+            qwen_generation_memory(&contract, &selection(MemoryStrategy::BoundedAttention))
+                .unwrap();
+        assert!(attention.tile_vae_decode);
+        assert!(attention.chunk_attention);
+        assert!(!attention.stage_residency);
+
+        let streamed = qwen_generation_memory(
+            &contract,
+            &selection(MemoryStrategy::BoundedTransformerResidency),
+        )
+        .unwrap();
+        assert!(
+            streamed.stage_residency,
+            "Qwen rung 4 explicitly requires rung 1"
+        );
+        assert!(streamed.tile_vae_decode);
+        assert!(streamed.chunk_attention);
+        assert!(streamed.stream_transformer_blocks);
+        assert_eq!(
+            streamed.transformer_window_component,
+            Some(TransformerComponent::Dit)
+        );
+    }
+
+    #[test]
+    fn unpublished_parameters_are_rejected_instead_of_silently_coerced() {
+        let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
+        let mut decode = selection(MemoryStrategy::BoundedDecode);
+        assert!(
+            contract.validate_selection(&decode).is_ok(),
+            "{:?}",
+            contract.validate_selection(&decode)
+        );
+        decode.parameters.decode_overlap = Some(REJECTED_SUB_512_OVERLAP);
+        assert!(contract.validate_selection(&decode).is_err());
+
+        let mut attention = selection(MemoryStrategy::BoundedAttention);
+        assert!(
+            contract.validate_selection(&attention).is_ok(),
+            "{:?}",
+            contract.validate_selection(&attention)
+        );
+        attention.parameters.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE / 2);
+        assert!(contract.validate_selection(&attention).is_err());
     }
 
     #[test]
@@ -484,20 +748,12 @@ mod tests {
     #[test]
     fn rung_four_rejects_an_unpublished_window() {
         let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
-        let mut selection = MemorySelection {
-            strategy: MemoryStrategy::BoundedTransformerResidency,
-            parameters: MemoryStrategyParameters {
-                transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
-                transformer_window_component: Some(TransformerComponent::Dit),
-                ..Default::default()
-            },
-            tier: MemoryNumericTier {
-                precision: Precision::Bf16,
-                quant: None,
-                component_precision_floors: &[],
-            },
-        };
-        assert!(contract.validate_selection(&selection).is_ok());
+        let mut selection = selection(MemoryStrategy::BoundedTransformerResidency);
+        assert!(
+            contract.validate_selection(&selection).is_ok(),
+            "{:?}",
+            contract.validate_selection(&selection)
+        );
         selection.parameters.transformer_window_size = Some(2);
         assert!(contract.validate_selection(&selection).is_err());
     }

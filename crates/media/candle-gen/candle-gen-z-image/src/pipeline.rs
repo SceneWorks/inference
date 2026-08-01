@@ -311,8 +311,8 @@ pub(crate) struct Components {
 /// but owning it here gives the phase one unambiguous lifetime and avoids a process cache silently
 /// retaining an encoder handle after its embeddings have been materialized.
 pub(crate) struct TextPhase {
-    text_encoder: TextEnc,
-    tokenizer: TextTokenizer,
+    pub(crate) text_encoder: TextEnc,
+    pub(crate) tokenizer: TextTokenizer,
 }
 
 /// Execute the three accelerator-residency phases with explicit scopes. Synchronization happens
@@ -432,6 +432,18 @@ impl Pipeline {
     /// the sequential ladder must use this path for both packed and dense tiers so its explicit
     /// attention-score budget is honored by bf16 as well as q4/q8.
     pub(crate) fn load_transformer(
+        &self,
+        use_accelerated_attn: bool,
+        stream_transformer_blocks: bool,
+    ) -> Result<DiT> {
+        self.load_transformer_cancelable(
+            use_accelerated_attn,
+            stream_transformer_blocks,
+            &CancelFlag::default(),
+        )
+    }
+
+    fn load_transformer_cancelable(
         &self,
         use_accelerated_attn: bool,
         stream_transformer_blocks: bool,
@@ -930,7 +942,13 @@ impl Pipeline {
             |text| self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
             // sc-9032: accelerated attention is not currently wired; match the resident path's
             // effective false value exactly.
-            || self.load_transformer(false, memory.stream_transformer_blocks, &req.cancel),
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
             |transformer, cap, on_progress| {
                 self.denoise_sequential(
                     req,
@@ -1021,7 +1039,13 @@ impl Pipeline {
                 };
                 Ok((cap, neg_cap))
             },
-            || self.load_transformer(false, memory.stream_transformer_blocks, &req.cancel),
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
             |transformer, (cap, neg_cap), on_progress| {
                 self.denoise_base_sequential(
                     req,
@@ -1905,7 +1929,7 @@ mod tests {
         let pipeline = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[], None);
         let cancel = CancelFlag::new();
         cancel.cancel();
-        let error = match pipeline.load_transformer(false, true, &cancel) {
+        let error = match pipeline.load_transformer_cancelable(false, true, &cancel) {
             Ok(_) => panic!("a canceled sidecar preparation must not construct a transformer"),
             Err(error) => error,
         };
