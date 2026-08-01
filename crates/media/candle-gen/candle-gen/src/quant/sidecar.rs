@@ -74,7 +74,7 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
     ) -> Result<Self> {
-        Self::prepare_impl(source, component_dir, packed, device, None)
+        Self::prepare_impl(source, component_dir, packed, device, None, None)
     }
 
     /// Cancellation-aware preparation for request-time component opens. Hashing checks between
@@ -86,7 +86,35 @@ impl PackedWeightSidecars {
         device: &Device,
         cancel: &CancelFlag,
     ) -> Result<Self> {
-        Self::prepare_impl(source, component_dir, packed, device, Some(cancel))
+        Self::prepare_impl(source, component_dir, packed, device, Some(cancel), None)
+    }
+
+    /// Prepare only packed projections whose full tensor base starts with `base_prefix`.
+    ///
+    /// This is the bounded-residency variant for providers whose streamed stack is one prefix inside
+    /// a larger component. It avoids hashing and materializing sidecars for weights that remain
+    /// resident, while retaining the same content address and cache lifecycle as [`Self::prepare`].
+    pub fn prepare_prefix_cancelable(
+        source: &MmapedSafetensors,
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: &CancelFlag,
+        base_prefix: &str,
+    ) -> Result<Self> {
+        if base_prefix.is_empty() {
+            return Err(Error::Msg(
+                "device-format sidecar: base prefix must not be empty".to_owned(),
+            ));
+        }
+        Self::prepare_impl(
+            source,
+            component_dir,
+            packed,
+            device,
+            Some(cancel),
+            Some(base_prefix),
+        )
     }
 
     fn prepare_impl(
@@ -95,6 +123,7 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
         cancel: Option<&CancelFlag>,
+        base_prefix: Option<&str>,
     ) -> Result<Self> {
         check_cancel(cancel)?;
         let bits = usize::try_from(packed.bits).map_err(|_| {
@@ -162,13 +191,17 @@ impl PackedWeightSidecars {
             .tensors()
             .into_iter()
             .filter_map(|(name, _)| name.strip_suffix(".scales").map(str::to_owned))
+            .filter(|base| base_prefix.is_none_or(|prefix| base.starts_with(prefix)))
             .collect();
         bases.sort();
         bases.dedup();
         if bases.is_empty() {
+            let selection = base_prefix
+                .map(|prefix| format!(" matching prefix `{prefix}`"))
+                .unwrap_or_default();
             return Err(Error::Msg(format!(
-                "device-format sidecar: packed component {} has no `.scales` triples",
-                component_dir.display()
+                "device-format sidecar: packed component {} has no `.scales` triples{selection}",
+                component_dir.display(),
             )));
         }
 
@@ -960,6 +993,43 @@ mod tests {
     #[test]
     fn q8_sidecar_is_byte_exact_and_reused_without_source_conversion() -> Result<()> {
         assert_q4_or_q8(8)
+    }
+
+    #[test]
+    fn prefix_preparation_excludes_resident_component_weights() -> Result<()> {
+        let dir = TestDir::new("prefix");
+        let values: Vec<f32> = (0..2 * 64).map(|i| (i % 29) as f32 / 9.0).collect();
+        let dense = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
+        let (layer_w, layer_s, layer_b) = pack_mlx_affine(&dense, 4, 64)?;
+        let (resident_w, resident_s, resident_b) = pack_mlx_affine(&dense, 4, 64)?;
+        let path = dir.0.join("model.safetensors");
+        safetensors::save(
+            &HashMap::from([
+                ("layers.0.proj.weight".to_owned(), layer_w),
+                ("layers.0.proj.scales".to_owned(), layer_s),
+                ("layers.0.proj.biases".to_owned(), layer_b),
+                ("noise_refiner.0.proj.weight".to_owned(), resident_w),
+                ("noise_refiner.0.proj.scales".to_owned(), resident_s),
+                ("noise_refiner.0.proj.biases".to_owned(), resident_b),
+            ]),
+            &path,
+        )?;
+        let source = open(&path)?;
+        let cache = PackedWeightSidecars::prepare_prefix_cancelable(
+            &source,
+            &dir.0,
+            PackedConfig {
+                bits: 4,
+                group_size: 64,
+            },
+            &Device::Cpu,
+            &CancelFlag::default(),
+            "layers.",
+        )?;
+        assert_eq!(cache.created_count(), 1);
+        assert!(cache.contains("layers.0.proj"));
+        assert!(!cache.contains("noise_refiner.0.proj"));
+        Ok(())
     }
 
     #[test]

@@ -90,22 +90,22 @@
 //!
 //! ## What that leaves undeclared, stated rather than glossed
 //!
-//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization — which ships today — does have
-//! a host cost, and this decision does **not** surface its size. Its per-window conversion allocates
-//! anonymous host memory per projection and frees it again: on the order of the block's unpacked codes
-//! for q4, and for q8 a **full dense f32 grid** (`repack::dequant_mlx_q8_gs`), which for a
-//! 3840 × 15360 projection is a few hundred MiB. Those are transients, not held for the request, and
-//! they are **not measured** — SC-15791 states plainly that q8 host memory is unverified. So on a
-//! low-RAM host a rung-4 Candle selection today carries an unquantified host transient that no gate
-//! sees. That is a consequence of the non-conforming realization, and SC-16096 both removes the
-//! conversion and owes the host measurement; it is recorded here so it is not mistaken for zero.
+//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization does have a host cost, and this
+//! decision does **not** surface its size. The original packed Candle realization converted each
+//! window from MLX-affine source tensors, allocating anonymous host memory per projection: on the
+//! order of the block's unpacked codes for q4, and for q8 a **full dense f32 grid**
+//! (`repack::dequant_mlx_q8_gs`), which for a 3840 × 15360 projection is a few hundred MiB. Those
+//! transients were not held for the request and SC-15791 did not measure them. SC-16096 replaced that
+//! Krea/Lens path with content-addressed device-format sidecars; SC-16510 completed the same transition
+//! for streamed Z-Image blocks. No current media provider declares `HostFormatConversion`, but the
+//! variant remains so a future converting realization must describe itself honestly rather than claim
+//! a device-format transfer.
 //!
 //! **Revisit trigger — deliberately broad enough to catch that case.** The axis is owed if a
 //! realization is measured to need host memory proportional to the model that a fit gate would have to
 //! account for: whether it is held for the request or transient, reclaimable or not, and whether or not
-//! a device-format alternative exists. SC-16096 must raise it rather than absorb it. What is *not* owed
-//! is an axis built ahead of that measurement, on the strength of a figure derived for a fix nobody has
-//! written.
+//! a device-format alternative exists. A provider that crosses that threshold must raise the contract
+//! question rather than absorb it. What is *not* owed is an axis built ahead of that measurement.
 
 use crate::{
     weightsmeta::safetensors_path_bytes, AdapterSpec, Error, GenerationRequest, LoadShape,
