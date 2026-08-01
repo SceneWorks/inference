@@ -26,7 +26,7 @@ pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const CALIBRATION_FINGERPRINT: &str =
-    "z-image-cuda-staged-tiled-decode-bounded-attention-streamed-blocks-v1";
+    "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
 
 pub(crate) fn generation_memory(
     contract: &MemoryProviderContract,
@@ -68,14 +68,6 @@ pub(crate) fn provider_contract(
 ) -> gen_core::Result<MemoryProviderContract> {
     let streamable =
         matches!(spec.weights, gen_core::WeightsSource::Dir(_)) && spec.adapters.is_empty();
-    let packed_snapshot = match &spec.weights {
-        gen_core::WeightsSource::Dir(root) => std::fs::read(root.join("transformer/config.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|config| config.get("quantization").cloned())
-            .is_some_and(|quantization| !quantization.is_null()),
-        gen_core::WeightsSource::File(_) => false,
-    };
     let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
             .unwrap_or_default();
@@ -120,18 +112,10 @@ pub(crate) fn provider_contract(
             device_residency: true,
             host_backed_weights: true,
             host_to_device_block_materialization: true,
-            block_materialization: if packed_snapshot {
-                // Packed q4/q8 blocks currently repack the MLX affine triple while loading each
-                // window. The declaration is intentionally honest; the paired follow-up replaces
-                // it with reusable device-format sidecars without changing the contract surface.
-                MemoryWindowMaterialization::HostFormatConversion {
-                    converts: "MLX affine q4/q8 block tensors into Candle quantized weights"
-                        .to_owned(),
-                    owner_story: "sc-16510".to_owned(),
-                }
-            } else {
-                MemoryWindowMaterialization::DeviceFormatTransfer
-            },
+            // Packed q4/q8 `layers.N` projections are prepared once as content-addressed GGML
+            // sidecars; each window maps and transfers only those already-device-format bytes.
+            // Dense snapshots already transfer their stored tensor format directly.
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
         // PiD replaces the native VAE with a separately planned decoder. Until that decoder accepts
@@ -594,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn block_materialization_reports_conversion_only_for_packed_snapshots() {
+    fn block_materialization_reports_device_format_transfer_for_dense_and_packed_snapshots() {
         let dense = provider_contract(crate::MODEL_ID, &spec()).unwrap();
         assert!(matches!(
             dense.backend,
@@ -621,9 +605,9 @@ mod tests {
         assert!(matches!(
             packed.backend,
             MemoryBackendRealization::CandleCuda {
-                block_materialization: MemoryWindowMaterialization::HostFormatConversion { ref owner_story, .. },
+                block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
                 ..
-            } if owner_story == "sc-16510"
+            }
         ));
     }
 

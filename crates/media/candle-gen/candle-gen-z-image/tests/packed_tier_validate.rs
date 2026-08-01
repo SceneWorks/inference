@@ -28,6 +28,132 @@ use candle_gen::gen_core::{
 
 use candle_gen_z_image::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
 
+#[cfg(all(windows, feature = "cuda"))]
+mod host_memory {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            size: u32,
+        ) -> i32;
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Peak {
+        pub working_set_start: u64,
+        pub working_set_peak: u64,
+        pub working_set_end: u64,
+        pub private_start: u64,
+        pub private_peak: u64,
+        pub private_end: u64,
+    }
+
+    fn counters() -> (u64, u64) {
+        let mut counters = ProcessMemoryCountersEx {
+            cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            page_fault_count: 0,
+            peak_working_set_size: 0,
+            working_set_size: 0,
+            quota_peak_paged_pool_usage: 0,
+            quota_paged_pool_usage: 0,
+            quota_peak_non_paged_pool_usage: 0,
+            quota_non_paged_pool_usage: 0,
+            pagefile_usage: 0,
+            peak_pagefile_usage: 0,
+            private_usage: 0,
+        };
+        // SAFETY: the current-process pseudo handle is always valid and the struct/size match the API.
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "K32GetProcessMemoryInfo failed");
+        (
+            counters.working_set_size as u64,
+            counters.private_usage as u64,
+        )
+    }
+
+    fn update_max(target: &AtomicU64, value: u64) {
+        target.fetch_max(value, Ordering::Relaxed);
+    }
+
+    pub fn sample<T>(f: impl FnOnce() -> T) -> (T, Peak) {
+        let (working_set_start, private_start) = counters();
+        let stop = Arc::new(AtomicBool::new(false));
+        let working_set_peak = Arc::new(AtomicU64::new(working_set_start));
+        let private_peak = Arc::new(AtomicU64::new(private_start));
+        let sampler = {
+            let stop = Arc::clone(&stop);
+            let working_set_peak = Arc::clone(&working_set_peak);
+            let private_peak = Arc::clone(&private_peak);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let (working_set, private) = counters();
+                    update_max(&working_set_peak, working_set);
+                    update_max(&private_peak, private);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let result = f();
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        let (working_set_end, private_end) = counters();
+        (
+            result,
+            Peak {
+                working_set_start,
+                working_set_peak: working_set_peak.load(Ordering::Relaxed),
+                working_set_end,
+                private_start,
+                private_peak: private_peak.load(Ordering::Relaxed),
+                private_end,
+            },
+        )
+    }
+}
+
+#[cfg(all(not(windows), feature = "cuda"))]
+mod host_memory {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Peak {
+        pub working_set_start: u64,
+        pub working_set_peak: u64,
+        pub working_set_end: u64,
+        pub private_start: u64,
+        pub private_peak: u64,
+        pub private_end: u64,
+    }
+
+    pub fn sample<T>(f: impl FnOnce() -> T) -> (T, Peak) {
+        (f(), Peak::default())
+    }
+}
 /// Basic non-degeneracy: the render is not solid-black / constant (a broken packed forward — NaN or
 /// zeroed activations — decodes to a flat image), and has some spread of pixel values.
 fn assert_coherent(img: &Image, tag: &str) {
@@ -133,7 +259,9 @@ fn render_base_ladder(
     generator: &dyn candle_gen::gen_core::Generator,
     strategy: MemoryStrategy,
     transformer_window_size: Option<u32>,
-) -> Image {
+    quant: Quant,
+    step_count: u32,
+) -> (Image, Vec<f64>) {
     let contract = generator
         .memory_strategy_contract()
         .expect("CUDA Z-Image base must publish a memory contract");
@@ -165,7 +293,7 @@ fn render_base_ladder(
         parameters,
         tier: MemoryNumericTier {
             precision: Precision::Bf16,
-            quant: Some(Quant::Q4),
+            quant: Some(quant),
             component_precision_floors: &[],
         },
     };
@@ -215,12 +343,21 @@ fn render_base_ladder(
         height: 256,
         count: 1,
         seed: Some(15815),
-        steps: Some(1),
+        steps: Some(step_count),
         guidance: Some(1.0),
         ..Default::default()
     };
     scope.configure_request(&mut request).unwrap();
-    let output = generator.generate(&request, &mut |_| {});
+    let started = Instant::now();
+    let mut last_step = started;
+    let mut step_seconds = Vec::new();
+    let output = generator.generate(&request, &mut |progress| {
+        if matches!(progress, Progress::Step { .. }) {
+            let now = Instant::now();
+            step_seconds.push(now.duration_since(last_step).as_secs_f64());
+            last_step = now;
+        }
+    });
     let image = match output {
         Ok(GenerationOutput::Images(mut images)) => {
             assert_eq!(images.len(), 1);
@@ -238,7 +375,7 @@ fn render_base_ladder(
         }
     };
     scope.finish(MemoryRunOutcome::Complete).unwrap();
-    image
+    (image, step_seconds)
 }
 
 #[test]
@@ -253,7 +390,13 @@ fn packed_base_all_rungs_preserve_fixed_seed_output() {
         .unwrap()
         .load("z_image", &spec)
         .expect("load packed Z-Image base");
-    let reference = render_base_ladder(generator.as_ref(), MemoryStrategy::Resident, None);
+    let (reference, _) = render_base_ladder(
+        generator.as_ref(),
+        MemoryStrategy::Resident,
+        None,
+        Quant::Q4,
+        1,
+    );
     assert_coherent(&reference, "base-q4-resident");
     for (strategy, window) in [
         (MemoryStrategy::StagedResidency, None),
@@ -261,11 +404,155 @@ fn packed_base_all_rungs_preserve_fixed_seed_output() {
         (MemoryStrategy::BoundedAttention, None),
         (MemoryStrategy::BoundedTransformerResidency, Some(1)),
     ] {
-        let adapted = render_base_ladder(generator.as_ref(), strategy, window);
+        let (adapted, _) = render_base_ladder(generator.as_ref(), strategy, window, Quant::Q4, 1);
         assert_eq!(
             adapted, reference,
             "real packed Z-Image output changed at {strategy:?} / window {window:?}"
         );
+    }
+}
+
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q8 + CUDA; proves q8 resident/sidecar output parity"]
+fn packed_base_q8_rung_four_preserves_fixed_seed_output() {
+    let tier = PathBuf::from(
+        std::env::var("Z_IMAGE_BASE_PACKED_Q8")
+            .expect("set Z_IMAGE_BASE_PACKED_Q8 to the z-image q8 tier directory"),
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(tier));
+    let generator = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
+        .expect("load packed Z-Image base q8");
+    let (resident, _) = render_base_ladder(
+        generator.as_ref(),
+        MemoryStrategy::Resident,
+        None,
+        Quant::Q8,
+        1,
+    );
+    let (streamed, _) = render_base_ladder(
+        generator.as_ref(),
+        MemoryStrategy::BoundedTransformerResidency,
+        Some(1),
+        Quant::Q8,
+        1,
+    );
+    assert_eq!(streamed, resident, "real q8 sidecar output changed");
+}
+
+#[cfg(feature = "cuda")]
+fn profile_sidecar_preparation(tier: &std::path::Path, tag: &str) {
+    use candle_gen::candle_core::safetensors::MmapedSafetensors;
+    use candle_gen::candle_core::Device;
+    use candle_gen::quant::{PackedConfig, PackedWeightSidecars};
+    use candle_gen::testkit::{used_mib, PeakSampler};
+
+    let transformer = tier.join("transformer");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(transformer.join("config.json")).expect("read transformer config"),
+    )
+    .expect("parse transformer config");
+    let packed = PackedConfig::from_config(&config).expect("packed transformer config");
+    let files = candle_gen::sorted_safetensors(&transformer, "z-image profile")
+        .expect("resolve transformer files");
+    // SAFETY: the real-weight evidence files are immutable during the measurement.
+    let source = unsafe { MmapedSafetensors::multi(&files).expect("mmap transformer") };
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let baseline = used_mib(candle_gen::testkit::probe_gpu()).expect("nvidia-smi baseline");
+    let gpu = PeakSampler::start_rendered();
+    let started = Instant::now();
+    let (prepared, host) = host_memory::sample(|| {
+        PackedWeightSidecars::prepare_prefix_cancelable(
+            &source,
+            &transformer,
+            packed,
+            &device,
+            &candle_gen::gen_core::CancelFlag::default(),
+            "layers.",
+        )
+    });
+    let elapsed = started.elapsed().as_secs_f64();
+    let gpu_peak = gpu.stop();
+    let prepared = prepared.expect("prepare device-format sidecars");
+    const MIB: f64 = 1024.0 * 1024.0;
+    eprintln!(
+        "[sc-16510 {tag} preparation] {elapsed:.3}s; created={} reused={}; hashed={:.1} MiB \
+         sidecars={:.1} MiB; host WS peak/end Δ={:.1}/{:.1} MiB; private peak/end Δ={:.1}/{:.1} \
+         MiB; CUDA baseline/peak/Δ={baseline}/{gpu_peak}/{} MiB",
+        prepared.created_count(),
+        prepared.reused_count(),
+        prepared.source_bytes_hashed() as f64 / MIB,
+        prepared.sidecar_bytes() as f64 / MIB,
+        host.working_set_peak.saturating_sub(host.working_set_start) as f64 / MIB,
+        host.working_set_end.saturating_sub(host.working_set_start) as f64 / MIB,
+        host.private_peak.saturating_sub(host.private_start) as f64 / MIB,
+        host.private_end.saturating_sub(host.private_start) as f64 / MIB,
+        gpu_peak.saturating_sub(baseline),
+    );
+    device.synchronize().expect("finish sidecar preparation");
+}
+
+#[cfg(feature = "cuda")]
+fn profile_rung_four_steps(tier: &std::path::Path, quant: Quant, tag: &str) {
+    use candle_gen::testkit::{used_mib, PeakSampler};
+
+    let spec = LoadSpec::new(WeightsSource::Dir(tier.to_path_buf()));
+    let generator = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
+        .expect("load packed Z-Image base");
+    let baseline = used_mib(candle_gen::testkit::probe_gpu()).expect("nvidia-smi baseline");
+    let gpu = PeakSampler::start_rendered();
+    let ((image, step_seconds), host) = host_memory::sample(|| {
+        render_base_ladder(
+            generator.as_ref(),
+            MemoryStrategy::BoundedTransformerResidency,
+            Some(1),
+            quant,
+            4,
+        )
+    });
+    let gpu_peak = gpu.stop();
+    assert_coherent(&image, tag);
+    assert_eq!(step_seconds.len(), 4, "expected four timed denoise steps");
+    let mut steady = step_seconds[1..].to_vec();
+    steady.sort_by(f64::total_cmp);
+    const MIB: f64 = 1024.0 * 1024.0;
+    eprintln!(
+        "[sc-16510 {tag} rung4] first-callback={:.3}s; steady steps={:?}; median/min/max={:.3}/{:.3}/{:.3}s; \
+         host WS peak/end Δ={:.1}/{:.1} MiB; private peak/end Δ={:.1}/{:.1} MiB; CUDA \
+         baseline/peak/Δ={baseline}/{gpu_peak}/{} MiB",
+        step_seconds[0],
+        &step_seconds[1..],
+        steady[steady.len() / 2],
+        steady[0],
+        steady[steady.len() - 1],
+        host.working_set_peak
+            .saturating_sub(host.working_set_start) as f64
+            / MIB,
+        host.working_set_end
+            .saturating_sub(host.working_set_start) as f64
+            / MIB,
+        host.private_peak.saturating_sub(host.private_start) as f64 / MIB,
+        host.private_end.saturating_sub(host.private_start) as f64 / MIB,
+        gpu_peak.saturating_sub(baseline),
+    );
+}
+
+/// SC-16510 acceptance evidence on real packed Base weights. Run this test alone with one test thread
+/// so q4/q8 preparation, host sampling, and device-level CUDA peaks do not overlap another test.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q4/Q8 + CUDA; records SC-16510 lifecycle evidence"]
+fn sc16510_real_q4_q8_sidecar_lifecycle_evidence() {
+    for (env, quant, tag) in [
+        ("Z_IMAGE_BASE_PACKED_Q4", Quant::Q4, "q4"),
+        ("Z_IMAGE_BASE_PACKED_Q8", Quant::Q8, "q8"),
+    ] {
+        let tier = PathBuf::from(std::env::var(env).unwrap_or_else(|_| panic!("set {env}")));
+        profile_sidecar_preparation(&tier, tag);
+        profile_rung_four_steps(&tier, quant, tag);
     }
 }
 
