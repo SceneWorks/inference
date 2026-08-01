@@ -164,15 +164,16 @@ pub fn accel_attn_enabled() -> bool {
     ACCEL_ATTN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A loaded candle Z-Image generator. Loading is **lazy**: `load` does no file I/O, and the heavy
-/// components (Qwen3 encoder + DiT + VAE) are built on the first [`generate`](Generator::generate)
-/// call and then **cached** in `components` (keyed by the accelerated-attention setting) so
+/// A loaded candle Z-Image generator. Loading is **tensor-lazy**: `load` reads only the transformer's
+/// small `config.json` tier marker, while the heavy components (Qwen3 encoder + DiT + VAE) are built
+/// on the first [`generate`](Generator::generate) call and then **cached** in `components` so
 /// back-to-back requests skip the disk re-read.
 pub struct ZImageGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
     dtype: DType,
+    loaded_quant: Option<gen_core::Quant>,
     /// Serializes cache use with request-staged eviction. Without this guard a warm request could
     /// retain cloned component Arcs while a concurrent staged request attempted to shed the cache.
     lifecycle: Mutex<()>,
@@ -240,6 +241,16 @@ impl Generator for ZImageGenerator {
         self.memory_strategy.as_ref()
     }
 
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        memory_strategy::safety_check(MODEL_ID, contract, context, self.loaded_quant)
+    }
+
     fn begin_memory_strategy_request(
         &self,
         context: &gen_core::MemoryRunContext,
@@ -247,7 +258,7 @@ impl Generator for ZImageGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return Ok(None);
         };
-        memory_strategy::validate_context(MODEL_ID, contract, context)?;
+        memory_strategy::validate_context(MODEL_ID, contract, context, self.loaded_quant)?;
         Ok(Some(Box::new(memory_strategy::ZImageMemoryScope::new(
             MODEL_ID,
             self.device.clone(),
@@ -476,6 +487,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
@@ -488,6 +500,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         dtype: DType::BF16,
+        loaded_quant,
         lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
@@ -532,6 +545,7 @@ pub fn load_from_comfyui_components(
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
+        loaded_quant: None,
         lifecycle: Mutex::new(()),
         adapters: Vec::new(),
         pid_spec: None,
@@ -559,6 +573,7 @@ pub fn load_from_comfyui_checkpoint(
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
+        loaded_quant: None,
         lifecycle: Mutex::new(()),
         adapters: Vec::new(),
         pid_spec: None,
@@ -605,14 +620,14 @@ fn registered_base_control_memory_contract(
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
     contract: registered_turbo_memory_contract,
-    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    safety_check: memory_strategy::registered_safety_check,
 };
 
 #[cfg(feature = "cuda")]
 const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: base::MODEL_ID,
     contract: registered_base_memory_contract,
-    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    safety_check: memory_strategy::registered_safety_check,
 };
 
 #[cfg(feature = "cuda")]
@@ -620,7 +635,7 @@ const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_turbo_control",
         contract: registered_turbo_control_memory_contract,
-        safety_check: gen_core::default_registered_memory_strategy_safety_check,
+        safety_check: memory_strategy::registered_safety_check,
     };
 
 #[cfg(feature = "cuda")]
@@ -628,7 +643,7 @@ const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_control",
         contract: registered_base_control_memory_contract,
-        safety_check: gen_core::default_registered_memory_strategy_safety_check,
+        safety_check: memory_strategy::registered_safety_check,
     };
 
 #[cfg(test)]
@@ -638,7 +653,7 @@ mod tests {
 
     /// The seam under test: resolving `"z_image_turbo"` through the family registry returns this
     /// candle generator. `load`
-    /// is lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
+    /// is tensor-lazy, so a nonexistent weights dir still resolves (the absent tier marker is dense).
     #[test]
     fn z_image_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));

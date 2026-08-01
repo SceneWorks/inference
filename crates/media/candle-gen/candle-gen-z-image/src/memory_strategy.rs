@@ -6,12 +6,13 @@
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, GenerationMemory, GenerationRequest, MemoryGeometry, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySelection, MemoryStrategy,
+    self, GenerationMemory, GenerationRequest, LoadSpec, MemoryGeometry, MemoryNumericTier,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, Precision, Quant, WeightsSource,
 };
 #[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
-    LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
+    LoadShape, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges,
     MemoryPrerequisiteScope, MemoryStrategyCapability, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes,
@@ -369,24 +370,84 @@ pub(crate) fn validate_context(
     provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
 ) -> gen_core::Result<()> {
-    if let gen_core::MemorySafetyDecision::Reject { reason } =
-        gen_core::default_memory_strategy_safety_check(contract, context)
+    if let MemorySafetyDecision::Reject { reason } =
+        safety_check(provider_id, contract, context, loaded_quant)
     {
         return Err(gen_core::Error::Unsupported(reason));
     }
-    if context.has_phases {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
-        )));
-    }
-    if context.use_pid && context.selection.strategy.is_optimized() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: PiD uses an alternate decode planner and cannot consume this native-VAE \
-             memory selection"
-        )));
-    }
     Ok(())
+}
+
+pub(crate) fn safety_check(
+    provider_id: &str,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> MemorySafetyDecision {
+    let route_gate = || {
+        if context.has_phases {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
+            )));
+        }
+        if context.use_pid && context.selection.strategy.is_optimized() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: PiD uses an alternate decode planner and cannot consume this \
+                 native-VAE memory selection"
+            )));
+        }
+        Ok(())
+    };
+    gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: loaded_quant,
+            component_precision_floors: &[],
+        }),
+        Some(&route_gate),
+    )
+}
+
+pub(crate) fn snapshot_quant_tier(
+    spec: &LoadSpec,
+    provider_id: &str,
+) -> gen_core::Result<Option<Quant>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{provider_id}: actual numeric tier requires a snapshot directory"
+            )))
+        }
+    };
+    crate::pipeline::packed_config_at(root, "transformer")
+        .map_err(gen_core::Error::backend)?
+        .map(|packed| match packed.bits {
+            4 => Ok(Quant::Q4),
+            8 => Ok(Quant::Q8),
+            bits => Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: transformer declares unsupported packed quantization width {bits}"
+            ))),
+        })
+        .transpose()
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn registered_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    match snapshot_quant_tier(spec, &contract.provider_id) {
+        Ok(quant) => safety_check(&contract.provider_id, contract, context, quant),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -498,7 +559,7 @@ mod tests {
     fn request_scope_applies_exact_parameters_and_finishes_once() {
         let contract = provider_contract(crate::MODEL_ID, &spec()).unwrap();
         let context = context(&contract);
-        validate_context(crate::MODEL_ID, &contract, &context).unwrap();
+        validate_context(crate::MODEL_ID, &contract, &context, None).unwrap();
         let mut scope = ZImageMemoryScope::new(crate::MODEL_ID, Device::Cpu, &contract, &context);
         scope
             .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, context.geometry)
@@ -527,12 +588,47 @@ mod tests {
         let contract = provider_contract(crate::MODEL_ID, &spec()).unwrap();
         let mut stale = context(&contract);
         stale.calibration_fingerprint.push_str("-stale");
-        assert!(validate_context(crate::MODEL_ID, &contract, &stale).is_err());
+        assert!(validate_context(crate::MODEL_ID, &contract, &stale, None).is_err());
 
         let mut pid = context(&contract);
         pid.use_pid = true;
-        let error = validate_context(crate::MODEL_ID, &contract, &pid).unwrap_err();
+        let error = validate_context(crate::MODEL_ID, &contract, &pid, None).unwrap_err();
         assert!(error.to_string().contains("PiD"));
+    }
+
+    #[test]
+    fn packed_q4_and_q8_snapshots_bind_weights_free_admission_to_the_detected_tier() {
+        for (bits, actual, wrong) in [
+            (4, Quant::Q4, Some(Quant::Q8)),
+            (8, Quant::Q8, Some(Quant::Q4)),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("candle-z-image-tier-{bits}-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("transformer")).unwrap();
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+            let mut actual_context = context(&contract);
+            actual_context.selection.tier.quant = Some(actual);
+            assert_eq!(
+                registered_safety_check(&spec, &contract, &actual_context),
+                MemorySafetyDecision::Accept
+            );
+            for selected in [None, wrong] {
+                let mut wrong_context = context(&contract);
+                wrong_context.selection.tier.quant = selected;
+                assert!(matches!(
+                    registered_safety_check(&spec, &contract, &wrong_context),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
     }
 
     #[test]

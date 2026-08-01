@@ -408,12 +408,13 @@ pub(crate) fn build_native_krea(
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
     let memory_strategy =
         crate::block_memory_strategy::memory_strategy_contract(descriptor.id, spec)?;
+    let quant = effective_base_quant_tier(spec, descriptor.id)?;
     let residency = build_residency(spec, descriptor.id)?;
     Ok(Box::new(Krea {
         descriptor,
         memory_strategy,
         precision: spec.precision,
-        quant: spec.quantize,
+        quant,
         streamable_transformer: crate::block_memory_strategy::is_streamable_spec(spec),
         residency,
         adapters: spec.adapters.clone(),
@@ -541,6 +542,22 @@ pub(crate) fn effective_base_quant_bits(
         return Ok(Some(packed));
     }
     load_time_quant_bits(spec, root, id)
+}
+
+/// Resolve the tier the base transformer actually uses. Unlike `LoadSpec::quantize`, this observes a
+/// pre-packed turnkey's on-disk marker and therefore remains correct when the worker selects Q4/Q8 by
+/// choosing a tier-specific snapshot without requesting an in-place quantization pass.
+pub(crate) fn effective_base_quant_tier(spec: &LoadSpec, id: &str) -> Result<Option<Quant>> {
+    let root = resolve_root(spec, id)?;
+    effective_base_quant_bits(spec, root, id)?
+        .map(|bits| {
+            crate::memory::tier_from_bits(bits).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{id}: transformer declares unsupported packed quantization width {bits}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component

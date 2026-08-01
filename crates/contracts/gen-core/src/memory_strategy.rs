@@ -1408,19 +1408,15 @@ pub fn standard_memory_strategy_safety_check(
     route_gate: Option<&dyn Fn() -> Result<()>>,
 ) -> MemorySafetyDecision {
     let reject = |reason| MemorySafetyDecision::Reject { reason };
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return reject(format!(
-            "{}: no calibration identity declared",
-            contract.provider_id
-        ));
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return reject(format!(
-            "{}: calibration handshake mismatch",
-            contract.provider_id
-        ));
+    if let Some(calibration) = contract.calibration.as_ref() {
+        if context.calibration_abi != calibration.abi
+            || context.calibration_fingerprint != calibration.fingerprint
+        {
+            return reject(format!(
+                "{}: calibration handshake mismatch",
+                contract.provider_id
+            ));
+        }
     }
     if let Some(loaded_tier) = loaded_tier {
         if context.selection.tier != loaded_tier {
@@ -1467,11 +1463,20 @@ pub fn default_memory_strategy_safety_check(
 /// The load specification is part of the weights-free registration callback so providers whose
 /// admission rules depend on the requested tier can reproduce their loaded generator's check.
 pub fn default_registered_memory_strategy_safety_check(
-    _spec: &crate::LoadSpec,
+    spec: &crate::LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    default_memory_strategy_safety_check(contract, context)
+    standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        }),
+        None,
+    )
 }
 
 fn validate_ranges(capability: &MemoryStrategyCapability, errors: &mut Vec<String>) {
@@ -2242,6 +2247,18 @@ mod tests {
             standard_memory_strategy_safety_check(&contract, &context, Some(loaded_tier), None),
             MemorySafetyDecision::Accept
         );
+        let matching_spec = crate::LoadSpec::new(crate::WeightsSource::Dir("/weights".into()))
+            .with_quant(Quant::Q4);
+        assert_eq!(
+            default_registered_memory_strategy_safety_check(&matching_spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        let wrong_spec = matching_spec.with_quant(Quant::Q8);
+        assert!(matches!(
+            default_registered_memory_strategy_safety_check(&wrong_spec, &contract, &context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
 
         let mut wrong_tier = context.clone();
         wrong_tier.selection.tier.quant = Some(Quant::Q8);
@@ -2353,6 +2370,18 @@ mod tests {
                 assert_eq!(support, &MemoryStrategySupport::Missing);
             }
         }
+
+        let mut context = admitted_context(&adopted_contract());
+        assert_eq!(
+            default_memory_strategy_safety_check(&contract, &context),
+            MemorySafetyDecision::Accept,
+            "calibration-free compatibility contracts preserve resident admission"
+        );
+        context.selection.strategy = MemoryStrategy::StagedResidency;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &context),
+            MemorySafetyDecision::Reject { reason } if reason.contains("Missing")
+        ));
     }
 
     #[test]

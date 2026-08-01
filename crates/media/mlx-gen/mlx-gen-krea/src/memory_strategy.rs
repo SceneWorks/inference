@@ -193,7 +193,12 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, spec.precision, spec.quantize, context)
+    match crate::model::effective_base_quant_tier(spec, &contract.provider_id) {
+        Ok(quant) => safety_check(contract, spec.precision, quant, context),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 pub fn begin_request(
@@ -331,17 +336,30 @@ mod tests {
     };
 
     #[test]
-    fn pose_control_rejects_a_selection_for_another_loaded_tier() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q4);
+    fn prepacked_q8_pose_without_an_override_accepts_only_the_actual_tier() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-krea-pose-q8-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         let calibration = contract.calibration.as_ref().unwrap();
-        let context = MemoryRunContext {
+        let context_for = |quant| MemoryRunContext {
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
-                    quant: Some(Quant::Q8),
+                    quant,
                     component_precision_floors: &[],
                 },
             },
@@ -369,10 +387,17 @@ mod tests {
             evidence_revision: "test".to_owned(),
         };
 
-        assert!(matches!(
-            registered_safety_check(&spec, &contract, &context),
-            MemorySafetyDecision::Reject { reason }
-                if reason.contains("does not match loaded tier")
-        ));
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &context_for(Some(Quant::Q8))),
+            MemorySafetyDecision::Accept
+        );
+        for wrong in [None, Some(Quant::Q4)] {
+            assert!(matches!(
+                registered_safety_check(&spec, &contract, &context_for(wrong)),
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("does not match loaded tier")
+            ));
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 }

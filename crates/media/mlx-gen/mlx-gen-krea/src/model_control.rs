@@ -139,6 +139,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Fail fast — validate the whole spec up front for BOTH residencies (mirrors the pre-sc-11101 load
     // order): dense bf16, a base snapshot dir, the required control overlay, and no quant override.
     validate_control_spec(spec)?;
+    let loaded_quant = crate::model::effective_base_quant_tier(spec, KREA_2_TURBO_CONTROL_ID)?;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
         memory_strategy: crate::memory_strategy::memory_strategy_contract(
@@ -146,7 +147,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             spec,
         )?,
         loaded_precision: spec.precision,
-        loaded_quant: spec.quantize,
+        loaded_quant,
         residency: build_control_residency(spec)?,
     }))
 }
