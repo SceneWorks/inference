@@ -79,7 +79,9 @@ fn load_neg_embed(dt: Dtype) -> Result<Array> {
     // on POSIX). The previous `!exists() { write }` left a *partial* file if a write was interrupted,
     // which every later run then `exists()`-skipped and failed to deserialize, and blindly trusted a
     // pre-existing (stale or hostile) file. Rewriting+renaming each load self-heals corruption and
-    // overwrites a planted file; the embed is tiny (~0.6 MB) so the cost is negligible (F-026).
+    // overwrites a planted file; the embed is tiny (~0.6 MB) so the cost is negligible.
+    // sc-5276 — filed as F-026 of the 2026-06-13 review, whose document is not in this repo; the
+    // in-tree reviews reuse F-026 for three unrelated findings, so cite the story.
     let tmp = dir.join(format!(
         "mlx_gen_seedvr2_neg_embed.{}.tmp",
         std::process::id()
