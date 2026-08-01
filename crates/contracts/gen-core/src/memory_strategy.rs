@@ -784,6 +784,17 @@ impl Default for MemoryRuntimeSemantics {
     }
 }
 
+/// A provider-verified exception to the shared cumulative cost-order composition.
+///
+/// This can remove only a default engagement edge. It cannot remove a prerequisite, and the provider
+/// must name the calibration or executable proof that established the cheaper composition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryStrategyEngagementExclusion {
+    pub selection: MemoryStrategy,
+    pub excluded_rung: MemoryStrategy,
+    pub evidence: String,
+}
+
 /// Static provider contract returned before weights are loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryProviderContract {
@@ -799,6 +810,9 @@ pub struct MemoryProviderContract {
     /// Realization-specific constraints appended to the shared graph. Providers cannot remove or
     /// replace [`MemoryStrategy::requires`].
     pub additional_prerequisites: Vec<(MemoryStrategy, MemoryStrategyPrerequisite)>,
+    /// Documented, provider-verified exceptions to the shared cumulative cost-order default.
+    /// Prerequisite edges remain authoritative and cannot be removed through this list.
+    pub default_engagement_exclusions: Vec<MemoryStrategyEngagementExclusion>,
     pub lifecycle: MemoryLifecycleCapabilities,
     pub formula: MemoryFormulaKind,
     /// `None` is the compatibility default for a provider that has not adopted calibration yet.
@@ -833,6 +847,7 @@ impl MemoryProviderContract {
             pid_decode_routes: None,
             load_shape: LoadShape::EagerMaterialization,
             additional_prerequisites: Vec::new(),
+            default_engagement_exclusions: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities::default(),
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
@@ -950,7 +965,11 @@ impl MemoryProviderContract {
                 } if required == rung
             )
         });
-        (strategy.engages(rung) || required_by_realization)
+        let excludes_default = self
+            .default_engagement_exclusions
+            .iter()
+            .any(|exclusion| exclusion.selection == strategy && exclusion.excluded_rung == rung);
+        ((strategy.engages(rung) && !excludes_default) || required_by_realization)
             && matches!(self.support(rung), Some(MemoryStrategySupport::Implemented))
     }
 
@@ -1014,6 +1033,53 @@ impl MemoryProviderContract {
                 Some(MemoryStrategySupport::Implemented)
             )
         };
+        let mut exclusions = std::collections::HashSet::new();
+        for exclusion in &self.default_engagement_exclusions {
+            if !exclusions.insert((exclusion.selection, exclusion.excluded_rung)) {
+                errors.push(format!(
+                    "duplicate default engagement exclusion {:?} -> {:?}",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if exclusion.evidence.trim().is_empty() {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} has no verification evidence",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if !exclusion.selection.engages(exclusion.excluded_rung) {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} does not remove a shared cost-order edge",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if exclusion.selection == exclusion.excluded_rung
+                || exclusion.excluded_rung == MemoryStrategy::Resident
+            {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} cannot remove the selected strategy or resident baseline",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if !implemented(exclusion.selection) || !implemented(exclusion.excluded_rung) {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} requires both strategies to be implemented",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+            if self.requires(exclusion.selection).any(|prerequisite| {
+                matches!(
+                    prerequisite,
+                    MemoryStrategyPrerequisite::Rung { rung, .. }
+                        if rung == exclusion.excluded_rung
+                )
+            }) {
+                errors.push(format!(
+                    "default engagement exclusion {:?} -> {:?} cannot remove a prerequisite edge",
+                    exclusion.selection, exclusion.excluded_rung
+                ));
+            }
+        }
         if implemented(MemoryStrategy::StagedResidency) {
             for phase in [
                 MemoryPhase::Conditioning,
@@ -2033,6 +2099,7 @@ mod tests {
             pid_decode_routes: None,
             load_shape: LoadShape::DeferredMaterialization,
             additional_prerequisites: Vec::new(),
+            default_engagement_exclusions: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities {
                 phases: vec![
                     MemoryPhase::Conditioning,
@@ -3017,5 +3084,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("irrelevant"));
+    }
+
+    #[test]
+    fn a_verified_exclusion_defeats_only_the_default_engagement_edge() {
+        let mut contract = adopted_contract();
+        contract
+            .default_engagement_exclusions
+            .push(MemoryStrategyEngagementExclusion {
+                selection: MemoryStrategy::BoundedAttention,
+                excluded_rung: MemoryStrategy::BoundedDecode,
+                evidence: "direct calibration: attention chunking is independent of decode tiling"
+                    .to_owned(),
+            });
+        assert!(contract.conformance_errors().is_empty());
+        assert!(!contract.engages(
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedDecode
+        ));
+        assert_eq!(
+            contract.engaged_composition(MemoryStrategy::BoundedAttention),
+            vec![MemoryStrategy::Resident, MemoryStrategy::BoundedAttention]
+        );
+        contract
+            .validate_selection(&MemorySelection {
+                strategy: MemoryStrategy::BoundedAttention,
+                parameters: MemoryStrategyParameters {
+                    attention_chunk_size: Some(256),
+                    ..Default::default()
+                },
+                tier: bf16(),
+            })
+            .expect("the documented cheaper composition must validate without decode parameters");
+
+        contract.default_engagement_exclusions[0].evidence.clear();
+        assert!(contract
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("has no verification evidence")));
     }
 }

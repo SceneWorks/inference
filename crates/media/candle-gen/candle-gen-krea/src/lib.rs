@@ -1310,6 +1310,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             )
         })
         .collect(),
+        default_engagement_exclusions: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1363,6 +1364,128 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     safety_check: gen_core::default_registered_memory_strategy_safety_check,
 };
 
+/// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
+/// route. The worker owns measured evidence and live-budget selection; this declaration owns which
+/// controls the provider can actually execute.
+#[cfg(any(feature = "cuda", test))]
+fn build_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::MemoryProviderContract {
+    use gen_core::{
+        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
+        MemoryPrerequisiteScope, MemoryProviderContract, MemoryStrategy,
+        MemoryStrategyEngagementExclusion, MemoryStrategyPrerequisite, MemoryStrategySupport,
+        MemoryWindowMaterialization,
+    };
+
+    let mut contract = MemoryProviderContract::compatibility_default(
+        "krea_2_turbo_control",
+        MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: false,
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+    );
+    contract.load_shape = LoadShape::EagerMaterialization;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: true,
+        attention_chunking: true,
+        transformer_window_materialization: false,
+    };
+    contract.formula = MemoryFormulaKind::PhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::OverlayBytes,
+        ],
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        "sc-16013-krea-control-direct-1024-v1",
+    ));
+    for capability in &mut contract.strategies {
+        capability.support = match capability.strategy {
+            MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedDecode => {
+                capability.parameters = MemoryParameterRanges {
+                    decode_tile_edges: vec![512],
+                    decode_overlaps: vec![128],
+                    ..Default::default()
+                };
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedAttention => {
+                capability.parameters = MemoryParameterRanges {
+                    attention_chunk_sizes: vec![128 * 1024 * 1024],
+                    ..Default::default()
+                };
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedTransformerResidency => {
+                MemoryStrategySupport::StructurallyNotApplicable {
+                    reason: "the Krea control provider has no transformer-window execution path"
+                        .to_owned(),
+                }
+            }
+        };
+    }
+    contract.additional_prerequisites = [
+        MemoryStrategy::BoundedDecode,
+        MemoryStrategy::BoundedAttention,
+    ]
+    .into_iter()
+    .map(|strategy| {
+        (
+            strategy,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        )
+    })
+    .collect();
+    if spec.quantize != Some(Quant::Q4) {
+        // SC-16013's direct 1024² calibration found no decode-tail peak on q8, bf16, or
+        // INT8-ConvRot. Attention chunking is independently executable there, so forcing tiled decode
+        // underneath it adds a speed cost with no measured memory saving. Q4 retains the cumulative
+        // composition because its staged 29.6 → 22.4 GiB decode saving is directly measured.
+        contract
+            .default_engagement_exclusions
+            .push(MemoryStrategyEngagementExclusion {
+            selection: MemoryStrategy::BoundedAttention,
+            excluded_rung: MemoryStrategy::BoundedDecode,
+            evidence:
+                "sc-16013-krea-control-direct-1024-v1: non-q4 decode tail is not the measured peak"
+                    .to_owned(),
+        });
+    }
+    contract
+}
+
+#[cfg(feature = "cuda")]
+fn registered_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_krea_control_memory_strategy_contract(spec))
+}
+
+#[cfg(feature = "cuda")]
+const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: "krea_2_turbo_control",
+    contract: registered_krea_control_memory_strategy_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+};
+
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
@@ -1372,7 +1495,11 @@ pub fn register_providers(
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION);
     #[cfg(feature = "cuda")]
-    let registry = registry.register_memory_strategy(TURBO_MEMORY_REGISTRATION);
+    let registry = registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        // The direct CUDA control runtime composes the registered Krea base with a native control
+        // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
+        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION);
     registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
@@ -1423,6 +1550,23 @@ mod explicit_registry_tests {
             )));
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
 
+            let control_contract = registry
+                .memory_strategy_contract("krea_2_turbo_control", &spec)
+                .unwrap()
+                .expect("Krea control must register its CUDA memory-strategy contract");
+            assert_eq!(
+                control_contract.calibration.as_ref().unwrap().fingerprint,
+                "sc-16013-krea-control-direct-1024-v1"
+            );
+            assert!(matches!(
+                control_contract
+                    .capability(candle_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                candle_gen::gen_core::MemoryStrategySupport::StructurallyNotApplicable { .. }
+            ));
+            gen_core_testkit::check_memory_strategy_contract(&control_contract).unwrap();
+
             let edit_default = candle_gen::gen_core::MemoryProviderContract::compatibility_default(
                 super::KREA_2_EDIT_ID,
                 contract.backend.clone(),
@@ -1447,6 +1591,38 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn krea_control_memory_contract_publishes_the_executable_surface() {
+        let dense = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = build_krea_control_memory_strategy_contract(&dense);
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::StructurallyNotApplicable { .. }
+        ));
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        ));
+        assert!(!contract.engages(
+            gen_core::MemoryStrategy::BoundedAttention,
+            gen_core::MemoryStrategy::BoundedDecode
+        ));
+
+        let q4 = dense.with_quant(Quant::Q4);
+        let q4_contract = build_krea_control_memory_strategy_contract(&q4);
+        assert!(q4_contract.engages(
+            gen_core::MemoryStrategy::BoundedAttention,
+            gen_core::MemoryStrategy::BoundedDecode
+        ));
+    }
 
     /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
     ///
