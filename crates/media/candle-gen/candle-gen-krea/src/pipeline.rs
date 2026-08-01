@@ -602,7 +602,7 @@ pub(crate) fn load_residency_heavy_convrot(
 /// context type is reusable by any int8 caller, and reusing NVFP4's sm_120 `Nvfp4Context` would wrongly
 /// deny int8 on sm_89..sm_120 cards.
 #[cfg(feature = "cuda")]
-fn ensure_int8_floor(device: &Device) -> Result<Int8Context> {
+pub(crate) fn ensure_int8_floor(device: &Device) -> Result<Int8Context> {
     let ctx = Int8Context::new(device)
         .map_err(|e| CandleError::Msg(format!("krea convrot: cublasLt probe: {e}")))?;
     if device.is_cuda() {
@@ -625,7 +625,7 @@ fn ensure_int8_floor(device: &Device) -> Result<Int8Context> {
 /// Non-CUDA build: the int8 floor is vacuous (the CPU dequant-dense fallback is test-only), and the
 /// shared context is empty — there is no handle to share.
 #[cfg(not(feature = "cuda"))]
-fn ensure_int8_floor(_device: &Device) -> Result<Int8Context> {
+pub(crate) fn ensure_int8_floor(_device: &Device) -> Result<Int8Context> {
     Ok(Int8Context::none())
 }
 

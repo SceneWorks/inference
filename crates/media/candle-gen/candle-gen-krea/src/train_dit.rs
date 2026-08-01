@@ -48,7 +48,8 @@ use candle_gen::train::lora::{LoraHost, LoraLinear};
 use crate::config::Krea2Config;
 use candle_gen::quant::QLinear as SharedQLinear;
 
-use crate::loader::{linear, rms_scale_weight, Weights};
+use crate::loader::{linear, linear_detect, rms_scale_weight, Weights};
+use crate::quant::QLinear as KreaQLinear;
 use crate::transformer::block::{RmsScale, SwiGlu, TextFusionTransformer};
 use crate::transformer::rope::{apply_interleaved_rope, RopeTables};
 use crate::transformer::{patchify, temb, unpatchify, RopeCache, ROPE_CACHE_CAP};
@@ -123,10 +124,47 @@ pub(crate) fn sdpa_diff_budgeted(
 /// Build a frozen base `Linear` (no bias) from the mmap'd `Weights` and wrap it as a trainable
 /// [`LoraLinear`], reading `in`/`out` from the on-disk shape (`[out, in]`) and recording `path` as the
 /// PEFT module path the harness matches against.
-fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
+fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
     let base = linear(w, path, bias)?;
     let (out_f, in_f) = base.weight().dims2()?;
-    Ok(LoraLinear::from_linear(base, in_f, out_f, path.to_string()))
+    Ok(ComposableLinear::Adapt(LoraLinear::from_linear(
+        base,
+        in_f,
+        out_f,
+        path.to_string(),
+    )))
+}
+
+/// A projection in the composable control DiT. Dense and MLX-packed bases retain the adapter-capable
+/// [`LoraLinear`] path; an immutable ConvRot checkpoint uses Krea's native [`KreaQLinear`] so its I8
+/// codes, per-row scales, online Hadamard rotation, and shared cuBLASLt context remain intact. ConvRot
+/// is deliberately absent from the adapter visitors because the provider rejects that combination.
+pub(crate) enum ComposableLinear {
+    Adapt(LoraLinear),
+    ConvRot(KreaQLinear),
+}
+
+impl ComposableLinear {
+    fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
+        match self {
+            Self::Adapt(linear) => Some(linear),
+            Self::ConvRot(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_convrot(&self) -> bool {
+        matches!(self, Self::ConvRot(_))
+    }
+}
+
+impl Module for ComposableLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Adapt(linear) => linear.forward(x),
+            Self::ConvRot(linear) => linear.forward(x),
+        }
+    }
 }
 
 /// Packed-inference twin of [`lora_proj`] (sc-11727). On a packed q4/q8 tier, build the projection's
@@ -138,7 +176,10 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
 /// weight is materialized just to read them. On a dense (bf16) tier there is no packed base to keep, so
 /// defer to [`lora_proj`] (identical). INFERENCE-ONLY: a packed base cannot host a trainable `Var`
 /// residual, so the trainer keeps [`lora_proj`].
-fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
+pub(crate) fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
+    if w.is_convrot() {
+        return Ok(ComposableLinear::ConvRot(linear_detect(w, path, bias)?));
+    }
     let scales_key = format!("{path}.scales");
     match w.packed() {
         Some(cfg) if w.contains(&scales_key) => {
@@ -165,7 +206,12 @@ fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
                 group,
                 w.device(),
             )?;
-            Ok(LoraLinear::from_qlinear(ql, in_f, out_f, path.to_string()))
+            Ok(ComposableLinear::Adapt(LoraLinear::from_qlinear(
+                ql,
+                in_f,
+                out_f,
+                path.to_string(),
+            )))
         }
         _ => lora_proj(w, path, bias),
     }
@@ -173,7 +219,7 @@ fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
 
 /// The projection loader a [`KreaTrainDit`] build uses: the packed-detecting [`lora_proj_packed`] on the
 /// control-INFERENCE path (`packed = true`, codes stay in VRAM), else the dense trainable [`lora_proj`].
-type ProjLoader = fn(&Weights, &str, bool) -> Result<LoraLinear>;
+type ProjLoader = fn(&Weights, &str, bool) -> Result<ComposableLinear>;
 
 fn proj_loader(packed: bool) -> ProjLoader {
     if packed {
@@ -187,11 +233,11 @@ fn proj_loader(packed: bool) -> ProjLoader {
 /// frozen `to_gate` / per-head `+1` RMSNorm — the trainable twin of [`crate::transformer::block`]'s
 /// `GatedAttention`.
 struct TrainAttention {
-    q: LoraLinear,
-    k: LoraLinear,
-    v: LoraLinear,
-    gate: LoraLinear,
-    o: LoraLinear,
+    q: ComposableLinear,
+    k: ComposableLinear,
+    v: ComposableLinear,
+    gate: ComposableLinear,
+    o: ComposableLinear,
     norm_q: Tensor, // f32, scale + 1
     norm_k: Tensor, // f32, scale + 1
     heads: usize,
@@ -238,10 +284,11 @@ impl TrainAttention {
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        f(&mut self.q)?;
-        f(&mut self.k)?;
-        f(&mut self.v)?;
-        f(&mut self.o)?;
+        for proj in [&mut self.q, &mut self.k, &mut self.v, &mut self.o] {
+            if let Some(proj) = proj.lora_mut() {
+                f(proj)?;
+            }
+        }
         Ok(())
     }
 
@@ -378,19 +425,19 @@ pub struct KreaTrainDit {
     //     `LoraLinear` so a USER LoRA (control-lane inference, sc-11720) can ride additively — identity
     //     to the plain Linear when unadapted, so training / control_scale=0 stay byte-exact. `time_mod_
     //     proj` stays plain Linear (out of the adapter surface, matching the txt2img front-end set). ---
-    img_in: LoraLinear,
-    time_embed_l1: LoraLinear,
-    time_embed_l2: LoraLinear,
+    img_in: ComposableLinear,
+    time_embed_l1: ComposableLinear,
+    time_embed_l2: ComposableLinear,
     time_mod_proj: Linear,
     txt_in_norm: RmsScale,
-    txt_in_l1: LoraLinear,
-    txt_in_l2: LoraLinear,
+    txt_in_l1: ComposableLinear,
+    txt_in_l2: ComposableLinear,
     text_fusion: TextFusionTransformer,
     // --- trainable single-stream stack ---
     blocks: Vec<TrainBlock>,
     // --- final layer (composable; on the backward path to every adapter) ---
     final_norm: Tensor, // f32, scale + 1
-    final_linear: LoraLinear,
+    final_linear: ComposableLinear,
     final_sstable: Tensor, // [1, 2, hidden]
     /// The control/training front-end sees fixed `(caption, height, width)` geometry throughout a
     /// denoise loop, so share the same bounded RoPE cache used by the inference DiT.
@@ -638,11 +685,17 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
     ) -> candle_gen::Result<()> {
         for (i, blk) in self.blocks.iter_mut().enumerate() {
             let p = format!("transformer_blocks.{i}");
-            f(&format!("{p}.attn.to_q"), &mut blk.attn.q)?;
-            f(&format!("{p}.attn.to_k"), &mut blk.attn.k)?;
-            f(&format!("{p}.attn.to_v"), &mut blk.attn.v)?;
-            f(&format!("{p}.attn.to_gate"), &mut blk.attn.gate)?;
-            f(&format!("{p}.attn.to_out.0"), &mut blk.attn.o)?;
+            for (path, proj) in [
+                (format!("{p}.attn.to_q"), &mut blk.attn.q),
+                (format!("{p}.attn.to_k"), &mut blk.attn.k),
+                (format!("{p}.attn.to_v"), &mut blk.attn.v),
+                (format!("{p}.attn.to_gate"), &mut blk.attn.gate),
+                (format!("{p}.attn.to_out.0"), &mut blk.attn.o),
+            ] {
+                if let Some(proj) = proj.lora_mut() {
+                    f(&path, proj)?;
+                }
+            }
             blk.mlp
                 .visit_adaptable_mut(&format!("{p}.ff"), &mut |path, a| f(path, a))?;
         }
@@ -656,7 +709,9 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
             ("txt_in.linear_2", &mut self.txt_in_l2),
             ("final_layer.linear", &mut self.final_linear),
         ] {
-            f(path, proj)?;
+            if let Some(proj) = proj.lora_mut() {
+                f(path, proj)?;
+            }
         }
         Ok(())
     }
