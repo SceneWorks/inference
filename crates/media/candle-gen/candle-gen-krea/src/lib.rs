@@ -210,7 +210,6 @@ impl ResidentKrea {
 pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
-    loaded_precision: gen_core::Precision,
     loaded_quant: Option<Quant>,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
@@ -419,11 +418,11 @@ impl Generator for KreaGenerator {
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", test))]
         {
             (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_memory_strategy_contract)
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", test)))]
         {
             None
         }
@@ -436,16 +435,7 @@ impl Generator for KreaGenerator {
         let Some(contract) = self.memory_strategy_contract() else {
             return gen_core::MemorySafetyDecision::Accept;
         };
-        gen_core::standard_memory_strategy_safety_check(
-            contract,
-            context,
-            Some(gen_core::MemoryNumericTier {
-                precision: self.loaded_precision,
-                quant: self.loaded_quant,
-                component_precision_floors: &[],
-            }),
-            None,
-        )
+        krea_memory_strategy_safety_check(contract, self.loaded_quant, context)
     }
 
     fn begin_memory_strategy_request(
@@ -1148,7 +1138,6 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
-        loaded_precision: spec.precision,
         loaded_quant,
         residency,
         root,
@@ -1237,7 +1226,6 @@ pub fn load_from_native_dit_file(
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
-        loaded_precision: gen_core::Precision::Bf16,
         loaded_quant: None,
         residency,
         root,
@@ -1415,20 +1403,30 @@ fn registered_krea_safety_check(
     context: &gen_core::MemoryRunContext,
 ) -> gen_core::MemorySafetyDecision {
     match actual_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => gen_core::standard_memory_strategy_safety_check(
-            contract,
-            context,
-            Some(gen_core::MemoryNumericTier {
-                precision: spec.precision,
-                quant,
-                component_precision_floors: &[],
-            }),
-            None,
-        ),
+        Ok(quant) => krea_memory_strategy_safety_check(contract, quant, context),
         Err(error) => gen_core::MemorySafetyDecision::Reject {
             reason: error.to_string(),
         },
     }
+}
+
+fn krea_memory_strategy_safety_check(
+    contract: &gen_core::MemoryProviderContract,
+    loaded_quant: Option<Quant>,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    // Krea executes its dense tensors at the provider's BF16/default tier. `LoadSpec::precision`
+    // is not wired into the loader, so it must not relabel the calibration evidence admitted here.
+    gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: loaded_quant,
+            component_precision_floors: &[],
+        }),
+        None,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -1722,12 +1720,15 @@ mod tests {
             .unwrap();
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
             let contract = krea_turbo_memory_strategy_contract();
+            let actual_context = resident_memory_context(contract, Some(actual));
             assert_eq!(
-                registered_krea_safety_check(
-                    &spec,
-                    contract,
-                    &resident_memory_context(contract, Some(actual)),
-                ),
+                registered_krea_safety_check(&spec, contract, &actual_context),
+                gen_core::MemorySafetyDecision::Accept
+            );
+            let mut generator = sequential_generator(descriptor());
+            generator.loaded_quant = Some(actual);
+            assert_eq!(
+                generator.memory_strategy_safety_check(&actual_context),
                 gen_core::MemorySafetyDecision::Accept
             );
             for selected in [None, wrong] {
@@ -1740,9 +1741,47 @@ mod tests {
                     gen_core::MemorySafetyDecision::Reject { reason }
                         if reason.contains("does not match loaded tier")
                 ));
+                assert!(matches!(
+                    generator.memory_strategy_safety_check(&resident_memory_context(
+                        contract, selected,
+                    )),
+                    gen_core::MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
             }
             std::fs::remove_dir_all(root).ok();
         }
+    }
+
+    #[test]
+    fn fp32_load_spec_cannot_relabel_bf16_loaded_or_registered_admission() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.precision = gen_core::Precision::Fp32;
+        let contract = krea_turbo_memory_strategy_contract();
+        let generator = sequential_generator(descriptor());
+
+        let mut fp32_context = resident_memory_context(contract, None);
+        fp32_context.selection.tier.precision = gen_core::Precision::Fp32;
+        assert!(matches!(
+            registered_krea_safety_check(&spec, contract, &fp32_context),
+            gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&fp32_context),
+            gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+
+        let bf16_context = resident_memory_context(contract, None);
+        assert_eq!(
+            registered_krea_safety_check(&spec, contract, &bf16_context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+        assert_eq!(
+            generator.memory_strategy_safety_check(&bf16_context),
+            gen_core::MemorySafetyDecision::Accept
+        );
     }
 
     #[test]
@@ -2707,7 +2746,6 @@ mod tests {
         KreaGenerator {
             descriptor,
             device: candle_gen::default_device().expect("a default device"),
-            loaded_precision: gen_core::Precision::Bf16,
             loaded_quant: None,
             residency: candle_gen::Residency::request_scoped(
                 |_| {
