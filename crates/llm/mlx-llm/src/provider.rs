@@ -13,12 +13,12 @@ use std::cell::OnceCell;
 use std::path::Path;
 
 use core_llm::{
-    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Content, Error as CoreError,
-    FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint,
-    Llama3Template, LoadSpec, Message, Quantize, RenderOptions, Result as CoreResult, Sampling,
-    StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage,
-    VideoRef,
+    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
+    Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
+    JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
+    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -977,7 +977,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
             // JSON-constrained decoding (sc-7166).
-            supported_constraints: vec![Constraint::Json],
+            supported_constraints: vec![ConstraintKind::Json],
         },
     }
 }

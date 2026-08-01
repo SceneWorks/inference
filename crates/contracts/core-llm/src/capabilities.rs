@@ -1,6 +1,6 @@
 //! Provider identity and declared capabilities.
 
-use crate::constraint::Constraint;
+use crate::constraint::{Constraint, ConstraintKind};
 use crate::error::{Error, Result};
 use crate::request::TextLlmRequest;
 
@@ -29,14 +29,18 @@ pub struct TextLlmCapabilities {
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
     pub supports_tools: bool,
-    /// The output constraints this provider can enforce (empty = none).
-    pub supported_constraints: Vec<Constraint>,
+    /// The output constraint KINDS this provider can enforce (empty = none).
+    ///
+    /// Kinds, not [`Constraint`] values: a provider cannot know in advance which schema or
+    /// grammar a caller will send, so advertising concrete values would make any payload-carrying
+    /// constraint permanently unsupportable. See [`ConstraintKind`].
+    pub supported_constraints: Vec<ConstraintKind>,
 }
 
 impl TextLlmCapabilities {
-    /// Whether a given constraint is supported.
-    pub fn supports_constraint(&self, c: Constraint) -> bool {
-        self.supported_constraints.contains(&c)
+    /// Whether a given constraint is supported, compared by [`ConstraintKind`].
+    pub fn supports_constraint(&self, c: &Constraint) -> bool {
+        self.supported_constraints.contains(&c.kind())
     }
 
     /// Validate a request against these capabilities. Providers call this from
@@ -95,7 +99,7 @@ impl TextLlmCapabilities {
             )));
         }
 
-        if let Some(c) = req.constraint {
+        if let Some(c) = &req.constraint {
             if !self.supports_constraint(c) {
                 return Err(Error::Unsupported(format!(
                     "[{id}] provider does not support the {c:?} constraint"

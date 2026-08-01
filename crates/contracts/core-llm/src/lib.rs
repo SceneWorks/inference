@@ -62,7 +62,9 @@ pub mod tool;
 
 pub use cancel::CancelFlag;
 pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
-pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonState};
+pub use constraint::{
+    Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
+};
 pub use detok::IncrementalDetok;
 pub use error::{Error, Result};
 pub use message::{Content, ImageRef, Message, Role, VideoRef};
