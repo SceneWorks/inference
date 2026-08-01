@@ -350,6 +350,46 @@ fn run_three_stage<Text, Encoded, Renderer, Latents, Decoder, Output>(
     Ok(output)
 }
 
+fn bounded_host_latent_transfer(
+    latents: &Tensor,
+    cancel: &CancelFlag,
+    tile_edge: u32,
+    overlap: u32,
+) -> Result<(Tensor, usize)> {
+    let output_stride = tile_edge.checked_sub(overlap).ok_or_else(|| {
+        CandleError::Msg(format!(
+            "z-image bounded host decode requires overlap below tile edge, got {tile_edge}/{overlap}"
+        ))
+    })?;
+    let latent_rows_per_transfer = usize::try_from(output_stride / 8).map_err(|_| {
+        CandleError::Msg("z-image bounded host decode transfer stride overflowed".into())
+    })?;
+    if latent_rows_per_transfer == 0 {
+        return Err(CandleError::Msg(
+            "z-image bounded host decode transfer stride must cover at least one latent row".into(),
+        ));
+    }
+    // Final Z-Image latents are (B,C,F,H,W); axis 2 is the singleton frame dimension and axis 3 is
+    // the spatial row dimension that the output-space tile tuple bounds.
+    let latent_height = latents.dim(3)?;
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < latent_height {
+        check_decode(cancel)?;
+        let length = latent_rows_per_transfer.min(latent_height - start);
+        chunks.push(
+            latents
+                .narrow(3, start, length)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?,
+        );
+        start += length;
+    }
+    let transfer_count = chunks.len();
+    let chunk_refs = chunks.iter().collect::<Vec<_>>();
+    Ok((Tensor::cat(&chunk_refs, 3)?, transfer_count))
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
     /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
@@ -505,7 +545,11 @@ impl Pipeline {
             )));
         }
         check_decode(cancel)?;
-        let latents = latents.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        // The legacy tile tuple now bounds the CUDA->host latent transfer rather than independently
+        // decoding VAE tiles. Both values are operational: their difference is the output-space
+        // stride, converted to latent rows. The host VAE still sees one reassembled tensor, preserving
+        // spatial group-normalization statistics and therefore output quality.
+        let (latents, _) = bounded_host_latent_transfer(latents, cancel, tile_edge, overlap)?;
         common::decode(vae, None, &latents)
     }
 
@@ -1542,6 +1586,28 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_host_transfer_uses_spatial_rows_and_reassembles_exactly() {
+        let values = (0..256).map(|value| value as f32).collect::<Vec<_>>();
+        let latents = Tensor::from_vec(values.clone(), (1, 1, 1, 128, 2), &Device::Cpu).unwrap();
+        let cancel = CancelFlag::new();
+        let (transferred, transfers) =
+            bounded_host_latent_transfer(&latents, &cancel, 512, 128).unwrap();
+        assert_eq!(transfers, 3, "128 latent rows at a 48-row stride");
+        assert_eq!(transferred.dims(), latents.dims());
+        assert_eq!(
+            transferred.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            values
+        );
+
+        let canceled = CancelFlag::new();
+        canceled.cancel();
+        assert!(matches!(
+            bounded_host_latent_transfer(&latents, &canceled, 512, 128),
+            Err(CandleError::Canceled)
+        ));
+    }
 
     /// **The rung-3 budget is the shared one (SC-15796).** [`CONSTRAINED_ATTN_SCORES_BUDGET`] no longer
     /// declares 64 Mi here, so asserting its value would just restate an alias. What is worth pinning
