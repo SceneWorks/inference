@@ -311,8 +311,8 @@ pub(crate) struct Components {
 /// but owning it here gives the phase one unambiguous lifetime and avoids a process cache silently
 /// retaining an encoder handle after its embeddings have been materialized.
 pub(crate) struct TextPhase {
-    text_encoder: TextEnc,
-    tokenizer: TextTokenizer,
+    pub(crate) text_encoder: TextEnc,
+    pub(crate) tokenizer: TextTokenizer,
 }
 
 /// Execute the three accelerator-residency phases with explicit scopes. Synchronization happens

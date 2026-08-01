@@ -26,6 +26,8 @@ use candle_gen::gen_core::{
     Progress, Quant, WeightsSource,
 };
 
+use candle_gen_z_image::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
+
 /// Basic non-degeneracy: the render is not solid-black / constant (a broken packed forward — NaN or
 /// zeroed activations — decodes to a flat image), and has some spread of pixel values.
 fn assert_coherent(img: &Image, tag: &str) {
@@ -265,6 +267,164 @@ fn packed_base_all_rungs_preserve_fixed_seed_output() {
             "real packed Z-Image output changed at {strategy:?} / window {window:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q4 + Z_IMAGE_BASE_CONTROL + CUDA"]
+fn packed_base_control_q4_loads_without_dense_shape_mismatch() {
+    load_packed_base_control("Z_IMAGE_BASE_PACKED_Q4", "q4");
+}
+
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q8 + Z_IMAGE_BASE_CONTROL + CUDA"]
+fn packed_base_control_q8_loads_without_dense_shape_mismatch() {
+    load_packed_base_control("Z_IMAGE_BASE_PACKED_Q8", "q8");
+}
+
+fn load_packed_base_control(snapshot_env: &str, tier: &str) {
+    let snapshot = PathBuf::from(
+        std::env::var(snapshot_env)
+            .unwrap_or_else(|_| panic!("set {snapshot_env} to the z-image {tier} tier directory")),
+    );
+    let control = PathBuf::from(
+        std::env::var("Z_IMAGE_BASE_CONTROL")
+            .expect("set Z_IMAGE_BASE_CONTROL to the base control checkpoint"),
+    );
+
+    ZImageControl::load(&ZImageControlPaths {
+        snapshot,
+        control,
+        base: true,
+    })
+    .unwrap_or_else(|error| {
+        panic!("packed {tier} base-control provider must load through packed-aware TE and DiT seams: {error}")
+    });
+}
+
+fn control_fixture(width: u32, height: u32) -> Image {
+    let mut pixels = vec![0u8; (width * height * 3) as usize];
+    let mut set = |x: u32, y: u32| {
+        if x < width && y < height {
+            let offset = ((y * width + x) * 3) as usize;
+            pixels[offset..offset + 3].fill(255);
+        }
+    };
+    let cx = width / 2;
+    for y in height / 8..height * 7 / 8 {
+        for dx in 0..3 {
+            set(cx + dx, y);
+        }
+    }
+    for x in width / 4..width * 3 / 4 {
+        for dy in 0..3 {
+            set(x, height / 3 + dy);
+        }
+    }
+    Image {
+        width,
+        height,
+        pixels,
+    }
+}
+
+fn mean_abs_diff(lhs: &Image, rhs: &Image) -> f64 {
+    assert_eq!((lhs.width, lhs.height), (rhs.width, rhs.height));
+    lhs.pixels
+        .iter()
+        .zip(&rhs.pixels)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .sum::<f64>()
+        / lhs.pixels.len() as f64
+}
+
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q4 + Z_IMAGE_BASE_CONTROL + CUDA"]
+fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
+    let snapshot = PathBuf::from(
+        std::env::var("Z_IMAGE_BASE_PACKED_Q4")
+            .expect("set Z_IMAGE_BASE_PACKED_Q4 to the z-image q4 tier directory"),
+    );
+    let control = PathBuf::from(
+        std::env::var("Z_IMAGE_BASE_CONTROL")
+            .expect("set Z_IMAGE_BASE_CONTROL to the base control checkpoint"),
+    );
+    let model = ZImageControl::load(&ZImageControlPaths {
+        snapshot,
+        control,
+        base: true,
+    })
+    .expect("load packed q4 base-control provider");
+    let control_image = control_fixture(256, 256);
+    let request = ZImageControlRequest {
+        prompt: "a studio photograph of a dancer, full body, crisp details".into(),
+        width: 256,
+        height: 256,
+        steps: 2,
+        control_scale: 1.0,
+        guidance: Some(4.0),
+        negative_prompt: Some("blurry, malformed".into()),
+        seed: 16170,
+        use_pid: false,
+        cancel: candle_gen::gen_core::CancelFlag::new(),
+    };
+    let render = |request: &ZImageControlRequest, control_image: &Image| {
+        model
+            .generate(request, control_image, &mut |_| {})
+            .expect("base-control render")
+    };
+
+    let controlled = render(&request, &control_image);
+    assert_coherent(&controlled, "base-control-q4");
+    let warm_repeat = render(&request, &control_image);
+    assert_eq!(warm_repeat, controlled, "fixed-seed warm repeat changed");
+
+    let uncontrolled = render(
+        &ZImageControlRequest {
+            control_scale: 0.0,
+            ..request.clone()
+        },
+        &control_image,
+    );
+    let control_delta = mean_abs_diff(&controlled, &uncontrolled);
+    assert!(
+        control_delta > 0.1,
+        "control_scale was ignored (mean absolute delta {control_delta:.4})"
+    );
+
+    let alternate_cfg = render(
+        &ZImageControlRequest {
+            guidance: Some(1.0),
+            negative_prompt: Some("this branch must be ignored at guidance one".into()),
+            ..request.clone()
+        },
+        &control_image,
+    );
+    let cfg_delta = mean_abs_diff(&controlled, &alternate_cfg);
+    assert!(
+        cfg_delta > 0.1,
+        "base guidance/negative-prompt fields were ignored (mean absolute delta {cfg_delta:.4})"
+    );
+
+    let invalid = model.generate(&request, &control_fixture(128, 256), &mut |_| {});
+    assert!(invalid.is_err(), "wrong control geometry must fail loudly");
+    assert_eq!(
+        render(&request, &control_image),
+        controlled,
+        "render changed after a recoverable control-input error"
+    );
+
+    let cancelled = ZImageControlRequest {
+        cancel: {
+            let cancel = candle_gen::gen_core::CancelFlag::new();
+            cancel.cancel();
+            cancel
+        },
+        ..request
+    };
+    let error = model
+        .generate(&cancelled, &control_image, &mut |_| {})
+        .expect_err("pre-cancel must stop before generation");
+    assert!(matches!(error, candle_gen::CandleError::Canceled));
 }
 
 /// The q4 packed tier renders a coherent image straight from the packed parts (the primary sc-9408

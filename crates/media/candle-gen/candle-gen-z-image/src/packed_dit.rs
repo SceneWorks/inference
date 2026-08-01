@@ -660,6 +660,112 @@ impl ZImageTransformer2DModel {
         })
     }
 
+    /// Narrow sibling seam for the bespoke Fun-ControlNet provider. Keeping the VACE injection math
+    /// in `control.rs` must not expose the packed transformer's weights or layer representation: these
+    /// helpers preserve the same packed attention path while containing future residency changes here.
+    pub(crate) fn control_config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub(crate) fn control_timestep_embedding(&self, t: &Tensor) -> Result<Tensor> {
+        self.t_embedder.forward(t)
+    }
+
+    pub(crate) fn control_embed_image(&self, patches: &Tensor) -> Result<Tensor> {
+        self.x_embedder.forward(patches)
+    }
+
+    pub(crate) fn control_rope(&self, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.rope_embedder.forward(position_ids)
+    }
+
+    pub(crate) fn control_refine_noise<F>(
+        &self,
+        mut hidden: Tensor,
+        attention_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln: &Tensor,
+        mut after_layer: F,
+    ) -> candle_gen::Result<Tensor>
+    where
+        F: FnMut(usize, Tensor) -> candle_gen::Result<Tensor>,
+    {
+        for (index, layer) in self.noise_refiner.iter().enumerate() {
+            hidden = layer.forward_with_attention_plan(
+                &hidden,
+                Some(attention_mask),
+                cos,
+                sin,
+                Some(adaln),
+                AttentionPlan::UNBOUNDED,
+            )?;
+            hidden = after_layer(index, hidden)?;
+        }
+        Ok(hidden)
+    }
+
+    pub(crate) fn control_embed_caption(&self, cap_feats: &Tensor) -> Result<Tensor> {
+        let normalized = self.cap_embedder_norm.forward(cap_feats)?;
+        self.cap_embedder_linear.forward(&normalized)
+    }
+
+    pub(crate) fn control_refine_context(
+        &self,
+        mut hidden: Tensor,
+        attention_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> candle_gen::Result<Tensor> {
+        for layer in &self.context_refiner {
+            hidden = layer.forward_with_attention_plan(
+                &hidden,
+                Some(attention_mask),
+                cos,
+                sin,
+                None,
+                AttentionPlan::UNBOUNDED,
+            )?;
+        }
+        Ok(hidden)
+    }
+
+    pub(crate) fn control_run_resident_layers<F>(
+        &self,
+        mut hidden: Tensor,
+        attention_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln: &Tensor,
+        mut after_layer: F,
+    ) -> candle_gen::Result<Tensor>
+    where
+        F: FnMut(usize, Tensor) -> candle_gen::Result<Tensor>,
+    {
+        let TransformerLayers::Resident(layers) = &self.layers else {
+            return Err(candle_gen::CandleError::Msg(
+                "z-image control: streamed base transformer is not supported by the eager control provider"
+                    .into(),
+            ));
+        };
+        for (index, layer) in layers.iter().enumerate() {
+            hidden = layer.forward_with_attention_plan(
+                &hidden,
+                Some(attention_mask),
+                cos,
+                sin,
+                Some(adaln),
+                AttentionPlan::UNBOUNDED,
+            )?;
+            hidden = after_layer(index, hidden)?;
+        }
+        Ok(hidden)
+    }
+
+    pub(crate) fn control_finish(&self, hidden: &Tensor, adaln: &Tensor) -> Result<Tensor> {
+        self.final_layer.forward(hidden, adaln)
+    }
+
     /// Forward pass — returns the **raw** DiT velocity `(B, C, F, H, W)` (the pipeline negates it).
     /// Byte-faithful to the stock model's forward (identical phases 1–13).
     pub fn forward(
