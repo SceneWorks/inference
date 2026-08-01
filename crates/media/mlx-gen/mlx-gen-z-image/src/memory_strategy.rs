@@ -147,6 +147,7 @@ use mlx_gen::gen_core::{
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
     PerComponentBytes, Result as CoreResult, TransformerComponent,
 };
+use mlx_gen::{Quant, WeightsSource};
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
 /// GroupNorm VAE (sc-13571). A request that names no geometry decodes here, which is what keeps every
@@ -333,12 +334,40 @@ pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
 /// the v3 calibration fingerprint prevents them from being read as resident+deferred evidence.
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
 
-pub(crate) const fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
+/// Resolve the numeric tier the transformer actually loads. A packed snapshot marker is
+/// authoritative even when `LoadSpec::quantize` is absent; a requested tier is the fallback only for
+/// a dense snapshot, where the loader performs the quantization in memory. The existing shared guard
+/// rejects a requested tier that disagrees with a packed turnkey before admission can mislabel it.
+pub(crate) fn loaded_tier(spec: &LoadSpec, provider_id: &str) -> CoreResult<MemoryNumericTier> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: actual numeric tier requires a snapshot directory"
+            )))
+        }
+    };
+    if let Some(requested) = spec.quantize {
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", requested.bits(), provider_id)
+            .map_err(CoreError::backend)?;
     }
+    let packed_bits =
+        mlx_gen::quant::packed_quant_bits(root, "transformer").map_err(CoreError::backend)?;
+    let quant = match packed_bits {
+        Some(4) => Some(Quant::Q4),
+        Some(8) => Some(Quant::Q8),
+        Some(bits) => {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: transformer declares unsupported packed quantization width {bits}"
+            )))
+        }
+        None => spec.quantize,
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
 }
 
 /// Stable identity for the Fun-Controlnet-Union network held beside the base Z-Image model.
@@ -941,7 +970,12 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, loaded_tier(spec), context)
+    match loaded_tier(spec, &contract.provider_id) {
+        Ok(tier) => safety_check(contract, tier, context),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 /// Open a request scope after `safety_check` accepted `context`.
@@ -1073,6 +1107,165 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "test".to_owned(),
         }
+    }
+
+    fn tier_spec(
+        tag: &str,
+        packed_bits: Option<i32>,
+        requested: Option<Quant>,
+    ) -> (std::path::PathBuf, LoadSpec) {
+        let root = std::env::temp_dir().join(format!(
+            "z-image-memory-tier-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        if let Some(bits) = packed_bits {
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+        }
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        spec.quantize = requested;
+        (root, spec)
+    }
+
+    fn resident_tier_context(
+        contract: &MemoryProviderContract,
+        quant: Option<Quant>,
+    ) -> MemoryRunContext {
+        let mut context = context_for(MemoryStrategy::Resident, false);
+        let calibration = contract.calibration.as_ref().unwrap();
+        context.calibration_abi = calibration.abi;
+        context.calibration_fingerprint = calibration.fingerprint.clone();
+        context.selection.tier.quant = quant;
+        context
+    }
+
+    fn memory_registrations() -> [mlx_gen::gen_core::MemoryRegistration; 4] {
+        [
+            crate::model::MEMORY_REGISTRATION,
+            crate::model_base::MEMORY_REGISTRATION,
+            crate::model_control::MEMORY_REGISTRATION,
+            crate::model_base_control::MEMORY_REGISTRATION,
+        ]
+    }
+
+    #[test]
+    fn all_four_registrations_bind_prepacked_q4_and_q8_without_an_override() {
+        for (bits, actual, wrong) in [
+            (4, Quant::Q4, Some(Quant::Q8)),
+            (8, Quant::Q8, Some(Quant::Q4)),
+        ] {
+            let (root, spec) = tier_spec(&format!("packed-{bits}"), Some(bits), None);
+            for registration in memory_registrations() {
+                let contract = (registration.contract)(&spec).unwrap();
+                assert_eq!(
+                    loaded_tier(&spec, registration.provider_id).unwrap().quant,
+                    Some(actual),
+                    "{} loaded-generator capture must use the packed marker",
+                    registration.provider_id
+                );
+                assert_eq!(
+                    (registration.safety_check)(
+                        &spec,
+                        &contract,
+                        &resident_tier_context(&contract, Some(actual)),
+                    ),
+                    MemorySafetyDecision::Accept,
+                    "{} must admit its actual packed tier",
+                    registration.provider_id
+                );
+                for selected in [None, wrong] {
+                    assert!(matches!(
+                        (registration.safety_check)(
+                            &spec,
+                            &contract,
+                            &resident_tier_context(&contract, selected),
+                        ),
+                        MemorySafetyDecision::Reject { reason }
+                            if reason.contains("does not match loaded tier")
+                    ));
+                }
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn all_four_registrations_use_requested_quant_only_for_dense_snapshots() {
+        for requested in [Quant::Q4, Quant::Q8] {
+            let (root, spec) = tier_spec("dense-requested", None, Some(requested));
+            for registration in memory_registrations() {
+                let contract = (registration.contract)(&spec).unwrap();
+                assert_eq!(
+                    loaded_tier(&spec, registration.provider_id).unwrap().quant,
+                    Some(requested)
+                );
+                assert_eq!(
+                    (registration.safety_check)(
+                        &spec,
+                        &contract,
+                        &resident_tier_context(&contract, Some(requested)),
+                    ),
+                    MemorySafetyDecision::Accept
+                );
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn packed_request_mismatch_rejects_all_registrations_and_load_entrypoints() {
+        let (root, spec) = tier_spec("packed-mismatch", Some(8), Some(Quant::Q4));
+        for registration in memory_registrations() {
+            let contract = (registration.contract)(&spec).unwrap();
+            let decision = (registration.safety_check)(
+                &spec,
+                &contract,
+                &resident_tier_context(&contract, Some(Quant::Q4)),
+            );
+            assert!(matches!(
+                decision,
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("pre-quantized Q8") && reason.contains("Q4")
+            ));
+        }
+
+        type Loader = fn(&LoadSpec) -> mlx_gen::Result<Box<dyn mlx_gen::Generator>>;
+        let mut control_spec = spec.clone();
+        control_spec.control = Some(WeightsSource::File("/control.safetensors".into()));
+        for (provider_id, load, load_spec) in [
+            (crate::model::MODEL_ID, crate::model::load as Loader, &spec),
+            (
+                crate::model_base::MODEL_ID,
+                crate::model_base::load as Loader,
+                &spec,
+            ),
+            (
+                crate::model_control::MODEL_ID,
+                crate::model_control::load as Loader,
+                &control_spec,
+            ),
+            (
+                crate::model_base_control::MODEL_ID,
+                crate::model_base_control::load as Loader,
+                &control_spec,
+            ),
+        ] {
+            let error = load(load_spec)
+                .err()
+                .expect("tier mismatch must reject")
+                .to_string();
+            assert!(error.contains(provider_id), "{provider_id}: {error}");
+            assert!(error.contains("pre-quantized Q8"), "{provider_id}: {error}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn context(strategy: MemoryStrategy) -> MemoryRunContext {

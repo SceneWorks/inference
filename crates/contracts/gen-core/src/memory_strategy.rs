@@ -1417,6 +1417,11 @@ pub fn standard_memory_strategy_safety_check(
                 contract.provider_id
             ));
         }
+    } else if context.selection.strategy.is_optimized() {
+        return reject(format!(
+            "{}: optimized memory strategy {:?} requires a calibration identity",
+            contract.provider_id, context.selection.strategy
+        ));
     }
     if let Some(loaded_tier) = loaded_tier {
         if context.selection.tier != loaded_tier {
@@ -2380,7 +2385,21 @@ mod tests {
         context.selection.strategy = MemoryStrategy::StagedResidency;
         assert!(matches!(
             default_memory_strategy_safety_check(&contract, &context),
-            MemorySafetyDecision::Reject { reason } if reason.contains("Missing")
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("requires a calibration identity")
+        ));
+
+        let mut mutated = contract.clone();
+        mutated
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+            .unwrap()
+            .support = MemoryStrategySupport::Implemented;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&mutated, &context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("requires a calibration identity")
         ));
     }
 

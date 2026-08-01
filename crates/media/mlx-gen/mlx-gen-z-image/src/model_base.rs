@@ -147,9 +147,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
                  not a single .safetensors file",
     )?;
+    let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImage {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
-        loaded_tier: crate::memory_strategy::loaded_tier(spec),
+        loaded_tier,
         descriptor: descriptor(),
         tokenizer,
         residency,

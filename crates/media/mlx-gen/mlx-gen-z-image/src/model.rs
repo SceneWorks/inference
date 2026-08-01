@@ -195,12 +195,13 @@ impl StagedHeavy for ZImageHeavyOwned {
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_residency(spec, MODEL_ID, PRECISION_MSG, FILE_MSG)?;
+    let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer,
         residency,
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
-        loaded_tier: crate::memory_strategy::loaded_tier(spec),
+        loaded_tier,
     }))
 }
 
