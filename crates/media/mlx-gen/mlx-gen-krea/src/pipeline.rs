@@ -34,8 +34,8 @@ use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, Progress, Result,
-    TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, PreviewSink,
+    Progress, Result, TimestepConvention,
 };
 
 use std::path::Path;
@@ -53,6 +53,63 @@ use crate::text_encoder::{
 use crate::transformer::{EditPrep, JointPrep, Krea2Transformer};
 use crate::vae::{load_vae, QwenVae};
 use mlx_gen_boogu::VisionTower;
+
+/// One Krea denoise trajectory's preview state. The Qwen provider owns the fitted projection;
+/// Krea owns schedule slicing and therefore the counter that numbers frames across this route.
+struct KreaPreview<'a> {
+    sink: &'a PreviewSink,
+    counter: mlx_gen::preview::PreviewCounter,
+    sigmas: &'a [f32],
+}
+
+impl<'a> KreaPreview<'a> {
+    fn new(sink: &'a PreviewSink, sigmas: &'a [f32]) -> Self {
+        Self {
+            sink,
+            counter: mlx_gen::preview::PreviewCounter::new(sigmas),
+            sigmas,
+        }
+    }
+
+    fn emit(&self, sigma: f32, latents: &Array) {
+        mlx_gen_qwen_image::preview::emit_spatial_preview(
+            self.sink,
+            &self.counter,
+            self.sigmas,
+            sigma,
+            latents,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_krea_sampler<F>(
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    preview: &KreaPreview<'_>,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: F,
+) -> Result<Array>
+where
+    F: FnMut(&Array, f32) -> Result<Array>,
+{
+    run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x, timestep| {
+            preview.emit(timestep, x);
+            predict(x, timestep)
+        },
+    )
+}
 
 /// Turbo text-to-image knobs, resolved from the [`crate::model`] request. Dimensions are validated at
 /// the Generator layer (multiple-of-16, in the resolution range) before the pipeline runs.
@@ -302,6 +359,7 @@ impl KreaHeavy {
     /// **Turbo t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
     /// [`T2iPlan`] built once per request. Byte-identical to the pre-hoist [`Self::render_turbo`] (the
     /// prep only depended on the latent geometry, not the noise values).
+    #[allow(clippy::too_many_arguments)]
     pub fn render_turbo_from(
         &self,
         plan: &T2iPlan,
@@ -309,6 +367,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -317,13 +376,14 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -354,7 +414,15 @@ impl KreaHeavy {
         // is shared across seeds.
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_turbo")?;
         let plan = self.prepare_t2i(context, None, opts.width, opts.height)?;
-        self.render_turbo_from(&plan, opts, decoder, keep, cancel, on_progress)
+        self.render_turbo_from(
+            &plan,
+            opts,
+            decoder,
+            keep,
+            cancel,
+            &PreviewSink::default(),
+            on_progress,
+        )
     }
 
     /// **Pose-ControlNet Turbo render** (sc-8465, epic 8459 S5) — the denoise/decode body of
@@ -389,6 +457,7 @@ impl KreaHeavy {
             None,
             opts,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -435,17 +504,19 @@ impl KreaHeavy {
         calibration_error_phase: Option<mlx_gen::gen_core::MemoryPhase>,
         opts: &TurboOptions,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, &sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             &sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -503,6 +574,7 @@ impl KreaHeavy {
             decoder,
             usize::MAX,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -550,6 +622,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -567,13 +640,14 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             x_start,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -610,7 +684,16 @@ impl KreaHeavy {
         // `render_base_from` directly so the preps are shared across seeds (F-073).
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_raw")?;
         let plan = self.prepare_t2i(ctx_pos, ctx_neg, opts.width, opts.height)?;
-        self.render_base_from(&plan, guidance, opts, decoder, keep, cancel, on_progress)
+        self.render_base_from(
+            &plan,
+            guidance,
+            opts,
+            decoder,
+            keep,
+            cancel,
+            &PreviewSink::default(),
+            on_progress,
+        )
     }
 
     /// **Raw true-CFG t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
@@ -625,6 +708,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -641,13 +725,14 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -694,16 +779,17 @@ impl KreaHeavy {
         latent: Array,
         seed: u64,
         cancel: &CancelFlag,
+        previews: &KreaPreview<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let block_window = dit.block_window(transformer_window_size, cancel)?;
-        run_flow_sampler(
+        run_krea_sampler(
             sampler,
-            TimestepConvention::Sigma,
             sub_sigmas,
             latent,
             seed,
             cancel,
+            previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -798,6 +884,7 @@ impl KreaHeavy {
     /// running latent — so the latent and sigma flow continuously across every boundary (the crux: no
     /// per-phase schedule, hence no seam/reset), while the ACTIVE ADAPTERS and GUIDANCE change per phase.
     /// This is the full "*N* steps Raw (CFG on) + *M* steps Raw+turbo-LoRA (CFG off)" workflow.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_multiphase(
         &self,
         plans: &[MultiPhasePlan],
@@ -805,11 +892,13 @@ impl KreaHeavy {
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         // Phase 0 starts from the initial noise at full[0]; each subsequent phase resumes from the
         // prior phase's output latent at the SHARED boundary sigma.
         let mut latent = init_noise(opts.height, opts.width, opts.seed)?;
+        let previews = KreaPreview::new(preview, full);
         for mp in plans {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
@@ -824,6 +913,7 @@ impl KreaHeavy {
                 latent,
                 opts.seed,
                 cancel,
+                &previews,
                 on_progress,
             )?;
         }
@@ -863,6 +953,7 @@ impl KreaHeavy {
             decoder,
             usize::MAX,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -881,6 +972,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -904,13 +996,14 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
 
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             x_start,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -973,6 +1066,7 @@ impl KreaHeavy {
             decoder,
             keep,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -1031,6 +1125,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         // Edit denoises from PURE NOISE — the source is in-context conditioning, not a noised init.
@@ -1055,13 +1150,14 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -1555,7 +1651,163 @@ fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
+        Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn active_preview_emits_one_numbered_frame_per_euler_step() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let previews = KreaPreview::new(&sink, &sigmas);
+        let latent = Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap();
+
+        run_krea_sampler(
+            None,
+            &sigmas,
+            latent,
+            7,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 3), (2, 3), (3, 3)]
+        );
+        assert!(frames
+            .iter()
+            .all(|frame| (frame.image.width, frame.image.height) == (2, 2)));
+    }
+
+    #[test]
+    fn active_preview_deduplicates_multieval_heun_steps() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let previews = KreaPreview::new(&sink, &sigmas);
+
+        run_krea_sampler(
+            Some("heun"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap(),
+            7,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.last().map(|frame| frame.current), Some(3));
+        assert!(frames.iter().all(|frame| frame.total == 3));
+    }
+
+    #[test]
+    fn multiphase_preview_keeps_one_global_counter_across_slices() {
+        let full = [1.0_f32, 0.75, 0.5, 0.25, 0.0];
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let previews = KreaPreview::new(&sink, &full);
+        let cancel = CancelFlag::new();
+        let latent = Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap();
+        let latent = run_krea_sampler(
+            None,
+            &full[..=2],
+            latent,
+            7,
+            &cancel,
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        run_krea_sampler(
+            None,
+            &full[2..],
+            latent,
+            7,
+            &cancel,
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 4), (2, 4), (3, 4), (4, 4)]
+        );
+    }
+
+    #[test]
+    fn inert_preview_preserves_fixed_seed_sampler_bytes() {
+        let sigmas = [1.0_f32, 0.6, 0.0];
+        let seed = 42;
+        let direct = run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            init_noise(16, 16, seed).unwrap(),
+            seed,
+            &CancelFlag::new(),
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        let sink = PreviewSink::default();
+        let previews = KreaPreview::new(&sink, &sigmas);
+        let wrapped = run_krea_sampler(
+            None,
+            &sigmas,
+            init_noise(16, 16, seed).unwrap(),
+            seed,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        assert_eq!(direct.as_slice::<f32>(), wrapped.as_slice::<f32>());
+        assert_eq!(previews.counter.next(&sigmas, sigmas[0]), Some(1));
+    }
+
+    #[test]
+    fn every_krea_sampler_site_flows_through_preview_wrapper() {
+        let source = include_str!("pipeline.rs");
+        assert_eq!(
+            source.matches("run_flow_sampler(").count(),
+            3,
+            "only the wrapper and inert identity oracle may call the raw sampler (plus this literal)"
+        );
+        assert_eq!(
+            source.matches("run_krea_sampler(").count(),
+            13,
+            "seven production sites, five weight-free test calls, and this literal"
+        );
+    }
 
     /// The Krea CFG combine is the reference `cond + g·(cond − uncond)`, not the standard
     /// `uncond + g·Δ`. With cond = 2, uncond = 1 (Δ = 1): g = 1 → 3 (the standard form would give 2 —

@@ -79,8 +79,33 @@ pub(crate) fn emit_preview(
     }
     mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
         let unpacked = unpack_latents(packed, width, height)?;
-        mlx_gen::preview::project_latents(&unpacked, &RGB_FACTORS, RGB_BIAS)
+        project_spatial_latents(&unpacked)
     });
+}
+
+/// Project and emit a Qwen-family spatial latent `[1, 16, h, w]` without packed-token conversion.
+///
+/// Krea 2 reuses [`crate::QwenVae`] and keeps its denoise state in this spatial layout, so this is
+/// the provider-owned reuse seam for the same fitted RGB coefficients. Callers must still own the
+/// schedule counter because only the generation route knows whether the current trajectory is a
+/// full schedule, an img2img tail, or a multi-phase slice. An inert sink returns before projection.
+pub fn emit_spatial_preview(
+    sink: &PreviewSink,
+    counter: &mlx_gen::preview::PreviewCounter,
+    sigmas: &[f32],
+    sigma: f32,
+    latents: &Array,
+) {
+    if !sink.is_active() {
+        return;
+    }
+    mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
+        project_spatial_latents(latents)
+    });
+}
+
+fn project_spatial_latents(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
+    mlx_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
 }
 
 #[cfg(test)]
@@ -130,5 +155,41 @@ mod tests {
         let frames = frames.lock().unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].current, frames[0].total), (2, 2));
+    }
+
+    #[test]
+    fn spatial_reuse_is_byte_identical_to_qwen_unpack_projection() {
+        let packed = crate::pipeline::create_noise(42, 16, 16).unwrap();
+        let spatial = unpack_latents(&packed, 16, 16).unwrap();
+        let sigmas = [1.0_f32, 0.0];
+
+        let packed_frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&packed_frames);
+        let packed_sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        emit_preview(
+            &packed_sink,
+            &mlx_gen::preview::PreviewCounter::new(&sigmas),
+            &sigmas,
+            sigmas[0],
+            &packed,
+            16,
+            16,
+        );
+
+        let spatial_frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&spatial_frames);
+        let spatial_sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        emit_spatial_preview(
+            &spatial_sink,
+            &mlx_gen::preview::PreviewCounter::new(&sigmas),
+            &sigmas,
+            sigmas[0],
+            &spatial,
+        );
+
+        assert_eq!(
+            packed_frames.lock().unwrap()[0].image,
+            spatial_frames.lock().unwrap()[0].image
+        );
     }
 }

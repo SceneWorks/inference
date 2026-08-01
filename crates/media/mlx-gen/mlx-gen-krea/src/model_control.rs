@@ -408,6 +408,7 @@ impl KreaTurboControl {
                         req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
                         &req.cancel,
+                        &req.preview,
                         on_progress,
                     )?;
                     images.push(img);
