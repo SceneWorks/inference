@@ -34,8 +34,9 @@ pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let streamable =
-        matches!(spec.weights, gen_core::WeightsSource::Dir(_)) && spec.adapters.is_empty();
+    let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, gen_core::WeightsSource::Dir(_))
+        && spec.adapters.is_empty();
     let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
             .unwrap_or_default();
@@ -89,7 +90,7 @@ pub(crate) fn provider_contract(
         // PiD replaces the native VAE with a separately planned decoder. Until that decoder accepts
         // this provider's explicit tile plan, the request safety gate rejects optimized PiD runs.
         pid_decode_routes: None,
-        load_shape: LoadShape::DeferredMaterialization,
+        load_shape: spec.load_shape,
         additional_prerequisites: [
             MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
@@ -128,7 +129,10 @@ pub(crate) fn provider_contract(
                 MemoryFormulaVariable::TransformerWindowSize,
             ],
         },
-        calibration: Some(MemoryCalibrationIdentity::new(CALIBRATION_FINGERPRINT)),
+        calibration: Some(MemoryCalibrationIdentity::new(
+            CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        )),
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -160,9 +164,10 @@ pub(crate) fn control_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
-    contract.calibration = Some(MemoryCalibrationIdentity::new(format!(
-        "{provider_id}-cuda-eager-control-v1"
-    )));
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        format!("{provider_id}-cuda-control-v1"),
+        LoadShape::EagerMaterialization,
+    ));
     Ok(contract)
 }
 
@@ -477,7 +482,44 @@ mod tests {
     };
 
     fn spec() -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        spec
+    }
+
+    #[test]
+    fn plain_contract_shape_controls_streaming_and_rung_four() {
+        let deferred = provider_contract(crate::MODEL_ID, &spec()).unwrap();
+        assert_eq!(deferred.load_shape, LoadShape::DeferredMaterialization);
+        assert_eq!(
+            deferred.calibration.as_ref().unwrap().load_shape,
+            LoadShape::DeferredMaterialization
+        );
+        assert!(deferred.lifecycle.transformer_window_materialization);
+        assert!(matches!(
+            deferred
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        ));
+
+        let mut eager_spec = spec();
+        eager_spec.load_shape = LoadShape::EagerMaterialization;
+        let eager = provider_contract(crate::MODEL_ID, &eager_spec).unwrap();
+        assert_eq!(eager.load_shape, LoadShape::EagerMaterialization);
+        assert_eq!(
+            eager.calibration.as_ref().unwrap().load_shape,
+            LoadShape::EagerMaterialization
+        );
+        assert!(!eager.lifecycle.transformer_window_materialization);
+        assert!(matches!(
+            eager
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        ));
     }
 
     #[test]
@@ -559,6 +601,7 @@ mod tests {
             selection: rung_four_selection(),
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

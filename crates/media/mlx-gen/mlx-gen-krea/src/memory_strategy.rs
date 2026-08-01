@@ -98,6 +98,7 @@ pub fn memory_strategy_contract(
         },
         calibration: Some(MemoryCalibrationIdentity::new(
             MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
         )),
         asset_facts: asset_facts(spec),
         runtime: MemoryRuntimeSemantics::default(),
@@ -419,6 +420,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

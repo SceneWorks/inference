@@ -385,19 +385,8 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// Calibration content fingerprint. It must change whenever quantization floors, tensor layout, or
 /// execution structure change in a way that invalidates measurements taken against this provider.
 ///
-/// The shape suffix is load-bearing: SC-15998 measured Eager and Deferred baselines at 9.550 and
-/// 4.847 GiB respectively, so evidence from one must never authorize the other.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "z-image-mlx-independent-materialization-v3-deferred";
-pub const EAGER_MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "z-image-mlx-independent-materialization-v3-eager";
-
-pub const fn memory_calibration_fingerprint(load_shape: mlx_gen::LoadShape) -> &'static str {
-    match load_shape {
-        mlx_gen::LoadShape::EagerMaterialization => EAGER_MEMORY_CALIBRATION_FINGERPRINT,
-        mlx_gen::LoadShape::DeferredMaterialization => MEMORY_CALIBRATION_FINGERPRINT,
-    }
-}
+/// Load shape is a typed evidence-key axis; this content fingerprint remains shape-independent.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materialization-v3";
 
 /// This provider's two bounded-decode routes, reconciled by the shared
 /// [`DecodeRoutes`](mlx_gen_pid::DecodeRoutes) (SC-15775).
@@ -557,7 +546,8 @@ pub fn memory_strategy_contract(
         },
         formula,
         calibration: Some(MemoryCalibrationIdentity::new(
-            memory_calibration_fingerprint(spec.load_shape),
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
         )),
         asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
@@ -1131,6 +1121,7 @@ mod tests {
             selection: selection_for(strategy, use_pid),
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            load_shape: mlx_gen::LoadShape::DeferredMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid,
@@ -1188,6 +1179,7 @@ mod tests {
         let calibration = contract.calibration.as_ref().unwrap();
         context.calibration_abi = calibration.abi;
         context.calibration_fingerprint = calibration.fingerprint.clone();
+        context.load_shape = calibration.load_shape;
         context.selection.tier.quant = quant;
         context
     }
@@ -1519,11 +1511,11 @@ mod tests {
         );
         assert_eq!(
             eager.calibration.as_ref().unwrap().fingerprint,
-            EAGER_MEMORY_CALIBRATION_FINGERPRINT
+            MEMORY_CALIBRATION_FINGERPRINT
         );
         assert_ne!(
-            deferred.calibration.as_ref().unwrap().fingerprint,
-            eager.calibration.as_ref().unwrap().fingerprint
+            deferred.calibration.as_ref().unwrap().load_shape,
+            eager.calibration.as_ref().unwrap().load_shape
         );
 
         // Use a lower rung implemented by both contracts so rejection proves evidence identity,
@@ -1537,7 +1529,8 @@ mod tests {
         ));
 
         let mut eager_context = context(MemoryStrategy::BoundedAttention);
-        eager_context.calibration_fingerprint = EAGER_MEMORY_CALIBRATION_FINGERPRINT.to_owned();
+        eager_context.calibration_fingerprint = MEMORY_CALIBRATION_FINGERPRINT.to_owned();
+        eager_context.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         assert!(matches!(
             safety_check(&deferred, eager_context.selection.tier, &eager_context),
             MemorySafetyDecision::Reject { reason }

@@ -164,6 +164,7 @@ fn check_memory_registration(
                 let context = route_context(
                     calibration.abi,
                     &calibration.fingerprint,
+                    calibration.load_shape,
                     edge,
                     overlap,
                     use_pid,
@@ -300,6 +301,20 @@ fn check_behavior_fixture(
     ) {
         errors.push(format!(
             "{}: {strategy:?} safety check is blind to mutated calibration fingerprint",
+            registration.provider_id
+        ));
+    }
+    let mut mutated_shape = fixture.context.clone();
+    mutated_shape.load_shape = match mutated_shape.load_shape {
+        gen_core::LoadShape::EagerMaterialization => gen_core::LoadShape::DeferredMaterialization,
+        gen_core::LoadShape::DeferredMaterialization => gen_core::LoadShape::EagerMaterialization,
+    };
+    if matches!(
+        (registration.safety_check)(spec, contract, &mutated_shape),
+        MemorySafetyDecision::Accept
+    ) {
+        errors.push(format!(
+            "{}: {strategy:?} safety check is blind to mutated calibration load shape",
             registration.provider_id
         ));
     }
@@ -451,6 +466,7 @@ fn check_behavior_fixture(
 fn route_context(
     calibration_abi: u32,
     calibration_fingerprint: &str,
+    load_shape: gen_core::LoadShape,
     edge: u32,
     overlap: u32,
     use_pid: bool,
@@ -471,6 +487,7 @@ fn route_context(
         },
         calibration_abi,
         calibration_fingerprint: calibration_fingerprint.to_owned(),
+        load_shape,
         mode: MemoryMode::TextToImage,
         has_reference: false,
         use_pid,
@@ -558,7 +575,10 @@ mod tests {
             decode_tiling: true,
             ..Default::default()
         };
-        contract.calibration = Some(MemoryCalibrationIdentity::new("pid-provider-v1"));
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            "pid-provider-v1",
+            contract.load_shape,
+        ));
         Ok(contract)
     }
 
@@ -663,6 +683,7 @@ mod tests {
             gen_core::MemoryBehaviorFixture::new(route_context(
                 calibration.abi,
                 &calibration.fingerprint,
+                calibration.load_shape,
                 routes.native.tile_edges[0],
                 routes.native.tile_overlap,
                 false,
@@ -670,6 +691,7 @@ mod tests {
             gen_core::MemoryBehaviorFixture::new(route_context(
                 calibration.abi,
                 &calibration.fingerprint,
+                calibration.load_shape,
                 routes.pid.tile_edges[0],
                 routes.pid.tile_overlap,
                 true,

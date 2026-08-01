@@ -119,9 +119,10 @@ use crate::{
 /// provider changes tensor layout, quantization floors, execution structure, or another detail that
 /// invalidates its measurements.
 ///
-/// SC-16065 is additive and deliberately did not bump this value: existing variables retain their
-/// meanings, while typed auxiliary components opt into the existing `OverlayBytes` input.
-pub const MEMORY_CALIBRATION_ABI: u32 = 1;
+/// ABI 2 adds the typed load-shape axis to calibration identities, run contexts, and evidence keys.
+/// ABI-1 records are intentionally stale because eager and deferred measurements are not
+/// interchangeable.
+pub const MEMORY_CALIBRATION_ABI: u32 = 2;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -632,13 +633,16 @@ impl MemoryBackendRealization {
 pub struct MemoryCalibrationIdentity {
     pub abi: u32,
     pub fingerprint: String,
+    /// Exact intra-phase materialization shape covered by this calibration.
+    pub load_shape: LoadShape,
 }
 
 impl MemoryCalibrationIdentity {
-    pub fn new(fingerprint: impl Into<String>) -> Self {
+    pub fn new(fingerprint: impl Into<String>, load_shape: LoadShape) -> Self {
         Self {
             abi: MEMORY_CALIBRATION_ABI,
             fingerprint: fingerprint.into(),
+            load_shape,
         }
     }
 }
@@ -1333,6 +1337,12 @@ impl MemoryProviderContract {
             if calibration.fingerprint.trim().is_empty() {
                 errors.push("calibration fingerprint must be non-empty".to_owned());
             }
+            if calibration.load_shape != self.load_shape {
+                errors.push(format!(
+                    "calibration load shape {:?} does not match contract load shape {:?}",
+                    calibration.load_shape, self.load_shape
+                ));
+            }
         }
 
         if self.backend.backend_id().is_empty() {
@@ -1519,6 +1529,7 @@ pub fn standard_memory_strategy_safety_check(
     if let Some(calibration) = contract.calibration.as_ref() {
         if context.calibration_abi != calibration.abi
             || context.calibration_fingerprint != calibration.fingerprint
+            || context.load_shape != calibration.load_shape
         {
             return reject(format!(
                 "{}: calibration handshake mismatch",
@@ -1874,6 +1885,8 @@ pub struct MemoryRunContext {
     /// this handshake too; optimized-only evidence validation is not sufficient.
     pub calibration_abi: u32,
     pub calibration_fingerprint: String,
+    /// Typed materialization shape covered by the calibration handshake.
+    pub load_shape: LoadShape,
     pub mode: MemoryMode,
     pub has_reference: bool,
     pub use_pid: bool,
@@ -1920,6 +1933,7 @@ pub fn standard_memory_behavior_context(
         selection: contract.representative_selection(strategy, tier, route.use_pid)?,
         calibration_abi: calibration.abi,
         calibration_fingerprint: calibration.fingerprint.clone(),
+        load_shape: calibration.load_shape,
         mode: route.mode,
         has_reference: route.has_reference,
         use_pid: route.use_pid,
@@ -2070,6 +2084,8 @@ pub struct MemoryEvidenceKey {
     pub resolved_route: String,
     pub backend: String,
     pub tier: MemoryNumericTier,
+    /// Exact intra-phase materialization shape measured by this evidence cell.
+    pub load_shape: LoadShape,
     pub mode: String,
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
@@ -2210,6 +2226,10 @@ impl MemoryEvidence {
         let Some(identity) = &contract.calibration else {
             return Err(MemoryEvidenceVerdict::Unverified);
         };
+        if self.key.load_shape != contract.load_shape || self.key.load_shape != identity.load_shape
+        {
+            return Err(MemoryEvidenceVerdict::FingerprintMismatch);
+        }
         if self.calibration_abi != identity.abi
             || self.calibration_fingerprint != identity.fingerprint
         {
@@ -2331,7 +2351,10 @@ mod tests {
                     MemoryFormulaVariable::PixelCount,
                 ],
             },
-            calibration: Some(MemoryCalibrationIdentity::new("test-layout-v1")),
+            calibration: Some(MemoryCalibrationIdentity::new(
+                "test-layout-v1",
+                LoadShape::DeferredMaterialization,
+            )),
             asset_facts: MemoryAssetFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
@@ -2351,6 +2374,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
@@ -2391,6 +2415,14 @@ mod tests {
                 if reason.contains("calibration handshake mismatch")
         ));
 
+        let mut wrong_shape = context.clone();
+        wrong_shape.load_shape = LoadShape::EagerMaterialization;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &wrong_shape),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+
         let mut wrong_abi = context;
         wrong_abi.calibration_abi += 1;
         assert!(matches!(
@@ -2398,6 +2430,16 @@ mod tests {
             MemorySafetyDecision::Reject { reason }
                 if reason.contains("calibration handshake mismatch")
         ));
+    }
+
+    #[test]
+    fn calibration_identity_load_shape_must_match_contract() {
+        let mut contract = adopted_contract();
+        contract.calibration.as_mut().unwrap().load_shape = LoadShape::EagerMaterialization;
+        assert!(contract
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("calibration load shape")));
     }
 
     #[test]
@@ -2572,6 +2614,7 @@ mod tests {
                     quant: Some(Quant::Q4),
                     component_precision_floors: &[],
                 },
+                load_shape: contract.load_shape,
                 mode: "text_to_image".to_owned(),
                 overlay: None,
                 geometry: MemoryGeometry {
@@ -2601,6 +2644,28 @@ mod tests {
             parity_result: MemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
+
+        evidence.key.load_shape = LoadShape::EagerMaterialization;
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+        evidence.key.load_shape = contract.load_shape;
+
+        let mut eager_contract = contract.clone();
+        eager_contract.load_shape = LoadShape::EagerMaterialization;
+        eager_contract.calibration.as_mut().unwrap().load_shape = LoadShape::EagerMaterialization;
+        assert_eq!(
+            evidence.optimized_eligibility(&eager_contract),
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+
+        evidence.calibration_abi = 1;
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+        evidence.calibration_abi = MEMORY_CALIBRATION_ABI;
 
         let mut changed_composition = contract.clone();
         changed_composition.additional_prerequisites.push((
@@ -2935,6 +3000,7 @@ mod tests {
                     quant: None,
                     component_precision_floors: &[],
                 },
+                load_shape: contract.load_shape,
                 mode: "text_to_image".to_owned(),
                 overlay: None,
                 geometry: MemoryGeometry {

@@ -1332,6 +1332,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
         },
         calibration: Some(MemoryCalibrationIdentity::new(
             "krea-turbo-cuda-phase-curves-v1",
+            LoadShape::DeferredMaterialization,
         )),
         // The Krea manifest phase curves already contain the measured resident floors. Asset facts
         // remain zero here rather than substituting on-disk shard sums for load-exact CUDA residency.
@@ -1557,6 +1558,7 @@ fn build_krea_control_memory_strategy_contract(
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         "sc-16013-krea-control-direct-1024-v1",
+        LoadShape::EagerMaterialization,
     ));
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
@@ -1766,6 +1768,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: gen_core::MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

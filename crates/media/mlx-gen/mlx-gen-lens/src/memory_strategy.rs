@@ -59,6 +59,7 @@ pub fn memory_strategy_contract(
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
     ));
     contract.asset_facts.base_bytes = footprint
         .text_encoder
@@ -396,12 +397,22 @@ mod tests {
     #[test]
     fn unmeasured_numeric_or_loader_shapes_do_not_advertise_rung_four() {
         let (root, base) = spec();
+        let deferred_contract = memory_strategy_contract("lens_turbo", &base).unwrap();
         let mut specs = Vec::new();
         let mut quantized = base.clone();
         quantized.quantize = Some(Quant::Q4);
         specs.push(quantized);
         let mut eager = base.clone();
         eager.load_shape = LoadShape::EagerMaterialization;
+        let eager_contract = memory_strategy_contract("lens_turbo", &eager).unwrap();
+        assert_eq!(
+            deferred_contract.calibration.as_ref().unwrap().fingerprint,
+            eager_contract.calibration.as_ref().unwrap().fingerprint
+        );
+        assert_ne!(
+            deferred_contract.calibration.as_ref().unwrap().load_shape,
+            eager_contract.calibration.as_ref().unwrap().load_shape
+        );
         specs.push(eager);
         let mut resident = base;
         resident.offload_policy = OffloadPolicy::Resident;
@@ -457,6 +468,7 @@ mod tests {
             },
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            load_shape: LoadShape::DeferredMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
