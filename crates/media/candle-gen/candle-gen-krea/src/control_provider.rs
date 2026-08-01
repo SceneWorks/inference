@@ -62,6 +62,10 @@ pub const DEFAULT_CONTROL_SCALE: f32 = 0.6;
 pub struct Krea2ControlPaths {
     /// Krea 2 Turbo diffusers snapshot dir (the deployed base the overlay applies on).
     pub root: PathBuf,
+    /// Optional INT8-ConvRot DiT single-file. When present, it replaces `root/transformer` while the
+    /// tokenizer, Qwen3-VL text encoder, and Qwen-Image VAE continue to load from `root`, matching the
+    /// registered Krea provider's validated ConvRot route. ConvRot does not support adapters.
+    pub convrot_dit: Option<PathBuf>,
     /// The trained control-branch overlay checkpoint (`.safetensors`, e.g. `control_step5000.safetensors`).
     pub control: PathBuf,
     /// User LoRA/LoKr adapters applied **additively** to the frozen base DiT (sc-11720) — a character /
@@ -185,10 +189,17 @@ impl Krea2Control {
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
     /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
+        if paths.convrot_dit.is_some() && !paths.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "krea control: INT8-ConvRot does not support LoRA/LoKr or diff-patch adapters"
+                    .into(),
+            ));
+        }
         let device = candle_gen::default_device()?;
         let text_root = paths.root.clone();
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
+        let heavy_convrot_dit = paths.convrot_dit.clone();
         let heavy_control = paths.control.clone();
         let heavy_adapters = paths.adapters.clone();
         let heavy_branch_tier = paths.branch_tier;
@@ -199,6 +210,7 @@ impl Krea2Control {
             move |_use_pid, _| {
                 load_control_heavy(
                     &heavy_root,
+                    heavy_convrot_dit.as_deref(),
                     &heavy_control,
                     &heavy_adapters,
                     heavy_branch_tier,
@@ -248,6 +260,7 @@ fn load_control_text(root: &Path, device: &Device) -> Result<Krea2ControlText> {
 /// Load the render phase after the text value has dropped on the sequential path.
 fn load_control_heavy(
     root: &Path,
+    convrot_dit: Option<&Path>,
     control: &Path,
     adapters: &[AdapterSpec],
     branch_tier: Option<Quant>,
@@ -255,16 +268,31 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
-    // Diff-patch (`.diff`/`.diff_b`) deltas fold into the dense baseline weights before the DiT builds
-    // (the projector filter-bypass is outside the additive residual surface); low-rank user adapters
-    // then ride as residuals. The pose control branch is never adapted either way.
-    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
-    let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
-    drop(dit_w);
-    if !adapters.is_empty() {
-        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
-    }
+    let mut dit = match control_dit_source(convrot_dit) {
+        ControlDitSource::Snapshot => {
+            let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
+            // Diff-patch (`.diff`/`.diff_b`) deltas fold into the dense baseline weights before the DiT
+            // builds (the projector filter-bypass is outside the additive residual surface); low-rank
+            // user adapters then ride as residuals. The pose control branch is never adapted either way.
+            let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+            let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
+            drop(dit_w);
+            if !adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+            }
+            dit
+        }
+        ControlDitSource::ConvRot(convrot_dit) => {
+            // Reuse the registered provider's exact descriptor validation, native-key remap, online
+            // Hadamard rotation, shared cuBLASLt context, and sm_89 floor. Only the composable DiT type
+            // differs because the pose branch injects residuals between main blocks.
+            let int8 = crate::pipeline::ensure_int8_floor(device)?;
+            let dit_w = Weights::from_convrot_file(convrot_dit, device, DType::BF16)?
+                .with_int8_context(int8);
+            crate::convert::validate_transformer(&dit_w, &cfg)?;
+            KreaTrainDit::load_inference(&dit_w, &cfg)?
+        }
+    };
 
     let mut branch = match branch_tier {
         Some(quant) => ControlBranch::from_checkpoint_quantized(control, &cfg, device, quant)?,
@@ -291,6 +319,19 @@ fn load_control_heavy(
         vae,
         vae_encoder,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlDitSource<'a> {
+    Snapshot,
+    ConvRot(&'a Path),
+}
+
+fn control_dit_source(convrot_dit: Option<&Path>) -> ControlDitSource<'_> {
+    match convrot_dit {
+        Some(path) => ControlDitSource::ConvRot(path),
+        None => ControlDitSource::Snapshot,
+    }
 }
 
 impl Krea2ControlHeavy {
@@ -413,6 +454,7 @@ mod tests {
     fn missing_paths(offload_policy: OffloadPolicy) -> Krea2ControlPaths {
         Krea2ControlPaths {
             root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
+            convrot_dit: None,
             control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
             adapters: Vec::new(),
             branch_tier: None,
@@ -435,6 +477,38 @@ mod tests {
         let model = Krea2Control::load(&missing_paths(OffloadPolicy::Resident))
             .expect("construction must not touch the missing snapshot");
         assert!(model.residency.with_resident_parts(|_, _| ()).is_none());
+    }
+
+    /// SC-16453: the immutable ConvRot file must survive the provider-path boundary and select the
+    /// ConvRot loader rather than falling back to `root/transformer`.
+    #[test]
+    fn convrot_identity_selects_the_convrot_dit_loader() {
+        let path = Path::new("/models/krea2_turbo_int8_convrot.safetensors");
+        assert_eq!(
+            control_dit_source(Some(path)),
+            ControlDitSource::ConvRot(path)
+        );
+        assert_eq!(control_dit_source(None), ControlDitSource::Snapshot);
+    }
+
+    /// ConvRot + adapters is unsupported and must reject before lazy model construction can silently
+    /// substitute the standard transformer or render without the requested adapter.
+    #[test]
+    fn convrot_rejects_adapters_before_loading_weights() {
+        let mut paths = missing_paths(OffloadPolicy::Resident);
+        paths.convrot_dit = Some(PathBuf::from(
+            "/nonexistent/krea2_turbo_int8_convrot.safetensors",
+        ));
+        paths.adapters.push(AdapterSpec::new(
+            PathBuf::from("/nonexistent/adapter.safetensors"),
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+        let error = Krea2Control::load(&paths)
+            .err()
+            .expect("ConvRot plus an adapter must reject")
+            .to_string();
+        assert!(error.contains("INT8-ConvRot does not support"), "{error}");
     }
 
     /// The request defaults match the Turbo control production knobs (1024², 8 CFG-free steps,
@@ -515,9 +589,11 @@ mod tests {
     ///
     /// Compare the raw pixel files byte-for-byte and use the printed rendered-device `overall-peak`
     /// deltas as the resident/sequential calibration. `KREA_CONTROL_BRANCH_QUANT=q8|q4` selects the
-    /// branch tier; omitted means bf16. `KREA_AB_RES` defaults to 768 and `KREA_AB_STEPS` defaults to
-    /// eight. One step is sufficient for packed-tier peak calibration because the same denoise working
-    /// set is reused at every step, but both processes in a parity pair must use the same value.
+    /// branch tier; omitted means bf16. `KREA_CONTROL_CONVROT_DIT=<file>` replaces the standard DiT,
+    /// while `KREA_TILE_VAE=1` and `KREA_CHUNK_ATTN=1` isolate the two fit-ladder savings.
+    /// `KREA_AB_RES` defaults to 768 and `KREA_AB_STEPS` defaults to eight. One step is sufficient for
+    /// packed-tier peak calibration because the same denoise working set is reused at every step, but
+    /// both processes in a parity pair must use the same value.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
@@ -549,6 +625,14 @@ mod tests {
         };
         let stage_residency =
             std::env::var("KREA_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
+        let convrot_dit = std::env::var("KREA_CONTROL_CONVROT_DIT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        let tile_vae_decode = std::env::var("KREA_TILE_VAE")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
+        let chunk_attention = std::env::var("KREA_CHUNK_ATTN")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
 
         let pose = image::open(pose_path).expect("decode pose PNG").to_rgb8();
         let pose = image::imageops::resize(&pose, res, res, image::imageops::FilterType::Lanczos3);
@@ -559,10 +643,11 @@ mod tests {
         };
         let paths = Krea2ControlPaths {
             root,
+            convrot_dit,
             control,
             adapters: Vec::new(),
             branch_tier,
-            chunk_attention: false,
+            chunk_attention,
             offload_policy: OffloadPolicy::Resident,
         };
         let request = Krea2ControlRequest {
@@ -572,6 +657,7 @@ mod tests {
             steps,
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 42,
+            tile_vae_decode,
             stage_residency,
             ..Default::default()
         };
@@ -594,11 +680,12 @@ mod tests {
             "resident"
         };
         eprintln!(
-            "SEQ_AB id=krea_2_turbo_control mode={mode} gpu={} {}x{} steps={} branch_tier={branch_tier:?} | {report} | bytes={} out={out}",
+            "SEQ_AB id=krea_2_turbo_control mode={mode} gpu={} {}x{} steps={} branch_tier={branch_tier:?} convrot={} tile_vae_decode={tile_vae_decode} chunk_attention={chunk_attention} | {report} | bytes={} out={out}",
             candle_gen::testkit::probe_gpu(),
             image.width,
             image.height,
             request.steps,
+            paths.convrot_dit.is_some(),
             image.pixels.len(),
         );
     }

@@ -117,6 +117,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     let model = Krea2Control::load(&Krea2ControlPaths {
         root: a.snapshot,
+        convrot_dit: std::env::var("KREA_CONTROL_CONVROT_DIT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from),
         control: a.ckpt,
         adapters: Vec::new(),
         branch_tier: a.branch_tier,
