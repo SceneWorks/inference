@@ -6,10 +6,10 @@
 //! as dense floats → a degenerate (flat) render, which the pixel-std assertion catches.
 //!
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
-//! converter packs only the **DiT `transformer/` block Linears** (double blocks' attention + FFN,
-//! single blocks' attention + `proj_mlp`/`proj_out`) into one flat
-//! `transformer/diffusion_pytorch_model.safetensors`; the transformer embedders + Approximator, the
-//! T5 encoder, and the VAE stay dense (mirrored). A packed tier is loaded with `Quant::None` (the
+//! converter packs the **DiT `transformer/` block Linears**, the complete T5-XXL quantizable surface,
+//! and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer and
+//! uses q8 auxiliaries because hosted image calibration rejects all-q4 quality; both routes remain
+//! fully packed with no dense transient. A packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
 //! tier is the mirrored source, loaded directly.
 //!
@@ -20,9 +20,14 @@
 //! Env knobs: SC8777_SRC (source snapshot dir; default the cached Chroma1-Base snapshot),
 //! SC8777_OUT (tier output dir), SC8777_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8777_MODEL
 //! (registry id: `chroma1_base` default / `chroma1_hd` / `chroma1_flash`), SC8777_KEEP (retain the
-//! tier).
+//! tier), and SC16462_AUX_BITS (optional T5/VAE bit width for mixed-precision shipping evidence).
 
+use mlx_gen::media::Image;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+use mlx_rs::transforms::eval;
+use mlx_rs::{Array, Dtype};
+use std::io::Read;
 use std::path::PathBuf;
 
 /// Resolve the cached HF snapshot dir for a `lodestones/<repo>` model, or `None` if absent.
@@ -64,6 +69,242 @@ fn bits_env() -> i32 {
         .unwrap_or(4)
 }
 
+fn auxiliary_bits_env(route_bits: i32) -> i32 {
+    std::env::var("SC16462_AUX_BITS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(route_bits)
+}
+
+fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
+    let complete = out
+        .join("transformer/diffusion_pytorch_model.safetensors")
+        .is_file()
+        && out.join("text_encoder/model.safetensors").is_file()
+        && out.join("vae/model.safetensors").is_file();
+    if !complete {
+        assert!(
+            !out.exists(),
+            "refusing to reuse incomplete packed destination {}",
+            out.display()
+        );
+        mlx_gen_chroma::convert::prequantize_turnkey(src, out, bits)
+            .expect("prequantize_turnkey succeeds");
+    }
+    for component in ["transformer", "text_encoder", "vae"] {
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join(component).join("config.json"))
+                .unwrap_or_else(|error| panic!("{component} config: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("parse {component} config: {error}"));
+        let expected_bits = if component == "transformer" {
+            bits
+        } else {
+            auxiliary_bits_env(bits)
+        };
+        assert_eq!(
+            config["quantization"]["bits"], expected_bits,
+            "{component} packed bit-width provenance"
+        );
+        let safetensors = std::fs::read_dir(out.join(component))
+            .expect("packed component dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().and_then(|ext| ext.to_str()) == Some("safetensors")
+            })
+            .count();
+        assert_eq!(
+            safetensors, 1,
+            "{component} must contain exactly one packed safetensors file"
+        );
+    }
+}
+
+fn gib(bytes: usize) -> f64 {
+    bytes as f64 / 2_f64.powi(30)
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    assert_eq!(a.len(), b.len(), "component output length mismatch");
+    let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        dot += x as f64 * y as f64;
+        aa += x as f64 * x as f64;
+        bb += y as f64 * y as f64;
+    }
+    dot / (aa.sqrt() * bb.sqrt()).max(f64::EPSILON)
+}
+
+fn exact_f32(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(&left, &right)| left.to_bits() == right.to_bits())
+}
+
+fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>, Vec<f32>, usize) {
+    clear_cache();
+    reset_peak_memory();
+    let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
+    let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
+    if let Some(bits) = quantize_at_load {
+        t5.quantize(bits).expect("load-time T5 quantization");
+    }
+    let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
+        &tokenizer,
+        &t5,
+        "a red fox trotting across a snowy meadow at sunrise, cinematic",
+    )
+    .expect("T5 prompt encode");
+    let output = output.as_dtype(Dtype::Float32).expect("T5 output f32");
+    let text_mask = text_mask
+        .as_dtype(Dtype::Float32)
+        .expect("T5 text mask f32");
+    eval([&output, &text_mask]).expect("materialize T5 output and mask");
+
+    let all_values = output.as_slice::<f32>().to_vec();
+
+    // Keep this as a semantic-span diagnostic only. Chroma's reference-compatible 0/1 additive
+    // attention mask does not prove the other positions are inert; the full-output exact check and
+    // full-pipeline image gate below remain authoritative for runtime parity and quality.
+    let token_width = output.shape()[2] as usize;
+    let mask = text_mask.as_slice::<f32>();
+    let mut active_values = Vec::with_capacity(mask.len() * token_width);
+    for (token, &active) in mask.iter().enumerate() {
+        if active > 0.5 {
+            let start = token * token_width;
+            active_values.extend_from_slice(&all_values[start..start + token_width]);
+        }
+    }
+    assert!(
+        !active_values.is_empty(),
+        "T5 prompt mask must retain tokens"
+    );
+    let peak = get_peak_memory();
+    drop(text_mask);
+    drop(output);
+    drop(t5);
+    clear_cache();
+    (all_values, active_values, peak)
+}
+
+fn vae_output(
+    root: &std::path::Path,
+    quantize_at_load: Option<i32>,
+) -> (Vec<f32>, Vec<f32>, usize) {
+    clear_cache();
+    reset_peak_memory();
+    let mut vae = mlx_gen_chroma::loader::load_vae(root).expect("VAE weights");
+    if let Some(bits) = quantize_at_load {
+        vae.quantize(bits).expect("load-time VAE quantization");
+    }
+    let latent_values = (0..16 * 8 * 8)
+        .map(|i| ((i as f32 * 0.013).sin() * 0.5).clamp(-1.0, 1.0))
+        .collect::<Vec<_>>();
+    let latents = Array::from_slice(&latent_values, &[1, 16, 1, 8, 8]);
+    let decoded = vae.decode(&latents).expect("VAE decode");
+    let decoded = decoded.as_dtype(Dtype::Float32).expect("VAE decode f32");
+    let image_values = (0..3 * 64 * 64)
+        .map(|i| ((i as f32 * 0.007).cos() * 0.5).clamp(-1.0, 1.0))
+        .collect::<Vec<_>>();
+    let image = Array::from_slice(&image_values, &[1, 3, 1, 64, 64]);
+    let encoded = vae.encode(&image).expect("VAE encode");
+    let encoded = encoded.as_dtype(Dtype::Float32).expect("VAE encode f32");
+    eval([&decoded, &encoded]).expect("materialize VAE outputs");
+    let decoded_values = decoded.as_slice::<f32>().to_vec();
+    let encoded_values = encoded.as_slice::<f32>().to_vec();
+    let peak = get_peak_memory();
+    drop(decoded);
+    drop(encoded);
+    drop(vae);
+    clear_cache();
+    (decoded_values, encoded_values, peak)
+}
+
+fn render_samples(root: PathBuf, id: &str) -> (Vec<Image>, usize) {
+    clear_cache();
+    reset_peak_memory();
+    let generator = mlx_gen_chroma::provider_registry()
+        .unwrap()
+        .load(id, &LoadSpec::new(WeightsSource::Dir(root)))
+        .expect("Chroma tier loads");
+    let prompts = [
+        "a studio photograph of a red fox on fresh snow, detailed fur",
+        "a watercolor lighthouse above a stormy ocean at sunset",
+    ];
+    let images = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let request = GenerationRequest {
+                prompt: (*prompt).into(),
+                width: 256,
+                height: 256,
+                count: 1,
+                seed: Some(16462 + index as u64),
+                steps: Some(8),
+                ..Default::default()
+            };
+            match generator
+                .generate(&request, &mut |_| {})
+                .expect("Chroma quality render")
+            {
+                GenerationOutput::Images(mut images) => {
+                    assert_eq!(images.len(), 1);
+                    images.pop().unwrap()
+                }
+                other => panic!("expected Images, got {other:?}"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let peak = get_peak_memory();
+    drop(generator);
+    clear_cache();
+    (images, peak)
+}
+
+fn image_metrics(reference: &Image, candidate: &Image) -> (f64, f64) {
+    assert_eq!(reference.pixels.len(), candidate.pixels.len());
+    let reference_f32 = reference
+        .pixels
+        .iter()
+        .map(|&pixel| pixel as f32)
+        .collect::<Vec<_>>();
+    let candidate_f32 = candidate
+        .pixels
+        .iter()
+        .map(|&pixel| pixel as f32)
+        .collect::<Vec<_>>();
+    let mean_absolute_error = reference
+        .pixels
+        .iter()
+        .zip(&candidate.pixels)
+        .map(|(&left, &right)| (left as f64 - right as f64).abs())
+        .sum::<f64>()
+        / reference.pixels.len() as f64;
+    (cosine(&reference_f32, &candidate_f32), mean_absolute_error)
+}
+
+fn files_are_identical(left: &std::path::Path, right: &std::path::Path) -> std::io::Result<bool> {
+    if std::fs::metadata(left)?.len() != std::fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = std::io::BufReader::with_capacity(8 * 1024 * 1024, std::fs::File::open(left)?);
+    let mut right = std::io::BufReader::with_capacity(8 * 1024 * 1024, std::fs::File::open(right)?);
+    let mut left_chunk = vec![0u8; 8 * 1024 * 1024];
+    let mut right_chunk = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let left_len = left.read(&mut left_chunk)?;
+        let right_len = right.read(&mut right_chunk)?;
+        if left_len != right_len || left_chunk[..left_len] != right_chunk[..right_len] {
+            return Ok(false);
+        }
+        if left_len == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 /// Build-only harness for producing **hostable** tiers (epic 8506 rollout): pack a tier from a Chroma
 /// snapshot into `SC8777_OUT` and keep it — no load/generate. `SC8777_BITS=0` (dense bf16) is a
 /// verbatim mirror of the source; copy the snapshot dir directly rather than running the packer. Run:
@@ -88,8 +329,7 @@ fn build_tier_only() {
         src.display(),
         out.display()
     );
-    mlx_gen_chroma::convert::prequantize_turnkey(&src, &out, bits)
-        .expect("prequantize_turnkey succeeds");
+    packed_tier(&src, &out, bits);
     let f = out
         .join("transformer")
         .join("diffusion_pytorch_model.safetensors");
@@ -103,12 +343,194 @@ fn build_tier_only() {
     for asset in ["model_index.json", "transformer/config.json"] {
         assert!(out.join(asset).is_file(), "missing {asset} in turnkey");
     }
-    assert!(out.join("vae").is_dir(), "missing vae/ in turnkey");
     assert!(
-        out.join("text_encoder").is_dir(),
-        "missing text_encoder/ in turnkey"
+        out.join("vae/model.safetensors").is_file(),
+        "missing packed vae/model.safetensors"
+    );
+    assert!(
+        out.join("text_encoder/model.safetensors").is_file(),
+        "missing packed text_encoder/model.safetensors"
     );
     println!("✓ built {}", out.display());
+}
+
+/// SC-16462: real T5-XXL and FLUX.1 VAE weights must take the packed loader path, produce exactly
+/// the same tensors as the established dense-load-then-quantize seam, and stay inside the measured
+/// direct semantic-span diagnostic versus bf16. Because Chroma uses the reference's literal 0/1
+/// additive attention mask, the separate full-pipeline image gate is authoritative for runtime
+/// quality. T5 is also the residency discriminator: a packed load must avoid the dense-plus-packed
+/// high-water mark that load-time quantization necessarily incurs.
+#[test]
+#[ignore = "needs real Chroma weights and Apple Silicon MLX"]
+fn packed_auxiliaries_match_load_time_quantization() {
+    let Some(src) = chroma_snapshot() else {
+        panic!("no Chroma snapshot (set SC8777_SRC or populate the explicit MLX_GEN_MODELS_ROOT)");
+    };
+    let bits = bits_env();
+    assert!(matches!(bits, 4 | 8), "SC8777_BITS must be 4 or 8");
+    let auxiliary_bits = auxiliary_bits_env(bits);
+    assert!(
+        matches!(auxiliary_bits, 4 | 8),
+        "SC16462_AUX_BITS must be 4 or 8"
+    );
+    let out = std::env::var("SC8777_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join(format!("chroma-tier-q{bits}")));
+    packed_tier(&src, &out, bits);
+
+    let packed_weights =
+        mlx_gen::weights::Weights::from_dir(out.join("text_encoder")).expect("packed T5 weights");
+    assert_eq!(
+        packed_weights.require("shared.weight").unwrap().dtype(),
+        Dtype::Uint32,
+        "T5 embedding must be stored as packed codes"
+    );
+    assert!(packed_weights.get("shared.scales").is_some());
+    let packed_weights =
+        mlx_gen::weights::Weights::from_dir(out.join("vae")).expect("packed VAE weights");
+    let vae_probe = "decoder.mid_block.attentions.0.to_q";
+    assert_eq!(
+        packed_weights
+            .require(&format!("{vae_probe}.weight"))
+            .unwrap()
+            .dtype(),
+        Dtype::Uint32,
+        "VAE attention must be stored as packed codes"
+    );
+    assert!(packed_weights.get(&format!("{vae_probe}.scales")).is_some());
+
+    let (dense_t5, dense_t5_active, dense_t5_peak) = t5_output(&src, None);
+    let (load_time_t5, load_time_t5_active, load_time_t5_peak) =
+        t5_output(&src, Some(auxiliary_bits));
+    let (packed_t5, packed_t5_active, packed_t5_peak) = t5_output(&out, None);
+    assert!(
+        exact_f32(&packed_t5, &load_time_t5),
+        "packed T5 output differs from load-time Q{auxiliary_bits} output"
+    );
+    assert!(
+        exact_f32(&packed_t5_active, &load_time_t5_active),
+        "packed T5 active-span output differs from load-time Q{auxiliary_bits} output"
+    );
+    let t5_all_positions_cosine = cosine(&dense_t5, &packed_t5);
+    let t5_active_span_cosine = cosine(&dense_t5_active, &packed_t5_active);
+    assert!(
+        t5_all_positions_cosine.is_finite() && t5_active_span_cosine.is_finite(),
+        "Q{auxiliary_bits} T5 diagnostic cosines must be finite"
+    );
+    assert!(
+        packed_t5_peak < load_time_t5_peak,
+        "packed T5 peak {:.2} GiB must stay below load-time quantization peak {:.2} GiB",
+        gib(packed_t5_peak),
+        gib(load_time_t5_peak)
+    );
+
+    let (dense_vae_decode, dense_vae_encode, dense_vae_peak) = vae_output(&src, None);
+    let (load_time_vae_decode, load_time_vae_encode, load_time_vae_peak) =
+        vae_output(&src, Some(auxiliary_bits));
+    let (packed_vae_decode, packed_vae_encode, packed_vae_peak) = vae_output(&out, None);
+    assert!(
+        exact_f32(&packed_vae_decode, &load_time_vae_decode),
+        "packed VAE decode differs from load-time Q{auxiliary_bits} decode"
+    );
+    assert!(
+        exact_f32(&packed_vae_encode, &load_time_vae_encode),
+        "packed VAE encode differs from load-time Q{auxiliary_bits} encode"
+    );
+    let vae_decode_cosine = cosine(&dense_vae_decode, &packed_vae_decode);
+    let vae_encode_cosine = cosine(&dense_vae_encode, &packed_vae_encode);
+    // q4 group quantization has a wider direct component envelope; the full rendered-image gate
+    // below remains the stricter user-visible no-regression contract for both bit widths.
+    let vae_floor = if auxiliary_bits == 8 { 0.99999 } else { 0.9995 };
+    assert!(
+        vae_decode_cosine >= vae_floor && vae_encode_cosine >= vae_floor,
+        "Q{auxiliary_bits} VAE cosine fell below {vae_floor:.5} (decode={vae_decode_cosine:.7}, encode={vae_encode_cosine:.7})"
+    );
+
+    println!(
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        model_id(),
+        bits,
+        auxiliary_bits,
+        t5_all_positions_cosine,
+        t5_active_span_cosine,
+        vae_decode_cosine,
+        vae_encode_cosine,
+        dense_t5_peak,
+        load_time_t5_peak,
+        packed_t5_peak,
+        dense_vae_peak,
+        load_time_vae_peak,
+        packed_vae_peak,
+    );
+}
+
+/// Compare the newly packed-auxiliary tier against the exact currently shipped tier, whose
+/// transformer is already packed at the same bit width but whose T5/VAE are dense. This isolates
+/// auxiliary quality at full-pipeline level and emits the q4/q8 calibration row consumed by the
+/// hosted lane. The tight pixel envelope is the story's measurable no-regression contract.
+#[test]
+#[ignore = "needs the shipped and candidate Chroma tiers plus Apple Silicon MLX"]
+fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
+    let baseline = PathBuf::from(
+        std::env::var("SC16462_BASELINE")
+            .expect("SC16462_BASELINE must point to the exact shipped q4/q8 tier"),
+    );
+    assert!(
+        baseline.join("transformer").is_dir()
+            && baseline.join("text_encoder").is_dir()
+            && baseline.join("vae").is_dir(),
+        "baseline tier is incomplete: {}",
+        baseline.display()
+    );
+    let candidate = PathBuf::from(
+        std::env::var("SC8777_OUT").expect("SC8777_OUT must point to the candidate packed tier"),
+    );
+    let bits = bits_env();
+    let auxiliary_bits = auxiliary_bits_env(bits);
+    let id = model_id();
+    let transformer = "transformer/diffusion_pytorch_model.safetensors";
+    assert!(
+        files_are_identical(&baseline.join(transformer), &candidate.join(transformer))
+            .expect("compare shipped and candidate transformers"),
+        "Q{bits} candidate transformer differs from the shipped transformer; auxiliary quality isolation is invalid"
+    );
+    let (baseline_images, baseline_peak) = render_samples(baseline, &id);
+    let (candidate_images, candidate_peak) = render_samples(candidate, &id);
+    let metrics = baseline_images
+        .iter()
+        .zip(&candidate_images)
+        .map(|(reference, candidate)| image_metrics(reference, candidate))
+        .collect::<Vec<_>>();
+    let minimum_cosine = metrics
+        .iter()
+        .map(|(cosine, _)| *cosine)
+        .fold(f64::INFINITY, f64::min);
+    let maximum_mae = metrics.iter().map(|(_, mae)| *mae).fold(0.0f64, f64::max);
+    assert!(
+        minimum_cosine >= 0.9999,
+        "Q{bits} auxiliary packing changed a render: minimum cosine {minimum_cosine:.6} < 0.9999"
+    );
+    assert!(
+        maximum_mae <= 1.0,
+        "Q{bits} auxiliary packing changed a render: maximum mean absolute pixel error {maximum_mae:.4} > 1.0"
+    );
+    assert!(
+        candidate_peak < baseline_peak,
+        "Q{bits} packed tier peak {:.2} GiB must stay below shipped dense-auxiliary peak {:.2} GiB",
+        gib(candidate_peak),
+        gib(baseline_peak)
+    );
+    println!(
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        id,
+        bits,
+        auxiliary_bits,
+        minimum_cosine,
+        maximum_mae,
+        baseline_peak,
+        candidate_peak,
+        metrics.len(),
+    );
 }
 
 #[test]
@@ -138,13 +560,20 @@ fn prequantize_turnkey_loads_packed_and_renders() {
             src.display(),
             out.display()
         );
-        mlx_gen_chroma::convert::prequantize_turnkey(&src, &out, bits)
-            .expect("prequantize_turnkey succeeds");
+        packed_tier(&src, &out, bits);
         assert!(
             out.join("transformer")
                 .join("diffusion_pytorch_model.safetensors")
                 .is_file(),
             "missing packed transformer safetensors"
+        );
+        assert!(
+            out.join("text_encoder/model.safetensors").is_file(),
+            "missing packed T5 safetensors"
+        );
+        assert!(
+            out.join("vae/model.safetensors").is_file(),
+            "missing packed VAE safetensors"
         );
         out.clone()
     };
