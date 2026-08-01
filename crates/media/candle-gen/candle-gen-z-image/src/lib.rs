@@ -32,6 +32,7 @@ mod comfyui;
 // one home for what the three entry points (pipeline/edit/control) used to triplicate.
 mod common;
 mod dit;
+mod memory_strategy;
 mod pipeline;
 // The packed-load seam (sc-9408, sc-9089 umbrella): re-exports the shared `candle_gen::quant::QLinear`
 // (F-025 / sc-9005) + the thin dense-or-packed `QEmbedding` wrapper over the shared module, plus the
@@ -99,10 +100,16 @@ pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRE
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(REGISTRATION)
-        .register_generator(base::REGISTRATION)
-        .register_trainer(training::REGISTRATION)
+        .register_generator(base::REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
+        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION);
+    registry.register_trainer(training::REGISTRATION)
 }
 
 /// Build the complete explicit Candle Z-Image provider catalog.
@@ -179,6 +186,9 @@ pub struct ZImageGenerator {
     /// the DiT/TE/VAE from the in-place remapped ComfyUI single-files rather than a diffusers snapshot
     /// dir. Set only by [`load_from_comfyui_components`]; the registry `load` leaves it `None`.
     comfyui: Option<std::sync::Arc<comfyui::ComfyuiSources>>,
+    /// Executable shared-memory contract for registry-loaded CUDA providers. Bespoke ComfyUI loads
+    /// deliberately leave this absent because their fused component source is not block-addressable.
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
     /// Cached components + the accel-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache, never
     /// across the denoise.
@@ -224,6 +234,26 @@ impl ZImageGenerator {
 impl Generator for ZImageGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(MODEL_ID, contract, context)?;
+        Ok(Some(Box::new(memory_strategy::ZImageMemoryScope::new(
+            MODEL_ID,
+            self.device.clone(),
+            contract,
+            context,
+        ))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -277,11 +307,19 @@ impl Generator for ZImageGenerator {
             ),
         };
 
-        if req
-            .memory
-            .as_ref()
-            .is_some_and(|memory| memory.stage_residency)
-        {
+        if let Some(memory) = req.memory.as_ref().filter(|memory| {
+            memory.stage_residency
+                || memory.tile_vae_decode
+                || memory.chunk_attention
+                || memory.stream_transformer_blocks
+        }) {
+            if !memory.stage_residency {
+                return Err(gen_core::Error::Unsupported(
+                    "z_image_turbo: bounded decode, attention, and transformer residency require \
+                     request-scoped staged residency"
+                        .into(),
+                ));
+            }
             if self.comfyui.is_some() {
                 return Err(gen_core::Error::Unsupported(
                     "z_image_turbo: sequential residency is unavailable for bespoke ComfyUI \
@@ -440,6 +478,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
+    #[cfg(feature = "cuda")]
+    let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
+    #[cfg(not(feature = "cuda"))]
+    let memory_strategy = None;
     Ok(Box::new(ZImageGenerator {
         descriptor: descriptor(),
         root,
@@ -452,6 +494,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
         comfyui: None,
+        memory_strategy,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
@@ -492,6 +535,7 @@ pub fn load_from_comfyui_components(
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
+        memory_strategy: None,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
@@ -518,6 +562,7 @@ pub fn load_from_comfyui_checkpoint(
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
+        memory_strategy: None,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
@@ -526,6 +571,64 @@ pub fn load_from_comfyui_checkpoint(
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
 // the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+
+#[cfg(feature = "cuda")]
+fn registered_turbo_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(MODEL_ID, spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_base_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(base::MODEL_ID, spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_turbo_control_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::control_contract("z_image_turbo_control", spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_base_control_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::control_contract("z_image_control", spec)
+}
+
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID,
+    contract: registered_turbo_memory_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: base::MODEL_ID,
+    contract: registered_base_memory_contract,
+    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: "z_image_turbo_control",
+        contract: registered_turbo_control_memory_contract,
+        safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    };
+
+#[cfg(feature = "cuda")]
+const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: "z_image_control",
+        contract: registered_base_control_memory_contract,
+        safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    };
 
 #[cfg(test)]
 mod tests {

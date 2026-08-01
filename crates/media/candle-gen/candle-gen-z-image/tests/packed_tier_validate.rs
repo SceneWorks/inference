@@ -20,7 +20,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, MemoryBudget,
+    MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryRunContext,
+    MemoryRunOutcome, MemorySelection, MemoryStrategy, MemoryStrategyParameters, Precision,
+    Progress, Quant, WeightsSource,
 };
 
 /// Basic non-degeneracy: the render is not solid-black / constant (a broken packed forward — NaN or
@@ -121,6 +124,146 @@ fn render_tier(env: &str, tag: &str) {
         let out_path = std::env::temp_dir().join(format!("z_image_packed_{tag}.png"));
         let _ = buf.save(&out_path);
         eprintln!("[{tag}] wrote {}", out_path.display());
+    }
+}
+
+fn render_base_ladder(
+    generator: &dyn candle_gen::gen_core::Generator,
+    strategy: MemoryStrategy,
+    transformer_window_size: Option<u32>,
+) -> Image {
+    let contract = generator
+        .memory_strategy_contract()
+        .expect("CUDA Z-Image base must publish a memory contract");
+    let parameters = match strategy {
+        MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+            MemoryStrategyParameters::default()
+        }
+        MemoryStrategy::BoundedDecode => MemoryStrategyParameters {
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            ..Default::default()
+        },
+        MemoryStrategy::BoundedAttention => MemoryStrategyParameters {
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(64 * 1024 * 1024),
+            ..Default::default()
+        },
+        MemoryStrategy::BoundedTransformerResidency => MemoryStrategyParameters {
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(64 * 1024 * 1024),
+            transformer_window_size,
+            ..Default::default()
+        },
+    };
+    let selection = MemorySelection {
+        strategy,
+        parameters,
+        tier: MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+    };
+    contract.validate_selection(&selection).unwrap();
+    let calibration = contract.calibration.as_ref().unwrap();
+    let context = MemoryRunContext {
+        selection,
+        calibration_abi: calibration.abi,
+        calibration_fingerprint: calibration.fingerprint.clone(),
+        mode: MemoryMode::TextToImage,
+        has_reference: false,
+        use_pid: false,
+        has_phases: false,
+        geometry: MemoryGeometry {
+            width: 256,
+            height: 256,
+            batch: 1,
+            frames: 1,
+        },
+        overlay: None,
+        budget: MemoryBudget {
+            total_bytes: u64::MAX,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        },
+        predicted_peak_bytes: 1,
+        cache_state: MemoryCacheState::Cold,
+        evidence_revision: "sc-15815-real-weight-conformance".to_owned(),
+    };
+    let mut scope = generator
+        .begin_memory_strategy_request(&context)
+        .unwrap()
+        .expect("Z-Image contract selection must create a request scope");
+    if contract.engages(strategy, MemoryStrategy::BoundedDecode) {
+        scope.configure_decode(512, 128, context.geometry).unwrap();
+    }
+    if contract.engages(strategy, MemoryStrategy::BoundedAttention) {
+        scope.configure_attention(64 * 1024 * 1024).unwrap();
+    }
+    if let Some(window) = transformer_window_size {
+        scope.materialize_transformer_window(0, window).unwrap();
+    }
+    let mut request = GenerationRequest {
+        prompt: "a photo of a rusty robot holding a lit candle, cinematic lighting".into(),
+        width: 256,
+        height: 256,
+        count: 1,
+        seed: Some(15815),
+        steps: Some(1),
+        guidance: Some(1.0),
+        ..Default::default()
+    };
+    scope.configure_request(&mut request).unwrap();
+    let output = generator.generate(&request, &mut |_| {});
+    let image = match output {
+        Ok(GenerationOutput::Images(mut images)) => {
+            assert_eq!(images.len(), 1);
+            images.remove(0)
+        }
+        Ok(other) => panic!("expected image output, got {other:?}"),
+        Err(error) => {
+            let message = error.to_string();
+            scope
+                .finish(MemoryRunOutcome::Error {
+                    message: message.clone(),
+                })
+                .unwrap();
+            panic!("real-weight ladder render failed: {message}");
+        }
+    };
+    scope.finish(MemoryRunOutcome::Complete).unwrap();
+    image
+}
+
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q4 + CUDA; exercises every implemented production rung"]
+fn packed_base_all_rungs_preserve_fixed_seed_output() {
+    let tier = PathBuf::from(
+        std::env::var("Z_IMAGE_BASE_PACKED_Q4")
+            .expect("set Z_IMAGE_BASE_PACKED_Q4 to the z-image q4 tier directory"),
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(tier));
+    let generator = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
+        .expect("load packed Z-Image base");
+    let reference = render_base_ladder(generator.as_ref(), MemoryStrategy::Resident, None);
+    assert_coherent(&reference, "base-q4-resident");
+    for (strategy, window) in [
+        (MemoryStrategy::StagedResidency, None),
+        (MemoryStrategy::BoundedDecode, None),
+        (MemoryStrategy::BoundedAttention, None),
+        (MemoryStrategy::BoundedTransformerResidency, Some(1)),
+    ] {
+        let adapted = render_base_ladder(generator.as_ref(), strategy, window);
+        assert_eq!(
+            adapted, reference,
+            "real packed Z-Image output changed at {strategy:?} / window {window:?}"
+        );
     }
 }
 

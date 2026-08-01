@@ -51,12 +51,16 @@ pub struct ZImageBaseGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// Serializes resident cache use with request-scoped staged eviction.
+    lifecycle: Mutex<()>,
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
     /// generator instance; empty ⇒ the stock unadapted build.
     adapters: Vec<AdapterSpec>,
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    /// Executable shared-memory contract captured from the exact load shape.
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
     /// Cached components + the accel-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache.
     components: Mutex<Option<(bool, Components)>>,
@@ -99,6 +103,28 @@ impl Generator for ZImageBaseGenerator {
         &self.descriptor
     }
 
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        crate::memory_strategy::validate_context(MODEL_ID, contract, context)?;
+        Ok(Some(Box::new(
+            crate::memory_strategy::ZImageMemoryScope::new(
+                MODEL_ID,
+                self.device.clone(),
+                contract,
+                context,
+            ),
+        )))
+    }
+
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // The shared capability floor: the base advertises guidance + negative prompt, so those are
         // accepted; anything outside the advertised set (e.g. conditioning) is rejected here.
@@ -130,6 +156,7 @@ impl Generator for ZImageBaseGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let pipe = Pipeline::load(
             &self.root,
             &self.device,
@@ -137,6 +164,35 @@ impl Generator for ZImageBaseGenerator {
             &self.adapters,
             self.pid_spec.clone(),
         );
+
+        if let Some(memory) = req.memory.as_ref().filter(|memory| {
+            memory.stage_residency
+                || memory.tile_vae_decode
+                || memory.chunk_attention
+                || memory.stream_transformer_blocks
+        }) {
+            if !memory.stage_residency {
+                return Err(gen_core::Error::Unsupported(
+                    "z_image: bounded decode, attention, and transformer residency require \
+                     request-scoped staged residency"
+                        .into(),
+                ));
+            }
+            if req.use_pid {
+                return Err(gen_core::Error::Unsupported(
+                    "z_image: PiD decode is not supported under sequential residency; use the \
+                     native VAE route or resident policy"
+                        .into(),
+                ));
+            }
+            self.device
+                .synchronize()
+                .map_err(candle_gen::CandleError::from)?;
+            drop(candle_gen::lock_recover(&self.components).take());
+            drop(candle_gen::lock_recover(&self.vae_encoder).take());
+            let images = pipe.render_base_sequential(req, on_progress)?;
+            return Ok(GenerationOutput::Images(images));
+        }
         let components = self.components(&pipe)?;
 
         // img2img / `Reference` (sc-8646): resolve the single reference + its effective strength, and —
@@ -205,7 +261,7 @@ pub fn descriptor() -> ModelDescriptor {
             component_precision_floors: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            supports_sequential_offload: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -252,16 +308,22 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype.
     let device = candle_gen::default_device()?;
+    #[cfg(feature = "cuda")]
+    let memory_strategy = Some(crate::memory_strategy::provider_contract(MODEL_ID, spec)?);
+    #[cfg(not(feature = "cuda"))]
+    let memory_strategy = None;
     Ok(Box::new(ZImageBaseGenerator {
         descriptor: descriptor(),
         root,
         device,
         dtype: DType::BF16,
+        lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
         // rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        memory_strategy,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
     }))
