@@ -44,7 +44,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use crate::control::Krea2ControlBranch;
-use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
+use crate::loader::{load_text_encoder, load_transformer_with_stream, load_vision_tower};
 use crate::multiphase::{PhaseSlice, ResolvedPhase};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{
@@ -65,6 +65,8 @@ pub struct TurboOptions {
     pub sampler: Option<String>,
     /// Curated scheduler override. `None` = the native exponential-mu schedule.
     pub scheduler: Option<String>,
+    /// MLX DiT blocks held at once. `None` keeps the resident straight-through path.
+    pub transformer_window_size: Option<usize>,
 }
 
 /// The **text-encode phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): tokenizer +
@@ -217,9 +219,16 @@ impl KreaHeavy {
     /// Load the single-stream DiT + Qwen-Image VAE from a Krea 2 snapshot's `transformer/` + `vae/`
     /// dirs.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
+        Self::from_snapshot_with_stream(root, false)
+    }
+
+    pub(crate) fn from_snapshot_with_stream(
+        root: impl AsRef<Path>,
+        streamable: bool,
+    ) -> Result<Self> {
         let root = root.as_ref();
         Ok(Self {
-            dit: load_transformer(root)?,
+            dit: load_transformer_with_stream(root, streamable)?,
             vae: load_vae(root)?,
         })
     }
@@ -255,6 +264,7 @@ impl KreaHeavy {
     /// survives the subsequent `quantize`.
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
         apply_adapters_strict_with_diff_patch(&mut self.dit, specs, "krea_2")?;
+        self.dit.capture_block_adapters();
         Ok(())
     }
 
@@ -304,6 +314,9 @@ impl KreaHeavy {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let sigmas = &full[..keep.min(full.len())];
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -314,7 +327,9 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = self
+                    .dit
+                    .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
@@ -549,6 +564,9 @@ impl KreaHeavy {
         let end = keep.min(full.len());
         let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -559,7 +577,9 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = self
+                    .dit
+                    .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
@@ -618,6 +638,9 @@ impl KreaHeavy {
             opts.scheduler.as_deref(),
         );
         let sigmas = &full[..keep.min(full.len())];
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -628,10 +651,14 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let cond =
+                    self.dit
+                        .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = match &plan.prep_neg {
                     Some(neg) => {
-                        let uncond = self.dit.forward_prepared(x, &t, neg)?;
+                        let uncond =
+                            self.dit
+                                .forward_prepared_windowed(x, &t, neg, block_window)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -663,11 +690,13 @@ impl KreaHeavy {
         guidance: f32,
         sub_sigmas: &[f32],
         sampler: Option<&str>,
+        transformer_window_size: Option<usize>,
         latent: Array,
         seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        let block_window = dit.block_window(transformer_window_size, cancel)?;
         run_flow_sampler(
             sampler,
             TimestepConvention::Sigma,
@@ -678,7 +707,7 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let cond = dit.forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = if guidance > 0.0 {
                     let neg = plan.prep_neg.as_ref().ok_or_else(|| {
                         mlx_gen::Error::Msg(
@@ -687,7 +716,7 @@ impl KreaHeavy {
                                 .into(),
                         )
                     })?;
-                    let uncond = dit.forward_prepared(x, &t, neg)?;
+                    let uncond = dit.forward_prepared_windowed(x, &t, neg, block_window)?;
                     krea_cfg_combine(&cond, &uncond, guidance)?
                 } else {
                     cond
@@ -736,6 +765,7 @@ impl KreaHeavy {
             if !specs.is_empty() {
                 mlx_gen::adapters::loader::apply_adapters_strict(&mut dit, &specs, "krea_2")?;
             }
+            dit.capture_block_adapters();
             // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
             let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
             let prep_neg = if phase.guidance > 0.0 {
@@ -790,6 +820,7 @@ impl KreaHeavy {
                 mp.guidance,
                 sub,
                 opts.sampler.as_deref(),
+                opts.transformer_window_size,
                 latent,
                 opts.seed,
                 cancel,
@@ -869,6 +900,9 @@ impl KreaHeavy {
         let end = keep.min(full.len());
         let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
 
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
@@ -880,10 +914,14 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let cond =
+                    self.dit
+                        .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = match &plan.prep_neg {
                     Some(neg) => {
-                        let uncond = self.dit.forward_prepared(x, &t, neg)?;
+                        let uncond =
+                            self.dit
+                                .forward_prepared_windowed(x, &t, neg, block_window)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -1014,6 +1052,9 @@ impl KreaHeavy {
             )
         };
         let sigmas = &full[..keep.min(full.len())];
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -1024,10 +1065,14 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared_edit(x, &t, &plan.prep_pos)?;
+                let cond =
+                    self.dit
+                        .forward_prepared_edit_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = match &plan.prep_neg {
                     Some(neg) => {
-                        let uncond = self.dit.forward_prepared_edit(x, &t, neg)?;
+                        let uncond =
+                            self.dit
+                                .forward_prepared_edit_windowed(x, &t, neg, block_window)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
