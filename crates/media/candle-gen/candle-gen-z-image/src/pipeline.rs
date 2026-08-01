@@ -445,11 +445,6 @@ impl Pipeline {
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
         let vb = self.component_vb("transformer")?;
-        if stream_transformer_blocks && !self.adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "z-image transformer streaming does not yet support load-time adapters".into(),
-            ));
-        }
         let mut dit = if stream_transformer_blocks {
             PackedDit::new_block_streamed(&dit_cfg, vb)?
         } else {
