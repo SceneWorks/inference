@@ -1,4 +1,4 @@
-//! Fresh-process CUDA measurement harness for SC-15256.
+//! Fresh-process CUDA measurement harness for SC-15256 / SC-16170.
 //!
 //! Run once per hosted Q4/Q8/BF16 tier and policy. Sequential runs emit physical text, denoise, and
 //! decode peaks from the provider's `Progress::Loading` boundaries; every run records the overall
@@ -47,6 +47,7 @@ fn measure_z_image_tier() {
             .expect("set Z_IMAGE_TIER_DIR to a hosted q4/q8/bf16 tier snapshot"),
     );
     let tier = std::env::var("Z_IMAGE_TIER_NAME").unwrap_or_else(|_| "unknown".into());
+    let provider = std::env::var("Z_IMAGE_PROVIDER").unwrap_or_else(|_| "z_image_turbo".into());
     let policy_name = std::env::var("Z_IMAGE_POLICY").unwrap_or_else(|_| "request-staged".into());
     let stage_residency = match policy_name.as_str() {
         "resident" => false,
@@ -59,13 +60,27 @@ fn measure_z_image_tier() {
         .unwrap_or(1);
     assert!(repeats > 0);
 
+    let width = std::env::var("Z_IMAGE_WIDTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    let height = std::env::var("Z_IMAGE_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    let default_steps = if provider == "z_image" { 50 } else { 8 };
+    let steps = std::env::var("Z_IMAGE_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default_steps);
+
     let spec = LoadSpec::new(WeightsSource::Dir(tier_dir));
     let request = GenerationRequest {
         prompt: "a rusty robot holding a lit candle, cinematic studio lighting, highly detailed"
             .into(),
-        width: 1024,
-        height: 1024,
-        steps: Some(8),
+        width,
+        height,
+        steps: Some(steps),
         count: 1,
         seed: Some(42),
         memory: Some(candle_gen::gen_core::GenerationMemory {
@@ -79,7 +94,7 @@ fn measure_z_image_tier() {
     let handle_phase = probe.phase();
     let generator = candle_gen_z_image::provider_registry()
         .expect("registry")
-        .load("z_image_turbo", &spec)
+        .load(&provider, &spec)
         .expect("load generator handle");
     probe.end_load(handle_phase);
 
@@ -116,8 +131,8 @@ fn measure_z_image_tier() {
             }
             other => panic!("expected image output, got {other:?}"),
         };
-        assert_eq!((image.width, image.height), (1024, 1024));
-        assert_eq!(image.pixels.len(), 1024 * 1024 * 3);
+        assert_eq!((image.width, image.height), (width, height));
+        assert_eq!(image.pixels.len(), (width * height * 3) as usize);
         let min = *image.pixels.iter().min().unwrap();
         let max = *image.pixels.iter().max().unwrap();
         assert!(max > min + 16, "render is degenerate: [{min}, {max}]");
@@ -140,7 +155,7 @@ fn measure_z_image_tier() {
             "ZIMAGE_PHASE tier={tier} policy={policy_name} repeat={repeat} phase={phase} peak_gb={peak_gb:.3}"
         );
     }
-    for seam in [384usize, 768] {
+    for seam in [width as usize * 3 / 8, width as usize * 3 / 4] {
         let ratio = seam_ratio(&image, seam);
         eprintln!(
             "ZIMAGE_SEAM tier={tier} policy={policy_name} x={seam} local_delta_ratio={ratio:.3}"
@@ -151,7 +166,7 @@ fn measure_z_image_tier() {
         );
     }
     eprintln!(
-        "ZIMAGE_VRAM tier={tier} policy={policy_name} gpu={} 1024x1024 steps=8 count=1 cold=true repeats={repeats} | {report}",
+        "ZIMAGE_VRAM provider={provider} tier={tier} policy={policy_name} gpu={} {width}x{height} steps={steps} count=1 cold=true repeats={repeats} | {report}",
         candle_gen::testkit::probe_gpu()
     );
 
