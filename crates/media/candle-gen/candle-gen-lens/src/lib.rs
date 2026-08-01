@@ -891,6 +891,7 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
             ))
             .into_iter()
             .collect(),
+        default_engagement_exclusions: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,

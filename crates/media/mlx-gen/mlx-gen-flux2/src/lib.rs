@@ -24,6 +24,7 @@ pub mod config;
 pub mod convert;
 pub mod kv_cache;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod pipeline;
@@ -85,6 +86,7 @@ pub fn register_providers(
         .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
         .register_generator(model::DEV_REGISTRATION)
         .register_generator(model::DEV_EDIT_REGISTRATION)
+        .register_memory_strategy(model::DEV_EDIT_MEMORY_REGISTRATION)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
 }
 
@@ -114,5 +116,19 @@ mod explicit_registry_tests {
                 "flux2_dev_control",
             ]
         );
+    }
+
+    #[test]
+    fn dev_edit_exposes_the_provider_memory_safety_contract() {
+        let registry = super::provider_registry().unwrap();
+        let contract = registry
+            .memory_strategy_contract(
+                super::FLUX2_DEV_EDIT_ID,
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(Default::default())),
+            )
+            .unwrap()
+            .expect("FLUX.2-dev edit memory contract");
+        assert_eq!(contract.provider_id, super::FLUX2_DEV_EDIT_ID);
+        assert!(contract.conformance_errors().is_empty());
     }
 }

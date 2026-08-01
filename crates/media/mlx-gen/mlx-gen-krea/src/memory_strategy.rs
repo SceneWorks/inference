@@ -68,6 +68,7 @@ pub fn memory_strategy_contract(
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
+        default_engagement_exclusions: Vec::new(),
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,

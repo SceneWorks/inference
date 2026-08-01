@@ -123,10 +123,13 @@ pub struct ModelRegistration {
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
-/// Optional, pre-load memory-strategy contract registration for one generator id.
+/// Optional, pre-load memory-strategy contract registration for one provider route id.
 ///
 /// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
-/// catalogs opt in with [`ProviderRegistryBuilder::register_memory_strategy`] as providers migrate.
+/// ordinary generators opt in with [`ProviderRegistryBuilder::register_memory_strategy`] as they
+/// migrate. A platform composition root may instead use
+/// [`ProviderRegistryBuilder::register_composed_memory_strategy`] for a real route assembled outside
+/// a single gen-core [`Generator`] (for example a base generator plus a native control overlay).
 #[derive(Clone, Copy)]
 pub struct MemoryRegistration {
     pub provider_id: &'static str,
@@ -220,6 +223,7 @@ pub struct AudioEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
+    composed_memory_strategy_ids: Vec<&'static str>,
     transforms: Vec<TransformRegistration>,
     audio_transforms: Vec<AudioTransformRegistration>,
     trainers: Vec<TrainerRegistration>,
@@ -253,6 +257,20 @@ impl ProviderRegistryBuilder {
         memory_strategy,
         MemoryRegistration
     );
+
+    /// Register memory policy for a real platform-composed route that is not represented by a
+    /// standalone gen-core [`Generator`] registration.
+    ///
+    /// This explicit seam preserves the ordinary registration invariant: calling
+    /// [`register_memory_strategy`](Self::register_memory_strategy) for an unmatched id is still an
+    /// error. Composition roots must opt in route by route, so a typo cannot silently become a
+    /// provider contract with no executable owner.
+    pub fn register_composed_memory_strategy(mut self, registration: MemoryRegistration) -> Self {
+        self.composed_memory_strategy_ids
+            .push(registration.provider_id);
+        self.memory_strategy.push(registration);
+        self
+    }
     builder_registration_method!(register_transform, transforms, TransformRegistration);
     builder_registration_method!(
         register_audio_transform,
@@ -321,6 +339,14 @@ impl ProviderRegistryBuilder {
         ensure_unique!(generators, "generator");
         {
             let mut ids = std::collections::BTreeSet::new();
+            let mut composed_ids = std::collections::BTreeSet::new();
+            for id in &self.composed_memory_strategy_ids {
+                if !composed_ids.insert(*id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate composed memory-strategy route id '{id}'"
+                    )));
+                }
+            }
             for registration in &self.memory_strategy {
                 if !ids.insert(registration.provider_id) {
                     return Err(Error::Msg(format!(
@@ -332,6 +358,7 @@ impl ProviderRegistryBuilder {
                     .generators
                     .iter()
                     .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                    && !composed_ids.contains(registration.provider_id)
                 {
                     return Err(Error::Msg(format!(
                         "memory-strategy contract '{}' has no matching generator registration",
@@ -353,6 +380,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
+            composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
             audio_transforms: self.audio_transforms.into_boxed_slice(),
             trainers: self.trainers.into_boxed_slice(),
@@ -371,6 +399,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
+    composed_memory_strategy_ids: Box<[&'static str]>,
     transforms: Box<[TransformRegistration]>,
     audio_transforms: Box<[AudioTransformRegistration]>,
     trainers: Box<[TrainerRegistration]>,
@@ -536,17 +565,18 @@ impl ProviderRegistry {
 
     /// Return the provider-owned memory-strategy contract for `id`, when adopted.
     ///
-    /// `Ok(None)` is the compatibility-safe resident-only/unverified state. Unknown generator ids
+    /// `Ok(None)` is the compatibility-safe resident-only/unverified state. Unknown provider ids
     /// remain errors; a malformed adopted contract also fails instead of being silently trusted.
     pub fn memory_strategy_contract(
         &self,
         id: &str,
         spec: &LoadSpec,
     ) -> Result<Option<MemoryProviderContract>> {
-        if !self
+        let has_generator = self
             .generators()
-            .any(|registration| (registration.descriptor)().id == id)
-        {
+            .any(|registration| (registration.descriptor)().id == id);
+        let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
+        if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
         }
         let Some(registration) = self
@@ -1460,6 +1490,50 @@ mod tests {
             "dummy_test_model"
         );
         assert!(registry.trainers().next().is_none());
+    }
+
+    fn composed_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        Ok(MemoryProviderContract::compatibility_default(
+            "dummy_composed_route",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
+    }
+
+    const DUMMY_COMPOSED_MEMORY_REGISTRATION: MemoryRegistration = MemoryRegistration {
+        provider_id: "dummy_composed_route",
+        contract: composed_memory_contract,
+        safety_check: crate::memory_strategy::default_registered_memory_strategy_safety_check,
+    };
+
+    #[test]
+    fn unmatched_memory_strategy_requires_explicit_composed_route_registration() {
+        let error = ProviderRegistryBuilder::new()
+            .register_memory_strategy(DUMMY_COMPOSED_MEMORY_REGISTRATION)
+            .build()
+            .err()
+            .expect("an ordinary memory registration must still match a generator");
+        assert_eq!(
+            error.to_string(),
+            "memory-strategy contract 'dummy_composed_route' has no matching generator registration"
+        );
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_COMPOSED_MEMORY_REGISTRATION)
+            .build()
+            .expect("an explicitly composed route is a valid memory-contract owner");
+        let contract = registry
+            .memory_strategy_contract(
+                "dummy_composed_route",
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .expect("the composed route resolves")
+            .expect("the composed route has a contract");
+        assert_eq!(contract.provider_id, "dummy_composed_route");
     }
 
     /// A tier the platform declared unimplemented is rejected at the load boundary — loudly, naming

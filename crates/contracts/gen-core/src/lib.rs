@@ -86,9 +86,10 @@ pub use memory_strategy::{
     MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope, MemoryProviderContract,
     MemoryRejection, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, MemoryWarmRunSemantics, MemoryWindowMaterialization,
-    TransformerComponent, MEMORY_CALIBRATION_ABI,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyEngagementExclusion,
+    MemoryStrategyParameters, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    MemoryWarmRunSemantics, MemoryWindowMaterialization, TransformerComponent,
+    MEMORY_CALIBRATION_ABI,
 };
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
