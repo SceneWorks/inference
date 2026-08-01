@@ -28,6 +28,10 @@ use mlx_gen::{
 };
 use mlx_gen_krea::{load, load_trainer};
 
+#[path = "../../tests/support/atomic_cache.rs"]
+#[allow(dead_code)] // this cache publishes a file, not symlink components
+mod atomic_cache;
+
 /// Resolve a cached HF snapshot dir (the `{env}` override, else the newest `models--{repo}` snapshot
 /// with a `transformer/` tree).
 fn snapshot(env: &str, repo_dir: &str) -> Option<PathBuf> {
@@ -206,6 +210,12 @@ fn save_png(img: &Image, name: &str) {
     eprintln!("  saved {}", p.display());
 }
 
+fn viability_adapter_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("krea_lora_viability")
+        .join("viability_magenta.safetensors")
+}
+
 /// Train a real LoRA on Raw over `images`/`caption` for `steps` steps at `rank` (512², grad-checkpointed).
 fn train_concept_lora(
     raw: &std::path::Path,
@@ -213,10 +223,10 @@ fn train_concept_lora(
     caption: &str,
     rank: u32,
     steps: u32,
-    out_name: &str,
 ) -> PathBuf {
-    let tmp = std::env::temp_dir().join(format!("krea_lora_viability_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let final_adapter = viability_adapter_path();
+    let staging =
+        atomic_cache::prepare_staging(&final_adapter).expect("prepare viability adapter staging");
     let mut trainer =
         load_trainer(&LoadSpec::new(WeightsSource::Dir(raw.to_path_buf()))).expect("load_trainer");
     let req = TrainingRequest {
@@ -239,8 +249,8 @@ fn train_concept_lora(
             gradient_checkpointing: true,
             ..Default::default()
         },
-        output_dir: tmp.clone(),
-        file_name: format!("{out_name}.safetensors"),
+        output_dir: staging.parent().unwrap().to_path_buf(),
+        file_name: staging.file_name().unwrap().to_string_lossy().into_owned(),
         trigger_words: vec![],
         cancel: CancelFlag::new(),
     };
@@ -253,7 +263,9 @@ fn train_concept_lora(
             }
         })
         .expect("train");
-    out.adapter_path
+    assert_eq!(out.adapter_path, staging, "trainer wrote the staging path");
+    atomic_cache::publish(&staging, &final_adapter).expect("publish viability adapter");
+    final_adapter
 }
 
 /// Render Turbo on an arbitrary `prompt` with `adapters` (seed 0, 512², 8 steps).
@@ -307,14 +319,7 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
 
-    let adapter = train_concept_lora(
-        &raw,
-        &images,
-        "a solid magenta color field",
-        16,
-        steps,
-        "viability_magenta",
-    );
+    let adapter = train_concept_lora(&raw, &images, "a solid magenta color field", 16, steps);
     // A PERMISSIVE prompt: the few-step distilled Turbo adheres strongly to prompt, so it resists a
     // LoRA that tries to OVERRIDE a strongly-described scene (e.g. "snowy mountain" stays a mountain);
     // a loosely-constrained backdrop gives the learned concept room to express, which is the fair
@@ -369,11 +374,7 @@ fn lora_scale_sweep_over_trained_concept() {
     };
     let adapter = std::env::var("KREA_ADAPTER")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::temp_dir()
-                .join("krea_lora_viability")
-                .join("viability_magenta.safetensors")
-        });
+        .unwrap_or_else(|_| viability_adapter_path());
     if !adapter.is_file() {
         eprintln!(
             "skipping: no adapter at {} (run raw_lora_visibly_shifts_turbo_toward_concept first)",
