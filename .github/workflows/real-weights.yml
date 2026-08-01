@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, chroma-auxiliary, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       publish_chroma_artifacts:
         description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
         type: boolean
@@ -143,6 +143,59 @@ jobs:
           path: |
             ${{ runner.temp }}/chroma-sc16462-calibration.jsonl
             ${{ runner.temp }}/chroma-sc16462-component.jsonl
+
+  # SC-16462 diagnostic lane: rank four single-sublayer T5 carve-outs at Chroma's production
+  # sequence length before spending another full Base/HD/Flash render matrix. This lane never
+  # publishes and deliberately materializes only Base's immutable bf16 text encoder.
+  mlx-chroma-t5-sensitivity:
+    name: Chroma T5 precision sensitivity
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-t5-sensitivity'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
+    env:
+      CHROMA_REPOSITORY: SceneWorks/chroma1-base-mlx
+      CHROMA_SOURCE_REVISION: e7330dda29d00ffdeeb719b28e92ee74cff0884c
+      SC8777_MODEL: chroma1_base
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize the immutable Base T5 source
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-t5-sensitivity-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$PYTHONPATH" "huggingface_hub==1.20.1"
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id=os.environ["CHROMA_REPOSITORY"],
+              revision=os.environ["CHROMA_SOURCE_REVISION"],
+              allow_patterns=["bf16/text_encoder/**"],
+              local_dir=os.environ["CHROMA_SNAPSHOT"],
+              token=False,
+          )
+          PY
+          test -d "$CHROMA_SNAPSHOT/bf16/text_encoder"
+          echo "SC8777_SRC=$CHROMA_SNAPSHOT/bf16" >> "$GITHUB_ENV"
+      - name: Rank single-sublayer T5 carve-outs
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-t5-sensitivity
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
+            t5_precision_sensitivity_sweep -- --ignored --exact --nocapture --test-threads=1 \
+            | tee "$RUNNER_TEMP/chroma-sc16462-t5-sensitivity.log"
+          grep 'SC16462_T5_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-t5-sensitivity.log"
+      - name: Upload T5 sensitivity evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chroma-sc16462-t5-sensitivity
+          if-no-files-found: error
+          path: ${{ runner.temp }}/chroma-sc16462-t5-sensitivity.log
 
   # Publication cannot begin until every Base/HD/Flash validation leg above is green. Each repo
   # receives q4+q8 in one parent-guarded commit. A retry explicitly verifies an already-published

@@ -25,7 +25,9 @@
 //! tier), and SC16462_AUX_BITS (optional T5/VAE bit width for mixed-precision shipping evidence).
 
 use mlx_gen::media::Image;
+use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_gen_flux::T5Sublayer;
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
@@ -142,6 +144,90 @@ fn exact_f32(a: &[f32], b: &[f32]) -> bool {
         && a.iter()
             .zip(b)
             .all(|(&left, &right)| left.to_bits() == right.to_bits())
+}
+
+#[derive(Clone, Copy)]
+enum T5ProbePolicy {
+    Dense,
+    Q8Linears,
+    Q8Except { block: usize, sublayer: T5Sublayer },
+}
+
+fn t5_probe_outputs(
+    root: &std::path::Path,
+    max_length: usize,
+    prompts: &[&str],
+    policy: T5ProbePolicy,
+) -> (Vec<(Vec<f32>, Vec<f32>)>, usize) {
+    clear_cache();
+    reset_peak_memory();
+    let tokenizer =
+        mlx_gen_chroma::loader::load_tokenizer_with_max_len(max_length).expect("tokenizer");
+    let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
+    match policy {
+        T5ProbePolicy::Dense => {}
+        T5ProbePolicy::Q8Linears => t5
+            .quantize_linears(8)
+            .expect("load-time T5 Linear quantization"),
+        T5ProbePolicy::Q8Except { block, sublayer } => t5
+            .quantize_linears_except(8, block, sublayer)
+            .expect("load-time T5 sensitivity quantization"),
+    }
+
+    let mut outputs = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        let (output, text_mask) =
+            mlx_gen_chroma::text::encode_prompt(&tokenizer, &t5, prompt).expect("T5 prompt encode");
+        let output = output.as_dtype(Dtype::Float32).expect("T5 output f32");
+        let text_mask = text_mask
+            .as_dtype(Dtype::Float32)
+            .expect("T5 text mask f32");
+        eval([&output, &text_mask]).expect("materialize T5 output and mask");
+
+        let all_values = output.as_slice::<f32>().to_vec();
+        let token_width = output.shape()[2] as usize;
+        let mask = text_mask.as_slice::<f32>();
+        let mut active_values = Vec::with_capacity(mask.len() * token_width);
+        for (token, &active) in mask.iter().enumerate() {
+            if active > 0.5 {
+                let start = token * token_width;
+                active_values.extend_from_slice(&all_values[start..start + token_width]);
+            }
+        }
+        assert!(
+            !active_values.is_empty(),
+            "T5 prompt mask must retain tokens"
+        );
+        outputs.push((all_values, active_values));
+    }
+
+    let peak = get_peak_memory();
+    drop(t5);
+    clear_cache();
+    (outputs, peak)
+}
+
+fn t5_sublayer_dense_bytes(root: &std::path::Path, block: usize, sublayer: T5Sublayer) -> usize {
+    let weights = Weights::from_dir(&root.join("text_encoder")).expect("T5 weights for byte count");
+    let (prefix, names): (String, &[&str]) = match sublayer {
+        T5Sublayer::Attention => (
+            format!("encoder.block.{block}.layer.0.SelfAttention"),
+            &["q", "k", "v", "o"],
+        ),
+        T5Sublayer::FeedForward => (
+            format!("encoder.block.{block}.layer.1.DenseReluDense"),
+            &["wi_0", "wi_1", "wo"],
+        ),
+    };
+    names
+        .iter()
+        .map(|name| {
+            weights
+                .require(&format!("{prefix}.{name}.weight"))
+                .expect("T5 sensitivity tensor")
+                .nbytes()
+        })
+        .sum()
 }
 
 fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>, Vec<f32>, usize) {
@@ -355,6 +441,112 @@ fn build_tier_only() {
         "missing packed text_encoder/model.safetensors"
     );
     println!("✓ built {}", out.display());
+}
+
+/// Rank the smallest credible T5 source-precision carve-outs before spending another full render
+/// matrix. The probes use Chroma's production sequence length, both strict-gate positive prompts,
+/// and the empty negative prompt exercised by Base/HD true CFG.
+#[test]
+#[ignore = "needs a real Chroma T5-XXL snapshot and Apple Silicon MLX"]
+fn t5_precision_sensitivity_sweep() {
+    let src = chroma_snapshot().expect("SC8777_SRC or cached Chroma snapshot required");
+    let prompts = [
+        "a studio photograph of a red fox on fresh snow, detailed fur",
+        "a watercolor lighthouse above a stormy ocean at sunset",
+        "",
+    ];
+    let (dense, dense_peak) = t5_probe_outputs(
+        &src,
+        mlx_gen_chroma::MAX_SEQUENCE_LENGTH,
+        &prompts,
+        T5ProbePolicy::Dense,
+    );
+    let candidates = [
+        ("q8-linears", T5ProbePolicy::Q8Linears, None),
+        (
+            "q8-except-block0-attention",
+            T5ProbePolicy::Q8Except {
+                block: 0,
+                sublayer: T5Sublayer::Attention,
+            },
+            Some((0usize, T5Sublayer::Attention)),
+        ),
+        (
+            "q8-except-block0-ffn",
+            T5ProbePolicy::Q8Except {
+                block: 0,
+                sublayer: T5Sublayer::FeedForward,
+            },
+            Some((0usize, T5Sublayer::FeedForward)),
+        ),
+        (
+            "q8-except-block23-attention",
+            T5ProbePolicy::Q8Except {
+                block: 23,
+                sublayer: T5Sublayer::Attention,
+            },
+            Some((23usize, T5Sublayer::Attention)),
+        ),
+        (
+            "q8-except-block23-ffn",
+            T5ProbePolicy::Q8Except {
+                block: 23,
+                sublayer: T5Sublayer::FeedForward,
+            },
+            Some((23usize, T5Sublayer::FeedForward)),
+        ),
+    ];
+
+    for (policy_name, policy, carveout) in candidates {
+        let (candidate, peak) =
+            t5_probe_outputs(&src, mlx_gen_chroma::MAX_SEQUENCE_LENGTH, &prompts, policy);
+        let prompt_metrics = dense
+            .iter()
+            .zip(&candidate)
+            .enumerate()
+            .map(
+                |(index, ((dense_all, dense_active), (candidate_all, candidate_active)))| {
+                    serde_json::json!({
+                        "promptIndex": index,
+                        "allPositionsCosine": cosine(dense_all, candidate_all),
+                        "activeSpanCosine": cosine(dense_active, candidate_active),
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        let worst_all = prompt_metrics
+            .iter()
+            .filter_map(|row| row["allPositionsCosine"].as_f64())
+            .fold(f64::INFINITY, f64::min);
+        let worst_active = prompt_metrics
+            .iter()
+            .filter_map(|row| row["activeSpanCosine"].as_f64())
+            .fold(f64::INFINITY, f64::min);
+        let dense_sublayer_bytes = carveout
+            .map(|(block, sublayer)| t5_sublayer_dense_bytes(&src, block, sublayer))
+            .unwrap_or(0);
+        let dense_block = carveout.map(|(block, _)| block);
+        let dense_sublayer = carveout.map(|(_, sublayer)| match sublayer {
+            T5Sublayer::Attention => "attention",
+            T5Sublayer::FeedForward => "ffn",
+        });
+        println!(
+            "SC16462_T5_SENSITIVITY {}",
+            serde_json::json!({
+                "model": model_id(),
+                "policy": policy_name,
+                "sequenceLength": mlx_gen_chroma::MAX_SEQUENCE_LENGTH,
+                "denseBlock": dense_block,
+                "denseSublayer": dense_sublayer,
+                "denseSublayerBytes": dense_sublayer_bytes,
+                "worstAllPositionsCosine": worst_all,
+                "worstActiveSpanCosine": worst_active,
+                "peakBytes": peak,
+                "densePeakBytes": dense_peak,
+                "prompts": prompt_metrics,
+            })
+        );
+    }
 }
 
 /// SC-16462: real T5-XXL and FLUX.1 VAE weights must take the packed loader path, produce exactly

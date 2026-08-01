@@ -312,6 +312,14 @@ pub struct T5TextEncoder {
     final_ln_w: Array,
 }
 
+/// A residual sublayer that may remain at source precision while the rest of T5's Linear surface
+/// is quantized. Chroma uses this to calibrate the smallest quality-preserving packed policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum T5Sublayer {
+    Attention,
+    FeedForward,
+}
+
 impl T5TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let p = |suffix: &str| join(prefix, suffix);
@@ -342,6 +350,30 @@ impl T5TextEncoder {
     pub fn quantize_linears(&mut self, bits: i32) -> Result<()> {
         for block in &mut self.blocks {
             block.quantize_linears(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Quantize every attention/FFN Linear except one explicitly selected residual sublayer.
+    ///
+    /// This is the narrow calibration seam used by Chroma's real-weight sensitivity sweep. The
+    /// caller must mirror the selected dense sublayer in any packed artifact predicate before the
+    /// policy can ship.
+    pub fn quantize_linears_except(
+        &mut self,
+        bits: i32,
+        dense_block: usize,
+        dense_sublayer: T5Sublayer,
+    ) -> Result<()> {
+        if dense_block >= self.blocks.len() {
+            return Err(crate::Error::Msg(format!(
+                "T5 dense carve-out block {dense_block} is outside 0..{}",
+                self.blocks.len()
+            )));
+        }
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            block
+                .quantize_linears_except(bits, (index == dense_block).then_some(dense_sublayer))?;
         }
         Ok(())
     }
@@ -397,6 +429,20 @@ impl T5Block {
     fn quantize_linears(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize_linears(bits)?;
         self.ff.quantize(bits)?;
+        Ok(())
+    }
+
+    fn quantize_linears_except(
+        &mut self,
+        bits: i32,
+        dense_sublayer: Option<T5Sublayer>,
+    ) -> Result<()> {
+        if dense_sublayer != Some(T5Sublayer::Attention) {
+            self.attn.quantize_linears(bits)?;
+        }
+        if dense_sublayer != Some(T5Sublayer::FeedForward) {
+            self.ff.quantize(bits)?;
+        }
         Ok(())
     }
 }
