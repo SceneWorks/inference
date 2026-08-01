@@ -50,7 +50,6 @@ use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
-use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 use candle_transformers::models::z_image::transformer::{
     create_coordinate_grid, patchify, unpatchify, Config as DitConfig,
 };
@@ -58,7 +57,9 @@ use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEnc
 
 // Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
 use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
-use crate::dit::{ZImageTransformer2DModel, ZImageTransformerBlock};
+use crate::dit::ZImageTransformerBlock;
+use crate::packed_dit::ZImageTransformer2DModel as PackedTransformer;
+use crate::pipeline::{DiT, Pipeline, TextEnc};
 
 /// The control transformer + context run bf16 (Z-Image native, candle txt2img dtype); the VAE encoder
 /// runs f32 (the encode path's dtype) and its output is cast to bf16 for the control context.
@@ -197,7 +198,7 @@ impl Default for ZImageControlRequest {
 /// The VACE control transformer: the vendored base DiT + the Fun-Controlnet-Union control stack
 /// (`control_all_x_embedder` + 15 `control_layers` + 2 `control_noise_refiner`).
 struct ZImageControlTransformer {
-    base: ZImageTransformer2DModel,
+    base: PackedTransformer,
     control_x_embedder: Linear,
     control_layers: Vec<ZImageControlBlock>,
     control_noise_refiner: Vec<ZImageControlBlock>,
@@ -205,11 +206,7 @@ struct ZImageControlTransformer {
 
 impl ZImageControlTransformer {
     /// Build from an already-loaded base transformer + the Fun-Controlnet-Union checkpoint VarBuilder.
-    fn from_weights(
-        base: ZImageTransformer2DModel,
-        cfg: &DitConfig,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn from_weights(base: PackedTransformer, cfg: &DitConfig, vb: VarBuilder) -> Result<Self> {
         let dim = cfg.dim;
         let key = format!("{}-{}", cfg.all_patch_size[0], cfg.all_f_patch_size[0]);
         let control_in = cfg.all_f_patch_size[0]
@@ -289,7 +286,7 @@ impl ZImageControlTransformer {
         scale: f64,
     ) -> Result<Tensor> {
         let base = &self.base;
-        let cfg = &base.cfg;
+        let cfg = base.control_config();
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = cfg.all_patch_size[0];
@@ -297,11 +294,11 @@ impl ZImageControlTransformer {
 
         // 1. Timestep embedding.
         let t_scaled = (t * cfg.t_scale)?;
-        let adaln = base.t_embedder.forward(&t_scaled)?;
+        let adaln = base.control_timestep_embedding(&t_scaled)?;
 
         // 2. Patchify + embed the image latent.
         let (x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
-        let mut x_emb = x_patches.apply(&base.x_embedder)?;
+        let mut x_emb = base.control_embed_image(&x_patches)?;
         let img_seq_len = x_emb.dim(1)?;
 
         // 3. Image position ids (offset past the caption block) + RoPE + an all-valid image mask.
@@ -311,7 +308,7 @@ impl ZImageControlTransformer {
         let text_len = cap_feats.dim(1)?;
         let x_pos_ids =
             create_coordinate_grid((f_tokens, h_tokens, w_tokens), (text_len + 1, 0, 0), device)?;
-        let (x_cos, x_sin) = base.rope_embedder.forward(&x_pos_ids)?;
+        let (x_cos, x_sin) = base.control_rope(&x_pos_ids)?;
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
 
         // 4. Embed the control context (same patchify geometry as the image → aligns 1:1).
@@ -330,27 +327,25 @@ impl ZImageControlTransformer {
         )?;
 
         // 6. Base noise refiner, injecting the control refiner hints.
-        for (i, layer) in base.noise_refiner.iter().enumerate() {
-            x_emb = layer.forward(&x_emb, Some(&x_attn_mask), &x_cos, &x_sin, Some(&adaln))?;
-            if let Some(n) = hint_index(&CONTROL_REFINER_PLACES, i) {
-                x_emb = add_hint(&x_emb, &refiner_hints[n], scale)?;
-            }
-        }
+        x_emb =
+            base.control_refine_noise(x_emb, &x_attn_mask, &x_cos, &x_sin, &adaln, |i, hidden| {
+                match hint_index(&CONTROL_REFINER_PLACES, i) {
+                    Some(n) => add_hint(&hidden, &refiner_hints[n], scale),
+                    None => Ok(hidden),
+                }
+            })?;
 
         // 7. Caption stream: RMSNorm → linear → context refiner.
-        let cap_normed = base.cap_embedder_norm.forward_diff(cap_feats)?;
-        let mut cap_emb = cap_normed.apply(&base.cap_embedder_linear)?;
+        let mut cap_emb = base.control_embed_caption(cap_feats)?;
         let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
-        let (cap_cos, cap_sin) = base.rope_embedder.forward(&cap_pos_ids)?;
+        let (cap_cos, cap_sin) = base.control_rope(&cap_pos_ids)?;
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-        for layer in &base.context_refiner {
-            cap_emb = layer.forward(&cap_emb, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
-        }
+        cap_emb = base.control_refine_context(cap_emb, &cap_attn_mask, &cap_cos, &cap_sin)?;
 
         // 8. Unify [image, caption].
         let mut unified = Tensor::cat(&[&x_emb, &cap_emb], 1)?;
         let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
-        let (unified_cos, unified_sin) = base.rope_embedder.forward(&unified_pos_ids)?;
+        let (unified_cos, unified_sin) = base.control_rope(&unified_pos_ids)?;
         let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
 
         // 9. Main control pass: thread the (refined) control state + caption through the 15 control
@@ -367,22 +362,21 @@ impl ZImageControlTransformer {
         )?;
 
         // 10. Base main layers, injecting the control hints at CONTROL_LAYERS_PLACES.
-        for (i, layer) in base.layers.iter().enumerate() {
-            unified = layer.forward(
-                &unified,
-                Some(&unified_attn_mask),
-                &unified_cos,
-                &unified_sin,
-                Some(&adaln),
-            )?;
-            if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
-                unified = add_hint(&unified, &main_hints[n], scale)?;
-            }
-        }
+        unified = base.control_run_resident_layers(
+            unified,
+            &unified_attn_mask,
+            &unified_cos,
+            &unified_sin,
+            &adaln,
+            |i, hidden| match hint_index(&CONTROL_LAYERS_PLACES, i) {
+                Some(n) => add_hint(&hidden, &main_hints[n], scale),
+                None => Ok(hidden),
+            },
+        )?;
 
         // 11. Head: image tokens → final AdaLN layer → unpatchify to the raw velocity.
         let x_out = unified.narrow(1, 0, img_seq_len)?;
-        let x_out = base.final_layer.forward(&x_out, &adaln)?;
+        let x_out = base.control_finish(&x_out, &adaln)?;
         Ok(unpatchify(
             &x_out,
             orig_size,
@@ -402,7 +396,7 @@ pub struct ZImageControl {
     /// from [`ZImageControlPaths::base`]; drives the scheduler (shift 6.0 vs 3.0), the default step
     /// count, and whether the denoise runs real CFG.
     base: bool,
-    text_encoder: ZImageTextEncoder,
+    text_encoder: TextEnc,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/uncond branch.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
@@ -425,33 +419,29 @@ impl ZImageControl {
         let device = candle_gen::default_device()?;
         let root = paths.snapshot.clone();
 
-        let text_encoder = ZImageTextEncoder::new(
-            &TextEncoderConfig::z_image(),
-            component_vb(&root, "text_encoder", DTYPE, &device)?,
-        )?;
-
+        let pipeline = Pipeline::load(&root, &device, DTYPE, &[], None);
+        let text = pipeline.load_text_phase()?;
         let dit_cfg = DitConfig::z_image_turbo();
-        let base = ZImageTransformer2DModel::new(
-            &dit_cfg,
-            component_vb(&root, "transformer", DTYPE, &device)?,
-        )?;
+        let base =
+            match pipeline.load_transformer(false, false)? {
+                DiT::Packed(base) => *base,
+                DiT::Dense(_) => return Err(CandleError::Msg(
+                    "z-image control: packed-aware transformer loader returned a dense-only model"
+                        .into(),
+                )),
+            };
         let control_file = resolve_control_file(&paths.control)?;
         let control_vb = candle_gen::mmap_var_builder(&[control_file], DTYPE, &device)?;
         let transformer = ZImageControlTransformer::from_weights(base, &dit_cfg, control_vb)?;
 
         let vae_cfg = VaeConfig::z_image();
-        let vae = AutoEncoderKL::new(&vae_cfg, component_vb(&root, "vae", DTYPE, &device)?)?;
-        let vae_encoder = VaeEncoder::new(
-            &vae_cfg,
-            component_vb(&root, "vae", ENC_DTYPE, &device)?.pp("encoder"),
-        )?;
-
-        let tokenizer = common::build_tokenizer(&root, "z-image control")?;
+        let vae = pipeline.load_vae()?;
+        let vae_encoder = pipeline.load_vae_encoder()?;
         Ok(Self {
             device,
             base: paths.base,
-            text_encoder,
-            tokenizer,
+            text_encoder: text.text_encoder,
+            tokenizer: text.tokenizer,
             transformer,
             vae,
             vae_encoder,
@@ -864,15 +854,6 @@ fn control_file_score(path: &Path) -> i32 {
 
 /// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype` (the txt2img loader).
 /// Delegates to the shared [`candle_gen::component_vb`] (sc-8999 / F-019).
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    candle_gen::component_vb(root, sub, dtype, device, "z-image control")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
