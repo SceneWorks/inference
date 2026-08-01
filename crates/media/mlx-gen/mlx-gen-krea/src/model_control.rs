@@ -395,6 +395,7 @@ impl KreaTurboControl {
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
+                        transformer_window_size: None,
                     };
                     let img = heavy.heavy.render_control_from(
                         &plan,

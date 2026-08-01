@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Result, WeightsSource};
 use mlx_gen_boogu::VisionTower;
 use mlx_rs::ops::multiply;
 use mlx_rs::Dtype;
@@ -77,11 +77,25 @@ pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
 /// the model. A pre-quantized snapshot loads through the same path (`quant::lin` auto-detects packed
 /// keys); a dense bf16 build is quantized later via [`crate::pipeline::KreaPipeline::quantize`].
 pub fn load_transformer(root: impl AsRef<Path>) -> Result<Krea2Transformer> {
+    load_transformer_with_stream(root, false)
+}
+
+/// Load the DiT and, for deferred snapshot loads, retain the re-openable transformer source needed
+/// to materialize exact block windows during denoise.
+pub(crate) fn load_transformer_with_stream(
+    root: impl AsRef<Path>,
+    streamable: bool,
+) -> Result<Krea2Transformer> {
     let root = root.as_ref();
     let cfg = Krea2Config::from_snapshot(root)?;
     let w = Weights::from_dir(root.join("transformer"))?;
     crate::convert::validate_transformer(&w, &cfg)?;
-    Krea2Transformer::from_weights(&w, &cfg)
+    let transformer = Krea2Transformer::from_weights(&w, &cfg)?;
+    Ok(if streamable {
+        transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")))
+    } else {
+        transformer
+    })
 }
 
 /// Validate and dequantize the non-rotated ComfyUI int8-tensorwise convention (sc-14023).
