@@ -26,7 +26,7 @@ use candle_gen::gen_core::{
     Progress, Quant, WeightsSource,
 };
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "cuda"))]
 mod host_memory {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -136,7 +136,7 @@ mod host_memory {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "cuda"))]
 mod host_memory {
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Peak {
