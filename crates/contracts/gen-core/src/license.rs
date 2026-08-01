@@ -150,6 +150,390 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
     rendered
 }
 
+// =================================================================================================
+// v3 — licence families, typed terms, and per-component rows (sc-16661).
+//
+// The v2 surface above records a legal CONCLUSION (`WeightLicense::commercial_use`) that depends on
+// facts inference does not have: the consumer's revenue, whether it redistributes weights or only
+// sells renders, whether it registered with the upstream. Three checkpoints already in the media
+// catalog have no correct boolean — FLUX.1-dev (weights non-commercial, outputs commercially
+// usable), SD3.5 (commercial below $1M annual revenue only), and Kolors (commercial weights use
+// only after registering with Kuaishou). Whichever value is written is silently wrong for half of
+// callers, and a join computed over it reads as authoritative.
+//
+// v3 stores facts instead, in three layers:
+//   * [`LicenseFamily`] — the reviewed unit, ~14 rows, read by a human once;
+//   * [`LicenseTerm`]   — typed obligations, so a licence join is a set union rather than a
+//                         boolean AND, and the consumer applies its own profile;
+//   * [`ComponentLicense`] — one row per loaded artifact, carrying the provenance that makes review
+//                         a quote check and makes upstream re-licensing detectable.
+//
+// A provider's terms are DERIVED from its components ([`provider_terms`]) and never hand-authored:
+// v2's hand-typed composite row is a second place to be wrong and can drift from its own components.
+//
+// The v2 types remain until the audio lane migrates (sc-16663) and the release tooling moves to
+// schema 3 (sc-16664); `commercial_use` has 67 usages across 18 audio provider crates, so deleting
+// it here would break the tree. v2 is superseded, not supported — do not add callers.
+// =================================================================================================
+
+/// A typed obligation or condition imposed by a [`LicenseFamily`].
+///
+/// Deliberately **not** a permissive/restrictive flag. Each variant is a fact about the licence
+/// text; whether a given use is permitted is the consumer's evaluation of the union of these
+/// against its own situation.
+///
+/// `Ord` is derived so a union renders deterministically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LicenseTerm {
+    /// An attribution / copyright notice must be reproduced by the product.
+    AttributionRequired,
+    /// Distribution must carry a NOTICE file, and modified files must be marked.
+    NoticeFileRequired,
+    /// Redistribution of the **weights** is restricted to non-commercial use.
+    NonCommercialWeights,
+    /// Use of the **outputs** (renders) is restricted to non-commercial use. Strictly stronger than
+    /// [`NonCommercialWeights`](Self::NonCommercialWeights) for a product that sells renders.
+    NonCommercialOutputs,
+    /// Commercial use is permitted only below an annual-revenue ceiling. A union may carry more
+    /// than one ceiling; every one binds, so a consumer at revenue `r` is clear only when `r` is
+    /// below **all** of them. That is why these are not collapsed to a minimum here.
+    RevenueCeiling {
+        /// The ceiling in whole US dollars.
+        amount_usd: u64,
+    },
+    /// Commercial use requires an out-of-band registration or approval with the upstream.
+    RegistrationRequired {
+        /// Where the registration is made (an email address or URL).
+        contact: &'static str,
+    },
+    /// An acceptable-use / prohibited-use policy binds the deployer.
+    AcceptableUsePolicy {
+        /// The policy text.
+        url: &'static str,
+    },
+    /// A concrete duty the deployer must discharge (e.g. content filtering on generated media).
+    DeployerObligation {
+        /// What the deployer must do, in the licence's own terms.
+        text: &'static str,
+    },
+    /// The licence's restrictions must be passed to downstream recipients as enforceable
+    /// provisions. Note that several licences impose this with materially different texts, so a
+    /// union containing it more than once is not redundant at the product layer.
+    DownstreamFlowDown,
+    /// The weights are gated upstream — the terms must be accepted to obtain them at all.
+    GatedAccess,
+}
+
+impl LicenseTerm {
+    /// The stable serialized discriminator for this term.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Self::AttributionRequired => "attribution_required",
+            Self::NoticeFileRequired => "notice_file_required",
+            Self::NonCommercialWeights => "non_commercial_weights",
+            Self::NonCommercialOutputs => "non_commercial_outputs",
+            Self::RevenueCeiling { .. } => "revenue_ceiling",
+            Self::RegistrationRequired { .. } => "registration_required",
+            Self::AcceptableUsePolicy { .. } => "acceptable_use_policy",
+            Self::DeployerObligation { .. } => "deployer_obligation",
+            Self::DownstreamFlowDown => "downstream_flow_down",
+            Self::GatedAccess => "gated_access",
+        }
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        let mut value = serde_json::json!({ "term": self.tag() });
+        let object = value
+            .as_object_mut()
+            .expect("term is serialized as an object");
+        match self {
+            Self::RevenueCeiling { amount_usd } => {
+                object.insert("amount_usd".into(), amount_usd.into());
+            }
+            Self::RegistrationRequired { contact } => {
+                object.insert("contact".into(), contact.into());
+            }
+            Self::AcceptableUsePolicy { url } => {
+                object.insert("url".into(), url.into());
+            }
+            Self::DeployerObligation { text } => {
+                object.insert("text".into(), text.into());
+            }
+            _ => {}
+        }
+        value
+    }
+}
+
+/// A licence **family** — one upstream licence text, reviewed once by a human.
+///
+/// Roughly fourteen families cover the whole catalog. Normalizing checkpoints onto families is what
+/// keeps the surface maintainable: adding a model is a transcription of which family it declares
+/// (mechanical, and verifiable against a quote), not another licence read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LicenseFamily {
+    /// Stable key referenced by [`ComponentLicense::family`], e.g. `"flux-1-dev-non-commercial"`.
+    pub id: &'static str,
+    /// SPDX identifier, or a `LicenseRef-…` id where the licence has no SPDX entry.
+    pub spdx_id: &'static str,
+    /// Human-readable licence name.
+    pub name: &'static str,
+    /// The canonical licence text this family was read from.
+    pub text_url: &'static str,
+    /// The typed obligations this licence imposes.
+    pub terms: &'static [LicenseTerm],
+}
+
+impl LicenseFamily {
+    /// Whether this family imposes `term`.
+    pub fn imposes(&self, term: LicenseTerm) -> bool {
+        self.terms.contains(&term)
+    }
+
+    /// Whether this family requires attribution (the invariant [`ComponentLicense`] rows are
+    /// checked against).
+    pub fn requires_attribution(&self) -> bool {
+        self.imposes(LicenseTerm::AttributionRequired)
+    }
+}
+
+/// One **loaded artifact** and the licence it declares — the fact layer.
+///
+/// The unit that carries a licence is a checkpoint, not a provider id: `boogu_image` is a Boogu DiT
+/// plus a Qwen3-VL-8B encoder plus a FLUX.1 VAE, three licences with different terms. Keying rows
+/// by component also lets the surface represent artifacts that register no provider id at all —
+/// the face / depth / segmentation / decoder stacks an identity or PiD render pulls in, which is
+/// where the strictest terms in the catalog live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentLicense {
+    /// Stable component key, e.g. `"arcface_antelopev2"`. Unique across the table.
+    pub component: &'static str,
+    /// The upstream artifact this row describes.
+    pub source_url: &'static str,
+    /// The licence identifier **as declared upstream**, verbatim (e.g. `"apache-2.0"`,
+    /// `"flux-1-dev-non-commercial-license"`). The drift gate re-reads `source_url` and compares
+    /// against this string, so it must be transcribed rather than normalized.
+    pub declared: &'static str,
+    /// The [`LicenseFamily::id`] this declaration normalizes to.
+    pub family: &'static str,
+    /// The attribution the family requires. Mandatory when the family sets
+    /// [`LicenseTerm::AttributionRequired`].
+    pub attribution: Option<&'static str>,
+    /// ISO `YYYY-MM-DD` date `declared` was read from `source_url`. Without an as-of date a
+    /// re-licensed upstream rots the table invisibly.
+    pub retrieved: &'static str,
+}
+
+/// The components a registered provider id loads. The per-backend part of the surface — the two
+/// media catalogs ship different id sets, but a component row itself is backend-independent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderComponents {
+    /// The registry id, matching the provider descriptor's `id`.
+    pub provider_id: &'static str,
+    /// Component keys resolving into the [`ComponentLicense`] table.
+    pub components: &'static [&'static str],
+}
+
+/// Whether `value` is an ISO `YYYY-MM-DD` calendar date. Dependency-free on purpose — the contracts
+/// crate takes no date dependency for one field.
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(i, b)| !matches!(i, 4 | 7) && !b.is_ascii_digit())
+    {
+        return false;
+    }
+    let number = |from: usize, to: usize| value[from..to].parse::<u32>().unwrap_or(0);
+    let (month, day) = (number(5, 7), number(8, 10));
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// Look up a family by id.
+pub fn resolve_family<'a>(families: &'a [LicenseFamily], id: &str) -> Option<&'a LicenseFamily> {
+    families.iter().find(|family| family.id == id)
+}
+
+/// The union of every term imposed on `provider` by the components it loads — sorted and
+/// deduplicated, so it is deterministic and comparable.
+///
+/// **Derived, never hand-authored.** This is the "effective terms" answer a consumer joins over,
+/// and computing it from the component rows is what keeps it from drifting away from them.
+/// A component that does not resolve contributes nothing; use
+/// [`license_table_conformance_errors`] to reject that state at the catalog boundary rather than
+/// silently under-reporting here.
+pub fn provider_terms(
+    provider: &ProviderComponents,
+    components: &[ComponentLicense],
+    families: &[LicenseFamily],
+) -> Vec<LicenseTerm> {
+    let mut terms: Vec<LicenseTerm> = provider
+        .components
+        .iter()
+        .filter_map(|key| components.iter().find(|row| row.component == *key))
+        .filter_map(|row| resolve_family(families, row.family))
+        .flat_map(|family| family.terms.iter().copied())
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+/// Every way the licence table can be malformed, as human-readable messages — the catalog ship-gate
+/// asserts this is empty so no registered provider escapes a resolved, well-formed licence.
+///
+/// Checks: component keys are unique and non-empty; identity fields are populated; every
+/// `family` resolves; `retrieved` is an ISO date; an attribution-requiring family implies an
+/// attribution on the row; every provider maps to at least one component and every referenced
+/// component exists.
+pub fn license_table_conformance_errors(
+    families: &[LicenseFamily],
+    components: &[ComponentLicense],
+    providers: &[ProviderComponents],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+
+    for row in components {
+        let key = row.component;
+        if key.is_empty() {
+            errors.push("component row has an empty component key".to_string());
+            continue;
+        }
+        if seen.contains(&key) {
+            errors.push(format!("duplicate component row {key:?}"));
+        }
+        seen.push(key);
+
+        if row.source_url.is_empty() {
+            errors.push(format!("component {key:?} has no source_url"));
+        }
+        if row.declared.is_empty() {
+            errors.push(format!(
+                "component {key:?} has no declared licence identifier"
+            ));
+        }
+        if !is_iso_date(row.retrieved) {
+            errors.push(format!(
+                "component {key:?} has a non-ISO retrieved date {:?}",
+                row.retrieved
+            ));
+        }
+        match resolve_family(families, row.family) {
+            None => errors.push(format!(
+                "component {key:?} references unknown licence family {:?}",
+                row.family
+            )),
+            Some(family) => {
+                if family.requires_attribution() && row.attribution.is_none() {
+                    errors.push(format!(
+                        "component {key:?} resolves to {:?}, which requires attribution, but \
+                         records none",
+                        family.id
+                    ));
+                }
+            }
+        }
+    }
+
+    for provider in providers {
+        if provider.components.is_empty() {
+            errors.push(format!(
+                "provider {:?} maps to no components",
+                provider.provider_id
+            ));
+        }
+        for key in provider.components {
+            if !components.iter().any(|row| row.component == *key) {
+                errors.push(format!(
+                    "provider {:?} references unknown component {key:?}",
+                    provider.provider_id
+                ));
+            }
+        }
+    }
+
+    errors
+}
+
+/// Serialize the licence table into the canonical **model-licenses manifest** JSON at
+/// `schema_version` 3 — the file the release tooling emits beside the SPDX SBOM.
+///
+/// Three fact sections (`families`, `components`, `providers`) plus, on each provider, the
+/// **derived** term union. Output is deterministic: every section is sorted by its key, so the
+/// committed manifest and the catalog-generated value compare byte-for-byte regardless of
+/// registration order. A trailing newline matches `write_json`'s convention in the release tooling.
+pub fn component_licenses_manifest_json(
+    families: &[LicenseFamily],
+    components: &[ComponentLicense],
+    providers: &[ProviderComponents],
+) -> String {
+    let mut sorted_families: Vec<&LicenseFamily> = families.iter().collect();
+    sorted_families.sort_by(|a, b| a.id.cmp(b.id));
+    let families_json: Vec<serde_json::Value> = sorted_families
+        .iter()
+        .map(|family| {
+            serde_json::json!({
+                "id": family.id,
+                "spdx_id": family.spdx_id,
+                "name": family.name,
+                "text_url": family.text_url,
+                "terms": family.terms.iter().map(|t| t.to_json()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let mut sorted_components: Vec<&ComponentLicense> = components.iter().collect();
+    sorted_components.sort_by(|a, b| a.component.cmp(b.component));
+    let components_json: Vec<serde_json::Value> = sorted_components
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "component": row.component,
+                "source_url": row.source_url,
+                "declared": row.declared,
+                "family": row.family,
+                "attribution": row.attribution,
+                "retrieved": row.retrieved,
+            })
+        })
+        .collect();
+
+    let mut sorted_providers: Vec<&ProviderComponents> = providers.iter().collect();
+    sorted_providers.sort_by(|a, b| a.provider_id.cmp(b.provider_id));
+    let providers_json: Vec<serde_json::Value> = sorted_providers
+        .iter()
+        .map(|provider| {
+            let mut keys: Vec<&str> = provider.components.to_vec();
+            keys.sort_unstable();
+            serde_json::json!({
+                "provider_id": provider.provider_id,
+                "components": keys,
+                "terms": provider_terms(provider, components, families)
+                    .into_iter()
+                    .map(|t| t.to_json())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let document = serde_json::json!({
+        "schema_version": 3,
+        "kind": "model-weight-licenses",
+        "families": families_json,
+        "components": components_json,
+        "providers": providers_json,
+    });
+    let mut rendered = serde_json::to_string_pretty(&document)
+        .expect("weight-license manifest is always serializable");
+    rendered.push('\n');
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +668,363 @@ mod tests {
         assert_eq!(rows[2]["component"], "b_checkpoint");
         // All three share the provider id.
         assert!(rows.iter().all(|r| r["provider_id"] == "foo"));
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+
+    // A miniature of the real table: a permissive DiT, a permissive encoder, and a research-only
+    // face model whose terms are the strictest in the set.
+    const FAMILIES: &[LicenseFamily] = &[
+        LicenseFamily {
+            id: "apache-2-0",
+            spdx_id: "Apache-2.0",
+            name: "Apache License 2.0",
+            text_url: "https://www.apache.org/licenses/LICENSE-2.0",
+            terms: &[
+                LicenseTerm::AttributionRequired,
+                LicenseTerm::NoticeFileRequired,
+            ],
+        },
+        LicenseFamily {
+            id: "flux-1-dev-non-commercial",
+            spdx_id: "LicenseRef-FLUX-1-dev-NC",
+            name: "FLUX.1 [dev] Non-Commercial License",
+            text_url: "https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md",
+            // Weights are non-commercial; OUTPUTS are explicitly commercially usable, so
+            // NonCommercialOutputs is deliberately absent.
+            terms: &[
+                LicenseTerm::NonCommercialWeights,
+                LicenseTerm::GatedAccess,
+                LicenseTerm::AcceptableUsePolicy {
+                    url: "https://blackforestlabs.ai/aup",
+                },
+            ],
+        },
+        LicenseFamily {
+            id: "insightface-research-only",
+            spdx_id: "LicenseRef-InsightFace-NC",
+            name: "InsightFace non-commercial research use only",
+            text_url: "https://github.com/deepinsight/insightface/tree/master/model_zoo",
+            terms: &[
+                LicenseTerm::NonCommercialWeights,
+                LicenseTerm::NonCommercialOutputs,
+            ],
+        },
+    ];
+
+    const COMPONENTS: &[ComponentLicense] = &[
+        ComponentLicense {
+            component: "flux1_dev_dit",
+            source_url: "https://huggingface.co/black-forest-labs/FLUX.1-dev",
+            declared: "flux-1-dev-non-commercial-license",
+            family: "flux-1-dev-non-commercial",
+            attribution: None,
+            retrieved: "2026-08-01",
+        },
+        ComponentLicense {
+            component: "t5_xxl",
+            source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+            declared: "apache-2.0",
+            family: "apache-2-0",
+            attribution: Some("T5 v1.1 © Google — Apache-2.0"),
+            retrieved: "2026-08-01",
+        },
+        ComponentLicense {
+            component: "arcface_antelopev2",
+            source_url: "https://github.com/deepinsight/insightface/tree/master/model_zoo",
+            declared: "non-commercial research purposes only",
+            family: "insightface-research-only",
+            attribution: None,
+            retrieved: "2026-08-01",
+        },
+    ];
+
+    const PLAIN_FLUX: ProviderComponents = ProviderComponents {
+        provider_id: "flux1_dev",
+        components: &["flux1_dev_dit", "t5_xxl"],
+    };
+    const IDENTITY_FLUX: ProviderComponents = ProviderComponents {
+        provider_id: "pulid_flux",
+        components: &["flux1_dev_dit", "t5_xxl", "arcface_antelopev2"],
+    };
+
+    #[test]
+    fn table_is_conformant() {
+        assert_eq!(
+            license_table_conformance_errors(FAMILIES, COMPONENTS, &[PLAIN_FLUX, IDENTITY_FLUX]),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The strictest term comes from a component that is not the headline model: the identity
+    /// render's output restriction is contributed by the face stack, not by the DiT. Deriving the
+    /// provider view is what surfaces it — a hand-authored composite is exactly where this is
+    /// missed.
+    #[test]
+    fn strictest_term_is_derived_from_a_non_obvious_component() {
+        let plain = provider_terms(&PLAIN_FLUX, COMPONENTS, FAMILIES);
+        let identity = provider_terms(&IDENTITY_FLUX, COMPONENTS, FAMILIES);
+
+        // The DiT restricts weights, so both carry that.
+        assert!(plain.contains(&LicenseTerm::NonCommercialWeights));
+        assert!(identity.contains(&LicenseTerm::NonCommercialWeights));
+
+        // Only the identity route restricts OUTPUTS, and it does so via the face model.
+        assert!(
+            !plain.contains(&LicenseTerm::NonCommercialOutputs),
+            "a plain FLUX render must not inherit an output restriction"
+        );
+        assert!(
+            identity.contains(&LicenseTerm::NonCommercialOutputs),
+            "the identity route must inherit the face stack's output restriction"
+        );
+
+        // Two renders over the same base model have materially different terms — the join the
+        // downstream product has to be able to compute.
+        assert_ne!(plain, identity);
+    }
+
+    /// FLUX.1-dev's weights-restricted / outputs-permitted split is the case a `commercial_use`
+    /// boolean cannot express. It must survive a manifest round trip intact.
+    #[test]
+    fn weights_nc_outputs_ok_split_survives_a_round_trip() {
+        let json =
+            component_licenses_manifest_json(FAMILIES, COMPONENTS, &[PLAIN_FLUX, IDENTITY_FLUX]);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let flux = value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["provider_id"] == "flux1_dev")
+            .unwrap();
+        let tags: Vec<&str> = flux["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["term"].as_str().unwrap())
+            .collect();
+
+        assert!(tags.contains(&"non_commercial_weights"));
+        assert!(
+            !tags.contains(&"non_commercial_outputs"),
+            "FLUX.1-dev outputs are commercially usable; the split must not collapse"
+        );
+        // And no boolean conclusion is emitted anywhere.
+        assert!(!json.contains("commercial_use"));
+    }
+
+    #[test]
+    fn parameterized_terms_round_trip_their_payload() {
+        const STABILITY: &[LicenseFamily] = &[LicenseFamily {
+            id: "stability-ai-community",
+            spdx_id: "LicenseRef-Stability-Community",
+            name: "Stability AI Community License",
+            text_url: "https://stability.ai/license",
+            terms: &[LicenseTerm::RevenueCeiling {
+                amount_usd: 1_000_000,
+            }],
+        }];
+        const ROWS: &[ComponentLicense] = &[ComponentLicense {
+            component: "sd3_5_large_dit",
+            source_url: "https://huggingface.co/stabilityai/stable-diffusion-3.5-large",
+            declared: "stabilityai-ai-community",
+            family: "stability-ai-community",
+            attribution: None,
+            retrieved: "2026-08-01",
+        }];
+        const PROVIDER: ProviderComponents = ProviderComponents {
+            provider_id: "sd3_5_large",
+            components: &["sd3_5_large_dit"],
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&component_licenses_manifest_json(
+            STABILITY,
+            ROWS,
+            &[PROVIDER],
+        ))
+        .unwrap();
+        let term = &value["providers"][0]["terms"][0];
+        assert_eq!(term["term"], "revenue_ceiling");
+        assert_eq!(term["amount_usd"], 1_000_000);
+    }
+
+    #[test]
+    fn manifest_is_deterministic_across_input_order() {
+        let forward =
+            component_licenses_manifest_json(FAMILIES, COMPONENTS, &[PLAIN_FLUX, IDENTITY_FLUX]);
+        let reversed =
+            component_licenses_manifest_json(FAMILIES, COMPONENTS, &[IDENTITY_FLUX, PLAIN_FLUX]);
+        assert_eq!(forward, reversed);
+        assert!(forward.ends_with("}\n"));
+
+        let value: serde_json::Value = serde_json::from_str(&forward).unwrap();
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["kind"], "model-weight-licenses");
+        // Providers are sorted by id: flux1_dev precedes pulid_flux.
+        assert_eq!(value["providers"][0]["provider_id"], "flux1_dev");
+        assert_eq!(value["providers"][1]["provider_id"], "pulid_flux");
+    }
+
+    #[test]
+    fn unresolved_family_is_an_error() {
+        const ORPHAN: &[ComponentLicense] = &[ComponentLicense {
+            component: "mystery",
+            source_url: "https://example.invalid/model",
+            declared: "who-knows",
+            family: "not-a-family",
+            attribution: None,
+            retrieved: "2026-08-01",
+        }];
+        let errors = license_table_conformance_errors(FAMILIES, ORPHAN, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("unknown licence family"), "{errors:?}");
+    }
+
+    #[test]
+    fn attribution_requiring_family_without_attribution_is_an_error() {
+        const MISSING: &[ComponentLicense] = &[ComponentLicense {
+            component: "t5_xxl",
+            source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+            declared: "apache-2.0",
+            family: "apache-2-0",
+            attribution: None,
+            retrieved: "2026-08-01",
+        }];
+        let errors = license_table_conformance_errors(FAMILIES, MISSING, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("requires attribution"), "{errors:?}");
+    }
+
+    #[test]
+    fn provenance_must_be_a_real_iso_date() {
+        assert!(is_iso_date("2026-08-01"));
+        assert!(!is_iso_date("2026-8-1"));
+        assert!(!is_iso_date("01-08-2026"));
+        assert!(!is_iso_date("2026-13-01"), "month 13 is not a date");
+        assert!(!is_iso_date("2026-08-32"), "day 32 is not a date");
+        assert!(!is_iso_date(""));
+
+        const STALE: &[ComponentLicense] = &[ComponentLicense {
+            component: "undated",
+            source_url: "https://example.invalid/model",
+            declared: "apache-2.0",
+            family: "apache-2-0",
+            attribution: Some("© Example"),
+            retrieved: "sometime",
+        }];
+        let errors = license_table_conformance_errors(FAMILIES, STALE, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("non-ISO retrieved date"), "{errors:?}");
+    }
+
+    #[test]
+    fn provider_referencing_a_missing_component_is_an_error() {
+        const DANGLING: ProviderComponents = ProviderComponents {
+            provider_id: "ghost",
+            components: &["nope"],
+        };
+        let errors = license_table_conformance_errors(FAMILIES, COMPONENTS, &[DANGLING]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("unknown component"), "{errors:?}");
+    }
+
+    #[test]
+    fn provider_with_no_components_is_an_error() {
+        const EMPTY: ProviderComponents = ProviderComponents {
+            provider_id: "hollow",
+            components: &[],
+        };
+        let errors = license_table_conformance_errors(FAMILIES, COMPONENTS, &[EMPTY]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("maps to no components"), "{errors:?}");
+    }
+
+    #[test]
+    fn duplicate_component_rows_are_rejected() {
+        const DUPES: &[ComponentLicense] = &[
+            ComponentLicense {
+                component: "t5_xxl",
+                source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+                declared: "apache-2.0",
+                family: "apache-2-0",
+                attribution: Some("© Google"),
+                retrieved: "2026-08-01",
+            },
+            ComponentLicense {
+                component: "t5_xxl",
+                source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+                declared: "apache-2.0",
+                family: "apache-2-0",
+                attribution: Some("© Google"),
+                retrieved: "2026-08-01",
+            },
+        ];
+        let errors = license_table_conformance_errors(FAMILIES, DUPES, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("duplicate component row"), "{errors:?}");
+    }
+
+    /// Two ceilings in one union both bind — they are not collapsed to a minimum, so a consumer
+    /// checking "am I below every ceiling" gets the right answer without special-casing.
+    #[test]
+    fn multiple_revenue_ceilings_are_both_retained() {
+        const TWO: &[LicenseFamily] = &[
+            LicenseFamily {
+                id: "a",
+                spdx_id: "LicenseRef-A",
+                name: "A",
+                text_url: "https://example.invalid/a",
+                terms: &[LicenseTerm::RevenueCeiling {
+                    amount_usd: 1_000_000,
+                }],
+            },
+            LicenseFamily {
+                id: "b",
+                spdx_id: "LicenseRef-B",
+                name: "B",
+                text_url: "https://example.invalid/b",
+                terms: &[LicenseTerm::RevenueCeiling {
+                    amount_usd: 10_000_000,
+                }],
+            },
+        ];
+        const ROWS: &[ComponentLicense] = &[
+            ComponentLicense {
+                component: "a",
+                source_url: "https://example.invalid/a",
+                declared: "a",
+                family: "a",
+                attribution: None,
+                retrieved: "2026-08-01",
+            },
+            ComponentLicense {
+                component: "b",
+                source_url: "https://example.invalid/b",
+                declared: "b",
+                family: "b",
+                attribution: None,
+                retrieved: "2026-08-01",
+            },
+        ];
+        const BOTH: ProviderComponents = ProviderComponents {
+            provider_id: "both",
+            components: &["a", "b"],
+        };
+        let terms = provider_terms(&BOTH, ROWS, TWO);
+        assert_eq!(
+            terms,
+            vec![
+                LicenseTerm::RevenueCeiling {
+                    amount_usd: 1_000_000
+                },
+                LicenseTerm::RevenueCeiling {
+                    amount_usd: 10_000_000
+                },
+            ]
+        );
     }
 }
