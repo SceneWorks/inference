@@ -16,10 +16,12 @@
 //! Edit, requiring the matching distillation LoRA via `spec.adapters`.
 
 pub mod adapters;
+mod block_stream;
 pub mod control_transformer;
 pub mod convert;
 pub mod image_processor;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod model_edit;
@@ -64,6 +66,9 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_generator(model_control::REGISTRATION)
         .register_generator(model_edit::REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_edit::MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Qwen-Image provider catalog.
@@ -85,5 +90,26 @@ mod explicit_registry_tests {
             explicit,
             ["qwen_image", "qwen_image_control", "qwen_image_edit"]
         );
+    }
+
+    #[test]
+    fn every_variant_resolves_its_memory_strategy_contract() {
+        use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/qwen".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        for id in ["qwen_image", "qwen_image_control", "qwen_image_edit"] {
+            let contract = registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must register a memory-strategy contract"));
+            assert_eq!(contract.provider_id, id);
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                super::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+            );
+        }
     }
 }

@@ -399,20 +399,74 @@ pub fn denoise_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_with_progress_windowed(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        start_step,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_with_progress_windowed(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    start_step: usize,
+    window_size: Option<usize>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
     // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
     // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
     // RAII guard (F-006) instead of leaking the process-global toggle on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let block_window = transformer.block_window(window_size, cancel)?;
     // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        let pos = transformer.forward(latents, pos_embeds, None, sigma, lh, lw, &[])?;
+        let pos = transformer.forward_windowed(
+            latents,
+            pos_embeds,
+            None,
+            sigma,
+            lh,
+            lw,
+            &[],
+            block_window,
+        )?;
         match neg_embeds {
             Some(neg) => {
-                let neg = transformer.forward(latents, neg, None, sigma, lh, lw, &[])?;
+                let neg = transformer.forward_windowed(
+                    latents,
+                    neg,
+                    None,
+                    sigma,
+                    lh,
+                    lw,
+                    &[],
+                    block_window,
+                )?;
                 compute_guided_noise(&pos, &neg, guidance)
             }
             None => Ok(pos),
@@ -459,16 +513,56 @@ pub fn denoise_control_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_control_with_progress_windowed(
+        transformer,
+        controlnet,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        control_cond,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        control_scale,
+        width,
+        height,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_control_with_progress_windowed(
+    transformer: &QwenTransformer,
+    controlnet: &QwenFunControlBranch,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    control_cond: &Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    control_scale: f32,
+    width: u32,
+    height: u32,
+    window_size: Option<usize>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
     // by the RAII guard (F-006) instead of leaking the process-global toggle on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let block_window = transformer.block_window(window_size, cancel)?;
     // Each step runs the base forward with the VACE control branch + the (constant) 132-ch control
     // context injected, scaled by `control_scale` (`= 0` reproduces base T2I). Under true CFG the
     // control forward runs once per guidance branch. Control is pose-only T2I (no img2img-with-control
     // path; F-122).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        let pos = transformer.forward_control(
+        let pos = transformer.forward_control_windowed(
             latents,
             pos_embeds,
             None,
@@ -478,10 +572,11 @@ pub fn denoise_control_with_progress(
             &[],
             Some((controlnet, control_cond)),
             control_scale,
+            block_window,
         )?;
         match neg_embeds {
             Some(neg) => {
-                let neg = transformer.forward_control(
+                let neg = transformer.forward_control_windowed(
                     latents,
                     neg,
                     None,
@@ -491,6 +586,7 @@ pub fn denoise_control_with_progress(
                     &[],
                     Some((controlnet, control_cond)),
                     control_scale,
+                    block_window,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)
             }
@@ -536,10 +632,48 @@ pub fn denoise_edit_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_edit_with_progress_windowed(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        static_image_latents,
+        cond_grids,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_edit_with_progress_windowed(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    static_image_latents: &Array,
+    cond_grids: &[(usize, usize)],
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    window_size: Option<usize>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
     // `denoise_with_progress`. Bit-exact; scoped + restored on drop by the RAII guard (F-006).
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let block_window = transformer.block_window(window_size, cancel)?;
     // Each step concatenates the noise latents with the (static) packed reference latents so the RoPE
     // spans `[noise] + references`, then slices the velocity back to the noise prefix. `None` joint
     // mask (as in T2I): the spliced prompt embeds are full-valid.
@@ -547,13 +681,31 @@ pub fn denoise_edit_with_progress(
         let noise_seq = latents.shape()[1];
         let hidden = concatenate_axis(&[latents, static_image_latents], 1)?;
         let pos = slice_seq(
-            &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
+            &transformer.forward_windowed(
+                &hidden,
+                pos_embeds,
+                None,
+                sigma,
+                lh,
+                lw,
+                cond_grids,
+                block_window,
+            )?,
             noise_seq,
         )?;
         match neg_embeds {
             Some(neg) => {
                 let neg = slice_seq(
-                    &transformer.forward(&hidden, neg, None, sigma, lh, lw, cond_grids)?,
+                    &transformer.forward_windowed(
+                        &hidden,
+                        neg,
+                        None,
+                        sigma,
+                        lh,
+                        lw,
+                        cond_grids,
+                        block_window,
+                    )?,
                     noise_seq,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)
