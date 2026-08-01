@@ -10,7 +10,7 @@ use mlx_rs::ops::{add, matmul, maximum, minimum, multiply, round};
 use mlx_rs::{Array, Dtype};
 
 use crate::array::scalar;
-use crate::{Image, PreviewFrame, PreviewSink, Result};
+use crate::{Error, Image, PreviewFrame, PreviewSink, Result};
 
 /// Numbers preview frames by schedule position rather than solver evaluation count.
 ///
@@ -54,27 +54,28 @@ impl PreviewCounter {
     }
 }
 
-/// Project an unpacked `[1, C, h, w]` latent and emit it for this schedule position.
+/// Run a provider-owned projection and emit it for this schedule position.
 ///
 /// Projection failures are deliberately swallowed: previews are decorative and losing a frame
-/// must never fail the caller's render. Providers must unpack family-specific layouts before
-/// calling this function and supply their own latent-to-RGB fit.
-pub fn emit_preview(
+/// must never fail the caller's render. The projection closure runs only after the counter advances,
+/// preserving schedule-position consumption when family-specific unpacking fails, and is never
+/// invoked for an inert sink or an already-emitted position.
+pub fn emit_preview<F>(
     sink: &PreviewSink,
     counter: &PreviewCounter,
     sigmas: &[f32],
     sigma: f32,
-    latents: &Array,
-    factors: &[[f32; 3]],
-    bias: [f32; 3],
-) {
+    project: F,
+) where
+    F: FnOnce() -> Result<Image>,
+{
     if !sink.is_active() {
         return;
     }
     let Some(current) = counter.next(sigmas, sigma) else {
         return;
     };
-    if let Ok(image) = project_latents(latents, factors, bias) {
+    if let Ok(image) = project() {
         sink.emit(PreviewFrame {
             current,
             total: counter.total(),
@@ -91,6 +92,12 @@ pub fn project_latents(latents: &Array, factors: &[[f32; 3]], bias: [f32; 3]) ->
     let shape = latents.shape();
     if shape.len() != 4 || shape[0] != 1 {
         return Err(format!("preview latent must have shape [1, C, h, w], got {shape:?}").into());
+    }
+    if shape[1] == 0 || shape[2] == 0 || shape[3] == 0 {
+        return Err(format!(
+            "preview latent channel and spatial dimensions must be non-zero, got {shape:?}"
+        )
+        .into());
     }
     let channels = shape[1] as usize;
     if factors.len() != channels {
@@ -111,7 +118,12 @@ pub fn project_latents(latents: &Array, factors: &[[f32; 3]], bias: [f32; 3]) ->
     let rgb = add(&matmul(&x, &factors)?, &bias)?;
     let rgb = minimum(&maximum(&rgb, scalar(0.0))?, scalar(1.0))?;
     let rgb = round(&multiply(&rgb, scalar(255.0))?, 0)?;
-    let pixels = rgb.as_slice::<f32>().iter().map(|&v| v as u8).collect();
+    let pixels = rgb
+        .try_as_slice::<f32>()
+        .map_err(|error| Error::Msg(format!("preview projection readback failed: {error}")))?
+        .iter()
+        .map(|&v| v as u8)
+        .collect();
     Ok(Image {
         width: w as u32,
         height: h as u32,
@@ -205,16 +217,12 @@ mod tests {
         let counter = PreviewCounter::new(&SIGMAS);
         let latents = Array::zeros::<f32>(&[1, 4, 2, 3]).unwrap();
 
-        emit_preview(&sink, &counter, &SIGMAS, SIGMAS[0], &latents, &[], [0.0; 3]);
-        emit_preview(
-            &sink,
-            &counter,
-            &SIGMAS,
-            SIGMAS[1],
-            &latents,
-            &[[0.0; 3]; 4],
-            [0.0; 3],
-        );
+        emit_preview(&sink, &counter, &SIGMAS, SIGMAS[0], || {
+            Err(Error::Msg("synthetic projection failure".into()))
+        });
+        emit_preview(&sink, &counter, &SIGMAS, SIGMAS[1], || {
+            project_latents(&latents, &[[0.0; 3]; 4], [0.0; 3])
+        });
 
         let frames = frames.lock().unwrap();
         assert_eq!(frames.len(), 1);
@@ -225,16 +233,23 @@ mod tests {
     #[test]
     fn inert_sink_does_not_advance_the_counter() {
         let counter = PreviewCounter::new(&SIGMAS);
-        let latents = Array::zeros::<f32>(&[1, 4, 1, 1]).unwrap();
         emit_preview(
             &PreviewSink::default(),
             &counter,
             &SIGMAS,
             SIGMAS[0],
-            &latents,
-            &[],
-            [0.0; 3],
+            || panic!("an inert preview sink must not invoke projection"),
         );
         assert_eq!(counter.next(&SIGMAS, SIGMAS[0]), Some(1));
+    }
+
+    #[test]
+    fn projection_rejects_zero_channel_or_spatial_dimensions() {
+        for shape in [[1, 0, 2, 3], [1, 4, 0, 3], [1, 4, 2, 0]] {
+            let latents = Array::zeros::<f32>(&shape).unwrap();
+            let factors = vec![[0.0; 3]; shape[1] as usize];
+            let error = project_latents(&latents, &factors, [0.0; 3]).unwrap_err();
+            assert!(error.to_string().contains("must be non-zero"));
+        }
     }
 }

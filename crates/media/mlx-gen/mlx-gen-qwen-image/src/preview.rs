@@ -77,17 +77,10 @@ pub(crate) fn emit_preview(
     if !sink.is_active() {
         return;
     }
-    if let Ok(unpacked) = unpack_latents(packed, width, height) {
-        mlx_gen::preview::emit_preview(
-            sink,
-            counter,
-            sigmas,
-            sigma,
-            &unpacked,
-            &RGB_FACTORS,
-            RGB_BIAS,
-        );
-    }
+    mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
+        let unpacked = unpack_latents(packed, width, height)?;
+        mlx_gen::preview::project_latents(&unpacked, &RGB_FACTORS, RGB_BIAS)
+    });
 }
 
 #[cfg(test)]
@@ -111,11 +104,31 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].current, frames[0].total), (1, 1));
         assert_eq!((frames[0].image.width, frames[0].image.height), (2, 2));
-        // This byte-level golden fixes both seeded MLX noise and Qwen's packed→spatial channel
-        // ordering across the move into the shared projection.
+        // Post-move fixture: this byte-level golden fixes both seeded MLX noise and Qwen's
+        // packed→spatial channel ordering. Base-branch equivalence is separate validation evidence,
+        // not something this head-only fixture can establish by itself.
         assert_eq!(
             frames[0].image.pixels,
             [120, 69, 59, 0, 0, 0, 126, 90, 115, 64, 152, 178]
         );
+    }
+
+    #[test]
+    fn failed_unpack_consumes_its_schedule_position() {
+        let invalid_packed = Array::zeros::<f32>(&[1, 1, 1]).unwrap();
+        let valid_packed = crate::pipeline::create_noise(42, 16, 16).unwrap();
+        let sigmas = [1.0_f32, 0.5, 0.0];
+        let counter = mlx_gen::preview::PreviewCounter::new(&sigmas);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+
+        emit_preview(&sink, &counter, &sigmas, sigmas[0], &invalid_packed, 16, 16);
+        emit_preview(&sink, &counter, &sigmas, sigmas[0], &valid_packed, 16, 16);
+        emit_preview(&sink, &counter, &sigmas, sigmas[1], &valid_packed, 16, 16);
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].current, frames[0].total), (2, 2));
     }
 }
