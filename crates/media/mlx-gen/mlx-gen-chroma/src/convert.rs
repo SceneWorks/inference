@@ -3,17 +3,15 @@
 //! Mirrors `mlx_gen_sdxl::convert` / `mlx_gen_sensenova::convert` (same `mlx_gen::quant::quantize_map`,
 //! byte-equal to the load-time `.quantize` seam), differing in the Chroma key layout and quant scope.
 //!
-//! Chroma quantizes **one** component — the DiT `transformer/` (the fork's `nn.quantize`, wired in
-//! [`crate::transformer::ChromaTransformer::quantize`]): the double blocks' attention + FFN Linears
-//! and the single blocks' attention + `proj_mlp`/`proj_out`. Everything else stays **dense in every
-//! tier**:
+//! Chroma's shipping Q4/Q8 tiers pack all three resident model components: the DiT `transformer/`,
+//! the T5-XXL `text_encoder/`, and the FLUX.1 `vae/`.
 //!
 //! * The transformer's own `x_embedder` / `context_embedder` / top-level `proj_out` and the entire
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
-//! * The T5-XXL **text encoder** (`text_encoder/`) and the FLUX.1 16-ch **VAE** (`vae/`) — never
-//!   quantized (a measurably-0% memory-only win, and not wired in the loader), so both are mirrored
-//!   verbatim (deref symlinks) into every tier.
+//! * T5 packs every quantizable attention/FFN Linear plus its token and relative-position
+//!   embeddings; RMSNorm scales remain dense.
+//! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
 //! a wrongly-packed dense tensor) loads u32 codes as dense floats → a garbage render. The completeness
@@ -39,6 +37,7 @@ use crate::quant::GROUP_SIZE;
 /// `transformer/`, so one flat file suffices; its stem matches the dense master so nothing downstream
 /// changes.
 const TRANSFORMER_FILE: &str = "diffusion_pytorch_model.safetensors";
+const AUXILIARY_FILE: &str = "model.safetensors";
 
 // ============================================================================================
 // Pack predicate (operates on the **base** = the on-disk key minus its `.weight`).
@@ -92,6 +91,22 @@ fn is_transformer_target(base: &str) -> bool {
     false
 }
 
+/// T5-XXL's fork predicate quantizes every shape-eligible Linear and embedding. The shared
+/// [`quantize_map`] guard keeps its 1-D LayerNorm/RMSNorm vectors dense. This deliberately matches
+/// the future-proof predicate in the FLUX converter, which owns the shared T5 loader.
+fn pack_all_t5(_base: &str) -> bool {
+    true
+}
+
+/// FLUX.1 VAE packed surface: encoder/decoder mid-block attention QKV/out projections. Convolutions
+/// and GroupNorms remain dense; the shared Z-Image VAE loader packed-detects these keys.
+fn is_vae_target(base: &str) -> bool {
+    base.ends_with(".to_q")
+        || base.ends_with(".to_k")
+        || base.ends_with(".to_v")
+        || base.ends_with(".to_out.0")
+}
+
 /// Load a component dir's safetensors (single or sharded) into one key→`Array` map. Chroma ships the
 /// transformer as sharded `diffusion_pytorch_model-0000N-of-0000M.safetensors`; the shard keys are
 /// disjoint, so we merge them (a duplicate key across shards is a corrupt snapshot → error).
@@ -110,14 +125,76 @@ fn load_component_map(dir: &Path) -> Result<HashMap<String, Array>> {
     Ok(map)
 }
 
+fn quantize_component(
+    src: &Path,
+    dst: &Path,
+    file: &str,
+    bits: i32,
+    is_target: fn(&str) -> bool,
+) -> Result<()> {
+    if !src.is_dir() {
+        return Err(Error::Msg(format!(
+            "chroma convert: source snapshot has no {} component",
+            src.display()
+        )));
+    }
+    std::fs::create_dir_all(dst)?;
+    let map = quantize_map(load_component_map(src)?, bits, GROUP_SIZE, is_target)?;
+    save_map(&dst.join(file), &map)?;
+    write_quantized_config(src, dst, bits, GROUP_SIZE)
+}
+
 /// Assemble a full pre-quantized turnkey Chroma snapshot in `dst_root`: pack the DiT `transformer/`
 /// block Linears into one `transformer/diffusion_pytorch_model.safetensors` (+ annotated
-/// `config.json`), mirror the dense T5 `text_encoder/` and FLUX.1 `vae/`, and copy the tokenizer /
-/// scheduler / `model_index.json` / license verbatim (deref symlinks). The result loads via
+/// `config.json`), pack T5 into `text_encoder/model.safetensors`, pack the VAE attention into
+/// `vae/model.safetensors`, and copy the tokenizer / scheduler / `model_index.json` / license. The
+/// result loads via
 /// [`crate::model::load_chroma`] (packed weights auto-detect) with no dense transient. `bits` = 4 (Q4
 /// tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion — mirror it; see
 /// the tier builder in `tests/prequantize_real_weights.rs`).
 pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
+    if !matches!(bits, 4 | 8) {
+        return Err(Error::Msg(format!(
+            "chroma convert: bits must be 4 or 8, got {bits}"
+        )));
+    }
+    if dst_root.exists() {
+        return Err(Error::Msg(format!(
+            "chroma convert: destination already exists; refusing to mix packed output with stale files: {}",
+            dst_root.display()
+        )));
+    }
+    let parent = dst_root.parent().ok_or_else(|| {
+        Error::Msg(format!(
+            "chroma convert: destination has no parent: {}",
+            dst_root.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let name = dst_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Msg("chroma convert: destination has no UTF-8 file name".into()))?;
+    let staging = parent.join(format!(".{name}.sceneworks-pack-{}", std::process::id()));
+    if staging.exists() {
+        return Err(Error::Msg(format!(
+            "chroma convert: staging destination already exists: {}",
+            staging.display()
+        )));
+    }
+    let result = prequantize_turnkey_into(src_root, &staging, bits);
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staging, dst_root) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn prequantize_turnkey_into(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
     std::fs::create_dir_all(dst_root)?;
 
     // Transformer: pack the block Linears into one flat file + annotate config.
@@ -139,8 +216,23 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     save_map(&tr_dst.join(TRANSFORMER_FILE), &map)?;
     write_quantized_config(&tr_src, &tr_dst, bits, GROUP_SIZE)?;
 
-    // T5 text encoder + FLUX.1 VAE stay dense (never quantized) — mirror both verbatim.
-    for rel in ["text_encoder", "vae", "tokenizer", "scheduler"] {
+    quantize_component(
+        &src_root.join("text_encoder"),
+        &dst_root.join("text_encoder"),
+        AUXILIARY_FILE,
+        bits,
+        pack_all_t5,
+    )?;
+    quantize_component(
+        &src_root.join("vae"),
+        &dst_root.join("vae"),
+        AUXILIARY_FILE,
+        bits,
+        is_vae_target,
+    )?;
+
+    // Tokenizer and scheduler carry no quantizable weights.
+    for rel in ["tokenizer", "scheduler"] {
         let s = src_root.join(rel);
         if s.exists() {
             copy_dir(&s, &dst_root.join(rel))?;
@@ -154,6 +246,29 @@ mod tests {
     use super::*;
     use mlx_rs::ops::{eq, quantize};
     use mlx_rs::{Array, Dtype};
+
+    #[test]
+    fn turnkey_refuses_invalid_bits_and_existing_destinations() {
+        let missing = Path::new("definitely-missing-chroma-source");
+        let invalid = prequantize_turnkey(missing, Path::new("unused-chroma-output"), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("bits must be 4 or 8"));
+
+        let destination = std::env::temp_dir().join(format!(
+            "mlx-gen-chroma-existing-destination-{}",
+            std::process::id()
+        ));
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination).unwrap();
+        }
+        std::fs::create_dir(&destination).unwrap();
+        let existing = prequantize_turnkey(missing, &destination, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(existing.contains("destination already exists"));
+        std::fs::remove_dir(&destination).unwrap();
+    }
 
     #[test]
     fn predicate_matches_block_linears_only() {
@@ -199,10 +314,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn auxiliary_component_predicates_cover_the_complete_packed_surface() {
+        for base in [
+            "shared",
+            "encoder.block.0.layer.0.SelfAttention.q",
+            "encoder.block.23.layer.0.SelfAttention.relative_attention_bias",
+            "encoder.block.23.layer.1.DenseReluDense.wi_0",
+            "encoder.block.23.layer.1.DenseReluDense.wi_1",
+            "encoder.block.23.layer.1.DenseReluDense.wo",
+        ] {
+            assert!(pack_all_t5(base), "{base} should be considered for packing");
+        }
+
+        for base in [
+            "decoder.mid_block.attentions.0.to_q",
+            "decoder.mid_block.attentions.0.to_k",
+            "decoder.mid_block.attentions.0.to_v",
+            "decoder.mid_block.attentions.0.to_out.0",
+            "encoder.mid_block.attentions.0.to_q",
+        ] {
+            assert!(is_vae_target(base), "{base} should be packed");
+        }
+        for base in [
+            "decoder.mid_block.attentions.0.group_norm",
+            "decoder.mid_block.resnets.0.conv1",
+            "decoder.conv_in",
+        ] {
+            assert!(!is_vae_target(base), "{base} should stay dense");
+        }
+    }
+
     fn byte_equal(a: &Array, b: &Array) -> bool {
         a.shape() == b.shape()
             && a.dtype() == b.dtype()
             && eq(a, b).unwrap().all(None).unwrap().item::<bool>()
+    }
+
+    #[test]
+    fn auxiliary_components_pack_byte_identical_to_the_shared_load_time_seams() {
+        let weight = Array::from_slice(
+            &(0..64 * 128).map(|i| (i as f32).cos()).collect::<Vec<_>>(),
+            &[64, 128],
+        );
+        let (expected_weight, expected_scales, expected_biases) =
+            quantize(weight.as_dtype(Dtype::Bfloat16).unwrap(), GROUP_SIZE, 4).unwrap();
+
+        for (base, predicate) in [
+            (
+                "encoder.block.0.layer.1.DenseReluDense.wi_0",
+                pack_all_t5 as fn(&str) -> bool,
+            ),
+            (
+                "decoder.mid_block.attentions.0.to_q",
+                is_vae_target as fn(&str) -> bool,
+            ),
+        ] {
+            let mut map = HashMap::new();
+            map.insert(format!("{base}.weight"), weight.clone());
+            let out = quantize_map(map, 4, GROUP_SIZE, predicate).unwrap();
+            assert!(byte_equal(
+                out.get(&format!("{base}.weight")).unwrap(),
+                &expected_weight
+            ));
+            assert!(byte_equal(
+                out.get(&format!("{base}.scales")).unwrap(),
+                &expected_scales
+            ));
+            assert!(byte_equal(
+                out.get(&format!("{base}.biases")).unwrap(),
+                &expected_biases
+            ));
+        }
     }
 
     /// The packed triple a block Linear becomes is byte-identical to the op the load-time `.quantize`

@@ -2,7 +2,9 @@
 //! `tokenizer/` (spiece + configs), `text_encoder/` (T5-XXL), `transformer/` (sharded Chroma DiT),
 //! `vae/` (AutoencoderKL), `scheduler/`, `model_index.json`.
 //!
-//! T5 encoder, VAE, and the pack/unpack/sigma helpers are reused from `mlx-gen-flux`. The only
+//! T5 encoder, VAE, and the pack/unpack/sigma helpers are reused from `mlx-gen-flux`. Those shared
+//! loaders packed-detect the T5 embeddings/Linears and the VAE mid-block attention, so q4/q8
+//! artifacts construct quantized modules directly without first materializing dense weights. The only
 //! Chroma-specific loading concerns are (1) T5 lives in `text_encoder/` not flux's `text_encoder_2/`,
 //! and (2) the tokenizer ships only `spiece.model`, so we load a vendored, prebuilt `tokenizer.json`
 //! (materialized by `tools/build_chroma_t5_tokenizer.py`) — never the network.
