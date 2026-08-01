@@ -10,6 +10,7 @@
 
 use mlx_gen::tiling::{SpatialTiling, TilingConfig};
 use mlx_gen_qwen_image::{load_vae, QwenVae};
+use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
 use mlx_rs::{random, Array};
 use std::path::PathBuf;
 
@@ -64,6 +65,71 @@ fn tile_cfg() -> TilingConfig {
             overlap_px: 64,
         }),
         temporal: None,
+    }
+}
+
+fn spatial_cfg(tile_px: i32, overlap_px: i32) -> TilingConfig {
+    TilingConfig {
+        spatial: Some(SpatialTiling {
+            tile_px,
+            overlap_px,
+        }),
+        temporal: None,
+    }
+}
+
+fn measured_decode(vae: &QwenVae, latent: &Array, tile_px: i32, overlap_px: i32) -> (Array, usize) {
+    clear_cache();
+    reset_peak_memory();
+    let baseline = get_active_memory();
+    let decoded = vae
+        .decode_tiled(latent, &spatial_cfg(tile_px, overlap_px), None)
+        .unwrap();
+    decoded.eval().unwrap();
+    let incremental_peak = get_peak_memory().saturating_sub(baseline);
+    (decoded, incremental_peak)
+}
+
+/// SC-15511's explicit adoption gate for the proposed 96-pixel overlap below a 512-pixel tile.
+/// This is a peak A/B, not a quality-only sweep: if 96 does not reduce the same-process active
+/// high-water mark at both the largest and smallest production sub-512 edges, it remains absent
+/// from the shipped contract even if its reconstruction delta is marginally tighter.
+#[test]
+#[ignore = "needs the Krea snapshot vae/ and an Apple/Metal device"]
+fn overlap_96_peak_ab_below_512() {
+    let vae: QwenVae = load_vae(&base_dir()).expect("load vae");
+    let key = random::key(15511).unwrap();
+    let latent = random::normal::<f32>(&[1, 16, 1, 128, 128], None, None, Some(&key)).unwrap();
+
+    for edge in [448, 256] {
+        // Warm both graph shapes before measuring so compilation/cache population is not attributed
+        // to whichever overlap happened to run first.
+        vae.decode_tiled(&latent, &spatial_cfg(edge, 64), None)
+            .unwrap()
+            .eval()
+            .unwrap();
+        vae.decode_tiled(&latent, &spatial_cfg(edge, 96), None)
+            .unwrap()
+            .eval()
+            .unwrap();
+
+        let (overlap64, peak64) = measured_decode(&vae, &latent, edge, 64);
+        let (overlap96, peak96) = measured_decode(&vae, &latent, edge, 96);
+        let (max_delta, mean_delta) = max_mean_abs(&overlap64, &overlap96);
+        println!(
+            "OVERLAP_AB edge={edge} overlap64_peak={} overlap96_peak={} delta={} max_output_delta={max_delta:.6e} mean_output_delta={mean_delta:.6e}",
+            peak64,
+            peak96,
+            peak96 as i128 - peak64 as i128,
+        );
+        assert!(
+            peak64 > 0 && peak96 > 0,
+            "peak counters must observe both decodes"
+        );
+        assert!(
+            peak96 >= peak64,
+            "96 reduced the active peak at edge {edge}; revisit the shipped 64-only contract"
+        );
     }
 }
 

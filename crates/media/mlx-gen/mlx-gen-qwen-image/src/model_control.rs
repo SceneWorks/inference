@@ -423,9 +423,16 @@ impl QwenImageControl {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let block_window = crate::memory_strategy::resolve_window_size(req, &self.memory_strategy)?;
+        let attention_budget = crate::pipeline::attention_budget(req);
+        let decode_tiling = crate::pipeline::decode_tiling(req);
 
         // Shared step/sampler/guidance/seed resolution (F-117).
         let params = resolve_run_params(req, req.width, req.height);
+        crate::pipeline::calibration_fault(
+            req,
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            MODEL_ID,
+        )?;
 
         let (control_image, control_scale) = self.resolve_control(req)?;
 
@@ -467,7 +474,6 @@ impl QwenImageControl {
             |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
-
                 // VAE-encode + pack the pose skeleton to the 132-ch control context `[1, seq, 132]` (constant
                 // across steps + the batch). The 2512-Fun control path VAE-encodes the control image and
                 // concatenates a zero mask + zero inpaint latent before packing 2×2 (pose-only layout). This is
@@ -488,13 +494,15 @@ impl QwenImageControl {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let decoder: &dyn LatentDecoder = match &pid_decoder {
-                    Some(d) => d,
-                    None => heavy.vae,
-                };
                 let denoise_sigmas = &params.sigmas[..keep];
                 let images = decode_and_collect(
-                    decoder,
+                    heavy.vae,
+                    pid_decoder
+                        .as_ref()
+                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    decode_tiling.as_ref(),
+                    req,
+                    MODEL_ID,
                     req.count,
                     params.base_seed,
                     req.width,
@@ -502,7 +510,7 @@ impl QwenImageControl {
                     on_progress,
                     |seed, progress| {
                         let noise = create_noise(seed, req.width, req.height)?;
-                        denoise_control_with_progress_windowed(
+                        let latents = denoise_control_with_progress_windowed(
                             heavy.transformer,
                             heavy.controlnet,
                             params.sampler_name.as_deref(),
@@ -516,10 +524,17 @@ impl QwenImageControl {
                             control_scale,
                             req.width,
                             req.height,
+                            attention_budget,
                             block_window,
                             &req.cancel,
                             progress,
-                        )
+                        )?;
+                        crate::pipeline::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            MODEL_ID,
+                        )?;
+                        Ok(latents)
                     },
                 )?;
                 Ok(GenerationOutput::Images(images))

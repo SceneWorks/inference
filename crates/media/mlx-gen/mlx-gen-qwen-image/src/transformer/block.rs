@@ -9,6 +9,7 @@ use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -88,6 +89,35 @@ impl QwenTransformerBlock {
         mask: Option<&Array>,
         modulate_index: Option<&Array>,
     ) -> Result<(Array, Array)> {
+        self.forward_budgeted(
+            hidden_states,
+            encoder_hidden_states,
+            text_embeddings,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            modulate_index,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::forward`] with the shared request-scoped bounded-attention plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_budgeted(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        text_embeddings: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        modulate_index: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         // SiLU'd timestep embedding. Under zero_cond_t this is [2B, dim]; the image modulation uses
         // the whole thing, the text modulation only the real-timestep half. SiLU is elementwise, so
         // `act[:B] == silu(temb[:B])` — slicing here is bit-identical to slicing the temb first.
@@ -111,7 +141,7 @@ impl QwenTransformerBlock {
             &txt_mod[0],
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward(
+        let (img_attn, txt_attn) = self.attn.forward_budgeted(
             &img_modulated,
             &txt_modulated,
             img_cos,
@@ -119,6 +149,7 @@ impl QwenTransformerBlock {
             txt_cos,
             txt_sin,
             mask,
+            attention,
         )?;
 
         let hidden_states = gated(hidden_states, &img_gate1, &img_attn)?;
