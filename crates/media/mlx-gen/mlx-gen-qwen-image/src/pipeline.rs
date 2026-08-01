@@ -515,7 +515,7 @@ pub(crate) fn denoise_with_progress_windowed(
     // closure sees the PRE-step latent, so frame 1 is essentially pure noise — the develop starts
     // grainy by construction. Numbering is by schedule position, not evaluation count; see
     // `preview::PreviewCounter`.
-    let previews = crate::preview::PreviewCounter::new(sliced);
+    let previews = mlx_gen::preview::PreviewCounter::new(sliced);
     // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
@@ -765,7 +765,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     // Preview: identical to `denoise_with_progress`. The noise-prefix latent handed to this closure
     // IS the developing image — the reference tail is static conditioning and is not projected.
-    let previews = crate::preview::PreviewCounter::new(sigmas);
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     // Each step concatenates the noise latents with the (static) packed reference latents so the RoPE
     // spans `[noise] + references`, then slices the velocity back to the noise prefix. `None` joint
     // mask (as in T2I): the spliced prompt embeds are full-valid.
