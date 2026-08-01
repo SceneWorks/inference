@@ -72,6 +72,10 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
+pub use license::{
+    component_licenses_manifest_json, license_table_conformance_errors, provider_terms,
+    resolve_family, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
+};
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
