@@ -43,6 +43,14 @@ Run a **single test**: `cargo test --locked -p <crate> <test_name>`
 (e.g. `cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored`).
 Real-weight tests are `#[ignore]`d and gated behind snapshot env vars — see `.github/workflows/real-weights.yml`.
 
+**Parity goldens are single-host, deliberately.** The rows reading `crates/media/mlx-gen/tools/golden/`
+(119 artifacts, 110 test files, 22 crates) fail in 0.00 s on any machine that did not dump them, and
+a fresh clone has none of them. That is the intended state, not a gap: the reference environment is
+named by location (a private `mflux` fork plus a source-built-MLX venv with no lockfile), so a second
+party cannot regenerate one. **Anyone gating on real-weight conformance must count these rows as
+contributing nothing off-host** — a 0.00 s failure still looks like coverage in the run output. Full
+statement and the routes that would change it: `crates/media/mlx-gen/tools/golden/README.md`.
+
 `cargo test` runs **single-threaded** by default here (`.cargo/config.toml` forces
 `RUST_TEST_THREADS=1` with `force = true`): MLX's shared Metal device is not thread-safe and
 parallel tests SIGSEGV. Do not remove or override this.
