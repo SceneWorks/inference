@@ -75,12 +75,23 @@ pub use text::{
 };
 pub use vision::NeoVisionEmbedder;
 
+/// sc-16209 Apple-Silicon warm sweep: SenseNova quality q8 peaked below 1.34 GiB at 1024².
+/// One- and two-step controls produced the same warm high-water mark.
+pub const QUALITY_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 1_438_814_045,
+        },
+    };
+
 /// Add all MLX SenseNova providers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::QUALITY_REGISTRATION)
+        .register_activation_memory(QUALITY_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::FAST_REGISTRATION)
 }
 

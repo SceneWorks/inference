@@ -58,12 +58,22 @@ pub use training::{
 pub use transformer::CosmosDiT;
 pub use vae::{load_vae, QwenVae};
 
+/// sc-16209 Apple-Silicon warm sweep: Anima Base q8 peaked below 7.67 GiB at 1024².
+pub const BASE_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: "anima_base",
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 8_235_599_791,
+        },
+    };
+
 /// Add all MLX Anima generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::BASE_REGISTRATION)
+        .register_activation_memory(BASE_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::AESTHETIC_REGISTRATION)
         .register_generator(model::TURBO_REGISTRATION)
         .register_trainer(training::BASE_TRAINER_REGISTRATION)

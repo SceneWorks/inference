@@ -89,12 +89,23 @@ pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};
 pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae};
 
+/// sc-16195 Apple-Silicon warm sweep: Krea 2 Turbo q8 and dense both peaked below 7.67 GiB
+/// at 1024². Activations stay bf16 across weight tiers; Raw/Edit are distinct unmeasured routes.
+pub const TURBO_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: KREA_2_TURBO_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 8_235_599_791,
+        },
+    };
+
 /// Add all MLX Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::TURBO_REGISTRATION)
+        .register_activation_memory(TURBO_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::RAW_REGISTRATION)
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)

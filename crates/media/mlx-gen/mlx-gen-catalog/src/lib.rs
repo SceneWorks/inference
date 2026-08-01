@@ -119,6 +119,71 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn measured_activation_anchors_are_provider_route_owned() {
+        let registry = super::provider_registry().unwrap();
+
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024("krea_2_turbo")
+                .unwrap(),
+            Some(8_235_599_791)
+        );
+        assert_eq!(
+            registry.activation_memory_bytes_1024("qwen_image").unwrap(),
+            Some(8_235_599_791)
+        );
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024("qwen_image_control")
+                .unwrap(),
+            None,
+            "Qwen Control is a distinct unmeasured route"
+        );
+        assert_eq!(
+            registry.activation_memory_bytes_1024("sdxl").unwrap(),
+            Some(15_086_072_628)
+        );
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024("z_image_turbo")
+                .unwrap(),
+            Some(15_086_072_628)
+        );
+        for (id, expected) in [
+            ("sana_sprint_1600m", 14_001_593_385),
+            ("anima_base", 8_235_599_791),
+            ("sensenova_u1_8b", 1_438_814_045),
+            ("flux2_klein_9b", 15_107_547_464),
+            ("flux1_dev", 15_096_810_046),
+            ("mage_flow", 1_685_774_664),
+        ] {
+            assert_eq!(
+                registry.activation_memory_bytes_1024(id).unwrap(),
+                Some(expected),
+                "{id} must publish its upward-rounded measured anchor"
+            );
+        }
+        for id in [
+            "sana_1600m",
+            "anima_turbo",
+            "sensenova_u1_8b_fast",
+            "flux2_klein_9b_edit",
+            "flux1_dev_control",
+            "mage_flow_edit",
+            "lens",
+            "lens_turbo",
+            "bernini_renderer",
+            "bernini",
+        ] {
+            assert_eq!(
+                registry.activation_memory_bytes_1024(id).unwrap(),
+                None,
+                "{id} is a distinct unmeasured route and must retain the consumer fallback"
+            );
+        }
+    }
+
+    #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))

@@ -42,6 +42,15 @@ pub use pipeline::{
 pub use text_encoder::{ClipTextEncoder, FluxTextEncoders, T5TextEncoder};
 pub use transformer::{FluxTransformer, FluxTransformerConfig};
 
+/// sc-16209 Apple-Silicon warm sweep: FLUX.1 Dev bf16 peaked below 14.06 GiB at 1024².
+pub const DEV_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: FLUX1_DEV_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 15_096_810_046,
+        },
+    };
+
 /// Add all MLX FLUX.1 providers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
@@ -49,6 +58,7 @@ pub fn register_providers(
     registry
         .register_generator(model::SCHNELL_REGISTRATION)
         .register_generator(model::DEV_REGISTRATION)
+        .register_activation_memory(DEV_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
 }
 

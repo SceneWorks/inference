@@ -143,6 +143,17 @@ pub struct MemoryRegistration {
         fn(&LoadSpec, &MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
 }
 
+/// Provider-owned, weights-free activation measurements for one registered generator route.
+///
+/// Kept separate from [`ModelRegistration`] and [`crate::Capabilities`] so providers opt in without a
+/// breaking migration of every unrelated descriptor. The anchor is a static, family-route-wide,
+/// warm 1024² transient; omission is the explicit unmeasured state.
+#[derive(Clone, Copy)]
+pub struct ActivationMemoryRegistration {
+    pub provider_id: &'static str,
+    pub anchor: crate::ActivationMemoryAnchor,
+}
+
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct TransformRegistration {
@@ -223,6 +234,7 @@ pub struct AudioEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
+    activation_memory: Vec<ActivationMemoryRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
     transforms: Vec<TransformRegistration>,
     audio_transforms: Vec<AudioTransformRegistration>,
@@ -252,6 +264,11 @@ impl ProviderRegistryBuilder {
     }
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
+    builder_registration_method!(
+        register_activation_memory,
+        activation_memory,
+        ActivationMemoryRegistration
+    );
     builder_registration_method!(
         register_memory_strategy,
         memory_strategy,
@@ -339,6 +356,33 @@ impl ProviderRegistryBuilder {
         ensure_unique!(generators, "generator");
         {
             let mut ids = std::collections::BTreeSet::new();
+            for registration in &self.activation_memory {
+                if !ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate activation-memory provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "activation-memory registration '{}' has no matching generator",
+                        registration.provider_id
+                    )));
+                }
+                if registration.anchor.bytes_1024 == 0 {
+                    return Err(Error::Msg(format!(
+                        "activation-memory registration '{}' is zero — omit unmeasured routes",
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
+        {
+            let mut ids = std::collections::BTreeSet::new();
             let mut composed_ids = std::collections::BTreeSet::new();
             for id in &self.composed_memory_strategy_ids {
                 if !composed_ids.insert(*id) {
@@ -380,6 +424,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
+            activation_memory: self.activation_memory.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
             audio_transforms: self.audio_transforms.into_boxed_slice(),
@@ -399,6 +444,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
+    activation_memory: Box<[ActivationMemoryRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
     transforms: Box<[TransformRegistration]>,
     audio_transforms: Box<[AudioTransformRegistration]>,
@@ -438,6 +484,22 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Provider-owned warm 1024² activation transient for `id`.
+    /// `Ok(None)` is the compatibility-safe unmeasured state; unknown ids remain errors.
+    pub fn activation_memory_bytes_1024(&self, id: &str) -> Result<Option<u64>> {
+        if !self
+            .generators()
+            .any(|registration| (registration.descriptor)().id == id)
+        {
+            return Err(Error::Msg(format!("no generator registered for id '{id}'")));
+        }
+        Ok(self
+            .activation_memory
+            .iter()
+            .find(|registration| registration.provider_id == id)
+            .map(|registration| registration.anchor.bytes_1024))
+    }
+
     /// Every adopted memory-strategy registration in this explicit catalog.
     pub fn memory_strategy_registrations(
         &self,
@@ -1047,7 +1109,8 @@ mod tests {
         CaptionCapabilities, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
     };
     use crate::generator::{
-        Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor, SizeFloor,
+        ActivationMemoryAnchor, Capabilities, GenerationOutput, GenerationRequest, Modality,
+        ModelDescriptor, SizeFloor,
     };
     use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
     use crate::media::{AudioTrack, Image};
@@ -2490,6 +2553,80 @@ mod tests {
             "descriptor conformance FAILED:\n  - {}",
             errs.join("\n  - ")
         );
+    }
+
+    #[test]
+    fn activation_memory_anchor_selection_is_provider_route_wide() {
+        const REGISTRATION: ActivationMemoryRegistration = ActivationMemoryRegistration {
+            provider_id: "dummy_test_model",
+            anchor: ActivationMemoryAnchor { bytes_1024: 8 },
+        };
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_activation_memory(REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024("dummy_test_model")
+                .unwrap(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn activation_memory_registration_fails_closed_and_preserves_unmeasured_state() {
+        const REGISTRATION: ActivationMemoryRegistration = ActivationMemoryRegistration {
+            provider_id: "dummy_test_model",
+            anchor: ActivationMemoryAnchor { bytes_1024: 8 },
+        };
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_activation_memory(REGISTRATION)
+            .register_activation_memory(REGISTRATION)
+            .build()
+            .err()
+            .expect("duplicate activation registration must fail")
+            .to_string();
+        assert!(duplicate.contains("duplicate activation-memory provider id"));
+
+        let orphan = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_activation_memory(ActivationMemoryRegistration {
+                provider_id: "no_such_model",
+                anchor: ActivationMemoryAnchor { bytes_1024: 8 },
+            })
+            .build()
+            .err()
+            .expect("orphan activation registration must fail")
+            .to_string();
+        assert!(orphan.contains("has no matching generator"));
+
+        let zero = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_activation_memory(ActivationMemoryRegistration {
+                provider_id: "dummy_test_model",
+                anchor: ActivationMemoryAnchor { bytes_1024: 0 },
+            })
+            .build()
+            .err()
+            .expect("zero activation registration must fail")
+            .to_string();
+        assert!(zero.contains("is zero"));
+
+        let unmeasured = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            unmeasured
+                .activation_memory_bytes_1024("dummy_test_model")
+                .unwrap(),
+            None
+        );
+        assert!(unmeasured
+            .activation_memory_bytes_1024("no_such_model")
+            .is_err());
     }
 
     /// Each per-descriptor invariant fires: identity shape, zero/inverted bounds, duplicate or
