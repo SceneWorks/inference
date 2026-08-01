@@ -14,7 +14,7 @@ use mlx_rs::Array;
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use super::time_text_embed::TimeTextEmbed;
 use super::{linear_from, AdaLayerNormContinuous, QwenRope3d, QwenTransformerBlock};
@@ -74,6 +74,10 @@ pub struct QwenTransformer {
     rope: QwenRope3d,
     eps: f32,
     zero_cond_t: bool,
+    num_heads: i32,
+    head_dim: i32,
+    /// Re-openable description of the 60-block DiT trunk for rung-4 requests (SC-16353).
+    block_stream: Option<crate::block_stream::QwenBlockStream>,
 }
 
 /// The Qwen adapter key→module map — the Rust analog of the fork's `QwenLoRAMapping`. Every fork
@@ -132,7 +136,54 @@ impl QwenTransformer {
             rope: QwenRope3d::qwen_image(),
             eps: cfg.txt_norm_eps,
             zero_cond_t: cfg.zero_cond_t,
+            num_heads: cfg.num_heads,
+            head_dim: cfg.head_dim,
+            block_stream: None,
         })
+    }
+
+    /// Arm bounded transformer residency for a re-openable transformer checkpoint.
+    pub fn with_block_stream(mut self, source: mlx_gen::WeightsSource, prefix: &str) -> Self {
+        let base = if prefix.is_empty() {
+            "transformer_blocks".to_owned()
+        } else {
+            format!("{prefix}.transformer_blocks")
+        };
+        self.block_stream = Some(crate::block_stream::QwenBlockStream::new(
+            source,
+            base,
+            self.num_heads,
+            self.head_dim,
+            self.blocks.len(),
+        ));
+        self
+    }
+
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let Some(size) = window_size else {
+            return Ok(None);
+        };
+        if self.block_stream.is_none() {
+            return Err(mlx_gen::Error::Unsupported(
+                "qwen-image: bounded transformer residency needs a re-openable transformer snapshot"
+                    .into(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.blocks.len(), size)?,
+            cancel,
+        }))
+    }
+
+    /// Capture adapters after the production adapter loader has finished.
+    pub fn capture_block_adapters(&mut self) {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.capture_adapters(&mut self.blocks);
+        }
     }
 
     /// Quantize every transformer Linear to Q4/Q8 in place (group_size 64), the mlx-rs equivalent
@@ -145,6 +196,9 @@ impl QwenTransformer {
         self.time_text_embed.quantize(bits)?;
         for block in &mut self.blocks {
             block.quantize(bits)?;
+        }
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.set_quant_bits(bits);
         }
         self.norm_out.quantize(bits)?;
         Ok(())
@@ -168,7 +222,7 @@ impl QwenTransformer {
         latent_w: usize,
         cond_grids: &[(usize, usize)],
     ) -> Result<Array> {
-        self.forward_control(
+        self.forward_control_windowed(
             hidden_states,
             encoder_hidden_states,
             encoder_hidden_states_mask,
@@ -178,6 +232,33 @@ impl QwenTransformer {
             cond_grids,
             None,
             0.0,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_windowed(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        encoder_hidden_states_mask: Option<&Array>,
+        timestep: f32,
+        latent_h: usize,
+        latent_w: usize,
+        cond_grids: &[(usize, usize)],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        self.forward_control_windowed(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            latent_h,
+            latent_w,
+            cond_grids,
+            None,
+            0.0,
+            window,
         )
     }
 
@@ -201,13 +282,41 @@ impl QwenTransformer {
         control: Option<(&QwenFunControlBranch, &Array)>,
         control_scale: f32,
     ) -> Result<Array> {
+        self.forward_control_windowed(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            latent_h,
+            latent_w,
+            cond_grids,
+            control,
+            control_scale,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_control_windowed(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        encoder_hidden_states_mask: Option<&Array>,
+        timestep: f32,
+        latent_h: usize,
+        latent_w: usize,
+        cond_grids: &[(usize, usize)],
+        control: Option<(&QwenFunControlBranch, &Array)>,
+        control_scale: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
         let b = hidden_states.shape()[0];
         let img_seq = hidden_states.shape()[1];
         let txt_seq = encoder_hidden_states.shape()[1];
 
-        let mut hidden = self.img_in.forward(hidden_states)?;
+        let hidden = self.img_in.forward(hidden_states)?;
         let encoder = rms_norm(encoder_hidden_states, &self.txt_norm_w, self.eps)?;
-        let mut encoder = self.txt_in.forward(&encoder)?;
+        let encoder = self.txt_in.forward(&encoder)?;
 
         let ts = Array::from_slice(&vec![timestep; b as usize], &[b]);
 
@@ -263,29 +372,80 @@ impl QwenTransformer {
             None => None,
         };
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            let (e, h) = block.forward(
-                &hidden,
-                &encoder,
-                &text_emb,
-                &img_cos,
-                &img_sin,
-                &txt_cos,
-                &txt_sin,
-                mask.as_ref(),
-                modulate_index.as_ref(),
-            )?;
-            encoder = e;
-            // After base block `i`, add the pre-scaled hint for this block (if `i` is a control layer)
-            // — the fork's `hidden_states = hidden_states + hints[block_id] * context_scale`.
-            hidden = match (&scaled_hints, control) {
+        let apply_hint = |h: Array, i: usize| -> Result<Array> {
+            match (&scaled_hints, control) {
                 (Some(hints), Some((branch, _))) => match branch.hint_index(i) {
-                    Some(n) => add(&h, &hints[n])?,
-                    None => h,
+                    Some(n) => Ok(add(&h, &hints[n])?),
+                    None => Ok(h),
                 },
-                _ => h,
-            };
-        }
+                _ => Ok(h),
+            }
+        };
+        let (_, hidden) = match window {
+            None => {
+                let mut encoder = encoder;
+                let mut hidden = hidden;
+                for (i, block) in self.blocks.iter().enumerate() {
+                    let (e, h) = block.forward(
+                        &hidden,
+                        &encoder,
+                        &text_emb,
+                        &img_cos,
+                        &img_sin,
+                        &txt_cos,
+                        &txt_sin,
+                        mask.as_ref(),
+                        modulate_index.as_ref(),
+                    )?;
+                    encoder = e;
+                    hidden = apply_hint(h, i)?;
+                }
+                (encoder, hidden)
+            }
+            Some(window) => {
+                let stream = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "qwen-image: window requested without a re-openable block stream".into(),
+                    )
+                })?;
+                if window.plan.n_blocks() != self.blocks.len()
+                    || stream.n_blocks() != self.blocks.len()
+                {
+                    return Err(Error::Msg(format!(
+                        "qwen-image: block plan covers {}, stream {}, resident stack {}",
+                        window.plan.n_blocks(),
+                        stream.n_blocks(),
+                        self.blocks.len()
+                    )));
+                }
+                mlx_gen::block_residency::run_windowed(
+                    &window.plan,
+                    window.cancel,
+                    (encoder, hidden),
+                    || stream.open(),
+                    |(mut encoder, mut hidden), view, range| {
+                        for i in range {
+                            let block = stream.materialize(view, i)?;
+                            let (e, h) = block.forward(
+                                &hidden,
+                                &encoder,
+                                &text_emb,
+                                &img_cos,
+                                &img_sin,
+                                &txt_cos,
+                                &txt_sin,
+                                mask.as_ref(),
+                                modulate_index.as_ref(),
+                            )?;
+                            encoder = e;
+                            hidden = apply_hint(h, i)?;
+                        }
+                        Ok((encoder, hidden))
+                    },
+                    |(encoder, hidden)| Ok(mlx_rs::transforms::eval([encoder, hidden])?),
+                )?
+            }
+        };
 
         // norm_out uses only the real-timestep half of the (doubled) temb (the fork's `temb[:B]`).
         let norm_emb = match &modulate_index {

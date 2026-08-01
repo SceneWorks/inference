@@ -27,10 +27,10 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    require_base_dir, require_control, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
-    Residency, Result, SizeFloor, WeightsSource,
+    gen_core, require_base_dir, require_control, AcceptedControlKinds, Capabilities,
+    ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Residency, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use std::path::Path;
@@ -39,9 +39,9 @@ use crate::control_transformer::QwenFunControlBranch;
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_control_with_progress, encode_fun_control_context,
-    encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params,
-    PID_BACKBONE,
+    create_noise, decode_and_collect, denoise_control_with_progress_windowed,
+    encode_fun_control_context, encode_prompt, negative_or_fallback, qwen_samplers,
+    qwen_schedulers, resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -114,6 +114,9 @@ pub struct QwenImageControl {
     /// the sum. The [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel
     /// checks, and the error-safe cache flush.
     residency: Residency<QwenTextEncoder, QwenControlHeavyOwned>,
+    memory_strategy: gen_core::MemoryProviderContract,
+    precision: Precision,
+    quant: Option<Quant>,
 }
 
 /// The heavy render-phase components — the base MMDiT transformer, the VACE control branch, the VAE,
@@ -181,6 +184,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         tokenizer,
         residency: build_residency(spec)?,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        precision: spec.precision,
+        quant: spec.quantize,
     }))
 }
 
@@ -252,6 +258,10 @@ fn load_heavy(
     // matching the Z-Image control port): quantizing before loading the control branch would not let
     // the dense control Linears compose. The text encoder + VAE stay dense (fork's quant scope).
     let mut transformer = loader::load_transformer(root)?;
+    if crate::memory_strategy::is_streamable_spec(spec) {
+        transformer =
+            transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
+    }
     let mut controlnet = loader::load_controlnet(control)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
@@ -285,6 +295,7 @@ fn load_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
+    transformer.capture_block_adapters();
     // Optional PiD overlay, loaded only when the spec carries it AND this generate uses it (`load_pid`,
     // F-177) — Resident passes `true`, Sequential passes `req.use_pid`.
     let pid = if load_pid {
@@ -342,10 +353,52 @@ impl ControlBranch for QwenImageControl {
     }
 }
 
-mlx_gen::impl_generator!(QwenImageControl {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Generator for QwenImageControl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+}
 
 impl QwenImageControl {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -369,6 +422,7 @@ impl QwenImageControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let block_window = crate::memory_strategy::resolve_window_size(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117).
         let params = resolve_run_params(req, req.width, req.height);
@@ -448,7 +502,7 @@ impl QwenImageControl {
                     on_progress,
                     |seed, progress| {
                         let noise = create_noise(seed, req.width, req.height)?;
-                        denoise_control_with_progress(
+                        denoise_control_with_progress_windowed(
                             heavy.transformer,
                             heavy.controlnet,
                             params.sampler_name.as_deref(),
@@ -462,6 +516,7 @@ impl QwenImageControl {
                             control_scale,
                             req.width,
                             req.height,
+                            block_window,
                             &req.cancel,
                             progress,
                         )
@@ -479,6 +534,13 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
 
 #[cfg(test)]
 mod tests {
