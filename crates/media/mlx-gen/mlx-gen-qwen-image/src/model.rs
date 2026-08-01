@@ -371,10 +371,17 @@ impl QwenImage {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let block_window = crate::memory_strategy::resolve_window_size(req, &self.memory_strategy)?;
+        let attention_budget = crate::pipeline::attention_budget(req);
+        let decode_tiling = crate::pipeline::decode_tiling(req);
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
         let params = resolve_run_params(req, req.width, req.height);
+        crate::pipeline::calibration_fault(
+            req,
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            MODEL_ID,
+        )?;
 
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
@@ -432,7 +439,6 @@ impl QwenImage {
             |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
-
                 // VAE-encode the init image to packed clean latents (f32) ONCE — it's seed-independent
                 // (LANCZOS resize + a full VAE encode), so doing it inside the per-image loop ran the encoder
                 // `count` times for identical output (F-118). Under `Sequential` this runs after the text
@@ -459,13 +465,15 @@ impl QwenImage {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let decoder: &dyn LatentDecoder = match &pid_decoder {
-                    Some(d) => d,
-                    None => heavy.vae,
-                };
                 let denoise_sigmas = &params.sigmas[..keep];
                 let images = decode_and_collect(
-                    decoder,
+                    heavy.vae,
+                    pid_decoder
+                        .as_ref()
+                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    decode_tiling.as_ref(),
+                    req,
+                    MODEL_ID,
                     req.count,
                     params.base_seed,
                     req.width,
@@ -484,7 +492,7 @@ impl QwenImage {
                             }
                             None => noise,
                         };
-                        denoise_with_progress_windowed(
+                        let latents = denoise_with_progress_windowed(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
                             denoise_sigmas,
@@ -496,10 +504,17 @@ impl QwenImage {
                             req.width,
                             req.height,
                             start_step,
+                            attention_budget,
                             block_window,
                             &req.cancel,
                             progress,
-                        )
+                        )?;
+                        crate::pipeline::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            MODEL_ID,
+                        )?;
+                        Ok(latents)
                     },
                 )?;
                 Ok(GenerationOutput::Images(images))
