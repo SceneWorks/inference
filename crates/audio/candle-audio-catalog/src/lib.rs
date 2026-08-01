@@ -699,6 +699,42 @@ mod tests {
         );
     }
 
+    /// The Stability AI Community License requires products using the weights to display this
+    /// exact mark. Pin it at the shipping catalog boundary so every present or future row under
+    /// that license carries the requirement into the generated release manifest.
+    #[test]
+    fn stability_ai_community_rows_require_powered_by_attribution() {
+        const SPDX_ID: &str = "LicenseRef-Stability-AI-Community";
+        const REQUIRED_MARK: &str = "Powered by Stability AI";
+
+        let entries = super::weight_licenses();
+        let community_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.license.spdx_id == SPDX_ID)
+            .collect();
+        assert!(
+            !community_entries.is_empty(),
+            "catalog has no {SPDX_ID} rows to validate"
+        );
+        for entry in community_entries {
+            let attribution_carries_mark = entry
+                .license
+                .attribution
+                .is_some_and(|text| text.contains(REQUIRED_MARK));
+            let restriction_carries_mark = entry
+                .license
+                .restriction
+                .is_some_and(|text| text.contains(REQUIRED_MARK));
+            assert!(
+                attribution_carries_mark || restriction_carries_mark,
+                "provider '{}' (component {:?}) uses {SPDX_ID} without the required \
+                 {REQUIRED_MARK:?} product attribution",
+                entry.provider_id,
+                entry.component,
+            );
+        }
+    }
+
     /// The lane's preparer registry: exactly one `candle` registration whose probe accepts a
     /// Kokoro-shaped snapshot (the audio path) AND still accepts what the LLM preparer accepts
     /// (delegation) — the sc-12836 accommodation without weakening candle-llm.
