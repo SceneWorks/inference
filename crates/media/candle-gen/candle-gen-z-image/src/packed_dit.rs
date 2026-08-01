@@ -34,6 +34,7 @@ use candle_gen::candle_nn::{RmsNorm, VarBuilder};
 // With no adapter attached the forward is byte-identical to the bare base, so the dense-parity test and
 // every packed load are unchanged. (The crate's other packed seams — `packed_te`, the VAE dequant — keep
 // using the plain `crate::quant::QLinear` enum; only the DiT needs the residual surface.)
+use candle_gen::block_window::BlockPlan;
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::quant::AdaptLinear as QLinear;
 
@@ -546,13 +547,31 @@ pub struct ZImageTransformer2DModel {
     cap_pad_token: Tensor,
     noise_refiner: Vec<ZImageTransformerBlock>,
     context_refiner: Vec<ZImageTransformerBlock>,
-    layers: Vec<ZImageTransformerBlock>,
+    layers: TransformerLayers,
     rope_embedder: RopeEmbedder,
     cfg: Config,
 }
 
+/// Main-stack residency for ladder rung 4. The front-end, refiners, and final projection remain
+/// resident; the 30 uniform `layers` blocks can instead be rebuilt from the retained read-only
+/// safetensors view one window at a time.
+enum TransformerLayers {
+    Resident(Vec<ZImageTransformerBlock>),
+    Streamed(VarBuilder<'static>),
+}
+
 impl ZImageTransformer2DModel {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_layers(cfg, vb, false)
+    }
+
+    /// Build the DiT with a host-backed main stack. This is the provider-side implementation of
+    /// bounded transformer residency: no `layers.N` tensor is transferred until its window runs.
+    pub fn new_block_streamed(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_layers(cfg, vb, true)
+    }
+
+    fn new_with_layers(cfg: &Config, vb: VarBuilder<'static>, stream_layers: bool) -> Result<Self> {
         let device = vb.device();
         let dtype = vb.dtype();
 
@@ -603,14 +622,19 @@ impl ZImageTransformer2DModel {
             )?);
         }
 
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for i in 0..cfg.n_layers {
-            layers.push(ZImageTransformerBlock::new(
-                cfg,
-                true,
-                vb.pp("layers").pp(i),
-            )?);
-        }
+        let layers = if stream_layers {
+            TransformerLayers::Streamed(vb.clone())
+        } else {
+            let mut layers = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                layers.push(ZImageTransformerBlock::new(
+                    cfg,
+                    true,
+                    vb.pp("layers").pp(i),
+                )?);
+            }
+            TransformerLayers::Resident(layers)
+        };
 
         let rope_embedder = RopeEmbedder::new(
             cfg.rope_theta,
@@ -683,6 +707,28 @@ impl ZImageTransformer2DModel {
         cap_mask: &Tensor,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_memory(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            attention_plan,
+            self.cfg.n_layers.max(1),
+        )
+    }
+
+    /// Request-scoped forward with both the bounded-attention plan and the admitted transformer
+    /// window. Resident models ignore `transformer_window`; streamed models drive the shared Candle
+    /// block-window scheduler and materialize every block in a window before executing any of them.
+    pub fn forward_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
@@ -739,15 +785,57 @@ impl ZImageTransformer2DModel {
         let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
 
         let mut unified = unified;
-        for layer in &self.layers {
-            unified = layer.forward_with_attention_plan(
-                &unified,
-                Some(&unified_attn_mask),
-                &unified_cos,
-                &unified_sin,
-                Some(&adaln_input),
-                attention_plan,
-            )?;
+        match &self.layers {
+            TransformerLayers::Resident(layers) => {
+                for layer in layers {
+                    unified = layer.forward_with_attention_plan(
+                        &unified,
+                        Some(&unified_attn_mask),
+                        &unified_cos,
+                        &unified_sin,
+                        Some(&adaln_input),
+                        attention_plan,
+                    )?;
+                }
+            }
+            TransformerLayers::Streamed(weights) => {
+                let block_plan = BlockPlan::new(self.cfg.n_layers, transformer_window)?;
+                let uncancelled = candle_gen::gen_core::CancelFlag::default();
+                let cancel = attention_plan.cancel.unwrap_or(&uncancelled);
+                unified = candle_gen::block_window::run_windowed(
+                    self.device(),
+                    &block_plan,
+                    cancel,
+                    unified,
+                    || Ok(weights.clone()),
+                    |mut state, view, range| {
+                        // Materialize the whole window before the first forward. Loading inside the
+                        // block loop would silently execute a window of one regardless of selection.
+                        let blocks = range
+                            .map(|index| {
+                                ZImageTransformerBlock::new(
+                                    &self.cfg,
+                                    true,
+                                    view.pp("layers").pp(index),
+                                )
+                                .map_err(candle_gen::CandleError::from)
+                            })
+                            .collect::<candle_gen::Result<Vec<_>>>()?;
+                        for block in &blocks {
+                            candle_gen::check_cancel(cancel)?;
+                            state = block.forward_with_attention_plan(
+                                &state,
+                                Some(&unified_attn_mask),
+                                &unified_cos,
+                                &unified_sin,
+                                Some(&adaln_input),
+                                attention_plan,
+                            )?;
+                        }
+                        Ok(state)
+                    },
+                )?;
+            }
         }
 
         let x_out = unified.narrow(1, 0, img_seq_len)?;
@@ -777,6 +865,12 @@ impl ZImageTransformer2DModel {
         &mut self,
         f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        if matches!(&self.layers, TransformerLayers::Streamed(_)) {
+            return Err(candle_gen::CandleError::Msg(
+                "z-image adapters must be installed before selecting streamed transformer blocks"
+                    .to_owned(),
+            ));
+        }
         f("cap_embedder.1", &mut self.cap_embedder_linear)?;
         f("all_x_embedder.2-1", &mut self.x_embedder)?;
         self.t_embedder.visit_adaptable_mut("t_embedder", f)?;
@@ -786,8 +880,10 @@ impl ZImageTransformer2DModel {
         for (i, blk) in self.context_refiner.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("context_refiner.{i}"), f)?;
         }
-        for (i, blk) in self.layers.iter_mut().enumerate() {
-            blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        if let TransformerLayers::Resident(layers) = &mut self.layers {
+            for (i, blk) in layers.iter_mut().enumerate() {
+                blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+            }
         }
         self.final_layer
             .visit_adaptable_mut("all_final_layer.2-1", f)?;
@@ -915,6 +1011,99 @@ mod parity_tests {
             diff < 1e-5,
             "query-chunked attention changed the DiT output by {diff}"
         );
+    }
+
+    #[test]
+    fn streamed_windows_match_resident_forward_including_ragged_tail() {
+        let dev = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.n_layers = 3;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        // Populate one immutable host-backed source, then build the streamed front/refiner shell from
+        // that same source. Two forces a 2+1 ragged tail; the larger published candidates exercise
+        // the all-covering window without changing the contract's production range.
+        let resident = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let expected = resident
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+
+        for window in [1, 2, 4, 8, 15, 30] {
+            let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb.clone()).unwrap();
+            let actual = streamed
+                .forward_with_memory(
+                    &prepared.latents,
+                    &t,
+                    &prepared.cap_feats,
+                    &prepared.cap_mask,
+                    plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+                    window,
+                )
+                .unwrap();
+            let diff = (expected.clone() - actual)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-5,
+                "streamed window {window} changed the DiT output by {diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_window_rejects_zero_and_preserves_typed_cancellation() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        // Populate all layer tensors once; the streamed model retains only the source view.
+        let _resident = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let zero = streamed
+            .forward_with_memory(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+                0,
+            )
+            .expect_err("a zero-width transformer window must be rejected");
+        assert!(zero.to_string().contains("window"));
+
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+        let plan = plan_from_budget(candle_gen::ATTN_SCORES_BUDGET).with_cancel(&cancel);
+        let canceled = streamed
+            .forward_with_memory(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan,
+                1,
+            )
+            .expect_err("a canceled streamed request must stop before producing output");
+        assert!(matches!(canceled, candle_gen::CandleError::Canceled));
     }
 
     #[test]
