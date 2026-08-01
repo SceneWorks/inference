@@ -1617,6 +1617,21 @@ pub fn effective_component_quant(
         .map_or(selected, |floor| floor.resident_tier)
 }
 
+/// Provider-owned warm activation transient measured at 1024×1024, in bytes.
+///
+/// `bytes_1024` is the bare engine allocation (`peak − resident`) for one warm image. It excludes
+/// model weights and OS/application reserve; consumers add those independently and may scale this
+/// anchor for request geometry. A route-wide anchor is valid only when measurements establish that
+/// its activation high-water is tier-independent. A provider with storage- or tier-dependent
+/// activation memory must omit this route-only carrier until a spec-aware contract exists. Distinct
+/// edit/control routes retain their own provider ids and must register separately. Providers publish
+/// only real on-device measurements at or above the observed high-water mark; no registration means
+/// "unmeasured".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivationMemoryAnchor {
+    pub bytes_1024: u64,
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).

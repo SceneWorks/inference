@@ -76,12 +76,22 @@ pub use transformer::{
 pub use vae::Flux2Vae;
 pub use vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
 
+/// sc-16209 Apple-Silicon warm sweep: FLUX.2 Klein 9B bf16 peaked below 14.07 GiB at 1024².
+pub const KLEIN_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: FLUX2_KLEIN_9B_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 15_107_547_464,
+        },
+    };
+
 /// Add all MLX FLUX.2 providers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::KLEIN_REGISTRATION)
+        .register_activation_memory(KLEIN_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::KLEIN_EDIT_REGISTRATION)
         .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
         .register_generator(model::DEV_REGISTRATION)

@@ -58,12 +58,24 @@ pub use vl_tokenizer::{
     EditInputs,
 };
 
+/// sc-16195 Apple-Silicon warm sweep: base Qwen-Image q8 peaked at 7.661 GiB at 1024².
+/// Rounded upward to 7.67 GiB and applies across weight tiers because activations stay bf16.
+/// Control/Edit are distinct unmeasured routes.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 8_235_599_791,
+        },
+    };
+
 /// Add all MLX Qwen-Image generators to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_control::REGISTRATION)
         .register_generator(model_edit::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)

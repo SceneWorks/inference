@@ -131,6 +131,16 @@ pub use training::{MageFlowTrainer, MODEL_ID as TRAINER_MODEL_ID};
 // `training` (LoRA + base fine-tune, sc-14055/sc-14056). They are not stubbed here because their
 // shape is decided by those stories, not by this one.
 
+/// sc-16209 Apple-Silicon warm sweep: Mage Flow bf16 peaked below 1.57 GiB at 1024².
+/// A two-step control set the published high-water mark.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: "mage_flow",
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 1_685_774_664,
+        },
+    };
+
 /// Add every Mage-Flow MLX provider to an explicit media registry builder.
 ///
 pub fn register_providers(
@@ -138,6 +148,7 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::REGISTRATION_BASE)
         .register_generator(model::REGISTRATION_TURBO)
         .register_generator(model::REGISTRATION_EDIT)

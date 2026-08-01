@@ -90,6 +90,7 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 

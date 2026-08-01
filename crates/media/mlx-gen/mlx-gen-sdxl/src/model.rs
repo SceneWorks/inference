@@ -13,8 +13,8 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
-    Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
+    curated_scheduler_names, default_seed, schedule_sigmas, ActivationMemoryAnchor, AlphaSchedule,
+    Capabilities, Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
     Quant, Residency, Result, Scheduler, SizeFloor, Solver, TcdSampler, WeightsSource,
@@ -1315,6 +1315,16 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// sc-16195 Apple-Silicon warm sweep: q8 and dense both peaked at 14.039 GiB at 1024².
+/// The 14.05 GiB family ceiling is deliberately upward-rounded.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: ActivationMemoryAnchor {
+            bytes_1024: 15_086_072_628,
+        },
+    };
 
 #[cfg(test)]
 mod tests {
