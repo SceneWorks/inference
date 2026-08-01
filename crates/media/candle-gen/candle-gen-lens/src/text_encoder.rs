@@ -45,6 +45,8 @@ use candle_gen::candle_nn::{
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::quant as shared;
 use candle_gen::CandleError;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // --- Config -----------------------------------------------------------------
 
@@ -567,7 +569,13 @@ struct SparseMoe {
 impl SparseMoe {
     /// `quant = None` keeps the dense bf16 experts (sc-5108); `Some(Q4_0 | Q8_0)` transcodes the fused
     /// MXFP4 experts to GGUF `QMatMul` (sc-5111), dequantizing to f32 then requantizing per expert.
-    fn new(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+    fn new(
+        cfg: &Config,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+        sidecars: Option<&shared::PackedWeightSidecars>,
+        source_base: &str,
+    ) -> Result<Self> {
         let router = linear(cfg.hidden_size, cfg.num_local_experts, vb.pp("router"))?;
         let e = cfg.num_local_experts;
         let h = cfg.hidden_size;
@@ -584,7 +592,7 @@ impl SparseMoe {
         if vb_e.contains_tensor("gate_up_proj.scales") {
             return Ok(Self {
                 router,
-                experts: packed_experts(&vb_e, cfg)?,
+                experts: packed_experts(&vb_e, cfg, sidecars, source_base)?,
                 num_experts_per_tok: cfg.num_experts_per_tok,
                 quantized: true,
             });
@@ -703,32 +711,58 @@ impl SparseMoe {
 /// per group) consumed by the repack; the model's expert bias is the separate `_bias` key, kept
 /// full-precision and added after the (dequantized) matmul in [`ExpertProj::forward`]. The Lens tier
 /// packs at MLX's default group size 64 (matching the DiT — [[mlx-packed-tier-format-facts]]).
-fn packed_experts(vb_e: &VarBuilder, cfg: &Config) -> Result<Vec<Expert>> {
+fn packed_experts(
+    vb_e: &VarBuilder,
+    cfg: &Config,
+    sidecars: Option<&shared::PackedWeightSidecars>,
+    source_base: &str,
+) -> Result<Vec<Expert>> {
     let e = cfg.num_local_experts;
     let dev = vb_e.device().clone();
     let cpu = Device::Cpu;
     // The u32 codes + f32 scales/biases pull to the CPU once per projection (the repack seam consumes
     // a CPU source; one bulk move beats 2·E device→CPU slice transfers). The small dense per-expert
     // model biases stay on-device — they are added on the activation device at forward.
-    let triple = |base: &str| -> Result<(Tensor, Tensor, Tensor)> {
-        Ok((
-            vb_e.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?
-                .to_device(&cpu)?,
-            vb_e.get_unchecked_dtype(&format!("{base}.scales"), DType::F32)?
-                .to_device(&cpu)?,
-            vb_e.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?
-                .to_device(&cpu)?,
-        ))
+    let triples = if sidecars.is_none() {
+        let triple = |base: &str| -> Result<(Tensor, Tensor, Tensor)> {
+            Ok((
+                vb_e.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?
+                    .to_device(&cpu)?,
+                vb_e.get_unchecked_dtype(&format!("{base}.scales"), DType::F32)?
+                    .to_device(&cpu)?,
+                vb_e.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?
+                    .to_device(&cpu)?,
+            ))
+        };
+        Some((triple("gate_up_proj")?, triple("down_proj")?))
+    } else {
+        None
     };
-    let (gu_wq, gu_s, gu_qb) = triple("gate_up_proj")?;
-    let (dn_wq, dn_s, dn_qb) = triple("down_proj")?;
     let gu_bias = vb_e.get_unchecked_dtype("gate_up_proj_bias", DType::F32)?; // [E, 2*inter], on dev
     let dn_bias = vb_e.get_unchecked_dtype("down_proj_bias", DType::F32)?; // [E, hidden], on dev
 
     // One expert-slice → a `Q4_1`/`Q8_0` `QMatMul` (bit-width inferred from the packed shapes) plus its
     // full-precision model bias, shaped exactly like the MXFP4 transcode's `ExpertProj::Quant`.
-    let proj = |wq: &Tensor, scales: &Tensor, qbias: &Tensor, bias: Tensor| -> Result<ExpertProj> {
-        let weight = shared::repack_packed_weight(wq, scales, qbias, shared::MLX_GROUP_SIZE, &dev)?;
+    let proj = |base: &str,
+                expert: usize,
+                fallback: Option<(&Tensor, &Tensor, &Tensor)>,
+                bias: Tensor|
+     -> Result<ExpertProj> {
+        let weight = match sidecars {
+            Some(sidecars) => {
+                sidecars.load_slice(&format!("{source_base}.{base}"), expert, &dev)?
+            }
+            None => {
+                let (wq, scales, qbias) = fallback.expect("fallback triple without sidecars");
+                shared::repack_packed_weight(
+                    &wq.i(expert)?,
+                    &scales.i(expert)?,
+                    &qbias.i(expert)?,
+                    shared::MLX_GROUP_SIZE,
+                    &dev,
+                )?
+            }
+        };
         Ok(ExpertProj::Quant {
             w: QMatMul::from_qtensor(weight)?,
             bias,
@@ -736,17 +770,18 @@ fn packed_experts(vb_e: &VarBuilder, cfg: &Config) -> Result<Vec<Expert>> {
     };
     (0..e)
         .map(|x| {
+            let fallback = triples.as_ref();
             Ok(Expert {
                 gate_up_proj: proj(
-                    &gu_wq.i(x)?,
-                    &gu_s.i(x)?,
-                    &gu_qb.i(x)?,
+                    "gate_up_proj",
+                    x,
+                    fallback.map(|(gu, _)| (&gu.0, &gu.1, &gu.2)),
                     gu_bias.i(x)?.contiguous()?,
                 )?,
                 down_proj: proj(
-                    &dn_wq.i(x)?,
-                    &dn_s.i(x)?,
-                    &dn_qb.i(x)?,
+                    "down_proj",
+                    x,
+                    fallback.map(|(_, dn)| (&dn.0, &dn.1, &dn.2)),
                     dn_bias.i(x)?.contiguous()?,
                 )?,
                 limit: cfg.swiglu_limit,
@@ -825,10 +860,17 @@ impl DecoderLayer {
         layer_idx: usize,
         vb: VarBuilder,
         quant: Option<GgmlDType>,
+        sidecars: Option<&shared::PackedWeightSidecars>,
     ) -> Result<Self> {
         Ok(Self {
             self_attn: Attention::new(cfg, vb.pp("self_attn"))?,
-            mlp: SparseMoe::new(cfg, vb.pp("mlp"), quant)?,
+            mlp: SparseMoe::new(
+                cfg,
+                vb.pp("mlp"),
+                quant,
+                sidecars,
+                &format!("model.layers.{layer_idx}.mlp.experts"),
+            )?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
                 cfg.hidden_size,
@@ -894,12 +936,24 @@ pub struct EncoderOutput {
 /// gpt-oss-20b used encoder-only: a single full-sequence forward that captures per-layer hidden states.
 pub struct GptOssTextEncoder {
     embed_tokens: Embedding,
-    layers: Vec<DecoderLayer>,
+    layers: EncoderLayers,
     norm: RmsNorm,
     rotary: RotaryEmbedding,
     sliding_window: usize,
     device: Device,
     dtype: DType,
+}
+
+struct StreamedLayers {
+    files: Arc<[PathBuf]>,
+    cfg: Config,
+    quant: Option<GgmlDType>,
+    sidecars: Option<Arc<shared::PackedWeightSidecars>>,
+}
+
+enum EncoderLayers {
+    Resident(Vec<DecoderLayer>),
+    Streamed(StreamedLayers),
 }
 
 impl GptOssTextEncoder {
@@ -919,13 +973,47 @@ impl GptOssTextEncoder {
     /// from the packed parts at the tier's own bit-width and `quant` is ignored for them — so a pure
     /// `lens-mlx` snapshot loads packed end-to-end regardless of the `quant` argument.
     pub fn new_quant(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        Self::new_quant_inner(cfg, vb, quant, None)
+    }
+
+    pub(crate) fn new_quant_streamable(
+        cfg: &Config,
+        vb: VarBuilder,
+        files: Vec<PathBuf>,
+        quant: Option<GgmlDType>,
+        sidecars: Option<Arc<shared::PackedWeightSidecars>>,
+    ) -> Result<Self> {
+        Self::new_quant_inner(
+            cfg,
+            vb,
+            quant,
+            Some(StreamedLayers {
+                files: files.into(),
+                cfg: cfg.clone(),
+                quant,
+                sidecars,
+            }),
+        )
+    }
+
+    fn new_quant_inner(
+        cfg: &Config,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+        streamed: Option<StreamedLayers>,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
         let vb_l = vb_m.pp("layers");
-        let layers = (0..cfg.num_hidden_layers)
-            .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant))
-            .collect::<Result<Vec<_>>>()?;
+        let layers = match streamed {
+            Some(streamed) => EncoderLayers::Streamed(streamed),
+            None => EncoderLayers::Resident(
+                (0..cfg.num_hidden_layers)
+                    .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant, None))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        };
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         Ok(Self {
             embed_tokens,
@@ -940,18 +1028,80 @@ impl GptOssTextEncoder {
 
     /// Run the encoder over `input_ids` (`[b, seq]`, u32), capturing every layer's hidden state.
     pub fn forward(&self, input_ids: &Tensor) -> Result<EncoderOutput> {
+        self.forward_with_window(input_ids, None, &CancelFlag::default())
+            .map_err(|error| match error {
+                candle_gen::CandleError::Candle(error) => error,
+                other => candle_gen::candle_core::Error::Msg(other.to_string()),
+            })
+    }
+
+    /// Streamable encoders route even an unscoped call through one all-covering window, so an empty
+    /// resident stack can never return the bare token embedding as plausible conditioning.
+    pub fn forward_with_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> candle_gen::Result<EncoderOutput> {
         let (_b, seq_len) = input_ids.dims2()?;
         let mut xs = self.embed_tokens.forward(input_ids)?;
         // Full-causal mask for full-attention layers, sliding-window mask for the alternating sliding
         // layers; selected per layer.
         let full = causal_mask(seq_len, None, &self.device, self.dtype)?;
         let sliding = causal_mask(seq_len, Some(self.sliding_window), &self.device, self.dtype)?;
-        let mut hidden_states = Vec::with_capacity(self.layers.len() + 1);
+        let layer_count = match &self.layers {
+            EncoderLayers::Resident(layers) => layers.len(),
+            EncoderLayers::Streamed(streamed) => streamed.cfg.num_hidden_layers,
+        };
+        let mut hidden_states = Vec::with_capacity(layer_count + 1);
         hidden_states.push(xs.clone());
-        for layer in self.layers.iter() {
-            let mask = if layer.is_sliding { &sliding } else { &full };
-            xs = layer.forward(&xs, &self.rotary, mask)?;
-            hidden_states.push(xs.clone());
+        match &self.layers {
+            EncoderLayers::Resident(layers) => {
+                for layer in layers {
+                    candle_gen::check_cancel(cancel)?;
+                    let mask = if layer.is_sliding { &sliding } else { &full };
+                    xs = layer.forward(&xs, &self.rotary, mask)?;
+                    hidden_states.push(xs.clone());
+                }
+            }
+            EncoderLayers::Streamed(streamed) => {
+                let plan = candle_gen::block_window::BlockPlan::new(
+                    layer_count,
+                    window.unwrap_or(layer_count),
+                )?;
+                xs = candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &plan,
+                    cancel,
+                    xs,
+                    || candle_gen::mmap_var_builder(&streamed.files, self.dtype, &self.device),
+                    |mut state, view, range| {
+                        let vb_l = view.pp("model").pp("layers");
+                        // Materialize the complete requested window before executing any layer. The
+                        // shared driver bounds the lifetime of this Vec; constructing one layer at a
+                        // time here would silently collapse every configured window to window 1 and
+                        // make the calibration parameter fictitious.
+                        let layers = range
+                            .map(|index| {
+                                DecoderLayer::new(
+                                    &streamed.cfg,
+                                    index,
+                                    vb_l.pp(index),
+                                    streamed.quant,
+                                    streamed.sidecars.as_deref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        for layer in layers {
+                            candle_gen::check_cancel(cancel)?;
+                            let mask = if layer.is_sliding { &sliding } else { &full };
+                            state = layer.forward(&state, &self.rotary, mask)?;
+                            hidden_states.push(state.clone());
+                        }
+                        Ok(state)
+                    },
+                )?;
+            }
         }
         let last_hidden_state = self.norm.forward(&xs)?;
         Ok(EncoderOutput {
@@ -967,19 +1117,40 @@ impl GptOssTextEncoder {
     /// `s-1`, hence the `+1`.) No final `norm` is applied — the captures are the raw residual stream;
     /// the DiT does the per-layer RMSNorm + concat + projection downstream (sc-5112).
     pub fn capture(&self, input_ids: &Tensor, selected: &[usize]) -> Result<Vec<Tensor>> {
-        let n = self.layers.len();
+        self.capture_with_window(input_ids, selected, None, &CancelFlag::default())
+            .map_err(|error| match error {
+                candle_gen::CandleError::Candle(error) => error,
+                other => candle_gen::candle_core::Error::Msg(other.to_string()),
+            })
+    }
+
+    pub fn capture_with_window(
+        &self,
+        input_ids: &Tensor,
+        selected: &[usize],
+        window: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> candle_gen::Result<Vec<Tensor>> {
+        let n = match &self.layers {
+            EncoderLayers::Resident(layers) => layers.len(),
+            EncoderLayers::Streamed(streamed) => streamed.cfg.num_hidden_layers,
+        };
         for &s in selected {
             if s >= n {
-                return Err(candle_gen::candle_core::Error::Msg(format!(
+                return Err(candle_gen::CandleError::Msg(format!(
                     "lens: selected layer {s} out of range (encoder has {n} layers)"
                 )));
             }
         }
-        let out = self.forward(input_ids)?;
+        let out = self.forward_with_window(input_ids, window, cancel)?;
         Ok(selected
             .iter()
             .map(|&s| out.hidden_states[s + 1].clone())
             .collect())
+    }
+
+    pub fn is_streamable(&self) -> bool {
+        matches!(self.layers, EncoderLayers::Streamed(_))
     }
 }
 
@@ -1006,7 +1177,7 @@ impl LensReasonerModel {
         let rotary = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
         let vb_l = vb_m.pp("layers");
         let layers = (0..cfg.num_hidden_layers)
-            .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant))
+            .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant, None))
             .collect::<Result<Vec<_>>>()?;
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         // The LM head sits at the top level (`lm_head.weight`), not under `model.`, and has no bias.
@@ -1122,6 +1293,73 @@ fn check_reasoner_cancel(cancel: &CancelFlag) -> candle_gen::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn streamable_encoder_without_layer_files() -> GptOssTextEncoder {
+        let device = Device::Cpu;
+        let mut cfg = Config::gpt_oss_20b();
+        cfg.vocab_size = 8;
+        cfg.hidden_size = 8;
+        cfg.intermediate_size = 64;
+        cfg.num_hidden_layers = 1;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        cfg.head_dim = 2;
+        cfg.num_local_experts = 2;
+        cfg.num_experts_per_tok = 1;
+        cfg.sliding_window = 4;
+        cfg.max_position_embeddings = 16;
+        let embed_tokens = Embedding::new(
+            Tensor::zeros((cfg.vocab_size, cfg.hidden_size), DType::F32, &device).unwrap(),
+            cfg.hidden_size,
+        );
+        let norm = RmsNorm::new(
+            Tensor::ones(cfg.hidden_size, DType::F32, &device).unwrap(),
+            cfg.rms_norm_eps,
+        );
+        let rotary = RotaryEmbedding::new(&cfg, &device, DType::F32).unwrap();
+        GptOssTextEncoder {
+            embed_tokens,
+            layers: EncoderLayers::Streamed(StreamedLayers {
+                files: Vec::<PathBuf>::new().into(),
+                cfg,
+                quant: None,
+                sidecars: None,
+            }),
+            norm,
+            rotary,
+            sliding_window: 4,
+            device,
+            dtype: DType::F32,
+        }
+    }
+
+    #[test]
+    fn unscoped_streamable_forward_cannot_return_the_bare_embedding() {
+        let encoder = streamable_encoder_without_layer_files();
+        let ids = Tensor::from_vec(vec![1u32, 2], (1, 2), &Device::Cpu).unwrap();
+        assert!(encoder.is_streamable());
+        assert!(
+            encoder.forward(&ids).is_err(),
+            "an unscoped streamable forward must try to materialize its all-covering layer window; \
+             returning Ok would expose the bare token embedding as plausible conditioning"
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_streamable_forward_stops_before_opening_a_window() {
+        let encoder = streamable_encoder_without_layer_files();
+        let ids = Tensor::from_vec(vec![1u32, 2], (1, 2), &Device::Cpu).unwrap();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let error = match encoder.forward_with_window(&ids, Some(1), &cancel) {
+            Ok(_) => panic!("pre-cancelled streamed encode must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, candle_gen::CandleError::Canceled),
+            "pre-cancel must remain typed and win over the intentionally missing layer file: {error:?}"
+        );
+    }
 
     #[test]
     fn pre_cancelled_reasoner_aborts_before_the_decode_cap() {
@@ -1363,8 +1601,8 @@ mod tests {
         ]);
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
 
-        let dense = SparseMoe::new(&cfg, vb.clone(), None).unwrap();
-        let quant = SparseMoe::new(&cfg, vb, Some(GgmlDType::Q8_0)).unwrap();
+        let dense = SparseMoe::new(&cfg, vb.clone(), None, None, "").unwrap();
+        let quant = SparseMoe::new(&cfg, vb, Some(GgmlDType::Q8_0), None, "").unwrap();
 
         let xs = Tensor::from_vec(prng(2 * 3 * h, 20), (2, 3, h), &dev).unwrap();
         let want = dense.forward(&xs).unwrap();
@@ -1476,7 +1714,7 @@ mod tests {
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
 
         // (1) `.scales` present ⇒ packed load, quant-independent (`None`).
-        let packed = SparseMoe::new(&cfg, vb, None).unwrap();
+        let packed = SparseMoe::new(&cfg, vb, None, None, "").unwrap();
         assert!(packed.quantized, "packed tier ⇒ experts computed in f32");
         assert_eq!(packed.experts.len(), e);
         for (x, ex) in packed.experts.iter().enumerate() {
@@ -1552,7 +1790,7 @@ mod tests {
             ),
         ]);
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
-        let err = SparseMoe::new(&cfg, vb, None)
+        let err = SparseMoe::new(&cfg, vb, None, None, "")
             .expect_err("unknown expert format must error")
             .to_string();
         assert!(
