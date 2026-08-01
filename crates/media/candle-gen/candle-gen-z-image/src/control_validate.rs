@@ -98,6 +98,7 @@ fn run_control_validation(
         seed: 12345,
         // Native VAE: this harness validates the pose-control pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        memory: Default::default(),
         cancel: CancelFlag::new(),
     };
 

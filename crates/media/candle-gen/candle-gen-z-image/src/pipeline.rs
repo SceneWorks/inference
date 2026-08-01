@@ -1198,7 +1198,7 @@ impl Pipeline {
     /// Decode a final latent with 512 px tiles and 128 px overlap. The shared tile planner's
     /// trapezoidal partition-of-unity blend preserves exact output dimensions and suppresses
     /// boundary-convolution seams while bounding the CUDA working set to one tile.
-    fn decode_tiled(
+    pub(crate) fn decode_tiled(
         &self,
         vae: &AutoEncoderKL,
         latents: &Tensor,

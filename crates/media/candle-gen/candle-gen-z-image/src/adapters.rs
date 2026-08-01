@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::LokrFactors;
@@ -291,6 +291,7 @@ pub fn merge_adapters(
 
 /// A resolved LoRA residual pending attachment: `a = downᵀ` `[in, rank]`, `b = upᵀ·(alpha/rank)`
 /// `[rank, out]`, `scale` the user strength. Read on CPU; moved to the DiT device at push.
+#[derive(Clone)]
 struct PendingLora {
     a: Tensor,
     b: Tensor,
@@ -300,6 +301,7 @@ struct PendingLora {
 /// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
 /// `[out, in]` to build the structured Kronecker factors ([`LokrFactors`], the vec-trick — never the
 /// dense delta).
+#[derive(Clone)]
 struct PendingLokr {
     w1: Option<Tensor>,
     w1_a: Option<Tensor>,
@@ -308,6 +310,71 @@ struct PendingLokr {
     w2_a: Option<Tensor>,
     w2_b: Option<Tensor>,
     scale: f64,
+}
+
+/// Resolved host-side residuals retained by a block-streamed DiT. Each materialized window receives
+/// these residuals before its first forward, preserving adapter semantics without retaining every
+/// base transformer block on the accelerator.
+#[derive(Clone, Default)]
+pub(crate) struct AdditivePlan {
+    pending_lora: BTreeMap<String, Vec<PendingLora>>,
+    pending_lokr: BTreeMap<String, Vec<PendingLokr>>,
+}
+
+impl AdditivePlan {
+    pub(crate) fn apply_projection(
+        &self,
+        path: &str,
+        lin: &mut candle_gen::quant::AdaptLinear,
+        device: &Device,
+    ) -> Result<(usize, usize, bool)> {
+        let (out_f, in_f) = lin.base_shape();
+        let mut applied = 0;
+        let mut skipped = 0;
+        let mut matched = false;
+        if let Some(list) = self.pending_lora.get(path) {
+            matched = true;
+            for pending in list {
+                if pending.a.dims()[0] != in_f || pending.b.dims()[1] != out_f {
+                    skipped += 1;
+                    continue;
+                }
+                lin.push_lora(
+                    pending.a.to_device(device)?,
+                    pending.b.to_device(device)?,
+                    pending.scale,
+                );
+                applied += 1;
+            }
+        }
+        if let Some(list) = self.pending_lokr.get(path) {
+            matched = true;
+            for pending in list {
+                match LokrFactors::build(
+                    pending.scale,
+                    (out_f, in_f),
+                    pending.w1.as_ref(),
+                    pending.w1_a.as_ref(),
+                    pending.w1_b.as_ref(),
+                    pending.w2.as_ref(),
+                    None,
+                    pending.w2_a.as_ref(),
+                    pending.w2_b.as_ref(),
+                )? {
+                    Some(factors) => {
+                        lin.push_lokr_structured(factors.to_device(device)?);
+                        applied += 1;
+                    }
+                    None => {
+                        return Err(CandleError::Msg(format!(
+                            "z_image: LoKr target `{path}` has no allocation-free structured form; use a dense bf16 snapshot"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok((applied, skipped, matched))
+    }
 }
 
 /// A report of a forward-time additive install (sc-11105) — the packed-tier analog of [`MergeReport`].
@@ -433,7 +500,7 @@ pub fn install_additive(
     // rank-2), so a `lora_transformer_<flat>` key resolves exactly as the dense fold's
     // `build_kohya_table` would (the additive-path analog with no base tensor map at hand).
     let mut paths: Vec<String> = Vec::new();
-    dit.visit_adaptable_mut(&mut |path, _lin| {
+    dit.visit_adaptable_for_install(&mut |path, _lin| {
         paths.push(path.to_string());
         Ok(())
     })?;
@@ -495,12 +562,16 @@ pub fn install_additive(
     // so they are moved onto it at push. A factor whose dims don't match the projection is surfaced as a
     // skipped key, never a crashing forward (the additive analog of the fold path's shape guard).
     let device = dit.device().clone();
+    let plan = AdditivePlan {
+        pending_lora,
+        pending_lokr,
+    };
     let mut matched: HashSet<String> = HashSet::new();
     let mut applied = 0usize;
     let mut skipped_keys = 0usize;
-    dit.visit_adaptable_mut(&mut |path, lin| {
+    dit.visit_adaptable_for_install(&mut |path, lin| {
         let (out_f, in_f) = lin.base_shape();
-        if let Some(list) = pending_lora.get(path) {
+        if let Some(list) = plan.pending_lora.get(path) {
             matched.insert(path.to_string());
             for p in list {
                 if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
@@ -511,7 +582,7 @@ pub fn install_additive(
                 applied += 1;
             }
         }
-        if let Some(list) = pending_lokr.get(path) {
+        if let Some(list) = plan.pending_lokr.get(path) {
             matched.insert(path.to_string());
             for p in list {
                 match LokrFactors::build(
@@ -541,11 +612,12 @@ pub fn install_additive(
         }
         Ok(())
     })?;
+    dit.retain_streamed_adapter_plan(plan.clone());
     report.applied = applied;
     report.skipped_keys += skipped_keys;
 
     // Pending targets absent from the DiT surface are surfaced, never silently dropped.
-    for path in pending_lora.keys().chain(pending_lokr.keys()) {
+    for path in plan.pending_lora.keys().chain(plan.pending_lokr.keys()) {
         if !matched.contains(path) {
             report.skipped_targets.push(path.clone());
         }
