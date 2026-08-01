@@ -8,7 +8,8 @@
 //! 1. hash the three source tensor views (including dtype, shape, group size, and format version);
 //! 2. convert each projection once through the existing [`super::repack_packed_weight`] implementation;
 //! 3. atomically write the resulting GGML bytes to a one-tensor safetensors sidecar under
-//!    `.candle-device-format-v1/` beside the source component; and
+//!    `.candle-device-format-v1/` beside the source component, or under the external cache when the
+//!    caller-provisioned component is read-only; and
 //! 4. mmap that sidecar for each materialization and copy its already-device-format bytes directly
 //!    to the requested device.
 //!
@@ -17,6 +18,10 @@
 //! allocation proportional to the tier: the mapped payload is reclaimable page cache, and
 //! [`QStorage::from_data`] copies it to the device before the mapping is dropped. First creation is
 //! deliberately projection-at-a-time, bounding the q8 dense conversion transient to one projection.
+//! A complete valid cache is opened read-only without creating or acquiring the preparation lock.
+//! Missing or corrupt entries still take the exclusive-lock path so recovery and publication remain
+//! serialized. The external root can be supplied explicitly or through
+//! `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`; otherwise the platform's per-user cache directory is used.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -39,6 +44,7 @@ const PREPARE_LOCK: &str = ".prepare.lock";
 const PAYLOAD_KEY: &str = "weight";
 const PAYLOAD_HASH_KEY: &str = "payload_sha256";
 const FORMAT_DOMAIN: &[u8] = b"sceneworks-candle-device-format-sidecar-v1\0";
+const HASH_CANCEL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -48,6 +54,22 @@ struct SidecarEntry {
     out_dim: usize,
     in_dim: usize,
     payload_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PreparedProjection {
+    entry_base: String,
+    source_hex: String,
+    source_base: String,
+    source_slice: Option<usize>,
+    bits: usize,
+    group_size: usize,
+    dtype: GgmlDType,
+    dtype_name: &'static str,
+    out_dim: usize,
+    in_dim: usize,
+    payload_bytes: usize,
+    source_bytes: usize,
 }
 
 /// Prepared device-format sidecars for every MLX-packed projection in one component.
@@ -74,7 +96,31 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
     ) -> Result<Self> {
-        Self::prepare_impl(source, component_dir, packed, device, None, None)
+        Self::prepare_impl(source, component_dir, packed, device, None, None, None)
+    }
+
+    /// Prepare packed projections with an explicit non-model cache root for read-only components.
+    ///
+    /// The model-adjacent cache remains preferred when it is writable. `external_cache_root` is used
+    /// only when that cache cannot be written (or when an already-complete cache exists there). Each
+    /// component receives a hashed namespace below the root, so unrelated snapshots do not share a
+    /// lock. This is the programmatic twin of `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`.
+    pub fn prepare_with_external_cache_root(
+        source: &MmapedSafetensors,
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        external_cache_root: &Path,
+    ) -> Result<Self> {
+        Self::prepare_impl(
+            source,
+            component_dir,
+            packed,
+            device,
+            None,
+            None,
+            Some(external_cache_root),
+        )
     }
 
     /// Cancellation-aware preparation for request-time component opens. Hashing checks between
@@ -86,7 +132,15 @@ impl PackedWeightSidecars {
         device: &Device,
         cancel: &CancelFlag,
     ) -> Result<Self> {
-        Self::prepare_impl(source, component_dir, packed, device, Some(cancel), None)
+        Self::prepare_impl(
+            source,
+            component_dir,
+            packed,
+            device,
+            Some(cancel),
+            None,
+            None,
+        )
     }
 
     /// Prepare only packed projections whose full tensor base starts with `base_prefix`.
@@ -114,6 +168,7 @@ impl PackedWeightSidecars {
             device,
             Some(cancel),
             Some(base_prefix),
+            None,
         )
     }
 
@@ -124,6 +179,7 @@ impl PackedWeightSidecars {
         device: &Device,
         cancel: Option<&CancelFlag>,
         base_prefix: Option<&str>,
+        external_cache_root: Option<&Path>,
     ) -> Result<Self> {
         check_cancel(cancel)?;
         let bits = usize::try_from(packed.bits).map_err(|_| {
@@ -145,23 +201,56 @@ impl PackedWeightSidecars {
             )));
         }
 
-        let cache_dir = component_dir.join(CACHE_DIR);
-        fs::create_dir_all(&cache_dir).map_err(|e| {
-            Error::Msg(format!(
-                "device-format sidecar: create {}: {e}",
-                cache_dir.display()
-            ))
-        })?;
+        let projections =
+            prepare_projections(source, component_dir, bits, group_size, cancel, base_prefix)?;
+        let source_bytes_hashed = projections.iter().fold(0u64, |sum, projection| {
+            sum.saturating_add(projection.source_bytes as u64)
+        });
+
+        // The common warm path is deliberately read-only: validate every expected content address
+        // before attempting create_dir_all or opening the writable lock. Published files are
+        // immutable, so a complete valid set needs no coordination with writers.
+        let adjacent_cache = component_dir.join(CACHE_DIR);
+        if cache_is_complete(&adjacent_cache, &projections, cancel)? {
+            return Ok(reused_cache(
+                projections,
+                adjacent_cache,
+                source_bytes_hashed,
+            ));
+        }
+
+        let external_cache = external_cache_dir(component_dir, external_cache_root);
+        if cache_is_complete(&external_cache, &projections, cancel)? {
+            return Ok(reused_cache(
+                projections,
+                external_cache,
+                source_bytes_hashed,
+            ));
+        }
+
+        // Prefer the historical model-adjacent location when it is writable. A caller-provisioned
+        // snapshot may legally be immutable, though, so failure to create/write there selects the
+        // namespaced per-user external cache instead of disabling packed loading or retaining a full
+        // tier's converted weights in anonymous memory.
+        let (cache_dir, prepare_lock) = match open_writable_cache(&adjacent_cache) {
+            Ok(lock) => (adjacent_cache, lock),
+            Err(adjacent_error) => match open_writable_cache(&external_cache) {
+                Ok(lock) => (external_cache, lock),
+                Err(external_error) => {
+                    return Err(Error::Msg(format!(
+                        "device-format sidecar: neither model-adjacent cache {} ({adjacent_error}) \
+                         nor external cache {} ({external_error}) is writable",
+                        adjacent_cache.display(),
+                        external_cache.display()
+                    )))
+                }
+            },
+        };
+
         // Serialize validation, corrupt recovery, and publication across processes. Without this
         // lock, two readers can both observe a corrupt final path and one can delete the valid
         // replacement the other just published. The lock file persists as a zero-byte cache
         // coordination artifact; the OS releases the advisory lock on every return or process exit.
-        let prepare_lock = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(cache_dir.join(PREPARE_LOCK))?;
         if cancel.is_some() {
             loop {
                 check_cancel(cancel)?;
@@ -187,126 +276,54 @@ impl PackedWeightSidecars {
             })?;
         }
 
-        let mut bases: Vec<String> = source
-            .tensors()
-            .into_iter()
-            .filter_map(|(name, _)| name.strip_suffix(".scales").map(str::to_owned))
-            .filter(|base| base_prefix.is_none_or(|prefix| base.starts_with(prefix)))
-            .collect();
-        bases.sort();
-        bases.dedup();
-        if bases.is_empty() {
-            let selection = base_prefix
-                .map(|prefix| format!(" matching prefix `{prefix}`"))
-                .unwrap_or_default();
-            return Err(Error::Msg(format!(
-                "device-format sidecar: packed component {} has no `.scales` triples{selection}",
-                component_dir.display(),
-            )));
-        }
-
-        let mut entries = HashMap::with_capacity(bases.len());
+        let mut entries = HashMap::with_capacity(projections.len());
         let mut created = 0usize;
         let mut reused = 0usize;
-        let mut source_bytes_hashed = 0u64;
         let mut sidecar_bytes = 0u64;
-        for base in bases {
+        for projection in projections {
             check_cancel(cancel)?;
-            let weight_key = format!("{base}.weight");
-            let scales_key = format!("{base}.scales");
-            let biases_key = format!("{base}.biases");
-            let weight = source.get(&weight_key).map_err(|e| {
-                Error::Msg(format!(
-                    "device-format sidecar: `{scales_key}` has no `{weight_key}` sibling: {e}"
-                ))
-            })?;
-            let scales = source.get(&scales_key)?;
-            let biases = source.get(&biases_key).map_err(|e| {
-                Error::Msg(format!(
-                    "device-format sidecar: `{scales_key}` has no `{biases_key}` sibling: {e}"
-                ))
-            })?;
-            let projections =
-                validate_source_shapes(&base, &weight, &scales, &biases, bits, group_size)?;
+            let path = cache_dir.join(format!(
+                "{}.{}.safetensors",
+                projection.source_hex, projection.dtype_name
+            ));
 
-            for projection in projections {
-                let entry_base = sidecar_entry_key(&base, projection.index);
-                let source_digest = match projection.index {
-                    None => source_digest(
-                        &base,
-                        bits,
-                        group_size,
-                        [
-                            (&weight_key, &weight),
-                            (&scales_key, &scales),
-                            (&biases_key, &biases),
-                        ],
-                        cancel,
-                    )?,
-                    Some(index) => source_slice_digest(
-                        &entry_base,
-                        bits,
-                        group_size,
-                        index,
-                        [
-                            (&weight_key, &weight),
-                            (&scales_key, &scales),
-                            (&biases_key, &biases),
-                        ],
-                        cancel,
-                    )?,
-                };
+            let valid = validate_sidecar(&path, projection.payload_bytes, cancel)?;
+            if valid {
+                reused += 1;
+            } else {
+                build_sidecar(
+                    source,
+                    &path,
+                    &projection.source_hex,
+                    &projection.source_base,
+                    projection.source_slice,
+                    projection.bits,
+                    projection.group_size,
+                    projection.out_dim,
+                    projection.in_dim,
+                    projection.dtype,
+                    device,
+                )?;
                 check_cancel(cancel)?;
-                source_bytes_hashed =
-                    source_bytes_hashed.saturating_add(projection.source_bytes as u64);
-                let source_hex = hex(&source_digest);
-                let dtype = if bits == 4 {
-                    GgmlDType::Q4_1
-                } else {
-                    GgmlDType::Q8_0
-                };
-                let dtype_name = if bits == 4 { "q4_1" } else { "q8_0" };
-                let payload_bytes = payload_len(dtype, projection.out_dim, projection.in_dim)?;
-                let path = cache_dir.join(format!("{source_hex}.{dtype_name}.safetensors"));
-
-                let valid = validate_sidecar(&path, payload_bytes)?;
-                if valid {
-                    reused += 1;
-                } else {
-                    build_sidecar(
-                        source,
-                        &path,
-                        &source_hex,
-                        &base,
-                        projection.index,
-                        bits,
-                        group_size,
-                        projection.out_dim,
-                        projection.in_dim,
-                        dtype,
-                        device,
-                    )?;
-                    check_cancel(cancel)?;
-                    if !validate_sidecar(&path, payload_bytes)? {
-                        return Err(Error::Msg(format!(
-                            "device-format sidecar: freshly written artifact {} failed validation",
-                            path.display()
-                        )));
-                    }
-                    created += 1;
+                if !validate_sidecar(&path, projection.payload_bytes, cancel)? {
+                    return Err(Error::Msg(format!(
+                        "device-format sidecar: freshly written artifact {} failed validation",
+                        path.display()
+                    )));
                 }
-                sidecar_bytes = sidecar_bytes.saturating_add(payload_bytes as u64);
-                entries.insert(
-                    entry_base,
-                    SidecarEntry {
-                        path,
-                        dtype,
-                        out_dim: projection.out_dim,
-                        in_dim: projection.in_dim,
-                        payload_bytes,
-                    },
-                );
+                created += 1;
             }
+            sidecar_bytes = sidecar_bytes.saturating_add(projection.payload_bytes as u64);
+            entries.insert(
+                projection.entry_base,
+                SidecarEntry {
+                    path,
+                    dtype: projection.dtype,
+                    out_dim: projection.out_dim,
+                    in_dim: projection.in_dim,
+                    payload_bytes: projection.payload_bytes,
+                },
+            );
         }
 
         Ok(Self {
@@ -397,6 +414,223 @@ impl PackedWeightSidecars {
     pub fn path_for(&self, base: &str) -> Option<&Path> {
         self.entries.get(base).map(|entry| entry.path.as_path())
     }
+}
+
+fn prepare_projections(
+    source: &MmapedSafetensors,
+    component_dir: &Path,
+    bits: usize,
+    group_size: usize,
+    cancel: Option<&CancelFlag>,
+    base_prefix: Option<&str>,
+) -> Result<Vec<PreparedProjection>> {
+    let mut bases: Vec<String> = source
+        .tensors()
+        .into_iter()
+        .filter_map(|(name, _)| name.strip_suffix(".scales").map(str::to_owned))
+        .filter(|base| base_prefix.is_none_or(|prefix| base.starts_with(prefix)))
+        .collect();
+    bases.sort();
+    bases.dedup();
+    if bases.is_empty() {
+        let selection = base_prefix
+            .map(|prefix| format!(" matching prefix `{prefix}`"))
+            .unwrap_or_default();
+        return Err(Error::Msg(format!(
+            "device-format sidecar: packed component {} has no `.scales` triples{selection}",
+            component_dir.display(),
+        )));
+    }
+
+    let mut prepared = Vec::new();
+    for base in bases {
+        check_cancel(cancel)?;
+        let weight_key = format!("{base}.weight");
+        let scales_key = format!("{base}.scales");
+        let biases_key = format!("{base}.biases");
+        let weight = source.get(&weight_key).map_err(|e| {
+            Error::Msg(format!(
+                "device-format sidecar: `{scales_key}` has no `{weight_key}` sibling: {e}"
+            ))
+        })?;
+        let scales = source.get(&scales_key)?;
+        let biases = source.get(&biases_key).map_err(|e| {
+            Error::Msg(format!(
+                "device-format sidecar: `{scales_key}` has no `{biases_key}` sibling: {e}"
+            ))
+        })?;
+        let projections =
+            validate_source_shapes(&base, &weight, &scales, &biases, bits, group_size)?;
+        for projection in projections {
+            let entry_base = sidecar_entry_key(&base, projection.index);
+            let source_digest = match projection.index {
+                None => source_digest(
+                    &base,
+                    bits,
+                    group_size,
+                    [
+                        (&weight_key, &weight),
+                        (&scales_key, &scales),
+                        (&biases_key, &biases),
+                    ],
+                    cancel,
+                )?,
+                Some(index) => source_slice_digest(
+                    &entry_base,
+                    bits,
+                    group_size,
+                    index,
+                    [
+                        (&weight_key, &weight),
+                        (&scales_key, &scales),
+                        (&biases_key, &biases),
+                    ],
+                    cancel,
+                )?,
+            };
+            check_cancel(cancel)?;
+            let dtype = if bits == 4 {
+                GgmlDType::Q4_1
+            } else {
+                GgmlDType::Q8_0
+            };
+            prepared.push(PreparedProjection {
+                entry_base,
+                source_hex: hex(&source_digest),
+                source_base: base.clone(),
+                source_slice: projection.index,
+                bits,
+                group_size,
+                dtype,
+                dtype_name: if bits == 4 { "q4_1" } else { "q8_0" },
+                out_dim: projection.out_dim,
+                in_dim: projection.in_dim,
+                payload_bytes: payload_len(dtype, projection.out_dim, projection.in_dim)?,
+                source_bytes: projection.source_bytes,
+            });
+        }
+    }
+    Ok(prepared)
+}
+
+fn cache_is_complete(
+    cache_dir: &Path,
+    projections: &[PreparedProjection],
+    cancel: Option<&CancelFlag>,
+) -> Result<bool> {
+    if !cache_dir.is_dir() {
+        return Ok(false);
+    }
+    for projection in projections {
+        check_cancel(cancel)?;
+        let path = cache_dir.join(format!(
+            "{}.{}.safetensors",
+            projection.source_hex, projection.dtype_name
+        ));
+        let valid = validate_sidecar(&path, projection.payload_bytes, cancel)?;
+        check_cancel(cancel)?;
+        if !valid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn reused_cache(
+    projections: Vec<PreparedProjection>,
+    cache_dir: PathBuf,
+    source_bytes_hashed: u64,
+) -> PackedWeightSidecars {
+    let reused = projections.len();
+    let mut entries = HashMap::with_capacity(reused);
+    let mut sidecar_bytes = 0u64;
+    for projection in projections {
+        let path = cache_dir.join(format!(
+            "{}.{}.safetensors",
+            projection.source_hex, projection.dtype_name
+        ));
+        sidecar_bytes = sidecar_bytes.saturating_add(projection.payload_bytes as u64);
+        entries.insert(
+            projection.entry_base,
+            SidecarEntry {
+                path,
+                dtype: projection.dtype,
+                out_dim: projection.out_dim,
+                in_dim: projection.in_dim,
+                payload_bytes: projection.payload_bytes,
+            },
+        );
+    }
+    PackedWeightSidecars {
+        entries,
+        cache_dir,
+        created: 0,
+        reused,
+        source_bytes_hashed,
+        sidecar_bytes,
+    }
+}
+
+fn open_writable_cache(cache_dir: &Path) -> std::io::Result<fs::File> {
+    fs::create_dir_all(cache_dir)?;
+    // Probe create+unlink before creating/opening the coordination lock. This runs only after the
+    // lock-free complete-cache path missed, proves the directory can publish an artifact, and avoids
+    // leaving a new lock file in a location that cannot actually accept the sidecars. `create_new`
+    // prevents following or truncating an attacker-controlled file.
+    let seq = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let probe = cache_dir.join(format!(".write-probe-{}-{seq}", std::process::id()));
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)?;
+    fs::remove_file(probe)?;
+    fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(cache_dir.join(PREPARE_LOCK))
+}
+
+fn external_cache_dir(component_dir: &Path, explicit_root: Option<&Path>) -> PathBuf {
+    let root = explicit_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_external_cache_root);
+    let identity = fs::canonicalize(component_dir).unwrap_or_else(|_| component_dir.to_path_buf());
+    let mut digest = Sha256::new();
+    digest.update(b"sceneworks-candle-device-format-component-v1\0");
+    digest.update(identity.to_string_lossy().as_bytes());
+    let namespace = hex(&digest.finalize());
+    root.join("candle-device-format-v1").join(namespace)
+}
+
+fn default_external_cache_root() -> PathBuf {
+    if let Some(root) =
+        std::env::var_os("SCENEWORKS_CANDLE_DEVICE_CACHE_DIR").filter(|root| !root.is_empty())
+    {
+        return PathBuf::from(root);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(root).join("SceneWorks");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Caches/SceneWorks");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(root) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(root).join("sceneworks");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".cache/sceneworks");
+        }
+    }
+    // Temp directories are user-scoped on supported Windows/macOS hosts and commonly so in
+    // containers. This last-resort cache is content-validated before every use; deployments that
+    // need a durable or policy-controlled location should set the documented override.
+    std::env::temp_dir().join("sceneworks-candle-cache")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -582,8 +816,7 @@ fn check_cancel(cancel: Option<&CancelFlag>) -> Result<()> {
 }
 
 fn hash_source_bytes(hash: &mut Sha256, bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<()> {
-    const CANCEL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-    for chunk in bytes.chunks(CANCEL_CHUNK_BYTES) {
+    for chunk in bytes.chunks(HASH_CANCEL_CHUNK_BYTES) {
         check_cancel(cancel)?;
         hash.update(chunk);
     }
@@ -699,7 +932,7 @@ fn build_sidecar(
         .sync_all()?;
 
     if final_path.exists() {
-        if validate_sidecar(final_path, payload.len())? {
+        if validate_sidecar(final_path, payload.len(), None)? {
             let _ = fs::remove_file(&temp_path);
             return Ok(());
         }
@@ -716,7 +949,7 @@ fn build_sidecar(
     }
     match fs::rename(&temp_path, final_path) {
         Ok(()) => Ok(()),
-        Err(_rename_error) if validate_sidecar(final_path, payload.len())? => {
+        Err(_rename_error) if validate_sidecar(final_path, payload.len(), None)? => {
             let _ = fs::remove_file(&temp_path);
             Ok(())
         }
@@ -743,7 +976,12 @@ fn safe_dtype(dtype: SafeDtype) -> Result<DType> {
     }
 }
 
-fn validate_sidecar(path: &Path, payload_bytes: usize) -> Result<bool> {
+fn validate_sidecar(
+    path: &Path,
+    payload_bytes: usize,
+    cancel: Option<&CancelFlag>,
+) -> Result<bool> {
+    check_cancel(cancel)?;
     if !path.is_file() {
         return Ok(false);
     }
@@ -760,8 +998,42 @@ fn validate_sidecar(path: &Path, payload_bytes: usize) -> Result<bool> {
         Ok(view) if view.dtype() == SafeDtype::U8 && view.data().len() == 32 => view,
         _ => return Ok(false),
     };
-    let actual_hash: [u8; 32] = Sha256::digest(payload.data()).into();
+    let actual_hash = validation_payload_digest(payload.data(), cancel)?;
+    check_cancel(cancel)?;
     Ok(stored_hash.data() == actual_hash)
+}
+
+fn validation_payload_digest(bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    for chunk in bytes.chunks(HASH_CANCEL_CHUNK_BYTES) {
+        check_cancel(cancel)?;
+        hash.update(chunk);
+        #[cfg(test)]
+        validation_cancel_test_hook(cancel);
+        check_cancel(cancel)?;
+    }
+    Ok(hash.finalize().into())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CANCEL_VALIDATION_AFTER_CHUNKS: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn validation_cancel_test_hook(cancel: Option<&CancelFlag>) {
+    if let Some(cancel) = cancel {
+        CANCEL_VALIDATION_AFTER_CHUNKS.with(|remaining| match remaining.get() {
+            Some(1) => {
+                remaining.set(None);
+                cancel.cancel();
+            }
+            Some(chunks) => remaining.set(Some(chunks - 1)),
+            None => {}
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -841,6 +1113,23 @@ mod tests {
         Ok(path)
     }
 
+    fn write_multi_source(dir: &Path, bits: usize) -> Result<PathBuf> {
+        let mut tensors = HashMap::new();
+        for layer in 0..2 {
+            let values: Vec<f32> = (0..2 * 64)
+                .map(|i| ((i * 17 + i / 7 + layer * 11) % 41) as f32 / 16.0)
+                .collect();
+            let dense = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
+            let (weight, scales, biases) = pack_mlx_affine(&dense, bits, 64)?;
+            tensors.insert(format!("layers.{layer}.proj.weight"), weight);
+            tensors.insert(format!("layers.{layer}.proj.scales"), scales);
+            tensors.insert(format!("layers.{layer}.proj.biases"), biases);
+        }
+        let path = dir.join("model.safetensors");
+        safetensors::save(&tensors, &path)?;
+        Ok(path)
+    }
+
     fn open(path: &Path) -> Result<MmapedSafetensors> {
         // SAFETY: immutable test fixture for the lifetime of the mapping.
         unsafe { MmapedSafetensors::new(path) }
@@ -903,6 +1192,138 @@ mod tests {
         canceller.join().unwrap();
         FileExt::unlock(&held)?;
         assert!(error.to_string().contains("cancelled"));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_entry_warm_caches_cancel_inside_payload_validation() -> Result<()> {
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        for external_warm_cache in [false, true] {
+            let component = TestDir::new(if external_warm_cache {
+                "cancel-warm-external"
+            } else {
+                "cancel-warm-adjacent"
+            });
+            let external = TestDir::new("cancel-warm-root");
+            let source_path = write_multi_source(&component.0, 4)?;
+            let source = open(&source_path)?;
+            if external_warm_cache {
+                // A regular file makes the adjacent cache unavailable on every platform, including
+                // root-capable CI, so the complete warm set is definitely external.
+                fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
+            }
+            let first = PackedWeightSidecars::prepare_impl(
+                &source,
+                &component.0,
+                packed,
+                &Device::Cpu,
+                None,
+                None,
+                Some(&external.0),
+            )?;
+            assert_eq!(first.created_count(), 2, "fixture must be non-vacuous");
+            assert!(first.contains("layers.0.proj"));
+            assert!(first.contains("layers.1.proj"));
+            assert_eq!(
+                first.cache_dir().starts_with(&external.0),
+                external_warm_cache,
+                "test must exercise the intended warm-cache location"
+            );
+
+            let cancel = CancelFlag::new();
+            // Deterministic mutation hook: cancel after hashing the first payload chunk. This proves
+            // the error originates inside artifact validation, not before source hashing or between
+            // the two entries, without relying on scheduler timing.
+            CANCEL_VALIDATION_AFTER_CHUNKS.with(|remaining| remaining.set(Some(1)));
+            let error = PackedWeightSidecars::prepare_impl(
+                &source,
+                &component.0,
+                packed,
+                &Device::Cpu,
+                Some(&cancel),
+                None,
+                Some(&external.0),
+            )
+            .unwrap_err();
+            CANCEL_VALIDATION_AFTER_CHUNKS.with(|remaining| remaining.set(None));
+
+            assert!(cancel.is_cancelled());
+            assert_eq!(
+                error.to_string(),
+                "device-format sidecar preparation cancelled"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_read_only_cache_reuses_without_creating_the_prepare_lock() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("warm-read-only");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source = open(&source_path)?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let first = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let cache_dir = first.cache_dir().to_path_buf();
+        let lock = cache_dir.join(PREPARE_LOCK);
+        fs::remove_file(&lock)?;
+
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o555))?;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o555))?;
+        let result = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu);
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o755))?;
+
+        let reused = result?;
+        assert_eq!(reused.created_count(), 0);
+        assert_eq!(reused.reused_count(), 1);
+        assert!(
+            !lock.exists(),
+            "warm reuse must not recreate the prepare lock"
+        );
+        reused.load("layers.0.proj", &Device::Cpu)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_read_only_component_uses_external_file_backed_cache() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let component = TestDir::new("cold-read-only");
+        let external = TestDir::new("external-root");
+        let source_path = write_source(&component.0, 4, 0.0)?;
+        let source = open(&source_path)?;
+        // A chmod alone is still writable to root. Making the adjacent cache pathname a regular file
+        // forces the same non-writable-cache branch under privileged CI while the chmod pins the real
+        // deployment contract for ordinary users.
+        fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
+        fs::set_permissions(&component.0, fs::Permissions::from_mode(0o555))?;
+        let result = PackedWeightSidecars::prepare_with_external_cache_root(
+            &source,
+            &component.0,
+            PackedConfig {
+                bits: 4,
+                group_size: 64,
+            },
+            &Device::Cpu,
+            &external.0,
+        );
+        fs::set_permissions(&component.0, fs::Permissions::from_mode(0o755))?;
+
+        let cache = result?;
+        assert_eq!(cache.created_count(), 1);
+        assert!(cache.cache_dir().starts_with(&external.0));
+        assert!(component.0.join(CACHE_DIR).is_file());
+        cache.load("layers.0.proj", &Device::Cpu)?;
         Ok(())
     }
 
@@ -1155,7 +1576,8 @@ mod tests {
         );
         assert!(validate_sidecar(
             &path,
-            payload_len(GgmlDType::Q8_0, 2, 64)?
+            payload_len(GgmlDType::Q8_0, 2, 64)?,
+            None,
         )?);
         Ok(())
     }

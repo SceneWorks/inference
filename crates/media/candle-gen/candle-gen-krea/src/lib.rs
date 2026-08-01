@@ -24,7 +24,10 @@
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0; Krea 2 Community License (non-commercial use
 //! satisfies it). The packed q4/q8/bf16 turnkey loads per-tier via `loader::linear_detect` (sc-9411);
 //! the descriptor advertises `supported_quants: [Q4, Q8]` so the worker's A-B quant toggle engages
-//! (sc-9607).
+//! (sc-9607). Packed loads retain file-backed converted sidecars: writable snapshots cache beside the
+//! component, while read-only snapshots use the configurable per-user external cache (sc-16587). A
+//! complete valid warm cache is read without taking its preparation lock; operators should budget
+//! roughly one additional packed-projection copy in whichever cache location is selected.
 
 pub mod adapters;
 pub mod config;
