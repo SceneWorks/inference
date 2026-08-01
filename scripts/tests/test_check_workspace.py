@@ -443,3 +443,108 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SnapshotPathDerivationTests(unittest.TestCase):
+    """`check_snapshot_path_derivation` must separate a `$HOME` *derivation* from a `$HOME`
+    *fallback*, because a naive grep for `env::var("HOME")` cannot: 102 files matched that grep when
+    the gate was written and only 15 carried the defect."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def check(self, source: str):
+        """Run the gate over a temp tree containing exactly `source`, returning the failure or None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "crate" / "tests").mkdir(parents=True)
+            (root / "crate" / "tests" / "real_weights.rs").write_text(source, encoding="utf-8")
+            try:
+                self.gate.check_snapshot_path_derivation(root)
+            except AssertionError as error:
+                return str(error)
+            return None
+
+    def test_a_derived_snapshot_path_with_no_override_fails(self) -> None:
+        failure = self.check(
+            'fn snapshot() -> PathBuf {\n'
+            '    PathBuf::from(std::env::var("HOME").unwrap())\n'
+            '        .join(".cache/mlx-gen-models/bernini_full_mlx_bf16")\n'
+            '}\n'
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("real_weights.rs:1", failure)
+
+    def test_an_override_with_a_home_fallback_passes(self) -> None:
+        self.assertIsNone(
+            self.check(
+                'fn converted_root() -> PathBuf {\n'
+                '    std::env::var("MLX_GEN_CONVERTED_ROOT")\n'
+                '        .map(PathBuf::from)\n'
+                '        .unwrap_or_else(|_| {\n'
+                '            PathBuf::from(std::env::var("HOME").expect("HOME"))\n'
+                '                .join(".cache/mlx-gen-models")\n'
+                '        })\n'
+                '}\n'
+            )
+        )
+
+    def test_a_bare_home_accessor_is_not_the_defect(self) -> None:
+        """The `mlx-gen-scail2` / `mlx-gen-krea-realtime` shape: the helper joins nothing, and its
+        callers wrap it in an override. Flagging it would make the gate wrong on 4 live files."""
+        self.assertIsNone(
+            self.check(
+                'fn home() -> PathBuf {\n'
+                '    PathBuf::from(std::env::var("HOME").unwrap())\n'
+                '}\n'
+                'fn snapshot_dir() -> PathBuf {\n'
+                '    std::env::var("SCAIL2_SNAPSHOT_DIR")\n'
+                '        .map(PathBuf::from)\n'
+                '        .unwrap_or_else(|_| home().join(".cache/scail2-mlx-convert"))\n'
+                '}\n'
+            )
+        )
+
+    def test_a_tilde_expander_is_not_the_defect(self) -> None:
+        """The `mlx-gen-wan` shape: `$HOME` expands a `~/` prefix on a value that already came from
+        an override, so the override is upstream of the read rather than absent."""
+        self.assertIsNone(
+            self.check(
+                'fn env_path(var: &str) -> Option<PathBuf> {\n'
+                '    std::env::var_os(var).map(|s| {\n'
+                '        let s = s.to_string_lossy();\n'
+                '        if let Some(rest) = s.strip_prefix("~/") {\n'
+                '            if let Some(home) = std::env::var_os("HOME") {\n'
+                '                return PathBuf::from(format!("{}/{rest}", home.to_string_lossy()));\n'
+                '            }\n'
+                '        }\n'
+                '        PathBuf::from(s.to_string())\n'
+                '    })\n'
+                '}\n'
+            )
+        )
+
+    def test_an_override_named_by_a_computed_string_still_counts(self) -> None:
+        """The `mlx-gen-mochi` shape: `env::var(format!("MOCHI_Q{bits}_DIR"))`. The override is real
+        even though no literal variable name appears, which is why the gate tests for *any* non-HOME
+        env read rather than for a name."""
+        self.assertIsNone(
+            self.check(
+                'fn tier_dir(bits: u32) -> PathBuf {\n'
+                '    if let Ok(d) = std::env::var(format!("MOCHI_Q{bits}_DIR")) {\n'
+                '        return PathBuf::from(d);\n'
+                '    }\n'
+                '    PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/mochi-tiers")\n'
+                '}\n'
+            )
+        )
+
+    def test_a_commented_out_override_does_not_disarm_the_gate(self) -> None:
+        self.assertIsNotNone(
+            self.check(
+                'fn snapshot() -> PathBuf {\n'
+                '    // std::env::var("SOME_OVERRIDE")\n'
+                '    PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/models/x")\n'
+                '}\n'
+            )
+        )

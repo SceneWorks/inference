@@ -18,6 +18,20 @@ use mlx_gen::weights::Weights;
 use mlx_gen_ltx::convert::{convert_and_assemble, LtxConvertOpts};
 use mlx_rs::ops::array_eq;
 
+/// The SceneWorks app-support model store the parity goldens live in.
+///
+/// `LTX_GOLDEN_ROOT` overrides it, `$HOME` stays the default. Without an override
+/// `run_base_parity` read `$HOME` unconditionally, so pointing the suite at a real store did
+/// nothing — the row asserted `golden.is_dir()` against a path the caller could not move.
+fn golden_root() -> PathBuf {
+    std::env::var("LTX_GOLDEN_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME"))
+                .join("Library/Application Support/SceneWorks/data/models/mlx")
+        })
+}
+
 /// The eros golden split dir (`LTX_EROS_DIR` or the default SceneWorks data path).
 fn eros_golden_dir() -> PathBuf {
     if let Ok(d) = std::env::var("LTX_EROS_DIR") {
@@ -203,10 +217,10 @@ fn base_source_file() -> PathBuf {
 /// Convert the base distilled checkpoint at `bits` and assert the six core components + configs match
 /// the golden `<id>` (the upsampler components are raw copies, exercised by the eros roundtrip test).
 fn run_base_parity(golden_id: &str, bits: i32) {
-    let home = std::env::var("HOME").unwrap();
-    let golden = PathBuf::from(&home).join(format!(
-        "Library/Application Support/SceneWorks/data/models/mlx/{golden_id}"
-    ));
+    // A ROOT override rather than a per-path one, unlike `LTX_BASE_DIR` / `LTX_EROS_DIR` above:
+    // `golden_id` is a parameter, so the path this resolves is not knowable when the variable is
+    // set. Its siblings keep their per-path variables — they name one path each and work today.
+    let golden = golden_root().join(golden_id);
     let source = base_source_file();
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
     assert!(source.is_file(), "source missing: {}", source.display());
