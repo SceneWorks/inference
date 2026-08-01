@@ -58,6 +58,29 @@ fn seam_ratio(image: &candle_gen::gen_core::Image, seam_x: usize) -> f64 {
     seam / neighborhood.max(1e-9)
 }
 
+fn mutation_metrics(left: &Image, right: &Image) -> (u8, f64) {
+    assert_eq!((left.width, left.height), (right.width, right.height));
+    assert_eq!(left.pixels.len(), right.pixels.len());
+    let mut maximum = 0u8;
+    let mut total = 0u64;
+    for (&lhs, &rhs) in left.pixels.iter().zip(&right.pixels) {
+        let delta = lhs.abs_diff(rhs);
+        maximum = maximum.max(delta);
+        total += u64::from(delta);
+    }
+    (maximum, total as f64 / left.pixels.len() as f64)
+}
+
+fn generated_image(output: GenerationOutput) -> Image {
+    match output {
+        GenerationOutput::Images(mut images) => {
+            assert_eq!(images.len(), 1);
+            images.remove(0)
+        }
+        other => panic!("expected image output, got {other:?}"),
+    }
+}
+
 #[test]
 #[ignore = "needs Z_IMAGE_TIER_DIR + CUDA; run in a fresh otherwise-idle process"]
 fn measure_z_image_tier() {
@@ -132,7 +155,7 @@ fn measure_z_image_tier() {
         )]);
     }
     let style_variation = std::env::var("Z_IMAGE_STYLE_VARIATION").as_deref() == Ok("1");
-    let request = GenerationRequest {
+    let base_request = GenerationRequest {
         prompt: "a rusty robot holding a lit candle, cinematic studio lighting, highly detailed"
             .into(),
         width,
@@ -141,6 +164,9 @@ fn measure_z_image_tier() {
         count: 1,
         seed: Some(42),
         memory: Some(memory),
+        ..Default::default()
+    };
+    let request = GenerationRequest {
         conditioning: style_variation
             .then(|| Conditioning::Reference {
                 image: reference_fixture(width, height),
@@ -148,7 +174,7 @@ fn measure_z_image_tier() {
             })
             .into_iter()
             .collect(),
-        ..Default::default()
+        ..base_request.clone()
     };
 
     let mut probe = candle_gen::testkit::VramProbe::start_rendered();
@@ -185,13 +211,7 @@ fn measure_z_image_tier() {
         if let Some((name, phase)) = observed.take() {
             phase_peaks.push((repeat, name, probe.end_observed(phase)));
         }
-        let image = match output {
-            GenerationOutput::Images(mut images) => {
-                assert_eq!(images.len(), 1);
-                images.remove(0)
-            }
-            other => panic!("expected image output, got {other:?}"),
-        };
+        let image = generated_image(output);
         assert_eq!((image.width, image.height), (width, height));
         assert_eq!(image.pixels.len(), (width * height * 3) as usize);
         let min = *image.pixels.iter().min().unwrap();
@@ -207,9 +227,46 @@ fn measure_z_image_tier() {
         }
         final_image = Some(image);
     }
+    let image = final_image.unwrap();
+
+    if style_variation {
+        let plain = generated_image(
+            generator
+                .generate(&base_request, &mut |_| {})
+                .expect("generate plain comparison for style mutation"),
+        );
+        let (maximum, mean) = mutation_metrics(&image, &plain);
+        eprintln!(
+            "ZIMAGE_MUTATION tier={tier} policy={policy_name} kind=style_reference_vs_plain max_rgb8={maximum} mean_rgb8={mean:.6}"
+        );
+        assert!(maximum > 0 && mean > 0.0, "style reference was ignored");
+    }
+
+    if std::env::var("Z_IMAGE_ADAPTER").is_ok() {
+        drop(generator);
+        let plain_generator = candle_gen_z_image::provider_registry()
+            .expect("registry")
+            .load(
+                &provider,
+                &LoadSpec::new(WeightsSource::Dir(PathBuf::from(
+                    std::env::var("Z_IMAGE_TIER_DIR").expect("tier dir"),
+                ))),
+            )
+            .expect("load unadapted comparison generator");
+        let plain = generated_image(
+            plain_generator
+                .generate(&base_request, &mut |_| {})
+                .expect("generate unadapted comparison"),
+        );
+        let (maximum, mean) = mutation_metrics(&image, &plain);
+        eprintln!(
+            "ZIMAGE_MUTATION tier={tier} policy={policy_name} kind=lora_vs_plain max_rgb8={maximum} mean_rgb8={mean:.6}"
+        );
+        assert!(maximum > 0 && mean > 0.0, "LoRA adapter was ignored");
+    }
+
     probe.end_gen(generate_phase);
     let report = probe.report().assert_trustworthy(1.0);
-    let image = final_image.unwrap();
 
     for (repeat, phase, peak_gb) in phase_peaks {
         eprintln!(
