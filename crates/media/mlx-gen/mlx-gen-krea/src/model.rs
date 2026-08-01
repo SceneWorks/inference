@@ -1306,7 +1306,7 @@ mlx_gen::register_generators! {
 }
 
 macro_rules! memory_registration {
-    ($name:ident, $provider_id:expr) => {
+    ($name:ident, $behavior:ident, $provider_id:expr) => {
         pub const $name: mlx_gen::gen_core::MemoryRegistration =
             mlx_gen::gen_core::MemoryRegistration {
                 provider_id: $provider_id,
@@ -1315,13 +1315,38 @@ macro_rules! memory_registration {
                 },
                 safety_check: crate::block_memory_strategy::registered_safety_check,
             };
+        pub const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::block_memory_strategy::registered_valid_fixture,
+                begin_request: |spec, contract, context| {
+                    crate::block_memory_strategy::registered_begin_request(
+                        $provider_id,
+                        spec,
+                        contract,
+                        context,
+                    )
+                },
+            };
     };
 }
 
-memory_registration!(TURBO_MEMORY_REGISTRATION, KREA_2_TURBO_ID);
-memory_registration!(RAW_MEMORY_REGISTRATION, KREA_2_RAW_ID);
-memory_registration!(EDIT_MEMORY_REGISTRATION, KREA_2_EDIT_ID);
-memory_registration!(TURBO_EDIT_MEMORY_REGISTRATION, KREA_2_TURBO_EDIT_ID);
+memory_registration!(
+    TURBO_MEMORY_REGISTRATION,
+    TURBO_MEMORY_BEHAVIOR,
+    KREA_2_TURBO_ID
+);
+memory_registration!(RAW_MEMORY_REGISTRATION, RAW_MEMORY_BEHAVIOR, KREA_2_RAW_ID);
+memory_registration!(
+    EDIT_MEMORY_REGISTRATION,
+    EDIT_MEMORY_BEHAVIOR,
+    KREA_2_EDIT_ID
+);
+memory_registration!(
+    TURBO_EDIT_MEMORY_REGISTRATION,
+    TURBO_EDIT_MEMORY_BEHAVIOR,
+    KREA_2_TURBO_EDIT_ID
+);
 mlx_gen::register_generators! {
     pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw;
     footprint = component_footprint

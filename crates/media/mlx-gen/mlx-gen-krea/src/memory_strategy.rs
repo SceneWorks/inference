@@ -69,6 +69,7 @@ pub fn memory_strategy_contract(
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
         default_engagement_exclusions: Vec::new(),
+        resident_request_memory: mlx_gen::gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -128,26 +129,6 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
     }
 }
 
-pub fn generation_memory(
-    contract: &MemoryProviderContract,
-    strategy: &mlx_gen::gen_core::MemorySelection,
-) -> Option<GenerationMemory> {
-    if strategy.strategy == MemoryStrategy::Resident {
-        return None;
-    }
-    let bounded_decode = contract.engages(strategy.strategy, MemoryStrategy::BoundedDecode);
-    Some(GenerationMemory {
-        tile_vae_decode: bounded_decode,
-        decode_tile_edge: bounded_decode
-            .then_some(strategy.parameters.decode_tile_edge)
-            .flatten(),
-        decode_overlap: bounded_decode
-            .then_some(strategy.parameters.decode_overlap)
-            .flatten(),
-        ..Default::default()
-    })
-}
-
 pub fn safety_check(
     contract: &MemoryProviderContract,
     precision: mlx_gen::Precision,
@@ -201,12 +182,74 @@ pub fn registered_safety_check(
     }
 }
 
+pub fn registered_valid_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let quant = crate::model::effective_base_quant_tier(spec, &contract.provider_id)?;
+    let context = mlx_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: spec.precision,
+            quant,
+            component_precision_floors: &[],
+        },
+        mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: mlx_gen::gen_core::MemoryMode::ImageToImage,
+            has_reference: true,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some("pose-control".to_owned()),
+        },
+    )?;
+    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+pub fn registered_begin_request(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        spec.precision,
+        crate::model::effective_base_quant_tier(spec, provider_id)?,
+        context,
+        weights_free_cleanup,
+    )
+}
+
 pub fn begin_request(
     provider_id: &'static str,
     contract: &MemoryProviderContract,
     precision: mlx_gen::Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        precision,
+        quant,
+        context,
+        mlx_cleanup,
+    )
+}
+
+fn begin_request_with_cleanup(
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+    precision: mlx_gen::Precision,
+    quant: Option<mlx_gen::Quant>,
+    context: &MemoryRunContext,
+    cleanup: fn() -> CoreResult<()>,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
@@ -217,7 +260,8 @@ pub fn begin_request(
         provider_id,
         decode_routes: decode_routes(provider_id)?,
         geometry: context.geometry,
-        memory: generation_memory(contract, &context.selection),
+        memory: contract.generation_memory(&context.selection),
+        cleanup,
         finished: false,
     })))
 }
@@ -227,6 +271,7 @@ struct KreaControlMemoryScope {
     decode_routes: mlx_gen_pid::DecodeRoutes,
     geometry: MemoryGeometry,
     memory: Option<GenerationMemory>,
+    cleanup: fn() -> CoreResult<()>,
     finished: bool,
 }
 
@@ -243,13 +288,22 @@ impl KreaControlMemoryScope {
     }
 
     fn synchronize_and_release(&mut self) -> CoreResult<()> {
-        let barrier = mlx_rs::Array::from(0.0_f32);
-        barrier.eval().map_err(mlx_gen::Error::from)?;
-        drop(barrier);
-        mlx_rs::memory::clear_cache();
+        (self.cleanup)()?;
         self.finished = true;
         Ok(())
     }
+}
+
+fn mlx_cleanup() -> CoreResult<()> {
+    let barrier = mlx_rs::Array::from(0.0_f32);
+    barrier.eval().map_err(mlx_gen::Error::from)?;
+    drop(barrier);
+    mlx_rs::memory::clear_cache();
+    Ok(())
+}
+
+fn weights_free_cleanup() -> CoreResult<()> {
+    Ok(())
 }
 
 impl MemoryRequestScope for KreaControlMemoryScope {

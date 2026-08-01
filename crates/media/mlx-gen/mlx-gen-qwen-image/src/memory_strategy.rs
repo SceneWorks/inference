@@ -180,8 +180,8 @@ pub fn memory_strategy_contract(
     let mut implemented_scratch = vec![(
         MemoryStrategy::BoundedDecode,
         MemoryParameterRanges {
-            decode_tile_edges: routes.native_edges().to_vec(),
-            decode_overlaps: vec![DECODE_OVERLAP],
+            decode_tile_edges: routes.published_edges(),
+            decode_overlaps: routes.published_overlaps(),
             ..Default::default()
         },
     )];
@@ -203,6 +203,16 @@ pub fn memory_strategy_contract(
         capability.support = MemoryStrategySupport::Implemented;
         capability.parameters = parameters;
     }
+    contract.pid_decode_routes = Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
+        native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+            tile_edges: routes.native_edges().to_vec(),
+            tile_overlap: DECODE_OVERLAP,
+        },
+        pid: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+            tile_edges: mlx_gen_pid::DecodeRoutes::pid_edges(),
+            tile_overlap: mlx_gen_pid::DecodeRoutes::pid_overlap(),
+        },
+    });
 
     if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
         let staged = contract
@@ -294,12 +304,102 @@ pub(crate) fn registered_safety_check(
     safety_check(contract, spec.precision, spec.quantize, context)
 }
 
+pub(crate) fn registered_valid_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let (mode, has_reference) = if contract.provider_id.ends_with("_edit") {
+        (mlx_gen::gen_core::MemoryMode::Edit, true)
+    } else if contract.provider_id.ends_with("_control") {
+        (mlx_gen::gen_core::MemoryMode::ImageToImage, true)
+    } else {
+        (mlx_gen::gen_core::MemoryMode::TextToImage, false)
+    };
+    let tier = MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    };
+    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
+        mode: mode.clone(),
+        has_reference,
+        use_pid,
+        has_phases: false,
+        overlay: None,
+    };
+    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
+        mlx_gen::gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            tier,
+            route(false),
+        )?,
+    )];
+    if contract.engages(strategy, MemoryStrategy::BoundedDecode) {
+        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
+            mlx_gen::gen_core::standard_memory_behavior_context(
+                contract,
+                strategy,
+                tier,
+                route(true),
+            )?,
+        ));
+    }
+    Ok(fixtures)
+}
+
+pub(crate) fn registered_begin_request(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        spec.precision,
+        spec.quantize,
+        context,
+        weights_free_cleanup,
+    )
+}
+
+#[cfg(test)]
+fn qwen_generation_memory(
+    contract: &MemoryProviderContract,
+    selection: &mlx_gen::gen_core::MemorySelection,
+) -> Option<GenerationMemory> {
+    contract.generation_memory(selection)
+}
+
 pub(crate) fn begin_request(
     provider_id: &'static str,
     contract: &MemoryProviderContract,
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        precision,
+        quant,
+        context,
+        mlx_cleanup,
+    )
+}
+
+fn begin_request_with_cleanup(
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+    precision: Precision,
+    quant: Option<mlx_gen::Quant>,
+    context: &MemoryRunContext,
+    cleanup: fn() -> CoreResult<()>,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
@@ -309,7 +409,7 @@ pub(crate) fn begin_request(
     Ok(Some(Box::new(QwenMemoryScope {
         provider_id,
         decode_routes: decode_routes(provider_id)?,
-        memory: qwen_generation_memory(contract, &context.selection),
+        memory: contract.generation_memory(&context.selection),
         geometry: context.geometry,
         use_pid: context.use_pid,
         transformer_window: contract
@@ -319,43 +419,9 @@ pub(crate) fn begin_request(
             )
             .then_some(context.selection.parameters.transformer_window_size)
             .flatten(),
+        cleanup,
         finished: false,
     })))
-}
-
-pub(crate) fn qwen_generation_memory(
-    contract: &MemoryProviderContract,
-    selection: &mlx_gen::gen_core::MemorySelection,
-) -> Option<GenerationMemory> {
-    if selection.strategy == MemoryStrategy::Resident {
-        return None;
-    }
-    let parameters = selection.parameters;
-    let stage_residency = contract.engages(selection.strategy, MemoryStrategy::StagedResidency);
-    let tile_vae_decode = contract.engages(selection.strategy, MemoryStrategy::BoundedDecode);
-    let chunk_attention = contract.engages(selection.strategy, MemoryStrategy::BoundedAttention);
-    let stream_transformer_blocks = contract.engages(
-        selection.strategy,
-        MemoryStrategy::BoundedTransformerResidency,
-    );
-    Some(GenerationMemory {
-        stage_residency,
-        tile_vae_decode,
-        decode_tile_edge: tile_vae_decode
-            .then_some(parameters.decode_tile_edge)
-            .flatten(),
-        decode_overlap: tile_vae_decode
-            .then_some(parameters.decode_overlap)
-            .flatten(),
-        chunk_attention,
-        stream_transformer_blocks,
-        transformer_window_size: stream_transformer_blocks
-            .then_some(parameters.transformer_window_size)
-            .flatten(),
-        transformer_window_component: stream_transformer_blocks
-            .then(|| parameters.window_component()),
-        ..Default::default()
-    })
 }
 
 struct QwenMemoryScope {
@@ -365,22 +431,44 @@ struct QwenMemoryScope {
     geometry: MemoryGeometry,
     use_pid: bool,
     transformer_window: Option<u32>,
+    cleanup: fn() -> CoreResult<()>,
     finished: bool,
 }
 
 impl QwenMemoryScope {
+    fn ensure_active(&self) -> CoreResult<()> {
+        if self.finished {
+            Err(CoreError::Msg(format!(
+                "{}: memory-strategy request scope is already finished",
+                self.provider_id
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn finish_inner(&mut self) -> CoreResult<()> {
-        let barrier = mlx_rs::Array::from(0.0_f32);
-        barrier.eval().map_err(mlx_gen::Error::from)?;
-        drop(barrier);
-        mlx_rs::memory::clear_cache();
+        (self.cleanup)()?;
         self.finished = true;
         Ok(())
     }
 }
 
+fn mlx_cleanup() -> CoreResult<()> {
+    let barrier = mlx_rs::Array::from(0.0_f32);
+    barrier.eval().map_err(mlx_gen::Error::from)?;
+    drop(barrier);
+    mlx_rs::memory::clear_cache();
+    Ok(())
+}
+
+fn weights_free_cleanup() -> CoreResult<()> {
+    Ok(())
+}
+
 impl MemoryRequestScope for QwenMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
+        self.ensure_active()?;
         if request.use_pid != self.use_pid {
             return Err(CoreError::Unsupported(format!(
                 "{}: request use_pid={} does not match admitted use_pid={}",
@@ -408,10 +496,10 @@ impl MemoryRequestScope for QwenMemoryScope {
     }
 
     fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        Ok(())
+        self.ensure_active()
     }
     fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        Ok(())
+        self.ensure_active()
     }
 
     fn configure_decode(
@@ -420,12 +508,14 @@ impl MemoryRequestScope for QwenMemoryScope {
         overlap: u32,
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
+        self.ensure_active()?;
         self.decode_routes
             .validate(self.use_pid, Some(tile_edge), Some(overlap))
             .map_err(CoreError::Unsupported)
     }
 
     fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
+        self.ensure_active()?;
         if chunk_size == ATTENTION_CHUNK_SIZE {
             Ok(())
         } else {
@@ -441,6 +531,7 @@ impl MemoryRequestScope for QwenMemoryScope {
         first_block: u32,
         block_count: u32,
     ) -> CoreResult<()> {
+        self.ensure_active()?;
         if self.transformer_window != Some(TRANSFORMER_WINDOW_SIZE)
             || block_count != TRANSFORMER_WINDOW_SIZE
             || first_block >= TRANSFORMER_BLOCKS
@@ -454,6 +545,7 @@ impl MemoryRequestScope for QwenMemoryScope {
     }
 
     fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
+        self.ensure_active()?;
         self.finish_inner()
     }
 }
@@ -485,8 +577,21 @@ mod tests {
         assert!(contract.conformance_errors().is_empty());
         let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert_eq!(decode.support, MemoryStrategySupport::Implemented);
-        assert_eq!(decode.parameters.decode_tile_edges, DECODE_TILE_EDGES);
-        assert_eq!(decode.parameters.decode_overlaps, vec![DECODE_OVERLAP]);
+        let routes = decode_routes("qwen_image").unwrap();
+        assert_eq!(
+            decode.parameters.decode_tile_edges,
+            routes.published_edges()
+        );
+        assert_eq!(
+            decode.parameters.decode_overlaps,
+            routes.published_overlaps()
+        );
+        let declared_routes = contract.pid_decode_routes.as_ref().unwrap();
+        assert_eq!(declared_routes.native.tile_edges, DECODE_TILE_EDGES);
+        assert_eq!(
+            declared_routes.pid.tile_edges,
+            mlx_gen_pid::DecodeRoutes::pid_edges()
+        );
         let attention = contract
             .capability(MemoryStrategy::BoundedAttention)
             .unwrap();

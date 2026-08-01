@@ -624,6 +624,14 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
         contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
         safety_check: crate::memory_strategy::registered_safety_check,
     };
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 mod tests {
