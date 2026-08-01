@@ -728,12 +728,15 @@ fn request_context_error(
     } else {
         MemoryMode::TextToImage
     };
-    if context.mode != expected_mode {
-        return Some(format!(
-            "{provider_id}: request mode {:?} does not match {expected_mode:?}",
-            context.mode
-        ));
-    }
+    let route_gate = || {
+        if context.mode != expected_mode {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: request mode {:?} does not match {expected_mode:?}",
+                context.mode
+            )));
+        }
+        Ok(())
+    };
     if let MemorySafetyDecision::Reject { reason } =
         mlx_gen::gen_core::standard_memory_strategy_safety_check(
             contract,
@@ -743,7 +746,7 @@ fn request_context_error(
                 quant: tier,
                 component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
             }),
-            None,
+            Some(&route_gate),
         )
     {
         return Some(reason);
@@ -1236,6 +1239,7 @@ mod tests {
 
         let mut wrong_identity = valid.clone();
         wrong_identity.calibration_fingerprint = "stale".to_owned();
+        wrong_identity.mode = MemoryMode::Edit;
         assert!(request_context_error(
             "mage_flow",
             MageVariant::Rl,
@@ -1245,6 +1249,19 @@ mod tests {
         )
         .unwrap()
         .contains("calibration handshake mismatch"));
+
+        let mut wrong_tier_and_mode = valid.clone();
+        wrong_tier_and_mode.selection.tier.quant = Some(Quant::Q8);
+        wrong_tier_and_mode.mode = MemoryMode::Edit;
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &wrong_tier_and_mode
+        )
+        .unwrap()
+        .contains("does not match loaded tier"));
 
         let mut zero_zero = valid.clone();
         zero_zero.budget.total_bytes = 0;

@@ -377,29 +377,26 @@ pub(crate) fn validate_context(
     {
         return Err(gen_core::Error::Unsupported(reason));
     }
+    if context.has_phases {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
+        )));
+    }
+    if context.use_pid && context.selection.strategy.is_optimized() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: PiD uses an alternate decode planner and cannot consume this native-VAE \
+             memory selection"
+        )));
+    }
     Ok(())
 }
 
 pub(crate) fn safety_check(
-    provider_id: &str,
+    _provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if context.has_phases {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
-            )));
-        }
-        if context.use_pid && context.selection.strategy.is_optimized() {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: PiD uses an alternate decode planner and cannot consume this \
-                 native-VAE memory selection"
-            )));
-        }
-        Ok(())
-    };
     gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
@@ -408,7 +405,7 @@ pub(crate) fn safety_check(
             quant: loaded_quant,
             component_precision_floors: &[],
         }),
-        Some(&route_gate),
+        None,
     )
 }
 
@@ -597,6 +594,40 @@ mod tests {
     }
 
     #[test]
+    fn tier_admission_does_not_advance_phase_or_pid_policy_beyond_begin_request() {
+        let spec = spec();
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+
+        let mut phases = context(&contract);
+        phases.has_phases = true;
+        assert_eq!(
+            safety_check(crate::MODEL_ID, &contract, &phases, None),
+            MemorySafetyDecision::Accept,
+            "loaded-generator admission is tier-only until sc-16600"
+        );
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &phases),
+            MemorySafetyDecision::Accept,
+            "weights-free admission is tier-only until sc-16600"
+        );
+        let error = validate_context(crate::MODEL_ID, &contract, &phases, None).unwrap_err();
+        assert!(error.to_string().contains("multi-phase"));
+
+        let mut pid = context(&contract);
+        pid.use_pid = true;
+        assert_eq!(
+            safety_check(crate::MODEL_ID, &contract, &pid, None),
+            MemorySafetyDecision::Accept
+        );
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &pid),
+            MemorySafetyDecision::Accept
+        );
+        let error = validate_context(crate::MODEL_ID, &contract, &pid, None).unwrap_err();
+        assert!(error.to_string().contains("PiD"));
+    }
+
+    #[test]
     fn packed_q4_and_q8_snapshots_bind_weights_free_admission_to_the_detected_tier() {
         for (bits, actual, wrong) in [
             (4, Quant::Q4, Some(Quant::Q8)),
@@ -611,21 +642,39 @@ mod tests {
             )
             .unwrap();
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-            let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
-            let mut actual_context = context(&contract);
-            actual_context.selection.tier.quant = Some(actual);
-            assert_eq!(
-                registered_safety_check(&spec, &contract, &actual_context),
-                MemorySafetyDecision::Accept
-            );
-            for selected in [None, wrong] {
-                let mut wrong_context = context(&contract);
-                wrong_context.selection.tier.quant = selected;
-                assert!(matches!(
-                    registered_safety_check(&spec, &contract, &wrong_context),
-                    MemorySafetyDecision::Reject { reason }
-                        if reason.contains("does not match loaded tier")
-                ));
+            for (provider_id, control) in [
+                (crate::MODEL_ID, false),
+                (crate::base::MODEL_ID, false),
+                ("z_image_turbo_control", true),
+                ("z_image_control", true),
+            ] {
+                let contract = if control {
+                    control_contract(provider_id, &spec).unwrap()
+                } else {
+                    provider_contract(provider_id, &spec).unwrap()
+                };
+                let mut actual_context = context(&contract);
+                actual_context.selection.strategy = MemoryStrategy::Resident;
+                actual_context.selection.parameters = Default::default();
+                actual_context.selection.tier.quant = Some(actual);
+                assert_eq!(
+                    registered_safety_check(&spec, &contract, &actual_context),
+                    MemorySafetyDecision::Accept
+                );
+                for selected in [None, wrong] {
+                    let mut wrong_context = context(&contract);
+                    wrong_context.selection.tier.quant = selected;
+                    assert!(matches!(
+                        registered_safety_check(&spec, &contract, &wrong_context),
+                        MemorySafetyDecision::Reject { reason }
+                            if reason.contains("does not match loaded tier")
+                    ));
+                    assert!(matches!(
+                        safety_check(provider_id, &contract, &wrong_context, Some(actual)),
+                        MemorySafetyDecision::Reject { reason }
+                            if reason.contains("does not match loaded tier")
+                    ));
+                }
             }
             std::fs::remove_dir_all(root).ok();
         }
