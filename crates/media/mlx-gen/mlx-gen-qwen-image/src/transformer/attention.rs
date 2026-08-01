@@ -5,12 +5,13 @@
 //! [`AdaptableLinear`] (Q8-quantizable); the q/k RMSNorm weights stay dense.
 
 use mlx_rs::error::Exception;
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, split_sections, subtract};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -117,6 +118,35 @@ impl QwenJointAttention {
         txt_sin: &Array,
         mask: Option<&Array>,
     ) -> Result<(Array, Array)> {
+        self.forward_budgeted(
+            img,
+            txt,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// Joint attention with the shared request-scoped rung-3 query budget.
+    ///
+    /// The unbounded plan is the historical single fused-SDPA call. A constrained plan splits only
+    /// query rows, so every row still attends over the complete text+image key/value sequence and
+    /// preserves the same projections, RoPE, scale, mask, precision, and output split.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_budgeted(
+        &self,
+        img: &Array,
+        txt: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        plan: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         let (b, img_seq) = (img.shape()[0], img.shape()[1]);
         let txt_seq = txt.shape()[1];
         let (h, hd) = (self.num_heads, self.head_dim);
@@ -149,10 +179,7 @@ impl QwenJointAttention {
         let k = concatenate_axis(&[&txt_k, &img_k], 1)?.transpose_axes(&[0, 2, 1, 3])?;
         let v = concatenate_axis(&[&txt_v, &img_v], 1)?.transpose_axes(&[0, 2, 1, 3])?;
 
-        let o = match mask {
-            Some(m) => scaled_dot_product_attention(&q, &k, &v, self.scale, m, None)?,
-            None => scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?,
-        };
+        let o = sdpa_budgeted_bhsd(&q, &k, &v, self.scale, mask, plan)?;
         let joint = txt_seq + img_seq;
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?

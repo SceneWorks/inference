@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 use mlx_gen_mage::convert::{prequantize_shared_components, prequantize_variant_tier};
 use mlx_gen_mage::{MageComponentDirs, MageFlowPipeline};
 
+#[path = "../../tests/support/atomic_cache.rs"]
+#[allow(dead_code)] // this cache has no symlink components
+mod atomic_cache;
+
 fn env_dir(key: &str) -> Option<PathBuf> {
     std::env::var(key)
         .ok()
@@ -52,18 +56,21 @@ fn ensure_trees() -> (PathBuf, PathBuf) {
     // caller did not pre-build a full tree. `bf16` is skipped here: it is a byte-exact copy of the
     // dense snapshot, and the tests that want it tolerate its absence.
     for tier in ["q8", "q4"] {
-        if !tiers.join(tier).exists() {
-            prequantize_variant_tier(
-                &src,
-                &tiers.join(tier),
-                tier,
-                "SceneWorks/Mage-Flow-Components-mlx",
-            )
-            .expect("prequantize_variant_tier");
+        let variant = tiers.join(tier);
+        if !variant.exists() {
+            let staging =
+                atomic_cache::prepare_staging(&variant).expect("prepare variant tier staging dir");
+            prequantize_variant_tier(&src, &staging, tier, "SceneWorks/Mage-Flow-Components-mlx")
+                .expect("prequantize_variant_tier");
+            atomic_cache::publish(&staging, &variant).expect("publish variant tier");
         }
-        if !components.join(tier).exists() {
-            prequantize_shared_components(&src, &components.join(tier), tier)
+        let shared = components.join(tier);
+        if !shared.exists() {
+            let staging = atomic_cache::prepare_staging(&shared)
+                .expect("prepare shared components staging dir");
+            prequantize_shared_components(&src, &staging, tier)
                 .expect("prequantize_shared_components");
+            atomic_cache::publish(&staging, &shared).expect("publish shared components");
         }
     }
     (tiers, components)

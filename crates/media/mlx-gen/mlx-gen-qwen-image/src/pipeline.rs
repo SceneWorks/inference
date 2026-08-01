@@ -11,9 +11,11 @@ use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtr
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
@@ -155,11 +157,17 @@ pub fn encode_prompt(
 /// returns its packed final latents; this helper handles the seed sequence, the `Decoding` progress
 /// tick, unpack + decode, and image collection identically for every variant.
 ///
-/// `decoder` is the latent→pixel decode seam (sc-7844): the native [`QwenVae`] by default, or a PiD
-/// decoder for this latent space once wired (sc-7845). PiD output may be larger than VAE-native, so
-/// downstream size is taken from the decoded tensor, not assumed.
+/// `pid_decoder` is the optional latent→pixel decode seam (sc-7844). The native [`QwenVae`] remains
+/// explicit so the shared memory ladder can select its head-once/tail-tiled path without wrapping or
+/// changing the PiD route. PiD output may be larger than VAE-native, so downstream size is taken
+/// from the decoded tensor, not assumed.
+#[allow(clippy::too_many_arguments)] // One explicit, shared decode seam preserves all variant inputs.
 pub fn decode_and_collect<F>(
-    decoder: &dyn LatentDecoder,
+    vae: &QwenVae,
+    pid_decoder: Option<&dyn LatentDecoder>,
+    tiling: Option<&TilingConfig>,
+    req: &GenerationRequest,
+    model_id: &str,
     count: u32,
     base_seed: u64,
     width: u32,
@@ -176,10 +184,64 @@ where
         let latents = denoise_one(seed, on_progress)?;
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latents, width, height)?;
-        let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+        let decoded = match (pid_decoder, tiling) {
+            (Some(pid), _) => pid.decode(&unpacked)?,
+            (None, Some(cfg)) => vae.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
+            (None, None) => vae.decode(&unpacked)?,
+        }
+        .as_dtype(Dtype::Float32)?;
+        // Fire the conformance fault only after the selected decoder (including every native VAE
+        // tile) has executed. This makes the propagated error exercise the same residency cleanup
+        // path as a real decoder failure instead of failing before the rung begins.
+        calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, model_id)?;
         images.push(decoded_to_image(&decoded)?);
     }
     Ok(images)
+}
+
+/// Request-local calibration fault at a completed physical phase boundary. Production requests
+/// leave the hidden selector field unset; conformance runs call this only after the selected phase
+/// has executed so the propagated error proves residency cleanup and a warm follow-up without a
+/// process-global switch.
+pub(crate) fn calibration_fault(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::MemoryPhase,
+    model_id: &str,
+) -> Result<()> {
+    match req.memory {
+        Some(memory) if memory.calibration_error_phase == Some(phase) => Err(Error::Msg(format!(
+            "{model_id}: injected memory-strategy calibration error at {phase:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Resolve the native Qwen VAE tile geometry selected by the shared ladder.
+///
+/// This is intentionally request-scoped. A warm generator cannot inherit a prior request's tile
+/// edge or overlap, and PiD remains a distinct decoder with its own geometry rather than silently
+/// receiving a Qwen-VAE tile.
+pub(crate) fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
+    req.memory
+        .filter(|memory| memory.tile_vae_decode)
+        .map(|memory| {
+            TilingConfig::spatial_only(
+                memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE) as i32,
+                memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP) as i32,
+            )
+        })
+}
+
+/// The request-scoped rung-3 budget. Unselected requests retain the historical one-call SDPA path.
+pub(crate) fn attention_budget(req: &GenerationRequest) -> AttentionBudget {
+    match req.memory {
+        Some(memory) if memory.chunk_attention => AttentionBudget::CONSTRAINED,
+        _ => AttentionBudget::UNBOUNDED,
+    }
 }
 
 /// The PiD backbone (latent-space) tag for the Qwen-Image VAE — shared by all three Qwen generators
@@ -411,6 +473,7 @@ pub fn denoise_with_progress(
         width,
         height,
         start_step,
+        AttentionBudget::UNBOUNDED,
         None,
         cancel,
         on_progress,
@@ -430,6 +493,7 @@ pub(crate) fn denoise_with_progress_windowed(
     width: u32,
     height: u32,
     start_step: usize,
+    attention_budget: AttentionBudget,
     window_size: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
@@ -441,6 +505,7 @@ pub(crate) fn denoise_with_progress_windowed(
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;
+    let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
@@ -453,6 +518,7 @@ pub(crate) fn denoise_with_progress_windowed(
             lh,
             lw,
             &[],
+            attention,
             block_window,
         )?;
         match neg_embeds {
@@ -465,6 +531,7 @@ pub(crate) fn denoise_with_progress_windowed(
                     lh,
                     lw,
                     &[],
+                    attention,
                     block_window,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)
@@ -527,6 +594,7 @@ pub fn denoise_control_with_progress(
         control_scale,
         width,
         height,
+        AttentionBudget::UNBOUNDED,
         None,
         cancel,
         on_progress,
@@ -548,6 +616,7 @@ pub(crate) fn denoise_control_with_progress_windowed(
     control_scale: f32,
     width: u32,
     height: u32,
+    attention_budget: AttentionBudget,
     window_size: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
@@ -557,6 +626,7 @@ pub(crate) fn denoise_control_with_progress_windowed(
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;
+    let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     // Each step runs the base forward with the VACE control branch + the (constant) 132-ch control
     // context injected, scaled by `control_scale` (`= 0` reproduces base T2I). Under true CFG the
     // control forward runs once per guidance branch. Control is pose-only T2I (no img2img-with-control
@@ -572,6 +642,7 @@ pub(crate) fn denoise_control_with_progress_windowed(
             &[],
             Some((controlnet, control_cond)),
             control_scale,
+            attention,
             block_window,
         )?;
         match neg_embeds {
@@ -586,6 +657,7 @@ pub(crate) fn denoise_control_with_progress_windowed(
                     &[],
                     Some((controlnet, control_cond)),
                     control_scale,
+                    attention,
                     block_window,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)
@@ -645,6 +717,7 @@ pub fn denoise_edit_with_progress(
         guidance,
         width,
         height,
+        AttentionBudget::UNBOUNDED,
         None,
         cancel,
         on_progress,
@@ -665,6 +738,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     guidance: f32,
     width: u32,
     height: u32,
+    attention_budget: AttentionBudget,
     window_size: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
@@ -674,6 +748,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;
+    let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     // Each step concatenates the noise latents with the (static) packed reference latents so the RoPE
     // spans `[noise] + references`, then slices the velocity back to the noise prefix. `None` joint
     // mask (as in T2I): the spliced prompt embeds are full-valid.
@@ -689,6 +764,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
                 lh,
                 lw,
                 cond_grids,
+                attention,
                 block_window,
             )?,
             noise_seq,
@@ -704,6 +780,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
                         lh,
                         lw,
                         cond_grids,
+                        attention,
                         block_window,
                     )?,
                     noise_seq,
@@ -883,6 +960,97 @@ mod tests {
             rp.guidance, DEFAULT_GUIDANCE,
             "both unset falls back to DEFAULT_GUIDANCE"
         );
+    }
+
+    #[test]
+    fn request_memory_selects_exact_native_decode_geometry() {
+        let none = GenerationRequest::default();
+        assert!(decode_tiling(&none).is_none());
+
+        let selected = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(384),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spatial = decode_tiling(&selected).unwrap().spatial.unwrap();
+        assert_eq!(spatial.tile_px, 384);
+        assert_eq!(spatial.overlap_px, 64);
+
+        let defaults = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spatial = decode_tiling(&defaults).unwrap().spatial.unwrap();
+        assert_eq!(
+            spatial.tile_px,
+            crate::memory_strategy::DECODE_TILE_EDGE as i32
+        );
+        assert_eq!(
+            spatial.overlap_px,
+            crate::memory_strategy::DECODE_OVERLAP as i32
+        );
+    }
+
+    #[test]
+    fn attention_budget_is_request_scoped() {
+        assert_eq!(
+            attention_budget(&GenerationRequest::default()).max_score_elements(),
+            u64::MAX
+        );
+        let selected = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            attention_budget(&selected).max_score_elements(),
+            mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET
+        );
+        assert!(attention_budget(&selected).eval_per_chunk());
+    }
+
+    #[test]
+    fn calibration_fault_is_request_local_and_phase_exact() {
+        let plain = GenerationRequest::default();
+        for phase in [
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            mlx_gen::gen_core::MemoryPhase::Denoise,
+            mlx_gen::gen_core::MemoryPhase::Decode,
+        ] {
+            assert!(calibration_fault(&plain, phase, "qwen_image").is_ok());
+        }
+
+        let injected = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Denoise),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(calibration_fault(
+            &injected,
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            "qwen_image"
+        )
+        .is_ok());
+        let error = calibration_fault(
+            &injected,
+            mlx_gen::gen_core::MemoryPhase::Denoise,
+            "qwen_image",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("qwen_image"));
+        assert!(error.contains("Denoise"));
     }
 
     #[test]

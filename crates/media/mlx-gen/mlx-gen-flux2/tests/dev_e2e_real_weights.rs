@@ -22,6 +22,9 @@ use mlx_gen::media::Image;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_flux2::{quantize_flux2_dit, quantize_flux2_text_encoder_dir};
 
+#[path = "../../tests/support/atomic_cache.rs"]
+mod atomic_cache;
+
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
 
@@ -42,31 +45,27 @@ fn prequantized_dev_snapshot() -> PathBuf {
         .exists()
     {
         println!("pre-quantizing dev DiT → Q{BITS}…");
-        quantize_flux2_dit(
-            &src.join("transformer"),
-            &dst.join("transformer"),
-            BITS,
-            GROUP_SIZE,
-        )
-        .expect("pre-quantize dev DiT");
+        let final_dir = dst.join("transformer");
+        let staging =
+            atomic_cache::prepare_staging(&final_dir).expect("prepare dev DiT staging dir");
+        quantize_flux2_dit(&src.join("transformer"), &staging, BITS, GROUP_SIZE)
+            .expect("pre-quantize dev DiT");
+        atomic_cache::publish(&staging, &final_dir).expect("publish dev DiT");
     }
     if !dst.join("text_encoder/model.safetensors").exists() {
         println!("pre-quantizing dev Mistral TE → Q{BITS}…");
-        quantize_flux2_text_encoder_dir(
-            &src.join("text_encoder"),
-            &dst.join("text_encoder"),
-            BITS,
-            GROUP_SIZE,
-        )
-        .expect("pre-quantize dev TE");
+        let final_dir = dst.join("text_encoder");
+        let staging =
+            atomic_cache::prepare_staging(&final_dir).expect("prepare dev TE staging dir");
+        quantize_flux2_text_encoder_dir(&src.join("text_encoder"), &staging, BITS, GROUP_SIZE)
+            .expect("pre-quantize dev TE");
+        atomic_cache::publish(&staging, &final_dir).expect("publish dev TE");
     }
     // VAE (dense, identical to klein) + tokenizer: symlink straight from the source snapshot.
     for sub in ["vae", "tokenizer"] {
         let link = dst.join(sub);
-        if !link.exists() {
-            std::os::unix::fs::symlink(std::fs::canonicalize(src.join(sub)).unwrap(), &link)
-                .expect("symlink component");
-        }
+        let source = std::fs::canonicalize(src.join(sub)).expect("canonicalize component");
+        atomic_cache::symlink_or_reuse(&source, &link).expect("publish component symlink");
     }
     dst
 }

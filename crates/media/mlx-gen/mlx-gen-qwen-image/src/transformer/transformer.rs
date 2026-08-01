@@ -13,6 +13,7 @@ use mlx_rs::Array;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::host_i32;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -232,6 +233,7 @@ impl QwenTransformer {
             cond_grids,
             None,
             0.0,
+            AttentionPlan::UNBOUNDED,
             None,
         )
     }
@@ -246,6 +248,7 @@ impl QwenTransformer {
         latent_h: usize,
         latent_w: usize,
         cond_grids: &[(usize, usize)],
+        attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
         self.forward_control_windowed(
@@ -258,6 +261,7 @@ impl QwenTransformer {
             cond_grids,
             None,
             0.0,
+            attention,
             window,
         )
     }
@@ -292,6 +296,7 @@ impl QwenTransformer {
             cond_grids,
             control,
             control_scale,
+            AttentionPlan::UNBOUNDED,
             None,
         )
     }
@@ -308,6 +313,7 @@ impl QwenTransformer {
         cond_grids: &[(usize, usize)],
         control: Option<(&QwenFunControlBranch, &Array)>,
         control_scale: f32,
+        attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
         let b = hidden_states.shape()[0];
@@ -386,7 +392,7 @@ impl QwenTransformer {
                 let mut encoder = encoder;
                 let mut hidden = hidden;
                 for (i, block) in self.blocks.iter().enumerate() {
-                    let (e, h) = block.forward(
+                    let (e, h) = block.forward_budgeted(
                         &hidden,
                         &encoder,
                         &text_emb,
@@ -396,6 +402,7 @@ impl QwenTransformer {
                         &txt_sin,
                         mask.as_ref(),
                         modulate_index.as_ref(),
+                        attention,
                     )?;
                     encoder = e;
                     hidden = apply_hint(h, i)?;
@@ -426,7 +433,7 @@ impl QwenTransformer {
                     |(mut encoder, mut hidden), view, range| {
                         for i in range {
                             let block = stream.materialize(view, i)?;
-                            let (e, h) = block.forward(
+                            let (e, h) = block.forward_budgeted(
                                 &hidden,
                                 &encoder,
                                 &text_emb,
@@ -436,6 +443,7 @@ impl QwenTransformer {
                                 &txt_sin,
                                 mask.as_ref(),
                                 modulate_index.as_ref(),
+                                attention,
                             )?;
                             encoder = e;
                             hidden = apply_hint(h, i)?;
