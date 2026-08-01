@@ -119,6 +119,7 @@ pub struct ZImageTurbo {
     /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
     /// Request-scoped component residency (SC-15806). Construction retains the two phase loaders;
     /// each request either populates/reuses one warm pair or runs encode → drop text → load heavy →
     /// denoise/decode according to [`GenerationMemory::stage_residency`](gen_core::GenerationMemory).
@@ -199,6 +200,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         tokenizer,
         residency,
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        loaded_tier: crate::memory_strategy::loaded_tier(spec),
     }))
 }
 
@@ -252,6 +254,11 @@ fn build_comfyui_generator(
                 "comfyui-in-place",
             ))),
         )?,
+        loaded_tier: mlx_gen::gen_core::MemoryNumericTier {
+            precision: mlx_gen::Precision::Bf16,
+            quant: None,
+            component_precision_floors: &[],
+        },
         residency: Residency::request_scoped(
             move |streamable| {
                 if streamable {
@@ -513,14 +520,19 @@ impl Generator for ZImageTurbo {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_tier, context)
     }
 
     fn begin_memory_strategy_request(
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.loaded_tier,
+            context,
+        )
     }
 }
 

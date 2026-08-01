@@ -6,7 +6,7 @@
 //! provider-specific tier or fit fork.
 
 use mlx_gen::gen_core::{
-    default_memory_strategy_safety_check, safetensors_path_bytes, LoadShape, LoadSpec,
+    safetensors_path_bytes, standard_memory_strategy_safety_check, LoadShape, LoadSpec,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryMode, MemoryNumericTier, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision,
     MemoryStrategy, MemoryStrategySupport, Quant, WeightsSource,
@@ -70,26 +70,6 @@ pub fn safety_check(
             ),
         };
     }
-    let Some(calibration) = &contract.calibration else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{FLUX2_DEV_EDIT_ID}: memory calibration is missing"),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{FLUX2_DEV_EDIT_ID}: memory calibration identity does not match"),
-        };
-    }
-    if context.selection.tier != expected_tier {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{FLUX2_DEV_EDIT_ID}: memory-safety context tier {:?} does not match the loaded tier {:?}",
-                context.selection.tier, expected_tier
-            ),
-        };
-    }
     let reference_count = context
         .overlay
         .as_deref()
@@ -145,7 +125,12 @@ pub fn safety_check(
     };
     let mut provider_context = context.clone();
     provider_context.predicted_peak_bytes = predicted_peak_bytes;
-    match default_memory_strategy_safety_check(contract, &provider_context) {
+    match standard_memory_strategy_safety_check(
+        contract,
+        &provider_context,
+        Some(expected_tier),
+        None,
+    ) {
         MemorySafetyDecision::Accept => MemorySafetyDecision::Accept,
         MemorySafetyDecision::Reject { .. } => {
             let gib = 1024.0 * 1024.0 * 1024.0;

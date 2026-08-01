@@ -8,9 +8,10 @@
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
@@ -260,59 +261,29 @@ pub(crate) fn safety_check(
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: no calibration identity declared", contract.provider_id),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: calibration handshake mismatch", contract.provider_id),
-        };
-    }
-    if context.selection.tier.precision != precision || context.selection.tier.quant != quant {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: request tier {:?} does not match loaded {precision:?}/{quant:?}",
-                contract.provider_id, context.selection.tier
-            ),
-        };
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
-    }
-    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-        let routes = match decode_routes(&contract.provider_id) {
-            Ok(routes) => routes,
-            Err(error) => {
-                return MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
-            }
-        };
-        if let Err(reason) = routes.validate(
-            context.use_pid,
-            context.selection.parameters.decode_tile_edge,
-            context.selection.parameters.decode_overlap,
-        ) {
-            return MemorySafetyDecision::Reject { reason };
+    let route_gate = || {
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+            let routes = decode_routes(&contract.provider_id)?;
+            routes
+                .validate(
+                    context.use_pid,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                )
+                .map_err(CoreError::Unsupported)?;
         }
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
-                contract.provider_id,
-                context.predicted_peak_bytes,
-                context.budget.effective_bytes()
-            ),
-        };
-    }
-    MemorySafetyDecision::Accept
+        Ok(())
+    };
+    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision,
+            quant,
+            component_precision_floors: &[],
+        }),
+        Some(&route_gate),
+    )
 }
 
 pub(crate) fn registered_safety_check(

@@ -1396,28 +1396,70 @@ fn validate_pid_decode_routes(
     }
 }
 
-/// The shared safety behavior for an adopted provider with no additional admission rules.
+/// The shared safety pipeline for an adopted provider.
 ///
-/// Provider registrations can point at this function without loading a [`Generator`](crate::Generator).
-/// Providers with extra safety rules expose their own function with the same signature.
-pub fn default_memory_strategy_safety_check(
+/// `loaded_tier` binds a weights-free registration or loaded generator to the numeric tier it
+/// actually loaded. `route_gate` is the only provider-owned part of the standard pipeline and runs
+/// after the shared handshake, tier, and selection checks but before the shared budget check.
+pub fn standard_memory_strategy_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+    loaded_tier: Option<MemoryNumericTier>,
+    route_gate: Option<&dyn Fn() -> Result<()>>,
 ) -> MemorySafetyDecision {
-    match contract.validate_selection(&context.selection) {
-        Ok(()) if context.budget.fits(context.predicted_peak_bytes) => MemorySafetyDecision::Accept,
-        Ok(()) => MemorySafetyDecision::Reject {
+    let reject = |reason| MemorySafetyDecision::Reject { reason };
+    let Some(calibration) = contract.calibration.as_ref() else {
+        return reject(format!(
+            "{}: no calibration identity declared",
+            contract.provider_id
+        ));
+    };
+    if context.calibration_abi != calibration.abi
+        || context.calibration_fingerprint != calibration.fingerprint
+    {
+        return reject(format!(
+            "{}: calibration handshake mismatch",
+            contract.provider_id
+        ));
+    }
+    if let Some(loaded_tier) = loaded_tier {
+        if context.selection.tier != loaded_tier {
+            return reject(format!(
+                "{}: selected tier {:?} does not match loaded tier {:?}",
+                contract.provider_id, context.selection.tier, loaded_tier
+            ));
+        }
+    }
+    if let Err(error) = contract.validate_selection(&context.selection) {
+        return reject(error.to_string());
+    }
+    if let Some(route_gate) = route_gate {
+        if let Err(error) = route_gate() {
+            return reject(error.to_string());
+        }
+    }
+    if !context.budget.fits(context.predicted_peak_bytes) {
+        return MemorySafetyDecision::Reject {
             reason: format!(
                 "{}: predicted peak {} exceeds effective budget {}",
                 contract.provider_id,
                 context.predicted_peak_bytes,
                 context.budget.effective_bytes()
             ),
-        },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        };
     }
+    MemorySafetyDecision::Accept
+}
+
+/// The shared safety behavior for an adopted provider with no additional admission rules.
+///
+/// Provider registrations can point at this function without loading a [`Generator`](crate::Generator).
+/// Providers with extra safety rules delegate to [`standard_memory_strategy_safety_check`].
+pub fn default_memory_strategy_safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    standard_memory_strategy_safety_check(contract, context, None, None)
 }
 
 /// Registry adapter for [`default_memory_strategy_safety_check`].
@@ -2126,6 +2168,116 @@ mod tests {
             asset_facts: MemoryAssetFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
+    }
+
+    fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunContext {
+        let calibration = contract.calibration.as_ref().expect("calibration");
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 512,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn default_safety_check_rejects_mutated_calibration_handshake() {
+        let contract = adopted_contract();
+        let context = admitted_context(&contract);
+        assert_eq!(
+            default_memory_strategy_safety_check(&contract, &context),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut wrong_fingerprint = context.clone();
+        wrong_fingerprint.calibration_fingerprint.push_str("-stale");
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &wrong_fingerprint),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+
+        let mut wrong_abi = context;
+        wrong_abi.calibration_abi += 1;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &wrong_abi),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+    }
+
+    #[test]
+    fn standard_safety_check_runs_tier_route_and_budget_gates() {
+        let contract = adopted_contract();
+        let context = admitted_context(&contract);
+        let loaded_tier = context.selection.tier;
+        assert_eq!(
+            standard_memory_strategy_safety_check(&contract, &context, Some(loaded_tier), None),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut wrong_tier = context.clone();
+        wrong_tier.selection.tier.quant = Some(Quant::Q8);
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &wrong_tier,
+                Some(loaded_tier),
+                None
+            ),
+            MemorySafetyDecision::Reject { reason } if reason.contains("does not match loaded tier")
+        ));
+
+        let route_gate = || Err(Error::Unsupported("route refused".to_owned()));
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &context,
+                Some(loaded_tier),
+                Some(&route_gate)
+            ),
+            MemorySafetyDecision::Reject { reason } if reason.contains("route refused")
+        ));
+
+        let mut over_budget = context;
+        over_budget.predicted_peak_bytes = 1025;
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &over_budget,
+                Some(loaded_tier),
+                None
+            ),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("predicted peak 1025 exceeds effective budget 1024")
+        ));
     }
 
     fn pid_contract() -> MemoryProviderContract {

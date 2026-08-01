@@ -6,8 +6,8 @@
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
     MemoryStrategySupport, PerComponentBytes, Result as CoreResult,
 };
@@ -150,80 +150,62 @@ pub fn generation_memory(
 
 pub fn safety_check(
     contract: &MemoryProviderContract,
+    precision: mlx_gen::Precision,
+    quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: no calibration identity declared", contract.provider_id),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: calibration handshake mismatch", contract.provider_id),
-        };
-    }
-    // The Krea pose-control composition deliberately has no PiD decoder (its heavy bundle is the
-    // base VAE plus the pose branch). Reject the flag explicitly instead of letting the residency
-    // seam ignore it and execute a native decode under a PiD-labelled request.
-    if context.use_pid {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
+    let route_gate = || {
+        // The Krea pose-control composition deliberately has no PiD decoder (its heavy bundle is the
+        // base VAE plus the pose branch). Reject the flag explicitly instead of letting the residency
+        // seam ignore it and execute a native decode under a PiD-labelled request.
+        if context.use_pid {
+            return Err(CoreError::Unsupported(format!(
                 "{}: PiD decode is not implemented for pose control",
                 contract.provider_id
-            ),
-        };
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
-    }
-    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-        let routes = match decode_routes(&contract.provider_id) {
-            Ok(routes) => routes,
-            Err(error) => {
-                return MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
-            }
-        };
-        if let Err(reason) = routes.validate(
-            false,
-            context.selection.parameters.decode_tile_edge,
-            context.selection.parameters.decode_overlap,
-        ) {
-            return MemorySafetyDecision::Reject { reason };
+            )));
         }
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
-                contract.provider_id,
-                context.predicted_peak_bytes,
-                context.budget.effective_bytes()
-            ),
-        };
-    }
-    MemorySafetyDecision::Accept
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+            let routes = decode_routes(&contract.provider_id)?;
+            routes
+                .validate(
+                    false,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                )
+                .map_err(CoreError::Unsupported)?;
+        }
+        Ok(())
+    };
+    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision,
+            quant,
+            component_precision_floors: &[],
+        }),
+        Some(&route_gate),
+    )
 }
 
 pub fn registered_safety_check(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, context)
+    safety_check(contract, spec.precision, spec.quantize, context)
 }
 
 pub fn begin_request(
     provider_id: &'static str,
     contract: &MemoryProviderContract,
+    precision: mlx_gen::Precision,
+    quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, context) {
+    if let MemorySafetyDecision::Reject { reason } =
+        safety_check(contract, precision, quant, context)
+    {
         return Err(CoreError::Unsupported(reason));
     }
     Ok(Some(Box::new(KreaControlMemoryScope {
@@ -337,5 +319,60 @@ impl Drop for KreaControlMemoryScope {
         if !self.finished {
             let _ = self.synchronize_and_release();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::gen_core::{
+        MemoryBudget, MemoryCacheState, MemoryMode, MemorySelection, MemoryStrategyParameters,
+        Precision, Quant, WeightsSource,
+    };
+
+    #[test]
+    fn pose_control_rejects_a_selection_for_another_loaded_tier() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q4);
+        let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
+        let calibration = contract.calibration.as_ref().unwrap();
+        let context = MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q8),
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 512,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        };
+
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
     }
 }

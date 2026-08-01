@@ -370,23 +370,6 @@ pub(crate) fn validate_context(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: optimized memory selection requires a provider calibration identity"
-        )));
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: memory calibration identity mismatch (selected ABI {} fingerprint {:?}, \
-             provider ABI {} fingerprint {:?})",
-            context.calibration_abi,
-            context.calibration_fingerprint,
-            calibration.abi,
-            calibration.fingerprint
-        )));
-    }
     if let gen_core::MemorySafetyDecision::Reject { reason } =
         gen_core::default_memory_strategy_safety_check(contract, context)
     {

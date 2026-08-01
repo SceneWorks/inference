@@ -723,12 +723,6 @@ fn request_context_error(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> Option<String> {
-    if context.selection.tier.precision != Precision::Bf16 || context.selection.tier.quant != tier {
-        return Some(format!(
-            "{provider_id}: request tier {:?} does not match loaded BF16/{tier:?}",
-            context.selection.tier
-        ));
-    }
     let expected_mode = if variant.is_edit() {
         MemoryMode::Edit
     } else {
@@ -740,19 +734,19 @@ fn request_context_error(
             context.mode
         ));
     }
-    if context.calibration_abi != mlx_gen::gen_core::MEMORY_CALIBRATION_ABI
-        || context.calibration_fingerprint != MEMORY_CALIBRATION_FINGERPRINT
+    if let MemorySafetyDecision::Reject { reason } =
+        mlx_gen::gen_core::standard_memory_strategy_safety_check(
+            contract,
+            context,
+            Some(mlx_gen::gen_core::MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: tier,
+                component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+            }),
+            None,
+        )
     {
-        return Some(format!(
-            "{provider_id}: request calibration identity {}/{:?} does not match provider {}/{:?}",
-            context.calibration_abi,
-            context.calibration_fingerprint,
-            mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            MEMORY_CALIBRATION_FINGERPRINT
-        ));
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return Some(error.to_string());
+        return Some(reason);
     }
     if context.budget.total_bytes == 0 {
         return Some(format!("{provider_id}: request budget is unavailable"));
@@ -779,13 +773,6 @@ fn request_context_error(
             required_total_peak_bytes,
             maximum_resident_credit,
             context.budget.committed_bytes
-        ));
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return Some(format!(
-            "{provider_id}: predicted incremental peak {} exceeds effective budget {}",
-            context.predicted_peak_bytes,
-            context.budget.effective_bytes()
         ));
     }
     None
@@ -1236,7 +1223,7 @@ mod tests {
         assert!(matches!(
             registered,
             MemorySafetyDecision::Reject { reason }
-                if reason.contains("does not match loaded BF16/Some(Q8)")
+                if reason.contains("does not match loaded tier")
         ));
         assert!(request_context_error(
             "mage_flow",
@@ -1257,7 +1244,7 @@ mod tests {
             &wrong_identity
         )
         .unwrap()
-        .contains("calibration identity"));
+        .contains("calibration handshake mismatch"));
 
         let mut zero_zero = valid.clone();
         zero_zero.budget.total_bytes = 0;

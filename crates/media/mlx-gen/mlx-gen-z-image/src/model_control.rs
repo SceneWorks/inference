@@ -102,6 +102,7 @@ pub struct ZImageTurboControl {
     /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
     /// Request-scoped residency shared with the base control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
@@ -312,6 +313,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageTurboControl {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        loaded_tier: crate::memory_strategy::loaded_tier(spec),
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -532,14 +534,19 @@ impl Generator for ZImageTurboControl {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_tier, context)
     }
 
     fn begin_memory_strategy_request(
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.loaded_tier,
+            context,
+        )
     }
 }
 

@@ -62,6 +62,8 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct KreaTurboControl {
     descriptor: ModelDescriptor,
     memory_strategy: gen_core::MemoryProviderContract,
+    loaded_precision: Precision,
+    loaded_quant: Option<Quant>,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -143,6 +145,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             KREA_2_TURBO_CONTROL_ID,
             spec,
         )?,
+        loaded_precision: spec.precision,
+        loaded_quant: spec.quantize,
         residency: build_control_residency(spec)?,
     }))
 }
@@ -442,7 +446,12 @@ impl Generator for KreaTurboControl {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.loaded_precision,
+            self.loaded_quant,
+            context,
+        )
     }
 
     fn begin_memory_strategy_request(
@@ -452,6 +461,8 @@ impl Generator for KreaTurboControl {
         crate::memory_strategy::begin_request(
             KREA_2_TURBO_CONTROL_ID,
             &self.memory_strategy,
+            self.loaded_precision,
+            self.loaded_quant,
             context,
         )
     }
