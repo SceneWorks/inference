@@ -86,6 +86,33 @@ use crate::common::{self, ResizePolicy};
 use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
 use crate::packed_te::ZImageTextEncoder as PackedTe;
 
+/// Read a component's packed descriptor without constructing a pipeline. Registry admission and
+/// lazy generators use this same source of truth as component loading, so a tier-specific snapshot
+/// cannot be mislabeled from `LoadSpec::quantize` (which Z-Image deliberately forbids).
+pub(crate) fn packed_config_at(
+    root: &Path,
+    sub: &str,
+) -> Result<Option<candle_gen::quant::PackedConfig>> {
+    let path = root.join(sub).join("config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CandleError::Msg(format!(
+                "z-image: read {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        CandleError::Msg(format!(
+            "z-image: parse {} (corrupt snapshot?): {error}",
+            path.display()
+        ))
+    })?;
+    Ok(candle_gen::quant::PackedConfig::from_config(&value))
+}
+
 /// The DiT, loaded **dense** (the stock `candle-transformers` model — a dense bf16 tier or the
 /// adapter-merged path) or **packed** (the vendored [`PackedDit`] built straight from an MLX-packed tier
 /// — sc-9408). Both expose the same `forward(x, t, cap_feats, cap_mask)` → raw velocity, so the render
@@ -727,27 +754,7 @@ impl Pipeline {
         &self,
         sub: &str,
     ) -> Result<Option<candle_gen::quant::PackedConfig>> {
-        let path = self.root.join(sub).join("config.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            // No config.json at all → legitimate dense / fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            // Present but unreadable (permissions, partial download) → surface, don't swallow.
-            Err(e) => {
-                return Err(CandleError::Msg(format!(
-                    "z-image: read {}: {e}",
-                    path.display()
-                )))
-            }
-        };
-        // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            CandleError::Msg(format!(
-                "z-image: parse {} (corrupt snapshot?): {e}",
-                path.display()
-            ))
-        })?;
-        Ok(candle_gen::quant::PackedConfig::from_config(&v))
+        packed_config_at(&self.root, sub)
     }
 
     /// Build a VAE [`VarBuilder`] for a **packed** tier by dequantizing the 8 packed mid-block attention

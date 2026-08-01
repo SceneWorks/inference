@@ -210,6 +210,7 @@ impl ResidentKrea {
 pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
+    loaded_quant: Option<Quant>,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
@@ -417,14 +418,24 @@ impl Generator for KreaGenerator {
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", test))]
         {
             (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_memory_strategy_contract)
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", test)))]
         {
             None
         }
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy_contract() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        krea_memory_strategy_safety_check(contract, self.loaded_quant, context)
     }
 
     fn begin_memory_strategy_request(
@@ -1032,6 +1043,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // provider in candle-gen AND the worker plus a gen-core pin bump. Only Krea reads this; every other
     // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
     let convrot_dit = convrot_selector(spec, descriptor.id)?;
+    let loaded_quant = actual_quant_tier(spec, descriptor.id)?;
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     //
@@ -1126,6 +1138,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
+        loaded_quant,
         residency,
         root,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
@@ -1213,6 +1226,7 @@ pub fn load_from_native_dit_file(
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
+        loaded_quant: None,
         residency,
         root,
         // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
@@ -1358,11 +1372,68 @@ fn registered_krea_turbo_memory_strategy_contract(
     Ok(krea_turbo_memory_strategy_contract().clone())
 }
 
+fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+    if convrot_selector(spec, id)?.is_some() {
+        return Ok(Some(Quant::Q8));
+    }
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: actual numeric tier requires a snapshot directory"
+            )))
+        }
+    };
+    loader::read_packed_config(&root.join("transformer"))
+        .map_err(gen_core::Error::backend)?
+        .map(|packed| match packed.bits {
+            4 => Ok(Quant::Q4),
+            8 => Ok(Quant::Q8),
+            bits => Err(gen_core::Error::Unsupported(format!(
+                "{id}: transformer declares unsupported packed quantization width {bits}"
+            ))),
+        })
+        .transpose()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_krea_safety_check(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    match actual_quant_tier(spec, &contract.provider_id) {
+        Ok(quant) => krea_memory_strategy_safety_check(contract, quant, context),
+        Err(error) => gen_core::MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn krea_memory_strategy_safety_check(
+    contract: &gen_core::MemoryProviderContract,
+    loaded_quant: Option<Quant>,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    // Krea executes its dense tensors at the provider's BF16/default tier. `LoadSpec::precision`
+    // is not wired into the loader, so it must not relabel the calibration evidence admitted here.
+    gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: loaded_quant,
+            component_precision_floors: &[],
+        }),
+        None,
+    )
+}
+
 #[cfg(feature = "cuda")]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: KREA_2_TURBO_ID,
     contract: registered_krea_turbo_memory_strategy_contract,
-    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    safety_check: registered_krea_safety_check,
 };
 
 /// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
@@ -1371,7 +1442,7 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
 #[cfg(any(feature = "cuda", test))]
 fn build_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
-) -> gen_core::MemoryProviderContract {
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
     use gen_core::{
         LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
@@ -1455,7 +1526,7 @@ fn build_krea_control_memory_strategy_contract(
         )
     })
     .collect();
-    if spec.quantize != Some(Quant::Q4) {
+    if actual_quant_tier(spec, "krea_2_turbo_control")? != Some(Quant::Q4) {
         // SC-16013's direct 1024² calibration found no decode-tail peak on q8, bf16, or
         // INT8-ConvRot. Attention chunking is independently executable there, so forcing tiled decode
         // underneath it adds a speed cost with no measured memory saving. Q4 retains the cumulative
@@ -1470,21 +1541,21 @@ fn build_krea_control_memory_strategy_contract(
                     .to_owned(),
         });
     }
-    contract
+    Ok(contract)
 }
 
 #[cfg(feature = "cuda")]
 fn registered_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    Ok(build_krea_control_memory_strategy_contract(spec))
+    build_krea_control_memory_strategy_contract(spec)
 }
 
 #[cfg(feature = "cuda")]
 const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: "krea_2_turbo_control",
     contract: registered_krea_control_memory_strategy_contract,
-    safety_check: gen_core::default_registered_memory_strategy_safety_check,
+    safety_check: registered_krea_safety_check,
 };
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
@@ -1593,10 +1664,130 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
 
+    fn resident_memory_context(
+        contract: &gen_core::MemoryProviderContract,
+        quant: Option<Quant>,
+    ) -> gen_core::MemoryRunContext {
+        let calibration = contract.calibration.as_ref().unwrap();
+        gen_core::MemoryRunContext {
+            selection: gen_core::MemorySelection {
+                strategy: gen_core::MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier: gen_core::MemoryNumericTier {
+                    precision: gen_core::Precision::Bf16,
+                    quant,
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            mode: gen_core::MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: gen_core::MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: gen_core::MemoryBudget {
+                total_bytes: 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 512,
+            cache_state: gen_core::MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn prepacked_turnkeys_without_overrides_bind_registration_to_q4_and_q8() {
+        for (bits, actual, wrong) in [
+            (4, Quant::Q4, Some(Quant::Q8)),
+            (8, Quant::Q8, Some(Quant::Q4)),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("candle-krea-tier-{bits}-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("transformer")).unwrap();
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let contract = krea_turbo_memory_strategy_contract();
+            let actual_context = resident_memory_context(contract, Some(actual));
+            assert_eq!(
+                registered_krea_safety_check(&spec, contract, &actual_context),
+                gen_core::MemorySafetyDecision::Accept
+            );
+            let mut generator = sequential_generator(descriptor());
+            generator.loaded_quant = Some(actual);
+            assert_eq!(
+                generator.memory_strategy_safety_check(&actual_context),
+                gen_core::MemorySafetyDecision::Accept
+            );
+            for selected in [None, wrong] {
+                assert!(matches!(
+                    registered_krea_safety_check(
+                        &spec,
+                        contract,
+                        &resident_memory_context(contract, selected),
+                    ),
+                    gen_core::MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+                assert!(matches!(
+                    generator.memory_strategy_safety_check(&resident_memory_context(
+                        contract, selected,
+                    )),
+                    gen_core::MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn fp32_load_spec_cannot_relabel_bf16_loaded_or_registered_admission() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.precision = gen_core::Precision::Fp32;
+        let contract = krea_turbo_memory_strategy_contract();
+        let generator = sequential_generator(descriptor());
+
+        let mut fp32_context = resident_memory_context(contract, None);
+        fp32_context.selection.tier.precision = gen_core::Precision::Fp32;
+        assert!(matches!(
+            registered_krea_safety_check(&spec, contract, &fp32_context),
+            gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&fp32_context),
+            gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+
+        let bf16_context = resident_memory_context(contract, None);
+        assert_eq!(
+            registered_krea_safety_check(&spec, contract, &bf16_context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+        assert_eq!(
+            generator.memory_strategy_safety_check(&bf16_context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+    }
+
     #[test]
     fn krea_control_memory_contract_publishes_the_executable_surface() {
         let dense = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let contract = build_krea_control_memory_strategy_contract(&dense);
+        let contract = build_krea_control_memory_strategy_contract(&dense).unwrap();
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         assert!(matches!(
             contract
@@ -1617,12 +1808,21 @@ mod tests {
             gen_core::MemoryStrategy::BoundedDecode
         ));
 
-        let q4 = dense.with_quant(Quant::Q4);
-        let q4_contract = build_krea_control_memory_strategy_contract(&q4);
+        let root =
+            std::env::temp_dir().join(format!("krea-candle-q4-contract-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let q4 = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let q4_contract = build_krea_control_memory_strategy_contract(&q4).unwrap();
         assert!(q4_contract.engages(
             gen_core::MemoryStrategy::BoundedAttention,
             gen_core::MemoryStrategy::BoundedDecode
         ));
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
@@ -2546,6 +2746,7 @@ mod tests {
         KreaGenerator {
             descriptor,
             device: candle_gen::default_device().expect("a default device"),
+            loaded_quant: None,
             residency: candle_gen::Residency::request_scoped(
                 |_| {
                     Err(candle_gen::CandleError::Msg(

@@ -6,10 +6,10 @@
 //! provider-specific tier or fit fork.
 
 use mlx_gen::gen_core::{
-    default_memory_strategy_safety_check, safetensors_path_bytes, LoadShape, LoadSpec,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryMode, MemoryNumericTier, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, Quant, WeightsSource,
+    safetensors_path_bytes, standard_memory_strategy_safety_check, Error as CoreError, LoadShape,
+    LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryMode, MemoryNumericTier, MemoryProviderContract, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Quant, WeightsSource,
 };
 
 use crate::config::{Flux2Variant, FLUX2_DEV_EDIT_ID};
@@ -63,59 +63,19 @@ pub fn safety_check(
     expected_tier: MemoryNumericTier,
     selected_weight_bytes: u64,
 ) -> MemorySafetyDecision {
-    if context.mode != MemoryMode::Edit || !context.has_reference {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{FLUX2_DEV_EDIT_ID}: memory-safety context must describe a referenced edit"
-            ),
-        };
-    }
-    let Some(calibration) = &contract.calibration else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{FLUX2_DEV_EDIT_ID}: memory calibration is missing"),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{FLUX2_DEV_EDIT_ID}: memory calibration identity does not match"),
-        };
-    }
-    if context.selection.tier != expected_tier {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{FLUX2_DEV_EDIT_ID}: memory-safety context tier {:?} does not match the loaded tier {:?}",
-                context.selection.tier, expected_tier
-            ),
-        };
-    }
     let reference_count = context
         .overlay
         .as_deref()
         .and_then(|overlay| overlay.strip_prefix("references="))
         .and_then(|count| count.parse::<usize>().ok())
         .filter(|count| *count >= 2);
-    let Some(reference_count) = reference_count else {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{FLUX2_DEV_EDIT_ID}: memory-safety context must name at least two references"
-            ),
-        };
-    };
     let required_transient_bytes =
         (REQUIRED_TRANSIENT_HEADROOM_GB * 1024.0 * 1024.0 * 1024.0).round() as u64;
-    if context.budget.reserved_headroom_bytes < required_transient_bytes {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{FLUX2_DEV_EDIT_ID}: memory-safety context reserves less than the measured \
-                 {REQUIRED_TRANSIENT_HEADROOM_GB:.0} GiB activation/transient allowance"
-            ),
-        };
-    }
     let tokens_per_image = (f64::from(context.geometry.width) / 16.0).ceil()
         * (f64::from(context.geometry.height) / 16.0).ceil();
-    let total_tokens = (1.0 + reference_count as f64) * tokens_per_image;
+    // Use a harmless placeholder while assembling the provider-owned context. The route gate below
+    // rejects a missing/invalid count before the shared budget stage can observe this prediction.
+    let total_tokens = (1.0 + reference_count.unwrap_or(2) as f64) * tokens_per_image;
     let q4_peak_bytes =
         ((BASE_GB + PER_TOKEN_GB * total_tokens) * 1024.0 * 1024.0 * 1024.0).round() as u64;
     let predicted_peak_bytes = match expected_tier.quant {
@@ -127,27 +87,60 @@ pub fn safety_check(
             // cannot inherit the smaller tier's admission boundary or admit on fabricated evidence.
             q4_peak_bytes.saturating_add(selected_weight_bytes)
         }
-        Some(Quant::Q8) | None => {
-            return MemorySafetyDecision::Reject {
-                reason: format!(
-                    "{FLUX2_DEV_EDIT_ID}: {:?} multi-reference admission needs the selected snapshot footprint",
-                    expected_tier.quant
-                ),
-            };
-        }
-        Some(Quant::Nvfp4) => {
-            return MemorySafetyDecision::Reject {
-                reason: format!(
-                    "{FLUX2_DEV_EDIT_ID}: NVFP4 is not implemented by the MLX provider"
-                ),
-            };
-        }
+        Some(Quant::Q8) | None => 0,
+        Some(Quant::Nvfp4) => 0,
     };
     let mut provider_context = context.clone();
     provider_context.predicted_peak_bytes = predicted_peak_bytes;
-    match default_memory_strategy_safety_check(contract, &provider_context) {
+    let route_accepted = std::cell::Cell::new(false);
+    let route_gate = || {
+        if context.mode != MemoryMode::Edit || !context.has_reference {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_EDIT_ID}: memory-safety context must describe a referenced edit"
+            )));
+        }
+        let Some(_) = reference_count else {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_EDIT_ID}: memory-safety context must name at least two references"
+            )));
+        };
+        if context.budget.reserved_headroom_bytes < required_transient_bytes {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_EDIT_ID}: memory-safety context reserves less than the measured \
+                 {REQUIRED_TRANSIENT_HEADROOM_GB:.0} GiB activation/transient allowance"
+            )));
+        }
+        match expected_tier.quant {
+            Some(Quant::Q8) | None if selected_weight_bytes == 0 => {
+                return Err(CoreError::Unsupported(format!(
+                    "{FLUX2_DEV_EDIT_ID}: {:?} multi-reference admission needs the selected snapshot footprint",
+                    expected_tier.quant
+                )));
+            }
+            Some(Quant::Nvfp4) => {
+                return Err(CoreError::Unsupported(format!(
+                    "{FLUX2_DEV_EDIT_ID}: NVFP4 is not implemented by the MLX provider"
+                )));
+            }
+            _ => {}
+        }
+        route_accepted.set(true);
+        Ok(())
+    };
+    match standard_memory_strategy_safety_check(
+        contract,
+        &provider_context,
+        Some(expected_tier),
+        Some(&route_gate),
+    ) {
         MemorySafetyDecision::Accept => MemorySafetyDecision::Accept,
-        MemorySafetyDecision::Reject { .. } => {
+        MemorySafetyDecision::Reject { reason: _ }
+            if route_accepted.get()
+                && !provider_context
+                    .budget
+                    .fits(provider_context.predicted_peak_bytes) =>
+        {
+            let reference_count = reference_count.expect("accepted route has reference count");
             let gib = 1024.0 * 1024.0 * 1024.0;
             MemorySafetyDecision::Reject {
                 reason: format!(
@@ -163,6 +156,7 @@ pub fn safety_check(
                 ),
             }
         }
+        MemorySafetyDecision::Reject { reason } => MemorySafetyDecision::Reject { reason },
     }
 }
 
@@ -319,5 +313,72 @@ mod tests {
                 MemorySafetyDecision::Reject { .. }
             ));
         }
+    }
+
+    #[test]
+    fn shared_rejections_keep_their_reason_before_provider_policy_and_budget_advice() {
+        let contract = build_contract();
+
+        let mut stale_and_wrong_route = context(1.0);
+        stale_and_wrong_route.calibration_fingerprint = "stale".to_owned();
+        stale_and_wrong_route.mode = MemoryMode::TextToImage;
+        let MemorySafetyDecision::Reject { reason } = safety_check(
+            &contract,
+            &stale_and_wrong_route,
+            stale_and_wrong_route.selection.tier,
+            0,
+        ) else {
+            panic!("stale handshake must reject");
+        };
+        assert!(
+            reason.contains("calibration handshake mismatch"),
+            "{reason}"
+        );
+        assert!(!reason.contains("Lower the output resolution"), "{reason}");
+
+        let mut wrong_tier = context(1.0);
+        wrong_tier.selection.tier.quant = Some(Quant::Q8);
+        let q4 = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let MemorySafetyDecision::Reject { reason } = safety_check(&contract, &wrong_tier, q4, 0)
+        else {
+            panic!("wrong tier must reject");
+        };
+        assert!(reason.contains("does not match loaded tier"), "{reason}");
+        assert!(!reason.contains("Lower the output resolution"), "{reason}");
+
+        let mut invalid_selection = context(1.0);
+        invalid_selection.selection.parameters.decode_tile_edge = Some(512);
+        let MemorySafetyDecision::Reject { reason } = safety_check(
+            &contract,
+            &invalid_selection,
+            invalid_selection.selection.tier,
+            0,
+        ) else {
+            panic!("invalid selection must reject");
+        };
+        assert!(reason.contains("decode_tile_edge"), "{reason}");
+        assert!(!reason.contains("Lower the output resolution"), "{reason}");
+
+        let mut wrong_route = context(1.0);
+        wrong_route.mode = MemoryMode::TextToImage;
+        let MemorySafetyDecision::Reject { reason } =
+            safety_check(&contract, &wrong_route, wrong_route.selection.tier, 0)
+        else {
+            panic!("provider route policy must reject");
+        };
+        assert!(reason.contains("referenced edit"), "{reason}");
+        assert!(!reason.contains("Lower the output resolution"), "{reason}");
+
+        let admitted_route = context(1.0);
+        let MemorySafetyDecision::Reject { reason } =
+            safety_check(&contract, &admitted_route, admitted_route.selection.tier, 0)
+        else {
+            panic!("under-budget request must reject");
+        };
+        assert!(reason.contains("Lower the output resolution"), "{reason}");
     }
 }

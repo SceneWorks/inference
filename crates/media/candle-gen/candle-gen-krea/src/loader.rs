@@ -839,7 +839,7 @@ fn detect_native_prefix(st: &MmapedSafetensors) -> String {
 /// packed snapshot surfaces instead of loading the wrong (dense) tier with no diagnostic (sc-9426,
 /// F-073 sibling — the `component_is_packed` twin in flux2). Mirrors boogu's `read_packed_config`
 /// (sc-9410) and z-image's `component_is_packed` (sc-9408).
-fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
+pub(crate) fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     let path = dir.join("config.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,

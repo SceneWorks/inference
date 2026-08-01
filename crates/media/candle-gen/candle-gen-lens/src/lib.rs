@@ -924,44 +924,22 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
 }
 
 fn lens_memory_strategy_safety_decision(
-    provider_id: &str,
     loaded_precision: Precision,
     loaded_quant: Option<Quant>,
     component_precision_floors: &'static [gen_core::ComponentPrecisionFloor],
     contract: &gen_core::MemoryProviderContract,
     context: &gen_core::MemoryRunContext,
 ) -> gen_core::MemorySafetyDecision {
-    let reject = |reason: String| gen_core::MemorySafetyDecision::Reject { reason };
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return reject(format!(
-            "{provider_id}: this load has no rung-4 calibration identity"
-        ));
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return reject(format!("{provider_id}: calibration handshake mismatch"));
-    }
-    if context.selection.tier.precision != loaded_precision
-        || context.selection.tier.quant != loaded_quant
-        || context.selection.tier.component_precision_floors != component_precision_floors
-    {
-        return reject(format!(
-            "{provider_id}: request tier {:?} does not match loaded {:?}/{:?}",
-            context.selection.tier, loaded_precision, loaded_quant
-        ));
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return reject(error.to_string());
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return reject(format!(
-            "{provider_id}: predicted peak {} exceeds effective budget {}",
-            context.predicted_peak_bytes,
-            context.budget.effective_bytes()
-        ));
-    }
-    gen_core::MemorySafetyDecision::Accept
+    gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(gen_core::MemoryNumericTier {
+            precision: loaded_precision,
+            quant: loaded_quant,
+            component_precision_floors,
+        }),
+        None,
+    )
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1230,7 +1208,6 @@ impl Generator for LensGenerator {
             };
         };
         lens_memory_strategy_safety_decision(
-            self.defaults.id,
             self.loaded_precision,
             self.loaded_quant,
             self.descriptor.capabilities.component_precision_floors,
@@ -1668,7 +1645,6 @@ fn registered_lens_turbo_memory_strategy_safety_check(
     context: &gen_core::MemoryRunContext,
 ) -> gen_core::MemorySafetyDecision {
     lens_memory_strategy_safety_decision(
-        MODEL_ID_TURBO,
         spec.precision,
         spec.quantize,
         descriptor_turbo().capabilities.component_precision_floors,

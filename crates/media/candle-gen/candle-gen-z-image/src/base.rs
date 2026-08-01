@@ -41,8 +41,8 @@ use crate::SIZE_MULTIPLE;
 /// `z_image_turbo` — a distinct id and registration, no clash.
 pub const MODEL_ID: &str = "z_image";
 
-/// A loaded candle **base** Z-Image generator. Loading is **lazy** (no file I/O in [`load`]); the heavy
-/// components (Qwen3 encoder + DiT + VAE) are built on the first [`generate`](Generator::generate) call
+/// A loaded candle **base** Z-Image generator. Loading is **tensor-lazy**: [`load`] reads only the
+/// transformer's small tier marker; heavy components are built on the first [`generate`](Generator::generate) call
 /// and cached (keyed by the accelerated-attention setting), exactly as the Turbo generator. The base
 /// reuses the Turbo's `Pipeline` + `Components` verbatim — only the render path (real CFG, shift
 /// 6.0) differs.
@@ -51,6 +51,7 @@ pub struct ZImageBaseGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    loaded_quant: Option<gen_core::Quant>,
     /// Serializes resident cache use with request-scoped staged eviction.
     lifecycle: Mutex<()>,
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
@@ -107,6 +108,16 @@ impl Generator for ZImageBaseGenerator {
         self.memory_strategy.as_ref()
     }
 
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        crate::memory_strategy::safety_check(MODEL_ID, contract, context, self.loaded_quant)
+    }
+
     fn begin_memory_strategy_request(
         &self,
         context: &gen_core::MemoryRunContext,
@@ -114,7 +125,7 @@ impl Generator for ZImageBaseGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return Ok(None);
         };
-        crate::memory_strategy::validate_context(MODEL_ID, contract, context)?;
+        crate::memory_strategy::validate_context(MODEL_ID, contract, context, self.loaded_quant)?;
         Ok(Some(Box::new(
             crate::memory_strategy::ZImageMemoryScope::new(
                 MODEL_ID,
@@ -307,6 +318,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    let loaded_quant = crate::memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype.
     let device = candle_gen::default_device()?;
     #[cfg(feature = "cuda")]
@@ -318,6 +330,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         dtype: DType::BF16,
+        loaded_quant,
         lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
@@ -340,7 +353,7 @@ mod tests {
 
     /// The seam under test: resolving `"z_image"` through the family registry returns this candle
     /// base generator. `load`
-    /// is lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
+    /// is tensor-lazy, so a nonexistent weights dir still resolves (the absent tier marker is dense).
     #[test]
     fn base_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));

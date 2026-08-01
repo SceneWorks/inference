@@ -22,9 +22,9 @@
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Result as CoreResult,
-    TransformerComponent,
+    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
@@ -116,50 +116,25 @@ pub(crate) fn safety_check(
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: no calibration identity declared", contract.provider_id),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: calibration handshake mismatch", contract.provider_id),
-        };
-    }
-    if context.use_pid {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
+    let route_gate = || {
+        if context.use_pid {
+            return Err(CoreError::Unsupported(format!(
                 "{}: Krea rung 4 is calibrated for native VAE decode, not the PiD overlay",
                 contract.provider_id
-            ),
-        };
-    }
-    if context.selection.tier.precision != precision || context.selection.tier.quant != quant {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: selected tier {:?} does not match loaded {precision:?}/{quant:?}",
-                contract.provider_id, context.selection.tier
-            ),
-        };
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
-                contract.provider_id,
-                context.predicted_peak_bytes,
-                context.budget.effective_bytes()
-            ),
-        };
-    }
-    MemorySafetyDecision::Accept
+            )));
+        }
+        Ok(())
+    };
+    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision,
+            quant,
+            component_precision_floors: &[],
+        }),
+        Some(&route_gate),
+    )
 }
 
 pub(crate) fn registered_safety_check(
@@ -167,7 +142,12 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, spec.precision, spec.quantize, context)
+    match crate::model::effective_base_quant_tier(spec, &contract.provider_id) {
+        Ok(quant) => safety_check(contract, spec.precision, quant, context),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 pub(crate) fn begin_request(
@@ -307,7 +287,10 @@ impl Drop for KreaMemoryScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+    use mlx_gen::gen_core::{
+        MemoryBudget, MemoryCacheState, MemoryMode, MemorySelection, MemoryStrategy,
+        MemoryStrategyParameters, MemoryStrategySupport,
+    };
     use mlx_gen::{AdapterKind, AdapterSpec, Quant};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -338,6 +321,74 @@ mod tests {
         bytes.extend_from_slice(header);
         bytes.extend_from_slice(&0.0_f32.to_le_bytes());
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn resident_context(
+        contract: &MemoryProviderContract,
+        quant: Option<Quant>,
+    ) -> MemoryRunContext {
+        let calibration = contract.calibration.as_ref().unwrap();
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant,
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 512,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn prepacked_q4_without_an_override_binds_registration_to_the_actual_tier() {
+        let (root, mut spec) = fixture();
+        spec.quantize = None;
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        assert_eq!(
+            registered_safety_check(
+                &spec,
+                &contract,
+                &resident_context(&contract, Some(Quant::Q4))
+            ),
+            MemorySafetyDecision::Accept
+        );
+        for wrong in [None, Some(Quant::Q8)] {
+            assert!(matches!(
+                registered_safety_check(&spec, &contract, &resident_context(&contract, wrong)),
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("does not match loaded tier")
+            ));
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
