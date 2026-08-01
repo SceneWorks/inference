@@ -83,6 +83,14 @@ fn measure_z_image_base_control_tier() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(2usize);
     let strategy = std::env::var("Z_IMAGE_MEMORY").unwrap_or_else(|_| "resident".into());
+    let decode_tile_edge = std::env::var("Z_IMAGE_DECODE_TILE_EDGE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512);
+    let decode_overlap = std::env::var("Z_IMAGE_DECODE_OVERLAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128);
     let memory = match strategy.as_str() {
         "resident" => GenerationMemory::default(),
         "staged" => GenerationMemory {
@@ -92,23 +100,23 @@ fn measure_z_image_base_control_tier() {
         "decode" => GenerationMemory {
             stage_residency: true,
             tile_vae_decode: true,
-            decode_tile_edge: Some(512),
-            decode_overlap: Some(128),
+            decode_tile_edge: Some(decode_tile_edge),
+            decode_overlap: Some(decode_overlap),
             ..Default::default()
         },
         "attention" => GenerationMemory {
             stage_residency: true,
             tile_vae_decode: true,
-            decode_tile_edge: Some(512),
-            decode_overlap: Some(128),
+            decode_tile_edge: Some(decode_tile_edge),
+            decode_overlap: Some(decode_overlap),
             chunk_attention: true,
             ..Default::default()
         },
         "transformer" => GenerationMemory {
             stage_residency: true,
             tile_vae_decode: true,
-            decode_tile_edge: Some(512),
-            decode_overlap: Some(128),
+            decode_tile_edge: Some(decode_tile_edge),
+            decode_overlap: Some(decode_overlap),
             chunk_attention: true,
             stream_transformer_blocks: true,
             transformer_window_size: Some(1),

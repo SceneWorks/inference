@@ -179,6 +179,15 @@ fn run_control_validation(
     );
     println!("[{tag}][cancel:mid] Err(Canceled) after {steps_seen} steps ✓");
 
+    let after_cancel = model
+        .generate(&req, &skeleton, &mut noop)
+        .expect("warm render after mid-denoise cancellation");
+    assert_eq!(
+        after_cancel, out_ctrl,
+        "mid-denoise cancellation poisoned the warm provider"
+    );
+    println!("[{tag}][cancel:cleanup] fixed-seed warm follow-up matched ✓");
+
     // The gate: the control path meaningfully changes the output (it actually conditions the image).
     assert!(
         diff > 5.0,

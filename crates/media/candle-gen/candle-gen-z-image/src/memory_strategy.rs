@@ -26,10 +26,10 @@ pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const CALIBRATION_FINGERPRINT: &str =
-    "z-image-cuda-staged-tiled-decode-bounded-attention-streamed-blocks-v1";
+    "z-image-cuda-base-control-host-decode-streamed-blocks-v1";
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
-    "z-image-cuda-control-staged-tiled-decode-bounded-attention-streamed-blocks-v1";
+    "z-image-cuda-base-control-host-decode-streamed-blocks-v1";
 
 pub(crate) fn generation_memory(
     contract: &MemoryProviderContract,
@@ -137,7 +137,8 @@ pub(crate) fn provider_contract(
         },
         strategies,
         // PiD replaces the native VAE with a separately planned decoder. Until that decoder accepts
-        // this provider's explicit tile plan, the request safety gate rejects optimized PiD runs.
+        // this provider's bounded host-decode route, the request safety gate rejects optimized PiD
+        // runs.
         pid_decode_routes: None,
         load_shape: LoadShape::DeferredMaterialization,
         additional_prerequisites: [
@@ -317,7 +318,7 @@ impl MemoryRequestScope for ZImageMemoryScope {
         self.ensure_active()?;
         if self.use_pid {
             return Err(gen_core::Error::Unsupported(format!(
-                "{}: PiD uses an alternate decoder whose explicit tile plan is not yet wired",
+                "{}: PiD uses an alternate decoder whose bounded host-decode route is not yet wired",
                 self.provider_id
             )));
         }
@@ -325,7 +326,7 @@ impl MemoryRequestScope for ZImageMemoryScope {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "{}: native decode tiling is fixed at {DECODE_TILE_EDGE}/{DECODE_OVERLAP}, got \
+                "{}: bounded host decode uses the calibrated {DECODE_TILE_EDGE}/{DECODE_OVERLAP} identity, got \
                  {tile_edge}/{overlap}",
                 self.provider_id
             )))

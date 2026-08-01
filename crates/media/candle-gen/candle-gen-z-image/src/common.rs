@@ -285,8 +285,8 @@ pub(crate) fn decode(
 }
 
 /// Convert a decoded `[1, 3, H, W]` image tensor in `[-1, 1]` to the generator contract's RGB8
-/// [`Image`]. Kept separate from [`decode`] so the sequential Z-Image path can run a tiled VAE
-/// decode, blend the tensor tiles, and reuse the exact same post-processing seam.
+/// [`Image`]. Kept separate from [`decode`] so alternate decode devices can reuse the exact same
+/// post-processing seam.
 pub(crate) fn decoded_to_image(decoded: &Tensor) -> Result<Image> {
     let img = postprocess_image(decoded)? // u8 (1, 3, H, W)
         .i(0)?

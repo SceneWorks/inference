@@ -56,7 +56,6 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
     self, AdapterSpec, CancelFlag, Conditioning, GenerationRequest, Image, LoadPhase, PidWeights,
     Progress,
@@ -175,16 +174,6 @@ impl TextEnc {
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
 pub(crate) const DEFAULT_STEPS: usize = 4;
 
-/// Z-Image's still-image AutoencoderKL geometry for the shared Candle tile planner. The decoder
-/// upsamples spatially by 8; the synthetic temporal axis stays at one. `full_res_channels` is
-/// conservative and is not used by this fixed 512/128 spatial plan.
-const Z_IMAGE_VAE_TILING: VaeTiling = VaeTiling {
-    spatial_scale: 8,
-    temporal_scale: 1,
-    causal_temporal: false,
-    full_res_channels: 128,
-};
-
 /// The constrained-rung attention score budget for the sequential packed tier: 64 Mi elements. At 1024²
 /// the normal 1e9-element i32-overflow guard is still a single pass; this lower quality-preserving
 /// budget chunks independent query rows and releases roughly a gigabyte of transient CUDA storage.
@@ -205,7 +194,7 @@ fn request_attention_plan(req: &GenerationRequest, max_score_elements: usize) ->
     .with_cancel(&req.cancel)
 }
 
-fn check_decode_tile(cancel: &CancelFlag) -> Result<()> {
+fn check_decode(cancel: &CancelFlag) -> Result<()> {
     candle_gen::check_cancel(cancel)
 }
 
@@ -478,6 +467,48 @@ impl Pipeline {
         }
     }
 
+    /// Load the native decoder on host memory for the bounded-decode rung. Z-Image's VAE contains
+    /// spatial group normalization, so independently decoded CUDA tiles can change normalization
+    /// statistics and leave visible tile grids even after overlap blending. Whole-frame f32 host
+    /// decode preserves the model's global statistics while bounding CUDA residency to the final
+    /// latent transfer; this is slower, but it is the quality-preserving constrained path.
+    pub(crate) fn load_vae_cpu(&self) -> Result<AutoEncoderKL> {
+        if self.comfyui.is_some() {
+            return Err(CandleError::Msg(
+                "z-image bounded decode is unavailable for bespoke ComfyUI component loads".into(),
+            ));
+        }
+        let device = Device::Cpu;
+        let vb = if self.component_is_packed("vae")? {
+            self.vae_vb_dequantized_on(DType::F32, &device)?
+        } else {
+            self.component_vb_on("vae", DType::F32, &device)?
+        };
+        Ok(AutoEncoderKL::new(&VaeConfig::z_image(), vb)?)
+    }
+
+    pub(crate) fn decode_cpu(
+        &self,
+        vae: &AutoEncoderKL,
+        latents: &Tensor,
+        cancel: &CancelFlag,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Image> {
+        if tile_edge != crate::memory_strategy::DECODE_TILE_EDGE
+            || overlap != crate::memory_strategy::DECODE_OVERLAP
+        {
+            return Err(CandleError::Msg(format!(
+                "z-image bounded host decode supports only the calibrated {}/{} tuple, got {tile_edge}/{overlap}",
+                crate::memory_strategy::DECODE_TILE_EDGE,
+                crate::memory_strategy::DECODE_OVERLAP,
+            )));
+        }
+        check_decode(cancel)?;
+        let latents = latents.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        common::decode(vae, None, &latents)
+    }
+
     /// Load the three heavy components from the snapshot's diffusers component subdirs
     /// (`text_encoder/`, `transformer/`, `vae/`). `use_accelerated_attn` enables the DiT's fused
     /// attention dispatch (CUDA flash-attn / Metal SDPA); on a build without those features the
@@ -693,12 +724,12 @@ impl Pipeline {
     /// passing every other (already-dense) tensor through unchanged — so the stock `AutoEncoderKL` loads
     /// without seeing a `.weight` u32/`.scales`/`.biases` triple it can't read. The dequant is ~2 MB of
     /// one-time work (the sc-9408 pragmatic VAE path — see [`crate::quant::dequant_packed_to_dense`]).
-    fn vae_vb_dequantized(&self, dtype: DType) -> Result<VarBuilder<'static>> {
+    fn vae_vb_dequantized_on(&self, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
         use candle_gen::candle_core::safetensors::MmapedSafetensors;
         let files = self.component_files("vae")?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
-        let src = VarBuilder::from_backend(Box::new(st), dtype, self.device.clone());
+        let src = VarBuilder::from_backend(Box::new(st), dtype, device.clone());
 
         // Collect every tensor, dequantizing the packed attention triples and dropping their
         // `.scales`/`.biases` siblings; pass all other tensors through at their native dtype.
@@ -717,17 +748,20 @@ impl Pipeline {
             }
             if let Some(base) = key.strip_suffix(".weight") {
                 if packed_bases.contains(base) {
-                    let dense =
-                        crate::quant::dequant_packed_to_dense(&src, base, &self.device, dtype)?;
+                    let dense = crate::quant::dequant_packed_to_dense(&src, base, device, dtype)?;
                     tensors.insert(key.clone(), dense);
                     continue;
                 }
             }
             // Dense tensor — load it through at its stored dtype/device.
-            let t = st2.load(&key, &self.device)?;
+            let t = st2.load(&key, device)?;
             tensors.insert(key.clone(), t.to_dtype(dtype)?);
         }
-        Ok(VarBuilder::from_tensors(tensors, dtype, &self.device))
+        Ok(VarBuilder::from_tensors(tensors, dtype, device))
+    }
+
+    fn vae_vb_dequantized(&self, dtype: DType) -> Result<VarBuilder<'static>> {
+        self.vae_vb_dequantized_on(dtype, &self.device)
     }
 
     /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
@@ -752,6 +786,16 @@ impl Pipeline {
     fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
         candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
+    }
+
+    fn component_vb_on(
+        &self,
+        sub: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
+        candle_gen::mmap_var_builder(&files, dtype, device)
     }
 
     /// Build the standalone f32 VAE **encoder** for the base img2img / `Reference` path (sc-8646). The
@@ -840,7 +884,7 @@ impl Pipeline {
     }
 
     /// Render the generic Turbo route under true three-stage sequential residency:
-    /// Qwen3 encode/drop, DiT denoise/drop, then seam-blended tiled VAE decode/drop. A reference
+    /// Qwen3 encode/drop, DiT denoise/drop, then whole-frame f32 host VAE decode/drop. A reference
     /// request gets one additional, explicitly-scoped VAE-encoder phase before prompt encoding.
     pub(crate) fn render_sequential(
         &self,
@@ -891,7 +935,13 @@ impl Pipeline {
                     on_progress,
                 )
             },
-            || self.load_vae(),
+            || {
+                if memory.tile_vae_decode {
+                    self.load_vae_cpu()
+                } else {
+                    self.load_vae()
+                }
+            },
             |vae, latents, on_progress| {
                 latents
                     .iter()
@@ -899,7 +949,7 @@ impl Pipeline {
                         candle_gen::check_cancel(&req.cancel)?;
                         on_progress(Progress::Decoding);
                         if memory.tile_vae_decode {
-                            self.decode_tiled(
+                            self.decode_cpu(
                                 vae,
                                 latent,
                                 &req.cancel,
@@ -921,7 +971,7 @@ impl Pipeline {
 
     /// Base/full-CFG twin of [`Self::render_sequential`]. It preserves the base schedule and both
     /// conditional forwards while giving the same request-scoped memory controls authority over
-    /// decode tiling, attention chunking, and transformer windows.
+    /// bounded host decode, attention chunking, and transformer windows.
     pub(crate) fn render_base_sequential(
         &self,
         req: &GenerationRequest,
@@ -983,7 +1033,13 @@ impl Pipeline {
                     on_progress,
                 )
             },
-            || self.load_vae(),
+            || {
+                if memory.tile_vae_decode {
+                    self.load_vae_cpu()
+                } else {
+                    self.load_vae()
+                }
+            },
             |vae, latents, on_progress| {
                 latents
                     .iter()
@@ -991,7 +1047,7 @@ impl Pipeline {
                         candle_gen::check_cancel(&req.cancel)?;
                         on_progress(Progress::Decoding);
                         if memory.tile_vae_decode {
-                            self.decode_tiled(
+                            self.decode_cpu(
                                 vae,
                                 latent,
                                 &req.cancel,
@@ -1188,41 +1244,6 @@ impl Pipeline {
                 },
             )
         })
-    }
-
-    /// Decode a final latent with 512 px tiles and 128 px overlap. The shared tile planner's
-    /// trapezoidal partition-of-unity blend preserves exact output dimensions and suppresses
-    /// boundary-convolution seams while bounding the CUDA working set to one tile.
-    pub(crate) fn decode_tiled(
-        &self,
-        vae: &AutoEncoderKL,
-        latents: &Tensor,
-        cancel: &CancelFlag,
-        tile_edge: u32,
-        overlap: u32,
-    ) -> Result<Image> {
-        let tile_edge = i32::try_from(tile_edge).map_err(|_| {
-            candle_gen::CandleError::Msg(format!(
-                "z-image decode tile edge {tile_edge} exceeds i32"
-            ))
-        })?;
-        let overlap = i32::try_from(overlap).map_err(|_| {
-            candle_gen::CandleError::Msg(format!("z-image decode overlap {overlap} exceeds i32"))
-        })?;
-        let cfg = TilingConfig::spatial_only(tile_edge, overlap);
-        let decoded = candle_gen::vae_tiling::decode_tiled(
-            Z_IMAGE_VAE_TILING,
-            "z-image AutoencoderKL",
-            latents,
-            &cfg,
-            |tile| -> Result<Tensor> {
-                check_decode_tile(cancel)?;
-                let tile = tile.squeeze(2)?;
-                let decoded = vae.decode(&tile)?.to_dtype(DType::F32)?;
-                Ok(decoded.unsqueeze(2)?)
-            },
-        )?;
-        common::decoded_to_image(&decoded.squeeze(2)?)
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -1703,8 +1724,9 @@ mod tests {
         );
     }
 
-    /// Cancellation raised after one decode tile must stop before the next tile and still evict the
-    /// active decoder. This exercises the exact per-tile guard used by the production tiled VAE.
+    /// Cancellation raised at the host-decode boundary must stop decode and still evict the active
+    /// decoder. A convolution already running on the host is not interruptible, so the production
+    /// route checks this boundary immediately before transferring and decoding the latent.
     #[test]
     fn three_stage_runner_cleans_up_when_decode_is_canceled() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1736,50 +1758,18 @@ mod tests {
                 })
             },
             |_, (), _| {
-                check_decode_tile(&cancel_during_decode)?;
-                candle_gen::lock_recover(&events).push("decode_tile_0");
                 cancel_during_decode.cancel();
-                check_decode_tile(&cancel_during_decode)?;
-                candle_gen::lock_recover(&events).push("decode_tile_1");
+                check_decode(&cancel_during_decode)?;
+                candle_gen::lock_recover(&events).push("decode");
                 Ok(())
             },
         );
         assert!(result.is_err());
         assert_eq!(
             *candle_gen::lock_recover(&events),
-            [
-                "drop_text",
-                "drop_dit",
-                "load_vae",
-                "decode_tile_0",
-                "drop_vae",
-            ],
-            "cancel must prevent later tiles and evict the decoder"
+            ["drop_text", "drop_dit", "load_vae", "drop_vae",],
+            "cancel must prevent host decode and evict the decoder"
         );
-    }
-
-    /// The production 1024² decode plan must tile both axes, preserve exact dimensions, and form a
-    /// partition of unity across every overlap. This locks the Z-Image-specific geometry and blend
-    /// parameters independently of the shared tiling crate's own generic tests.
-    #[test]
-    fn sequential_vae_tile_plan_is_seam_blended_and_dimension_exact() {
-        let cfg = TilingConfig::spatial_only(512, 128);
-        let plan = cfg.plan(Z_IMAGE_VAE_TILING, 1, 128, 128);
-        assert_eq!((plan.out_h, plan.out_w), (1024, 1024));
-        assert!(plan.h.len() > 1 && plan.w.len() > 1);
-
-        for (axis, tiles) in [("height", &plan.h), ("width", &plan.w)] {
-            let mut weights = vec![0.0f32; 1024];
-            for tile in tiles {
-                for (offset, value) in tile.mask.iter().enumerate() {
-                    weights[tile.out_start as usize + offset] += value;
-                }
-            }
-            assert!(
-                weights.iter().all(|weight| (*weight - 1.0).abs() < 1e-5),
-                "{axis} blend weights must sum to one at every output pixel"
-            );
-        }
     }
 
     /// `component_is_packed` detects the `quantization` block a packed MLX tier writes into a component

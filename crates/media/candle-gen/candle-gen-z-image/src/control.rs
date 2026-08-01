@@ -920,11 +920,16 @@ impl ZImageControl {
 
         candle_gen::check_cancel(&req.cancel)?;
         on_progress(Progress::Loading(LoadPhase::Renderer));
-        let vae = self.pipeline.load_vae()?;
-        on_progress(Progress::Decoding);
         let pid = self.pid_decoder_for(req)?;
-        let output = if req.memory.tile_vae_decode && pid.is_none() {
-            self.pipeline.decode_tiled(
+        let bounded_decode = req.memory.tile_vae_decode && pid.is_none();
+        let vae = if bounded_decode {
+            self.pipeline.load_vae_cpu()?
+        } else {
+            self.pipeline.load_vae()?
+        };
+        on_progress(Progress::Decoding);
+        let output = if bounded_decode {
+            self.pipeline.decode_cpu(
                 &vae,
                 &latents,
                 &req.cancel,

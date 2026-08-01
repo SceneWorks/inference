@@ -8,8 +8,27 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    AdapterKind, AdapterSpec, Conditioning, GenerationMemory, GenerationOutput, GenerationRequest,
+    Image, LoadSpec, Progress, WeightsSource,
 };
+
+fn reference_fixture(width: u32, height: u32) -> Image {
+    let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.extend_from_slice(&[
+                (x * 255 / width.max(1)) as u8,
+                (y * 255 / height.max(1)) as u8,
+                ((x + y) * 255 / (width + height).max(1)) as u8,
+            ]);
+        }
+    }
+    Image {
+        width,
+        height,
+        pixels,
+    }
+}
 
 fn seam_ratio(image: &candle_gen::gen_core::Image, seam_x: usize) -> f64 {
     let width = image.width as usize;
@@ -48,11 +67,41 @@ fn measure_z_image_tier() {
     );
     let tier = std::env::var("Z_IMAGE_TIER_NAME").unwrap_or_else(|_| "unknown".into());
     let provider = std::env::var("Z_IMAGE_PROVIDER").unwrap_or_else(|_| "z_image_turbo".into());
-    let policy_name = std::env::var("Z_IMAGE_POLICY").unwrap_or_else(|_| "request-staged".into());
-    let stage_residency = match policy_name.as_str() {
-        "resident" => false,
-        "request-staged" => true,
-        other => panic!("Z_IMAGE_POLICY must be resident or request-staged, got {other}"),
+    let policy_name = std::env::var("Z_IMAGE_POLICY").unwrap_or_else(|_| "staged".into());
+    let memory = match policy_name.as_str() {
+        "resident" => GenerationMemory::default(),
+        "staged" | "request-staged" => GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        },
+        "decode" => GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            ..Default::default()
+        },
+        "attention" => GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            chunk_attention: true,
+            ..Default::default()
+        },
+        "transformer" => GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            chunk_attention: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(1),
+            ..Default::default()
+        },
+        other => panic!(
+            "Z_IMAGE_POLICY must be resident, staged, decode, attention, or transformer; got {other}"
+        ),
     };
     let repeats: usize = std::env::var("Z_IMAGE_REPEATS")
         .ok()
@@ -74,7 +123,15 @@ fn measure_z_image_tier() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(default_steps);
 
-    let spec = LoadSpec::new(WeightsSource::Dir(tier_dir));
+    let mut spec = LoadSpec::new(WeightsSource::Dir(tier_dir));
+    if let Ok(path) = std::env::var("Z_IMAGE_ADAPTER") {
+        spec = spec.with_adapters(vec![AdapterSpec::new(
+            PathBuf::from(path),
+            1.0,
+            AdapterKind::Lora,
+        )]);
+    }
+    let style_variation = std::env::var("Z_IMAGE_STYLE_VARIATION").as_deref() == Ok("1");
     let request = GenerationRequest {
         prompt: "a rusty robot holding a lit candle, cinematic studio lighting, highly detailed"
             .into(),
@@ -83,10 +140,14 @@ fn measure_z_image_tier() {
         steps: Some(steps),
         count: 1,
         seed: Some(42),
-        memory: Some(candle_gen::gen_core::GenerationMemory {
-            stage_residency,
-            ..Default::default()
-        }),
+        memory: Some(memory),
+        conditioning: style_variation
+            .then(|| Conditioning::Reference {
+                image: reference_fixture(width, height),
+                strength: Some(0.5),
+            })
+            .into_iter()
+            .collect(),
         ..Default::default()
     };
 
@@ -166,7 +227,8 @@ fn measure_z_image_tier() {
         );
     }
     eprintln!(
-        "ZIMAGE_VRAM provider={provider} tier={tier} policy={policy_name} gpu={} {width}x{height} steps={steps} count=1 cold=true repeats={repeats} | {report}",
+        "ZIMAGE_VRAM provider={provider} tier={tier} mode={} policy={policy_name} gpu={} {width}x{height} steps={steps} count=1 cold=true repeats={repeats} | {report}",
+        if style_variation { "style_variations" } else { "text_to_image" },
         candle_gen::testkit::probe_gpu()
     );
 
