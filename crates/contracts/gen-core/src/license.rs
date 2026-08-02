@@ -36,6 +36,14 @@
 //! migrates (sc-16663) and the release tooling moves to schema 3 (sc-16664), which retires
 //! [`weight_licenses_manifest_json`] in favour of [`component_licenses_manifest_json`].
 //! **Do not add v2 callers.**
+//!
+//! ## The table itself (sc-16662)
+//!
+//! [`families`] carries the transcribed [`LicenseFamily`] rows — sixteen upstream texts, each term
+//! backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md`. The values
+//! are **provisional**: an agent gathered the quotes and no human has yet signed them off.
+
+pub mod families;
 
 /// The license under which a provider's **model weights** (its pinned checkpoint) are distributed.
 ///
@@ -205,6 +213,12 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 //   * `RevenueCeiling` carried an amount with no boundary reading, while Stability says "more than
 //     USD $1,000,000" and LTX-2 says "at least $10,000,000" — different answers at exactly the
 //     amount. It now carries a `CeilingBoundary`.
+//
+// sc-16662 landed the family table itself (`license::families`) and amended one more shape for the
+// same reason — the texts, not a preference. `AcceptableUsePolicy::url` and
+// `RegistrationRequired::contact` are now `Option`: four of the sixteen families name a policy or a
+// registration and publish no address for it, so a required address left only a fabricated URL or a
+// dropped fact. See the `LicenseTerm` type note.
 // =================================================================================================
 
 /// Which side of a [`LicenseTerm::RevenueCeiling`] the named amount itself falls on.
@@ -254,6 +268,20 @@ impl CeilingBoundary {
 /// that conclusion belongs to the consumer, who alone knows its own revenue, whether it
 /// redistributes weights, and which agreements it has with its own users.
 ///
+/// ## A licence can name a thing without naming its address (sc-16662)
+///
+/// [`AcceptableUsePolicy::url`](Self::AcceptableUsePolicy::url) and
+/// [`RegistrationRequired::contact`](Self::RegistrationRequired::contact) are `Option`, because the
+/// texts in the catalog do this and a required address forces one of two dishonest outcomes:
+/// invent a URL, or drop the fact that the licence points somewhere. Four of the sixteen families
+/// read this way — CreativeML Open RAIL++-M, FLUX.1 \[dev\] and LTX-2 Community name a policy with
+/// no published address, and the LTX-2 copy shipped beside the weights names a registration with
+/// no address. `None` is the recorded fact "the text names this and gives no address", which is
+/// what a consumer shows a user; it is not "no policy" and not "unknown".
+///
+/// [`license_table_conformance_errors`] rejects `Some("")` and `Some("   ")` for either field, so
+/// the absence is spelled one way rather than two.
+///
 /// ## Serialized order is keyed on [`tag`](Self::tag), not on declaration order
 ///
 /// A derived `Ord` would make the emitted order of a [`provider_terms`] union a function of where
@@ -294,13 +322,27 @@ pub enum LicenseTerm {
     },
     /// The licence names an out-of-band registration or approval with the upstream.
     RegistrationRequired {
-        /// Where the registration is made (an email address or URL).
-        contact: &'static str,
+        /// Where the registration is made (an email address or URL), when the text names one.
+        ///
+        /// `None` records that the licence names the registration **without naming an address** —
+        /// see the type-level note on addressless references. The LTX-2 Community License copy
+        /// distributed beside the `Lightricks/LTX-2.3` weights reads *"required to contact
+        /// Licensor."* full stop, while the copy in the licensor's GitHub repository links an
+        /// address at the same sentence.
+        contact: Option<&'static str>,
     },
     /// The licence names an acceptable-use / prohibited-use policy.
     AcceptableUsePolicy {
-        /// The policy text.
-        url: &'static str,
+        /// Where the policy is published, when the text names an address.
+        ///
+        /// `None` records that the licence names a policy and **gives no address** — see the
+        /// type-level note. Three families in the catalog read this way: CreativeML Open RAIL++-M
+        /// (whose text contains no URL of any kind and enumerates its restrictions in its own
+        /// Attachment A), FLUX.1 \[dev\] (which enumerates prohibited uses in §4 and never uses the
+        /// phrase at all, while its model card cites a `POLICY.md` that is not published), and
+        /// LTX-2 Community (which capitalises the term in Attachment A but never defines it and
+        /// publishes no policy document).
+        url: Option<&'static str>,
     },
     /// A concrete duty the licence puts on the deployer (e.g. content filtering on generated
     /// media), in the licence's own words.
@@ -400,14 +442,23 @@ impl LicenseTerm {
     /// distinct terms never share a key — every field that distinguishes two values of a variant
     /// appears in the key — so sorting by it is deterministic without depending on the declaration
     /// order of the `enum`; see the type-level note.
+    ///
+    /// The middle slot carries an optional payload's **presence** for the two `Option` fields, not
+    /// only its contents: `None` and `Some("")` are different disclosures ("the text names no
+    /// address" versus a malformed row), and flattening both to `""` would let
+    /// [`provider_terms`]'s dedup drop one of them.
     fn sort_key(&self) -> (&'static str, u64, &'static str) {
         match *self {
             Self::RevenueCeiling {
                 amount_usd,
                 boundary,
             } => (self.tag(), amount_usd, boundary.tag()),
-            Self::RegistrationRequired { contact } => (self.tag(), 0, contact),
-            Self::AcceptableUsePolicy { url } => (self.tag(), 0, url),
+            Self::RegistrationRequired { contact } => {
+                (self.tag(), contact.is_some() as u64, contact.unwrap_or(""))
+            }
+            Self::AcceptableUsePolicy { url } => {
+                (self.tag(), url.is_some() as u64, url.unwrap_or(""))
+            }
             Self::DeployerObligation { text } => (self.tag(), 0, text),
             Self::DownstreamLicenseCopy { family } | Self::DownstreamRestrictions { family } => {
                 (self.tag(), 0, family)
@@ -436,11 +487,14 @@ impl LicenseTerm {
             Self::DownstreamLicenseCopy { family } | Self::DownstreamRestrictions { family } => {
                 object.insert("family".into(), family.into());
             }
+            // `None` is emitted as an explicit JSON `null` rather than an absent key: the fact
+            // being disclosed is "the licence names this and gives no address", and a key that
+            // simply vanished would read to a consumer as "no such term was recorded".
             Self::RegistrationRequired { contact } => {
-                object.insert("contact".into(), contact.into());
+                object.insert("contact".into(), serde_json::json!(contact));
             }
             Self::AcceptableUsePolicy { url } => {
-                object.insert("url".into(), url.into());
+                object.insert("url".into(), serde_json::json!(url));
             }
             Self::DeployerObligation { text } => {
                 object.insert("text".into(), text.into());
@@ -809,6 +863,20 @@ pub fn license_table_conformance_errors(
                     ));
                 }
             }
+            // "The text names no address" is spelled `None`. A blank `Some` renders as nothing on a
+            // licences page while reading as an address in the JSON, so it is neither disclosure.
+            let blank_address = match term {
+                LicenseTerm::AcceptableUsePolicy { url } => url.map(is_blank),
+                LicenseTerm::RegistrationRequired { contact } => contact.map(is_blank),
+                _ => None,
+            };
+            if blank_address == Some(true) {
+                errors.push(format!(
+                    "licence family {id:?} declares a {} term with an empty address; record a \
+                     licence that names no address as None, not as an empty string",
+                    term.tag()
+                ));
+            }
         }
     }
 
@@ -1101,7 +1169,7 @@ mod v3_tests {
                     family: "flux-1-dev-non-commercial",
                 },
                 LicenseTerm::AcceptableUsePolicy {
-                    url: "https://example.invalid/fixture-aup",
+                    url: Some("https://example.invalid/fixture-aup"),
                 },
             ],
         },
@@ -2427,6 +2495,59 @@ mod v3_amendment_tests {
         );
     }
 
+    /// sc-16662: an addressless policy or registration is spelled `None`. A blank `Some` reads as
+    /// an address in the JSON and renders as nothing on a licences page, so it is neither the
+    /// "here is where to look" disclosure nor the "the text names no address" one — and it would
+    /// sort and serialize next to the honest `None` rather than being visibly wrong.
+    #[test]
+    fn a_blank_address_is_an_error_but_an_absent_one_is_not() {
+        const BLANK: &[LicenseFamily] = &[LicenseFamily {
+            id: "blank-addresses",
+            spdx_id: "LicenseRef-Blank",
+            name: "Fixture with blank addresses",
+            text_url: "https://example.invalid/blank",
+            terms: &[
+                LicenseTerm::AcceptableUsePolicy { url: Some("") },
+                LicenseTerm::RegistrationRequired {
+                    contact: Some("   "),
+                },
+            ],
+        }];
+        let errors = license_table_conformance_errors(BLANK, &[], &[]);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("acceptable_use_policy"), "{errors:?}");
+        assert!(errors[1].contains("registration_required"), "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.contains("record a licence that names no address as None")),
+            "{errors:?}"
+        );
+
+        // The honest shape passes, and so does the addressed one.
+        const HONEST: &[LicenseFamily] = &[LicenseFamily {
+            id: "ltx-2-community",
+            spdx_id: "LicenseRef-LTX-2-Community",
+            name: "LTX-2 Community License Agreement",
+            text_url: "https://example.invalid/ltx",
+            terms: &[
+                LicenseTerm::AcceptableUsePolicy { url: None },
+                LicenseTerm::RegistrationRequired { contact: None },
+            ],
+        }];
+        assert_eq!(
+            license_table_conformance_errors(HONEST, &[], &[]),
+            Vec::<String>::new()
+        );
+
+        // And the two absences stay distinguishable from a blank one all the way into the union,
+        // which is the reason `sort_key` carries presence rather than only contents.
+        assert_ne!(
+            LicenseTerm::AcceptableUsePolicy { url: None }.to_json(),
+            LicenseTerm::AcceptableUsePolicy { url: Some("") }.to_json()
+        );
+    }
+
     /// Gating is not a property of the family, so a table defect in the family section must not
     /// swallow it — the consumer still needs to know the checkpoint is gated.
     #[test]
@@ -2629,17 +2750,21 @@ mod v3_amendment_tests {
                 boundary: CeilingBoundary::Inclusive,
             },
             LicenseTerm::RegistrationRequired {
-                contact: "https://example.invalid/register",
+                contact: Some("https://example.invalid/register"),
             },
             LicenseTerm::RegistrationRequired {
-                contact: "opensource@example.invalid",
+                contact: Some("opensource@example.invalid"),
+            },
+            // The sc-16662 shape: a registration the text names with no address. It must not
+            // collide with either of the addressed ones, nor with the addressless AUP below.
+            LicenseTerm::RegistrationRequired { contact: None },
+            LicenseTerm::AcceptableUsePolicy {
+                url: Some("https://example.invalid/aup"),
             },
             LicenseTerm::AcceptableUsePolicy {
-                url: "https://example.invalid/aup",
+                url: Some("https://example.invalid/prohibited_use_policy"),
             },
-            LicenseTerm::AcceptableUsePolicy {
-                url: "https://example.invalid/prohibited_use_policy",
-            },
+            LicenseTerm::AcceptableUsePolicy { url: None },
             LicenseTerm::DeployerObligation {
                 text: "implement and maintain content filtering measures",
             },

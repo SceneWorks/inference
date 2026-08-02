@@ -1,53 +1,105 @@
-# Licence family table — primary-source evidence pack (sc-16662)
+# Licence family table — SIGN-OFF DOCUMENT (sc-16662)
 
-**Status: DRAFT EVIDENCE — NOT SIGNED OFF. No legal determination has been made here.**
+**Status: PROVISIONAL. The values below are LANDED IN CODE and have NOT been read by a human.**
 
 | | |
 | --- | --- |
 | Story | sc-16662 — Licence family table, human legal read of the ~14 families |
 | Epic | 16660 |
+| Landed in | `crates/contracts/gen-core/src/license/families.rs` — 16 `LicenseFamily` consts plus `LICENSE_FAMILIES` |
 | Evidence gathered by | Claude (Opus 5), automated agent, on behalf of Michael Trefry |
+| Transcribed into code by | Claude (Opus 5), automated agent, **2026-08-02** |
 | Retrieval date for **every** quote below | **2026-08-02** (unless a row says otherwise) |
 | Method | `curl` of the canonical licence file (upstream HF `raw/main/LICENSE*`, the licensor's own domain, or the licensor's own GitHub), then verbatim extraction of the operative clause |
-| Gated repos | Files behind an HF gate were retrieved **2026-08-02** with the authenticated Hugging Face CLI (`hf download <repo> <file>`) by Claude (Opus 5) on Michael Trefry's Windows host, under HF account **`SceneWorks`** (`hf auth whoami` → `user: SceneWorks`). See "Authenticated reads" below. |
-| Reviewed and signed off by | **_(unsigned — Michael)_** |
+| Gated repos | Files behind an HF gate were retrieved **2026-08-02** with the authenticated Hugging Face CLI (`hf download <repo> <file>`) by Claude (Opus 5) on Michael Trefry's Windows host, under HF account **`SceneWorks`**. See "Authenticated reads" below. |
+| **Read and signed off by a human** | **_(NOT YET — Michael)_** |
 | Sign-off date | **_(pending)_** |
+
+## Who read what, and when — plainly
+
+The story's definition of done asks that a note record who read what and when. The honest record is:
+
+> An **automated agent** fetched sixteen primary-source licence texts on 2026-08-02, extracted a
+> verbatim quote for every term it proposed, and transcribed those terms into Rust consts. **No
+> human being has yet read a licence text or checked a quote.** Nothing here has been reviewed by a
+> lawyer and none of it is legal advice.
+
+The values are landed rather than held back because the surface is disclosure-only (below), so a
+wrong value shows a user a wrong sentence rather than blocking anything — and because a landed table
+carrying an explicit PROVISIONAL marker is easier to review than a branch nobody can compile.
+Michael's review is a **quote check**: for each family, read the quote, decide whether it supports
+the term, tick the box. When every box is ticked, change the status line at the top of this file and
+delete the PROVISIONAL banner from the module docs in `families.rs`.
 
 ## What this document is, and what it is not
 
 This records **facts**: the canonical text URL for each licence family, the identifier the upstream
-declares verbatim, and a short verbatim quote of the operative clause behind every term proposed for
+declares verbatim, and a short verbatim quote of the operative clause behind every term landed for
 that family. Per the epic's governing principle R2, it deliberately contains **no legal
 conclusions** — no row says "therefore you may use this commercially". A quote is a fact; an
 entitlement is not.
 
-The purpose is to make Michael's review a **quote check** rather than independent research. For each
-family: read the quote, decide whether it supports the term, tick the box.
-
 Every quote is reproduced under fair use for the purpose of review, is limited to the operative
 clause relied on, and is attributed to the URL it came from. No licence is reproduced in full.
+
+## Disclosure only — the constraint that governs every entry
+
+**No licence term in this surface blocks, gates, or degrades any functionality.** The data exists so
+a consumer can SHOW it to a user. Two consequences run through everything below:
+
+1. A term records what a text **names**, never what a user may or may not do.
+2. **Where a licence is silent, the surface is silent.** A non-commercial restriction on *use of the
+   weights* is not transcribed as a restriction on *outputs* unless the text says so. Four families
+   restrict weights and say nothing about outputs (`insightface-research-only`, `nvidia-nsclv1`,
+   `apple-mlr`, `cc-by-nc-4-0`); none of them carries `NonCommercialOutputs`, and **no family in the
+   table does**. That is a deliberate reversal of the story's draft for insightface and CC-BY-NC —
+   see **U3**.
 
 The typed vocabulary is fixed by the landed contract (`crates/contracts/gen-core/src/license.rs`,
 `LicenseTerm`) and terms may only be drawn from it:
 `AttributionRequired`, `NoticeFileRequired`, `NonCommercialWeights`, `NonCommercialOutputs`,
-`RevenueCeiling{amount_usd}`, `RegistrationRequired{contact}`, `AcceptableUsePolicy{url}`,
-`DeployerObligation{text}`, `DownstreamFlowDown`, `GatedAccess`.
+`RevenueCeiling{amount_usd, boundary}`, `RegistrationRequired{contact: Option}`,
+`AcceptableUsePolicy{url: Option}`, `DeployerObligation{text}`, `DownstreamLicenseCopy{family}`,
+`DownstreamRestrictions{family}`, `GatedAccess`.
 
-> Note on where the contract lives: at the time this note was written, the v3 `LicenseTerm` /
-> `LicenseFamily` / `ComponentLicense` types were on the unmerged sc-16661 branch
-> (`claudeanthropic/sc-16661/contract-weightlicense-v3`, PR #400), **not** on `main`. `main` still
-> carries the older schema-2 `WeightLicense` only. Nothing in this note edits Rust.
+> **The vocabulary changed after this note's first draft**, in each case because the texts forced
+> it. sc-16898 split the bare `DownstreamFlowDown` into `DownstreamLicenseCopy` /
+> `DownstreamRestrictions` (Q2), moved `GatedAccess` off `LicenseFamily` onto
+> `ComponentLicense::gated` (U7), and gave `RevenueCeiling` a `CeilingBoundary` (U1 vs family 8).
+> sc-16662 then made `AcceptableUsePolicy::url` and `RegistrationRequired::contact` `Option` (U2,
+> U10). The family rows below have been rewritten onto the current shape: where the first pass wrote
+> `DownstreamFlowDown`, the landed value names which of the two kinds it is.
 
 ---
 
 # UNRESOLVED — needs Michael
 
 Every item below is either **AMBIGUOUS** (the text does not settle it) or **NOT FOUND** (no
-canonical text was reachable). None of them has been resolved by guessing.
+canonical text was reachable). None of them has been resolved by guessing. Where landing the consts
+forced a choice, the choice is stated here and is **reversible in one commit** — none of it is
+buried in the family rows.
 
 **Update 2026-08-02 (second pass, authenticated).** U1 is **RESOLVED**; U2 is **narrowed** — one of
 the four URLs was found and the other three are now positively established as having no address. A
-new item **U10** was opened by the authenticated read. Everything else stands.
+new item **U10** was opened by the authenticated read.
+
+**Update 2026-08-02 (transcription pass, sc-16662).** The consts landed. Every open item and the
+disposition taken for it:
+
+| # | item | disposition taken when landing | still needs Michael? |
+| --- | --- | --- | --- |
+| U1 | SD3.5's gated text | **CLOSED** — read under authentication; `stability-ai-community` sources from SD3.5's own file, ceiling `$1,000,000` **Exclusive** | no |
+| U2 | `AcceptableUsePolicy` with no URL ×3 | **Contract amended.** `AcceptableUsePolicy::url` is now `Option<&'static str>`; OpenRAIL++, FLUX.1 [dev] and LTX-2 land `url: None` — "the licence names a policy and gives no address" is now representable. **No URL was invented**, and `https://blackforestlabs.ai/aup` (404, in no licence text) is asserted absent by a test | **confirm the convention** |
+| U3 | `NonCommercialOutputs` from a use restriction | **Term NOT landed on any family.** No quote supports it anywhere. Reverses the draft for `insightface-research-only` and `cc-by-nc-4-0`. A test fails if it is re-added | **decide whether silence should read as restriction** |
+| U4 | `nvidia-open-model` may have no checkpoint | Family **landed** (its text is real and was read). Whether any shipped checkpoint declares it is a *component-row* question, i.e. sc-16665 | **confirm before component rows land** |
+| U5 | `candle-gen-sana/NOTICE` contradicted by source | Untouched — out of scope, flagged only | **needs a fix story** |
+| U6 | Kolors repo-level licence | Untouched — a component question, not a family one | at sc-16665 |
+| U7 | `GatedAccess` on family vs component | **CLOSED by sc-16898** — moved to `ComponentLicense::gated`. No family declares it; conformance rejects it and a test asserts it | no |
+| U8 | Llama's 700M-MAU threshold has no variant | **Landed as `DeployerObligation`**, quoted verbatim, per the contract's own guidance. It is emphatically *not* laundered into a `RevenueCeiling` | **confirm** |
+| U9 | Apache-2.0 §4(a) as flow-down | **Landed as `DownstreamLicenseCopy`.** The sc-16898 split answers the question the item posed: §4(a) is a copy-of-licence duty and Apache states no use restrictions to flow down, so the lighter variant fits exactly and the heavier one does not | **confirm** |
+| U10 | LTX-2 ships two different texts | **Defaulted to the copy shipped beside the weights** (`Lightricks/LTX-2.3` `LICENSE`). Consequence: `RegistrationRequired{contact: None}` — the shipped text names no address. The GitHub copy's `https://ltx.io/model/licensing` is **not** transcribed. A test pins the choice | **DECIDE which text governs** |
+| U11 | Gemma: is the §3.1 Notice string *also* `AttributionRequired`? | **NOT landed.** `gemma-terms` carries `NoticeFileRequired` only. Calling one obligation two terms is a modelling choice, not a transcription | **decide** |
+| Q2 | do the flow-downs differ? | **CLOSED by sc-16898** — two variants, each carrying its family. Four families state the heavier "restrictions as enforceable provisions" shape and eleven state the lighter "copy of the licence" shape; three state both | no |
 
 ## U1. SD3.5's own `LICENSE.md` — **RESOLVED. Read under authentication; cosmetic differences only.**
 
@@ -289,7 +341,12 @@ was not settled from primary sources. The draft's assignment of `chatglm3-model-
 text encoder" is supported for the **text encoder component**; the Kolors UNet/VAE component is
 unresolved.
 
-## U7. `GatedAccess` is a per-checkpoint distribution fact, not a licence-text fact (AMBIGUOUS)
+## U7. `GatedAccess` is a per-checkpoint distribution fact, not a licence-text fact — **CLOSED**
+
+> **Resolved by sc-16898**, in the direction this item argued for: `GatedAccess` moved to
+> `ComponentLicense::gated`, `license_table_conformance_errors` rejects it on a family, and
+> `provider_terms` still raises it into the derived union. No family in the landed table declares
+> it. The per-checkpoint table below stands as the evidence for the component rows (sc-16665).
 
 Nothing in any licence text says "the weights are gated". Gating is a Hugging Face repo setting.
 Measured 2026-08-02 via the HF API:
@@ -317,7 +374,13 @@ Family 16 (JoyCaption) gates additional commercial terms on *monthly active user
 `RevenueCeiling{amount_usd}` would be a false transcription. There is no `UserCeiling` variant.
 Michael must decide: omit the term, widen the variant, or accept that this fact is unrepresentable.
 
-## U9. Does Apache-2.0 §4(a) constitute `DownstreamFlowDown`? (AMBIGUOUS)
+## U9. Does Apache-2.0 §4(a) constitute a flow-down? — **landed as the copy variant; confirm**
+
+> The sc-16898 split dissolves the dilemma this item poses. §4(a) is textually a
+> *copy-of-licence* duty, and Apache-2.0 has no use restrictions for a downstream agreement to
+> reproduce — so `DownstreamLicenseCopy` fits exactly and `DownstreamRestrictions` cannot apply.
+> `apache-2-0` therefore landed with `DownstreamLicenseCopy{"apache-2-0"}`. **Michael: confirm,
+> since it puts a flow-down on the most widely used family in the catalog.**
 
 Apache-2.0 §4(a): *"You must give any other recipients of the Work or Derivative Works a copy of this
 License"* — textually the same shape as the flow-down clauses in families 4/5/7/8/9/10/11/12/12b/15/16.
@@ -374,6 +437,76 @@ the same defect class as U1, caught the same way; it is recorded rather than res
 
 ---
 
+# What landed in code — the 16 families at a glance
+
+`crates/contracts/gen-core/src/license/families.rs`, one `pub const LicenseFamily` per row plus
+`LICENSE_FAMILIES`. Every term below is backed by a quote in this document; the source comments in
+`families.rs` carry the same quote beside the term. **All 16 landed; none was withheld.**
+
+| # | family id | terms landed |
+| --- | --- | --- |
+| 1 | `apache-2-0` | `AttributionRequired`, `NoticeFileRequired`, `DownstreamLicenseCopy` |
+| 2 | `mit` | `AttributionRequired` |
+| 3 | `cc-by-nc-4-0` | `AttributionRequired`, `NonCommercialWeights` |
+| 4 | `creativeml-openrail-pp-m` | `DownstreamRestrictions`, `AttributionRequired`, `NoticeFileRequired`, `AcceptableUsePolicy{None}` |
+| 5 | `stability-ai-community` | `RevenueCeiling{1_000_000, Exclusive}`, `RegistrationRequired{Some}`, `AttributionRequired`, `NoticeFileRequired`, `DownstreamLicenseCopy`, `AcceptableUsePolicy{Some}` |
+| 6 | `flux-1-dev-non-commercial` | `NonCommercialWeights`, `DownstreamLicenseCopy`, `DeployerObligation{content filters}`, `AcceptableUsePolicy{None}` |
+| 7 | `krea-2-community` | `RevenueCeiling{1_000_000, Inclusive}`, `RegistrationRequired{Some}`, `DownstreamLicenseCopy`, `AttributionRequired`, `NoticeFileRequired`, `DeployerObligation` ×2, `AcceptableUsePolicy{Some}` |
+| 8 | `ltx-2-community` | `RevenueCeiling{10_000_000, Inclusive}`, `RegistrationRequired{None}`, `DownstreamRestrictions`, `DownstreamLicenseCopy`, `AttributionRequired`, `NoticeFileRequired`, `DeployerObligation{exclusive relicensing}`, `AcceptableUsePolicy{None}` |
+| 9 | `circlestone-labs-non-commercial` | `NonCommercialWeights`, `DownstreamLicenseCopy`, `AttributionRequired` |
+| 10 | `gemma-terms` | `DownstreamRestrictions`, `DownstreamLicenseCopy`, `NoticeFileRequired`, `AcceptableUsePolicy{Some}` |
+| 11 | `nvidia-open-model` | `DeployerObligation{guardrails}`, `DownstreamLicenseCopy`, `NoticeFileRequired`, `AttributionRequired`, `AcceptableUsePolicy{Some}` |
+| 12 | `nvidia-nsclv1` | `NonCommercialWeights`, `DownstreamLicenseCopy`, `DownstreamRestrictions`, `AttributionRequired` |
+| 13 | `insightface-research-only` | `NonCommercialWeights` |
+| 14 | `chatglm3-model-license` | `RegistrationRequired{Some}`, `AttributionRequired` |
+| 15 | `apple-mlr` | `NonCommercialWeights`, `DownstreamLicenseCopy`, `AttributionRequired` |
+| 16 | `llama-3-1-community` | `DownstreamLicenseCopy`, `AttributionRequired`, `NoticeFileRequired`, `AcceptableUsePolicy{Some}`, `DeployerObligation{700M MAU}` |
+
+## Terms deliberately NOT landed
+
+| term | where the draft or a first-pass row proposed it | why it is absent |
+| --- | --- | --- |
+| `NonCommercialOutputs` | `insightface-research-only`, `cc-by-nc-4-0` (story draft); `nvidia-nsclv1`, `apple-mlr` (first pass, flagged) | **No quote, anywhere.** All four restrict *use of the weights* and are silent on outputs. Inferring a restriction from silence is a legal reading, not a transcription — **U3** |
+| `GatedAccess` | FLUX, Krea, SD3.5, Gemma (story draft) | Not a licence-text fact. sc-16898 moved it to `ComponentLicense::gated`; conformance now rejects it on a family — **U7** |
+| `AttributionRequired` on `gemma-terms` | first pass, flagged `(?)` | The §3.1 Notice string is the only attribution-shaped obligation; naming it twice is a modelling choice — **U11** |
+| `RegistrationRequired{Some("https://ltx.io/model/licensing")}` | first pass, from the GitHub copy | Not in the text shipped with the weights — **U10** |
+| any `AcceptableUsePolicy` URL for OpenRAIL++, FLUX, LTX-2 | the sc-16661 fixture guessed `https://blackforestlabs.ai/aup` | That URL 404s and appears in no licence text. Landed as `url: None` — **U2** |
+
+## SPDX ids
+
+Three are already committed in `release/model-weight-licenses.json` and were reused verbatim:
+`LicenseRef-Stability-AI-Community`, `LicenseRef-Gemma-Terms`, `LicenseRef-Apple-MLR`. `Apache-2.0`,
+`MIT` and `CC-BY-NC-4.0` are real SPDX identifiers. The remaining ten have no SPDX entry, so a
+`LicenseRef-…` id was minted for each (`LicenseRef-CreativeML-OpenRAIL-PP-M`,
+`LicenseRef-FLUX-1-dev-Non-Commercial`, `LicenseRef-Krea-2-Community`, `LicenseRef-LTX-2-Community`,
+`LicenseRef-CircleStone-Labs-Non-Commercial`, `LicenseRef-NVIDIA-Open-Model`,
+`LicenseRef-NVIDIA-NSCLv1`, `LicenseRef-InsightFace-Research-Only`,
+`LicenseRef-ChatGLM3-6B-Model-License`, `LicenseRef-Llama-3.1-Community`). A minted `LicenseRef-` is
+a naming choice, not a claim about a text — but they are a compatibility boundary once published, so
+**say now if you want different strings.**
+
+## What the tests enforce
+
+`crates/contracts/gen-core/src/license/families.rs` `mod tests` — nine tests:
+
+- every const is in `LICENSE_FAMILIES`, the slice is sorted by id, and every id resolves;
+- `license_table_conformance_errors` is empty over the whole family set;
+- no family declares `GatedAccess`;
+- **no family declares `NonCommercialOutputs`** (with a message pointing back at this document);
+- Stability `Exclusive` vs LTX-2 `Inclusive` vs Krea `Inclusive` at the same amount as Stability;
+- the two flow-down shapes are held apart by exact family lists, and every flow-down names its own
+  family;
+- the addressless policies/registrations are exactly the four expected, and
+  `blackforestlabs.ai` appears nowhere in the emitted manifest;
+- LTX-2's `text_url` is the shipped copy and it carries **no** registration address;
+- a **term census** pinning every family's exact term list.
+
+The census is the tripwire for "no term without a quote". Full linkage is not mechanisable from the
+crate — the quotes live in this Markdown file and the contracts crate reads no files at test time —
+so adding, removing or re-parameterising any term fails the census and sends the author back here.
+
+---
+
 # Q1 — Does the Stable Video Diffusion community licence carry a revenue ceiling?
 
 ## ANSWER: **YES — USD $1,000,000 annual revenue.** SVD-XT is governed by the *Stability AI Community License Agreement*, the same text as SD3.5.
@@ -421,6 +554,13 @@ SVD-XT's. The merge is confirmed on primary sources for both members. See U1.
 ---
 
 # Q2 — Are the three `DownstreamFlowDown` obligations the same obligation?
+
+> **RESOLVED and shipped.** sc-16898 split the bare variant into `DownstreamLicenseCopy{family}`
+> and `DownstreamRestrictions{family}` along exactly the line this section draws. Four families
+> state the heavier restrictions-as-enforceable-provisions shape (`creativeml-openrail-pp-m`,
+> `gemma-terms`, `ltx-2-community`, `nvidia-nsclv1`) and eleven state the lighter copy-of-licence
+> shape; three state **both**. Carrying the family id means eleven distinct duties stay eleven
+> elements of a union instead of deduping to one.
 
 ## ANSWER: **MATERIALLY_DIFFERENT.** And the problem is bigger than three families — **eleven** of the sixteen impose a flow-down, in at least three structurally distinct shapes.
 
@@ -537,9 +677,9 @@ For each family: `[ ]` = unreviewed. Michael ticks when the quote supports the t
 | --- | --- | --- |
 | [ ] | `AttributionRequired` | §4(c) "You must retain, in the Source form of any Derivative Works that You distribute, all copyright, patent, trademark, and attribution notices from the Source form of the Work" |
 | [ ] | `NoticeFileRequired` | §4(d) "If the Work includes a \"NOTICE\" text file as part of its distribution, then any Derivative Works that You distribute must include a readable copy of the attribution notices contained within such NOTICE file" |
-| [ ] | *(?)* `DownstreamFlowDown` | §4(a) "You must give any other recipients of the Work or Derivative Works a copy of this License" — **see U9, draft omits this** |
+| [ ] | `DownstreamLicenseCopy{"apache-2-0"}` | §4(a) "You must give any other recipients of the Work or Derivative Works a copy of this License" — **LANDED.** The sc-16898 split settles **U9**: this is a copy-of-licence duty, and Apache-2.0 states no use restrictions for a downstream agreement to reproduce, so the heavier `DownstreamRestrictions` does not fit. **Confirm.** |
 
-Matches draft. One open question (U9).
+Matches the draft, plus the §4(a) flow-down the draft omitted (U9, now landed as the copy variant).
 
 ---
 
@@ -570,9 +710,9 @@ Matches draft.
 | --- | --- | --- |
 | [ ] | `AttributionRequired` | §3(a)(1) "If You Share the Licensed Material (including in modified form), You must: … retain … identification of the creator(s) of the Licensed Material …; a copyright notice; a notice that refers to this Public License" |
 | [ ] | `NonCommercialWeights` | §1(i) "NonCommercial means not primarily intended for or directed towards commercial advantage or monetary compensation." |
-| [ ] | ⚠ `NonCommercialOutputs` | **no supporting quote found — see U3.** The licence governs Sharing and use of the Licensed Material; it says nothing about material generated by running a model |
+| — | ⚠ `NonCommercialOutputs` | **NOT LANDED** — **no supporting quote found, see U3.** The licence governs Sharing and use of the Licensed Material; it says nothing about material generated by running a model |
 
-Draft asserts both NC terms; only `NonCommercialWeights` is quotable.
+Draft asserts both NC terms; only `NonCommercialWeights` is quotable, and only it is landed.
 
 ---
 
@@ -589,10 +729,10 @@ Draft asserts both NC terms; only `NonCommercialWeights` is quotable.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `DownstreamFlowDown` | Section III "Use-based restrictions as referenced in paragraph 5 MUST be included as an enforceable provision by You in any type of legal agreement … and You shall give notice to subsequent users You Distribute to, that the Model or Derivatives of the Model are subject to paragraph 5." |
+| [ ] | `DownstreamRestrictions{"creativeml-openrail-pp-m"}` | Section III "Use-based restrictions as referenced in paragraph 5 MUST be included as an enforceable provision by You in any type of legal agreement … and You shall give notice to subsequent users You Distribute to, that the Model or Derivatives of the Model are subject to paragraph 5." |
 | [ ] | `AttributionRequired` | Section III "You must retain all copyright, patent, trademark, and attribution notices excluding those notices that do not pertain to any part of the Model" |
 | [ ] | `NoticeFileRequired` | Section III "You must cause any modified files to carry prominent notices stating that You changed the files" |
-| [ ] | ⚠ `AcceptableUsePolicy{url: —}` | **inline, no canonical URL.** The file contains **zero URLs of any kind**. Body: "The restrictions set forth in Attachment A are considered Use-based restrictions. Therefore You cannot use the Model and the Derivatives of the Model for the specified restricted uses." — **see U2** |
+| [ ] | `AcceptableUsePolicy{url: None}` | **LANDED.** **Inline, no canonical URL.** The file contains **zero URLs of any kind**. Body: "The restrictions set forth in Attachment A are considered Use-based restrictions. Therefore You cannot use the Model and the Derivatives of the Model for the specified restricted uses." — **see U2** |
 
 Draft has `AcceptableUsePolicy, DownstreamFlowDown`. Evidence adds `AttributionRequired` and
 `NoticeFileRequired`; the AUP URL is unresolved. The draft's note "commercial permitted" is a
@@ -621,12 +761,12 @@ conclusion, not a term — correctly absent from `terms`.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `RevenueCeiling{1_000_000}` | §III "If at any time You or Your Affiliate(s), either individually or in aggregate, generate **more than** USD $1,000,000 in annual revenue … any licenses granted to You under this Agreement shall terminate as of such date." — **boundary is EXCLUSIVE**; the string "at least" appears nowhere in either file. Verified byte-identical in SD3.5's own file and SVD-XT's (U1). Cf. the intro: "free access … for people or organizations  generating annual revenue of less than US $1,000,000" |
-| [ ] | `RegistrationRequired{"https://stability.ai/community-license"}` | §III "If You are using or distributing the Stability AI Materials for a Commercial Purpose, You must register with Stability AI at (https://stability.ai/community-license)." |
+| [ ] | `RevenueCeiling{1_000_000, Exclusive}` | §III "If at any time You or Your Affiliate(s), either individually or in aggregate, generate **more than** USD $1,000,000 in annual revenue … any licenses granted to You under this Agreement shall terminate as of such date." — **boundary is EXCLUSIVE**; the string "at least" appears nowhere in either file. Verified byte-identical in SD3.5's own file and SVD-XT's (U1). Cf. the intro: "free access … for people or organizations  generating annual revenue of less than US $1,000,000" |
+| [ ] | `RegistrationRequired{Some("https://stability.ai/community-license")}` | §III "If You are using or distributing the Stability AI Materials for a Commercial Purpose, You must register with Stability AI at (https://stability.ai/community-license)." |
 | [ ] | `AttributionRequired` | §IV(a) "prominently display \"Powered by Stability AI\" on a related website, user interface, blogpost, about page, or product documentation" |
 | [ ] | `NoticeFileRequired` | §IV(a) "retain the following attribution notice within a \"Notice\" text file distributed as a part of such copies: \"This Stability AI Model is licensed under the Stability AI Community License, Copyright © Stability AI Ltd. All Rights Reserved\"" |
-| [ ] | `DownstreamFlowDown` | §IV(a) "If You distribute or make available the Stability AI Materials or a Derivative Work to a third party, or a product or service that uses any portion of them, You shall: (i) provide a copy of this Agreement to that third party" |
-| [ ] | `AcceptableUsePolicy{"https://stability.ai/use-policy"}` | §V "\"AUP\" means the Stability AI Acceptable Use Policy available at (https://stability.ai/use-policy), as may be updated from time to time." |
+| [ ] | `DownstreamLicenseCopy{"stability-ai-community"}` | §IV(a) "If You distribute or make available the Stability AI Materials or a Derivative Work to a third party, or a product or service that uses any portion of them, You shall: (i) provide a copy of this Agreement to that third party" |
+| [ ] | `AcceptableUsePolicy{Some("https://stability.ai/use-policy")}` | §V "\"AUP\" means the Stability AI Acceptable Use Policy available at (https://stability.ai/use-policy), as may be updated from time to time." |
 
 **Draft correction — the largest in the table.** Draft #5 (SD3.5) had
 `RevenueCeiling{1_000_000}, AcceptableUsePolicy, AttributionRequired` and draft #6 (SVD-XT) had
@@ -655,10 +795,10 @@ the two are one family, both carry the ceiling, and **both additionally carry
 | --- | --- | --- |
 | [ ] | `NonCommercialWeights` | §2(b) "You may only access, use, Distribute, or create Derivatives of the FLUX.1 [dev] Model or Derivatives for Non-Commercial Purposes." |
 | [ ] | *(NOT `NonCommercialOutputs`)* | §2(d) "You may use Output for any purpose (including for commercial purposes), except as expressly prohibited herein." — draft is **correct** to exclude it |
-| [ ] | `DownstreamFlowDown` | §3(a) "you must make available a copy of this License to third-party recipients of the FLUX.1 [dev] Models and/or Derivatives you Distribute, and specify that any rights to use the FLUX.1 [dev] Models and/or Derivatives shall be directly granted by Company to said third-party recipients pursuant to this License" |
-| [ ] | `DeployerObligation{"implement and maintain content filtering measures"}` | §2(e) "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX.1 [dev] Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful or infringing content" |
-| [ ] | ⚠ `AcceptableUsePolicy{url: —}` | **inline, no canonical URL.** Prohibited uses are inline in §4; the strings "acceptable use" / "use policy" / "AUP" do **not occur anywhere** in the 18,491-char text. The model card's gate prompt cites `.../FLUX.1-dev/blob/main/POLICY.md`, but **that file does not exist** (authenticated `hf download` → "Entry Not Found"; absent from the repo's complete file list) — **see U2** |
-| [ ] | ⚠ `GatedAccess` | not a licence-text fact; HF `gated: auto` — **see U7** |
+| [ ] | `DownstreamLicenseCopy{"flux-1-dev-non-commercial"}` | §3(a) "you must make available a copy of this License to third-party recipients of the FLUX.1 [dev] Models and/or Derivatives you Distribute, and specify that any rights to use the FLUX.1 [dev] Models and/or Derivatives shall be directly granted by Company to said third-party recipients pursuant to this License" |
+| [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §2(e) "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX.1 [dev] Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful or infringing content" |
+| [ ] | `AcceptableUsePolicy{url: None}` | **LANDED.** **Inline, no canonical URL.** Prohibited uses are inline in §4; the strings "acceptable use" / "use policy" / "AUP" do **not occur anywhere** in the 18,491-char text. The model card's gate prompt cites `.../FLUX.1-dev/blob/main/POLICY.md`, but **that file does not exist** (authenticated `hf download` → "Entry Not Found"; absent from the repo's complete file list) — **see U2** |
+| — | ⚠ `GatedAccess` | **NOT LANDED** **on the family** — not a licence-text fact; HF `gated: auto`. Moved to `ComponentLicense::gated` by sc-16898; **U7 closed** |
 
 **Draft correction.** Draft #7 had `NonCommercialWeights, GatedAccess, AcceptableUsePolicy`. Evidence
 adds **`DownstreamFlowDown`** and **`DeployerObligation{content filtering}`** — the draft assigned
@@ -679,15 +819,15 @@ content filtering only to Krea. The draft's note that outputs are commercial-OK 
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `RevenueCeiling{1_000_000}` | §2.3 "Commercial Use under this Agreement of the Krea Model, Derivatives, or Outputs is permitted only if you … have total company-wide annual revenue of less than one million United States dollars ($1,000,000 USD), calculated on a trailing twelve-month basis" |
-| [ ] | `RegistrationRequired{"opensource@krea.ai"}` | §2.3 "If you meet or exceed this threshold, you must obtain a separate enterprise license from Krea prior to any Commercial Use. … Enterprise license inquiries may be directed to opensource@krea.ai." |
-| [ ] | `DownstreamFlowDown` | §3.1 "you shall (a) provide a copy of this Agreement and require each recipient to be bound by the Terms of this Agreement" |
+| [ ] | `RevenueCeiling{1_000_000, Inclusive}` | §2.3 "Commercial Use under this Agreement of the Krea Model, Derivatives, or Outputs is permitted only if you … have total company-wide annual revenue of **less than** one million United States dollars ($1,000,000 USD), calculated on a trailing twelve-month basis", and from the other side: "If you **meet or exceed** this threshold, you must obtain a separate enterprise license". "meet or exceed" puts $1,000,000 exactly **at** the threshold, so the boundary is **INCLUSIVE** — the same amount as Stability with the opposite reading. **This boundary determination is new in the transcription pass; check it first.** |
+| [ ] | `RegistrationRequired{Some("opensource@krea.ai")}` | §2.3 "If you meet or exceed this threshold, you must obtain a separate enterprise license from Krea prior to any Commercial Use. … Enterprise license inquiries may be directed to opensource@krea.ai." |
+| [ ] | `DownstreamLicenseCopy{"krea-2-community"}` | §3.1 "you shall (a) provide a copy of this Agreement and require each recipient to be bound by the Terms of this Agreement" |
 | [ ] | `AttributionRequired` | §3.1(b) "include \"Krea\" at the beginning of any such AI model name" |
 | [ ] | `NoticeFileRequired` | §3.1(c) "retain the following attribution notice within a \"Notice\" text file distributed as part of such copies: \"Krea 2 is licensed under the Krea 2 Community License Agreement.\"" |
-| [ ] | `DeployerObligation{"implement reasonable and appropriate Content Filter measures"}` | §4.2 "You must implement reasonable and appropriate Content Filter measures to detect, prevent, and mitigate the generation or distribution of prohibited, harmful, or unlawful content through your deployment of the Krea Model or any Derivative." |
-| [ ] | `DeployerObligation{"disclose that Outputs were generated using artificial intelligence where required by law"}` | §4.3 "Where required by applicable law, regulation, or platform policy, you must clearly disclose that Outputs were generated using artificial intelligence." |
-| [ ] | ✅ `AcceptableUsePolicy{"https://www.krea.ai/krea-2-use-policy"}` | §4.4 "You must comply with the Acceptable Use Policy, which is incorporated herein by reference." The address is **not** in the PDF but **is** in `krea/Krea-2-Turbo`'s model-card gate prompt: "acknowledge the [Acceptable Use Policy](https://www.krea.ai/krea-2-use-policy)". **URL resolves, HTTP 200**, titled "Krea Acceptable Use Policy", dated June 22, 2026 (= the licence's own date), and scoped to "all use of Krea 2 Raw model weights and Krea 2 Turbo model weights obtained through download". **U2 resolved for this family** |
-| [ ] | ⚠ `GatedAccess` | HF `gated: auto` — see U7 |
+| [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §4.2 "You must implement reasonable and appropriate Content Filter measures to detect, prevent, and mitigate the generation or distribution of prohibited, harmful, or unlawful content through your deployment of the Krea Model or any Derivative." |
+| [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §4.3 "Where required by applicable law, regulation, or platform policy, you must clearly disclose that Outputs were generated using artificial intelligence." |
+| [ ] | ✅ `AcceptableUsePolicy{Some("https://www.krea.ai/krea-2-use-policy")}` | §4.4 "You must comply with the Acceptable Use Policy, which is incorporated herein by reference." The address is **not** in the PDF but **is** in `krea/Krea-2-Turbo`'s model-card gate prompt: "acknowledge the [Acceptable Use Policy](https://www.krea.ai/krea-2-use-policy)". **URL resolves, HTTP 200**, titled "Krea Acceptable Use Policy", dated June 22, 2026 (= the licence's own date), and scoped to "all use of Krea 2 Raw model weights and Krea 2 Turbo model weights obtained through download". **U2 resolved for this family** |
+| — | ⚠ `GatedAccess` | **NOT LANDED** **on the family** — HF `gated: auto`; moved to `ComponentLicense::gated`, U7 closed |
 
 **Draft correction.** Draft #8 had `GatedAccess, AcceptableUsePolicy, DeployerObligation{content
 filtering}`. Evidence adds **`RevenueCeiling{1_000_000}`** (the draft had no ceiling for Krea at all),
@@ -702,13 +842,20 @@ and a second `DeployerObligation`.
 
 ## 8. `ltx-2-community` — LTX-2 Community License Agreement
 
-- **text_url**: ⚠ **two upstream texts exist and they differ — see U10.**
-  - `https://raw.githubusercontent.com/Lightricks/LTX-2/main/LICENSE` (HTTP 200, 21,461 bytes,
-    retrieved 2026-08-02; this is the `license_link` in the HF card metadata) — the copy the quotes
-    below are taken from unless noted.
-  - `https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE` (21,393 bytes, retrieved 2026-08-02)
-    — the copy committed **beside the weights this repo loads**. Same title and date, but it omits
-    the registration URL and inverts the `"Control"` threshold.
+- **text_url — ⚠ TWO upstream texts exist and they differ; see U10. LANDED VALUE:**
+  **`https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE`** (21,393 bytes, retrieved
+  2026-08-02) — the copy committed **beside the weights this repo loads**, i.e. the text a user who
+  downloads the checkpoint actually receives. That is the tie-breaker applied; it is a choice, not a
+  finding, and **Michael must confirm or overrule it**.
+  - The rejected alternative: `https://raw.githubusercontent.com/Lightricks/LTX-2/main/LICENSE`
+    (HTTP 200, 21,461 bytes, retrieved 2026-08-02) — the `license_link` in the HF card metadata.
+    Same title and date. It differs in exactly two operative places: it links the registration
+    address the shipped copy omits, and it inverts the `"Control"` threshold.
+  - **Consequence of the choice**: `RegistrationRequired` lands with **no address**
+    (`contact: None`), because the shipped text names none. `https://ltx.io/model/licensing` is
+    **not** transcribed. Choosing the GitHub copy instead would add that URL and flip `"Control"`
+    from "50% or more" to "more than 50%".
+  - Every other quote below is unaffected: U10 established the two files agree everywhere else.
 
   Both headers: "LTX-2 Community License Agreement / License date: January 5, 2026"
 - **declared upstream**: `ltx-2-community-license-agreement` (HF card `license_name`)
@@ -718,12 +865,14 @@ and a second `DeployerObligation`.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `RevenueCeiling{10_000_000}` | §2 "Entities with annual revenues of **at least** $10,000,000 (the \"Commercial Entities\") are required to obtain a paid commercial use license in order to use LTX-2 and Derivatives of LTX-2" — **boundary is INCLUSIVE**, and this clause is **identical in both upstream copies** (U10), so the ceiling itself is not in doubt |
-| [ ] | ⚠ `RegistrationRequired{"https://ltx.io/model/licensing"}` | **GitHub copy only** — §2 "Commercial Entities interested in such a commercial license are required to [contact Licensor](https://ltx.io/model/licensing)." The HF `LTX-2.3` copy shipped with the weights reads "…are required to contact Licensor." with **no URL**. The URL resolves (HTTP 200) but is not in the shipped text — **see U10** |
-| [ ] | `DownstreamFlowDown` | §3(a) "Use-based restrictions as referenced in paragraph 4 and all provisions of Attachment A MUST be included as an enforceable provision by you in any type of legal agreement … governing the use and/or distribution of LTX-2" ; §3(b) "You must provide any third party recipients of LTX-2 or Derivatives of LTX-2 a copy of this Agreement, including all attachments and use policies." |
+| [ ] | `RevenueCeiling{10_000_000, Inclusive}` | §2 "Entities with annual revenues of **at least** $10,000,000 (the \"Commercial Entities\") are required to obtain a paid commercial use license in order to use LTX-2 and Derivatives of LTX-2" — **boundary is INCLUSIVE**, and this clause is **identical in both upstream copies** (U10), so the ceiling itself is not in doubt |
+| [ ] | ⚠ `RegistrationRequired{contact: None}` | **LANDED.** The shipped `LTX-2.3` copy reads §2 "Commercial Entities interested in such a commercial license are required to contact Licensor." — **no URL**. The GitHub copy reads "…required to [contact Licensor](https://ltx.io/model/licensing)" and that URL resolves (HTTP 200), but it is **not in the text shipped with the weights**, so it is not transcribed. **See U10 — this is the term the text choice decides.** |
+| [ ] | `DownstreamRestrictions{"ltx-2-community"}` | §3(a) "Use-based restrictions as referenced in paragraph 4 and all provisions of Attachment A MUST be included as an enforceable provision by you in any type of legal agreement … governing the use and/or distribution of LTX-2" |
+| [ ] | `DownstreamLicenseCopy{"ltx-2-community"}` | §3(b) "You must provide any third party recipients of LTX-2 or Derivatives of LTX-2 a copy of this Agreement, including all attachments and use policies." — LTX-2 imposes **both** flow-down shapes, which stay two elements of a union |
+| [ ] | `DeployerObligation{"Any Derivative of LTX-2 must be distributed exclusively under the terms of this Agreement with a complete copy of this license included"}` | §3(b), **closely paraphrased** — the source quote elides the subject clause: "(b) … Any Derivative of LTX-2 … must be distributed exclusively under the terms of this Agreement with a complete copy of this license included". A copyleft-shaped constraint neither OpenRAIL++ nor Gemma states, so it is carried separately rather than folded into the flow-down |
 | [ ] | `AttributionRequired` | §3(d) "You must retain all copyright, patent, trademark, and attribution notices excluding those notices that do not pertain to any part of LTX-2" |
 | [ ] | `NoticeFileRequired` | §3(c) "You must cause any modified files to carry prominent notices stating that you changed the files" |
-| [ ] | ⚠ `AcceptableUsePolicy{url: —}` | **referenced, never defined, no address anywhere.** Attachment A "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use Policy. **In addition**, you agree not to use the Outputs…" — the "In addition" implies the AUP is a *separate* document from the enumerated list, yet the term is never defined, the licence's only URL is the GitHub repo, and that repo root holds no policy file — **see U2** |
+| [ ] | `AcceptableUsePolicy{url: None}` | **LANDED.** **Referenced, never defined, no address anywhere.** Attachment A "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use Policy. **In addition**, you agree not to use the Outputs…" — the "In addition" implies the AUP is a *separate* document from the enumerated list, yet the term is never defined, the licence's only URL is the GitHub repo, and that repo root holds no policy file — **see U2** |
 
 **Draft correction.** Draft #9 had `RevenueCeiling{10_000_000}, AcceptableUsePolicy,
 DownstreamFlowDown`. The ceiling amount is confirmed, but note the framing is **inverted** relative
@@ -748,7 +897,7 @@ at *"at least"* $10,000,000 — i.e. inclusive of exactly $10M. If `RevenueCeili
 | --- | --- | --- |
 | [ ] | `NonCommercialWeights` | §2(b) "You may only access, use, Distribute, or create Derivatives of the CircleStone Model or Derivatives for Non-Commercial Purposes, unless otherwise expressly granted by this License." |
 | [ ] | *(NOT `NonCommercialOutputs`)* | §2(e) "You may use Outputs for any purpose (including for commercial purposes), except as expressly prohibited herein." |
-| [ ] | `DownstreamFlowDown` | §3(a) "you must make available a copy of this License to third-party recipients of the CircleStone Models and/or Derivatives you Distribute, and specify that any rights to use the CircleStone Models and/or Derivatives shall be directly granted by Company to said third-party recipients pursuant to this License" |
+| [ ] | `DownstreamLicenseCopy{"circlestone-labs-non-commercial"}` | §3(a) "you must make available a copy of this License to third-party recipients of the CircleStone Models and/or Derivatives you Distribute, and specify that any rights to use the CircleStone Models and/or Derivatives shall be directly granted by Company to said third-party recipients pursuant to this License" |
 | [ ] | `AttributionRequired` | §3 attribution string: "The CircleStone Model is licensed by CircleStone Labs LLC under the CircleStone Non-Commercial License. Copyright CircleStone Labs LLC." |
 
 **Draft correction.** Draft #10 had only `NonCommercialWeights`. Evidence adds `DownstreamFlowDown`
@@ -769,15 +918,16 @@ close relative of FLUX.1 [dev]'s).
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `DownstreamFlowDown` | §3.1 "You must include the use restrictions referenced in Section 3.2 as an enforceable provision in any agreement … and you must provide notice to subsequent users you Distribute to that Gemma or Model Derivatives are subject to the use restrictions in Section 3.2." + "You must provide all third party recipients of Gemma or Model Derivatives a copy of this Agreement." |
+| [ ] | `DownstreamRestrictions{"gemma-terms"}` | §3.1 "You must include the use restrictions referenced in Section 3.2 as an enforceable provision in any agreement … and you must provide notice to subsequent users you Distribute to that Gemma or Model Derivatives are subject to the use restrictions in Section 3.2." |
+| [ ] | `DownstreamLicenseCopy{"gemma-terms"}` | §3.1 "You must provide all third party recipients of Gemma or Model Derivatives a copy of this Agreement." — the same section imposes **both** shapes |
 | [ ] | `NoticeFileRequired` | §3.1 "All Distributions (other than through a Hosted Service) must be accompanied by a \"Notice\" text file that contains the following notice: \"Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms\"." |
-| [ ] | `AcceptableUsePolicy{"https://ai.google.dev/gemma/prohibited_use_policy"}` | §3.2 "You must not use any of the Gemma Services: for the restricted uses set forth in the Gemma Prohibited Use Policy at ai.google.dev/gemma/prohibited_use_policy (\"Prohibited Use Policy\"), which is hereby incorporated by reference into this Agreement" |
-| [ ] | *(?)* `AttributionRequired` | the §3.1 Notice string is the only attribution obligation; whether it is *also* `AttributionRequired` or *only* `NoticeFileRequired` is a modelling choice for Michael |
-| [ ] | ⚠ `GatedAccess` | `gemma-2-2b-it` is `gated: manual` — see U7 |
+| [ ] | `AcceptableUsePolicy{Some("https://ai.google.dev/gemma/prohibited_use_policy")}` | §3.2 "You must not use any of the Gemma Services: for the restricted uses set forth in the Gemma Prohibited Use Policy at ai.google.dev/gemma/prohibited_use_policy (\"Prohibited Use Policy\"), which is hereby incorporated by reference into this Agreement" |
+| — | *(?)* `AttributionRequired` | **NOT LANDED** — **new item U11.** The §3.1 Notice string is the only attribution-shaped obligation; calling one obligation two terms is a modelling choice, not a transcription, so `gemma-terms` carries `NoticeFileRequired` only. **Decide.** |
+| — | ⚠ `GatedAccess` | **NOT LANDED** **on the family** — `gemma-2-2b-it` is `gated: manual`; moved to `ComponentLicense::gated`, U7 closed |
 | | *(no `NonCommercial*`)* | §3.3 "Google claims no rights in Outputs you generate using Gemma." |
 
-**Matches the draft** (`AcceptableUsePolicy, DownstreamFlowDown, NoticeFileRequired`) — the only
-draft row that survives intact. Note the Hosted-Service carve-out in §3.1, which is the scope
+**Matches the draft** (`AcceptableUsePolicy`, flow-down, `NoticeFileRequired`) — the only draft row
+that survives intact, though the single draft flow-down turns out to be two. Note the Hosted-Service carve-out in §3.1, which is the scope
 difference discussed in Q2.
 
 ---
@@ -794,11 +944,11 @@ difference discussed in Q2.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `DeployerObligation{"do not bypass, disable, or circumvent any safety guardrail without a substantially similar guardrail"}` | §2 "If You bypass, disable, reduce the efficacy of, or circumvent any technical limitation, safety guardrail or associated safety guardrail hyperparameter, encryption, security, digital rights management, or authentication mechanism … contained in the Model without a substantially similar Guardrail appropriate for your use case, your rights under this Agreement will automatically terminate." |
-| [ ] | `DownstreamFlowDown` | §3 "If you distribute the Model, You must give any other recipients of the Model a copy of this Agreement" |
+| [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §2 "If You bypass, disable, reduce the efficacy of, or circumvent any technical limitation, safety guardrail or associated safety guardrail hyperparameter, encryption, security, digital rights management, or authentication mechanism … contained in the Model without a substantially similar Guardrail appropriate for your use case, your rights under this Agreement will automatically terminate." |
+| [ ] | `DownstreamLicenseCopy{"nvidia-open-model"}` | §3 "If you distribute the Model, You must give any other recipients of the Model a copy of this Agreement" |
 | [ ] | `NoticeFileRequired` | §3 "include the following attribution notice within a \"Notice\" text file with such copies: \"Licensed by NVIDIA Corporation under the NVIDIA Open Model License\"" |
 | [ ] | `AttributionRequired` | same clause as above |
-| [ ] | `AcceptableUsePolicy{"https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/"}` | §3 "AI Ethics. Use of the Models under the Agreement must be consistent with NVIDIA's Trustworthy AI terms found at https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/." |
+| [ ] | `AcceptableUsePolicy{Some("https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/")}` | §3 "AI Ethics. Use of the Models under the Agreement must be consistent with NVIDIA's Trustworthy AI terms found at https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/." |
 | | *(commercially usable)* | §1 "Models are commercially usable." — a fact, no term |
 
 **Draft correction.** Draft #12 had only `DeployerObligation{safety guardrails}`. Evidence adds four
@@ -822,9 +972,10 @@ more terms — and, more importantly, this family covers **only** the Open Model
 | ✔ | term | verbatim support |
 | --- | --- | --- |
 | [ ] | `NonCommercialWeights` | §3.3 "The Work and any derivative works thereof only may be used or intended for use non-commercially. … As used herein, \"non-commercially\" means for research or evaluation purposes only." |
-| [ ] | `DownstreamFlowDown` | §3.1 "You may reproduce or distribute the Work only if (a) you do so under this license, (b) you include a complete copy of this license with your distribution" ; §3.2 "Your Terms provide that the use limitation in Section 3.3 applies to your derivative works" |
+| [ ] | `DownstreamLicenseCopy{"nvidia-nsclv1"}` | §3.1 "You may reproduce or distribute the Work only if (a) you do so under this license, (b) you include a complete copy of this license with your distribution" |
+| [ ] | `DownstreamRestrictions{"nvidia-nsclv1"}` | §3.2 "Your Terms provide that the use limitation in Section 3.3 applies to your derivative works" — the restriction must survive into the deployer's own terms, which is the heavier shape, imposed here **alongside** the copy duty |
 | [ ] | `AttributionRequired` | §3.1(c) "you retain without modification any copyright, patent, trademark, or attribution notices that are present in the Work" |
-| [ ] | ⚠ `NonCommercialOutputs` | **no supporting quote — see U3.** `mlx-gen-pid/src/lib.rs` asserts "The NC restriction flows to PiD-decoded output", but that is SceneWorks' own reading, not NVIDIA's words |
+| — | ⚠ `NonCommercialOutputs` | **NOT LANDED** — **no supporting quote, see U3.** `mlx-gen-pid/src/lib.rs` asserts "The NC restriction flows to PiD-decoded output", but that is SceneWorks' own reading, not NVIDIA's words |
 
 **This family does not exist in the draft.** Merging PiD into `nvidia-open-model` would attach a
 commercially-usable licence's terms to non-commercial weights — the single most consequential
@@ -847,10 +998,10 @@ correction in this note after Q1.
 | ✔ | term | verbatim support |
 | --- | --- | --- |
 | [ ] | `NonCommercialWeights` | README §License "The training data containing the annotation (and the models trained with these data) are available for non-commercial research purposes only." |
-| [ ] | ⚠ `NonCommercialOutputs` | **no supporting quote — see U3.** The prose restricts model availability/use; it says nothing about generated images |
+| — | ⚠ `NonCommercialOutputs` | **NOT LANDED** — **no supporting quote, see U3.** The prose restricts model availability/use; it says nothing about generated images. **This reverses the story's draft table for insightface, deliberately.** |
 | | *(context)* | README §License "The code of InsightFace is released under the MIT License. There is no limitation for both academic and commercial usage." — the MIT grant is **code only** |
 
-**Draft asserts both NC terms; only the first is quotable.** Additionally flag the *evidence quality*:
+**Draft asserts both NC terms; only the first is quotable, and only it is landed.** Additionally flag the *evidence quality*:
 a README sentence is the weakest source in this whole table, and it is attached to the checkpoints
 the story describes as carrying the strictest terms in the catalog. Michael may want a stronger
 basis (or a decision to stop shipping them) rather than a table row.
@@ -870,7 +1021,7 @@ basis (or a decision to stop shipping them) rather than a table row.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `RegistrationRequired{"https://open.bigmodel.cn/mla/form"}` | §2 "This license permits you to use all open-source models in this repository for academic research free. Users who wish to use the models for commercial purposes must register [here](https://open.bigmodel.cn/mla/form)." |
+| [ ] | `RegistrationRequired{Some("https://open.bigmodel.cn/mla/form")}` | §2 "This license permits you to use all open-source models in this repository for academic research free. Users who wish to use the models for commercial purposes must register [here](https://open.bigmodel.cn/mla/form)." |
 | [ ] | `AttributionRequired` | §2 "The license notice shall be included in all copies or substantial portions of the Software." |
 | | *(context)* | §2 "Registered users may use the models for commercial activities free of charge, but must comply with all terms and conditions of this license." |
 
@@ -891,9 +1042,9 @@ Draft had `RegistrationRequired` only; evidence adds `AttributionRequired`.
 | ✔ | term | verbatim support |
 | --- | --- | --- |
 | [ ] | `NonCommercialWeights` | §1 "limited license, to use, copy, modify, distribute, and create Model Derivatives … exclusively for Research Purposes. … \"Research Purposes\" does not include any commercial exploitation, product development or use in any commercial product or service." |
-| [ ] | `DownstreamFlowDown` | §2 "If you choose to redistribute Apple Machine Learning Research Model or its Model Derivatives, you must provide a copy of this Agreement to such third party" |
+| [ ] | `DownstreamLicenseCopy{"apple-mlr"}` | §2 "If you choose to redistribute Apple Machine Learning Research Model or its Model Derivatives, you must provide a copy of this Agreement to such third party" |
 | [ ] | `AttributionRequired` | §2 "ensure that the following attribution notice be provided: \"Apple Machine Learning Research Model is licensed under the Apple Machine Learning Research Model License Agreement.\"" |
-| [ ] | ⚠ `NonCommercialOutputs` | no supporting quote — see U3 |
+| — | ⚠ `NonCommercialOutputs` | **NOT LANDED** — no supporting quote, see U3 |
 
 **Absent from the draft entirely**, despite already being committed weight-licence data. This is the
 strictest licence in the audio catalog and the reason both MMAudio composite rows carry
@@ -913,11 +1064,11 @@ strictest licence in the audio catalog and the reason both MMAudio composite row
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `DownstreamFlowDown` | §1(b)(i) "you shall (A) provide a copy of this Agreement with any such Llama Materials" |
+| [ ] | `DownstreamLicenseCopy{"llama-3-1-community"}` | §1(b)(i) "you shall (A) provide a copy of this Agreement with any such Llama Materials" |
 | [ ] | `AttributionRequired` | §1(b)(i) "prominently display \"Built with Llama\" on a related website, user interface, blogpost, about page, or product documentation" |
 | [ ] | `NoticeFileRequired` | §1(b)(iii) "You must retain in all copies of the Llama Materials that you distribute the following attribution notice within a \"Notice\" text file distributed as a part of such copies: \"Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.\"" |
-| [ ] | `AcceptableUsePolicy{"https://llama.meta.com/llama3_1/use-policy"}` | §1(b)(iv) "adhere to the Acceptable Use Policy for the Llama Materials (available at https://llama.meta.com/llama3_1/use-policy), which is hereby incorporated by reference into this Agreement" |
-| [ ] | ⚠ *(no variant fits)* | §2 "If, on the Llama 3.1 version release date, the monthly active users … is greater than 700 million monthly active users in the preceding calendar month, you must request a license from Meta" — **see U8** |
+| [ ] | `AcceptableUsePolicy{Some("https://llama.meta.com/llama3_1/use-policy")}` | §1(b)(iv) "adhere to the Acceptable Use Policy for the Llama Materials (available at https://llama.meta.com/llama3_1/use-policy), which is hereby incorporated by reference into this Agreement" |
+| [ ] | `DeployerObligation{"If, on the Llama 3.1 version release date, the monthly active users … is greater than 700 million monthly active users in the preceding calendar month, you must request a license from Meta"}` | §2, quoted with the source's own elision. **LANDED.** No typed variant carries a user-count threshold, and `RevenueCeiling` would be a false transcription — the contract directs such conditions to `DeployerObligation` verbatim. **U8: confirm.** |
 
 Note the crates' own doc comments describe JoyCaption's *prompt table* as Apache-2.0. That is the
 source licence of a data file, not the weights. Absent from the draft entirely.
@@ -1042,40 +1193,61 @@ Gating status was read from the Hugging Face model API (`https://huggingface.co/
 
 # Sign-off
 
-Michael: tick each family's terms above, then record the outcome here. Nothing downstream of this
-story (the `LicenseFamily` consts, the catalog tables, the schema-3 manifest) should land until the
-U-items are resolved, because each unresolved item is a term that would otherwise be transcribed on
-a guess.
+**Nothing here is signed off.** The `LicenseFamily` consts are landed and marked PROVISIONAL in
+their own module docs. They are landed rather than held because the surface is disclosure-only — a
+wrong value shows a user a wrong sentence, it does not block a render — and because a compiled table
+is easier to review than a branch. Everything downstream of this story (the component rows sc-16665,
+the schema-3 manifest sc-16664, the drift job sc-16670) should wait on the ticks below.
+
+## 1. Per-family quote check
+
+For each family: read the quote in its section above, decide whether it supports the term, tick.
 
 | family | reviewed | notes |
 | --- | --- | --- |
-| 1 `apache-2-0` | [ ] | |
+| 1 `apache-2-0` | [ ] | flow-down is new vs the draft — U9 |
 | 2 `mit` | [ ] | |
-| 3 `cc-by-nc-4-0` | [ ] | |
-| 4 `creativeml-openrail-pp-m` | [ ] | |
-| 5 `stability-ai-community` | [ ] | |
-| 6 `flux-1-dev-non-commercial` | [ ] | |
-| 7 `krea-2-community` | [ ] | |
-| 8 `ltx-2-community` | [ ] | |
+| 3 `cc-by-nc-4-0` | [ ] | `NonCommercialOutputs` dropped — U3 |
+| 4 `creativeml-openrail-pp-m` | [ ] | AUP has no address — U2 |
+| 5 `stability-ai-community` | [ ] | merged #5/#6; ceiling **Exclusive** |
+| 6 `flux-1-dev-non-commercial` | [ ] | AUP has no address — U2 |
+| 7 `krea-2-community` | [ ] | **ceiling boundary Inclusive is a new determination** |
+| 8 `ltx-2-community` | [ ] | **two upstream texts — U10 is the decision** |
 | 9 `circlestone-labs-non-commercial` | [ ] | |
-| 10 `gemma-terms` | [ ] | |
-| 11 `nvidia-open-model` | [ ] | |
-| 12 `nvidia-nsclv1` | [ ] | |
-| 13 `insightface-research-only` | [ ] | |
+| 10 `gemma-terms` | [ ] | `AttributionRequired` withheld — U11 |
+| 11 `nvidia-open-model` | [ ] | may have no checkpoint — U4 |
+| 12 `nvidia-nsclv1` | [ ] | `NonCommercialOutputs` dropped — U3 |
+| 13 `insightface-research-only` | [ ] | README prose is the whole evidence; `NonCommercialOutputs` dropped — U3 |
 | 14 `chatglm3-model-license` | [ ] | |
-| 15 `apple-mlr` | [ ] | |
-| 16 `llama-3-1-community` | [ ] | |
+| 15 `apple-mlr` | [ ] | `NonCommercialOutputs` dropped — U3 |
+| 16 `llama-3-1-community` | [ ] | 700M-MAU as `DeployerObligation` — U8 |
+
+## 2. Decisions
+
+Items marked **DECIDE** were taken by the transcription pass and are reversible in one commit; items
+marked **confirm** are readings the evidence supports but a human has not endorsed.
 
 | decision | outcome |
 | --- | --- |
-| U1 SD3.5 gated text | ✅ **CLOSED 2026-08-02** — read under HF account `SceneWorks`; cosmetic differences only, revenue clause byte-identical, ceiling "more than USD $1,000,000" (exclusive). #5/#6 merge stands. No decision needed |
-| U2 `AcceptableUsePolicy` with no URL | **Narrowed.** Krea resolved → `https://www.krea.ai/krea-2-use-policy`. OpenRAIL++ / FLUX / LTX-2 confirmed to have **no canonical URL**; decision still needed on the convention for those three |
-| U3 `NonCommercialOutputs` from a use restriction | |
-| U4 `nvidia-open-model` has no checkpoint | |
-| U5 `candle-gen-sana/NOTICE` correction | |
-| U6 Kolors repo-level licence | |
-| U7 `GatedAccess` on family vs component | |
-| U8 Llama 700M MAU has no variant | |
-| U9 Apache-2.0 §4(a) as flow-down | |
-| U10 which of LTX-2's two texts governs | |
-| Q2 does `DownstreamFlowDown` carry the family id? | |
+| U1 SD3.5 gated text | ✅ **CLOSED 2026-08-02** — read under HF account `SceneWorks`; cosmetic differences only, revenue clause byte-identical, ceiling "more than USD $1,000,000" (**Exclusive**). #5/#6 merge stands. No decision needed |
+| U2 `AcceptableUsePolicy` with no URL | **DECIDE.** Krea resolved → `https://www.krea.ai/krea-2-use-policy`. For OpenRAIL++ / FLUX / LTX-2 the **contract was amended**: `AcceptableUsePolicy::url` is now `Option`, and those three land `None`. No URL was invented; `https://blackforestlabs.ai/aup` is asserted absent by a test. Confirm the convention, or say you would rather point `url` at the licence text itself |
+| U3 `NonCommercialOutputs` from a use restriction | **DECIDE.** Not landed on any family — no quote exists for it. Reverses the story's draft for `insightface-research-only` and `cc-by-nc-4-0`. If you read silence as reaching outputs, that is a legal determination and it should be recorded here as one, with your name on it |
+| U4 `nvidia-open-model` has no checkpoint | **OPEN.** Family landed (its text is real and was read); whether any shipped checkpoint declares it is a component question. Settle before sc-16665 |
+| U5 `candle-gen-sana/NOTICE` correction | **OPEN.** SANA's weights read Apache-2.0 on primary sources, not an NVIDIA family. Needs its own story; untouched here |
+| U6 Kolors repo-level licence | **OPEN.** A component question, deferred to sc-16665 |
+| U7 `GatedAccess` on family vs component | ✅ **CLOSED by sc-16898** — moved to `ComponentLicense::gated`; conformance rejects it on a family; a test asserts no family declares it |
+| U8 Llama 700M MAU has no variant | **confirm.** Landed as a verbatim `DeployerObligation`, per the contract's own guidance. Not laundered into a `RevenueCeiling`, and a contract test asserts that |
+| U9 Apache-2.0 §4(a) as flow-down | **confirm.** Landed as `DownstreamLicenseCopy{"apache-2-0"}`. The sc-16898 split makes the answer mechanical: §4(a) is a copy duty and Apache states no restrictions to flow down |
+| U10 which of LTX-2's two texts governs | **DECIDE — the most consequential open item.** Landed from the copy **shipped beside the weights** (`Lightricks/LTX-2.3` `LICENSE`), so `RegistrationRequired{contact: None}`. Choosing the GitHub copy instead adds `https://ltx.io/model/licensing` and flips `"Control"` from "50% or more" to "more than 50%" |
+| U11 Gemma `AttributionRequired` (new) | **DECIDE.** Not landed; `gemma-terms` carries `NoticeFileRequired` only |
+| Krea ceiling boundary (new) | **confirm.** §2.3's "meet or exceed" reads **Inclusive** — the same $1,000,000 as Stability with the opposite boundary. This determination was made in the transcription pass, not the evidence pass |
+| Q1 SVD-XT revenue ceiling | ✅ **ANSWERED** — yes, $1,000,000, same text as SD3.5 |
+| Q2 do the flow-downs differ? | ✅ **ANSWERED and shipped** — materially different; two variants, each carrying its family |
+
+## 3. Sign-off
+
+| | |
+| --- | --- |
+| Reviewed by | **_(pending — Michael)_** |
+| Date | **_(pending)_** |
+| Outcome | **_(pending)_** |
