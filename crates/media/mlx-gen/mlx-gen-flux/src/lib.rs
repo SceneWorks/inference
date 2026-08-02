@@ -40,7 +40,7 @@ pub use model_control::{descriptor_dev_control, load_dev_control, Flux1DevContro
 pub use pipeline::{
     build_linear_sigmas, create_noise, image_seq_len, pack_latents, unpack_latents,
 };
-pub use text_encoder::{ClipTextEncoder, FluxTextEncoders, T5TextEncoder};
+pub use text_encoder::{ClipTextEncoder, FluxTextEncoders, T5Sublayer, T5TextEncoder};
 pub use transformer::{FluxTransformer, FluxTransformerConfig};
 
 /// sc-16209 Apple-Silicon warm sweep: FLUX.1 Dev bf16 peaked below 14.06 GiB at 1024².

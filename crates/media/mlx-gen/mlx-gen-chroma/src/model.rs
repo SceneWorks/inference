@@ -133,7 +133,7 @@ fn load_text_only(variant: ChromaVariant, spec: &LoadSpec) -> Result<ChromaTextO
     let root = resolve_root(variant, spec)?;
     let mut t5 = loader::load_t5_encoder(root)?;
     if let Some(q) = spec.quantize {
-        t5.quantize(q.bits())?;
+        t5.quantize_linears(q.bits())?;
     }
     Ok(ChromaTextOwned {
         tokenizer: loader::load_tokenizer()?,
