@@ -13,9 +13,13 @@
 //! # Why `memory_strategy` and not `memory` (SC-15804)
 //!
 //! The contract carried an `Image*` prefix through SC-15449 because the image lane adopted it
-//! first. Nothing in the four-rung ladder is image-specific — rung 1 sheds a conditioning
-//! component, rung 2 bounds decoder scratch, rung 3 bounds attention, rung 4 bounds transformer
-//! residency, and video and audio have all four — so the vocabulary is lane-neutral here.
+//! first. Nothing in the four-rung ladder's mechanisms is image-specific: rung 1 sheds a
+//! conditioning component, rung 2 bounds decoder scratch, rung 3 bounds attention, and rung 4
+//! bounds transformer residency. Those mechanisms can apply to video and audio providers, so the
+//! vocabulary is lane-neutral; that applicability does not claim adoption coverage. At the
+//! sc-16595 review point (F-200, 2026-08-01 review), audio had no registered memory-strategy
+//! contract. sc-16998 separately tracks the first Stable Audio 3 adoption and non-vacuous audio
+//! catalog conformance.
 //!
 //! It is deliberately **not** the bare name `memory`. Five crates in this workspace already have a
 //! `memory` module, meaning two different things: `mlx_gen::memory` is the MLX budget interface
