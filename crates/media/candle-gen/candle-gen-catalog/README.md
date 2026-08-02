@@ -40,6 +40,13 @@ that every descriptor is on the `candle` backend, and runs the weights-free desc
 conformance sweep. Changing the shipped surface requires an intentional update to that test —
 that edit is the review point where platform inclusion becomes visible.
 
+The `preview_advertising` test module (epic 16948, sc-16951) guards `Capabilities::supports_preview`
+the same way, in both directions — but against the provider **sources** rather than against a second
+hand-kept list. A crate whose sources hand a preview hook to a sampler driver must advertise, and a
+descriptor that advertises must have wiring behind it. **A story that wires a family amends that
+module in its own PR**: add the family's exact route ids to `PREVIEW_ROUTE_IDS` and flip its
+descriptors — the build fails until both happen. Weights-free, like the rest of the contract.
+
 Consumers reach this catalog through the [`runtime-cuda`](../../../bundles/runtime-cuda/README.md)
 and [`runtime-cpu`](../../../bundles/runtime-cpu/README.md) bundles, which validate it against
 the Candle backend and pair it with the Candle LLM and snapshot-preparer catalogs.
