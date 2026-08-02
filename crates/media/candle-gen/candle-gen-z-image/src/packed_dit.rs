@@ -688,6 +688,10 @@ pub struct ZImageTransformer2DModel {
     layers: TransformerLayers,
     rope_embedder: RopeEmbedder,
     cfg: Config,
+    /// Per-instance scheduler trace for mutation-sensitive plain-forward tests. Test-only and
+    /// mutex-backed so parallel tests never share recorder state.
+    #[cfg(test)]
+    streamed_window_trace: std::sync::Mutex<Vec<(usize, usize)>>,
 }
 
 /// Main-stack residency for ladder rung 4. The front-end, refiners, and final projection remain
@@ -816,6 +820,8 @@ impl ZImageTransformer2DModel {
             layers,
             rope_embedder,
             cfg: cfg.clone(),
+            #[cfg(test)]
+            streamed_window_trace: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1086,6 +1092,9 @@ impl ZImageTransformer2DModel {
                     unified,
                     || Ok(weights.clone()),
                     |mut state, view, range| {
+                        #[cfg(test)]
+                        candle_gen::lock_recover(&self.streamed_window_trace)
+                            .push((range.start, range.end));
                         // Materialize the whole window before the first forward. Loading inside the
                         // block loop would silently execute a window of one regardless of selection.
                         let blocks = range
@@ -1133,6 +1142,11 @@ impl ZImageTransformer2DModel {
             f_patch_size,
             self.cfg.in_channels,
         )?)
+    }
+
+    #[cfg(test)]
+    fn streamed_window_trace(&self) -> Vec<(usize, usize)> {
+        candle_gen::lock_recover(&self.streamed_window_trace).clone()
     }
 
     /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
@@ -1484,7 +1498,7 @@ mod parity_tests {
     }
 
     #[test]
-    fn plain_forward_window_is_storage_aware() {
+    fn plain_forward_drives_streamed_storage_through_bounded_windows() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         assert!(
@@ -1495,12 +1509,48 @@ mod parity_tests {
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let resident = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
         let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let plan = plan_from_budget(candle_gen::ATTN_SCORES_BUDGET);
 
-        assert_eq!(resident.plain_forward_transformer_window(), cfg.n_layers);
+        let resident_output = resident
+            .forward_with_attention_plan(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan,
+            )
+            .unwrap();
+        let streamed_output = streamed
+            .forward_with_attention_plan(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                plan,
+            )
+            .unwrap();
+        let diff = (&resident_output - &streamed_output)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-5, "storage choice changed the output by {diff}");
+        assert!(
+            resident.streamed_window_trace().is_empty(),
+            "resident storage must preserve its direct traversal"
+        );
         assert_eq!(
-            streamed.plain_forward_transformer_window(),
-            crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW,
-            "the implicit streamed path must not materialize the full trunk"
+            streamed.streamed_window_trace(),
+            vec![(0, 1), (1, 2)],
+            "the actual plain-forward wiring must schedule the streamed trunk one bounded window \
+             at a time"
         );
     }
 
