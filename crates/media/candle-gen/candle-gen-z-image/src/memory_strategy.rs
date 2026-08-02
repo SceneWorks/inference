@@ -168,7 +168,7 @@ pub(crate) fn control_contract(
         },
     );
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        format!("{provider_id}-cuda-control-v1"),
+        format!("{}-cuda-control-v1", provider_id.replace('_', "-")),
         LoadShape::EagerMaterialization,
     ));
     Ok(contract)
@@ -805,6 +805,10 @@ mod tests {
         for id in ["z_image_turbo_control", "z_image_control"] {
             let contract = control_contract(id, &spec()).unwrap();
             assert!(contract.conformance_errors().is_empty());
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                format!("{}-cuda-control-v1", id.replace('_', "-"))
+            );
             assert_eq!(
                 contract
                     .capability(MemoryStrategy::BoundedTransformerResidency)

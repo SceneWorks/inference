@@ -8,6 +8,10 @@ from pathlib import Path
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
 RESIDENCY_SCRIPT = WORKFLOW.parents[2] / "scripts" / "release" / "run-residency-ab.ps1"
+QWEN_MEMORY_STRATEGY = (
+    WORKFLOW.parents[2]
+    / "crates/media/candle-gen/candle-gen-qwen-image/src/memory_strategy.rs"
+)
 
 
 def job_if_expression(workflow: str, job: str) -> str:
@@ -257,6 +261,68 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("qwen_image_probed_generate_for_offload_ab", script)
         self.assertIn("flux_dev_probed_generate_for_offload_ab", script)
         self.assertEqual(script.count("--features cuda"), 1)
+        qwen_source = QWEN_MEMORY_STRATEGY.read_text(encoding="utf-8")
+        fingerprint = re.search(
+            r'pub const CALIBRATION_FINGERPRINT: &str =\s*"([^"]+)"',
+            qwen_source,
+        )
+        self.assertIsNotNone(fingerprint)
+        qwen_fingerprint = fingerprint.group(1)
+        self.assertEqual(script.count(qwen_fingerprint), 1)
+        self.assertEqual(script.count("$QwenCalibrationFingerprint"), 4)
+        self.assertNotIn("qwen-image-cuda-residency-v1", script)
+
+    def test_memory_evidence_v1_lane_is_exact_artifact_bound_and_operator_dispatched(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  mlx-memory-evidence-v1:")
+        end = workflow.index("\n  mlx-llm:", start)
+        job = workflow[start:end]
+
+        self.assertIn("memory-evidence-v1", workflow.split("jobs:", 1)[0])
+        self.assertIn("sceneworks_revision:", workflow.split("jobs:", 1)[0])
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'memory-evidence-v1'",
+            job,
+        )
+        self.assertIn("INFERENCE_REVISION: ${{ github.sha }}", job)
+        self.assertIn("ZIMAGE_SEQ_SIZE: 512", job)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"', job)
+        self.assertIn("git diff --quiet", job)
+        self.assertIn("git diff --cached --quiet", job)
+        self.assertIn("ensure_model_snapshot.py", job)
+        self.assertIn("SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance", job)
+        self.assertIn("https://github.com/SceneWorks/SceneWorks.git", job)
+        self.assertIn('fetch --depth=1 origin "${{ inputs.sceneworks_revision }}"', job)
+        self.assertIn('git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD', job)
+        self.assertIn('echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"', job)
+        self.assertGreaterEqual(
+            job.count('test -z "$(git status --porcelain --untracked-files=normal)"'),
+            2,
+        )
+        self.assertIn("verify_model_snapshot.py", job)
+        self.assertIn("--inventory-output", job)
+        self.assertIn("MEMORY_MODEL_INVENTORY_SHA256", job)
+        self.assertIn('echo "MEMORY_MODEL_REVISION=$model_revision" >> "$GITHUB_ENV"', job)
+        self.assertIn("MEMORY_MODEL_INVENTORY_AFTER", job)
+        self.assertIn('cmp -s "$MEMORY_MODEL_INVENTORY" "$MEMORY_MODEL_INVENTORY_AFTER"', job)
+        self.assertIn("--model z-image-turbo", job)
+        self.assertIn("sequential_bounds_peak_and_is_byte_identical", job)
+        self.assertIn("--ignored --exact --test-threads=1 --nocapture", job)
+        self.assertIn("set -o pipefail", job)
+        self.assertIn("verify_residency_ab.py", job)
+        self.assertIn("--min-reduction-mib 512", job)
+        self.assertIn("--expected-fingerprint z-image-mlx-independent-materialization-v3", job)
+        self.assertIn("--expected-abi 3", job)
+        self.assertIn("--expected-model-revision", job)
+        self.assertIn("--expected-model-inventory-sha256", job)
+        self.assertIn("z_image_turbo-resident.rgb", job)
+        self.assertIn("z_image_turbo-staged.rgb", job)
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertNotIn("if: always()", job)
+        self.assertIn("z-image-turbo-model-inventory.json", job)
+        self.assertIn("verifier-result.txt", job)
+        self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
 
     def test_windows_cuda_check_rejects_fork_prs_but_preserves_trusted_events(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
