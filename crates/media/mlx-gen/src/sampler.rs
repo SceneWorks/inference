@@ -538,8 +538,37 @@ pub fn run_flow_sampler(
     on_progress: &mut dyn FnMut(Progress),
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
+    run_flow_sampler_with_latent_hook(
+        sampler_name,
+        conv,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |_, _| {},
+        predict,
+    )
+}
+
+/// [`run_flow_sampler`] with a best-effort observer of the raw flow latent at each actual outer
+/// solver step. Multi-evaluation solvers expose only their outer-step input: Heun correctors and
+/// DPM++ SDE midpoint evaluations are suppressed by [`run_curated_sampler_with_latent_hook`]. The
+/// legacy wrapper supplies an inert observer and therefore preserves the numerical path exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler_with_latent_hook(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    on_latent: impl FnMut(&Array, f32),
+    predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler(
+    run_curated_sampler_with_latent_hook(
         sampler_name,
         &ms,
         sigmas,
@@ -547,6 +576,7 @@ pub fn run_flow_sampler(
         seed,
         cancel,
         on_progress,
+        on_latent,
         predict,
     )
 }
@@ -1380,6 +1410,58 @@ mod tests {
         let explicit = run_curated_sampler_with_latent_hook(
             Some("euler"),
             &ms,
+            &sigmas,
+            init,
+            42,
+            &cancel,
+            &mut progress,
+            |_, _| {},
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        assert_eq!(legacy.as_slice::<f32>(), explicit.as_slice::<f32>());
+    }
+
+    #[test]
+    fn flow_hook_observes_outer_steps_and_inert_wrapper_is_exact() {
+        let sigmas = vec![1.0_f32, 0.75, 0.5, 0.25, 0.0];
+        let init = arr(&[0.3, -1.1, 2.0]);
+        let cancel = CancelFlag::new();
+
+        for solver in ["heun", "dpmpp_sde"] {
+            let mut observed = Vec::new();
+            let mut progress = |_p: Progress| {};
+            run_flow_sampler_with_latent_hook(
+                Some(solver),
+                TimestepConvention::Sigma,
+                &sigmas,
+                init.clone(),
+                7,
+                &cancel,
+                &mut progress,
+                |_latent, sigma| observed.push(sigma),
+                |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+            )
+            .unwrap();
+            assert_eq!(observed, sigmas[..4], "{solver} leaked an inner evaluation");
+        }
+
+        let mut progress = |_p: Progress| {};
+        let legacy = run_flow_sampler(
+            Some("euler"),
+            TimestepConvention::Sigma,
+            &sigmas,
+            init.clone(),
+            42,
+            &cancel,
+            &mut progress,
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        let mut progress = |_p: Progress| {};
+        let explicit = run_flow_sampler_with_latent_hook(
+            Some("euler"),
+            TimestepConvention::Sigma,
             &sigmas,
             init,
             42,

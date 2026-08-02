@@ -29,6 +29,7 @@ pub mod model;
 pub mod model_control;
 pub mod pipeline;
 pub mod pos_embed;
+pub mod preview;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
@@ -125,6 +126,21 @@ mod explicit_registry_tests {
                 "flux2_dev_edit",
                 "flux2_dev_control",
             ]
+        );
+
+        let preview_ids: Vec<_> = registry
+            .generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                descriptor
+                    .capabilities
+                    .supports_preview
+                    .then_some(descriptor.id)
+            })
+            .collect();
+        assert_eq!(
+            preview_ids, explicit,
+            "every and only FLUX.2 route previews"
         );
     }
 
