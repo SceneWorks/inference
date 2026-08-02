@@ -935,6 +935,7 @@ mod tests {
                 1024,
                 Some(GenerationMemory {
                     calibration_error_phase: Some(named),
+                    calibration_fault_harness_authorized: true,
                     ..Default::default()
                 }),
             );

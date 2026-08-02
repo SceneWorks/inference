@@ -276,7 +276,7 @@ impl Chroma {
         self.residency
             .with_resident_parts(|text, heavy| {
                 f(&text.tokenizer, &text.t5, &heavy.transformer, &heavy.vae)
-            })
+            })?
             .ok_or_else(|| {
                 Error::Msg(format!(
                     "{}: components are not resident (Sequential offload holds no warm components \

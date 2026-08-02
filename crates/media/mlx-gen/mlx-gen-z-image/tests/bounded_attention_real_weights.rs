@@ -598,7 +598,11 @@ fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
 
         let mut first = request(bounded());
         if let Some(phase) = fault {
-            first.memory.as_mut().unwrap().calibration_error_phase = Some(phase);
+            first
+                .memory
+                .as_mut()
+                .unwrap()
+                .authorize_calibration_fault(phase);
         }
         let outcome = generator.generate(&first, &mut |_| {});
         match (fault, outcome) {

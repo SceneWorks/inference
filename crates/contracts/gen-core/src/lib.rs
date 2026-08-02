@@ -77,7 +77,7 @@ pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
     adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts,
+    standard_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts, MemoryBackend,
     MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics,
     MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
     MemoryConformanceState, MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension,

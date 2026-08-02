@@ -256,7 +256,7 @@ mod tests {
             *crate::lock_recover(&loads),
             vec!["text", "heavy", "text", "heavy"]
         );
-        assert!(residency.with_resident_parts(|_, _| ()).is_none());
+        assert!(residency.with_resident_parts(|_, _| ()).unwrap().is_none());
     }
 
     #[test]

@@ -589,12 +589,37 @@ pub enum MemoryBackendRealization {
     },
 }
 
-impl MemoryBackendRealization {
-    pub const fn backend_id(&self) -> &'static str {
+/// Stable backend identity used by evidence and caller-side selection.
+///
+/// This deliberately excludes the realization capability flags above. Those flags describe one
+/// loaded provider and are covered by its calibration identity; the evidence-key axis is the
+/// canonical backend family carried by persisted calibration records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryBackend {
+    Candle,
+    Mlx,
+}
+
+impl MemoryBackend {
+    /// Stable spelling at the persisted evidence/protocol boundary.
+    pub const fn as_key(self) -> &'static str {
         match self {
-            Self::CandleCuda { .. } => "candle",
-            Self::MlxMetal { .. } => "mlx",
+            Self::Candle => "candle",
+            Self::Mlx => "mlx",
         }
+    }
+}
+
+impl MemoryBackendRealization {
+    pub const fn backend_kind(&self) -> MemoryBackend {
+        match self {
+            Self::CandleCuda { .. } => MemoryBackend::Candle,
+            Self::MlxMetal { .. } => MemoryBackend::Mlx,
+        }
+    }
+
+    pub const fn backend_id(&self) -> &'static str {
+        self.backend_kind().as_key()
     }
 
     /// This realization's rung-4 window materialization (SC-16090) — the backend-neutral question,
@@ -750,10 +775,14 @@ pub struct MemoryAssetFacts {
     pub overlay_bytes: u64,
 }
 
-/// Cache keys must include every axis that can change residency or execution.
+/// Request-level cache keys must include every axis that can change residency or execution.
+///
+/// A warm generator is owned by one resolved provider, backend realization, and load shape, so
+/// those axes are invariant inside this contract. A caller whose outer cache spans loaded
+/// generators must key that outer cache by those loader identities too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryCacheSemantics {
-    StrategyTierParametersGeometryAndOverlay,
+    StrategyTierParametersModeGeometryOverlayAndEngagedComposition,
 }
 
 /// Warm generators must not inherit a prior request's memory decision.
@@ -780,7 +809,8 @@ pub struct MemoryRuntimeSemantics {
 impl Default for MemoryRuntimeSemantics {
     fn default() -> Self {
         Self {
-            cache: MemoryCacheSemantics::StrategyTierParametersGeometryAndOverlay,
+            cache:
+                MemoryCacheSemantics::StrategyTierParametersModeGeometryOverlayAndEngagedComposition,
             warm_run: MemoryWarmRunSemantics::RevalidateBudgetAndReapplyRequestState,
             cancellation: MemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
             error: MemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
@@ -883,11 +913,7 @@ impl MemoryProviderContract {
     /// pre-SC-16065 provider has no typed components, so this returns the byte-identical input scalar.
     pub fn predicted_peak_from_base(&self, base_predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
         let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
-        let auxiliary_bytes = if components.is_empty() {
-            0
-        } else {
-            self.asset_facts.overlay_bytes
-        };
+        let auxiliary_bytes = self.auxiliary_overlay_bytes_for_prediction();
         MemoryPeakBreakdown {
             predicted_peak_bytes: base_predicted_peak_bytes.saturating_add(auxiliary_bytes),
             unattributed_bytes: base_predicted_peak_bytes,
@@ -899,11 +925,7 @@ impl MemoryProviderContract {
     /// never rewritten; this is the inspection seam for run contexts and evidence records.
     pub fn decompose_predicted_peak(&self, predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
         let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
-        let auxiliary_bytes = if components.is_empty() {
-            0
-        } else {
-            self.asset_facts.overlay_bytes
-        };
+        let auxiliary_bytes = self.auxiliary_overlay_bytes_for_prediction();
         MemoryPeakBreakdown {
             predicted_peak_bytes,
             unattributed_bytes: predicted_peak_bytes.saturating_sub(auxiliary_bytes),
@@ -916,6 +938,19 @@ impl MemoryProviderContract {
             .resident_components()
             .iter()
             .filter(|component| component.kind.is_auxiliary())
+    }
+
+    /// Compatibility aggregate attributed to typed auxiliary components in peak calculations.
+    ///
+    /// The typed-component sum and this aggregate are intentionally separate declaration legs;
+    /// conformance proves they agree. Legacy contracts with only an aggregate must not gain a new
+    /// contribution merely by calling the decomposition helpers.
+    fn auxiliary_overlay_bytes_for_prediction(&self) -> u64 {
+        if self.auxiliary_components().next().is_some() {
+            self.asset_facts.overlay_bytes
+        } else {
+            0
+        }
     }
 
     /// Typed resident component declarations, empty for every non-adopting provider.
@@ -1843,16 +1878,16 @@ pub struct MemoryBudget {
 impl MemoryBudget {
     /// Effective request budget. Reserved headroom is removed from the currently free plus
     /// reclaimable memory, while the total-minus-headroom ceiling prevents reclaimable accounting
-    /// from exceeding physical capacity. All arithmetic is saturating.
+    /// from exceeding physical capacity. Signed intermediate arithmetic preserves an existing
+    /// overcommit deficit instead of saturating it away before reclamation is credited.
     pub fn effective_bytes(self) -> u64 {
         let ceiling = self
             .total_bytes
             .saturating_sub(self.reserved_headroom_bytes);
-        self.total_bytes
-            .saturating_sub(self.committed_bytes)
-            .saturating_add(self.reclaimable_bytes)
-            .saturating_sub(self.reserved_headroom_bytes)
-            .min(ceiling)
+        let available = i128::from(self.total_bytes) - i128::from(self.committed_bytes)
+            + i128::from(self.reclaimable_bytes)
+            - i128::from(self.reserved_headroom_bytes);
+        available.clamp(0, i128::from(ceiling)) as u64
     }
 
     /// Exact-boundary fits are accepted.
@@ -1869,12 +1904,24 @@ pub enum MemoryCacheState {
 }
 
 /// Advertised request surface. Optimized evidence never transfers between these modes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryMode {
     TextToImage,
     ImageToImage,
     Edit,
     Other(String),
+}
+
+impl MemoryMode {
+    /// Stable spelling at the persisted evidence/protocol boundary.
+    pub fn as_key(&self) -> &str {
+        match self {
+            Self::TextToImage => "text_to_image",
+            Self::ImageToImage => "image_to_image",
+            Self::Edit => "edit",
+            Self::Other(mode) => mode,
+        }
+    }
 }
 
 /// Context for provider safety and lifecycle hooks.
@@ -1888,6 +1935,8 @@ pub struct MemoryRunContext {
     /// Typed materialization shape covered by the calibration handshake.
     pub load_shape: LoadShape,
     pub mode: MemoryMode,
+    /// Provider safety input. Reference-sensitive routes use this to reject a context that does not
+    /// describe the request they are about to execute.
     pub has_reference: bool,
     pub use_pid: bool,
     pub has_phases: bool,
@@ -1895,7 +1944,9 @@ pub struct MemoryRunContext {
     pub overlay: Option<String>,
     pub budget: MemoryBudget,
     pub predicted_peak_bytes: u64,
+    /// Caller-facing telemetry for cold/warm admission and cache-poisoning regression checks.
     pub cache_state: MemoryCacheState,
+    /// Caller-facing identity of the exact evidence record selected for this request.
     pub evidence_revision: String,
 }
 
@@ -2082,17 +2133,27 @@ impl MemoryEvidenceDimensions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryEvidenceKey {
     pub resolved_route: String,
-    pub backend: String,
+    pub backend: MemoryBackend,
     pub tier: MemoryNumericTier,
     /// Exact intra-phase materialization shape measured by this evidence cell.
     pub load_shape: LoadShape,
-    pub mode: String,
+    pub mode: MemoryMode,
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
     pub strategy: MemoryStrategy,
     /// Exact, canonically ordered strategy set active when this evidence was measured.
     pub engaged_composition: Vec<MemoryStrategy>,
     pub parameters: MemoryStrategyParameters,
+}
+
+impl MemoryEvidenceKey {
+    fn has_canonical_engaged_composition(&self) -> bool {
+        !self.engaged_composition.is_empty()
+            && self
+                .engaged_composition
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+    }
 }
 
 /// Numerical parity contract for an evidence record.
@@ -2118,7 +2179,7 @@ pub enum MemoryParityResult {
     NotRun,
 }
 
-/// Dynamic/static evidence handshake consumed by the shared selector.
+/// Dynamic/static evidence handshake populated and consumed by caller-side admission selectors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryEvidence {
     pub key: MemoryEvidenceKey,
@@ -2145,13 +2206,7 @@ impl MemoryEvidence {
 
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        if self.key.engaged_composition.is_empty()
-            || !self
-                .key
-                .engaged_composition
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-        {
+        if !self.key.has_canonical_engaged_composition() {
             errors.push(
                 "evidence engaged composition must be a non-empty canonical strategy set"
                     .to_owned(),
@@ -2193,13 +2248,7 @@ impl MemoryEvidence {
         &self,
         contract: &MemoryProviderContract,
     ) -> std::result::Result<(), MemoryEvidenceVerdict> {
-        if self.key.engaged_composition.is_empty()
-            || !self
-                .key
-                .engaged_composition
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-        {
+        if !self.key.has_canonical_engaged_composition() {
             return Err(MemoryEvidenceVerdict::Invalid);
         }
         if self.key.engaged_composition != contract.engaged_composition(self.key.strategy) {
@@ -2248,8 +2297,9 @@ fn validate_parity_limit(metric: &str, maximum_error: f64, errors: &mut Vec<Stri
     }
 }
 
-/// Truthful pre-OOM rejection payload. The caller may populate a measured smaller geometry; it must
-/// not invent advice from unknown or unverified evidence.
+/// Truthful caller-facing pre-OOM rejection payload. The caller may populate a measured smaller
+/// geometry; it must not invent advice from unknown or unverified evidence. The contract defines
+/// this vocabulary even when an in-process provider does not construct it directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRejection {
     pub available_bytes: u64,
@@ -2608,14 +2658,14 @@ mod tests {
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
                 resolved_route: "test".to_owned(),
-                backend: "mlx".to_owned(),
+                backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
                     component_precision_floors: &[],
                 },
                 load_shape: contract.load_shape,
-                mode: "text_to_image".to_owned(),
+                mode: MemoryMode::TextToImage,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 1024,
@@ -2644,6 +2694,18 @@ mod tests {
             parity_result: MemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
+
+        let canonical_composition = evidence.key.engaged_composition.clone();
+        evidence.key.engaged_composition = vec![MemoryStrategy::Resident, MemoryStrategy::Resident];
+        assert!(evidence
+            .validation_errors()
+            .iter()
+            .any(|error| error.contains("canonical strategy set")));
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(MemoryEvidenceVerdict::Invalid)
+        );
+        evidence.key.engaged_composition = canonical_composition;
 
         evidence.key.load_shape = LoadShape::EagerMaterialization;
         assert_eq!(
@@ -2772,6 +2834,39 @@ mod tests {
             .effective_bytes(),
             0
         );
+    }
+
+    #[test]
+    fn effective_budget_preserves_an_overcommit_deficit_before_reclamation() {
+        let budget = MemoryBudget {
+            total_bytes: 100,
+            committed_bytes: 110,
+            reclaimable_bytes: 50,
+            reserved_headroom_bytes: 10,
+        };
+        assert_eq!(budget.effective_bytes(), 30);
+        assert!(budget.fits(30));
+        assert!(!budget.fits(31));
+
+        assert_eq!(
+            MemoryBudget {
+                committed_bytes: 160,
+                ..budget
+            }
+            .effective_bytes(),
+            0,
+            "an overcommit larger than all reclaimable memory must leave no request budget"
+        );
+    }
+
+    #[test]
+    fn evidence_axes_have_stable_protocol_keys_without_stringly_runtime_identity() {
+        assert_eq!(MemoryBackend::Mlx.as_key(), "mlx");
+        assert_eq!(MemoryBackend::Candle.as_key(), "candle");
+        assert_eq!(MemoryMode::TextToImage.as_key(), "text_to_image");
+        assert_eq!(MemoryMode::ImageToImage.as_key(), "image_to_image");
+        assert_eq!(MemoryMode::Edit.as_key(), "edit");
+        assert_eq!(MemoryMode::Other("custom".to_owned()).as_key(), "custom");
     }
 
     #[test]
@@ -2994,14 +3089,14 @@ mod tests {
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
                 resolved_route: "test".to_owned(),
-                backend: "mlx".to_owned(),
+                backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: None,
                     component_precision_floors: &[],
                 },
                 load_shape: contract.load_shape,
-                mode: "text_to_image".to_owned(),
+                mode: MemoryMode::TextToImage,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 512,

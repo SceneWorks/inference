@@ -468,7 +468,11 @@ mod tests {
     fn legacy_policy_does_not_eagerly_load_components() {
         let model = Krea2Control::load(&missing_paths(OffloadPolicy::Sequential))
             .expect("construction must not touch the missing snapshot");
-        assert!(model.residency.with_resident_parts(|_, _| ()).is_none());
+        assert!(model
+            .residency
+            .with_resident_parts(|_, _| ())
+            .unwrap()
+            .is_none());
     }
 
     /// The resident legacy value is equally lazy; neither load-time value can choose the request route.
@@ -476,7 +480,11 @@ mod tests {
     fn resident_legacy_policy_is_also_lazy() {
         let model = Krea2Control::load(&missing_paths(OffloadPolicy::Resident))
             .expect("construction must not touch the missing snapshot");
-        assert!(model.residency.with_resident_parts(|_, _| ()).is_none());
+        assert!(model
+            .residency
+            .with_resident_parts(|_, _| ())
+            .unwrap()
+            .is_none());
     }
 
     /// SC-16453: the immutable ConvRot file must survive the provider-path boundary and select the

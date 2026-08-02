@@ -551,6 +551,7 @@ fn a_canceled_or_errored_windowed_run_leaves_no_residual_cache() {
             let generator = mlx_gen_z_image::load(&spec()).expect("load");
             let req = request(Some(GenerationMemory {
                 calibration_error_phase: Some(phase),
+                calibration_fault_harness_authorized: true,
                 ..memory_at(window)
             }));
             assert!(
