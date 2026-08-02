@@ -45,3 +45,4 @@ mlx-gen-z-image = { path = "../mlx-gen-z-image" }
 
 [dev-dependencies]
 gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../../contracts/gen-core-testkit" }
+image = { workspace = true }
