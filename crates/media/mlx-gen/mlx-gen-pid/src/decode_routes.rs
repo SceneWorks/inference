@@ -224,6 +224,20 @@ impl DecodeRoutes {
         })
     }
 
+    /// Declare the native route using the provider-facing [`mlx_gen::gen_core::Result`] spelling.
+    ///
+    /// [`Self::new`] remains the diagnostic constructor and returns every defect as `Vec<String>`;
+    /// providers should use this constructor so the stable error join and typed
+    /// [`mlx_gen::gen_core::Error::Unsupported`] mapping are not copied into every adopter.
+    pub fn new_core(
+        provider_id: &str,
+        native_edges: impl IntoIterator<Item = u32>,
+        native_overlap: u32,
+    ) -> mlx_gen::gen_core::Result<Self> {
+        Self::new(provider_id, native_edges, native_overlap)
+            .map_err(|errors| mlx_gen::gen_core::Error::Unsupported(errors.join("; ")))
+    }
+
     /// The native VAE route's declared tile edges, descending.
     pub fn native_edges(&self) -> &[u32] {
         &self.native_edges
@@ -552,6 +566,17 @@ mod tests {
         assert_eq!(
             assert_decode_routes("z_image_turbo", [768, 640, 512], 64).native_edges(),
             &[768, 640, 512]
+        );
+    }
+
+    #[test]
+    fn core_constructor_preserves_joined_diagnostics_and_the_typed_error() {
+        let errors = DecodeRoutes::new("broken", [2048, 0], 0).unwrap_err();
+        let error = DecodeRoutes::new_core("broken", [2048, 0], 0).unwrap_err();
+        assert!(matches!(error, mlx_gen::gen_core::Error::Unsupported(_)));
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported: {}", errors.join("; "))
         );
     }
 }

@@ -1,49 +1,391 @@
+import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.release.verify_residency_ab import read_peak, verify
+from scripts.release.verify_residency_ab import PREFIX, read_record, verify
+
+
+REVISION = "a" * 40
+SCENEWORKS_REVISION = "b" * 40
+MODEL_REVISION = "c" * 40
+MODEL_INVENTORY_SHA256 = "d" * 64
+FINGERPRINT = "test-layout-v1"
+OUTPUT = b"exact parity output"
+OUTPUT_SHA256 = hashlib.sha256(OUTPUT).hexdigest()
+
+
+def record(strategy: str, peak: int) -> dict:
+    composition = ["resident"]
+    if strategy == "staged_residency":
+        composition.append("staged_residency")
+    return {
+        "schema_version": 1,
+        "key": {
+            "resolved_route": "flux1_dev",
+            "backend": "candle",
+            "tier": {
+                "precision": "bf16",
+                "quant": "q8",
+                "component_precision_floors": [],
+            },
+            "load_shape": "eager_materialization",
+            "mode": "text_to_image",
+            "overlay": None,
+            "geometry": {
+                "width": 1024,
+                "height": 1024,
+                "batch": 1,
+                "frames": 1,
+                "reference_count": 0,
+            },
+            "strategy": strategy,
+            "engaged_composition": composition,
+            "parameters": {
+                "decode_tile_edge": None,
+                "decode_overlap": None,
+                "attention_chunk_size": None,
+                "transformer_window_size": None,
+                "transformer_window_component": None,
+            },
+        },
+        "declared_calibration": {
+            "abi": 3,
+            "fingerprint": FINGERPRINT,
+            "load_shape": "eager_materialization",
+        },
+        "observed_calibration": {
+            "abi": 3,
+            "fingerprint": FINGERPRINT,
+            "load_shape": "eager_materialization",
+        },
+        "predicted_peak_bytes": peak,
+        "observed_peak_bytes": peak,
+        "inference_revision": REVISION,
+        "sceneworks_revision": SCENEWORKS_REVISION,
+        "model_revision": MODEL_REVISION,
+        "model_inventory_sha256": MODEL_INVENTORY_SHA256,
+        "harness_version": "test-harness-v1",
+        "output_sha256": OUTPUT_SHA256,
+        "parity": {"kind": "exact"},
+        "parity_result": {"kind": "not_run"},
+    }
 
 
 class VerifyResidencyAbTests(unittest.TestCase):
-    def write_log(self, root: Path, name: str, mode: str, peak: int) -> Path:
+    def write_log(self, root: Path, name: str, payload: dict) -> Path:
         path = root / name
         path.write_text(
-            f"test output\nSEQ_AB model=flux1_dev mode={mode} gpu=NVIDIA peak_mib={peak} | sample\n",
+            "test output\n" + PREFIX + json.dumps(payload, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         return path
 
-    def test_accepts_material_reduction(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            resident = self.write_log(root, "resident.log", "resident", 24000)
-            sequential = self.write_log(root, "sequential.log", "request-staged", 15000)
-            self.assertEqual(verify(resident, sequential, 512), (24000, 15000))
+    def valid_pair(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        resident = self.write_log(root, "resident.log", record("resident", 24_000 << 20))
+        staged = self.write_log(
+            root, "staged.log", record("staged_residency", 15_000 << 20)
+        )
+        resident_output = root / "resident.rgb"
+        staged_output = root / "staged.rgb"
+        resident_output.write_bytes(OUTPUT)
+        staged_output.write_bytes(OUTPUT)
+        return resident, staged, resident_output, staged_output
 
-    def test_rejects_wrong_mode_and_insufficient_reduction(self) -> None:
+    def test_accepts_complete_material_reduction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            resident = self.write_log(root, "resident.log", "resident", 16000)
-            wrong = self.write_log(root, "wrong.log", "resident", 14000)
-            with self.assertRaisesRegex(RuntimeError, "expected mode=request-staged"):
-                read_peak(wrong, "request-staged")
-            sequential = self.write_log(root, "sequential.log", "request-staged", 15700)
-            with self.assertRaisesRegex(RuntimeError, "required at least 512"):
-                verify(resident, sequential, 512)
+            resident, staged, resident_output, staged_output = self.valid_pair(Path(temporary))
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                ),
+                (24_000 << 20, 15_000 << 20),
+            )
 
-    def test_rejects_missing_or_ambiguous_results(self) -> None:
+    def test_rejects_legacy_missing_duplicate_and_malformed_records(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "log"
-            path.write_text("no result\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "found 0"):
-                read_peak(path, "resident")
+            path.write_text("SEQ_AB mode=resident peak_mib=1\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
+                read_record(path, "resident")
+            payload = json.dumps(record("resident", 10))
+            path.write_text(f"{PREFIX}{payload}\n{PREFIX}{payload}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "found 2"):
+                read_record(path, "resident")
             path.write_text(
-                "SEQ_AB mode=resident peak_mib=1\nSEQ_AB mode=resident peak_mib=2\n",
+                f"{PREFIX}{payload}\nSEQ_AB mode=resident peak_mib=1\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "found 2"):
-                read_peak(path, "resident")
+            with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
+                read_record(path, "resident")
+            path.write_text(
+                f"test output SEQ_AB mode=resident peak_mib=1\n{PREFIX}{payload}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
+                read_record(path, "resident")
+            path.write_text(f'{PREFIX}{{"schema_version":1,"schema_version":1}}\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "duplicate JSON key"):
+                read_record(path, "resident")
+
+    def test_rejects_missing_extra_and_wrongly_typed_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, mutate, message in (
+                ("missing", lambda value: value.pop("harness_version"), "missing"),
+                ("extra", lambda value: value.update({"legacy_peak_mib": 4}), "extra"),
+                (
+                    "bool-peak",
+                    lambda value: value.update({"observed_peak_bytes": True}),
+                    "positive integer",
+                ),
+            ):
+                payload = record("resident", 10)
+                mutate(payload)
+                path = self.write_log(root, name, payload)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    read_record(path, "resident")
+
+            payload = record("resident", 10)
+            payload["parity"] = {
+                "kind": "tolerance",
+                "metric": "max_abs",
+                "maximum_error": float("nan"),
+            }
+            path = self.write_log(root, "non-finite", payload)
+            with self.assertRaisesRegex(RuntimeError, "non-finite JSON number"):
+                read_record(path, "resident")
+
+            overflow = record("resident", 10)
+            overflow["parity"] = {
+                "kind": "tolerance",
+                "metric": "max_abs",
+                "maximum_error": 0,
+            }
+            encoded = json.dumps(overflow, separators=(",", ":")).replace(
+                '"maximum_error":0', '"maximum_error":1e9999'
+            )
+            path.write_text(f"{PREFIX}{encoded}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "finite and non-negative"):
+                read_record(path, "resident")
+
+    def test_rejects_fingerprint_abi_revision_and_load_shape_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.valid_pair(root)
+            with self.assertRaisesRegex(RuntimeError, "exported calibration fingerprint"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    "other-layout-v1",
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                )
+            with self.assertRaisesRegex(RuntimeError, "exported ABI"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    4,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                )
+            with self.assertRaisesRegex(RuntimeError, "model revision"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    "e" * 40,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                )
+            with self.assertRaisesRegex(RuntimeError, "model inventory SHA-256"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    "f" * 64,
+                    resident_output,
+                    staged_output,
+                )
+
+            for name, mutate, message in (
+                (
+                    "observed-fingerprint",
+                    lambda value: value["observed_calibration"].update(
+                        {"fingerprint": "other-layout-v1"}
+                    ),
+                    "identities differ",
+                ),
+                (
+                    "shape",
+                    lambda value: value["observed_calibration"].update(
+                        {"load_shape": "deferred_materialization"}
+                    ),
+                    "identities differ",
+                ),
+                (
+                    "revision",
+                    lambda value: value.update({"inference_revision": "main"}),
+                    "exact lowercase",
+                ),
+                (
+                    "model-inventory",
+                    lambda value: value.update({"model_inventory_sha256": "mutable"}),
+                    "64 lowercase",
+                ),
+                (
+                    "grammar",
+                    lambda value: [
+                        value[field].update({"fingerprint": "Layout_V1"})
+                        for field in ("declared_calibration", "observed_calibration")
+                    ],
+                    "lowercase ASCII kebab",
+                ),
+                (
+                    "zero-version",
+                    lambda value: [
+                        value[field].update({"fingerprint": "layout-v0-v1"})
+                        for field in ("declared_calibration", "observed_calibration")
+                    ],
+                    "exactly one positive",
+                ),
+            ):
+                payload = record("resident", 10)
+                mutate(payload)
+                path = self.write_log(root, name, payload)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    read_record(path, "resident")
+
+    def test_rejects_every_non_strategy_ab_invariant_and_small_reduction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident_payload = record("resident", 16_000 << 20)
+            resident_output = root / "resident.rgb"
+            staged_output = root / "staged.rgb"
+            resident_output.write_bytes(OUTPUT)
+            staged_output.write_bytes(OUTPUT)
+            for field, value in (
+                ("backend", "mlx"),
+                ("mode", "edit"),
+                ("overlay", "control"),
+                ("load_shape", "deferred_materialization"),
+            ):
+                staged_payload = record("staged_residency", 14_000 << 20)
+                staged_payload["key"][field] = value
+                if field == "load_shape":
+                    staged_payload["declared_calibration"]["load_shape"] = value
+                    staged_payload["observed_calibration"]["load_shape"] = value
+                resident = self.write_log(root, f"resident-{field}", resident_payload)
+                staged = self.write_log(root, f"staged-{field}", staged_payload)
+                with self.assertRaisesRegex(RuntimeError, "non-strategy A/B invariant"):
+                    verify(
+                        resident,
+                        staged,
+                        512,
+                        "flux1_dev",
+                        FINGERPRINT,
+                        3,
+                        MODEL_REVISION,
+                        MODEL_INVENTORY_SHA256,
+                        resident_output,
+                        staged_output,
+                    )
+
+            resident = self.write_log(root, "resident-small", resident_payload)
+            staged = self.write_log(
+                root, "staged-small", record("staged_residency", 15_700 << 20)
+            )
+            with self.assertRaisesRegex(RuntimeError, "required at least"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                )
+
+            resident, staged, resident_output, staged_output = self.valid_pair(root)
+            staged_output.write_bytes(b"different output")
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 does not match"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                )
+            with self.assertRaisesRegex(RuntimeError, "non-negative"):
+                verify(
+                    resident,
+                    staged,
+                    -1,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                )
+
+    def test_rejects_strategy_composition_and_parameter_schema_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = record("staged_residency", 10)
+            payload["key"]["engaged_composition"] = ["resident"]
+            path = self.write_log(root, "composition", payload)
+            with self.assertRaisesRegex(RuntimeError, "engaged_composition"):
+                read_record(path, "staged_residency")
+
+            payload = record("resident", 10)
+            payload["key"]["parameters"]["decode_tile_edge"] = "512"
+            path = self.write_log(root, "parameter", payload)
+            with self.assertRaisesRegex(RuntimeError, "non-negative integer or null"):
+                read_record(path, "resident")
+
+            payload = record("staged_residency", 10)
+            payload["key"]["parameters"]["decode_tile_edge"] = 512
+            path = self.write_log(root, "resident-parameter", payload)
+            with self.assertRaisesRegex(RuntimeError, "must be empty"):
+                read_record(path, "staged_residency")
 
 
 if __name__ == "__main__":

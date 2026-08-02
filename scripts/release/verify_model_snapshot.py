@@ -4,12 +4,62 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import tomllib
 from pathlib import Path
 
 
 MARKER = ".sceneworks-model-revision"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def snapshot_inventory(model: dict, snapshot: Path) -> dict:
+    """Return a canonical content inventory after validating the pinned snapshot claim."""
+    verify_snapshot(model, snapshot)
+    root = snapshot.resolve()
+    files = []
+    for item in sorted(root.rglob("*")):
+        if not (item.is_file() or item.is_symlink()):
+            continue
+        relative = item.relative_to(root).as_posix()
+        if relative == MARKER or relative.startswith(".cache/"):
+            continue
+        try:
+            size = item.stat().st_size
+            digest = _sha256(item)
+        except OSError as error:
+            raise RuntimeError(f"cannot inventory model file {item}: {error}") from error
+        files.append(
+            {
+                "path": item.relative_to(root).as_posix(),
+                "kind": "symlink" if item.is_symlink() else "file",
+                "size": size,
+                "sha256": digest,
+            }
+        )
+    if not files:
+        raise RuntimeError(f"snapshot has no files to inventory: {root}")
+    content_projection = [
+        {"path": item["path"], "size": item["size"], "sha256": item["sha256"]}
+        for item in files
+    ]
+    encoded = json.dumps(content_projection, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "schema_version": 1,
+        "model": model["key"],
+        "repository": model["repository"],
+        "revision": model["revision"],
+        "inventory_sha256": hashlib.sha256(encoded).hexdigest(),
+        "files": files,
+    }
 
 
 def load_model(manifest: Path, key: str) -> dict:
@@ -68,10 +118,24 @@ def main() -> int:
         type=Path,
         default=Path("release/real-weight-models.toml"),
     )
+    parser.add_argument(
+        "--inventory-output",
+        type=Path,
+        help="write a canonical dereferenced content inventory for evidence binding",
+    )
     args = parser.parse_args()
     model = load_model(args.manifest, args.model)
     verify_snapshot(model, args.snapshot)
-    print(f"model snapshot: OK ({model['key']}@{model['revision']})")
+    suffix = ""
+    if args.inventory_output is not None:
+        inventory = snapshot_inventory(model, args.snapshot)
+        args.inventory_output.parent.mkdir(parents=True, exist_ok=True)
+        args.inventory_output.write_text(
+            json.dumps(inventory, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        suffix = f" inventory_sha256={inventory['inventory_sha256']}"
+    print(f"model snapshot: OK ({model['key']}@{model['revision']}){suffix}")
     return 0
 
 
