@@ -25,14 +25,18 @@ use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     schedule_sigmas, AdapterSpec, AlphaSchedule, CancelFlag, DiffusionSampler,
-    DiscreteModelSampling, Error, Image, Progress, Result, Scheduler,
+    DiscreteModelSampling, Error, Image, PreviewSink, Progress, Result, Scheduler,
 };
 
 use mlx_gen_sdxl::{
-    apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_curated, denoise_ip,
-    denoise_ip_control, encode_init_latents, load_unet_kolors_dtype, load_vae,
-    preprocess_control_image, Autoencoder, ControlContext, ControlNet, Denoiser, IpImageEncoder,
-    LoraCoverage, SdxlLoraReport, UNet2DConditionModel,
+    apply_sdxl_adapters_with, decode_image, denoise,
+    denoise_control_with_preview as denoise_control_registered,
+    denoise_curated_with_preview as denoise_curated_registered,
+    denoise_ip_control_with_preview as denoise_ip_control_registered,
+    denoise_ip_with_preview as denoise_ip_registered, denoise_with_preview as denoise_registered,
+    encode_init_latents, load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder,
+    ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage, SdxlLoraReport,
+    UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -299,12 +303,7 @@ impl KolorsHeavy {
         self.dtype
     }
 
-    /// Run the CFG denoise loop from a (raw, unit-normal) initial-noise tensor `init_noise`
-    /// `[1, h, w, 4]`. The single denoise assembly for plain T2I: the parity gate feeds diffusers'
-    /// exact noise with a no-op `cancel`/`on_progress`, and the registry's production count loop
-    /// drives it with the real request `CancelFlag` + progress sink — so the two surfaces can't drift
-    /// (F-146). `pos`/`neg` are the `(context, pooled)` from [`KolorsText::encode`]. Returns the
-    /// final latents `[1, h, w, 4]`.
+    /// Backward-compatible plain-T2I denoise with an inert preview sink.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise_latents(
         &self,
@@ -319,38 +318,22 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        // PiD from_ldm early-stop (sc-8049): `run_steps = Some(keep-1)` truncates the schedule so the
-        // solver stops at the VP-capture σ; `None` runs the full schedule byte-identically.
-        let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
-        let sampler = match run_steps {
-            Some(rs) => sampler.truncate_to(rs),
-            None => sampler,
-        };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
-        let latents = sampler.scale_initial_noise(init_noise)?;
-
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
-        denoise(
-            &d,
-            latents,
-            &conditioning,
-            &pooled,
-            &time_ids,
+        self.denoise_latents_with_preview(
+            init_noise,
+            pos,
+            neg,
+            num_steps,
             cfg,
+            height,
+            width,
+            run_steps,
             cancel,
             on_progress,
+            &PreviewSink::default(),
         )
     }
 
-    /// Run the img2img CFG denoise loop from pre-encoded init latents + a supplied noise tensor —
-    /// split out (like [`denoise_latents`](Self::denoise_latents)) so the parity gate can feed
-    /// diffusers' exact VAE-encoded init + noise. `init_latents` is the scaled VAE mean
-    /// `[1, h, w, 4]`; the sampler is the strength-sliced schedule, the init is seeded via
-    /// [`KolorsEulerSampler::add_noise`] (raw `x₀ + noise·σ_start`, no `scale_initial_noise`), and the
-    /// loop runs the remaining `int(num_steps·strength)` steps. Returns the final latents.
+    /// Backward-compatible img2img denoise with an inert preview sink.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise_img2img_latents(
         &self,
@@ -366,6 +349,252 @@ impl KolorsHeavy {
         run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.denoise_img2img_latents_with_preview(
+            init_latents,
+            noise,
+            pos,
+            neg,
+            num_steps,
+            strength,
+            cfg,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Backward-compatible curated denoise with an inert preview sink.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_curated_latents(
+        &self,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        init_latents: Option<&Array>,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+        control: Option<(&ControlNet, &Image, f32)>,
+        ip_tokens: Option<(&Array, f32)>,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.denoise_curated_latents_with_preview(
+            sampler_name,
+            scheduler_name,
+            init_latents,
+            noise,
+            pos,
+            neg,
+            num_steps,
+            strength,
+            cfg,
+            seed,
+            height,
+            width,
+            control,
+            ip_tokens,
+            run_steps,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Backward-compatible ControlNet denoise with an inert preview sink.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_controlnet_latents(
+        &self,
+        controlnet: &ControlNet,
+        init_noise: &Array,
+        control_image: &Image,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        cfg: f32,
+        control_scale: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.denoise_controlnet_latents_with_preview(
+            controlnet,
+            init_noise,
+            control_image,
+            pos,
+            neg,
+            num_steps,
+            cfg,
+            control_scale,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Backward-compatible IP-Adapter denoise with an inert preview sink.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_ip_latents(
+        &self,
+        ip_tokens: &Array,
+        init_noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        cfg: f32,
+        ip_scale: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.denoise_ip_latents_with_preview(
+            ip_tokens,
+            init_noise,
+            pos,
+            neg,
+            num_steps,
+            cfg,
+            ip_scale,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Backward-compatible combined ControlNet + IP-Adapter denoise with an inert preview sink.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_controlnet_ip_latents(
+        &self,
+        controlnet: &ControlNet,
+        ip_tokens: &Array,
+        init_latents: &Array,
+        noise: &Array,
+        control_image: &Image,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        control_scale: f32,
+        ip_scale: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.denoise_controlnet_ip_latents_with_preview(
+            controlnet,
+            ip_tokens,
+            init_latents,
+            noise,
+            control_image,
+            pos,
+            neg,
+            num_steps,
+            strength,
+            cfg,
+            control_scale,
+            ip_scale,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Run the CFG denoise loop from a (raw, unit-normal) initial-noise tensor `init_noise`
+    /// `[1, h, w, 4]`. The single denoise assembly for plain T2I: the parity gate feeds diffusers'
+    /// exact noise with a no-op `cancel`/`on_progress`, and the registry's production count loop
+    /// drives it with the real request `CancelFlag` + progress sink — so the two surfaces can't drift
+    /// (F-146). `pos`/`neg` are the `(context, pooled)` from [`KolorsText::encode`]. Returns the
+    /// final latents `[1, h, w, 4]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_latents_with_preview(
+        &self,
+        init_noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        cfg: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+    ) -> Result<Array> {
+        // PiD from_ldm early-stop (sc-8049): `run_steps = Some(keep-1)` truncates the schedule so the
+        // solver stops at the VP-capture σ; `None` runs the full schedule byte-identically.
+        let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let latents = sampler.scale_initial_noise(init_noise)?;
+
+        let d = Denoiser {
+            unet: &self.unet,
+            sampler: &sampler,
+        };
+        denoise_registered(
+            &d,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            cancel,
+            on_progress,
+            preview,
+        )
+    }
+
+    /// Run the img2img CFG denoise loop from pre-encoded init latents + a supplied noise tensor —
+    /// split out (like [`denoise_latents`](Self::denoise_latents)) so the parity gate can feed
+    /// diffusers' exact VAE-encoded init + noise. `init_latents` is the scaled VAE mean
+    /// `[1, h, w, 4]`; the sampler is the strength-sliced schedule, the init is seeded via
+    /// [`KolorsEulerSampler::add_noise`] (raw `x₀ + noise·σ_start`, no `scale_initial_noise`), and the
+    /// loop runs the remaining `int(num_steps·strength)` steps. Returns the final latents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_img2img_latents_with_preview(
+        &self,
+        init_latents: &Array,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate the (already strength-sliced) schedule to `keep-1`
         // steps when `run_steps = Some`; `None` runs the full sliced schedule byte-identically. The
@@ -383,7 +612,7 @@ impl KolorsHeavy {
             unet: &self.unet,
             sampler: &sampler,
         };
-        denoise(
+        denoise_registered(
             &d,
             latents,
             &conditioning,
@@ -392,6 +621,7 @@ impl KolorsHeavy {
             cfg,
             cancel,
             on_progress,
+            preview,
         )
     }
 
@@ -414,7 +644,7 @@ impl KolorsHeavy {
     /// **text** conditioning (`control_encoder = None` ⇒ `cn_enc = conditioning` in `denoise_curated`),
     /// matching the bespoke `denoise_controlnet*_latents`. Both `None` ⇒ plain txt2img / img2img.
     #[allow(clippy::too_many_arguments)]
-    pub fn denoise_curated_latents(
+    pub fn denoise_curated_latents_with_preview(
         &self,
         sampler_name: Option<&str>,
         scheduler_name: Option<&str>,
@@ -433,6 +663,7 @@ impl KolorsHeavy {
         run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Array> {
         use mlx_rs::ops::{add, multiply};
         // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
@@ -499,7 +730,7 @@ impl KolorsHeavy {
             None => None,
         };
 
-        denoise_curated(
+        denoise_curated_registered(
             &self.unet,
             sampler_name,
             &ms,
@@ -512,6 +743,7 @@ impl KolorsHeavy {
             seed,
             cancel,
             on_progress,
+            preview,
             &controls,
             ip_batched.as_ref().map(|(tokens, scale)| (tokens, *scale)),
             // `control_encoder = None` ⇒ the Kolors ControlNet cross-attends to the text
@@ -528,7 +760,7 @@ impl KolorsHeavy {
     /// conditioned with the **same ChatGLM3 context** as the U-Net (the branch projects it with its
     /// own `encoder_hid_proj`). `control_scale = 0` ⇒ the residuals vanish ⇒ identical to plain T2I.
     #[allow(clippy::too_many_arguments)]
-    pub fn denoise_controlnet_latents(
+    pub fn denoise_controlnet_latents_with_preview(
         &self,
         controlnet: &ControlNet,
         init_noise: &Array,
@@ -543,6 +775,7 @@ impl KolorsHeavy {
         run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
         // runs the full schedule byte-identically.
@@ -571,7 +804,7 @@ impl KolorsHeavy {
             unet: &self.unet,
             sampler: &sampler,
         };
-        denoise_control(
+        denoise_control_registered(
             &d,
             latents,
             &conditioning,
@@ -580,6 +813,7 @@ impl KolorsHeavy {
             cfg,
             cancel,
             on_progress,
+            preview,
             &cc,
         )
     }
@@ -590,7 +824,7 @@ impl KolorsHeavy {
     /// here with a zeros uncond row. The IP-Adapter pairs must already be installed
     /// ([`install_ip_adapter`](Self::install_ip_adapter)). `ip_scale = 0` ⇒ identical to plain T2I.
     #[allow(clippy::too_many_arguments)]
-    pub fn denoise_ip_latents(
+    pub fn denoise_ip_latents_with_preview(
         &self,
         ip_tokens: &Array,
         init_noise: &Array,
@@ -604,6 +838,7 @@ impl KolorsHeavy {
         run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
         // runs the full schedule byte-identically.
@@ -623,7 +858,7 @@ impl KolorsHeavy {
             unet: &self.unet,
             sampler: &sampler,
         };
-        denoise_ip(
+        denoise_ip_registered(
             &d,
             latents,
             &conditioning,
@@ -632,6 +867,7 @@ impl KolorsHeavy {
             cfg,
             cancel,
             on_progress,
+            preview,
             &tokens,
             ip_scale,
         )
@@ -644,11 +880,12 @@ impl KolorsHeavy {
     /// seeds the img2img init. Mirrors the vendored `StableDiffusionXLControlNetImg2ImgPipeline` with
     /// `ip_adapter_image` (the torch `KolorsDiffusersAdapter._run_pose`).
     ///
-    /// Reuses the SDXL [`denoise_ip_control`] primitive (built for InstantID, sc-3113/3114) — it runs
-    /// the ControlNet branch and injects the IP tokens in the same step. The crucial Kolors-specific
-    /// wiring: the ControlNet cross-attends to the **text** `conditioning` (`control_encoder =
-    /// conditioning`), NOT the IP tokens — the Kolors ControlNet projects the ChatGLM3 context with
-    /// its own `encoder_hid_proj`, unlike InstantID's IdentityNet which cross-attends to face tokens.
+    /// Reuses the SDXL [`mlx_gen_sdxl::denoise_ip_control_with_preview`] primitive (built for
+    /// InstantID, sc-3113/3114) — it runs the ControlNet branch and injects the IP tokens in the same
+    /// step. The crucial Kolors-specific wiring: the ControlNet cross-attends to the **text**
+    /// `conditioning` (`control_encoder = conditioning`), NOT the IP tokens — the Kolors ControlNet
+    /// projects the ChatGLM3 context with its own `encoder_hid_proj`, unlike InstantID's IdentityNet
+    /// which cross-attends to face tokens.
     ///
     /// `control_scale` (torch `controlnet_conditioning_scale` ≈ 0.7) and `ip_scale` (torch
     /// `ip_adapter_scale` ≈ 0.6) are independent; `strength` is the img2img init strength (torch
@@ -657,7 +894,7 @@ impl KolorsHeavy {
     /// is the VAE mean of the reference (`[1, h, w, 4]`); `ip_tokens` is `[1, N, 2048]`. The ControlNet
     /// must be loaded and the IP-Adapter pairs installed.
     #[allow(clippy::too_many_arguments)]
-    pub fn denoise_controlnet_ip_latents(
+    pub fn denoise_controlnet_ip_latents_with_preview(
         &self,
         controlnet: &ControlNet,
         ip_tokens: &Array,
@@ -676,6 +913,7 @@ impl KolorsHeavy {
         run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate the (strength-sliced) schedule to `keep-1` steps
         // when `run_steps = Some`; `None` runs the full sliced schedule byte-identically.
@@ -710,7 +948,7 @@ impl KolorsHeavy {
         // context (its own `encoder_hid_proj`), NOT the IP tokens. `cn_enc = control_encoder
         // .unwrap_or(conditioning)` in `denoise_core`, so passing the text conditioning here is the
         // Kolors-correct override (the InstantID default would feed face tokens).
-        denoise_ip_control(
+        denoise_ip_control_registered(
             &d,
             latents,
             &conditioning,
@@ -719,6 +957,7 @@ impl KolorsHeavy {
             cfg,
             cancel,
             on_progress,
+            preview,
             &cc,
             &conditioning,
             &tokens,

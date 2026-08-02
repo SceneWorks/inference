@@ -330,14 +330,93 @@ pub fn run_curated_sampler(
     on_progress: &mut dyn FnMut(Progress),
     mut predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
-    use gen_core::sampling::{denoise as gc_denoise, sampler_by_name, Euler, Sampler};
+    run_curated_sampler_with_latent_hook(
+        sampler_name,
+        ms,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |_, _| {},
+        &mut predict,
+    )
+}
+
+/// Tracks the callback phase for curated solvers that evaluate the model twice per outer step.
+///
+/// Heun evaluates at the next schedule sigma for its corrector, while DPM++ SDE evaluates at an
+/// off-schedule midpoint. Neither evaluation is a new denoise step. Keeping this small adapter at
+/// the MLX driver seam avoids widening the backend-neutral sampler trait solely for decorative
+/// output while still exposing the exact outer-step cadence to providers.
+struct CuratedStepObserver {
+    solver: gen_core::sampling::Solver,
+    step: usize,
+    correction_pending: bool,
+}
+
+impl CuratedStepObserver {
+    fn new(solver: gen_core::sampling::Solver) -> Self {
+        Self {
+            solver,
+            step: 0,
+            correction_pending: false,
+        }
+    }
+
+    fn is_step_start(&mut self, sigmas: &[f32], sigma: f32) -> bool {
+        if self.correction_pending {
+            self.correction_pending = false;
+            return false;
+        }
+
+        let step = self.step;
+        self.step = self.step.saturating_add(1);
+        let evaluates_twice = match self.solver {
+            gen_core::sampling::Solver::Heun | gen_core::sampling::Solver::DpmppSde => true,
+            gen_core::sampling::Solver::Euler
+            | gen_core::sampling::Solver::EulerAncestral
+            | gen_core::sampling::Solver::Dpmpp2m
+            | gen_core::sampling::Solver::UniPc
+            | gen_core::sampling::Solver::Lcm
+            | gen_core::sampling::Solver::Ddim
+            | gen_core::sampling::Solver::ErSde
+            | gen_core::sampling::Solver::Dpmpp2mSde => false,
+        };
+        let has_correction = evaluates_twice
+            && sigma != 0.0
+            && sigmas.get(step + 1).is_some_and(|&next| next != 0.0);
+        self.correction_pending = has_correction;
+        true
+    }
+}
+
+/// [`run_curated_sampler`] with a best-effort observer of the raw, unscaled latent at the start of
+/// each actual solver step. Heun corrector evaluations and DPM++ SDE midpoint evaluations are
+/// deliberately suppressed. The legacy wrapper supplies a no-op hook, preserving the exact
+/// numerical integration path and output bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_curated_sampler_with_latent_hook(
+    sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut on_latent: impl FnMut(&Array, f32),
+    mut predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    use gen_core::sampling::{denoise as gc_denoise, Sampler, Solver};
 
     let ops = MlxLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
-    let sampler: Box<dyn Sampler<MlxLatentOps>> = sampler_name
-        .and_then(sampler_by_name::<MlxLatentOps>)
-        .unwrap_or_else(|| Box::new(Euler));
+    let solver = sampler_name
+        .and_then(Solver::from_name)
+        .unwrap_or(Solver::Euler);
+    let sampler: Box<dyn Sampler<MlxLatentOps>> = solver.boxed();
+    let mut step_observer = CuratedStepObserver::new(solver);
 
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<Array> {
         step_gate(cancel, on_progress, sigmas, total, sigma)?;
@@ -346,6 +425,9 @@ pub fn run_curated_sampler(
         // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
         // back here is always the fresh node to integrate from, so evaluating it is safe.
         ge(mlx_rs::transforms::eval([x]))?;
+        if step_observer.is_step_start(sigmas, sigma) {
+            on_latent(x, sigma);
+        }
         gc_denoise(&ops, ms, x, sigma, |xin, t| {
             predict(xin, t).map_err(Into::into)
         })
@@ -379,6 +461,32 @@ pub fn run_cfgpp_sampler(
     on_progress: &mut dyn FnMut(Progress),
     mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
 ) -> Result<Array> {
+    run_cfgpp_sampler_with_latent_hook(
+        base_sampler_name,
+        ms,
+        sigmas,
+        latents,
+        cancel,
+        on_progress,
+        |_, _| {},
+        &mut predict_pair,
+    )
+}
+
+/// [`run_cfgpp_sampler`] with the same actual-step raw-latent observer offered by
+/// [`run_curated_sampler_with_latent_hook`]. Every shipped CFG++ solver performs exactly one model
+/// evaluation per outer step, so no correction/midpoint filtering is required here.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cfgpp_sampler_with_latent_hook(
+    base_sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut on_latent: impl FnMut(&Array, f32),
+    mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
+) -> Result<Array> {
     use gen_core::sampling::{
         base_supports_cfgpp, cfgpp_denoise as gc_cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler,
         Solver,
@@ -397,6 +505,7 @@ pub fn run_cfgpp_sampler(
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
         step_gate(cancel, on_progress, sigmas, total, sigma)?;
         ge(mlx_rs::transforms::eval([x]))?;
+        on_latent(x, sigma);
         gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
             predict_pair(xin, t).map_err(Into::into)
         })
@@ -1200,6 +1309,120 @@ mod tests {
             let want = x0 - e * sigmas[0]; // x_init − ε·σ_0
             assert!((g - want).abs() < 2e-3, "eps euler: got {g} want {want}");
         }
+    }
+
+    #[test]
+    fn raw_latent_hook_observes_only_heun_outer_step_sigmas() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let mut observed = Vec::new();
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        run_curated_sampler_with_latent_hook(
+            Some("heun"),
+            &ms,
+            &sigmas,
+            arr(&[0.3, -1.1, 2.0]),
+            0,
+            &cancel,
+            &mut progress,
+            |_latent, sigma| observed.push(sigma),
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        assert_eq!(observed, sigmas[..4]);
+    }
+
+    #[test]
+    fn raw_latent_hook_suppresses_dpmpp_sde_midpoint_evaluations() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let mut observed = Vec::new();
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        run_curated_sampler_with_latent_hook(
+            Some("dpmpp_sde"),
+            &ms,
+            &sigmas,
+            arr(&[0.3, -1.1, 2.0]),
+            7,
+            &cancel,
+            &mut progress,
+            |_latent, sigma| observed.push(sigma),
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        assert_eq!(observed, sigmas[..4]);
+    }
+
+    #[test]
+    fn curated_legacy_wrapper_matches_explicit_inert_hook_exactly() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let init = arr(&[0.3, -1.1, 2.0]);
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let legacy = run_curated_sampler(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            init.clone(),
+            42,
+            &cancel,
+            &mut progress,
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        let mut progress = |_p: Progress| {};
+        let explicit = run_curated_sampler_with_latent_hook(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            init,
+            42,
+            &cancel,
+            &mut progress,
+            |_, _| {},
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        assert_eq!(legacy.as_slice::<f32>(), explicit.as_slice::<f32>());
+    }
+
+    #[test]
+    fn cfgpp_legacy_wrapper_matches_explicit_inert_hook_exactly() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let init = arr(&[0.3, -1.1, 2.0]);
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let legacy = run_cfgpp_sampler(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            init.clone(),
+            &cancel,
+            &mut progress,
+            |_xin, _t| Ok((arr(&[0.7, -0.2, 0.4]), arr(&[0.1, 0.2, -0.1]))),
+        )
+        .unwrap();
+        let mut progress = |_p: Progress| {};
+        let explicit = run_cfgpp_sampler_with_latent_hook(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            init,
+            &cancel,
+            &mut progress,
+            |_, _| {},
+            |_xin, _t| Ok((arr(&[0.7, -0.2, 0.4]), arr(&[0.1, 0.2, -0.1]))),
+        )
+        .unwrap();
+        assert_eq!(legacy.as_slice::<f32>(), explicit.as_slice::<f32>());
     }
 
     /// `run_av_curated_sampler` drives LTX's joint two-stream (video+audio) FLOW denoise: the curated

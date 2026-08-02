@@ -127,7 +127,7 @@ pub fn descriptor() -> ModelDescriptor {
             // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
             // advisory in `load`).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -634,7 +634,7 @@ impl KolorsGenerator {
                             .clone()
                             .expect("curated_init is Some iff use_curated (computed above)");
 
-                        let latents = heavy.denoise_curated_latents(
+                        let latents = heavy.denoise_curated_latents_with_preview(
                             req.sampler.as_deref(),
                             req.scheduler.as_deref(),
                             init_opt.as_ref(),
@@ -652,6 +652,7 @@ impl KolorsGenerator {
                             run_steps,
                             &req.cancel,
                             on_progress,
+                            &req.preview,
                         )?;
                         let latents = match &vp_plan {
                             Some(p) => {
@@ -674,7 +675,7 @@ impl KolorsGenerator {
                                 "legacy_pose_init is Some in the non-curated combined-pose mode",
                             );
                             let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
-                            heavy.denoise_controlnet_ip_latents(
+                            heavy.denoise_controlnet_ip_latents_with_preview(
                                 heavy_owned.control.as_ref().expect("validated above"),
                                 tokens,
                                 init_latents,
@@ -692,9 +693,10 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
                             )?
                         } else if let Some((image, scale)) = control {
-                            heavy.denoise_controlnet_latents(
+                            heavy.denoise_controlnet_latents_with_preview(
                                 heavy_owned.control.as_ref().expect("validated above"),
                                 &noise,
                                 image,
@@ -708,9 +710,10 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
                             )?
                         } else if let Some((tokens, scale)) = &ip {
-                            heavy.denoise_ip_latents(
+                            heavy.denoise_ip_latents_with_preview(
                                 tokens,
                                 &noise,
                                 &pos,
@@ -723,12 +726,13 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
                             )?
                         } else if let Some((_image, strength)) = img2img {
                             let x0 = legacy_img2img_init.as_ref().expect(
                                 "legacy_img2img_init is Some in the non-curated img2img mode",
                             );
-                            heavy.denoise_img2img_latents(
+                            heavy.denoise_img2img_latents_with_preview(
                                 x0,
                                 &noise,
                                 &pos,
@@ -741,9 +745,10 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
                             )?
                         } else {
-                            heavy.denoise_latents(
+                            heavy.denoise_latents_with_preview(
                                 &noise,
                                 &pos,
                                 neg.as_ref(),
@@ -754,6 +759,7 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
                             )?
                         };
 
@@ -874,6 +880,7 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_preview);
         assert!(
             d.capabilities.supports_lora,
             "Kolors LoRA is wired (sc-4733)"

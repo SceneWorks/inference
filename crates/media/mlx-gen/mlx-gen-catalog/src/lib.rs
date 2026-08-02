@@ -118,7 +118,7 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
-    const PREVIEW_PROVIDER_IDS: [&str; 10] = [
+    const PREVIEW_PROVIDER_IDS: [&str; 12] = [
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
@@ -129,6 +129,8 @@ mod tests {
         "krea_2_turbo_control",
         "qwen_image",
         "qwen_image_edit",
+        "sdxl",
+        "kolors",
     ];
 
     #[test]
@@ -159,6 +161,29 @@ mod tests {
         assert_eq!(
             advertising, expected,
             "only providers with an actual PreviewSink denoise route may advertise support"
+        );
+    }
+
+    #[test]
+    fn temporal_svd_and_struct_only_instantid_stay_outside_preview_advertising() {
+        let registry = super::provider_registry().unwrap();
+        let descriptors: Vec<_> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)())
+            .collect();
+        let svd = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == "svd_xt")
+            .expect("SVD remains a registered temporal generator");
+        assert!(
+            !svd.capabilities.supports_preview,
+            "SVD temporal previews remain scoped to sc-16636"
+        );
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| descriptor.id != "instantid"),
+            "InstantID is a struct-only composition API and must not gain invented registration"
         );
     }
 
