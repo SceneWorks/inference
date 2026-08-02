@@ -325,6 +325,22 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // The clearest case in the lane of ids that load a **different base checkpoint**, not just a
     // different sampler: control is `Qwen/Qwen-Image-2512`, edit is `Qwen/Qwen-Image-Edit`. Each
     // route's bundled Qwen2.5-VL tower is a pinned hole.
+    //
+    // All three routes carry a Lightning distill LoRA, but they do NOT all carry the same one — the
+    // split follows the transformer config, not the base repository name. T2I and **control** both
+    // build the tower through `loader::load_transformer` (`QwenTransformerConfig::qwen_image()`),
+    // so the 2512 control base is the same module tree the T2I distill LoRA maps onto; Edit alone
+    // takes `load_transformer_edit` (`zero_cond_t: true`), which is why it names the separate
+    // `Qwen-Image-Edit-2511-Lightning`. Control reaches the recipe end-to-end: its descriptor
+    // advertises `qwen_samplers()` (the `lightning` profile) and `supports_lora`, and
+    // `model_control.rs` applies `spec.adapters` onto that base transformer via the same
+    // `apply_qwen_adapters` T2I uses, then drops the negative branch under `params.is_lightning`
+    // (CFG-distilled → one forward/step). No 2512-specific Lightning repository is named anywhere in
+    // `mlx-gen-qwen-image`, and `sampler.rs` states the distill LoRA is supplied via `spec.adapters`
+    // with `lightx2v/Qwen-Image-Lightning` as the named instance — so that is the artifact the
+    // control id can load, and the row carries it. The distiller trained it against the 2509 base,
+    // which is a parity question, not a licence one: the edge exists because the id can load the
+    // artifact.
     ProviderComponents {
         provider_id: "qwen_image",
         components: &["qwen_image", "qwen_image_lightning", "nvidia_pid_students"],
@@ -334,6 +350,7 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         components: &[
             "qwen_image_2512",
             "qwen_image_2512_fun_controlnet_union",
+            "qwen_image_lightning",
             "nvidia_pid_students",
         ],
     },
@@ -985,7 +1002,9 @@ mod tests {
         assert!(!terms("mochi_1").contains(&LicenseTerm::GatedAccess));
 
         // The PiD overlay is the **only** reason `sana_1600m` and `z_image` name a non-commercial
-        // text at all: every other component on either row is Apache-2.0, `mlx-gen-pid` states
+        // text at all: every other component on either row carries no non-commercial term
+        // (`sana_1600m`'s Gemma-2-2B-IT caption encoder resolves to `gemma-terms`, not
+        // `apache-2-0` — but that family states no `NonCommercialWeights`), `mlx-gen-pid` states
         // NVIDIA's terms in one crate, and not one of the thirteen consumers repeats it. Deriving
         // the union from the components is what surfaces that — which is epic 16660's R6, and the
         // reason the strictest term in a row is routinely not its headline model. `seedvr2` has no
