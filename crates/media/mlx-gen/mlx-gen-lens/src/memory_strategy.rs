@@ -146,7 +146,7 @@ pub(crate) fn registered_valid_fixture(
         },
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: mlx_gen::gen_core::MemoryMode::TextToImage,
-            has_reference: false,
+            reference_count: 0,
             use_pid: false,
             has_phases: false,
             overlay: None,
@@ -364,6 +364,7 @@ mod tests {
                 height: 256,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {

@@ -691,7 +691,7 @@ mod tests {
             },
             MemoryBehaviorRoute {
                 mode: MemoryMode::TextToImage,
-                has_reference: false,
+                reference_count: 0,
                 use_pid: false,
                 has_phases: false,
                 overlay: None,

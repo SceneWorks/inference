@@ -784,7 +784,7 @@ pub(crate) fn registered_valid_fixture(
         } else {
             mlx_gen::gen_core::MemoryMode::TextToImage
         },
-        has_reference: is_control,
+        reference_count: u32::from(is_control),
         use_pid,
         has_phases: false,
         overlay: None,
@@ -1018,6 +1018,7 @@ mod tests {
                 height: 1024,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {
@@ -1991,6 +1992,7 @@ mod tests {
             let mut ctx = context(strategy);
             ctx.mode = MemoryMode::Edit;
             ctx.has_reference = true;
+            ctx.geometry.reference_count = 1;
             assert!(
                 matches!(
                     safety_check(&contract, ctx.selection.tier, &ctx),
@@ -2184,6 +2186,10 @@ mod tests {
             },
             MemoryGeometry {
                 frames: ctx.geometry.frames + 1,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                reference_count: 1,
                 ..ctx.geometry
             },
             MemoryGeometry {

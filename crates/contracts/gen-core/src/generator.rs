@@ -866,6 +866,26 @@ pub struct ControlClipRef<'a> {
 }
 
 impl GenerationRequest {
+    /// Number of image-conditioning inputs represented by this request for memory-evidence
+    /// geometry. Multi-image carriers contribute their flattened image count; control/depth/mask
+    /// carriers each contribute one. Temporal keyframes and clips are covered by the frame axis.
+    pub fn image_reference_count(&self) -> u32 {
+        self.conditioning.iter().fold(0_u32, |count, conditioning| {
+            let increment = match conditioning {
+                Conditioning::Reference { .. }
+                | Conditioning::Control { .. }
+                | Conditioning::Depth { .. }
+                | Conditioning::Mask { .. } => 1,
+                Conditioning::MultiReference { images } => {
+                    u32::try_from(images.len()).unwrap_or(u32::MAX)
+                }
+                Conditioning::ReduxRefs { refs } => u32::try_from(refs.len()).unwrap_or(u32::MAX),
+                _ => 0,
+            };
+            count.saturating_add(increment)
+        })
+    }
+
     /// The first request-supplied `Option<f32>` knob that is **non-finite** (NaN / ±Inf), returned as
     /// `(field, value)` — or `None` when every present float is finite. This is the single home of the
     /// finiteness floor (F-053 / F-001): a NaN/Inf on *any* float knob flows into the guidance /

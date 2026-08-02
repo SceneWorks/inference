@@ -278,7 +278,7 @@ pub(crate) fn registered_valid_fixture(
             } else {
                 mlx_gen::gen_core::MemoryMode::TextToImage
             },
-            has_reference: is_edit,
+            reference_count: u32::from(is_edit),
             use_pid: false,
             has_phases: false,
             overlay: None,
@@ -467,6 +467,7 @@ mod tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {

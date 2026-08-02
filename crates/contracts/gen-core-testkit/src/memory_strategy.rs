@@ -505,6 +505,7 @@ fn route_context(
             height: 1024,
             batch: 1,
             frames: 1,
+            reference_count: 0,
         },
         overlay: None,
         budget: MemoryBudget {
