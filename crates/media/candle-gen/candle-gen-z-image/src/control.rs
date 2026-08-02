@@ -662,6 +662,7 @@ impl ZImageControl {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |latents, t| -> Result<Tensor> {
                 let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                 // Conditional velocity (Z-Image sign convention: the DiT output is negated before the

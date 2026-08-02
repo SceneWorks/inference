@@ -329,6 +329,7 @@ impl IpAdapterFlux {
             seed,
             cancel,
             on_progress,
+            None,
             |img, t| -> Result<Tensor> {
                 // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
                 // driver's `CandleError`. The XLabs IP residual injection lives inside this closure.

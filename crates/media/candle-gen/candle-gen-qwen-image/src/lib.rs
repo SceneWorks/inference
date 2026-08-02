@@ -382,6 +382,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |latents, sigma| -> CResult<Tensor> {
                     let pos = transformer.forward(latents, pos_embeds, sigma, lat_h, lat_w)?;
                     match neg_embeds {

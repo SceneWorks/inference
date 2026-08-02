@@ -16,6 +16,7 @@ use gen_core::sampling::{LatentOps, TimestepConvention};
 use gen_core::{CancelFlag, Progress};
 use rand::{rngs::StdRng, SeedableRng};
 
+use crate::preview::{PreviewCounter, PreviewHook};
 use crate::{CandleError, Result};
 
 /// Lift a `candle_core::Result` into the backend-neutral `gen_core::Result` (the `LatentOps` trait is
@@ -163,6 +164,26 @@ impl GuidanceOps for CandleLatentOps {
 /// `CandleError::Canceled`. Progress is reported as the count of schedule nodes already descended past,
 /// robust to the multi-eval solvers (heun / dpmpp_sde call this twice per step; the count stays
 /// monotone and ≤ total).
+///
+/// ## The `preview` seam (epic 16948, sc-16949)
+///
+/// `preview` is a family's opt-in per-step latent preview hook ([`crate::preview::PreviewHook`]).
+/// `None` is the default and is byte-identical to a run without it — the driver builds no counter and
+/// does no work. A `Some` hook over an inert [`gen_core::PreviewSink`] costs one
+/// [`is_active`](gen_core::PreviewSink::is_active) check per evaluation and nothing else.
+///
+/// Two properties the seam guarantees so families do not have to:
+///
+/// * **The driver owns the [`PreviewCounter`]**, built from the very `sigmas` it is integrating, so a
+///   family cannot number frames against a different schedule than the one being run. The counter
+///   dedups by schedule position, which is what collapses a multi-eval solver's repeated evaluation
+///   into exactly one frame per outer step (progress deliberately repeats there; previews must not).
+/// * **The hook sees the running latent `x`, never the `c_in`-scaled model input `x_in`.**
+///   `gc_denoise` applies the input scaling internally, so the `x` handed here is the tensor a
+///   family's linear RGB fit was measured against.
+///
+/// A projection failure inside the hook is swallowed — previews are decorative and never fail a
+/// render.
 #[allow(clippy::too_many_arguments)]
 pub fn run_curated_sampler(
     sampler_name: Option<&str>,
@@ -172,6 +193,7 @@ pub fn run_curated_sampler(
     seed: u64,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
     use gen_core::sampling::{denoise as gc_denoise, sampler_by_name, Euler, Sampler};
@@ -182,6 +204,9 @@ pub fn run_curated_sampler(
     let sampler: Box<dyn Sampler<CandleLatentOps>> = sampler_name
         .and_then(sampler_by_name::<CandleLatentOps>)
         .unwrap_or_else(|| Box::new(Euler));
+    // Built HERE, not by the family, so frame numbering can only ever key off the schedule this
+    // driver actually integrates. `None` allocates nothing and adds no per-eval work.
+    let previews = preview.map(|hook| (hook, PreviewCounter::new(sigmas)));
 
     let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {
         if cancel.is_cancelled() {
@@ -191,6 +216,11 @@ pub fn run_curated_sampler(
         // solvers (heun / dpmpp_sde call this twice per step; the count stays monotone and ≤ total).
         let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
         on_progress(Progress::Step { current, total });
+        // Best-effort preview of the RUNNING latent (not the c_in-scaled `x_in` gc_denoise builds).
+        // The counter drops the multi-eval repeat the progress line above deliberately emits twice.
+        if let Some((hook, counter)) = &previews {
+            hook.emit(counter, sigmas, sigma, x);
+        }
         gc_denoise(&ops, ms, x, sigma, |xin, t| {
             predict(xin, t).map_err(Into::into)
         })
@@ -210,6 +240,9 @@ pub fn run_curated_sampler(
 /// The time-shift lives entirely in `sigmas` (resolved by [`resolve_flow_schedule`]), so
 /// `FlowModelSampling::new(conv)` (mu = 0) is the correct integration contract here — its `timestep` /
 /// `denoised_coeffs` are mu-independent.
+///
+/// `preview` is the optional per-step latent preview hook; see [`run_curated_sampler`] for the full
+/// contract. `None` is byte-identical to a run without it.
 #[allow(clippy::too_many_arguments)]
 pub fn run_flow_sampler(
     sampler_name: Option<&str>,
@@ -219,6 +252,7 @@ pub fn run_flow_sampler(
     seed: u64,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
@@ -230,6 +264,7 @@ pub fn run_flow_sampler(
         seed,
         cancel,
         on_progress,
+        preview,
         predict,
     )
 }
@@ -563,12 +598,27 @@ impl ScmScheduler {
 /// `predict(lat_in, scm_t)` returns the RAW trunk output; the trigflow recombination + renoise live
 /// here, so the driver is trunk-agnostic (the embedded guidance scalar is captured by the closure).
 /// Cancel + monotone progress mirror the [`run_curated_sampler`] run-loop contract.
+///
+/// ## The `preview` seam (epic 16948, sc-16949)
+///
+/// `preview` is the same opt-in [`crate::preview::PreviewHook`] the curated drivers take, but keyed
+/// differently: SCM walks `ScmScheduler` **angle timesteps**, not a descending σ array, so
+/// `PreviewCounter::new(sigmas)` does not apply and this driver numbers frames with
+/// [`PreviewCounter::with_steps`] on the step index instead. `None` is byte-identical to a run
+/// without it; a `Some` hook over an inert sink costs one `is_active()` check per step.
+///
+/// **The hook receives the running `latents`, which are pre-scaled by `sigma_data`.** This loop
+/// multiplies the seed latent by `σ_data` on entry and divides the result back out on exit, so a
+/// family's projector must apply the same `1/σ_data` correction before projecting or the preview is
+/// uniformly over-scaled (`σ_data = 0.5` for Sprint, i.e. 2× too bright). This mirrors the
+/// `inverse_sigma_data` argument the MLX Sprint preview carries.
 pub fn run_scm_sampler(
     scheduler: &ScmScheduler,
     latents: Tensor,
     seed: u64,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
     let ops = CandleLatentOps;
@@ -576,6 +626,8 @@ pub fn run_scm_sampler(
     let n = scheduler.num_steps();
     let total = n.max(1) as u32;
     let single_step = scheduler.is_single_step();
+    // Step-index keyed: this loop has no σ schedule for the sigma-keyed counter to search.
+    let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(n)));
 
     // diffusers: latents = latents * sigma_data (the SCM prior std-dev).
     let mut latents = latents.affine(sd, 0.0)?;
@@ -589,6 +641,10 @@ pub fn run_scm_sampler(
             current: (i as u32 + 1).min(total),
             total,
         });
+        // Best-effort preview of the running (σ_data-scaled) latent — see the doc note above.
+        if let Some((hook, counter)) = &previews {
+            hook.emit_step(counter, i, &latents);
+        }
 
         let s = scheduler.timesteps[i];
         let t_next = scheduler.timesteps[i + 1];
@@ -788,6 +844,7 @@ mod tests {
             0,
             &cancel,
             &mut progress,
+            None,
             |xin, _t| velocity(xin),
         )
         .unwrap();
@@ -818,6 +875,7 @@ mod tests {
             0,
             &cancel,
             &mut progress,
+            None,
             |_xin, _t| Ok(t(&eps)),
         )
         .unwrap();
@@ -853,6 +911,7 @@ mod tests {
                 7,
                 &cancel,
                 &mut progress,
+                None,
                 // A mild v "model": v = 0.1·x_in (the input is c_in-scaled, keeping it bounded).
                 |xin, _t| Ok(xin.affine(0.1, 0.0)?),
             )
@@ -881,6 +940,7 @@ mod tests {
                 7,
                 &cancel,
                 &mut p,
+                None,
                 |xin, _t| Ok(xin.affine(0.25, 0.1)?),
             )
             .unwrap()
@@ -908,6 +968,7 @@ mod tests {
             0,
             &cancel,
             &mut progress,
+            None,
             |xin, _t| Ok(xin.clone()),
         )
         .unwrap_err();
@@ -992,6 +1053,7 @@ mod tests {
             7,
             &cancel,
             &mut progress,
+            None,
             |xin, _t| Ok(xin.affine(0.25, 0.1)?),
         )
         .unwrap();
@@ -999,6 +1061,222 @@ mod tests {
         assert!(vec1(&out.to_dtype(DType::F32).unwrap())
             .iter()
             .all(|v| v.is_finite()));
+    }
+
+    // --- Preview seam (epic 16948, sc-16949) ------------------------------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    use gen_core::{Image, PreviewFrame, PreviewSink};
+
+    /// A sink that records every frame it receives.
+    fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        (
+            PreviewSink::new(move |frame| captured.lock().unwrap().push(frame)),
+            frames,
+        )
+    }
+
+    /// A stand-in for a family's projector: records the tensor it was handed and returns a 1×1 frame.
+    /// Real families project through `preview::project_latents`, which needs a `[1, C, h, w]` latent;
+    /// these driver tests run 1-D toy latents, so the projection itself is out of scope here.
+    fn recording_projector(
+        seen: &Arc<Mutex<Vec<Vec<f32>>>>,
+    ) -> impl Fn(&Tensor) -> Result<Image> + '_ {
+        move |x: &Tensor| {
+            seen.lock().unwrap().push(vec1(x));
+            Ok(Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0],
+            })
+        }
+    }
+
+    /// THE candle-specific hazard. `run_curated_sampler` recomputes the step counter on every model
+    /// evaluation, and heun / dpmpp_sde evaluate twice per outer step — so the value it feeds
+    /// `on_progress` deliberately repeats. An undeduped preview path would burn a projection and push
+    /// a duplicate frame. Exactly one frame per outer step must survive: 8, numbered 1..=8, on an
+    /// 8-step schedule. Not 16 (undeduped), and not 4 (a counter that swallowed the corrector).
+    #[test]
+    fn preview_emits_exactly_one_frame_per_outer_step_on_multi_eval_solvers() {
+        let sigmas = build_flow_sigmas(8, compute_mu(image_seq_len(512, 512), 8));
+        assert_eq!(sigmas.len(), 9, "an 8-step schedule carries 9 sigmas");
+        for name in ["euler", "heun", "dpmpp_sde"] {
+            let (sink, frames) = collecting_sink();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let hook = PreviewHook::new(&sink, recording_projector(&seen));
+            let cancel = CancelFlag::new();
+            let mut progress = |_p: Progress| {};
+            run_flow_sampler(
+                Some(name),
+                TimestepConvention::Sigma,
+                &sigmas,
+                t(&[0.2, -0.5, 1.0, 0.3]),
+                7,
+                &cancel,
+                &mut progress,
+                Some(&hook),
+                |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+            )
+            .unwrap();
+
+            let frames = frames.lock().unwrap();
+            let numbering: Vec<u32> = frames.iter().map(|f| f.current).collect();
+            assert_eq!(numbering, (1..=8).collect::<Vec<_>>(), "{name} numbering");
+            assert!(frames.iter().all(|f| f.total == 8), "{name} total");
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                8,
+                "{name}: a deduped position must not burn a projection"
+            );
+        }
+    }
+
+    /// Progress still repeats on a two-eval solver — the dedup belongs to the preview counter, not to
+    /// the progress line. Guards against "fixing" the duplicate by changing `on_progress`.
+    #[test]
+    fn progress_still_repeats_where_preview_dedups() {
+        let sigmas = build_flow_sigmas(8, compute_mu(image_seq_len(512, 512), 8));
+        let cancel = CancelFlag::new();
+        let mut steps = Vec::new();
+        let mut progress = |p: Progress| {
+            if let Progress::Step { current, .. } = p {
+                steps.push(current);
+            }
+        };
+        run_flow_sampler(
+            Some("heun"),
+            TimestepConvention::Sigma,
+            &sigmas,
+            t(&[0.2, -0.5, 1.0, 0.3]),
+            7,
+            &cancel,
+            &mut progress,
+            None,
+            |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+        )
+        .unwrap();
+        assert!(
+            steps.len() > 8,
+            "heun evaluates more than once per step: {steps:?}"
+        );
+        assert!(steps.windows(2).all(|w| w[0] <= w[1]) && steps.iter().all(|&c| c <= 8));
+    }
+
+    /// N1 for the new seam: attaching a preview hook — inert or active — cannot move a single bit of
+    /// the render. Checked on a stochastic solver so a stray RNG draw would show up.
+    #[test]
+    fn preview_hook_leaves_the_render_byte_identical() {
+        let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
+        let run = |preview: Option<&PreviewHook<'_>>| {
+            let cancel = CancelFlag::new();
+            let mut progress = |_p: Progress| {};
+            vec1(
+                &run_flow_sampler(
+                    Some("dpmpp_sde"),
+                    TimestepConvention::Sigma,
+                    &sigmas,
+                    t(&[0.2, -0.5, 1.0, 0.3]),
+                    7,
+                    &cancel,
+                    &mut progress,
+                    preview,
+                    |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+                )
+                .unwrap(),
+            )
+        };
+        let baseline = run(None);
+        let inert = PreviewSink::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(
+            run(Some(&PreviewHook::new(&inert, recording_projector(&seen)))),
+            baseline,
+            "an inert sink must be byte-identical to no hook at all"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an inert sink must not invoke the projection"
+        );
+
+        let (active, _frames) = collecting_sink();
+        assert_eq!(
+            run(Some(&PreviewHook::new(&active, recording_projector(&seen)))),
+            baseline,
+            "an active sink must not perturb the render either"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 6);
+    }
+
+    /// Previews are decorative: a projector that always fails loses its frames and nothing else.
+    #[test]
+    fn preview_projection_failure_never_fails_the_render() {
+        let sigmas = build_flow_sigmas(4, compute_mu(image_seq_len(512, 512), 4));
+        let (sink, frames) = collecting_sink();
+        let hook = PreviewHook::new(&sink, |_: &Tensor| {
+            Err(CandleError::Msg("synthetic projection failure".into()))
+        });
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            t(&[0.2, -0.5, 1.0, 0.3]),
+            7,
+            &cancel,
+            &mut progress,
+            Some(&hook),
+            |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+        )
+        .unwrap();
+        assert!(vec1(&out).iter().all(|v| v.is_finite()));
+        assert!(frames.lock().unwrap().is_empty());
+    }
+
+    /// The hook must see the RUNNING latent `x`, not the `c_in`-scaled model input `x_in`. Proven over
+    /// an ε/DDPM `ModelSampling` whose input scale is emphatically not the identity: at σ = 8,
+    /// `c_in = 1/sqrt(65) ≈ 0.124`, so the two tensors are unmistakably different.
+    #[test]
+    fn preview_hook_sees_the_running_latent_not_the_scaled_model_input() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];
+        let x_init = t(&[0.3, -1.1, 2.0]);
+        let (sink, _frames) = collecting_sink();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook = PreviewHook::new(&sink, recording_projector(&seen));
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let recorded_inputs = Arc::clone(&inputs);
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        run_curated_sampler(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            x_init.clone(),
+            0,
+            &cancel,
+            &mut progress,
+            Some(&hook),
+            |xin, _t| {
+                recorded_inputs.lock().unwrap().push(vec1(xin));
+                Ok(t(&[0.7, -0.2, 0.4]))
+            },
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        let inputs = inputs.lock().unwrap();
+        assert_eq!(seen[0], vec1(&x_init), "the hook must receive `x`");
+        assert_ne!(
+            inputs[0], seen[0],
+            "this ModelSampling scales its input, so `x_in` != `x` — the test would be vacuous \
+             otherwise"
+        );
     }
 
     // --- Two-stream AV driver (epic 7114 P4, sc-7125): LTX's joint video+audio denoise --------------
@@ -1165,6 +1443,7 @@ mod tests {
             7,
             &cancel,
             &mut progress,
+            None,
             |xin, scm_t| {
                 forwards += 1;
                 Ok(xin.affine(0.2 * scm_t as f64 + 0.1, 0.05)?)
@@ -1191,10 +1470,18 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut forwards = 0usize;
         let mut progress = |_p: Progress| {};
-        let out = run_scm_sampler(&scheduler, latents, 1, &cancel, &mut progress, |xin, _t| {
-            forwards += 1;
-            Ok(xin.affine(0.3, 0.0)?)
-        })
+        let out = run_scm_sampler(
+            &scheduler,
+            latents,
+            1,
+            &cancel,
+            &mut progress,
+            None,
+            |xin, _t| {
+                forwards += 1;
+                Ok(xin.affine(0.3, 0.0)?)
+            },
+        )
         .unwrap();
         assert_eq!(forwards, 1, "single-step SCM runs exactly one forward");
         assert!(vec1(&out).iter().all(|x| x.is_finite()));
@@ -1214,6 +1501,7 @@ mod tests {
                 seed,
                 &cancel,
                 &mut progress,
+                None,
                 |xin, scm_t| Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?),
             )
             .unwrap();
@@ -1221,6 +1509,131 @@ mod tests {
         };
         assert_eq!(run(7), run(7), "same seed reproduces");
         assert_ne!(run(7), run(8), "different seed diverges (renoise mixes in)");
+    }
+
+    /// The SCM seam. Sprint has NO sigma schedule — it walks `ScmScheduler` angle timesteps — so the
+    /// σ-keyed `PreviewCounter::new(sigmas)` does not apply and the driver keys frames on the step
+    /// index. One frame per step, numbered 1..=n, `total == n`.
+    #[test]
+    fn scm_preview_emits_one_frame_per_step_keyed_on_the_step_index() {
+        for steps in [1, 2, 4] {
+            let scheduler = ScmScheduler::new(steps);
+            let (sink, frames) = collecting_sink();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let hook = PreviewHook::new(&sink, recording_projector(&seen));
+            let cancel = CancelFlag::new();
+            let mut progress = |_p: Progress| {};
+            run_scm_sampler(
+                &scheduler,
+                t(&[0.3, -1.1, 2.0, 0.05]),
+                7,
+                &cancel,
+                &mut progress,
+                Some(&hook),
+                |xin, scm_t| Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?),
+            )
+            .unwrap();
+
+            let frames = frames.lock().unwrap();
+            let numbering: Vec<u32> = frames.iter().map(|f| f.current).collect();
+            assert_eq!(
+                numbering,
+                (1..=steps as u32).collect::<Vec<_>>(),
+                "{steps}-step SCM numbering"
+            );
+            assert!(
+                frames.iter().all(|f| f.total == steps as u32),
+                "{steps}-step SCM total"
+            );
+        }
+    }
+
+    /// The SCM hook receives the running latent, which this loop pre-scales by `σ_data` — the detail a
+    /// family's projector must undo. Pinned so the contract in the driver docs cannot drift silently.
+    #[test]
+    fn scm_preview_receives_the_sigma_data_scaled_running_latent() {
+        let scheduler = ScmScheduler::new(2);
+        let x_init = t(&[0.3, -1.1, 2.0, 0.05]);
+        let (sink, _frames) = collecting_sink();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook = PreviewHook::new(&sink, recording_projector(&seen));
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        run_scm_sampler(
+            &scheduler,
+            x_init.clone(),
+            7,
+            &cancel,
+            &mut progress,
+            Some(&hook),
+            |xin, scm_t| Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?),
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        let want = vec1(&x_init.affine(scheduler.sigma_data as f64, 0.0).unwrap());
+        assert_eq!(seen[0], want, "step 0 sees the σ_data-scaled seed latent");
+    }
+
+    /// N1 for the SCM seam: a preview hook — inert or active — leaves the latent byte-identical.
+    #[test]
+    fn scm_preview_hook_leaves_the_render_byte_identical() {
+        let run = |preview: Option<&PreviewHook<'_>>| {
+            let scheduler = ScmScheduler::new(4);
+            let cancel = CancelFlag::new();
+            let mut progress = |_p: Progress| {};
+            vec1(
+                &run_scm_sampler(
+                    &scheduler,
+                    t(&[0.3, -1.1, 2.0, 0.05]),
+                    7,
+                    &cancel,
+                    &mut progress,
+                    preview,
+                    |xin, scm_t| Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?),
+                )
+                .unwrap(),
+            )
+        };
+        let baseline = run(None);
+        let inert = PreviewSink::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(
+            run(Some(&PreviewHook::new(&inert, recording_projector(&seen)))),
+            baseline
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        let (active, _frames) = collecting_sink();
+        assert_eq!(
+            run(Some(&PreviewHook::new(&active, recording_projector(&seen)))),
+            baseline
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    /// A projector that always fails costs the SCM render nothing.
+    #[test]
+    fn scm_preview_projection_failure_never_fails_the_render() {
+        let scheduler = ScmScheduler::new(4);
+        let (sink, frames) = collecting_sink();
+        let hook = PreviewHook::new(&sink, |_: &Tensor| {
+            Err(CandleError::Msg("synthetic projection failure".into()))
+        });
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_scm_sampler(
+            &scheduler,
+            t(&[0.3, -1.1, 2.0, 0.05]),
+            7,
+            &cancel,
+            &mut progress,
+            Some(&hook),
+            |xin, scm_t| Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?),
+        )
+        .unwrap();
+        assert!(vec1(&out).iter().all(|v| v.is_finite()));
+        assert!(frames.lock().unwrap().is_empty());
     }
 }
 

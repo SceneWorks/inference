@@ -338,6 +338,7 @@ impl Pipeline {
                 knobs.seed,
                 cancel,
                 on_progress,
+                None,
                 |latents, t| -> CResult<Tensor> {
                     let ts = t as f64 * n_train;
                     let v_pos = dit.forward(latents, ctx_pos, ts, cos, sin)?;

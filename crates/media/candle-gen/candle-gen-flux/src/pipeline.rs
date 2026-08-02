@@ -654,6 +654,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
+            None,
             |img, t| -> Result<Tensor> {
                 // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.

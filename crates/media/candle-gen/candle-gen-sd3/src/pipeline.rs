@@ -544,6 +544,7 @@ pub(crate) fn render_core(
         seed,
         cancel,
         on_progress,
+        None,
         |latents, sigma| -> Result<Tensor> {
             // SD3 feeds the DiT `t = σ·1000` (the timestep convention; the embedder scales the
             // sinusoid). f32 here is correct — the embedder upcasts internally.

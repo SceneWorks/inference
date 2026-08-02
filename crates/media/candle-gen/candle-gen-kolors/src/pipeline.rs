@@ -452,6 +452,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x_in, t| -> Result<Tensor> {
                 // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
                 // index the UNet embeds. CFG batches/combines exactly like the native leading-Euler path.

@@ -422,6 +422,7 @@ impl Flux1DevControl {
             seed,
             cancel,
             on_progress,
+            None,
             |img, t| -> Result<Tensor> {
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
                 Ok(self.transformer.forward_composed(

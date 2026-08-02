@@ -647,6 +647,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
                     let out = if embedded_guidance {
