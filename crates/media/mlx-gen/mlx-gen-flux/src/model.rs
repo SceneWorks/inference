@@ -5,9 +5,9 @@ use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler, Conditioning, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Residency, Result, TimestepConvention, WeightsSource,
+    default_seed, run_flow_sampler_with_latent_hook, Conditioning, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
+    Precision, Progress, Residency, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
@@ -573,7 +573,8 @@ impl Flux1 {
             let latents = create_noise(seed, req.width, req.height)?;
             // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
             // `run_flow_sampler`.
-            let final_latents = run_flow_sampler(
+            let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+            let final_latents = run_flow_sampler_with_latent_hook(
                 Some(sampler_name),
                 TimestepConvention::Sigma,
                 denoise_sigmas,
@@ -581,6 +582,17 @@ impl Flux1 {
                 seed,
                 &req.cancel,
                 on_progress,
+                |latents, sigma| {
+                    crate::preview::emit_preview(
+                        &req.preview,
+                        &previews,
+                        denoise_sigmas,
+                        sigma,
+                        latents,
+                        req.width,
+                        req.height,
+                    );
+                },
                 |x_in, timestep| {
                     // The curated samplers expose no step index, but the CFG-scheduling consumers
                     // (`timestep_to_start_cfg`) need one — derive it as the count of schedule nodes

@@ -15,6 +15,7 @@ pub mod loader;
 pub mod model;
 pub mod model_control;
 pub mod pipeline;
+pub mod preview;
 pub mod quant;
 pub mod text_encoder;
 pub mod transformer;

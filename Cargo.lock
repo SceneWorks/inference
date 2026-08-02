@@ -2125,6 +2125,7 @@ dependencies = [
 name = "mlx-gen-catalog"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-anima",
  "mlx-gen-bernini",
