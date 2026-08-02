@@ -160,7 +160,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -564,7 +564,7 @@ impl LensGenerator {
                     // The one render body (sc-11030): the same `LensHeavy::render` for both residencies, so a
                     // Sequential job (encoder already dropped) is byte-identical to Resident. The reasoner
                     // (sc-3176) is a standalone struct-API opt-in; the registry path leaves it off.
-                    let image = heavy.heavy.render(
+                    let image = heavy.heavy.render_with_preview(
                         &encoder_features,
                         &encoder_mask,
                         latent_h,
@@ -592,6 +592,7 @@ impl LensGenerator {
                                 on_progress(Progress::Decoding);
                             }
                         },
+                        &req.preview,
                     )?;
                     images.push(image);
                     // F-030 residual (sc-11133): a `keep == 1` early-stop runs 0 real steps, so the

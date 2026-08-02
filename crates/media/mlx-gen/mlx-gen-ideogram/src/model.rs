@@ -94,7 +94,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `max(TE, DiTs+VAE)`. Ideogram Q4/Q8 quantize the whole model DENSE at load, so a
             // `Sequential` + `quantize` load re-quantizes each generate (F-181 advisory in `load`).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -404,7 +404,7 @@ impl Ideogram4 {
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let seed = base_seed.wrapping_add(n as u64);
-                    let arr = heavy.run_denoise_from_embeds(
+                    let arr = heavy.run_denoise_from_embeds_with_preview(
                         &te_out,
                         req.height,
                         req.width,
@@ -416,6 +416,7 @@ impl Ideogram4 {
                         pid_ref,
                         &req.cancel,
                         on_progress,
+                        &req.preview,
                     )?;
                     images.push(array_to_image(&arr)?);
                 }

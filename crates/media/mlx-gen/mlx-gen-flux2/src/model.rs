@@ -19,9 +19,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler, CancelFlag, Error, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Residency, Result, TimestepConvention, WeightsSource,
+    default_seed, run_flow_sampler_with_latent_hook, CancelFlag, Error, GenerationOutput,
+    GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
+    Precision, Progress, Residency, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
@@ -1050,14 +1050,28 @@ impl Flux2 {
                     };
                     // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
                     // `run_flow_sampler`. img2img slices the schedule from `start_step`.
-                    let final_latents = run_flow_sampler(
+                    let denoise_sigmas = &sched.sigmas[start_step..keep];
+                    let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                    let final_latents = run_flow_sampler_with_latent_hook(
                         sampler_name,
                         TimestepConvention::Sigma,
-                        &sched.sigmas[start_step..keep],
+                        denoise_sigmas,
                         latents,
                         seed,
                         &req.cancel,
                         on_progress,
+                        |latents, sigma| {
+                            crate::preview::emit_flux_preview(
+                                &req.preview,
+                                &previews,
+                                denoise_sigmas,
+                                sigma,
+                                latents,
+                                lat_h as i32,
+                                lat_w as i32,
+                                vae,
+                            );
+                        },
                         predict,
                     )?;
                     on_progress(Progress::Decoding);

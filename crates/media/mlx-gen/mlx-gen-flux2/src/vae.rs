@@ -370,11 +370,48 @@ impl Flux2Vae {
     /// Decode the transformer's packed output `[B, lat_h, lat_w, 128]` (NHWC): de-normalize with
     /// the BatchNorm stats, 2×2-unpatchify into `[B, lat_h·2, lat_w·2, 32]`, then `decode`.
     pub fn decode_packed_latents(&self, packed: &Array) -> Result<Array> {
+        let latents = self.unpack_flux_packed_latents(packed)?;
+        self.decode(&latents)
+    }
+
+    /// De-normalize and unpatchify FLUX/Lens packed-grid latents into the VAE's true raw 32-channel
+    /// latent space. Input is NHWC `[B, h, w, 128]`, with channel order `c·4 + ph·2 + pw`; output
+    /// is NHWC `[B, h·2, w·2, 32]`. This is the narrow shared seam for decorative latent previews
+    /// and native VAE decode; callers must not project the intermediate packed 128-channel tensor.
+    pub fn unpack_flux_packed_latents(&self, packed: &Array) -> Result<Array> {
+        let shape = packed.shape();
+        if shape.len() != 4 || shape[3] != 128 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "FLUX packed latent must have shape [B, h, w, 128], got {shape:?}"
+            )));
+        }
         let packed = packed.as_dtype(Dtype::Float32)?;
         // De-normalize: x·std + mean (bn channel order = the packed 128-ch order).
         let denorm = add(&multiply(&packed, &self.bn_std)?, &self.bn_mean)?;
-        let latents = unpatchify(&denorm)?;
-        self.decode(&latents)
+        unpatchify(&denorm)
+    }
+
+    /// De-normalize and unpatchify Ideogram 4 packed-token latents into the same VAE's true raw
+    /// 32-channel latent space. Input is `[B, grid_h·grid_w, 128]`, with Ideogram's distinct packed
+    /// channel order `(ph, pw, c)`; output is NHWC `[B, grid_h·2, grid_w·2, 32]`.
+    pub fn unpack_ideogram_packed_latents(
+        &self,
+        packed: &Array,
+        grid_h: i32,
+        grid_w: i32,
+    ) -> Result<Array> {
+        let shape = packed.shape();
+        if shape.len() != 3 || shape[1] != grid_h.saturating_mul(grid_w) || shape[2] != 128 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "Ideogram packed latent must have shape [B, {}, 128], got {shape:?}",
+                grid_h.saturating_mul(grid_w)
+            )));
+        }
+        let packed = packed.as_dtype(Dtype::Float32)?;
+        let std = self.bn_std.reshape(&[1, 1, 128])?;
+        let mean = self.bn_mean.reshape(&[1, 1, 128])?;
+        let denorm = add(&multiply(&packed, &std)?, &mean)?;
+        unpatchify_ideogram(&denorm, grid_h, grid_w)
     }
 
     /// The packed-space BatchNorm de-normalization stats `(bn_std, bn_mean)` (each `[128]`, in the
@@ -424,6 +461,15 @@ fn unpatchify(x: &Array) -> Result<Array> {
         .reshape(&[b, h * 2, w_ * 2, c4])?)
 }
 
+/// Ideogram's patch-major 2x2 unpatch order: `(ph, pw, c)` rather than FLUX's `(c, ph, pw)`.
+fn unpatchify_ideogram(x: &Array, grid_h: i32, grid_w: i32) -> Result<Array> {
+    let shape = x.shape();
+    let channels = shape[2] / 4;
+    Ok(x.reshape(&[shape[0], grid_h, grid_w, 2, 2, channels])?
+        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+        .reshape(&[shape[0], grid_h * 2, grid_w * 2, channels])?)
+}
+
 #[allow(dead_code)]
 const _: i32 = LATENT_CHANNELS; // documented; channel counts come from the checkpoint shapes.
 
@@ -457,6 +503,28 @@ mod tests {
                             let want = (hi * 1000 + wi * 100 + (c * 4 + ph * 2 + pw)) as f32;
                             assert_eq!(got, want, "mismatch at hi{hi} wi{wi} ph{ph} pw{pw} c{c}");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ideogram_unpatchify_uses_patch_major_ordering() {
+        // One 2x1 token grid, two raw channels: packed index = (ph*2 + pw)*2 + c.
+        let data = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let packed = Array::from_slice(&data, &[1, 2, 8]);
+        let out = unpatchify_ideogram(&packed, 2, 1).unwrap();
+        assert_eq!(out.shape(), &[1, 4, 2, 2]);
+        let values = out.as_slice::<f32>();
+        let at = |h: usize, w: usize, c: usize| values[((h * 2 + w) * 2) + c];
+        for token_h in 0..2 {
+            for ph in 0..2 {
+                for pw in 0..2 {
+                    for channel in 0..2 {
+                        let got = at(token_h * 2 + ph, pw, channel);
+                        let want = (token_h * 8 + (ph * 2 + pw) * 2 + channel) as f32;
+                        assert_eq!(got, want);
                     }
                 }
             }

@@ -78,5 +78,19 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["ideogram_4", "ideogram_4_turbo"]);
+        let preview_ids: Vec<_> = registry
+            .generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                descriptor
+                    .capabilities
+                    .supports_preview
+                    .then_some(descriptor.id)
+            })
+            .collect();
+        assert_eq!(
+            preview_ids, explicit,
+            "every and only Ideogram 4 route previews"
+        );
     }
 }

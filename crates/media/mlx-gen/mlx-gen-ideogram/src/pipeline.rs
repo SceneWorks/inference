@@ -29,7 +29,7 @@ use mlx_gen::image::{resize_lanczos_u8, resize_nearest_u8};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::{flow_capture_plan, CancelFlag, Error, LatentDecoder, Progress, Result};
+use mlx_gen::{flow_capture_plan, CancelFlag, Error, LatentDecoder, PreviewSink, Progress, Result};
 use mlx_gen_flux2::{patchify_latents, Flux2Vae};
 
 use crate::adapters::apply_ideogram_adapters;
@@ -440,6 +440,41 @@ impl Ideogram4Heavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        self.run_denoise_from_embeds_with_preview(
+            te_out,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            edit,
+            run_from,
+            pid,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Preview-aware sibling of [`Self::run_denoise_from_embeds`]. Ideogram owns this cadence
+    /// because its reversed logit-normal Euler/inpaint loop does not route through the shared flow
+    /// sampler. One frame is attempted at the start of each actually executed loop step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_denoise_from_embeds_with_preview(
+        &self,
+        te_out: &Array,
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        edit: Option<&EditInit>,
+        run_from: usize,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+    ) -> Result<Array> {
         let patch = PATCH * AE_SCALE;
         // Request-derived: reject as a typed error rather than abort the worker (F-020/L-A). The
         // RES_MIN/RES_MAX (256–2048) range is a Generator-layer guarantee (enforced by the shared
@@ -525,6 +560,11 @@ impl Ideogram4Heavy {
         // low-noise polish tail `i < run_from` is skipped). `run_from == 0` → the full range (byte-
         // identical clean path). `total` counts the executed steps so progress still reaches 100%.
         let total_run = num_run - run_from;
+        let preview_sigmas: Vec<f32> = (run_from..=num_run)
+            .rev()
+            .map(|step| schedule.eval(si[step]) as f32)
+            .collect();
+        let previews = mlx_gen::preview::PreviewCounter::new(&preview_sigmas);
         for i in (run_from..num_run).rev() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
@@ -532,6 +572,17 @@ impl Ideogram4Heavy {
             let t_val = schedule.eval(si[i + 1]);
             let s_val = schedule.eval(si[i]);
             let t = Array::from_slice(&[t_val as f32], &[1]);
+
+            mlx_gen_flux2::preview::emit_ideogram_preview(
+                preview,
+                &previews,
+                &preview_sigmas,
+                t_val as f32,
+                &z,
+                grid_h,
+                grid_w,
+                &self.vae,
+            );
 
             let pos_z = concatenate_axis(&[&text_z_padding, &z], 1)?;
             let pos_out = self.cond.forward_prepared(&pos_z, &t, &cond_prep, None)?;
@@ -598,22 +649,9 @@ impl Ideogram4Heavy {
         grid_w: i32,
         pid: Option<&dyn LatentDecoder>,
     ) -> Result<Array> {
-        // De-normalize the packed latent with the VAE's BatchNorm stats — `z * bn_std + bn_mean`,
-        // exactly the reference (`pipeline_ideogram4`), NOT a separate latent_norm. The earlier
-        // hardcoded LATENT_SCALE/LATENT_SHIFT did not match the bn stats and distorted the decode.
-        let (bn_std, bn_mean) = self.vae.bn_stats();
-        let denorm = add(
-            &multiply(z, &bn_std.reshape(&[1, 1, 128])?)?,
-            &bn_mean.reshape(&[1, 1, 128])?,
-        )?; // [1, L, 128]
-
-        // Unpatchify to NHWC: [1,gh,gw,2,2,32] → [1,gh,2,gw,2,32] → [1, gh·2, gw·2, 32]. The 128
-        // packed channels are ordered (ph, pw, c) — c innermost — for this DiT (verified: the
-        // FLUX-family (c, ph, pw) split produces a 2px grid).
-        let latent = denorm
-            .reshape(&[1, grid_h, grid_w, 2, 2, 32])?
-            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-            .reshape(&[1, grid_h * 2, grid_w * 2, 32])?; // [1, gh·2, gw·2, 32] NHWC — the raw VAE latent
+        // The shared VAE owns both the BatchNorm de-normalization and Ideogram's distinct
+        // `(ph,pw,c)` unpatch order. The result is the order-canonical raw 32-channel VAE latent.
+        let latent = self.vae.unpack_ideogram_packed_latents(z, grid_h, grid_w)?;
 
         let decoded = match pid {
             // PiD 4× super-resolving decode (sc-7847). Ideogram's DiT packs the 128 channels as

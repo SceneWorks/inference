@@ -144,6 +144,20 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["lens_turbo", "lens"]);
         assert_eq!(explicit_trainers, ["lens"]);
+        let preview_ids: Vec<_> = registry
+            .generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                descriptor
+                    .capabilities
+                    .supports_preview
+                    .then_some(descriptor.id)
+            })
+            .collect();
+        assert_eq!(
+            preview_ids, explicit_generators,
+            "every and only Lens route previews"
+        );
 
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(std::path::PathBuf::from(
             "/nonexistent/sc15800-contract-fixture",

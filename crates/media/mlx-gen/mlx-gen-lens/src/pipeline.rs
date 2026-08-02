@@ -30,8 +30,8 @@ use mlx_gen::gen_core;
 use mlx_gen::scheduler::compute_mu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, Image, MlxLatentOps, Progress,
-    Quant, Result, TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error, Image,
+    MlxLatentOps, PreviewSink, Progress, Quant, Result, TimestepConvention,
 };
 use mlx_gen_flux2::{load_vae, Flux2Vae};
 
@@ -479,6 +479,42 @@ impl LensHeavy {
         )
     }
 
+    /// Preview-aware sibling of [`Self::denoise_with_sampler`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_with_sampler_with_preview(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+        preview: &PreviewSink,
+    ) -> Result<Array> {
+        self.denoise_with_sampler_keep_with_preview(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler_name,
+            scheduler_name,
+            seed,
+            None,
+            cancel,
+            on_step,
+            preview,
+        )
+    }
+
     /// PiD `from_ldm` early-stop (sc-8048) denoise: as [`denoise_with_sampler`](Self::denoise_with_sampler)
     /// but truncates the descending flow-match schedule to `keep` (`Some(k)` → run over `sigmas[..k]`,
     /// leaving the latent at the capture σ `sigmas[k-1]`; `None` → the full schedule, byte-identical).
@@ -498,6 +534,43 @@ impl LensHeavy {
         keep: Option<usize>,
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
+        self.denoise_with_sampler_keep_with_preview(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler_name,
+            scheduler_name,
+            seed,
+            keep,
+            cancel,
+            on_step,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Preview-aware sibling of [`Self::denoise_with_sampler_keep`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_with_sampler_keep_with_preview(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        seed: u64,
+        keep: Option<usize>,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+        preview: &PreviewSink,
     ) -> Result<Array> {
         // The native Lens schedule is the byte-exact N1 default: empirical-μ flow-match sigmas (length
         // num_steps + 1, trailing 0). A curated `scheduler_name` re-shapes σ over the SAME empirical μ
@@ -575,7 +648,8 @@ impl LensHeavy {
         // per-step `eval` (sc-5399 — bounds the lazy graph so a mid-render cancel lands within ~1 model
         // eval), and progress are handled inside `run_flow_sampler`. `euler` reproduces the legacy
         // `FlowMatchEuler::step` loop within the N1 parity tolerance.
-        run_flow_sampler(
+        let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+        run_flow_sampler_with_latent_hook(
             sampler_name,
             TimestepConvention::Sigma,
             sigmas,
@@ -583,6 +657,18 @@ impl LensHeavy {
             seed,
             cancel,
             &mut on_progress,
+            |latents, sigma| {
+                mlx_gen_flux2::preview::emit_flux_preview(
+                    preview,
+                    &previews,
+                    sigmas,
+                    sigma,
+                    latents,
+                    latent_h as i32,
+                    latent_w as i32,
+                    &self.vae,
+                );
+            },
             predict,
         )
     }
@@ -610,10 +696,47 @@ impl LensHeavy {
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Image> {
+        self.render_with_preview(
+            encoder_features,
+            encoder_mask,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler,
+            scheduler,
+            seed,
+            keep,
+            pid_decoder,
+            cancel,
+            on_step,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// Preview-aware sibling of [`Self::render`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_preview(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler: Option<&str>,
+        scheduler: Option<&str>,
+        seed: u64,
+        keep: Option<usize>,
+        pid_decoder: Option<&dyn mlx_gen::LatentDecoder>,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize),
+        preview: &PreviewSink,
+    ) -> Result<Image> {
         let seq_len = (latent_h * latent_w) as i32;
         mlx_rs::random::seed(seed)?;
         let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
-        let latents = self.denoise_with_sampler_keep(
+        let latents = self.denoise_with_sampler_keep_with_preview(
             encoder_features,
             encoder_mask,
             &init,
@@ -627,6 +750,7 @@ impl LensHeavy {
             keep,
             cancel,
             &mut |cur, _total| on_step(cur),
+            preview,
         )?;
         // `vae::decode` returns NHWC [1, H, W, 3] (native) or [1, 4H, 4W, 3] (PiD, 4× SR), both in
         // [-1,1] — `decoded_to_image` handles either.
