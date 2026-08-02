@@ -36,8 +36,8 @@ use crate::model::validate_request;
 use crate::model_base::{DEFAULT_GUIDANCE, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::model_control::{load_control_residency, ZImageControlHeavyOwned};
 use crate::pipeline::{
-    self, denoise_control_cfg_with_progress, encode_control_context, encode_init_latents,
-    init_time_step,
+    self, denoise_control_cfg_with_progress_and_preview, encode_control_context,
+    encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 
@@ -84,7 +84,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -206,24 +206,14 @@ impl ZImageControl {
         // [`Residency::run`] seam (sc-11124). Base-control delta vs the Turbo control variant: real CFG
         // (a negative-prompt uncond branch) and no bf16 cap cast.
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
-        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
-        let streamable = self
-            .memory_strategy
-            .lifecycle
-            .transformer_window_materialization;
-        let tiling = pipeline::decode_tiling(req, stage_residency);
-        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
-        // unless this request selected bounded attention, so the default forward is unchanged.
-        let attention_budget = pipeline::attention_budget(req);
-        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
-        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
-        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
-        let deferred_materialization = streamable;
-        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
-        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
-        // includes the encoder, so an unscoped request conditions exactly as before.
-        let encoder_window =
-            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
+        let pipeline::RequestRungs {
+            stage_residency,
+            streamable,
+            tiling,
+            attention_budget,
+            block_window,
+            encoder_window,
+        } = pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
         let images = self.residency.run_staged_request_scoped(
             stage_residency,
             streamable,
@@ -323,7 +313,7 @@ impl ZImageControl {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_control_cfg_with_progress(
+                        denoise_control_cfg_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -338,6 +328,7 @@ impl ZImageControl {
                             attention_budget,
                             block_window,
                             &req.cancel,
+                            &req.preview,
                             op,
                         )
                     },
@@ -536,7 +527,7 @@ mod tests {
                 panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
             });
             assert!(
-                res.with_resident_parts(|_, _| ()).is_none(),
+                res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }

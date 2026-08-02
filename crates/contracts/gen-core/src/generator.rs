@@ -529,9 +529,25 @@ pub struct GenerationMemory {
 
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
-    /// warm follow-up request. Production selectors must leave this at `None` (the default).
+    /// warm follow-up request. The shared request floor accepts this only when paired with
+    /// [`Self::calibration_fault_harness_authorized`]. Production selectors must leave both controls
+    /// at their defaults.
     #[doc(hidden)]
     pub calibration_error_phase: Option<MemoryPhase>,
+    /// Explicit authorization paired with [`Self::calibration_error_phase`] by calibration harnesses.
+    /// A phase without authorization, or authorization without a phase, is rejected at the shared
+    /// request floor rather than reaching a provider-internal failure seam by convention alone.
+    #[doc(hidden)]
+    pub calibration_fault_harness_authorized: bool,
+}
+
+impl GenerationMemory {
+    /// Authorize one deterministic phase failure for a calibration/conformance harness.
+    #[doc(hidden)]
+    pub fn authorize_calibration_fault(&mut self, phase: MemoryPhase) {
+        self.calibration_error_phase = Some(phase);
+        self.calibration_fault_harness_authorized = true;
+    }
 }
 
 /// The typed audio request sub-block carried by [`GenerationRequest::audio`] (sc-12834). A single
@@ -850,6 +866,26 @@ pub struct ControlClipRef<'a> {
 }
 
 impl GenerationRequest {
+    /// Number of image-conditioning inputs represented by this request for memory-evidence
+    /// geometry. Multi-image carriers contribute their flattened image count; control/depth/mask
+    /// carriers each contribute one. Temporal keyframes and clips are covered by the frame axis.
+    pub fn image_reference_count(&self) -> u32 {
+        self.conditioning.iter().fold(0_u32, |count, conditioning| {
+            let increment = match conditioning {
+                Conditioning::Reference { .. }
+                | Conditioning::Control { .. }
+                | Conditioning::Depth { .. }
+                | Conditioning::Mask { .. } => 1,
+                Conditioning::MultiReference { images } => {
+                    u32::try_from(images.len()).unwrap_or(u32::MAX)
+                }
+                Conditioning::ReduxRefs { refs } => u32::try_from(refs.len()).unwrap_or(u32::MAX),
+                _ => 0,
+            };
+            count.saturating_add(increment)
+        })
+    }
+
     /// The first request-supplied `Option<f32>` knob that is **non-finite** (NaN / ±Inf), returned as
     /// `(field, value)` — or `None` when every present float is finite. This is the single home of the
     /// finiteness floor (F-053 / F-001): a NaN/Inf on *any* float knob flows into the guidance /
@@ -1983,6 +2019,24 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if let Some(memory) = req.memory {
+            match (
+                memory.calibration_fault_harness_authorized,
+                memory.calibration_error_phase,
+            ) {
+                (false, None) | (true, Some(_)) => {}
+                (false, Some(_)) => {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: calibration fault injection requires explicit harness authorization"
+                    )));
+                }
+                (true, None) => {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: calibration fault harness authorization requires an error phase"
+                    )));
+                }
+            }
+        }
         if req.count == 0 || req.count > self.max_count {
             return Err(Error::Msg(format!(
                 "{id}: count {} out of range 1..={}",
@@ -2466,6 +2520,7 @@ mod tests {
                 transformer_window_size: None,
                 transformer_window_component: None,
                 calibration_error_phase: None,
+                calibration_fault_harness_authorized: false,
             }
         );
     }
@@ -2636,6 +2691,43 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    #[test]
+    fn calibration_fault_injection_requires_a_complete_harness_authorization_pair() {
+        let capabilities = caps();
+
+        let mut phase_without_authorization = base_req();
+        phase_without_authorization.memory = Some(GenerationMemory {
+            calibration_error_phase: Some(MemoryPhase::Denoise),
+            ..Default::default()
+        });
+        let error = capabilities
+            .validate_request("m", &phase_without_authorization)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("explicit harness authorization"))
+        );
+
+        let mut authorization_without_phase = base_req();
+        authorization_without_phase.memory = Some(GenerationMemory {
+            calibration_fault_harness_authorized: true,
+            ..Default::default()
+        });
+        let error = capabilities
+            .validate_request_skip_size("m", &authorization_without_phase)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("requires an error phase"))
+        );
+
+        let mut authorized = base_req();
+        let mut memory = GenerationMemory::default();
+        memory.authorize_calibration_fault(MemoryPhase::Decode);
+        authorized.memory = Some(memory);
+        capabilities
+            .validate_request("m", &authorized)
+            .expect("an explicitly authorized calibration harness request reaches the provider");
     }
 
     /// `ResolvedDownstream` exempts **the sentinel**, not every size.

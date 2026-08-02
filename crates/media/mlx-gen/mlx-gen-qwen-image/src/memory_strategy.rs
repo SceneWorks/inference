@@ -5,13 +5,16 @@
 //! planner through every one of the 60 joint-attention blocks; rung 4 uses the shared block-window
 //! primitive from SC-16353. The provider contract is the only selector surface.
 
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+#[cfg(test)]
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    Result as CoreResult, TransformerComponent,
+    Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult,
+    TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
@@ -45,7 +48,14 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// [`mlx_gen::block_residency::BlockPlan::is_bounded`] defines it as fully resident.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[TRANSFORMER_WINDOW_SIZE];
-pub const TRANSFORMER_BLOCKS: u32 = 60;
+
+fn transformer_blocks(provider_id: &str) -> usize {
+    if provider_id == crate::model_edit::MODEL_ID {
+        crate::transformer::QwenTransformerConfig::qwen_image_edit().num_layers
+    } else {
+        crate::transformer::QwenTransformerConfig::qwen_image().num_layers
+    }
+}
 
 pub(crate) fn is_streamable_spec(spec: &LoadSpec) -> bool {
     let matching_device_format = match (&spec.weights, spec.quantize) {
@@ -102,12 +112,68 @@ pub(crate) fn resolve_window_size(
                 .unwrap_or(TRANSFORMER_WINDOW_SIZE) as usize,
         ));
     }
-    Ok(Some(TRANSFORMER_BLOCKS as usize))
+    Ok(Some(transformer_blocks(&contract.provider_id)))
 }
 
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    let _ = crate::model::component_footprint(spec)?;
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Msg(
+            "qwen-image memory facts require a snapshot directory".to_owned(),
+        ));
+    };
+    let project = |path: &std::path::Path, quant: Option<mlx_gen::Quant>| -> CoreResult<u64> {
+        projected_safetensors_bytes(path, |_| match quant {
+            Some(quant) => ResidentProjection::GroupQuantized {
+                bits: quant.bits(),
+                group_size: crate::quant::GROUP_SIZE as usize,
+            },
+            None => ResidentProjection::Stored,
+        })
+    };
+    let conditioning_bytes = project(&root.join("text_encoder"), None)?;
+    let transformer_bytes = project(&root.join("transformer"), spec.quantize)?;
+    let decoder_bytes = project(&root.join("vae"), None)?;
+    let overlay_bytes = match &spec.control {
+        Some(WeightsSource::Dir(path)) | Some(WeightsSource::File(path)) => {
+            projected_safetensors_bytes(path, |_| match spec.quantize {
+                Some(quant) => ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                },
+                None => ResidentProjection::Stored,
+            })?
+        }
+        None => 0,
+    };
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        conditioning_bytes,
+        transformer_bytes,
+        decoder_bytes,
+        overlay_bytes,
+    )
+}
+
+/// Declaration-equivalent contract used only by weights-free registry conformance.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    memory_strategy_contract_with_asset_facts(provider_id, spec, 0, 0, 0, 0)
+}
+
+fn memory_strategy_contract_with_asset_facts(
+    provider_id: &str,
+    spec: &LoadSpec,
+    conditioning_bytes: u64,
+    transformer_bytes: u64,
+    decoder_bytes: u64,
+    overlay_bytes: u64,
 ) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
     let streamable = is_streamable_spec(spec);
@@ -115,7 +181,6 @@ pub fn memory_strategy_contract(
     // windowed by the shared block loader.  It may use the native tiled VAE, but must not inherit
     // the base/edit route's rung-3 or rung-4 claims merely because those providers share a crate.
     let has_unbounded_control_branch = provider_id == "qwen_image_control";
-    let footprint = crate::model::component_footprint(spec)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -126,36 +191,45 @@ pub fn memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::OverlayBytes,
-            MemoryFormulaVariable::DecodeTileArea,
-            MemoryFormulaVariable::AttentionChunkSize,
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::OverlayBytes,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+        MemoryFormulaVariable::TransformerWindowSize,
+    ];
+    contract.formula = if overlay_bytes > 0 {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: vec![MemoryResidentComponent {
+                id: "control_branch".to_owned(),
+                kind: MemoryComponentKind::ControlBranch,
+                resident_bytes: overlay_bytes,
+                bounded_by: None,
+            }],
+        }
+    } else {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
     ));
-    let overlay_bytes = spec.control.as_ref().and_then(source_bytes).unwrap_or(0);
-    contract.asset_facts.base_bytes = footprint
-        .text_encoder
-        .saturating_add(footprint.dit)
-        .saturating_add(footprint.vae)
-        .saturating_add(overlay_bytes);
-    contract.asset_facts.conditioning_bytes = footprint.text_encoder;
-    contract.asset_facts.transformer_bytes = footprint.dit;
-    contract.asset_facts.decoder_bytes = footprint.vae;
+    contract.asset_facts.base_bytes = conditioning_bytes
+        .saturating_add(transformer_bytes)
+        .saturating_add(decoder_bytes);
+    contract.asset_facts.conditioning_bytes = conditioning_bytes;
+    contract.asset_facts.transformer_bytes = transformer_bytes;
+    contract.asset_facts.decoder_bytes = decoder_bytes;
     contract.asset_facts.overlay_bytes = overlay_bytes;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -215,14 +289,15 @@ pub fn memory_strategy_contract(
         staged.support = MemoryStrategySupport::Implemented;
     }
     if streamable && !has_unbounded_control_branch {
+        let transformer_blocks = transformer_blocks(provider_id);
         let plan = mlx_gen::block_residency::BlockPlan::new(
-            TRANSFORMER_BLOCKS as usize,
+            transformer_blocks,
             TRANSFORMER_WINDOW_SIZE as usize,
         )?;
         if !plan.is_bounded() {
             return Err(CoreError::Unsupported(format!(
                 "{provider_id}: published transformer window {} does not bound the {}-block stack",
-                TRANSFORMER_WINDOW_SIZE, TRANSFORMER_BLOCKS
+                TRANSFORMER_WINDOW_SIZE, transformer_blocks
             )));
         }
         let rung = contract
@@ -242,19 +317,6 @@ pub fn memory_strategy_contract(
         },
     ));
     Ok(contract)
-}
-
-fn source_bytes(source: &WeightsSource) -> Option<u64> {
-    match source {
-        WeightsSource::File(path) => std::fs::metadata(path).ok().map(|metadata| metadata.len()),
-        WeightsSource::Dir(path) => std::fs::read_dir(path).ok().map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .filter_map(|entry| entry.metadata().ok())
-                .filter(|metadata| metadata.is_file())
-                .fold(0_u64, |sum, metadata| sum.saturating_add(metadata.len()))
-        }),
-    }
 }
 
 pub(crate) fn safety_check(
@@ -318,7 +380,7 @@ pub(crate) fn registered_valid_fixture(
     };
     let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
         mode: mode.clone(),
-        has_reference,
+        reference_count: u32::from(has_reference),
         use_pid,
         has_phases: false,
         overlay: None,
@@ -356,7 +418,7 @@ pub(crate) fn registered_begin_request(
         spec.precision,
         spec.quantize,
         context,
-        weights_free_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
@@ -381,7 +443,7 @@ pub(crate) fn begin_request(
         precision,
         quant,
         context,
-        mlx_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
 }
 
@@ -391,163 +453,38 @@ fn begin_request_with_cleanup(
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
-    cleanup: fn() -> CoreResult<()>,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
     {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(QwenMemoryScope {
+    let routes = decode_routes(provider_id)?;
+    let transformer_blocks = transformer_blocks(provider_id);
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        decode_routes: decode_routes(provider_id)?,
-        memory: contract.generation_memory(&context.selection),
-        geometry: context.geometry,
-        use_pid: context.use_pid,
-        transformer_window: contract
-            .engages(
-                context.selection.strategy,
-                MemoryStrategy::BoundedTransformerResidency,
-            )
-            .then_some(context.selection.parameters.transformer_window_size)
-            .flatten(),
-        cleanup,
-        finished: false,
-    })))
-}
-
-struct QwenMemoryScope {
-    provider_id: &'static str,
-    decode_routes: mlx_gen_pid::DecodeRoutes,
-    memory: Option<GenerationMemory>,
-    geometry: MemoryGeometry,
-    use_pid: bool,
-    transformer_window: Option<u32>,
-    cleanup: fn() -> CoreResult<()>,
-    finished: bool,
-}
-
-impl QwenMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn finish_inner(&mut self) -> CoreResult<()> {
-        (self.cleanup)()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-fn mlx_cleanup() -> CoreResult<()> {
-    let barrier = mlx_rs::Array::from(0.0_f32);
-    barrier.eval().map_err(mlx_gen::Error::from)?;
-    drop(barrier);
-    mlx_rs::memory::clear_cache();
-    Ok(())
-}
-
-fn weights_free_cleanup() -> CoreResult<()> {
-    Ok(())
-}
-
-impl MemoryRequestScope for QwenMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        if request.use_pid != self.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request use_pid={} does not match admitted use_pid={}",
-                self.provider_id, request.use_pid, self.use_pid
-            )));
-        }
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request geometry {}x{}x{} exceeds admitted {}x{}x{}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.decode_routes
-            .validate(self.use_pid, Some(tile_edge), Some(overlap))
-            .map_err(CoreError::Unsupported)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
-        self.ensure_active()?;
-        if chunk_size == ATTENTION_CHUNK_SIZE {
-            Ok(())
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "{}: attention chunk size must be {ATTENTION_CHUNK_SIZE}, got {chunk_size}",
-                self.provider_id
-            )))
-        }
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        if self.transformer_window != Some(TRANSFORMER_WINDOW_SIZE)
-            || block_count != TRANSFORMER_WINDOW_SIZE
-            || first_block >= TRANSFORMER_BLOCKS
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: invalid DiT window ({first_block}, {block_count})",
-                self.provider_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.finish_inner()
-    }
-}
-
-impl Drop for QwenMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.finish_inner();
-        }
-    }
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        transformer_blocks,
+        move |use_pid, edge, overlap| {
+            routes
+                .validate(use_pid, Some(edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
+        },
+    )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten();
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    )))
 }
 
 #[cfg(test)]
@@ -556,11 +493,52 @@ mod tests {
     use mlx_gen::gen_core::{
         MemoryNumericTier, MemorySelection, MemoryStrategyParameters, MemoryStrategySupport,
     };
+    use std::sync::OnceLock;
+
+    fn write_snapshot(root: &std::path::Path) {
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_control(&dir.join("model.safetensors"));
+        }
+    }
 
     fn spec() -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir("/nonexistent/qwen".into()))
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("qwen-memory-spec-{}", std::process::id()));
+            write_snapshot(&root);
+            root
+        });
+        LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    fn write_control(path: &std::path::Path) {
+        let mut header =
+            br#"{"control.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
+                .to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 256]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn empty_required_component_directory_cannot_be_reported_as_zero() {
+        let root =
+            std::env::temp_dir().join(format!("qwen-empty-component-{}", std::process::id()));
+        write_snapshot(&root);
+        std::fs::remove_file(root.join("transformer/model.safetensors")).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(memory_strategy_contract("qwen_image", &spec).is_err());
+        assert!(weights_free_memory_strategy_contract("qwen_image", &spec).is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -646,6 +624,36 @@ mod tests {
         }
         assert!(!contract.lifecycle.attention_chunking);
         assert!(!contract.lifecycle.transformer_window_materialization);
+    }
+
+    #[test]
+    fn control_overlay_is_quant_projected_typed_and_excluded_from_base() {
+        let root = std::env::temp_dir().join(format!(
+            "qwen-control-facts-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        write_snapshot(&root);
+        let control = root.join("control.safetensors");
+        write_control(&control);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_quant(mlx_gen::Quant::Q4)
+            .with_control(WeightsSource::File(control));
+        let contract = memory_strategy_contract("qwen_image_control", &spec).unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, 256);
+        assert_eq!(contract.asset_facts.transformer_bytes, 72);
+        assert_eq!(contract.asset_facts.decoder_bytes, 256);
+        assert_eq!(contract.asset_facts.base_bytes, 584);
+        assert_eq!(contract.asset_facts.overlay_bytes, 72);
+        assert_eq!(contract.auxiliary_resident_bytes(), 72);
+        assert!(matches!(
+            contract.formula,
+            MemoryFormulaKind::ComponentPhaseEnvelope { .. }
+        ));
+        assert!(contract.conformance_errors().is_empty());
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
@@ -780,7 +788,7 @@ mod tests {
     fn dense_load_time_quantization_does_not_advertise_rung_four() {
         let root =
             std::env::temp_dir().join(format!("qwen-rung4-quant-contract-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        write_snapshot(&root);
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"dtype":"bfloat16"}"#,

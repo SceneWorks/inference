@@ -32,10 +32,10 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, run_flow_sampler, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, TimestepConvention,
+    require_control, run_flow_sampler_with_latent_hook, AcceptedControlKinds, Capabilities,
+    ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
+    Quant, Residency, Result, SizeFloor, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -105,7 +105,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
             // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -307,7 +307,8 @@ impl Flux1DevControl {
                 for i in 0..req.count {
                     let seed = base_seed.wrapping_add(i as u64);
                     let latents = create_noise(seed, req.width, req.height)?;
-                    let final_latents = run_flow_sampler(
+                    let previews = mlx_gen::preview::PreviewCounter::new(&sigmas);
+                    let final_latents = run_flow_sampler_with_latent_hook(
                         Some(sampler_name),
                         TimestepConvention::Sigma,
                         &sigmas,
@@ -315,6 +316,17 @@ impl Flux1DevControl {
                         seed,
                         &req.cancel,
                         on_progress,
+                        |latents, sigma| {
+                            crate::preview::emit_preview(
+                                &req.preview,
+                                &previews,
+                                &sigmas,
+                                sigma,
+                                latents,
+                                req.width,
+                                req.height,
+                            );
+                        },
                         |x_in, timestep| {
                             heavy.transformer.forward_composed(
                                 x_in,

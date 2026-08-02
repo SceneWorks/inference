@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use safetensors::Dtype;
 use safetensors::SafeTensors;
@@ -180,9 +180,11 @@ pub struct SafetensorsTensorHeader {
     pub data_bytes: u64,
 }
 
-/// Read tensor shapes/dtypes/byte ranges from one safetensors file or one sharded directory without
-/// reading tensor data. Directory duplicate-key semantics match [`CheckpointMeta::from_dir`]: files
-/// are sorted and the later shard wins.
+/// Read tensor shapes/dtypes/byte ranges from one safetensors file or one recursively sharded
+/// directory without reading tensor data. Directory duplicate-key semantics match
+/// [`CheckpointMeta::from_dir`]: files are sorted and the later shard wins. File symlinks are
+/// followed (as required by the Hugging Face cache), directory symlinks are skipped, and malformed
+/// or unreadable trees fail closed instead of silently producing partial facts.
 pub fn safetensors_path_tensor_headers(
     path: impl AsRef<Path>,
 ) -> Result<Vec<SafetensorsTensorHeader>> {
@@ -264,15 +266,34 @@ pub fn safetensors_path_tensor_headers(
             .collect()
     }
 
+    fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                collect_files(&path, files)?;
+                continue;
+            }
+            let metadata = std::fs::metadata(&path)?;
+            if metadata.is_dir() {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) == Some("safetensors")
+                && !is_hidden_file(&path)
+            {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
     let path = path.as_ref();
     if path.is_file() {
         return read_file(path);
     }
-    let mut files = std::fs::read_dir(path)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("safetensors"))
-        .filter(|path| !is_hidden_file(path))
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    collect_files(path, &mut files)?;
     files.sort();
     if files.is_empty() {
         return Err(Error::Msg(format!(

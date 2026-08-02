@@ -27,6 +27,7 @@ pub use gen_core::{
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
 pub mod array;
+pub mod asset_facts;
 // Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
 pub mod attention;
 // Bounded transformer residency (SC-15750): ladder rung 4, likewise shared — see the module docs for
@@ -39,6 +40,7 @@ pub mod mllm;
 pub mod nn;
 pub mod preview;
 pub mod quant;
+pub mod request_scope;
 pub mod residency;
 pub mod sampler;
 pub mod scheduler;
@@ -78,6 +80,7 @@ pub mod transform {
 // Array-level tiled-decode blend loop (sc-11747): the MLX half of the gen-core tiling seam, shared by
 // every VAE that tiles a decode (Wan z16/z48, Qwen-Image). gen-core carries the pure geometry
 // ([`tiling::TilePlan`]); this carries the tensor loop.
+pub mod memory_probe;
 pub mod vae_tiling;
 
 pub use attention::{
@@ -114,9 +117,10 @@ pub use runtime::{
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,
-    run_av_curated_sampler, run_cfgpp_sampler, run_curated_sampler, run_flow_sampler,
-    AlphaSchedule, AvLatents, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler,
-    MlxAvLatentOps, MlxLatentOps, TcdSampler,
+    run_av_curated_sampler, run_cfgpp_sampler, run_cfgpp_sampler_with_latent_hook,
+    run_curated_sampler, run_curated_sampler_with_latent_hook, run_flow_sampler,
+    run_flow_sampler_with_latent_hook, AlphaSchedule, AvLatents, DiffusionSampler,
+    FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};

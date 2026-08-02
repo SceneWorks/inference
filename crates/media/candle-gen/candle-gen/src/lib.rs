@@ -107,6 +107,15 @@ pub mod gpu;
 // matrix. Provider crates' packed-detect loaders build on this.
 pub mod quant;
 
+// Shared per-step latent preview machinery (epic 16948 / sc-16949) — the candle twin of
+// `mlx_gen::preview`. Numbers schedule positions (deduping the repeat a multi-eval solver produces),
+// projects an unpacked `[1, C, h, w]` latent through a family-owned linear RGB fit, and emits the
+// frame best-effort. Families opt in by handing a `preview::PreviewHook` to the sampler drivers.
+pub mod preview;
+pub use preview::{emit_preview, emit_preview_at, project_latents, PreviewCounter, PreviewHook};
+
+pub mod request_scope;
+
 // The shared native training harness (epic 5164 / sc-5165) — the candle twin of `mlx_gen::train`.
 // Provider crates (sdxl/z-image/wan/lens) build their `gen_core::Trainer` on top of this.
 pub mod train;

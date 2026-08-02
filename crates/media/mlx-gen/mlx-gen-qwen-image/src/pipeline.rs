@@ -66,6 +66,28 @@ pub fn qwen_schedulers() -> Vec<&'static str> {
 /// Default step count for the Lightning recipe.
 pub const LIGHTNING_DEFAULT_STEPS: u32 = 8;
 
+/// Request-scoped memory-ladder controls shared by T2I, Edit, and Control.
+pub(crate) struct RequestRungs {
+    pub(crate) block_window: Option<usize>,
+    pub(crate) attention_budget: AttentionBudget,
+    pub(crate) decode_tiling: Option<TilingConfig>,
+}
+
+/// Resolve the family memory preamble once so no Qwen variant can omit a rung or its calibration
+/// phase boundary. Preview cadence/state remains a separate request concern.
+pub(crate) fn resolve_request_rungs(
+    req: &GenerationRequest,
+    contract: &mlx_gen::gen_core::MemoryProviderContract,
+    model_id: &str,
+) -> Result<RequestRungs> {
+    calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning, model_id)?;
+    Ok(RequestRungs {
+        block_window: crate::memory_strategy::resolve_window_size(req, contract)?,
+        attention_budget: attention_budget(req),
+        decode_tiling: decode_tiling(req),
+    })
+}
+
 /// Per-run scalars shared by all three Qwen generators: the Lightning flag, resolved step count and
 /// guidance, the per-batch base seed, the selected curated-solver name (epic 7114), and the
 /// (seed-independent) flow-match sigma schedule. Extracted so the three `generate` paths can't drift
@@ -834,6 +856,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_variant_uses_the_canonical_request_rung_preamble() {
+        for (name, source) in [
+            ("t2i", include_str!("model.rs")),
+            ("control", include_str!("model_control.rs")),
+            ("edit", include_str!("model_edit.rs")),
+        ] {
+            assert_eq!(
+                source
+                    .matches("crate::pipeline::resolve_request_rungs(req")
+                    .count(),
+                1,
+                "{name} must use the canonical preamble exactly once"
+            );
+            assert!(
+                !source.contains("crate::memory_strategy::resolve_window_size(req"),
+                "{name} bypassed the canonical preamble"
+            );
+        }
+    }
+
+    #[test]
     fn slice_seq_matches_arange_gather() {
         // F-114: the zero-copy split-at-boundary must return exactly what the old arange `take_axis`
         // gather did — the leading n tokens, same values.
@@ -1050,6 +1093,7 @@ mod tests {
         let injected = GenerationRequest {
             memory: Some(mlx_gen::gen_core::GenerationMemory {
                 calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Denoise),
+                calibration_fault_harness_authorized: true,
                 ..Default::default()
             }),
             ..Default::default()

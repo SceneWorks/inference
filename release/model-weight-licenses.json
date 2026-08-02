@@ -1,436 +1,1229 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "kind": "model-weight-licenses",
+  "families": [
+    {
+      "id": "apache-2-0",
+      "spdx_id": "Apache-2.0",
+      "name": "Apache License 2.0",
+      "text_url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        }
+      ]
+    },
+    {
+      "id": "apple-mlr",
+      "spdx_id": "LicenseRef-Apple-MLR",
+      "name": "Apple Machine Learning Research Model License Agreement",
+      "text_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384/raw/main/LICENSE",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apple-mlr"
+        },
+        {
+          "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "id": "cc-by-nc-4-0",
+      "spdx_id": "CC-BY-NC-4.0",
+      "name": "Creative Commons Attribution-NonCommercial 4.0 International",
+      "text_url": "https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt",
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "non_commercial_weights"
+        }
+      ]
+    },
+    {
+      "id": "chatglm3-model-license",
+      "spdx_id": "LicenseRef-ChatGLM3-6B-Model-License",
+      "name": "The ChatGLM3-6B License",
+      "text_url": "https://raw.githubusercontent.com/THUDM/ChatGLM3/main/MODEL_LICENSE",
+      "terms": [
+        {
+          "term": "registration_required",
+          "contact": "https://open.bigmodel.cn/mla/form"
+        },
+        {
+          "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "id": "circlestone-labs-non-commercial",
+      "spdx_id": "LicenseRef-CircleStone-Labs-Non-Commercial",
+      "name": "CircleStone Labs Non-Commercial License v1.2",
+      "text_url": "https://huggingface.co/circlestone-labs/Anima/raw/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "circlestone-labs-non-commercial"
+        },
+        {
+          "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "id": "creativeml-openrail-pp-m",
+      "spdx_id": "LicenseRef-CreativeML-OpenRAIL-PP-M",
+      "name": "CreativeML Open RAIL++-M License",
+      "text_url": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/raw/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "downstream_restrictions",
+          "family": "creativeml-openrail-pp-m"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": null
+        }
+      ]
+    },
+    {
+      "id": "flux-1-dev-non-commercial",
+      "spdx_id": "LicenseRef-FLUX-1-dev-Non-Commercial",
+      "name": "FLUX.1 [dev] Non-Commercial License v1.1.1",
+      "text_url": "https://raw.githubusercontent.com/black-forest-labs/flux/main/model_licenses/LICENSE-FLUX1-dev",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "flux-1-dev-non-commercial"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX.1 [dev] Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful or infringing content"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": null
+        }
+      ]
+    },
+    {
+      "id": "flux-non-commercial-v2-1",
+      "spdx_id": "LicenseRef-FLUX-Non-Commercial-v2.1",
+      "name": "FLUX Non-Commercial License v2.1",
+      "text_url": "https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "flux-non-commercial-v2-1"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful or infringing content"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "ensure Output includes disclosure (or other indication) that the Output was generated or modified using artificial intelligence technologies to the extent required under applicable law."
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://bfl.ai/legal/usage-policy"
+        }
+      ]
+    },
+    {
+      "id": "gemma-terms",
+      "spdx_id": "LicenseRef-Gemma-Terms",
+      "name": "Gemma Terms of Use",
+      "text_url": "https://ai.google.dev/gemma/terms",
+      "terms": [
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        }
+      ]
+    },
+    {
+      "id": "ideogram-4-non-commercial",
+      "spdx_id": "LicenseRef-Ideogram-4-Non-Commercial",
+      "name": "Ideogram Non-Commercial Model Agreement",
+      "text_url": "https://huggingface.co/ideogram-ai/ideogram-4-fp8/blob/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "ideogram-4-non-commercial"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "ideogram-4-non-commercial"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ideogram.ai/legal/usage-policy"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You are responsible for implementing appropriate safety measures, including content filters and human oversight, suitable for your use case and to prevent the creation, display, generation or reproduction of unlawful or infringing content"
+        }
+      ]
+    },
+    {
+      "id": "insightface-research-only",
+      "spdx_id": "LicenseRef-InsightFace-Research-Only",
+      "name": "InsightFace non-commercial research use only",
+      "text_url": "https://raw.githubusercontent.com/deepinsight/insightface/master/README.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        }
+      ]
+    },
+    {
+      "id": "krea-2-community",
+      "spdx_id": "LicenseRef-Krea-2-Community",
+      "name": "Krea 2 Community License Agreement v.1",
+      "text_url": "https://cdn.jsdelivr.net/gh/krea-ai/krea-2@db3984fbc6e13b34c0064990fc2d95ac64d00058/assets/hf_samples/LICENSE.pdf",
+      "terms": [
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "inclusive"
+        },
+        {
+          "term": "registration_required",
+          "contact": "opensource@krea.ai"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "krea-2-community"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You must implement reasonable and appropriate Content Filter measures to detect, prevent, and mitigate the generation or distribution of prohibited, harmful, or unlawful content through your deployment of the Krea Model or any Derivative."
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "Where required by applicable law, regulation, or platform policy, you must clearly disclose that Outputs were generated using artificial intelligence."
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://www.krea.ai/krea-2-use-policy"
+        }
+      ]
+    },
+    {
+      "id": "llama-3-1-community",
+      "spdx_id": "LicenseRef-Llama-3.1-Community",
+      "name": "Llama 3.1 Community License Agreement",
+      "text_url": "https://raw.githubusercontent.com/meta-llama/llama-models/main/models/llama3_1/LICENSE",
+      "terms": [
+        {
+          "term": "downstream_license_copy",
+          "family": "llama-3-1-community"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://llama.meta.com/llama3_1/use-policy"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If, on the Llama 3.1 version release date, the monthly active users … is greater than 700 million monthly active users in the preceding calendar month, you must request a license from Meta"
+        }
+      ]
+    },
+    {
+      "id": "ltx-2-community",
+      "spdx_id": "LicenseRef-LTX-2-Community",
+      "name": "LTX-2 Community License Agreement",
+      "text_url": "https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE",
+      "terms": [
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 10000000,
+          "boundary": "inclusive"
+        },
+        {
+          "term": "registration_required",
+          "contact": null
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "ltx-2-community"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "ltx-2-community"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "Any Derivative of LTX-2 … must be distributed exclusively under the terms of this Agreement with a complete copy of this license included"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": null
+        }
+      ]
+    },
+    {
+      "id": "meta-sam-license",
+      "spdx_id": "LicenseRef-Meta-SAM",
+      "name": "SAM License",
+      "text_url": "https://huggingface.co/facebook/sam3/blob/main/LICENSE",
+      "terms": [
+        {
+          "term": "downstream_restrictions",
+          "family": "meta-sam-license"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "meta-sam-license"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you submit for publication the results of research you perform on, using, or otherwise in connection with SAM Materials, you must acknowledge the use of SAM Materials in your publication."
+        }
+      ]
+    },
+    {
+      "id": "mit",
+      "spdx_id": "MIT",
+      "name": "MIT License",
+      "text_url": "https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt",
+      "terms": [
+        {
+          "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "id": "nvidia-nsclv1",
+      "spdx_id": "LicenseRef-NVIDIA-NSCLv1",
+      "name": "NVIDIA License (NSCLv1)",
+      "text_url": "https://huggingface.co/nvidia/PixelDiT-1300M-1024px/raw/main/LICENSE",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "nvidia-nsclv1"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "nvidia-nsclv1"
+        },
+        {
+          "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "id": "nvidia-open-model",
+      "spdx_id": "LicenseRef-NVIDIA-Open-Model",
+      "name": "NVIDIA Open Model License Agreement",
+      "text_url": "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/",
+      "terms": [
+        {
+          "term": "deployer_obligation",
+          "text": "If You bypass, disable, reduce the efficacy of, or circumvent any technical limitation, safety guardrail or associated safety guardrail hyperparameter, encryption, security, digital rights management, or authentication mechanism … contained in the Model without a substantially similar Guardrail appropriate for your use case, your rights under this Agreement will automatically terminate."
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "nvidia-open-model"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/"
+        }
+      ]
+    },
+    {
+      "id": "stability-ai-community",
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "name": "Stability AI Community License Agreement",
+      "text_url": "https://huggingface.co/stabilityai/stable-diffusion-3.5-large/raw/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        }
+      ]
+    }
+  ],
+  "components": [
+    {
+      "component": "acestep_v15_sft_audio_token_detokenizer",
+      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "ACE-Step v1.5 XL SFT audio_token_detokenizer © ACE-Step — licensed under MIT",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "acestep_v15_sft_audio_tokenizer",
+      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "ACE-Step v1.5 XL SFT audio_tokenizer (FSQ) © ACE-Step — licensed under MIT",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "acestep_v15_sft_transformer",
+      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "ACE-Step v1.5 XL SFT transformer (cover DiT) © ACE-Step — licensed under MIT",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "acestep_v15_turbo_text_encoder",
+      "source_url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "Qwen3-Embedding-0.6B © Alibaba Cloud — licensed under Apache-2.0; redistributed as the text_encoder of ACE-Step/acestep-v15-xl-turbo-diffusers",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "acestep_v15_xl_turbo",
+      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "ACE-Step v1.5 XL Turbo © ACE-Step — licensed under MIT",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "chatterbox",
+      "source_url": "https://huggingface.co/ResembleAI/chatterbox",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "Chatterbox © Resemble AI — licensed under MIT",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "clap_htsat_unfused",
+      "source_url": "https://huggingface.co/laion/clap-htsat-unfused",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "CLAP (HTSAT-unfused) © LAION — licensed under Apache-2.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "dfn5b_clip_vit_h14_384",
+      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
+      "gated": false,
+      "declared": "apple-amlr",
+      "family": "apple-mlr",
+      "attribution": "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License Agreement",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "kokoro_82m",
+      "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "Kokoro-82M © hexgrad — licensed under Apache-2.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "mmaudio_bigvgan_16k",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MMAudio 16k BigVGAN (best_netG.pt) © Sony Research Inc. — released under CC-BY-NC-4.0; 16k BigVGAN pretrained model from Make-An-Audio 2 (ByteDance, MIT); BigVGAN code © NVIDIA (MIT), adapted from HiFi-GAN (MIT)",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "mmaudio_mmdit_large_44k_v2",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MMAudio large_44k_v2 network (mmaudio_large_44k_v2.pth) © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "mmaudio_mmdit_small_16k",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MMAudio © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "mmaudio_vae_16k",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MMAudio 16k mel-VAE (v1-16.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives © NVIDIA (CC-BY-NC-SA-4.0)",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "mmaudio_vae_44k",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MMAudio 44k mel-VAE (v1-44.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives © NVIDIA (CC-BY-NC-SA-4.0)",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "moss_sound_effect_v2",
+      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "moss_tts_realtime_1_7b",
+      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "MOSS-TTS-Realtime-1.7B © OpenMOSS Team — licensed under Apache-2.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "moss_ttsd_v05",
+      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "nvidia_bigvgan_v2_44khz_128band_512x",
+      "source_url": "https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_512x",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "NVIDIA BigVGAN v2 (bigvgan_v2_44khz_128band_512x, bigvgan_generator.pt) © 2024 NVIDIA CORPORATION — MIT License (model card license: mit); BigVGAN code adapted from HiFi-GAN (jik876, MIT).",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "openvoice_v2",
+      "source_url": "https://huggingface.co/myshell-ai/OpenVoiceV2",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "OpenVoice V2 © MyShell.ai — licensed under MIT",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_medium_base_root",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base",
+      "gated": false,
+      "declared": "stable-audio-community",
+      "family": "stability-ai-community",
+      "attribution": "Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_medium_base_t5gemma",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE_GEMMA.md",
+      "gated": false,
+      "declared": "Gemma Terms of Use",
+      "family": "gemma-terms",
+      "attribution": "T5Gemma model weights © Google",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_medium_root",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium",
+      "gated": true,
+      "declared": "stable-audio-community",
+      "family": "stability-ai-community",
+      "attribution": "Stable Audio 3 Medium © Stability AI — Powered by Stability AI",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_medium_t5gemma",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE_GEMMA.md",
+      "gated": true,
+      "declared": "Gemma Terms of Use",
+      "family": "gemma-terms",
+      "attribution": "T5Gemma model weights © Google",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_music_base_root",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base",
+      "gated": false,
+      "declared": "stable-audio-community",
+      "family": "stability-ai-community",
+      "attribution": "Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_music_base_t5gemma",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE_GEMMA.md",
+      "gated": false,
+      "declared": "Gemma Terms of Use",
+      "family": "gemma-terms",
+      "attribution": "T5Gemma model weights © Google",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_music_root",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music",
+      "gated": true,
+      "declared": "stable-audio-community",
+      "family": "stability-ai-community",
+      "attribution": "Stable Audio 3 Small Music © Stability AI — Powered by Stability AI",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_music_t5gemma",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE_GEMMA.md",
+      "gated": true,
+      "declared": "Gemma Terms of Use",
+      "family": "gemma-terms",
+      "attribution": "T5Gemma model weights © Google",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_sfx_base_root",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base",
+      "gated": false,
+      "declared": "stable-audio-community",
+      "family": "stability-ai-community",
+      "attribution": "Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_sfx_base_t5gemma",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE_GEMMA.md",
+      "gated": false,
+      "declared": "Gemma Terms of Use",
+      "family": "gemma-terms",
+      "attribution": "T5Gemma model weights © Google",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_sfx_root",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx",
+      "gated": true,
+      "declared": "stable-audio-community",
+      "family": "stability-ai-community",
+      "attribution": "Stable Audio 3 Small SFX © Stability AI — Powered by Stability AI",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "stable_audio_3_small_sfx_t5gemma",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
+      "gated": true,
+      "declared": "Gemma Terms of Use",
+      "family": "gemma-terms",
+      "attribution": "T5Gemma model weights © Google",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "synchformer_vfeat",
+      "source_url": "https://github.com/v-iashin/Synchformer",
+      "gated": false,
+      "declared": "mit",
+      "family": "mit",
+      "attribution": "Synchformer © 2024 Vladimir Iashin — MIT License; checkpoint distributed via MMAudio (hkchengrex/MMAudio) ext_weights",
+      "retrieved": "2026-08-02"
+    },
+    {
+      "component": "whisper_base",
+      "source_url": "https://huggingface.co/openai/whisper-base",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "Whisper © OpenAI — licensed under Apache-2.0",
+      "retrieved": "2026-08-02"
+    }
+  ],
   "providers": [
     {
       "provider_id": "acestep_v15_turbo",
-      "component": null,
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
-      "commercial_use": true,
-      "attribution": "ACE-Step v1.5 XL Turbo © ACE-Step — licensed under MIT",
-      "restriction": "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0."
-    },
-    {
-      "provider_id": "acestep_v15_turbo",
-      "component": "audio_token_detokenizer",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-      "commercial_use": true,
-      "attribution": "ACE-Step v1.5 XL SFT audio_token_detokenizer © ACE-Step — licensed under MIT",
-      "restriction": null
-    },
-    {
-      "provider_id": "acestep_v15_turbo",
-      "component": "audio_tokenizer",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-      "commercial_use": true,
-      "attribution": "ACE-Step v1.5 XL SFT audio_tokenizer (FSQ) © ACE-Step — licensed under MIT",
-      "restriction": null
-    },
-    {
-      "provider_id": "acestep_v15_turbo",
-      "component": "transformer",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-      "commercial_use": true,
-      "attribution": "ACE-Step v1.5 XL SFT transformer (cover DiT) © ACE-Step — licensed under MIT",
-      "restriction": null
+      "components": [
+        "acestep_v15_sft_audio_token_detokenizer",
+        "acestep_v15_sft_audio_tokenizer",
+        "acestep_v15_sft_transformer",
+        "acestep_v15_turbo_text_encoder",
+        "acestep_v15_xl_turbo"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     },
     {
       "provider_id": "chatterbox_tts",
-      "component": null,
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ResembleAI/chatterbox",
-      "commercial_use": true,
-      "attribution": "Chatterbox © Resemble AI — licensed under MIT",
-      "restriction": null
+      "components": [
+        "chatterbox"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        }
+      ]
     },
     {
       "provider_id": "chatterbox_ve",
-      "component": null,
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ResembleAI/chatterbox",
-      "commercial_use": true,
-      "attribution": "Chatterbox © Resemble AI — licensed under MIT",
-      "restriction": null
+      "components": [
+        "chatterbox"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        }
+      ]
     },
     {
       "provider_id": "clap_htsat_unfused",
-      "component": null,
-      "spdx_id": "Apache-2.0",
-      "license_name": "Apache License 2.0",
-      "source_url": "https://huggingface.co/laion/clap-htsat-unfused",
-      "commercial_use": true,
-      "attribution": "CLAP (HTSAT-unfused) © LAION — licensed under Apache-2.0",
-      "restriction": null
+      "components": [
+        "clap_htsat_unfused"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     },
     {
       "provider_id": "kokoro_82m",
-      "component": null,
-      "spdx_id": "Apache-2.0",
-      "license_name": "Apache License 2.0",
-      "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
-      "commercial_use": true,
-      "attribution": "Kokoro-82M © hexgrad — licensed under Apache-2.0",
-      "restriction": null
+      "components": [
+        "kokoro_82m"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     },
     {
       "provider_id": "mmaudio_large_44k",
-      "component": null,
-      "spdx_id": "LicenseRef-MMAudio-large-44k-composite",
-      "license_name": "MMAudio large_44k_v2 composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
-      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio video→audio 44.1 kHz (mmaudio_large_44k) assembles five checkpoints: the large_44k_v2 MM-DiT network + 44k mel-VAE (© Sony Research Inc. / MMAudio — CC-BY-NC-4.0), the DFN5B-CLIP ViT-H/14-384 conditioner (© Apple Inc. — Apple ML Research Model License, research-only), the Synchformer visual encoder (© 2024 Vladimir Iashin — MIT), and the NVIDIA BigVGAN v2 44 kHz vocoder (© 2024 NVIDIA CORPORATION — MIT).",
-      "restriction": "Research / non-commercial only — the intersection of five component licenses. The strictest, the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific research and academic development and excludes any commercial product or service; the MMAudio large_44k_v2 MM-DiT / 44k mel-VAE add CC-BY-NC-4.0 (non-commercial); the Synchformer encoder and NVIDIA BigVGAN v2 vocoder are MIT (permissive). See candle-audio-mmaudio::WEIGHT_LICENSES_44K for each checkpoint's full terms. A legal read is warranted before any commercial use."
-    },
-    {
-      "provider_id": "mmaudio_large_44k",
-      "component": "dfn5b_clip_vit_h14_384",
-      "spdx_id": "LicenseRef-Apple-MLR",
-      "license_name": "Apple Machine Learning Research Model License Agreement",
-      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
-      "commercial_use": false,
-      "attribution": "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License Agreement (research / non-commercial use only)",
-      "restriction": "Apple ML Research Model License: research and academic use only; 'Research Purposes' excludes any commercial exploitation, product development, or use in a commercial product or service. Trained on the DFN-5B image-text dataset. A legal read is warranted before any commercial use."
-    },
-    {
-      "provider_id": "mmaudio_large_44k",
-      "component": "mmaudio_mmdit_large_44k_v2",
-      "spdx_id": "CC-BY-NC-4.0",
-      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
-      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio large_44k_v2 network (mmaudio_large_44k_v2.pth) © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
-      "restriction": "CC-BY-NC 4.0: non-commercial use only. The MMAudio code is MIT, but the released model weights are NonCommercial; a commercial use needs a separate license from the authors. Trained on VGGSound (research-oriented terms)."
-    },
-    {
-      "provider_id": "mmaudio_large_44k",
-      "component": "mmaudio_vae_44k",
-      "spdx_id": "CC-BY-NC-4.0",
-      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
-      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio 44k mel-VAE (v1-44.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives © NVIDIA (CC-BY-NC-SA-4.0)",
-      "restriction": "Non-commercial only: MMAudio releases all ext_weights checkpoints under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; MMAudio states it does not guarantee suitability for commercial use."
-    },
-    {
-      "provider_id": "mmaudio_large_44k",
-      "component": "nvidia_bigvgan_v2_44khz_128band_512x",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_512x",
-      "commercial_use": true,
-      "attribution": "NVIDIA BigVGAN v2 (bigvgan_v2_44khz_128band_512x, bigvgan_generator.pt) © 2024 NVIDIA CORPORATION — MIT License (model card license: mit); BigVGAN code adapted from HiFi-GAN (jik876, MIT).",
-      "restriction": "Code + weights are MIT (permissive). BigVGAN v2 was trained by NVIDIA on large-scale diverse audio (speech in multiple languages, environmental sounds, instruments); those upstream training-data terms are NVIDIA's to honor, and a downstream commercial use of the weights warrants a legal read even though the MIT grant itself is unrestricted."
-    },
-    {
-      "provider_id": "mmaudio_large_44k",
-      "component": "synchformer_vfeat",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://github.com/v-iashin/Synchformer",
-      "commercial_use": true,
-      "attribution": "Synchformer © 2024 Vladimir Iashin — MIT License; checkpoint distributed via MMAudio (hkchengrex/MMAudio) ext_weights",
-      "restriction": "Code is MIT. Released weights were trained on VGGSound/AudioSet/LRS3; those datasets carry their own (YouTube/BBC-sourced, research-oriented) terms — a legal read is warranted before any commercial redistribution of the weights."
+      "components": [
+        "dfn5b_clip_vit_h14_384",
+        "mmaudio_mmdit_large_44k_v2",
+        "mmaudio_vae_44k",
+        "nvidia_bigvgan_v2_44khz_128band_512x",
+        "synchformer_vfeat"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apple-mlr"
+        },
+        {
+          "term": "non_commercial_weights"
+        }
+      ]
     },
     {
       "provider_id": "mmaudio_small_16k",
-      "component": null,
-      "spdx_id": "LicenseRef-MMAudio-small-16k-composite",
-      "license_name": "MMAudio small_16k composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
-      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio video→audio (mmaudio_small_16k) assembles five checkpoints: the MM-DiT network + 16k mel-VAE + 16k BigVGAN (© Sony Research Inc. / MMAudio — CC-BY-NC-4.0), the DFN5B-CLIP ViT-H/14-384 conditioner (© Apple Inc. — Apple ML Research Model License, research-only), and the Synchformer visual encoder (© 2024 Vladimir Iashin — MIT).",
-      "restriction": "Research / non-commercial only — the intersection of five component licenses. The strictest, the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific research and academic development and excludes any commercial product or service; the MMAudio MM-DiT / mel-VAE / BigVGAN checkpoints add CC-BY-NC-4.0 (non-commercial); the Synchformer encoder is MIT. See candle-audio-mmaudio::WEIGHT_LICENSES for each checkpoint's full terms. A legal read is warranted before any commercial use."
-    },
-    {
-      "provider_id": "mmaudio_small_16k",
-      "component": "dfn5b_clip_vit_h14_384",
-      "spdx_id": "LicenseRef-Apple-MLR",
-      "license_name": "Apple Machine Learning Research Model License Agreement",
-      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
-      "commercial_use": false,
-      "attribution": "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License Agreement (research / non-commercial use only)",
-      "restriction": "Apple ML Research Model License: research and academic use only; 'Research Purposes' excludes any commercial exploitation, product development, or use in a commercial product or service. Trained on the DFN-5B image-text dataset. A legal read is warranted before any commercial use."
-    },
-    {
-      "provider_id": "mmaudio_small_16k",
-      "component": "mmaudio_bigvgan_16k",
-      "spdx_id": "CC-BY-NC-4.0",
-      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
-      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio 16k BigVGAN (best_netG.pt) © Sony Research Inc. — released under CC-BY-NC-4.0; 16k BigVGAN pretrained model from Make-An-Audio 2 (ByteDance, MIT); BigVGAN code © NVIDIA (MIT), adapted from HiFi-GAN (MIT)",
-      "restriction": "Non-commercial only: MMAudio releases all ext_weights checkpoints under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; MMAudio states it does not guarantee suitability for commercial use."
-    },
-    {
-      "provider_id": "mmaudio_small_16k",
-      "component": "mmaudio_mmdit_small_16k",
-      "spdx_id": "CC-BY-NC-4.0",
-      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
-      "source_url": "https://github.com/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
-      "restriction": "CC-BY-NC 4.0: non-commercial use only. The MMAudio code is MIT, but the released model weights are NonCommercial; a commercial use needs a separate license from the authors. Trained on VGGSound (research-oriented terms)."
-    },
-    {
-      "provider_id": "mmaudio_small_16k",
-      "component": "mmaudio_vae_16k",
-      "spdx_id": "CC-BY-NC-4.0",
-      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
-      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-      "commercial_use": false,
-      "attribution": "MMAudio 16k mel-VAE (v1-16.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives © NVIDIA (CC-BY-NC-SA-4.0)",
-      "restriction": "Non-commercial only: MMAudio releases all ext_weights checkpoints under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; MMAudio states it does not guarantee suitability for commercial use."
-    },
-    {
-      "provider_id": "mmaudio_small_16k",
-      "component": "synchformer_vfeat",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://github.com/v-iashin/Synchformer",
-      "commercial_use": true,
-      "attribution": "Synchformer © 2024 Vladimir Iashin — MIT License; checkpoint distributed via MMAudio (hkchengrex/MMAudio) ext_weights",
-      "restriction": "Code is MIT. Released weights were trained on VGGSound/AudioSet/LRS3; those datasets carry their own (YouTube/BBC-sourced, research-oriented) terms — a legal read is warranted before any commercial redistribution of the weights."
+      "components": [
+        "dfn5b_clip_vit_h14_384",
+        "mmaudio_bigvgan_16k",
+        "mmaudio_mmdit_small_16k",
+        "mmaudio_vae_16k",
+        "synchformer_vfeat"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apple-mlr"
+        },
+        {
+          "term": "non_commercial_weights"
+        }
+      ]
     },
     {
       "provider_id": "moss_sfx_v2",
-      "component": null,
-      "spdx_id": "Apache-2.0",
-      "license_name": "Apache License 2.0",
-      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
-      "commercial_use": true,
-      "attribution": "MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0",
-      "restriction": null
+      "components": [
+        "moss_sound_effect_v2"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     },
     {
       "provider_id": "moss_tts_realtime",
-      "component": null,
-      "spdx_id": "Apache-2.0",
-      "license_name": "Apache License 2.0",
-      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
-      "commercial_use": true,
-      "attribution": "MOSS-TTS-Realtime-1.7B © OpenMOSS Team — licensed under Apache-2.0",
-      "restriction": null
+      "components": [
+        "moss_tts_realtime_1_7b"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     },
     {
       "provider_id": "moss_ttsd_v05",
-      "component": null,
-      "spdx_id": "Apache-2.0",
-      "license_name": "Apache License 2.0",
-      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
-      "commercial_use": true,
-      "attribution": "MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0",
-      "restriction": null
+      "components": [
+        "moss_ttsd_v05"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     },
     {
       "provider_id": "openvoice_v2",
-      "component": null,
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/myshell-ai/OpenVoiceV2",
-      "commercial_use": true,
-      "attribution": "OpenVoice V2 © MyShell.ai — licensed under MIT",
-      "restriction": null
+      "components": [
+        "openvoice_v2"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        }
+      ]
     },
     {
       "provider_id": "stable_audio_3_medium",
-      "component": null,
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Medium © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_medium",
-      "component": "root",
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Medium © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_medium",
-      "component": "t5gemma",
-      "spdx_id": "LicenseRef-Gemma-Terms",
-      "license_name": "Gemma Terms of Use",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE_GEMMA.md",
-      "commercial_use": true,
-      "attribution": "T5Gemma model weights © Google",
-      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
-    },
-    {
-      "provider_id": "stable_audio_3_medium_base",
-      "component": null,
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_medium_base",
-      "component": "root",
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+      "components": [
+        "stable_audio_3_medium_root",
+        "stable_audio_3_medium_t5gemma"
+      ],
+      "terms": [
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "gated_access"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        }
+      ]
     },
     {
       "provider_id": "stable_audio_3_medium_base",
-      "component": "t5gemma",
-      "spdx_id": "LicenseRef-Gemma-Terms",
-      "license_name": "Gemma Terms of Use",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE_GEMMA.md",
-      "commercial_use": true,
-      "attribution": "T5Gemma model weights © Google",
-      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
+      "components": [
+        "stable_audio_3_medium_base_root",
+        "stable_audio_3_medium_base_t5gemma"
+      ],
+      "terms": [
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        }
+      ]
     },
     {
       "provider_id": "stable_audio_3_small_music",
-      "component": null,
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small Music © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_small_music",
-      "component": "root",
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small Music © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_small_music",
-      "component": "t5gemma",
-      "spdx_id": "LicenseRef-Gemma-Terms",
-      "license_name": "Gemma Terms of Use",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE_GEMMA.md",
-      "commercial_use": true,
-      "attribution": "T5Gemma model weights © Google",
-      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
-    },
-    {
-      "provider_id": "stable_audio_3_small_music_base",
-      "component": null,
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_small_music_base",
-      "component": "root",
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+      "components": [
+        "stable_audio_3_small_music_root",
+        "stable_audio_3_small_music_t5gemma"
+      ],
+      "terms": [
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "gated_access"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        }
+      ]
     },
     {
       "provider_id": "stable_audio_3_small_music_base",
-      "component": "t5gemma",
-      "spdx_id": "LicenseRef-Gemma-Terms",
-      "license_name": "Gemma Terms of Use",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE_GEMMA.md",
-      "commercial_use": true,
-      "attribution": "T5Gemma model weights © Google",
-      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
+      "components": [
+        "stable_audio_3_small_music_base_root",
+        "stable_audio_3_small_music_base_t5gemma"
+      ],
+      "terms": [
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        }
+      ]
     },
     {
       "provider_id": "stable_audio_3_small_sfx",
-      "component": null,
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small SFX © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_small_sfx",
-      "component": "root",
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small SFX © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_small_sfx",
-      "component": "t5gemma",
-      "spdx_id": "LicenseRef-Gemma-Terms",
-      "license_name": "Gemma Terms of Use",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
-      "commercial_use": true,
-      "attribution": "T5Gemma model weights © Google",
-      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
-    },
-    {
-      "provider_id": "stable_audio_3_small_sfx_base",
-      "component": null,
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
-    },
-    {
-      "provider_id": "stable_audio_3_small_sfx_base",
-      "component": "root",
-      "spdx_id": "LicenseRef-Stability-AI-Community",
-      "license_name": "Stability AI Community License",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
-      "commercial_use": false,
-      "attribution": "Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI",
-      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+      "components": [
+        "stable_audio_3_small_sfx_root",
+        "stable_audio_3_small_sfx_t5gemma"
+      ],
+      "terms": [
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "gated_access"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        }
+      ]
     },
     {
       "provider_id": "stable_audio_3_small_sfx_base",
-      "component": "t5gemma",
-      "spdx_id": "LicenseRef-Gemma-Terms",
-      "license_name": "Gemma Terms of Use",
-      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE_GEMMA.md",
-      "commercial_use": true,
-      "attribution": "T5Gemma model weights © Google",
-      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
+      "components": [
+        "stable_audio_3_small_sfx_base_root",
+        "stable_audio_3_small_sfx_base_t5gemma"
+      ],
+      "terms": [
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://stability.ai/use-policy"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "stability-ai-community"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "gemma-terms"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://stability.ai/community-license"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 1000000,
+          "boundary": "exclusive"
+        }
+      ]
     },
     {
       "provider_id": "whisper_base",
-      "component": null,
-      "spdx_id": "Apache-2.0",
-      "license_name": "Apache License 2.0",
-      "source_url": "https://huggingface.co/openai/whisper-base",
-      "commercial_use": true,
-      "attribution": "Whisper © OpenAI — licensed under Apache-2.0",
-      "restriction": null
+      "components": [
+        "whisper_base"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
     }
   ]
 }

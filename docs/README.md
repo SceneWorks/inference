@@ -22,6 +22,26 @@ Documentation for the SceneWorks inference workspace.
   is Candle-native on every platform (no ONNX/third backend), and how the runtime catalog's
   dedicated audio section carries a `candle` audio lane inside the mlx macOS bundle.
 
+## Licensing
+
+The [`licensing/`](licensing/) directory holds the primary-source evidence behind the model-weight
+licence surface — the canonical text URL, the verbatim upstream identifier, and a quoted operative
+clause for every term assigned to a licence family.
+
+- **[Licence family evidence pack (sc-16662)](licensing/sc-16662-licence-family-evidence.md)** —
+  the licence families, quote-checkable, with an explicit unresolved list. **Draft, unsigned.** It
+  records facts, not legal conclusions.
+- **[Media checkpoint census (sc-16665)](licensing/sc-16665-media-checkpoint-census.md)** — which
+  upstream checkpoints every registered media provider actually loads, read from the code. Records
+  component identity only: it assigns no families and asserts no licences, and marks every component
+  whose upstream the repository does not state as UNDETERMINED.
+- **[Checkpoint licence evidence (sc-16665)](licensing/sc-16665-checkpoint-licence-evidence.md)** —
+  the primary-source licence read for each of those checkpoints, and the sign-off document behind
+  `license::components`. **Draft, unsigned.** Its
+  [known holes](licensing/sc-16665-checkpoint-licence-evidence.md#known-holes--the-rows-sc-16665-deliberately-did-not-write)
+  section is the authoritative list of checkpoints that were left without a row rather than given a
+  guessed one.
+
 ## Migration records
 
 The [`migration/`](migration/) directory records how this repository was assembled from the

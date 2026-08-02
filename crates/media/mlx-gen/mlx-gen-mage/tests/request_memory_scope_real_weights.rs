@@ -74,6 +74,7 @@ fn context(
             height,
             batch: 1,
             frames: 1,
+            reference_count: 0,
         },
         overlay: None,
         budget: MemoryBudget {

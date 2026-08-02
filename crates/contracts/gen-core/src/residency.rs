@@ -56,6 +56,7 @@ pub trait StagedHeavy {
 pub struct Residency<Text, Heavy, R: ResidencyRuntime> {
     loaders: Loaders<Text, Heavy, R>,
     warm: Mutex<Option<ResidentPair<Text, Heavy>>>,
+    rebuildable: bool,
     default_stage_residency: bool,
     on_staged: Option<Box<dyn Fn() + Send + Sync>>,
     runtime: PhantomData<R>,
@@ -82,6 +83,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 heavy,
                 streamable: false,
             })),
+            rebuildable: false,
             default_stage_residency: false,
             on_staged: None,
             runtime: PhantomData,
@@ -100,6 +102,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 load_warm: None,
             },
             warm: Mutex::new(None),
+            rebuildable: true,
             default_stage_residency: true,
             on_staged: None,
             runtime: PhantomData,
@@ -118,6 +121,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 load_warm: None,
             },
             warm: Mutex::new(None),
+            rebuildable: true,
             default_stage_residency: false,
             on_staged: None,
             runtime: PhantomData,
@@ -137,6 +141,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 load_warm: Some(Box::new(load_warm)),
             },
             warm: Mutex::new(None),
+            rebuildable: true,
             default_stage_residency: false,
             on_staged: None,
             runtime: PhantomData,
@@ -196,12 +201,12 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         self.default_stage_residency
     }
 
-    pub fn with_resident_parts<T>(&self, f: impl FnOnce(&Text, &Heavy) -> T) -> Option<T> {
-        let warm = self
-            .warm
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        warm.as_ref().map(|pair| f(&pair.text, &pair.heavy))
+    pub fn with_resident_parts<T>(
+        &self,
+        f: impl FnOnce(&Text, &Heavy) -> T,
+    ) -> RuntimeResult<R, Option<T>> {
+        let warm = self.warm()?;
+        Ok(warm.as_ref().map(|pair| f(&pair.text, &pair.heavy)))
     }
 
     /// Evict a warm pair before a backend-specific multi-stage path starts loading its first phase.
@@ -209,6 +214,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
     /// keeps the lifecycle lock for the whole request. This escape hatch is for already-established
     /// serialized video-like phase bodies whose order is intentionally not collapsed into this seam.
     pub fn evict_warm(&self) -> RuntimeResult<R, bool> {
+        self.ensure_rebuildable("evict warm components")?;
         let mut warm = self.warm()?;
         Ok(Self::evict_warm_locked(&mut warm))
     }
@@ -217,6 +223,17 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         self.warm
             .lock()
             .map_err(|_| Error::Msg("component-residency mutex poisoned".into()).into())
+    }
+
+    fn ensure_rebuildable(&self, action: &str) -> RuntimeResult<R, ()> {
+        if self.rebuildable {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(format!(
+                "resident-only component source cannot {action} because it has no reload loaders"
+            ))
+            .into())
+        }
     }
 
     fn evict_warm_locked(warm: &mut Option<ResidentPair<Text, Heavy>>) -> bool {
@@ -234,6 +251,13 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         streamable: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> RuntimeResult<R, ()> {
+        if !self.rebuildable && (streamable || warm.is_none()) {
+            return Err(Error::Unsupported(
+                "resident-only component source cannot change materialization shape or reload"
+                    .into(),
+            )
+            .into());
+        }
         if warm
             .as_ref()
             .is_some_and(|pair| pair.streamable != streamable)
@@ -263,6 +287,8 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 }
             };
             on_progress(Progress::Loading(LoadPhase::Renderer));
+            // Warm residents deliberately load the reusable PiD superset once. Per-request
+            // `use_pid` selects the decode path; it must not narrow the cross-request warm pair.
             let heavy = match (self.loaders.load_heavy)(true, streamable) {
                 Ok(heavy) => heavy,
                 Err(error) => {
@@ -318,6 +344,9 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         render: impl FnOnce(&Heavy, Encoded, &mut dyn FnMut(Progress)) -> RuntimeResult<R, Out>,
     ) -> RuntimeResult<R, Out> {
         check_cancel::<R>(cancel)?;
+        if stage_residency || streamable {
+            self.ensure_rebuildable("stage or rematerialize components")?;
+        }
         let mut warm = self.warm()?;
         if !stage_residency {
             self.ensure_warm_locked(&mut warm, streamable, on_progress)?;
@@ -366,6 +395,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         body: impl FnOnce() -> RuntimeResult<R, Out>,
     ) -> RuntimeResult<R, Out> {
         check_cancel::<R>(cancel)?;
+        self.ensure_rebuildable("enter an exclusive staged request")?;
         let mut warm = self.warm()?;
         Self::evict_warm_locked(&mut warm);
         let result = body();
@@ -424,6 +454,9 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         ) -> RuntimeResult<R, Out>,
     ) -> RuntimeResult<R, Out> {
         check_cancel::<R>(cancel)?;
+        if stage_residency || streamable {
+            self.ensure_rebuildable("stage or rematerialize components")?;
+        }
         let mut warm = self.warm()?;
         if !stage_residency {
             self.ensure_warm_locked(&mut warm, streamable, on_progress)?;
@@ -655,6 +688,94 @@ mod tests {
                 "render",
             ]
         );
+    }
+
+    #[test]
+    fn resident_only_rejects_eviction_before_losing_its_warm_pair() {
+        let residency = Residency::<u8, u8, Runtime>::resident(2, 3);
+        let callbacks = AtomicUsize::new(0);
+        let run = |stage_residency, streamable| {
+            residency.run_request_scoped(
+                stage_residency,
+                streamable,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                },
+                |text| {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok(*text)
+                },
+                |_| {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |heavy, encoded, _| {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok(*heavy + encoded)
+                },
+            )
+        };
+
+        for (stage_residency, streamable) in [(true, false), (false, true)] {
+            let error: Error = run(stage_residency, streamable).unwrap_err();
+            assert!(
+                matches!(error, Error::Unsupported(message) if message.contains("resident-only"))
+            );
+            assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        }
+        let error: Error = residency.evict_warm().unwrap_err();
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("resident-only")));
+        let body_calls = AtomicUsize::new(0);
+        let error: Error = residency
+            .run_exclusive_staged(&CancelFlag::new(), || {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("resident-only")));
+        assert_eq!(body_calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(run(false, false).unwrap(), 5);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            residency
+                .with_resident_parts(|text, heavy| *text + *heavy)
+                .unwrap(),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn every_residency_accessor_fails_closed_after_mutex_poisoning() {
+        let residency = Residency::<u8, u8, Runtime>::request_scoped(|_| Ok(2), |_, _| Ok(3));
+        let ordinary_run = || {
+            residency.run_request_scoped(
+                false,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |text| Ok(*text),
+                |_| Ok(()),
+                |heavy, encoded, _| Ok(*heavy + encoded),
+            )
+        };
+        assert_eq!(ordinary_run().unwrap(), 5);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = residency.warm.lock().unwrap();
+            panic!("poison residency for the fail-closed policy test");
+        }));
+
+        let assert_poison = |error: Error| {
+            assert!(
+                matches!(error, Error::Msg(message) if message == "component-residency mutex poisoned")
+            );
+        };
+        assert_poison(residency.with_resident_parts(|_, _| ()).unwrap_err());
+        assert_poison(ordinary_run().unwrap_err());
+        assert_poison(residency.evict_warm().unwrap_err());
     }
 
     #[test]

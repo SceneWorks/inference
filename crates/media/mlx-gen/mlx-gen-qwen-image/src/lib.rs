@@ -80,10 +80,31 @@ pub fn register_providers(
         .register_generator(model_control::REGISTRATION)
         .register_generator(model_edit::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
+            },
+        })
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model_control::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    model_control::MODEL_ID,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_edit::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model_edit::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(model_edit::MODEL_ID, spec)
+            },
+        })
         .register_memory_behavior(model_edit::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
@@ -94,6 +115,27 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn snapshot() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("qwen-registry-{}", std::process::id()));
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        root
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -126,7 +168,8 @@ mod explicit_registry_tests {
         use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
         let registry = super::provider_registry().unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/qwen".into()))
+        let root = snapshot();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
         for id in ["qwen_image", "qwen_image_control", "qwen_image_edit"] {
@@ -140,5 +183,6 @@ mod explicit_registry_tests {
                 super::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
             );
         }
+        std::fs::remove_dir_all(root).ok();
     }
 }

@@ -110,15 +110,51 @@ pub fn register_providers(
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_TURBO_ID,
+            contract: |spec| {
+                block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_TURBO_ID, spec)
+            },
+        })
         .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_RAW_ID,
+            contract: |spec| {
+                block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_RAW_ID, spec)
+            },
+        })
         .register_memory_behavior(model::RAW_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_EDIT_ID,
+            contract: |spec| {
+                block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_EDIT_ID, spec)
+            },
+        })
         .register_memory_behavior(model::EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_TURBO_EDIT_ID,
+            contract: |spec| {
+                block_memory_strategy::weights_free_memory_strategy_contract(
+                    KREA_2_TURBO_EDIT_ID,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(model::TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_TURBO_CONTROL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    KREA_2_TURBO_CONTROL_ID,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
@@ -130,12 +166,34 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn snapshot(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("krea-{tag}-{}", std::process::id()));
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        root
+    }
+
     #[test]
     fn every_base_variant_resolves_the_rung_four_contract_through_the_registry() {
         use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
 
         let registry = super::provider_registry().unwrap();
-        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+        let root = snapshot("registry-memory");
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         for id in [
@@ -158,6 +216,7 @@ mod explicit_registry_tests {
                 [crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE]
             );
         }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -189,13 +248,14 @@ mod explicit_registry_tests {
             .iter()
             .all(|descriptor| descriptor.capabilities.supports_preview));
 
+        let root = snapshot("registry-control-memory");
+        let control = root.join("control.safetensors");
+        write_minimal_safetensors(&control);
         let contract = registry
             .memory_strategy_contract(
                 "krea_2_turbo_control",
-                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
-                    .with_control(mlx_gen::WeightsSource::File(
-                        "/nonexistent/control.safetensors".into(),
-                    ))
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()))
+                    .with_control(mlx_gen::WeightsSource::File(control))
                     .with_offload_policy(mlx_gen::OffloadPolicy::Sequential),
             )
             .unwrap()
@@ -228,6 +288,7 @@ mod explicit_registry_tests {
         );
         gen_core_testkit::check_memory_strategy_contract(&contract)
             .expect("Krea control memory contract conformance");
+        std::fs::remove_dir_all(root).ok();
 
         let context = mlx_gen::gen_core::MemoryRunContext {
             selection: mlx_gen::gen_core::MemorySelection {
@@ -256,6 +317,7 @@ mod explicit_registry_tests {
                 height: 768,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: Some("control:1".to_owned()),
             budget: mlx_gen::gen_core::MemoryBudget {

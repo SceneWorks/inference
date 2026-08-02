@@ -2,9 +2,10 @@
 
 use gen_core::{
     LoadSpec, MemoryBehaviorRegistration, MemoryBudget, MemoryCacheState, MemoryCleanupSemantics,
-    MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryPhase, MemoryProviderContract,
-    MemoryRegistration, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyParameters, MemoryStrategySupport, Precision, ProviderRegistry,
+    MemoryContractFixtureRegistration, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryProviderContract, MemoryRegistration, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
+    MemoryStrategySupport, Precision, ProviderRegistry,
 };
 
 /// Check the static declaration and the safety-critical runtime semantics every provider must share.
@@ -61,10 +62,13 @@ pub fn check_memory_strategy_registry(
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     for registration in registry.memory_strategy_registrations() {
+        let contract_fixture = registry
+            .memory_contract_fixture_registrations()
+            .find(|fixture| fixture.provider_id == registration.provider_id);
         let behavior = registry
             .memory_behavior_registrations()
             .find(|behavior| behavior.provider_id == registration.provider_id);
-        check_memory_registration(registration, behavior, spec, &mut errors);
+        check_memory_registration(registration, contract_fixture, behavior, spec, &mut errors);
     }
     if errors.is_empty() {
         Ok(())
@@ -85,11 +89,15 @@ pub fn memory_strategy_registry_conformance(registry: &ProviderRegistry, spec: &
 
 fn check_memory_registration(
     registration: &MemoryRegistration,
+    contract_fixture: Option<&MemoryContractFixtureRegistration>,
     behavior: Option<&MemoryBehaviorRegistration>,
     spec: &LoadSpec,
     errors: &mut Vec<String>,
 ) {
-    let contract = match (registration.contract)(spec) {
+    let contract_factory = contract_fixture
+        .map(|fixture| fixture.contract)
+        .unwrap_or(registration.contract);
+    let contract = match contract_factory(spec) {
         Ok(contract) => contract,
         Err(error) => {
             errors.push(format!(
@@ -497,6 +505,7 @@ fn route_context(
             height: 1024,
             batch: 1,
             frames: 1,
+            reference_count: 0,
         },
         overlay: None,
         budget: MemoryBudget {
@@ -726,6 +735,37 @@ mod tests {
         let mut errors = Vec::new();
         check_memory_registration(
             &registration,
+            None,
+            Some(&PID_BEHAVIOR),
+            &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            &mut errors,
+        );
+        assert_eq!(errors, Vec::<String>::new());
+    }
+
+    #[test]
+    fn conformance_uses_the_explicit_weights_free_factory() {
+        fn production_requires_assets(
+            _spec: &LoadSpec,
+        ) -> gen_core::Result<MemoryProviderContract> {
+            Err(gen_core::Error::Msg(
+                "production contract touched required assets".to_owned(),
+            ))
+        }
+
+        let registration = MemoryRegistration {
+            provider_id: "pid-provider",
+            contract: production_requires_assets,
+            safety_check: route_aware_safety,
+        };
+        let contract_fixture = MemoryContractFixtureRegistration {
+            provider_id: "pid-provider",
+            contract: pid_contract,
+        };
+        let mut errors = Vec::new();
+        check_memory_registration(
+            &registration,
+            Some(&contract_fixture),
             Some(&PID_BEHAVIOR),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
             &mut errors,
@@ -754,6 +794,7 @@ mod tests {
         let mut errors = Vec::new();
         check_memory_registration(
             &registration,
+            None,
             Some(&PID_BEHAVIOR),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
             &mut errors,
@@ -1010,6 +1051,7 @@ mod tests {
         let mut errors = Vec::new();
         check_memory_registration(
             &registration,
+            None,
             Some(&behavior),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
             &mut errors,

@@ -14,7 +14,8 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{
-    CancelFlag, DiffusionSampler, Error, Image, LatentDecoder, MlxLatentOps, Progress, Result,
+    CancelFlag, DiffusionSampler, Error, Image, LatentDecoder, MlxLatentOps, PreviewSink, Progress,
+    Result,
 };
 
 use crate::inpaint::InpaintBlend;
@@ -75,11 +76,10 @@ pub struct ControlContext<'a> {
     pub scale: f32,
 }
 
-/// Run the denoise loop with CFG, driven entirely by the sampler's own schedule
-/// (`sampler.num_steps()` iterations). `latents` is the seeded init `[1, h, w, 4]`;
-/// `conditioning`/`pooled`/`time_ids` carry the CFG batch (B = 2 when `cfg > 1`). Returns the final
-/// latents; progress per step; `cancel` between steps. Each iteration:
-/// `x_in = scale_model_input(latents)` → U-Net eps → (CFG) → `latents = sampler.step(eps, latents)`.
+// Backward-compatible struct API. Registered generators call the explicit `*_with_preview`
+// variants below; direct users (including InstantID) retain the exact inert-preview signatures and
+// execution semantics they had before sc-16633.
+
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     d: &Denoiser,
@@ -91,7 +91,7 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    denoise_core(
+    denoise_with_preview(
         d,
         latents,
         conditioning,
@@ -100,16 +100,10 @@ pub fn denoise(
         cfg,
         cancel,
         on_progress,
-        None,
-        &[],
-        None,
-        None,
+        &PreviewSink::default(),
     )
 }
 
-/// Like [`denoise`] but applies the legacy inpaint **mask-blend** after each step (sc-3057):
-/// `latents = (1-mask)·init_noised + mask·latents`. The blend draws no RNG, so the ancestral noise
-/// stream is identical to plain img2img (a full-white mask ⇒ bit-identical to [`denoise`]).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_inpaint(
     d: &Denoiser,
@@ -122,7 +116,7 @@ pub fn denoise_inpaint(
     on_progress: &mut dyn FnMut(Progress),
     blend: &InpaintBlend,
 ) -> Result<Array> {
-    denoise_core(
+    denoise_inpaint_with_preview(
         d,
         latents,
         conditioning,
@@ -131,16 +125,11 @@ pub fn denoise_inpaint(
         cfg,
         cancel,
         on_progress,
-        Some(blend),
-        &[],
-        None,
-        None,
+        &PreviewSink::default(),
+        blend,
     )
 }
 
-/// Like [`denoise`] but runs a ControlNet branch each step and injects its residuals into the UNet
-/// (sc-3058). Works on the txt2img or img2img init (set up by the caller); `scale = 0` ⇒ identical
-/// to [`denoise`] (the residuals vanish).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_control(
     d: &Denoiser,
@@ -153,7 +142,7 @@ pub fn denoise_control(
     on_progress: &mut dyn FnMut(Progress),
     control: &ControlContext,
 ) -> Result<Array> {
-    denoise_multi_control(
+    denoise_control_with_preview(
         d,
         latents,
         conditioning,
@@ -162,14 +151,11 @@ pub fn denoise_control(
         cfg,
         cancel,
         on_progress,
-        std::slice::from_ref(control),
+        &PreviewSink::default(),
+        control,
     )
 }
 
-/// Like [`denoise_control`] but runs **multiple** ControlNet branches and sums their residuals — the
-/// diffusers `MultiControlNetModel` rule (sc-3378). `controls[i]` pairs with the `i`-th branch; all
-/// share the text `conditioning` as their cross-attention input. A single-element `controls` is
-/// bit-identical to [`denoise_control`]; an empty `controls` reduces to [`denoise`].
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_multi_control(
     d: &Denoiser,
@@ -182,7 +168,7 @@ pub fn denoise_multi_control(
     on_progress: &mut dyn FnMut(Progress),
     controls: &[ControlContext],
 ) -> Result<Array> {
-    denoise_core(
+    denoise_multi_control_with_preview(
         d,
         latents,
         conditioning,
@@ -191,16 +177,11 @@ pub fn denoise_multi_control(
         cfg,
         cancel,
         on_progress,
-        None,
+        &PreviewSink::default(),
         controls,
-        None,
-        None,
     )
 }
 
-/// Like [`denoise`] but injects the IP-Adapter image `tokens` (`[B, N, cross_attention_dim]`,
-/// CFG-batched with a zeros uncond row) into every cross-attention at `scale` (sc-3059). Works on
-/// the txt2img or img2img init; `scale = 0` ⇒ identical to [`denoise`].
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_ip(
     d: &Denoiser,
@@ -214,7 +195,7 @@ pub fn denoise_ip(
     tokens: &Array,
     scale: f32,
 ) -> Result<Array> {
-    denoise_core(
+    denoise_ip_with_preview(
         d,
         latents,
         conditioning,
@@ -223,19 +204,12 @@ pub fn denoise_ip(
         cfg,
         cancel,
         on_progress,
-        None,
-        &[],
-        Some((tokens, scale)),
-        None,
+        &PreviewSink::default(),
+        tokens,
+        scale,
     )
 }
 
-/// Like [`denoise`] but runs the **InstantID** dual conditioning each step (sc-3113/3114): the
-/// IdentityNet ControlNet (on the kps `control` image, cross-attended to `controlnet_encoder` = the
-/// face tokens) injects its residuals, while the face IP `tokens` are injected into the UNet
-/// cross-attention at `scale`. `tokens`/`controlnet_encoder` are typically the same CFG-batched
-/// `[B, 16, cross_attention_dim]` face tokens. `scale = 0` + a `0`-scale control ⇒ identical to
-/// [`denoise`].
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_ip_control(
     d: &Denoiser,
@@ -251,7 +225,7 @@ pub fn denoise_ip_control(
     tokens: &Array,
     scale: f32,
 ) -> Result<Array> {
-    denoise_ip_multi_control(
+    denoise_ip_control_with_preview(
         d,
         latents,
         conditioning,
@@ -260,20 +234,14 @@ pub fn denoise_ip_control(
         cfg,
         cancel,
         on_progress,
-        std::slice::from_ref(control),
+        &PreviewSink::default(),
+        control,
         controlnet_encoder,
         tokens,
         scale,
     )
 }
 
-/// Like [`denoise_ip_control`] but runs **multiple** ControlNet branches and sums their residuals
-/// before injection — the diffusers `MultiControlNetModel` rule (sc-3378). This is the engine for
-/// InstantID pose mode (sc-3117): `controls = [IdentityNet(kps), OpenPose(skeleton)]`, each with its
-/// own `conditioning_scale`, all sharing `controlnet_encoder` (the face tokens) as their
-/// cross-attention conditioning — exactly as the vendored InstantID pipeline passes the same
-/// `prompt_image_emb` to every sub-ControlNet. A single-element `controls` is bit-identical to
-/// [`denoise_ip_control`]; an empty `controls` reduces to [`denoise_ip`].
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_ip_multi_control(
     d: &Denoiser,
@@ -289,6 +257,40 @@ pub fn denoise_ip_multi_control(
     tokens: &Array,
     scale: f32,
 ) -> Result<Array> {
+    denoise_ip_multi_control_with_preview(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+        controls,
+        controlnet_encoder,
+        tokens,
+        scale,
+    )
+}
+
+/// Run the denoise loop with CFG, driven entirely by the sampler's own schedule
+/// (`sampler.num_steps()` iterations). `latents` is the seeded init `[1, h, w, 4]`;
+/// `conditioning`/`pooled`/`time_ids` carry the CFG batch (B = 2 when `cfg > 1`). Returns the final
+/// latents; progress per step; `cancel` between steps. Each iteration:
+/// `x_in = scale_model_input(latents)` → U-Net eps → (CFG) → `latents = sampler.step(eps, latents)`.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     denoise_core(
         d,
         latents,
@@ -298,6 +300,217 @@ pub fn denoise_ip_multi_control(
         cfg,
         cancel,
         on_progress,
+        preview,
+        None,
+        &[],
+        None,
+        None,
+    )
+}
+
+/// Like [`denoise`] but applies the legacy inpaint **mask-blend** after each step (sc-3057):
+/// `latents = (1-mask)·init_noised + mask·latents`. The blend draws no RNG, so the ancestral noise
+/// stream is identical to plain img2img (a full-white mask ⇒ bit-identical to [`denoise`]).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_inpaint_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    blend: &InpaintBlend,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        Some(blend),
+        &[],
+        None,
+        None,
+    )
+}
+
+/// Like [`denoise`] but runs a ControlNet branch each step and injects its residuals into the UNet
+/// (sc-3058). Works on the txt2img or img2img init (set up by the caller); `scale = 0` ⇒ identical
+/// to [`denoise`] (the residuals vanish).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    control: &ControlContext,
+) -> Result<Array> {
+    denoise_multi_control_with_preview(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        std::slice::from_ref(control),
+    )
+}
+
+/// Like [`denoise_control`] but runs **multiple** ControlNet branches and sums their residuals — the
+/// diffusers `MultiControlNetModel` rule (sc-3378). `controls[i]` pairs with the `i`-th branch; all
+/// share the text `conditioning` as their cross-attention input. A single-element `controls` is
+/// bit-identical to [`denoise_control`]; an empty `controls` reduces to [`denoise`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_multi_control_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    controls: &[ControlContext],
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        None,
+        controls,
+        None,
+        None,
+    )
+}
+
+/// Like [`denoise`] but injects the IP-Adapter image `tokens` (`[B, N, cross_attention_dim]`,
+/// CFG-batched with a zeros uncond row) into every cross-attention at `scale` (sc-3059). Works on
+/// the txt2img or img2img init; `scale = 0` ⇒ identical to [`denoise`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    tokens: &Array,
+    scale: f32,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        None,
+        &[],
+        Some((tokens, scale)),
+        None,
+    )
+}
+
+/// Like [`denoise`] but runs the **InstantID** dual conditioning each step (sc-3113/3114): the
+/// IdentityNet ControlNet (on the kps `control` image, cross-attended to `controlnet_encoder` = the
+/// face tokens) injects its residuals, while the face IP `tokens` are injected into the UNet
+/// cross-attention at `scale`. `tokens`/`controlnet_encoder` are typically the same CFG-batched
+/// `[B, 16, cross_attention_dim]` face tokens. `scale = 0` + a `0`-scale control ⇒ identical to
+/// [`denoise`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip_control_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    control: &ControlContext,
+    controlnet_encoder: &Array,
+    tokens: &Array,
+    scale: f32,
+) -> Result<Array> {
+    denoise_ip_multi_control_with_preview(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        std::slice::from_ref(control),
+        controlnet_encoder,
+        tokens,
+        scale,
+    )
+}
+
+/// Like [`denoise_ip_control`] but runs **multiple** ControlNet branches and sums their residuals
+/// before injection — the diffusers `MultiControlNetModel` rule (sc-3378). This is the engine for
+/// InstantID pose mode (sc-3117): `controls = [IdentityNet(kps), OpenPose(skeleton)]`, each with its
+/// own `conditioning_scale`, all sharing `controlnet_encoder` (the face tokens) as their
+/// cross-attention conditioning — exactly as the vendored InstantID pipeline passes the same
+/// `prompt_image_emb` to every sub-ControlNet. A single-element `controls` is bit-identical to
+/// [`denoise_ip_control`]; an empty `controls` reduces to [`denoise_ip`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip_multi_control_with_preview(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    controls: &[ControlContext],
+    controlnet_encoder: &Array,
+    tokens: &Array,
+    scale: f32,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
         None,
         controls,
         Some((tokens, scale)),
@@ -378,6 +591,7 @@ fn denoise_core(
     cfg: f32,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
     inpaint: Option<&InpaintBlend>,
     controls: &[ControlContext],
     ip: Option<(&Array, f32)>,
@@ -397,6 +611,8 @@ fn denoise_core(
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
     let total = steps as u32;
+    let preview_sigmas: Vec<f32> = (0..=steps).rev().map(|step| step as f32).collect();
+    let preview_counter = mlx_gen::preview::PreviewCounter::new(&preview_sigmas);
     // ControlNet cross-attn conditioning: `conditioning` (text) for tile-CN; the caller may
     // override it (InstantID feeds the face tokens as the IdentityNet's encoder_hidden_states).
     // The override is shared across branches — matching the InstantID MultiControlNet path,
@@ -406,6 +622,13 @@ fn denoise_core(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        crate::preview::emit_nhwc_preview(
+            preview,
+            &preview_counter,
+            &preview_sigmas,
+            preview_sigmas[i],
+            &latents,
+        );
         // Scale the latents into the model's input space: identity for the ancestral sampler (which
         // folds the renormalization into its step → bit-identical to the pre-trait loop), `x/√(σ²+1)`
         // for the Lightning Euler sampler. Acceleration samplers also cast to the U-Net compute dtype.
@@ -460,6 +683,44 @@ fn denoise_core(
     Ok(latents)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_curated(
+    unet: &UNet2DConditionModel,
+    sampler_name: Option<&str>,
+    ms: &mlx_gen::DiscreteModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+) -> Result<Array> {
+    denoise_curated_with_preview(
+        unet,
+        sampler_name,
+        ms,
+        sigmas,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        seed,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+        controls,
+        ip,
+        control_encoder,
+    )
+}
+
 /// Curated unified-sampler denoise (epic 7114, sc-7121) — the **additive** k-diffusion alternative to
 /// SDXL's bespoke ancestral default. Drives any [`mlx_gen::Solver`] over a `DiscreteModelSampling`
 /// (ε-prediction) and an [`mlx_gen::Scheduler`]-built σ schedule, through the shared
@@ -479,7 +740,7 @@ fn denoise_core(
 /// is the nearest training index (`mlx_gen::DiscreteModelSampling::timestep`) — ComfyUI's behaviour for a
 /// discrete model under a curated solver.
 #[allow(clippy::too_many_arguments)]
-pub fn denoise_curated(
+pub fn denoise_curated_with_preview(
     unet: &UNet2DConditionModel,
     sampler_name: Option<&str>,
     ms: &mlx_gen::DiscreteModelSampling,
@@ -492,6 +753,7 @@ pub fn denoise_curated(
     seed: u64,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
     controls: &[ControlContext],
     ip: Option<(&Array, f32)>,
     control_encoder: Option<&Array>,
@@ -500,7 +762,8 @@ pub fn denoise_curated(
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
     let cn_enc = control_encoder.unwrap_or(conditioning);
-    mlx_gen::run_curated_sampler(
+    let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
+    mlx_gen::run_curated_sampler_with_latent_hook(
         sampler_name,
         ms,
         sigmas,
@@ -508,6 +771,9 @@ pub fn denoise_curated(
         seed,
         cancel,
         on_progress,
+        |latents, sigma| {
+            crate::preview::emit_nhwc_preview(preview, &preview_counter, sigmas, sigma, latents);
+        },
         |x_in, timestep| {
             // `x_in` is the c_in-scaled latent (f32); cast to the U-Net compute dtype, then CFG-batch.
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
@@ -548,14 +814,6 @@ pub fn denoise_curated(
     )
 }
 
-/// CFG++ denoise (epic 7434 P3, sc-8256) — the [`denoise_curated`] twin that routes through
-/// [`mlx_gen::run_cfgpp_sampler`]. Same U-Net forward + CFG combine, but it surfaces the unconditional
-/// branch (`eps_neg`) alongside the guided combine so the CFG++ solver can land on the guided `x0` while
-/// renoising from the unconditional one (Chung et al.). Selected only when `guidance_method == "cfg_pp"`,
-/// a CFG++-compatible base sampler is chosen, AND CFG is active (`cfg > 1`) — CFG++ is meaningless
-/// without a guidance gap (the caller guarantees `cfg_on`). `base_sampler_name` is the base solver
-/// (`euler`/`ddim`/`dpmpp_2m`); the guided combine reuses the shared `gen_core::guidance::cfg`, so at
-/// matched `cfg` the guided trajectory anchor is byte-identical to the plain path.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfgpp(
     unet: &UNet2DConditionModel,
@@ -573,15 +831,64 @@ pub fn denoise_cfgpp(
     ip: Option<(&Array, f32)>,
     control_encoder: Option<&Array>,
 ) -> Result<Array> {
+    denoise_cfgpp_with_preview(
+        unet,
+        base_sampler_name,
+        ms,
+        sigmas,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+        controls,
+        ip,
+        control_encoder,
+    )
+}
+
+/// CFG++ denoise (epic 7434 P3, sc-8256) — the [`denoise_curated`] twin that routes through
+/// [`mlx_gen::run_cfgpp_sampler`]. Same U-Net forward + CFG combine, but it surfaces the unconditional
+/// branch (`eps_neg`) alongside the guided combine so the CFG++ solver can land on the guided `x0` while
+/// renoising from the unconditional one (Chung et al.). Selected only when `guidance_method == "cfg_pp"`,
+/// a CFG++-compatible base sampler is chosen, AND CFG is active (`cfg > 1`) — CFG++ is meaningless
+/// without a guidance gap (the caller guarantees `cfg_on`). `base_sampler_name` is the base solver
+/// (`euler`/`ddim`/`dpmpp_2m`); the guided combine reuses the shared `gen_core::guidance::cfg`, so at
+/// matched `cfg` the guided trajectory anchor is byte-identical to the plain path.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfgpp_with_preview(
+    unet: &UNet2DConditionModel,
+    base_sampler_name: Option<&str>,
+    ms: &mlx_gen::DiscreteModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+) -> Result<Array> {
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cn_enc = control_encoder.unwrap_or(conditioning);
-    mlx_gen::run_cfgpp_sampler(
+    let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
+    mlx_gen::run_cfgpp_sampler_with_latent_hook(
         base_sampler_name,
         ms,
         sigmas,
         latents,
         cancel,
         on_progress,
+        |latents, sigma| {
+            crate::preview::emit_nhwc_preview(preview, &preview_counter, sigmas, sigma, latents);
+        },
         |x_in, timestep| {
             // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;

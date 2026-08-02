@@ -19,9 +19,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler, CancelFlag, Error, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Residency, Result, TimestepConvention, WeightsSource,
+    default_seed, run_flow_sampler_with_latent_hook, CancelFlag, Error, GenerationOutput,
+    GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
+    Precision, Progress, Residency, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
@@ -187,14 +187,12 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         quant: spec.quantize,
         component_precision_floors: &[],
     };
-    let selected_weight_bytes = mlx_gen::gen_core::safetensors_path_bytes(root);
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
         memory_strategy: crate::memory_strategy::contract_for_variant(variant),
         memory_numeric_tier: Some(memory_numeric_tier),
-        selected_weight_bytes,
         tokenizer: Some(tokenizer),
         residency: build_residency(variant, spec)?,
     }))
@@ -343,10 +341,9 @@ pub struct Flux2 {
     variant: Flux2Variant,
     config: Flux2Config,
     memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
-    /// Exact load-time tier and selected snapshot footprint used by provider-owned admission.
-    /// Test-only instances have no load artifact, so their tier remains unknown.
+    /// Exact load-time tier used by provider-owned route validation. Test-only instances have no
+    /// load artifact, so their tier remains unknown.
     memory_numeric_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
-    selected_weight_bytes: u64,
     /// The (small, always-warm) tokenizer. `None` only for the weightless `new_for_tests` instances;
     /// the production load path always populates it.
     tokenizer: Option<TextTokenizer>,
@@ -368,7 +365,6 @@ impl Flux2 {
             config: variant.config(),
             memory_strategy: crate::memory_strategy::contract_for_variant(variant),
             memory_numeric_tier: None,
-            selected_weight_bytes: 0,
             tokenizer: None,
             residency: Residency::sequential(
                 || {
@@ -704,12 +700,7 @@ impl Generator for Flux2 {
                         ),
                     };
                 };
-                crate::memory_strategy::safety_check(
-                    contract,
-                    context,
-                    expected_tier,
-                    self.selected_weight_bytes,
-                )
+                crate::memory_strategy::safety_check(contract, context, expected_tier)
             },
         )
     }
@@ -1050,14 +1041,28 @@ impl Flux2 {
                     };
                     // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
                     // `run_flow_sampler`. img2img slices the schedule from `start_step`.
-                    let final_latents = run_flow_sampler(
+                    let denoise_sigmas = &sched.sigmas[start_step..keep];
+                    let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                    let final_latents = run_flow_sampler_with_latent_hook(
                         sampler_name,
                         TimestepConvention::Sigma,
-                        &sched.sigmas[start_step..keep],
+                        denoise_sigmas,
                         latents,
                         seed,
                         &req.cancel,
                         on_progress,
+                        |latents, sigma| {
+                            crate::preview::emit_flux_preview(
+                                &req.preview,
+                                &previews,
+                                denoise_sigmas,
+                                sigma,
+                                latents,
+                                lat_h as i32,
+                                lat_w as i32,
+                                vae,
+                            );
+                        },
                         predict,
                     )?;
                     on_progress(Progress::Decoding);

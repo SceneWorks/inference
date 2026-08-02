@@ -12,11 +12,10 @@ use mlx_rs::{Array, Dtype};
 use crate::array::scalar;
 use crate::{Error, Image, PreviewFrame, PreviewSink, Result};
 
-/// Numbers preview frames by schedule position rather than solver evaluation count.
+/// Numbers preview frames by schedule position.
 ///
-/// A provider's prediction closure runs once per solver evaluation: once per step for Euler and
-/// twice per step for the Heun family. Keying frames to schedule positions therefore prevents a
-/// Heun render from reaching `total` halfway through and stalling for its remaining evaluations.
+/// The sampler driver invokes providers once per actual outer solver step. Keying the resulting
+/// frames to schedule positions keeps numbering monotonic and bounded even for truncated schedules.
 pub struct PreviewCounter {
     emitted: Cell<u32>,
     total: u32,
@@ -152,12 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn heun_cadence_does_not_overrun_the_step_count() {
+    fn duplicate_schedule_positions_are_not_emitted_twice() {
         let counter = PreviewCounter::new(&SIGMAS);
         let mut frames = Vec::new();
-        for pair in SIGMAS.windows(2).take(8) {
-            frames.extend(counter.next(&SIGMAS, pair[0]));
-            frames.extend(counter.next(&SIGMAS, pair[1]));
+        for &sigma in &SIGMAS[..8] {
+            frames.extend(counter.next(&SIGMAS, sigma));
+            frames.extend(counter.next(&SIGMAS, sigma));
         }
         assert_eq!(frames, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(frames.iter().all(|&f| f <= counter.total()));

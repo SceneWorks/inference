@@ -420,18 +420,14 @@ impl QwenImageControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let block_window = crate::memory_strategy::resolve_window_size(req, &self.memory_strategy)?;
-        let attention_budget = crate::pipeline::attention_budget(req);
-        let decode_tiling = crate::pipeline::decode_tiling(req);
+        let crate::pipeline::RequestRungs {
+            block_window,
+            attention_budget,
+            decode_tiling,
+        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117).
         let params = resolve_run_params(req, req.width, req.height);
-        crate::pipeline::calibration_fault(
-            req,
-            mlx_gen::gen_core::MemoryPhase::Conditioning,
-            MODEL_ID,
-        )?;
-
         let (control_image, control_scale) = self.resolve_control(req)?;
 
         // Phase A: prompt → embeds (epic 10834 Phase 1, sc-11006; sc-11125). Under `Sequential` the

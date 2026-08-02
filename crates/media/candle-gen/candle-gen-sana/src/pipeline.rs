@@ -137,6 +137,7 @@ pub fn denoise_cfg(
         seed,
         cancel,
         on_progress,
+        None,
         predict,
     )
 }
@@ -470,7 +471,7 @@ pub fn denoise_sprint(
             .forward_with_guidance(lat_in, cond, &t, Some(&guidance))
             .map_err(CandleError::from)
     };
-    run_scm_sampler(scheduler, latents, seed, cancel, on_progress, predict)
+    run_scm_sampler(scheduler, latents, seed, cancel, on_progress, None, predict)
 }
 
 /// The composed **SANA-Sprint** text-to-image pipeline (CFG-free SCM/TrigFlow few-step, sc-11781) — a

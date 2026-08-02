@@ -155,11 +155,39 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION_EDIT_BASE)
         .register_generator(model::REGISTRATION_EDIT_TURBO)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "mage_flow",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow", spec),
+        })
         .register_memory_strategy(model::MEMORY_REGISTRATION_BASE)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "mage_flow_base",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_base", spec),
+        })
         .register_memory_strategy(model::MEMORY_REGISTRATION_TURBO)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "mage_flow_turbo",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_turbo", spec),
+        })
         .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "mage_flow_edit",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_edit", spec),
+        })
         .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_BASE)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "mage_flow_edit_base",
+            contract: |spec| {
+                model::weights_free_memory_strategy_contract("mage_flow_edit_base", spec)
+            },
+        })
         .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_TURBO)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "mage_flow_edit_turbo",
+            contract: |spec| {
+                model::weights_free_memory_strategy_contract("mage_flow_edit_turbo", spec)
+            },
+        })
         // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055).
         .register_trainer(training::REGISTRATION)
 }
@@ -171,6 +199,27 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn snapshot() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("mage-registry-{}", std::process::id()));
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        root
+    }
+
     use super::*;
 
     #[test]
@@ -202,13 +251,15 @@ mod explicit_registry_tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
-        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("unused".into()));
+        let root = snapshot();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
         for id in MODEL_IDS {
             assert!(registry
                 .memory_strategy_contract(id, &spec)
                 .unwrap()
                 .is_some());
         }
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Every id is prefixed with the family id, matching the image-family convention

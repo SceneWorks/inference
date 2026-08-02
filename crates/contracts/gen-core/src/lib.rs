@@ -72,12 +72,18 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
-pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
+pub use license::components::MEDIA_COMPONENT_LICENSES;
+pub use license::families::LICENSE_FAMILIES;
+pub use license::{
+    component_licenses_manifest_json, license_table_conformance_errors, provider_terms,
+    resolve_component, resolve_family, CeilingBoundary, ComponentLicense, LicenseFamily,
+    LicenseTerm, ProviderComponents,
+};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
     adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts,
+    standard_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts, MemoryBackend,
     MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics,
     MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
     MemoryConformanceState, MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension,
@@ -95,9 +101,10 @@ pub use memory_strategy::{
 pub use registry::{
     ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
     CaptionerRegistration, ImageEmbedderRegistration, MemoryBehaviorBeginRequest,
-    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryRegistration, ModelRegistration,
-    PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration,
-    TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
+    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
+    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{

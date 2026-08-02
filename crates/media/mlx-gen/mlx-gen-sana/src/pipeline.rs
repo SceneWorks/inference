@@ -48,8 +48,8 @@
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, Error, FlowMatchEuler, Image, Progress, Result,
-    TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, Image, PreviewSink,
+    Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array};
@@ -109,6 +109,42 @@ pub fn denoise_cfg(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_cfg_with_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        uncond,
+        uncond_mask,
+        guidance_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_cfg`] with an optional best-effort preview of each actual outer solver step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_preview(
+    transformer: &SanaTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    uncond: Option<&Array>,
+    uncond_mask: Option<&Array>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
@@ -130,14 +166,19 @@ pub fn denoise_cfg(
     // img2img runs the tail of the schedule (`sigmas[start_step..]`); txt2img passes `start_step = 0`
     // → the full schedule, byte-identical to the pre-img2img path. The pre-noised init latent (blended
     // at `sigmas[start_step]` by the caller) is the loop's starting point.
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start_step.min(scheduler.sigmas.len().saturating_sub(1))..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::Sigma,
-        &scheduler.sigmas[start_step.min(scheduler.sigmas.len().saturating_sub(1))..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| {
+            crate::preview::emit_base_preview(preview, &previews, sigmas, sigma, latents);
+        },
         predict,
     )
 }
@@ -200,9 +241,39 @@ pub fn denoise_sprint(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_sprint_with_preview(
+        transformer,
+        scheduler,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_sprint`] with an optional best-effort preview of each SCM step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_with_preview(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     // txt2img: seed the SCM prior (`latents * sigma_data`) and run the whole angle schedule (start 0).
     let latents = multiply(&latents, arr1(scheduler.sigma_data))?;
-    denoise_sprint_from(
+    denoise_sprint_from_with_preview(
         transformer,
         scheduler,
         0,
@@ -214,6 +285,7 @@ pub fn denoise_sprint(
         guidance_embeds_scale,
         cancel,
         on_progress,
+        preview,
     )
 }
 
@@ -236,6 +308,38 @@ pub fn denoise_sprint_from(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_sprint_from_with_preview(
+        transformer,
+        scheduler,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_sprint_from`] with an optional best-effort preview of each SCM step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_from_with_preview(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     use mlx_rs::transforms::eval;
 
     let sd = scheduler.sigma_data;
@@ -248,6 +352,8 @@ pub fn denoise_sprint_from(
     let n = scheduler.num_steps();
     let start = start_step.min(n);
     let total = (n - start).max(1) as u32;
+    let preview_schedule = &scheduler.timesteps[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(preview_schedule);
     let mut denoised = latents.clone();
     // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
     // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
@@ -269,6 +375,14 @@ pub fn denoise_sprint_from(
         });
 
         let s = scheduler.timesteps[i];
+        crate::preview::emit_sprint_preview(
+            preview,
+            &previews,
+            preview_schedule,
+            s,
+            &latents,
+            1.0 / sd,
+        );
         let t_next = scheduler.timesteps[i + 1];
         let scm_t = scheduler.scm_timestep(i);
         let in_scale = scheduler.input_scale(i);
@@ -535,10 +649,30 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        self.render_one_with_preview(
+            cond,
+            req,
+            guidance,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
+    }
+
+    /// [`Self::render_one`] with an optional best-effort native-latent preview sink.
+    pub fn render_one_with_preview(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+    ) -> Result<Image> {
         if self.sprint {
-            self.render_sprint(cond, req, guidance, cancel, on_progress)
+            self.render_sprint(cond, req, guidance, cancel, on_progress, preview)
         } else {
-            self.render_cfg(cond, req, guidance, cancel, on_progress)
+            self.render_cfg(cond, req, guidance, cancel, on_progress, preview)
         }
     }
 
@@ -550,6 +684,7 @@ impl SanaHeavy {
         guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
@@ -604,7 +739,7 @@ impl SanaHeavy {
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
         let uncond_mask = cond.uncond.as_ref().map(|(_, um)| um);
-        let latents = denoise_cfg(
+        let latents = denoise_cfg_with_preview(
             &self.transformer,
             &scheduler,
             req.sampler,
@@ -618,6 +753,7 @@ impl SanaHeavy {
             guidance,
             cancel,
             on_progress,
+            preview,
         )?;
         on_progress(Progress::Decoding);
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
@@ -639,6 +775,7 @@ impl SanaHeavy {
         guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
@@ -677,7 +814,7 @@ impl SanaHeavy {
             // txt2img: the SCM prior is `noise · σ_data`.
             multiply(&noise, arr1(sd))?
         };
-        let latents = denoise_sprint_from(
+        let latents = denoise_sprint_from_with_preview(
             &self.transformer,
             &scheduler,
             start_step,
@@ -689,6 +826,7 @@ impl SanaHeavy {
             self.guidance_embeds_scale,
             cancel,
             on_progress,
+            preview,
         )?;
         on_progress(Progress::Decoding);
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)

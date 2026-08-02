@@ -50,25 +50,25 @@ pub const MODEL_ID: &str = "moss_sfx_v2";
 pub const HUB_REPO: &str = "OpenMOSS-Team/MOSS-SoundEffect-v2.0";
 pub const HUB_REVISION: &str = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d";
 
-/// The license of the pinned MOSS-SoundEffect v2.0 weight checkpoint (sc-13332) — surfaced for
-/// SceneWorks' end-product licenses page. Apache-2.0 (permissive), verified against the
-/// `OpenMOSS-Team/MOSS-SoundEffect-v2.0` model card.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
-        attribution: Some("MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned MOSS-SoundEffect-v2.0 checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "moss_sound_effect_v2";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned MOSS-SoundEffect-v2.0 checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `OpenMOSS-Team/MOSS-SoundEffect-v2.0` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::license::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some("MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0"),
+        retrieved: "2026-08-02",
     };
 
 /// Native output sample rate (Hz).

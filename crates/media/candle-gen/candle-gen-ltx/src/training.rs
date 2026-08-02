@@ -414,6 +414,7 @@ impl FlowMatchTrainer for LtxTrainer {
             seed,
             &cancel,
             &mut progress,
+            None,
             |x, sigma| Ok(dit.forward(x, sigma as f64, context, &state.positions)?),
         )?;
         let latent = unflatten_latent(&out.to_dtype(DType::F32)?, 1, edge, edge)?;

@@ -250,7 +250,7 @@ impl Generator for ZImageGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return gen_core::MemorySafetyDecision::Accept;
         };
-        memory_strategy::safety_check(MODEL_ID, contract, context, self.loaded_quant)
+        memory_strategy::admission_safety_check(MODEL_ID, contract, context, self.loaded_quant)
     }
 
     fn begin_memory_strategy_request(
@@ -261,12 +261,12 @@ impl Generator for ZImageGenerator {
             return Ok(None);
         };
         memory_strategy::validate_context(MODEL_ID, contract, context, self.loaded_quant)?;
-        Ok(Some(Box::new(memory_strategy::ZImageMemoryScope::new(
+        Ok(Some(Box::new(memory_strategy::request_scope(
             MODEL_ID,
             self.device.clone(),
             contract,
             context,
-        ))))
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -494,9 +494,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", test)))]
     let memory_strategy = None;
     Ok(Box::new(ZImageGenerator {
         descriptor: descriptor(),
@@ -591,41 +591,41 @@ pub fn load_from_comfyui_checkpoint(
 // the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn registered_turbo_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(MODEL_ID, spec)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn registered_base_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(base::MODEL_ID, spec)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn registered_turbo_control_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::control_contract("z_image_turbo_control", spec)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn registered_base_control_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::control_contract("z_image_control", spec)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
     contract: registered_turbo_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID,
@@ -635,7 +635,7 @@ const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: base::MODEL_ID,
     contract: registered_base_memory_contract,
@@ -651,7 +651,7 @@ const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_turbo_control",
@@ -659,7 +659,7 @@ const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
         safety_check: memory_strategy::registered_safety_check,
     };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_control",
@@ -670,7 +670,113 @@ const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
+    use candle_gen::gen_core::{
+        Conditioning, ConditioningKind, Image, LoadShape, LoadSpec, MemoryBehaviorRoute,
+        MemoryMode, MemoryNumericTier, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+        Precision, Quant, WeightsSource,
+    };
+
+    fn admission_context(
+        contract: &gen_core::MemoryProviderContract,
+        strategy: MemoryStrategy,
+        quant: Option<Quant>,
+    ) -> MemoryRunContext {
+        gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant,
+                component_precision_floors: &[],
+            },
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_admission_matrix(
+        label: &str,
+        context: &MemoryRunContext,
+        admit: impl Fn(&MemoryRunContext) -> MemorySafetyDecision,
+    ) {
+        assert_eq!(
+            admit(context),
+            MemorySafetyDecision::Accept,
+            "{label}: valid fixture"
+        );
+
+        let mut phases = context.clone();
+        phases.has_phases = true;
+        assert!(
+            matches!(
+                admit(&phases),
+                MemorySafetyDecision::Reject { reason } if reason.contains("multi-phase")
+            ),
+            "{label}: multi-phase mutation"
+        );
+
+        let mut pid = context.clone();
+        pid.use_pid = true;
+        if context.selection.strategy.is_optimized() {
+            assert!(
+                matches!(
+                    admit(&pid),
+                    MemorySafetyDecision::Reject { reason } if reason.contains("PiD")
+                ),
+                "{label}: optimized PiD mutation"
+            );
+        } else {
+            assert_eq!(
+                admit(&pid),
+                MemorySafetyDecision::Accept,
+                "{label}: resident PiD remains admissible"
+            );
+        }
+
+        let mut stale = context.clone();
+        stale.calibration_fingerprint.push_str("-stale");
+        assert!(
+            matches!(
+                admit(&stale),
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("calibration handshake mismatch")
+            ),
+            "{label}: fingerprint mutation"
+        );
+
+        let mut wrong_tier = context.clone();
+        wrong_tier.selection.tier.quant = None;
+        assert!(
+            matches!(
+                admit(&wrong_tier),
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("does not match loaded tier")
+            ),
+            "{label}: numeric-tier mutation"
+        );
+    }
+
+    fn packed_q4_spec() -> (LoadSpec, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "candle-z-image-sc-16600-admission-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        (spec, root)
+    }
 
     /// The seam under test: resolving `"z_image_turbo"` through the family registry returns this
     /// candle generator. `load`
@@ -686,6 +792,46 @@ mod tests {
         assert_eq!(g.descriptor().family, "z-image");
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    #[test]
+    fn loaded_and_registered_admission_seams_cover_the_complete_context_gate() {
+        let (spec, root) = packed_q4_spec();
+
+        for (label, generator) in [
+            ("loaded turbo hook", load(&spec).unwrap()),
+            ("loaded base hook", base::load(&spec).unwrap()),
+        ] {
+            let contract = generator
+                .memory_strategy_contract()
+                .expect("unit-test loads retain their CUDA memory contract");
+            let context =
+                admission_context(contract, MemoryStrategy::StagedResidency, Some(Quant::Q4));
+            assert_admission_matrix(label, &context, |context| {
+                generator.memory_strategy_safety_check(context)
+            });
+        }
+
+        for registration in [
+            TURBO_MEMORY_REGISTRATION,
+            BASE_MEMORY_REGISTRATION,
+            TURBO_CONTROL_MEMORY_REGISTRATION,
+            BASE_CONTROL_MEMORY_REGISTRATION,
+        ] {
+            let contract = (registration.contract)(&spec).unwrap();
+            assert_eq!(contract.provider_id, registration.provider_id);
+            let strategy = if registration.provider_id.ends_with("_control") {
+                MemoryStrategy::Resident
+            } else {
+                MemoryStrategy::StagedResidency
+            };
+            let context = admission_context(&contract, strategy, Some(Quant::Q4));
+            assert_admission_matrix(registration.provider_id, &context, |context| {
+                (registration.safety_check)(&spec, &contract, context)
+            });
+        }
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// The descriptor advertises the wired distilled txt2img + img2img surface: no CFG or negative

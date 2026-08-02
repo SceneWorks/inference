@@ -6,7 +6,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::{host_i32, scalar};
 use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::{join, Weights};
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::{add, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis};
 use mlx_rs::{Array, Dtype};
@@ -312,6 +312,14 @@ pub struct T5TextEncoder {
     final_ln_w: Array,
 }
 
+/// A residual sublayer that may remain at source precision while the rest of T5's Linear surface
+/// is quantized. Chroma uses this to calibrate the smallest quality-preserving packed policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum T5Sublayer {
+    Attention,
+    FeedForward,
+}
+
 impl T5TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let p = |suffix: &str| join(prefix, suffix);
@@ -330,6 +338,42 @@ impl T5TextEncoder {
         self.shared.quantize(bits)?;
         for block in &mut self.blocks {
             block.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Quantize the large attention/FFN Linear surface while retaining the token-embedding and
+    /// relative-position-bias tables at their source precision. Chroma uses this sensitivity-
+    /// calibration policy for its packed auxiliary artifacts; hosted evidence determines whether
+    /// retaining those two boundary tables sufficiently reduces perturbation through the 24-layer
+    /// residual stream while the packed Linear surface removes the full dense-T5 residency.
+    pub fn quantize_linears(&mut self, bits: i32) -> Result<()> {
+        for block in &mut self.blocks {
+            block.quantize_linears(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Quantize every attention/FFN Linear except one explicitly selected residual sublayer.
+    ///
+    /// This is the narrow calibration seam used by Chroma's real-weight sensitivity sweep. The
+    /// caller must mirror the selected dense sublayer in any packed artifact predicate before the
+    /// policy can ship.
+    pub fn quantize_linears_except(
+        &mut self,
+        bits: i32,
+        dense_block: usize,
+        dense_sublayer: T5Sublayer,
+    ) -> Result<()> {
+        if dense_block >= self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "T5 dense carve-out block {dense_block} is outside 0..{}",
+                self.blocks.len()
+            )));
+        }
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            block
+                .quantize_linears_except(bits, (index == dense_block).then_some(dense_sublayer))?;
         }
         Ok(())
     }
@@ -379,6 +423,26 @@ impl T5Block {
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize(bits)?;
         self.ff.quantize(bits)?;
+        Ok(())
+    }
+
+    fn quantize_linears(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize_linears(bits)?;
+        self.ff.quantize(bits)?;
+        Ok(())
+    }
+
+    fn quantize_linears_except(
+        &mut self,
+        bits: i32,
+        dense_sublayer: Option<T5Sublayer>,
+    ) -> Result<()> {
+        if dense_sublayer != Some(T5Sublayer::Attention) {
+            self.attn.quantize_linears(bits)?;
+        }
+        if dense_sublayer != Some(T5Sublayer::FeedForward) {
+            self.ff.quantize(bits)?;
+        }
         Ok(())
     }
 }
@@ -450,6 +514,14 @@ impl T5Attention {
         self.v.quantize(bits, None)?;
         self.o.quantize(bits, None)?;
         self.rel_bias.quantize(bits)?;
+        Ok(())
+    }
+
+    fn quantize_linears(&mut self, bits: i32) -> Result<()> {
+        self.q.quantize(bits, None)?;
+        self.k.quantize(bits, None)?;
+        self.v.quantize(bits, None)?;
+        self.o.quantize(bits, None)?;
         Ok(())
     }
 }

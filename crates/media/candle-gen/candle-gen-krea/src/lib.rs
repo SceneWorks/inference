@@ -1416,7 +1416,7 @@ fn registered_krea_valid_fixture(
             } else {
                 gen_core::MemoryMode::TextToImage
             },
-            has_reference: is_control,
+            reference_count: u32::from(is_control),
             use_pid: false,
             has_phases: false,
             overlay: is_control.then(|| "pose-control".to_owned()),
@@ -1778,6 +1778,7 @@ mod tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: gen_core::MemoryBudget {
@@ -2254,8 +2255,11 @@ mod tests {
         };
         scope.configure_request(&mut request).unwrap();
         assert_eq!(request.memory, Some(attention_memory));
-        request.memory.as_mut().unwrap().calibration_error_phase =
-            Some(gen_core::MemoryPhase::Denoise);
+        request
+            .memory
+            .as_mut()
+            .unwrap()
+            .authorize_calibration_fault(gen_core::MemoryPhase::Denoise);
         scope.configure_request(&mut request).unwrap();
         assert_eq!(
             request.memory,

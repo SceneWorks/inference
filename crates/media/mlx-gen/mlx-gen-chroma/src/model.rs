@@ -19,9 +19,10 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
-    Precision, Progress, Residency, Result, TimestepConvention, WeightsSource,
+    default_seed, resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec,
+    ModelDescriptor, OffloadPolicy, Precision, PreviewSink, Progress, Residency, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -132,7 +133,7 @@ fn load_text_only(variant: ChromaVariant, spec: &LoadSpec) -> Result<ChromaTextO
     let root = resolve_root(variant, spec)?;
     let mut t5 = loader::load_t5_encoder(root)?;
     if let Some(q) = spec.quantize {
-        t5.quantize(q.bits())?;
+        t5.quantize_linears(q.bits())?;
     }
     Ok(ChromaTextOwned {
         tokenizer: loader::load_tokenizer()?,
@@ -276,7 +277,7 @@ impl Chroma {
         self.residency
             .with_resident_parts(|text, heavy| {
                 f(&text.tokenizer, &text.t5, &heavy.transformer, &heavy.vae)
-            })
+            })?
             .ok_or_else(|| {
                 Error::Msg(format!(
                     "{}: components are not resident (Sequential offload holds no warm components \
@@ -430,6 +431,7 @@ impl Chroma {
                 latents,
                 sampler_name,
                 sigmas,
+                &PreviewSink::default(),
                 seed,
                 cancel,
                 on_progress,
@@ -454,6 +456,7 @@ impl Chroma {
         latents: Array,
         sampler_name: &str,
         sigmas: Vec<f32>,
+        preview: &PreviewSink,
         seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -491,6 +494,9 @@ impl Chroma {
             sigmas,
             sampler_name,
             seed,
+            width,
+            height,
+            preview,
             guidance,
             pos_embeds,
             &rope_pos,
@@ -509,6 +515,9 @@ impl Chroma {
         sigmas: Vec<f32>,
         sampler_name: &str,
         seed: u64,
+        width: u32,
+        height: u32,
+        preview: &PreviewSink,
         guidance: f32,
         pos_embeds: &Array,
         rope_pos: &RopeTable,
@@ -549,7 +558,8 @@ impl Chroma {
         // (dpmpp_2m / uni_pc / …) becomes available. Cancellation, the per-step `eval` (sc-5514 /
         // sc-5399 — bounds the lazy graph so a mid-render cancel lands within ~1 model eval), and
         // progress are handled inside `run_flow_sampler`.
-        run_flow_sampler(
+        let previews = mlx_gen::preview::PreviewCounter::new(&sigmas);
+        run_flow_sampler_with_latent_hook(
             Some(sampler_name),
             TimestepConvention::Sigma,
             &sigmas,
@@ -557,6 +567,11 @@ impl Chroma {
             seed,
             cancel,
             on_progress,
+            |latents, sigma| {
+                mlx_gen_flux::preview::emit_preview(
+                    preview, &previews, &sigmas, sigma, latents, width, height,
+                );
+            },
             predict,
         )
     }
@@ -799,6 +814,7 @@ impl Chroma {
                         latents,
                         name,
                         denoise_sigmas.to_vec(),
+                        &req.preview,
                         seed,
                         &req.cancel,
                         on_progress,

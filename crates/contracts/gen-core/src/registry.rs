@@ -143,6 +143,18 @@ pub struct MemoryRegistration {
         fn(&LoadSpec, &MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
 }
 
+/// Provider-owned, weights-free contract fixture paired with a [`MemoryRegistration`].
+///
+/// Catalog conformance uses this factory when required model assets are unavailable. Production
+/// registry resolution never consults it and continues to call [`MemoryRegistration::contract`].
+/// The fixture must preserve the route declaration and inject zero asset facts without filesystem
+/// traversal.
+#[derive(Clone, Copy)]
+pub struct MemoryContractFixtureRegistration {
+    pub provider_id: &'static str,
+    pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
+}
+
 /// Provider-owned, weights-free executable fixture for one implemented memory strategy.
 ///
 /// The request is intentionally provider-owned: edit/control routes can supply their real mode and
@@ -161,7 +173,7 @@ impl MemoryBehaviorFixture {
             use_pid: context.use_pid,
             ..Default::default()
         };
-        if context.has_reference {
+        for _ in 0..context.geometry.reference_count {
             request.conditioning.push(crate::Conditioning::Reference {
                 image: crate::Image {
                     width: 1,
@@ -286,6 +298,7 @@ pub struct AudioEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
+    memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
@@ -326,6 +339,11 @@ impl ProviderRegistryBuilder {
         register_memory_strategy,
         memory_strategy,
         MemoryRegistration
+    );
+    builder_registration_method!(
+        register_memory_contract_fixture,
+        memory_contract_fixture,
+        MemoryContractFixtureRegistration
     );
     builder_registration_method!(
         register_memory_behavior,
@@ -441,6 +459,27 @@ impl ProviderRegistryBuilder {
         }
         {
             let mut ids = std::collections::BTreeSet::new();
+            for registration in &self.memory_contract_fixture {
+                if !ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate memory-contract fixture provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .memory_strategy
+                    .iter()
+                    .any(|memory| memory.provider_id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "memory-contract fixture '{}' has no matching memory strategy",
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
+        {
+            let mut ids = std::collections::BTreeSet::new();
             for registration in &self.memory_behavior {
                 if !ids.insert(registration.provider_id) {
                     return Err(Error::Msg(format!(
@@ -503,6 +542,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
+            memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
@@ -524,6 +564,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
+    memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
@@ -566,12 +607,14 @@ macro_rules! explicit_registry_kind {
 
 impl ProviderRegistry {
     /// Provider-owned warm 1024² activation transient for `id`.
-    /// `Ok(None)` is the compatibility-safe unmeasured state; unknown ids remain errors.
+    /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
+    /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
     pub fn activation_memory_bytes_1024(&self, id: &str) -> Result<Option<u64>> {
-        if !self
+        let has_generator = self
             .generators()
-            .any(|registration| (registration.descriptor)().id == id)
-        {
+            .any(|registration| (registration.descriptor)().id == id);
+        let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
+        if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
         }
         Ok(self
@@ -586,6 +629,12 @@ impl ProviderRegistry {
         &self,
     ) -> impl ExactSizeIterator<Item = &MemoryRegistration> {
         self.memory_strategy.iter()
+    }
+
+    pub fn memory_contract_fixture_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &MemoryContractFixtureRegistration> {
+        self.memory_contract_fixture.iter()
     }
 
     pub fn memory_behavior_registrations(
@@ -1665,6 +1714,81 @@ mod tests {
         safety_check: crate::memory_strategy::default_registered_memory_strategy_safety_check,
     };
 
+    fn production_contract_requires_assets(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        Err(Error::Msg("production factory requires assets".to_owned()))
+    }
+
+    fn weights_free_fixture_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        Ok(MemoryProviderContract::compatibility_default(
+            "dummy_weights_free_route",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
+    }
+
+    const DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION: MemoryRegistration = MemoryRegistration {
+        provider_id: "dummy_weights_free_route",
+        contract: production_contract_requires_assets,
+        safety_check: crate::memory_strategy::default_registered_memory_strategy_safety_check,
+    };
+
+    const DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE: MemoryContractFixtureRegistration =
+        MemoryContractFixtureRegistration {
+            provider_id: "dummy_weights_free_route",
+            contract: weights_free_fixture_contract,
+        };
+
+    #[test]
+    fn production_registry_resolution_never_uses_the_weights_free_factory() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .build()
+            .unwrap();
+        let error = registry
+            .memory_strategy_contract(
+                "dummy_weights_free_route",
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("production factory requires assets"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn weights_free_contract_fixtures_are_unique_and_paired() {
+        let orphan = ProviderRegistryBuilder::new()
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .build()
+            .err()
+            .expect("an orphan fixture must fail")
+            .to_string();
+        assert!(
+            orphan.contains("has no matching memory strategy"),
+            "{orphan}"
+        );
+
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .build()
+            .err()
+            .expect("duplicate fixtures must fail")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate memory-contract fixture provider id"),
+            "{duplicate}"
+        );
+    }
+
     #[test]
     fn unmatched_memory_strategy_requires_explicit_composed_route_registration() {
         let error = ProviderRegistryBuilder::new()
@@ -1689,6 +1813,15 @@ mod tests {
             .expect("the composed route resolves")
             .expect("the composed route has a contract");
         assert_eq!(contract.provider_id, "dummy_composed_route");
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024("dummy_composed_route")
+                .expect("a known composed route has a truthful unmeasured activation state"),
+            None
+        );
+        assert!(registry
+            .activation_memory_bytes_1024("unknown_composed_route")
+            .is_err());
     }
 
     /// A tier the platform declared unimplemented is rejected at the load boundary — loudly, naming

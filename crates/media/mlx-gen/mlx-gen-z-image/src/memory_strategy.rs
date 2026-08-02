@@ -46,7 +46,8 @@
 //! so the scope of every quoted number matters: see `gen_core::attention_budget` for the full table.
 //!
 //! **Rung 1 is request-scoped (SC-15806).** `z_image_generation_memory` sets
-//! [`GenerationMemory::stage_residency`] only when the contract says rung 1 is engaged. The same
+//! [`mlx_gen::gen_core::GenerationMemory::stage_residency`] only when the contract says rung 1 is
+//! engaged. The same
 //! cached generator can therefore serve warm → staged → warm without reconstruction. Z-Image ignores
 //! the legacy load-time [`OffloadPolicy`](mlx_gen::OffloadPolicy); the shared contract selection is
 //! the authority.
@@ -137,16 +138,21 @@
 //! [`MEMORY_CALIBRATION_FINGERPRINT`]; the worker owns live-budget accounting and least-cost
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_safetensors_tensors, ResidentProjection,
+};
 use mlx_gen::gen_core::{
-    safetensors_path_tensor_headers, Error as CoreError, GenerationMemory, GenerationRequest,
-    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
-    Result as CoreResult, TransformerComponent,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategyParameters, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
+#[cfg(test)]
+use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
+#[cfg(test)]
+use mlx_gen::GenerationRequest;
 use mlx_gen::{Quant, WeightsSource};
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
@@ -423,8 +429,7 @@ fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
 /// the spec root for a pre-quantized turnkey). A single-file (ComfyUI) source has no component tree,
 /// so its asset facts stay zero rather than reporting a fabricated split.
 ///
-/// Fallible since SC-15775 only because the per-route decode declaration is: an overlapping native
-/// ladder cannot be constructed, so it cannot be published either. Nothing else here can fail.
+/// Fallible when route geometry is invalid or required component assets cannot be inspected.
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -443,10 +448,42 @@ pub fn memory_strategy_contract(
     //    intra-phase block materialization are separate axes.
     let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
         && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization);
+    let (asset_facts, resident_components) = asset_facts(spec, streamable)?;
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        streamable,
+        asset_facts,
+        resident_components,
+    )
+}
+
+/// Declaration-equivalent contract used only by weights-free registry conformance.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
+        && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization);
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        streamable,
+        MemoryAssetFacts::default(),
+        Vec::new(),
+    )
+}
+
+fn memory_strategy_contract_with_asset_facts(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    asset_facts: MemoryAssetFacts,
+    resident_components: Vec<MemoryResidentComponent>,
+) -> CoreResult<MemoryProviderContract> {
     // Bound once: the declaration is checked at construction, so building it twice inside the
     // capability map would re-run the check and re-allocate for no gain.
     let routes = decode_routes(provider_id)?;
-    let (asset_facts, resident_components) = asset_facts(spec, streamable)?;
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -561,9 +598,27 @@ fn asset_facts(
     spec: &LoadSpec,
     streamable: bool,
 ) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
+    let components = match &spec.weights {
+        WeightsSource::Dir(root) => {
+            let project = |path: &std::path::Path| {
+                projected_safetensors_bytes(path, |_| match spec.quantize {
+                    Some(quant) => ResidentProjection::GroupQuantized {
+                        bits: quant.bits(),
+                        group_size: crate::quant::GROUP_SIZE as usize,
+                    },
+                    None => ResidentProjection::Stored,
+                })
+            };
+            mlx_gen::PerComponentBytes {
+                text_encoder: project(&root.join("text_encoder"))?,
+                dit: project(&root.join("transformer"))?,
+                vae: project(&root.join("vae"))?,
+            }
+        }
+        // A combined single-file checkpoint cannot be split into the three contract components.
+        // Zero remains the truthful unknown; the independently addressed control is still exact.
+        WeightsSource::File(_) => mlx_gen::PerComponentBytes::default(),
+    };
     let resident_components = match &spec.control {
         Some(source) => control_resident_components(source, spec.quantize, streamable)?,
         None => Vec::new(),
@@ -602,49 +657,18 @@ fn control_resident_components(
     let path = match source {
         mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => path,
     };
-    let tensors = safetensors_path_tensor_headers(path)?;
-    let packed_bases = tensors
-        .iter()
-        .filter_map(|tensor| tensor.name.strip_suffix(".scales"))
-        .collect::<std::collections::HashSet<_>>();
     let bits = quant.map(|quant| quant.bits());
     let mut stack_bytes = 0_u64;
     let mut persistent_bytes = 0_u64;
+    let tensors = projected_safetensors_tensors(path, |_| match bits {
+        Some(bits) => ResidentProjection::GroupQuantized {
+            bits,
+            group_size: crate::quant::GROUP_SIZE as usize,
+        },
+        None => ResidentProjection::Stored,
+    })?;
     for tensor in &tensors {
-        let base = tensor.name.strip_suffix(".weight");
-        let projected_bytes = match (base, bits, tensor.shape.as_slice()) {
-            (Some(base), Some(bits), [out, input])
-                if !packed_bases.contains(base)
-                    && *input >= crate::quant::GROUP_SIZE as usize
-                    && *input % crate::quant::GROUP_SIZE as usize == 0 =>
-            {
-                let out = u64::try_from(*out).map_err(|_| {
-                    CoreError::Msg("control tensor output dimension overflow".into())
-                })?;
-                let input = u64::try_from(*input).map_err(|_| {
-                    CoreError::Msg("control tensor input dimension overflow".into())
-                })?;
-                let packed_weight = out
-                    .checked_mul(input)
-                    .and_then(|elements| elements.checked_mul(bits as u64))
-                    .map(|packed_bits| packed_bits / 8)
-                    .ok_or_else(|| {
-                        CoreError::Msg("control quantized weight size overflow".into())
-                    })?;
-                let group_entries = out
-                    .checked_mul(input / crate::quant::GROUP_SIZE as u64)
-                    .ok_or_else(|| {
-                        CoreError::Msg("control quantization table size overflow".into())
-                    })?;
-                let table_bytes = group_entries.checked_mul(4).ok_or_else(|| {
-                    CoreError::Msg("control quantization table size overflow".into())
-                })?;
-                packed_weight
-                    .checked_add(table_bytes)
-                    .ok_or_else(|| CoreError::Msg("control resident size overflow".into()))?
-            }
-            _ => tensor.data_bytes,
-        };
+        let projected_bytes = tensor.resident_bytes;
         if tensor.name.starts_with(CONTROL_STACK_PREFIX) {
             stack_bytes = stack_bytes.saturating_add(projected_bytes);
         } else {
@@ -684,197 +708,6 @@ fn control_resident_components(
 ///
 /// `Resident` returns `None`, which is the historical fast path (`GenerationRequest::memory`
 /// untouched).
-/// Request-scoped lifecycle state for one admitted Z-Image generation.
-///
-/// Holds no MLX arrays: its whole job is to translate the shared selection into
-/// [`GenerationRequest::memory`], reject parameters this provider does not implement, and guarantee
-/// the terminal synchronize-and-release on success, cancellation, **and** error.
-pub(crate) struct ZImageMemoryScope {
-    pub(crate) provider_id: &'static str,
-    pub(crate) geometry: MemoryGeometry,
-    pub(crate) memory: Option<GenerationMemory>,
-    /// Which decode this request runs, so `configure_decode` validates the route's own candidate
-    /// subset rather than the published union (see [`decode_routes`]).
-    pub(crate) use_pid: bool,
-    /// The window a rung-4 selection admitted, so `materialize_transformer_window` can check the
-    /// hook's `(first_block, block_count)` against the plan actually running instead of accepting any
-    /// pair. `None` below rung 4.
-    pub(crate) transformer_window: Option<u32>,
-    cleanup: fn() -> CoreResult<()>,
-    pub(crate) finished: bool,
-}
-
-impl ZImageMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Terminal barrier + cache eviction, idempotent.
-    ///
-    /// MLX is lazy and its allocator retains freed buffers in a cache, so "the request is over" is
-    /// only true after (a) a synchronous barrier on the default stream — which is what
-    /// [`mlx_rs::Array::eval`] is — and (b) an explicit [`clear_cache`](mlx_rs::memory::clear_cache).
-    /// Without both, a canceled or errored request can leave partially-resident buffers that poison
-    /// the next request's budget. This runs on every exit path, including [`Drop`].
-    fn synchronize_and_release(&mut self) -> CoreResult<()> {
-        (self.cleanup)()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-fn mlx_cleanup() -> CoreResult<()> {
-    let barrier = mlx_rs::Array::from(0.0_f32);
-    barrier.eval().map_err(mlx_gen::Error::from)?;
-    drop(barrier);
-    mlx_rs::memory::clear_cache();
-    Ok(())
-}
-
-fn weights_free_cleanup() -> CoreResult<()> {
-    Ok(())
-}
-
-impl MemoryRequestScope for ZImageMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        // Route drift is as fatal as geometry drift, and for the same reason. The scope's decode
-        // parameters are route-specific — a PiD-admitted scope carries a 1024-4096 px super-resolved
-        // tile — so applying it to a non-PiD request would write a PiD edge into a NATIVE decode. At
-        // 1024² a 4096 px tile collapses to a single tile, i.e. an effectively untiled decode while the
-        // evidence records a bounded one. That is the exact "executed a different strategy than the
-        // selector chose" failure the contract exists to prevent, so it is checked here beside the
-        // geometry it is a sibling of.
-        if request.use_pid != self.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request use_pid={} does not match the admitted route (use_pid={}); the decode \
-                 parameters are route-specific and cannot be carried across",
-                self.provider_id, request.use_pid, self.use_pid
-            )));
-        }
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request geometry {}x{} count {} does not match admitted {}x{} count {}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        // The shared selection is authoritative and request-scoped: overwrite (never merge) whatever
-        // a reused warm request carried, so a deeper prior rung cannot leak into this run.
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        // The phase boundaries themselves are owned by `Residency::run_staged`, which already
-        // evaluates and drops between phases; the scope only has to stay live across them.
-        self.ensure_active()
-    }
-
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        // The same shared, route-aware gate `safety_check` uses (SC-15775) — one implementation, so
-        // the scope cannot admit a geometry admission refused, or vice versa.
-        decode_routes(self.provider_id)?
-            .validate(self.use_pid, Some(tile_edge), Some(overlap))
-            .map_err(CoreError::Unsupported)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
-        self.ensure_active()?;
-        if chunk_size == ATTENTION_CHUNK_SIZE {
-            Ok(())
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "{}: attention chunk size is fixed at {ATTENTION_CHUNK_SIZE} score elements, got \
-                 {chunk_size}",
-                self.provider_id
-            )))
-        }
-    }
-
-    /// SC-15754. The window schedule itself is driven by
-    /// [`mlx_gen::block_residency::run_windowed`] inside the DiT forward — this hook is the shared
-    /// contract's *validation* seam, not a second driver: it answers "would the window you are about
-    /// to run be the one this request was admitted for?".
-    ///
-    /// Accepting an arbitrary `(first_block, block_count)` here would let a harness record a sweep
-    /// point that the provider never executed, which is the same class of false green as declaring a
-    /// rung Implemented because its Candle twin exists.
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        let Some(window) = self.transformer_window else {
-            return Err(CoreError::Unsupported(format!(
-                "{}: this request did not select bounded transformer residency, so no transformer \
-                 window is active",
-                self.provider_id
-            )));
-        };
-        let n_blocks = crate::transformer::ZImageTransformerConfig::turbo().n_layers as u32;
-        if first_block >= n_blocks {
-            return Err(CoreError::Unsupported(format!(
-                "{}: transformer window starts at block {first_block}, past the {n_blocks}-block \
-                 stack",
-                self.provider_id
-            )));
-        }
-        // Every window is `window` blocks except a ragged tail at the end of the stack.
-        let expected = window.min(n_blocks - first_block);
-        if block_count != expected {
-            return Err(CoreError::Unsupported(format!(
-                "{}: transformer window at block {first_block} is {block_count} blocks, but the \
-                 admitted window size {window} makes it {expected}",
-                self.provider_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        // Deliberately outcome-independent: cancellation and error need the barrier + eviction at
-        // least as much as success does.
-        self.ensure_active()?;
-        self.synchronize_and_release()
-    }
-}
-
-impl Drop for ZImageMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.synchronize_and_release();
-        }
-    }
-}
-
 /// The provider safety check every Z-Image variant shares: the calibration handshake, then the shared
 /// contract's own selection validation, then the budget. Defense in depth only — it can reject, it can
 /// never swap in a different strategy or numeric tier.
@@ -951,7 +784,7 @@ pub(crate) fn registered_valid_fixture(
         } else {
             mlx_gen::gen_core::MemoryMode::TextToImage
         },
-        has_reference: is_control,
+        reference_count: u32::from(is_control),
         use_pid,
         has_phases: false,
         overlay: None,
@@ -990,7 +823,7 @@ pub(crate) fn registered_begin_request(
         contract,
         loaded_tier(spec, provider_id)?,
         context,
-        weights_free_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
@@ -1001,7 +834,13 @@ pub(crate) fn begin_request(
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    begin_request_with_cleanup(provider_id, contract, loaded_tier, context, mlx_cleanup)
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        loaded_tier,
+        context,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
+    )
 }
 
 fn begin_request_with_cleanup(
@@ -1009,23 +848,32 @@ fn begin_request_with_cleanup(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
-    cleanup: fn() -> CoreResult<()>,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(ZImageMemoryScope {
+    let routes = decode_routes(provider_id)?;
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        geometry: context.geometry,
-        memory: contract.generation_memory(&context.selection),
-        use_pid: context.use_pid,
-        transformer_window: (context.selection.strategy
-            == MemoryStrategy::BoundedTransformerResidency)
-            .then_some(())
-            .and(context.selection.parameters.transformer_window_size),
-        cleanup,
-        finished: false,
-    })))
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        crate::transformer::ZImageTransformerConfig::turbo().n_layers,
+        move |use_pid, tile_edge, overlap| {
+            routes
+                .validate(use_pid, Some(tile_edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
+        },
+    )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = (context.selection.strategy
+        == MemoryStrategy::BoundedTransformerResidency)
+        .then_some(())
+        .and(context.selection.parameters.transformer_window_size);
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    )))
 }
 
 #[cfg(test)]
@@ -1057,15 +905,54 @@ mod tests {
         MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemorySelection, Precision,
         Quant, MEMORY_CALIBRATION_ABI,
     };
+    use std::sync::OnceLock;
+
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_snapshot(root: &std::path::Path) {
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+    }
 
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
     fn spec() -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("z-image-memory-spec-{}", std::process::id()));
+            write_snapshot(&root);
+            root
+        });
+        LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
     }
 
     fn contract() -> MemoryProviderContract {
         memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap()
+    }
+
+    #[test]
+    fn required_component_directory_cannot_disappear_into_zero_facts() {
+        let root =
+            std::env::temp_dir().join(format!("z-image-missing-component-{}", std::process::id()));
+        write_snapshot(&root);
+        std::fs::remove_dir_all(root.join("text_encoder")).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(memory_strategy_contract(crate::model::MODEL_ID, &spec).is_err());
+        assert!(weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
@@ -1131,6 +1018,7 @@ mod tests {
                 height: 1024,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {
@@ -1157,7 +1045,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
         ));
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        write_snapshot(&root);
         if let Some(bits) = packed_bits {
             std::fs::write(
                 root.join("transformer/config.json"),
@@ -1378,6 +1266,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&control, bytes).unwrap();
+        write_snapshot(&root);
+        let base_weight = vec![0_u8; 2 * 64 * 2];
+        let base = TensorView::new(Dtype::BF16, vec![2, 64], &base_weight).unwrap();
+        let base_bytes = serialize([("blocks.0.attn.to_q.weight", base)], &None).unwrap();
+        std::fs::write(root.join("transformer/model.safetensors"), base_bytes).unwrap();
 
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
@@ -1392,6 +1285,10 @@ mod tests {
         const STACK_RESIDENT_BYTES: u64 = 72;
         const PERSISTENT_RESIDENT_BYTES: u64 = 136;
         const CONTROL_RESIDENT_BYTES: u64 = STACK_RESIDENT_BYTES + PERSISTENT_RESIDENT_BYTES;
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.transformer_bytes, 72);
+        assert_eq!(contract.asset_facts.decoder_bytes, 2);
+        assert_eq!(contract.asset_facts.base_bytes, 76);
         assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_RESIDENT_BYTES);
         let component = contract
             .resident_components()
@@ -1503,7 +1400,8 @@ mod tests {
     #[test]
     fn eager_and_deferred_evidence_identities_cannot_cross_authorize() {
         let deferred = contract();
-        let eager_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()));
+        let mut eager_spec = spec();
+        eager_spec.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         let eager = memory_strategy_contract(crate::model::MODEL_ID, &eager_spec).unwrap();
         assert_eq!(
             deferred.calibration.as_ref().unwrap().fingerprint,
@@ -1681,8 +1579,9 @@ mod tests {
     /// layer rather than at generate time.
     #[test]
     fn rung_four_availability_uses_source_and_load_shape_not_offload_policy() {
-        let eager = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
-            .with_offload_policy(mlx_gen::OffloadPolicy::Resident);
+        let mut eager = spec();
+        eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        eager.offload_policy = mlx_gen::OffloadPolicy::Resident;
         let contract = memory_strategy_contract(crate::model::MODEL_ID, &eager).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
@@ -1713,9 +1612,9 @@ mod tests {
             Some(MemoryStrategySupport::Implemented)
         ));
         // Sequential+Eager remains unavailable: staged residency does not imply deferred blocks.
-        let staged_eager =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
-                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        let mut staged_eager = spec();
+        staged_eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        staged_eager.offload_policy = mlx_gen::OffloadPolicy::Sequential;
         let staged_eager =
             super::memory_strategy_contract(crate::model::MODEL_ID, &staged_eager).unwrap();
         assert!(matches!(
@@ -2093,6 +1992,7 @@ mod tests {
             let mut ctx = context(strategy);
             ctx.mode = MemoryMode::Edit;
             ctx.has_reference = true;
+            ctx.geometry.reference_count = 1;
             assert!(
                 matches!(
                     safety_check(&contract, ctx.selection.tier, &ctx),
@@ -2275,6 +2175,36 @@ mod tests {
         scope
             .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, ctx.geometry)
             .unwrap();
+        for geometry in [
+            MemoryGeometry {
+                width: ctx.geometry.width / 2,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                height: ctx.geometry.height / 2,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                frames: ctx.geometry.frames + 1,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                reference_count: 1,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                batch: 0,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                batch: ctx.geometry.batch + 1,
+                ..ctx.geometry
+            },
+        ] {
+            assert!(scope
+                .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, geometry)
+                .is_err());
+        }
         // Off-ladder edges and the wrong overlap are refused.
         assert!(scope
             .configure_decode(500, DECODE_OVERLAP, ctx.geometry)
@@ -2304,6 +2234,7 @@ mod tests {
             first += w;
         }
         assert!(scope.materialize_transformer_window(n, w).is_err());
+        assert!(scope.materialize_transformer_window(0, 0).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
 
         // Below rung 4 there is no window at all, so the hook refuses everything.
@@ -2313,6 +2244,57 @@ mod tests {
             .unwrap();
         assert!(scope.materialize_transformer_window(0, 1).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
+    }
+
+    #[test]
+    fn registered_behavior_enforces_decode_geometry_batch_prefixes_and_terminal_request_state() {
+        let spec = spec().with_quant(Quant::Q4);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
+        ctx.geometry.batch = 3;
+        let mut scope =
+            (crate::model::MEMORY_BEHAVIOR_REGISTRATION.begin_request)(&spec, &contract, &ctx)
+                .unwrap()
+                .expect("registered behavior must adopt the shared MLX scope");
+        scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    batch: 1,
+                    ..ctx.geometry
+                },
+            )
+            .unwrap();
+        assert!(scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    width: ctx.geometry.width / 2,
+                    ..ctx.geometry
+                },
+            )
+            .is_err());
+        assert!(scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    batch: 4,
+                    ..ctx.geometry
+                },
+            )
+            .is_err());
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        let mut request = GenerationRequest {
+            prompt: "after-finish".to_owned(),
+            width: ctx.geometry.width,
+            height: ctx.geometry.height,
+            count: 1,
+            ..Default::default()
+        };
+        assert!(scope.configure_request(&mut request).is_err());
     }
 
     #[test]

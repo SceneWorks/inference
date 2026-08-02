@@ -21,10 +21,10 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, gen_core, require_base_dir,
-    require_control, run_flow_sampler, Capabilities, Conditioning, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
-    TimestepConvention,
+    require_control, run_flow_sampler_with_latent_hook, Capabilities, Conditioning,
+    ConditioningKind, ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
+    Result, SizeFloor, TimestepConvention,
 };
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -87,7 +87,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // Mistral-3 text encoder drops after the prompt encode, then the control transformer (dev
             // DiT + control branch) + VAE load, bounding peak to `max(TE, DiT+control+VAE)`.
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -435,14 +435,28 @@ impl Flux2DevControl {
                             control_scale,
                         )
                     };
-                    let final_latents = run_flow_sampler(
+                    let denoise_sigmas = &sched.sigmas[start_step..];
+                    let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                    let final_latents = run_flow_sampler_with_latent_hook(
                         sampler_name,
                         TimestepConvention::Sigma,
-                        &sched.sigmas[start_step..],
+                        denoise_sigmas,
                         latents,
                         seed,
                         &req.cancel,
                         on_progress,
+                        |latents, sigma| {
+                            crate::preview::emit_flux_preview(
+                                &req.preview,
+                                &previews,
+                                denoise_sigmas,
+                                sigma,
+                                latents,
+                                lat_h as i32,
+                                lat_w as i32,
+                                vae,
+                            );
+                        },
                         predict,
                     )?;
                     on_progress(Progress::Decoding);

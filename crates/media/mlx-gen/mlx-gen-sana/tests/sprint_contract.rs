@@ -23,7 +23,8 @@ use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Progress};
+use mlx_gen::{CancelFlag, PreviewFrame, PreviewSink, Progress};
+use std::sync::{Arc, Mutex};
 
 use mlx_gen_sana::{
     denoise_sprint, BlockType, DcAeConfig, DcAeDecoder, DcAeEncoder, SanaTransformer,
@@ -439,6 +440,71 @@ fn sprint_wires_guidance_trunk_scm_decode() {
     assert_eq!(img.width, (latent_w * scale) as u32);
     assert_eq!(img.height, (latent_h * scale) as u32);
     assert_eq!(img.pixels.len(), (img.width * img.height * 3) as usize);
+}
+
+#[test]
+fn sprint_preview_numbers_actual_steps_and_is_output_inert() {
+    let mut tcfg = tiny_sprint_config();
+    tcfg.in_channels = 32;
+    tcfg.out_channels = 32;
+    let trunk =
+        SanaTransformer::from_weights(&tiny_sprint_trunk_weights(&tcfg), tcfg.clone()).unwrap();
+    let latent_h = 6;
+    let latent_w = 4;
+    let latents = normal::<f32>(
+        &[1, 32, latent_h, latent_w],
+        None,
+        None,
+        Some(&key(911).unwrap()),
+    )
+    .unwrap();
+    let cond = rand(&[1, 7, tcfg.caption_channels], 912);
+    let scheduler = ScmScheduler::new(2);
+    let cancel = CancelFlag::default();
+    let legacy = denoise_sprint(
+        &trunk,
+        &scheduler,
+        19,
+        latents.clone(),
+        &cond,
+        None,
+        4.5,
+        tcfg.guidance_embeds_scale,
+        &cancel,
+        &mut |_| {},
+    )
+    .unwrap();
+    let frames = Arc::new(Mutex::new(Vec::<PreviewFrame>::new()));
+    let captured = Arc::clone(&frames);
+    let active = mlx_gen_sana::pipeline::denoise_sprint_with_preview(
+        &trunk,
+        &scheduler,
+        19,
+        latents,
+        &cond,
+        None,
+        4.5,
+        tcfg.guidance_embeds_scale,
+        &cancel,
+        &mut |_| {},
+        &PreviewSink::new(move |frame| captured.lock().unwrap().push(frame)),
+    )
+    .unwrap();
+    assert_eq!(active.as_slice::<f32>(), legacy.as_slice::<f32>());
+    let frames = frames.lock().unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| (frame.current, frame.total))
+            .collect::<Vec<_>>(),
+        vec![(1, 2), (2, 2)]
+    );
+    assert!(frames.iter().all(|frame| {
+        (frame.image.width, frame.image.height) == (latent_w as u32, latent_h as u32)
+    }));
+    assert!(frames
+        .windows(2)
+        .any(|pair| pair[0].image.pixels != pair[1].image.pixels));
 }
 
 /// Single-step Sprint (num_steps = 1): the SCM loop must take exactly one step and skip the renoise

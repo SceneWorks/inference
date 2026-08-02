@@ -313,6 +313,7 @@ fn render_base_ladder(
             height: 256,
             batch: 1,
             frames: 1,
+            reference_count: 0,
         },
         overlay: None,
         budget: MemoryBudget {

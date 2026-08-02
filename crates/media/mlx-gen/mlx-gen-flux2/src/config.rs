@@ -219,7 +219,7 @@ impl Flux2Variant {
                 // bounding peak to `max(TE, DiT+VAE)`. The edit variants' reference conditioning that
                 // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
                 supports_sequential_offload: true,
-                supports_preview: false,
+                supports_preview: true,
                 supports_streaming: false,
                 supports_multi_speaker: false,
                 supports_conversation_history: false,

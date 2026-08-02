@@ -119,10 +119,11 @@ use crate::{
 /// provider changes tensor layout, quantization floors, execution structure, or another detail that
 /// invalidates its measurements.
 ///
-/// ABI 2 adds the typed load-shape axis to calibration identities, run contexts, and evidence keys.
-/// ABI-1 records are intentionally stale because eager and deferred measurements are not
-/// interchangeable.
-pub const MEMORY_CALIBRATION_ABI: u32 = 2;
+/// ABI 2 added the typed load-shape axis to calibration identities, run contexts, and evidence
+/// keys. ABI 3 adds the typed reference-count geometry axis. Earlier records are intentionally
+/// stale because reference-sensitive request peaks cannot be keyed by a boolean or an overlay
+/// identity string.
+pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -589,12 +590,37 @@ pub enum MemoryBackendRealization {
     },
 }
 
-impl MemoryBackendRealization {
-    pub const fn backend_id(&self) -> &'static str {
+/// Stable backend identity used by evidence and caller-side selection.
+///
+/// This deliberately excludes the realization capability flags above. Those flags describe one
+/// loaded provider and are covered by its calibration identity; the evidence-key axis is the
+/// canonical backend family carried by persisted calibration records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryBackend {
+    Candle,
+    Mlx,
+}
+
+impl MemoryBackend {
+    /// Stable spelling at the persisted evidence/protocol boundary.
+    pub const fn as_key(self) -> &'static str {
         match self {
-            Self::CandleCuda { .. } => "candle",
-            Self::MlxMetal { .. } => "mlx",
+            Self::Candle => "candle",
+            Self::Mlx => "mlx",
         }
+    }
+}
+
+impl MemoryBackendRealization {
+    pub const fn backend_kind(&self) -> MemoryBackend {
+        match self {
+            Self::CandleCuda { .. } => MemoryBackend::Candle,
+            Self::MlxMetal { .. } => MemoryBackend::Mlx,
+        }
+    }
+
+    pub const fn backend_id(&self) -> &'static str {
+        self.backend_kind().as_key()
     }
 
     /// This realization's rung-4 window materialization (SC-16090) — the backend-neutral question,
@@ -739,6 +765,10 @@ impl MemoryPeakBreakdown {
 }
 
 /// Provider-owned, load-exact asset facts used as formula inputs.
+///
+/// `base_bytes` is exactly the sum of the three base-model component fields. Auxiliary networks
+/// never belong in any of those four fields; they are declared once in `overlay_bytes` and, when
+/// non-zero alongside both formula variables, by typed resident components.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryAssetFacts {
     pub base_bytes: u64,
@@ -750,10 +780,14 @@ pub struct MemoryAssetFacts {
     pub overlay_bytes: u64,
 }
 
-/// Cache keys must include every axis that can change residency or execution.
+/// Request-level cache keys must include every axis that can change residency or execution.
+///
+/// A warm generator is owned by one resolved provider, backend realization, and load shape, so
+/// those axes are invariant inside this contract. A caller whose outer cache spans loaded
+/// generators must key that outer cache by those loader identities too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryCacheSemantics {
-    StrategyTierParametersGeometryAndOverlay,
+    StrategyTierParametersModeGeometryOverlayAndEngagedComposition,
 }
 
 /// Warm generators must not inherit a prior request's memory decision.
@@ -780,7 +814,8 @@ pub struct MemoryRuntimeSemantics {
 impl Default for MemoryRuntimeSemantics {
     fn default() -> Self {
         Self {
-            cache: MemoryCacheSemantics::StrategyTierParametersGeometryAndOverlay,
+            cache:
+                MemoryCacheSemantics::StrategyTierParametersModeGeometryOverlayAndEngagedComposition,
             warm_run: MemoryWarmRunSemantics::RevalidateBudgetAndReapplyRequestState,
             cancellation: MemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
             error: MemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
@@ -883,11 +918,7 @@ impl MemoryProviderContract {
     /// pre-SC-16065 provider has no typed components, so this returns the byte-identical input scalar.
     pub fn predicted_peak_from_base(&self, base_predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
         let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
-        let auxiliary_bytes = if components.is_empty() {
-            0
-        } else {
-            self.asset_facts.overlay_bytes
-        };
+        let auxiliary_bytes = self.auxiliary_overlay_bytes_for_prediction();
         MemoryPeakBreakdown {
             predicted_peak_bytes: base_predicted_peak_bytes.saturating_add(auxiliary_bytes),
             unattributed_bytes: base_predicted_peak_bytes,
@@ -899,11 +930,7 @@ impl MemoryProviderContract {
     /// never rewritten; this is the inspection seam for run contexts and evidence records.
     pub fn decompose_predicted_peak(&self, predicted_peak_bytes: u64) -> MemoryPeakBreakdown {
         let components = self.auxiliary_components().cloned().collect::<Vec<_>>();
-        let auxiliary_bytes = if components.is_empty() {
-            0
-        } else {
-            self.asset_facts.overlay_bytes
-        };
+        let auxiliary_bytes = self.auxiliary_overlay_bytes_for_prediction();
         MemoryPeakBreakdown {
             predicted_peak_bytes,
             unattributed_bytes: predicted_peak_bytes.saturating_sub(auxiliary_bytes),
@@ -916,6 +943,19 @@ impl MemoryProviderContract {
             .resident_components()
             .iter()
             .filter(|component| component.kind.is_auxiliary())
+    }
+
+    /// Compatibility aggregate attributed to typed auxiliary components in peak calculations.
+    ///
+    /// The typed-component sum and this aggregate are intentionally separate declaration legs;
+    /// conformance proves they agree. Legacy contracts with only an aggregate must not gain a new
+    /// contribution merely by calling the decomposition helpers.
+    fn auxiliary_overlay_bytes_for_prediction(&self) -> u64 {
+        if self.auxiliary_components().next().is_some() {
+            self.asset_facts.overlay_bytes
+        } else {
+            0
+        }
     }
 
     /// Typed resident component declarations, empty for every non-adopting provider.
@@ -1281,6 +1321,24 @@ impl MemoryProviderContract {
                         capability.strategy
                     ));
                 }
+                let has_implementation_hook = match capability.strategy {
+                    MemoryStrategy::Resident => false,
+                    MemoryStrategy::StagedResidency => {
+                        !self.lifecycle.phases.is_empty()
+                            || self.lifecycle.synchronized_phase_release
+                    }
+                    MemoryStrategy::BoundedDecode => self.lifecycle.decode_tiling,
+                    MemoryStrategy::BoundedAttention => self.lifecycle.attention_chunking,
+                    MemoryStrategy::BoundedTransformerResidency => {
+                        self.lifecycle.transformer_window_materialization
+                    }
+                };
+                if has_implementation_hook {
+                    errors.push(format!(
+                        "{:?} cannot be StructurallyNotApplicable while its implementation hook is declared",
+                        capability.strategy
+                    ));
+                }
             }
             validate_ranges(capability, &mut errors);
             validate_owned_parameter_domain(capability, &mut errors);
@@ -1312,6 +1370,31 @@ impl MemoryProviderContract {
             }
         }
         let auxiliary_bytes = self.auxiliary_resident_bytes();
+        match self
+            .asset_facts
+            .conditioning_bytes
+            .checked_add(self.asset_facts.transformer_bytes)
+            .and_then(|bytes| bytes.checked_add(self.asset_facts.decoder_bytes))
+        {
+            Some(base_components) if base_components != self.asset_facts.base_bytes => {
+                errors.push(format!(
+                    "base_bytes {} must equal base component bytes {} and exclude overlay_bytes",
+                    self.asset_facts.base_bytes, base_components
+                ));
+            }
+            None => errors.push("base component byte sum overflow".to_owned()),
+            _ => {}
+        }
+        if self.asset_facts.overlay_bytes > 0
+            && self.formula.uses(MemoryFormulaVariable::AssetBytes)
+            && self.formula.uses(MemoryFormulaVariable::OverlayBytes)
+            && auxiliary_bytes == 0
+        {
+            errors.push(
+                "a non-zero overlay declared with AssetBytes and OverlayBytes must use typed auxiliary resident components"
+                    .to_owned(),
+            );
+        }
         if auxiliary_bytes > 0 {
             if auxiliary_bytes != self.asset_facts.overlay_bytes {
                 errors.push(format!(
@@ -1526,6 +1609,29 @@ pub fn standard_memory_strategy_safety_check(
     route_gate: Option<&dyn Fn() -> Result<()>>,
 ) -> MemorySafetyDecision {
     let reject = |reason| MemorySafetyDecision::Reject { reason };
+    if context.budget.reclaimable_bytes > context.budget.committed_bytes {
+        return reject(format!(
+            "{}: reclaimable bytes {} exceed committed bytes {}; reclaim credit must be a subset \
+             of the charged snapshot",
+            contract.provider_id, context.budget.reclaimable_bytes, context.budget.committed_bytes
+        ));
+    }
+    if context.has_reference != (context.geometry.reference_count > 0) {
+        return reject(format!(
+            "{}: has_reference={} is inconsistent with reference_count={}",
+            contract.provider_id, context.has_reference, context.geometry.reference_count
+        ));
+    }
+    if context
+        .overlay
+        .as_deref()
+        .is_some_and(|overlay| overlay.contains('='))
+    {
+        return reject(format!(
+            "{}: overlay is an identity axis and must not encode structured key/value data",
+            contract.provider_id
+        ));
+    }
     if let Some(calibration) = contract.calibration.as_ref() {
         if context.calibration_abi != calibration.abi
             || context.calibration_fingerprint != calibration.fingerprint
@@ -1561,7 +1667,7 @@ pub fn standard_memory_strategy_safety_check(
     if !context.budget.fits(context.predicted_peak_bytes) {
         return MemorySafetyDecision::Reject {
             reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
+                "{}: incremental live demand {} exceeds effective budget {}",
                 contract.provider_id,
                 context.predicted_peak_bytes,
                 context.budget.effective_bytes()
@@ -1829,35 +1935,86 @@ pub struct MemoryGeometry {
     pub height: u32,
     pub batch: u32,
     pub frames: u32,
+    /// Number of reference images consumed by this provider forward pass. This is request
+    /// geometry, not overlay identity; zero means the request has no reference input.
+    pub reference_count: u32,
 }
 
 /// Canonical live-budget accounting owned by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryBudget {
+    /// The platform-enforced capacity available to this process or worker, in bytes. This and every
+    /// other budget field are one caller snapshot taken immediately before request admission.
     pub total_bytes: u64,
+    /// Bytes already charged against [`total_bytes`](Self::total_bytes) at that snapshot, including
+    /// unrelated live allocations and any request-owned resident assets loaded before admission.
+    /// A caller must not subtract these bytes again from `total_bytes` before constructing the
+    /// budget.
     pub committed_bytes: u64,
+    /// Memory a backend is holding but could return under pressure — chiefly an allocator's
+    /// freed-buffer reuse cache.
+    ///
+    /// **Creditable only if something will actually reclaim it before the platform's killer fires.**
+    /// [`effective_bytes`](Self::effective_bytes) adds this back into the budget, which assumes a
+    /// reclaimer exists. That assumption holds where the OS applies backpressure and fails where it
+    /// terminates the process instead.
+    ///
+    /// iOS is the failing case, measured: jetsam reads `phys_footprint` — which counts an allocator's
+    /// reuse cache in full — and does not ask anyone to release anything first. An MLX process there
+    /// sat at `active + cache` pinned to the per-process cap across an entire decode, with ~3.9 GB
+    /// cached and reclaimable, and was killed with 4 MiB of headroom. Every byte counted here was
+    /// genuinely reclaimable and none of it was reclaimed, because nothing asked.
+    ///
+    /// What makes it creditable is bounding the allocator's own cache limit so the *allocator*
+    /// reclaims continuously rather than waiting to be asked (`runtime_ios`'s
+    /// `bound_mlx_to_platform_limits`). A caller that cannot name such a mechanism should pass `0`
+    /// here rather than credit memory that will still be resident at the moment of the kill.
+    /// Reclaimable bytes are a subset of `committed_bytes`, never a separate pool: the shared safety
+    /// gate rejects `reclaimable_bytes > committed_bytes` rather than inventing capacity that was not
+    /// first charged to the snapshot.
     pub reclaimable_bytes: u64,
+    /// Capacity deliberately unavailable to the request, in the same process-residency currency as
+    /// `total_bytes` and `committed_bytes`.
     pub reserved_headroom_bytes: u64,
 }
 
 impl MemoryBudget {
     /// Effective request budget. Reserved headroom is removed from the currently free plus
     /// reclaimable memory, while the total-minus-headroom ceiling prevents reclaimable accounting
-    /// from exceeding physical capacity. All arithmetic is saturating.
+    /// from exceeding physical capacity. Signed intermediate arithmetic preserves an existing
+    /// overcommit deficit instead of saturating it away before reclamation is credited.
     pub fn effective_bytes(self) -> u64 {
         let ceiling = self
             .total_bytes
             .saturating_sub(self.reserved_headroom_bytes);
-        self.total_bytes
-            .saturating_sub(self.committed_bytes)
-            .saturating_add(self.reclaimable_bytes)
-            .saturating_sub(self.reserved_headroom_bytes)
-            .min(ceiling)
+        let available = i128::from(self.total_bytes) - i128::from(self.committed_bytes)
+            + i128::from(self.reclaimable_bytes)
+            - i128::from(self.reserved_headroom_bytes);
+        available.clamp(0, i128::from(ceiling)) as u64
     }
 
-    /// Exact-boundary fits are accepted.
-    pub fn fits(self, predicted_peak_bytes: u64) -> bool {
-        predicted_peak_bytes <= self.effective_bytes()
+    /// Whether the request's **incremental** live demand fits; exact boundaries are accepted.
+    ///
+    /// `incremental_live_demand_bytes` is the additional live allocation above this budget's
+    /// committed snapshot, not an absolute request high-water and not process footprint. Evidence
+    /// records an absolute request live peak; before calling `fits`, the caller subtracts only the
+    /// request-owned resident bytes already included in `committed_bytes`. Unrelated committed bytes
+    /// are already charged by [`effective_bytes`](Self::effective_bytes) and must not be subtracted
+    /// from the request peak.
+    pub fn fits(self, incremental_live_demand_bytes: u64) -> bool {
+        incremental_live_demand_bytes <= self.effective_bytes()
+    }
+
+    /// Total platform capacity required by this snapshot and an incremental request demand.
+    ///
+    /// This is the user-facing inverse of [`fits`](Self::fits): already committed bytes remain
+    /// charged, valid reclaim credit is removed, then reserved headroom and new live demand are
+    /// added. Saturation keeps an invalidly large input conservative.
+    pub fn required_total_bytes(self, incremental_live_demand_bytes: u64) -> u64 {
+        self.committed_bytes
+            .saturating_sub(self.reclaimable_bytes.min(self.committed_bytes))
+            .saturating_add(self.reserved_headroom_bytes)
+            .saturating_add(incremental_live_demand_bytes)
     }
 }
 
@@ -1869,12 +2026,24 @@ pub enum MemoryCacheState {
 }
 
 /// Advertised request surface. Optimized evidence never transfers between these modes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryMode {
     TextToImage,
     ImageToImage,
     Edit,
     Other(String),
+}
+
+impl MemoryMode {
+    /// Stable spelling at the persisted evidence/protocol boundary.
+    pub fn as_key(&self) -> &str {
+        match self {
+            Self::TextToImage => "text_to_image",
+            Self::ImageToImage => "image_to_image",
+            Self::Edit => "edit",
+            Self::Other(mode) => mode,
+        }
+    }
 }
 
 /// Context for provider safety and lifecycle hooks.
@@ -1888,30 +2057,43 @@ pub struct MemoryRunContext {
     /// Typed materialization shape covered by the calibration handshake.
     pub load_shape: LoadShape,
     pub mode: MemoryMode,
+    /// Compatibility summary for older callers. It must equal `geometry.reference_count > 0`;
+    /// provider safety rejects inconsistent contexts before any provider-owned route gate runs.
     pub has_reference: bool,
     pub use_pid: bool,
     pub has_phases: bool,
     pub geometry: MemoryGeometry,
+    /// Exact overlay identity used for evidence keying. Structured request data belongs in typed
+    /// context or geometry fields; key/value encodings such as `references=2` are rejected.
     pub overlay: Option<String>,
     pub budget: MemoryBudget,
+    /// Incremental live-allocation demand above `budget.committed_bytes`. The selected evidence owns
+    /// an absolute request peak; the caller removes exactly the request-resident portion already
+    /// present in the budget snapshot before building this context.
     pub predicted_peak_bytes: u64,
+    /// Caller-facing telemetry for cold/warm admission and cache-poisoning regression checks.
     pub cache_state: MemoryCacheState,
+    /// Caller-facing identity of the exact evidence record selected for this request.
     pub evidence_revision: String,
 }
 
 impl MemoryRunContext {
     pub fn predicted_peak_breakdown(
         &self,
-        contract: &MemoryProviderContract,
+        _contract: &MemoryProviderContract,
     ) -> MemoryPeakBreakdown {
-        contract.decompose_predicted_peak(self.predicted_peak_bytes)
+        // Context demand is incremental after the caller credits request-owned resident bytes.
+        // Provider formula components describe the evidence-owned absolute peak and cannot be
+        // subtracted from this scalar a second time.
+        MemoryPeakBreakdown::from_unattributed(self.predicted_peak_bytes)
     }
 }
 
 /// Build a deterministic, finite, weights-free context from provider-owned route facts.
 pub struct MemoryBehaviorRoute {
     pub mode: MemoryMode,
-    pub has_reference: bool,
+    /// Exact number of reference images in the provider-owned weights-free fixture.
+    pub reference_count: u32,
     pub use_pid: bool,
     pub has_phases: bool,
     pub overlay: Option<String>,
@@ -1935,7 +2117,7 @@ pub fn standard_memory_behavior_context(
         calibration_fingerprint: calibration.fingerprint.clone(),
         load_shape: calibration.load_shape,
         mode: route.mode,
-        has_reference: route.has_reference,
+        has_reference: route.reference_count > 0,
         use_pid: route.use_pid,
         has_phases: route.has_phases,
         geometry: MemoryGeometry {
@@ -1943,6 +2125,7 @@ pub fn standard_memory_behavior_context(
             height: 1024,
             batch: 1,
             frames: 1,
+            reference_count: route.reference_count,
         },
         overlay: route.overlay,
         budget: MemoryBudget {
@@ -2082,17 +2265,27 @@ impl MemoryEvidenceDimensions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryEvidenceKey {
     pub resolved_route: String,
-    pub backend: String,
+    pub backend: MemoryBackend,
     pub tier: MemoryNumericTier,
     /// Exact intra-phase materialization shape measured by this evidence cell.
     pub load_shape: LoadShape,
-    pub mode: String,
+    pub mode: MemoryMode,
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
     pub strategy: MemoryStrategy,
     /// Exact, canonically ordered strategy set active when this evidence was measured.
     pub engaged_composition: Vec<MemoryStrategy>,
     pub parameters: MemoryStrategyParameters,
+}
+
+impl MemoryEvidenceKey {
+    fn has_canonical_engaged_composition(&self) -> bool {
+        !self.engaged_composition.is_empty()
+            && self
+                .engaged_composition
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+    }
 }
 
 /// Numerical parity contract for an evidence record.
@@ -2118,7 +2311,7 @@ pub enum MemoryParityResult {
     NotRun,
 }
 
-/// Dynamic/static evidence handshake consumed by the shared selector.
+/// Dynamic/static evidence handshake populated and consumed by caller-side admission selectors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryEvidence {
     pub key: MemoryEvidenceKey,
@@ -2129,7 +2322,29 @@ pub struct MemoryEvidence {
     pub sceneworks_revision: String,
     pub inference_revision: String,
     pub harness_version: String,
+    /// Absolute request peak **live allocation** the formula predicts — bytes held by the request's
+    /// live tensors at the high-water mark, including request-resident assets but excluding any
+    /// allocator reuse cache. A caller converts this to `MemoryRunContext::predicted_peak_bytes` by
+    /// subtracting exactly the request-resident bytes already charged in its budget snapshot. See
+    /// [`observed_peak_bytes`](Self::observed_peak_bytes) for why the distinction is load-bearing
+    /// and not pedantic.
     pub predicted_peak_bytes: u64,
+    /// Absolute request peak **live allocation** measured by the calibration harness. `None` until
+    /// measured; it uses the same baseline as `predicted_peak_bytes` above.
+    ///
+    /// **Live allocation, not process footprint, and the two are not close.** An allocator's
+    /// freed-buffer reuse cache is excluded here and counted by the OS: a Z-Image 1024² render
+    /// measured 3102 MiB of live peak and 6488 MiB of `active + cache` on the same run. Comparing the
+    /// wrong one against a cap is not conservative in a predictable direction — of three
+    /// configurations measured together, the one with the **lowest** live peak had the **highest**
+    /// footprint and was the only one an iOS device refused. A ladder built on the wrong quantity can
+    /// rank a fatal configuration as the safest of its set.
+    ///
+    /// Live allocation is the right quantity *here* because it is the irreducible working set — the
+    /// part no tuning removes. The cache is modelled on the other side of the comparison, by
+    /// [`MemoryBudget::reclaimable_bytes`], whose docs carry the precondition that makes that
+    /// modelling valid. A calibration that records footprint in this field silently double-counts
+    /// the cache against a budget that already credits it.
     pub observed_peak_bytes: Option<u64>,
     pub parity: MemoryParityContract,
     pub parity_result: MemoryParityResult,
@@ -2145,13 +2360,7 @@ impl MemoryEvidence {
 
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        if self.key.engaged_composition.is_empty()
-            || !self
-                .key
-                .engaged_composition
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-        {
+        if !self.key.has_canonical_engaged_composition() {
             errors.push(
                 "evidence engaged composition must be a non-empty canonical strategy set"
                     .to_owned(),
@@ -2193,13 +2402,7 @@ impl MemoryEvidence {
         &self,
         contract: &MemoryProviderContract,
     ) -> std::result::Result<(), MemoryEvidenceVerdict> {
-        if self.key.engaged_composition.is_empty()
-            || !self
-                .key
-                .engaged_composition
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-        {
+        if !self.key.has_canonical_engaged_composition() {
             return Err(MemoryEvidenceVerdict::Invalid);
         }
         if self.key.engaged_composition != contract.engaged_composition(self.key.strategy) {
@@ -2248,8 +2451,9 @@ fn validate_parity_limit(metric: &str, maximum_error: f64, errors: &mut Vec<Stri
     }
 }
 
-/// Truthful pre-OOM rejection payload. The caller may populate a measured smaller geometry; it must
-/// not invent advice from unknown or unverified evidence.
+/// Truthful caller-facing pre-OOM rejection payload. The caller may populate a measured smaller
+/// geometry; it must not invent advice from unknown or unverified evidence. The contract defines
+/// this vocabulary even when an in-process provider does not construct it directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRejection {
     pub available_bytes: u64,
@@ -2384,6 +2588,7 @@ mod tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {
@@ -2396,6 +2601,38 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "test".to_owned(),
         }
+    }
+
+    #[test]
+    fn behavior_fixture_preserves_exact_reference_cardinality() {
+        let contract = adopted_contract();
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let context = standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::Resident,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Edit,
+                reference_count: 4,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("behavior context");
+        let fixture = crate::MemoryBehaviorFixture::new(context);
+        assert!(fixture.context.has_reference);
+        assert_eq!(fixture.context.geometry.reference_count, 4);
+        assert_eq!(fixture.request.conditioning.len(), 4);
+        assert!(fixture
+            .request
+            .conditioning
+            .iter()
+            .all(|conditioning| matches!(conditioning, crate::Conditioning::Reference { .. })));
     }
 
     #[test]
@@ -2487,6 +2724,20 @@ mod tests {
             MemorySafetyDecision::Reject { reason } if reason.contains("route refused")
         ));
 
+        let mut invalid_reclaim_credit = context.clone();
+        invalid_reclaim_credit.budget.committed_bytes = 10;
+        invalid_reclaim_credit.budget.reclaimable_bytes = 11;
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &invalid_reclaim_credit,
+                Some(loaded_tier),
+                None
+            ),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("reclaim credit must be a subset")
+        ));
+
         let mut over_budget = context;
         over_budget.predicted_peak_bytes = 1025;
         assert!(matches!(
@@ -2497,7 +2748,7 @@ mod tests {
                 None
             ),
             MemorySafetyDecision::Reject { reason }
-                if reason.contains("predicted peak 1025 exceeds effective budget 1024")
+                if reason.contains("incremental live demand 1025 exceeds effective budget 1024")
         ));
     }
 
@@ -2603,25 +2854,83 @@ mod tests {
     }
 
     #[test]
+    fn asset_facts_reject_overlay_contamination_and_ambiguous_overlay_formulas() {
+        let mut contract = adopted_contract();
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 40,
+            decoder_bytes: 10,
+            overlay_bytes: 7,
+        };
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+            resident_components: vec![MemoryResidentComponent {
+                id: "control".to_owned(),
+                kind: MemoryComponentKind::ControlBranch,
+                resident_bytes: 7,
+                bounded_by: None,
+            }],
+        };
+        assert!(contract.conformance_errors().is_empty());
+
+        let mut contaminated = contract.clone();
+        contaminated.asset_facts.base_bytes += contaminated.asset_facts.overlay_bytes;
+        assert!(contaminated
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("exclude overlay_bytes")));
+
+        let mut ambiguous = contract;
+        ambiguous.formula = MemoryFormulaKind::PhaseEnvelope {
+            phases: ambiguous.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        };
+        assert!(ambiguous
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("typed auxiliary resident components")));
+
+        let mut candle_krea_shape = adopted_contract();
+        candle_krea_shape.formula = MemoryFormulaKind::PhaseEnvelope {
+            phases: candle_krea_shape.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        };
+        assert!(candle_krea_shape.conformance_errors().is_empty());
+    }
+
+    #[test]
     fn optimized_evidence_requires_every_dimension_and_matching_fingerprint() {
         let contract = adopted_contract();
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
                 resolved_route: "test".to_owned(),
-                backend: "mlx".to_owned(),
+                backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
                     component_precision_floors: &[],
                 },
                 load_shape: contract.load_shape,
-                mode: "text_to_image".to_owned(),
+                mode: MemoryMode::TextToImage,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 1024,
                     height: 1024,
                     batch: 1,
                     frames: 1,
+                    reference_count: 0,
                 },
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
@@ -2644,6 +2953,18 @@ mod tests {
             parity_result: MemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
+
+        let canonical_composition = evidence.key.engaged_composition.clone();
+        evidence.key.engaged_composition = vec![MemoryStrategy::Resident, MemoryStrategy::Resident];
+        assert!(evidence
+            .validation_errors()
+            .iter()
+            .any(|error| error.contains("canonical strategy set")));
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(MemoryEvidenceVerdict::Invalid)
+        );
+        evidence.key.engaged_composition = canonical_composition;
 
         evidence.key.load_shape = LoadShape::EagerMaterialization;
         assert_eq!(
@@ -2741,6 +3062,26 @@ mod tests {
     }
 
     #[test]
+    fn fits_consumes_incremental_demand_not_the_absolute_request_peak() {
+        let budget = MemoryBudget {
+            total_bytes: 100,
+            committed_bytes: 40,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 10,
+        };
+        let absolute_request_peak = 80;
+        let request_resident_already_committed = 30;
+        let incremental_live_demand = absolute_request_peak - request_resident_already_committed;
+
+        assert_eq!(budget.effective_bytes(), 50);
+        assert!(budget.fits(incremental_live_demand));
+        assert_eq!(budget.required_total_bytes(incremental_live_demand), 100);
+        assert!(!budget.fits(absolute_request_peak));
+        assert_eq!(budget.required_total_bytes(absolute_request_peak), 130);
+        assert!(!budget.fits(incremental_live_demand + 1));
+    }
+
+    #[test]
     fn effective_budget_saturates_at_zero_and_total_minus_headroom() {
         assert_eq!(
             MemoryBudget {
@@ -2775,6 +3116,39 @@ mod tests {
     }
 
     #[test]
+    fn effective_budget_preserves_an_overcommit_deficit_before_reclamation() {
+        let budget = MemoryBudget {
+            total_bytes: 100,
+            committed_bytes: 110,
+            reclaimable_bytes: 50,
+            reserved_headroom_bytes: 10,
+        };
+        assert_eq!(budget.effective_bytes(), 30);
+        assert!(budget.fits(30));
+        assert!(!budget.fits(31));
+
+        assert_eq!(
+            MemoryBudget {
+                committed_bytes: 160,
+                ..budget
+            }
+            .effective_bytes(),
+            0,
+            "an overcommit larger than all reclaimable memory must leave no request budget"
+        );
+    }
+
+    #[test]
+    fn evidence_axes_have_stable_protocol_keys_without_stringly_runtime_identity() {
+        assert_eq!(MemoryBackend::Mlx.as_key(), "mlx");
+        assert_eq!(MemoryBackend::Candle.as_key(), "candle");
+        assert_eq!(MemoryMode::TextToImage.as_key(), "text_to_image");
+        assert_eq!(MemoryMode::ImageToImage.as_key(), "image_to_image");
+        assert_eq!(MemoryMode::Edit.as_key(), "edit");
+        assert_eq!(MemoryMode::Other("custom".to_owned()).as_key(), "custom");
+    }
+
+    #[test]
     fn provider_contract_requires_hooks_for_implemented_rungs() {
         let mut contract = adopted_contract();
         contract.lifecycle.attention_chunking = false;
@@ -2782,6 +3156,23 @@ mod tests {
             .conformance_errors()
             .iter()
             .any(|error| error.contains("attention_chunking")));
+    }
+
+    #[test]
+    fn provider_contract_rejects_structural_absence_when_an_implementation_hook_exists() {
+        let mut contract = adopted_contract();
+        contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::BoundedAttention)
+            .expect("bounded attention capability")
+            .support = MemoryStrategySupport::StructurallyNotApplicable {
+            reason: "mutated contradiction".to_owned(),
+        };
+        assert!(contract.conformance_errors().iter().any(|error| {
+            error.contains("BoundedAttention cannot be StructurallyNotApplicable")
+                && error.contains("implementation hook")
+        }));
     }
 
     /// **SC-16090.** A rung-4 realization that converts formats per window may ship, but not silently:
@@ -2994,20 +3385,21 @@ mod tests {
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
                 resolved_route: "test".to_owned(),
-                backend: "mlx".to_owned(),
+                backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: None,
                     component_precision_floors: &[],
                 },
                 load_shape: contract.load_shape,
-                mode: "text_to_image".to_owned(),
+                mode: MemoryMode::TextToImage,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 512,
                     height: 512,
                     batch: 1,
                     frames: 1,
+                    reference_count: 0,
                 },
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
