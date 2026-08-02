@@ -83,6 +83,14 @@ buried in the family rows.
 the four URLs was found and the other three are now positively established as having no address. A
 new item **U10** was opened by the authenticated read.
 
+**Update 2026-08-02 (review pass, sc-16662).** Three review findings closed against this note and
+`families.rs`, none of them changing a term list: LTX-2's `DeployerObligation` string now carries the
+source's own "…" instead of joining across it (family 8); `cc-by-nc-4-0`'s `NonCommercialWeights` is
+now supported by §2(a)(1), the operative grant, rather than §1(i), which is only the definition of
+the word (family 3); and **U11 is widened** from a Gemma-only question to the three-row decision it
+actually is — Gemma, `nvidia-open-model` and Krea — with the candidate distinguisher written down.
+The landed values stay **PROVISIONAL**.
+
 **Update 2026-08-02 (transcription pass, sc-16662).** The consts landed. Every open item and the
 disposition taken for it:
 
@@ -98,7 +106,7 @@ disposition taken for it:
 | U8 | Llama's 700M-MAU threshold has no variant | **Landed as `DeployerObligation`**, quoted verbatim, per the contract's own guidance. It is emphatically *not* laundered into a `RevenueCeiling` | **confirm** |
 | U9 | Apache-2.0 §4(a) as flow-down | **Landed as `DownstreamLicenseCopy`.** The sc-16898 split answers the question the item posed: §4(a) is a copy-of-licence duty and Apache states no use restrictions to flow down, so the lighter variant fits exactly and the heavier one does not | **confirm** |
 | U10 | LTX-2 ships two different texts | **Defaulted to the copy shipped beside the weights** (`Lightricks/LTX-2.3` `LICENSE`). Consequence: `RegistrationRequired{contact: None}` — the shipped text names no address. The GitHub copy's `https://ltx.io/model/licensing` is **not** transcribed. A test pins the choice | **DECIDE which text governs** |
-| U11 | Gemma: is the §3.1 Notice string *also* `AttributionRequired`? | **NOT landed.** `gemma-terms` carries `NoticeFileRequired` only. Calling one obligation two terms is a modelling choice, not a transcription | **decide** |
+| U11 | Is a notice clause *also* `AttributionRequired`? — Gemma **and** NVIDIA, plus Krea's naming duty | **Answered opposite ways by transcription order, which is the defect.** `gemma-terms` carries `NoticeFileRequired` only; `nvidia-open-model` derives **both** terms from its one §3 clause; `krea-2-community` carries `AttributionRequired` on a model-name-prefix duty. The candidate distinguisher is textual — NVIDIA says "attribution notice", Gemma says only "notice" — and it is stated in U11 rather than assumed | **DECIDE all three together** |
 | Q2 | do the flow-downs differ? | **CLOSED by sc-16898** — two variants, each carrying its family. Four families state the heavier "restrictions as enforceable provisions" shape and eleven state the lighter "copy of the licence" shape; three state both | no |
 
 ## U1. SD3.5's own `LICENSE.md` — **RESOLVED. Read under authentication; cosmetic differences only.**
@@ -435,6 +443,65 @@ different `LICENSE` beside the weights. **AMBIGUOUS** — Michael must decide wh
 transcribed from, and the answer determines whether `RegistrationRequired` has a URL at all. This is
 the same defect class as U1, caught the same way; it is recorded rather than resolved.
 
+## U11. Is a notice clause *also* `AttributionRequired`? — `gemma-terms`, `nvidia-open-model` and Krea's naming duty (AMBIGUOUS ×3)
+
+**Widened by the sc-16662 review pass; decide all three rows here, in one read.**
+
+The item was first opened as a Gemma-only question. It is not one. `nvidia-open-model` makes the
+*same* modelling move in the *opposite* direction, from a clause of the same shape, and neither the
+consts nor this note argued why. So U11 is currently answered one way for NVIDIA and deferred for
+Gemma — by transcription order, not by a reading anyone took. A third row, Krea's, rests on a
+different clause but the same class of judgement. **One decision settles three rows.**
+
+Nothing here gates anything: `AttributionRequired` is a disclosure that the licence names an
+attribution duty. The question is only whether the table says that about these texts.
+
+### The two notice clauses, side by side
+
+| | `nvidia-open-model` §3 | `gemma-terms` §3.1 |
+| --- | --- | --- |
+| **the clause, verbatim** | "include the following **attribution notice** within a \"Notice\" text file with such copies: \"Licensed by NVIDIA Corporation under the NVIDIA Open Model License\"" | "All Distributions (other than through a Hosted Service) must be accompanied by a \"Notice\" text file that contains the following **notice**: \"Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms\"." |
+| **what landed** | `NoticeFileRequired` **and** `AttributionRequired` — two terms from the one clause | `NoticeFileRequired` **only** — the second term withheld |
+| **the string the clause names** | "Licensed by NVIDIA Corporation under the NVIDIA Open Model License" — names the licensor | "Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms" — names the terms, not a party |
+| **carve-out** | none | Hosted Service distributions are excluded |
+
+**The candidate distinguisher — stated so it can be accepted or rejected, not asserted.** NVIDIA's
+clause calls the thing an *"attribution notice"*; Gemma's calls it a *"notice"* and never uses the
+word attribution. On that hook the two treatments are defensible exactly as landed: the table would
+be reporting each text's own vocabulary. The two supporting facts above point the same way — NVIDIA's
+string names a party (the shape of attribution) while Gemma's names a document. **This argument is
+made nowhere in the code and was made nowhere in this note before the review pass; it is offered
+here as the leading candidate, not as a finding.** Both family consts now carry a doc comment
+pointing at this item, so a reader of either lands on the open decision instead of on a silent
+inconsistency.
+
+The competing reading, equally available: "attribution notice" and "notice" are the same duty in
+different words, one clause is one obligation, and the table should either derive both terms from
+both clauses or from neither.
+
+### The third row: Krea §3.1(b)
+
+`krea-2-community` carries `AttributionRequired` on §3.1(b) — "include \"Krea\" at the beginning of
+any such AI model name" — a **model-naming** duty, not a notice string. It is quoted, and
+`AttributionRequired` is the closest variant the vocabulary carries, but "prefix the model name" is
+not obviously the same disclosure as "reproduce this attribution string". (Krea's `NoticeFileRequired`
+is a *separate* clause, §3.1(c), so this is not the one-clause-two-terms question — it is the
+adjacent one: how far the variant stretches.) Same class of judgement, so it is decided here rather
+than separately.
+
+### The four ways this can be settled
+
+| option | effect on the consts |
+| --- | --- |
+| **A — accept as landed** (the "attribution notice" hook governs) | no code change; U11 closes with the textual argument above recorded as the reason |
+| **B — add `AttributionRequired` to `gemma-terms`** | one term added; the §3.1 Notice string is then read as attribution too |
+| **C — drop `AttributionRequired` from `nvidia-open-model`** | one term removed; a notice clause yields only `NoticeFileRequired`, uniformly |
+| **D — narrow Krea** | `AttributionRequired` comes off `krea-2-community`, leaving §3.1(c)'s `NoticeFileRequired`; or the variant's doc widens to say a naming duty counts |
+
+Options B, C and D each change a term list, so each fails the **term census** in
+`families.rs` by design and lands as a deliberate, reviewable edit. Option A costs nothing but a
+tick.
+
 ---
 
 # What landed in code — the 16 families at a glance
@@ -468,7 +535,7 @@ the same defect class as U1, caught the same way; it is recorded rather than res
 | --- | --- | --- |
 | `NonCommercialOutputs` | `insightface-research-only`, `cc-by-nc-4-0` (story draft); `nvidia-nsclv1`, `apple-mlr` (first pass, flagged) | **No quote, anywhere.** All four restrict *use of the weights* and are silent on outputs. Inferring a restriction from silence is a legal reading, not a transcription — **U3** |
 | `GatedAccess` | FLUX, Krea, SD3.5, Gemma (story draft) | Not a licence-text fact. sc-16898 moved it to `ComponentLicense::gated`; conformance now rejects it on a family — **U7** |
-| `AttributionRequired` on `gemma-terms` | first pass, flagged `(?)` | The §3.1 Notice string is the only attribution-shaped obligation; naming it twice is a modelling choice — **U11** |
+| `AttributionRequired` on `gemma-terms` | first pass, flagged `(?)` | The §3.1 Notice string is the only attribution-shaped obligation; naming it twice is a modelling choice — **U11**. Note the mirror: `nvidia-open-model` **did** land both terms from its one §3 clause, and `krea-2-community` landed the term on a model-naming duty. U11 decides all three |
 | `RegistrationRequired{Some("https://ltx.io/model/licensing")}` | first pass, from the GitHub copy | Not in the text shipped with the weights — **U10** |
 | any `AcceptableUsePolicy` URL for OpenRAIL++, FLUX, LTX-2 | the sc-16661 fixture guessed `https://blackforestlabs.ai/aup` | That URL 404s and appears in no licence text. Landed as `url: None` — **U2** |
 
@@ -709,7 +776,7 @@ Matches draft.
 | ✔ | term | verbatim support |
 | --- | --- | --- |
 | [ ] | `AttributionRequired` | §3(a)(1) "If You Share the Licensed Material (including in modified form), You must: … retain … identification of the creator(s) of the Licensed Material …; a copyright notice; a notice that refers to this Public License" |
-| [ ] | `NonCommercialWeights` | §1(i) "NonCommercial means not primarily intended for or directed towards commercial advantage or monetary compensation." |
+| [ ] | `NonCommercialWeights` | §2(a)(1) — **the operative grant, bounded on its face**: "the Licensor hereby grants You a worldwide, royalty-free, non-sublicensable, non-exclusive, irrevocable license to exercise the Licensed Rights in the Licensed Material to: a. reproduce and Share the Licensed Material, in whole or in part, **for NonCommercial purposes only**; and b. produce, reproduce, and Share Adapted Material **for NonCommercial purposes only**." Supporting definition, §1(i): "NonCommercial means not primarily intended for or directed towards commercial advantage or monetary compensation." **§1(i) alone was the first pass's only support and is not a restriction** — it defines a word; §2(a)(1) is the clause that bounds the grant, so it is what `families.rs` now quotes beside the term. Every other `NonCommercialWeights` row in this document quotes an operative restriction (FLUX §2(b), CircleStone §2(b), NSCLv1 §3.3, Apple MLR §1, InsightFace README), and this row now does too |
 | — | ⚠ `NonCommercialOutputs` | **NOT LANDED** — **no supporting quote found, see U3.** The licence governs Sharing and use of the Licensed Material; it says nothing about material generated by running a model |
 
 Draft asserts both NC terms; only `NonCommercialWeights` is quotable, and only it is landed.
@@ -822,7 +889,7 @@ content filtering only to Krea. The draft's note that outputs are commercial-OK 
 | [ ] | `RevenueCeiling{1_000_000, Inclusive}` | §2.3 "Commercial Use under this Agreement of the Krea Model, Derivatives, or Outputs is permitted only if you … have total company-wide annual revenue of **less than** one million United States dollars ($1,000,000 USD), calculated on a trailing twelve-month basis", and from the other side: "If you **meet or exceed** this threshold, you must obtain a separate enterprise license". "meet or exceed" puts $1,000,000 exactly **at** the threshold, so the boundary is **INCLUSIVE** — the same amount as Stability with the opposite reading. **This boundary determination is new in the transcription pass; check it first.** |
 | [ ] | `RegistrationRequired{Some("opensource@krea.ai")}` | §2.3 "If you meet or exceed this threshold, you must obtain a separate enterprise license from Krea prior to any Commercial Use. … Enterprise license inquiries may be directed to opensource@krea.ai." |
 | [ ] | `DownstreamLicenseCopy{"krea-2-community"}` | §3.1 "you shall (a) provide a copy of this Agreement and require each recipient to be bound by the Terms of this Agreement" |
-| [ ] | `AttributionRequired` | §3.1(b) "include \"Krea\" at the beginning of any such AI model name" |
+| [ ] | ⚠ `AttributionRequired` | §3.1(b) "include \"Krea\" at the beginning of any such AI model name" — a **model-naming** duty, not a notice string, recorded as the closest variant the vocabulary carries. Whether the variant stretches that far is the same class of judgement as the NVIDIA/Gemma notice clauses — **decided with them in U11** |
 | [ ] | `NoticeFileRequired` | §3.1(c) "retain the following attribution notice within a \"Notice\" text file distributed as part of such copies: \"Krea 2 is licensed under the Krea 2 Community License Agreement.\"" |
 | [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §4.2 "You must implement reasonable and appropriate Content Filter measures to detect, prevent, and mitigate the generation or distribution of prohibited, harmful, or unlawful content through your deployment of the Krea Model or any Derivative." |
 | [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §4.3 "Where required by applicable law, regulation, or platform policy, you must clearly disclose that Outputs were generated using artificial intelligence." |
@@ -869,7 +936,7 @@ and a second `DeployerObligation`.
 | [ ] | ⚠ `RegistrationRequired{contact: None}` | **LANDED.** The shipped `LTX-2.3` copy reads §2 "Commercial Entities interested in such a commercial license are required to contact Licensor." — **no URL**. The GitHub copy reads "…required to [contact Licensor](https://ltx.io/model/licensing)" and that URL resolves (HTTP 200), but it is **not in the text shipped with the weights**, so it is not transcribed. **See U10 — this is the term the text choice decides.** |
 | [ ] | `DownstreamRestrictions{"ltx-2-community"}` | §3(a) "Use-based restrictions as referenced in paragraph 4 and all provisions of Attachment A MUST be included as an enforceable provision by you in any type of legal agreement … governing the use and/or distribution of LTX-2" |
 | [ ] | `DownstreamLicenseCopy{"ltx-2-community"}` | §3(b) "You must provide any third party recipients of LTX-2 or Derivatives of LTX-2 a copy of this Agreement, including all attachments and use policies." — LTX-2 imposes **both** flow-down shapes, which stay two elements of a union |
-| [ ] | `DeployerObligation{"Any Derivative of LTX-2 must be distributed exclusively under the terms of this Agreement with a complete copy of this license included"}` | §3(b), **closely paraphrased** — the source quote elides the subject clause: "(b) … Any Derivative of LTX-2 … must be distributed exclusively under the terms of this Agreement with a complete copy of this license included". A copyleft-shaped constraint neither OpenRAIL++ nor Gemma states, so it is carried separately rather than folded into the flow-down |
+| [ ] | `DeployerObligation{"Any Derivative of LTX-2 … must be distributed exclusively under the terms of this Agreement with a complete copy of this license included"}` | §3(b), **quoted with the source's own elision preserved**: "(b) … Any Derivative of LTX-2 … must be distributed exclusively under the terms of this Agreement with a complete copy of this license included". The landed string is that fragment from "Any" onward, character for character, "…" included — so note and const now read identically. **It first landed without the "…"**, which silently joined across the elided subject clause and presented two fragments as one continuous sentence; since a consumer eventually shows this string to a user, the join misrepresented the source, and the ellipsis is restored. (Cf. `nvidia-open-model` §2 and `llama-3-1-community` §2, whose landed strings already carried theirs.) A copyleft-shaped constraint neither OpenRAIL++ nor Gemma states, so it is carried separately rather than folded into the flow-down |
 | [ ] | `AttributionRequired` | §3(d) "You must retain all copyright, patent, trademark, and attribution notices excluding those notices that do not pertain to any part of LTX-2" |
 | [ ] | `NoticeFileRequired` | §3(c) "You must cause any modified files to carry prominent notices stating that you changed the files" |
 | [ ] | `AcceptableUsePolicy{url: None}` | **LANDED.** **Referenced, never defined, no address anywhere.** Attachment A "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use Policy. **In addition**, you agree not to use the Outputs…" — the "In addition" implies the AUP is a *separate* document from the enumerated list, yet the term is never defined, the licence's only URL is the GitHub repo, and that repo root holds no policy file — **see U2** |
@@ -922,7 +989,7 @@ close relative of FLUX.1 [dev]'s).
 | [ ] | `DownstreamLicenseCopy{"gemma-terms"}` | §3.1 "You must provide all third party recipients of Gemma or Model Derivatives a copy of this Agreement." — the same section imposes **both** shapes |
 | [ ] | `NoticeFileRequired` | §3.1 "All Distributions (other than through a Hosted Service) must be accompanied by a \"Notice\" text file that contains the following notice: \"Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms\"." |
 | [ ] | `AcceptableUsePolicy{Some("https://ai.google.dev/gemma/prohibited_use_policy")}` | §3.2 "You must not use any of the Gemma Services: for the restricted uses set forth in the Gemma Prohibited Use Policy at ai.google.dev/gemma/prohibited_use_policy (\"Prohibited Use Policy\"), which is hereby incorporated by reference into this Agreement" |
-| — | *(?)* `AttributionRequired` | **NOT LANDED** — **new item U11.** The §3.1 Notice string is the only attribution-shaped obligation; calling one obligation two terms is a modelling choice, not a transcription, so `gemma-terms` carries `NoticeFileRequired` only. **Decide.** |
+| — | *(?)* `AttributionRequired` | **NOT LANDED** — **U11.** The §3.1 Notice string is the only attribution-shaped obligation; calling one obligation two terms is a modelling choice, not a transcription, so `gemma-terms` carries `NoticeFileRequired` only. **`nvidia-open-model` §3 makes the opposite call from a clause of the same shape** (family 11 below) — the two are decided together in U11, where the "attribution notice" vs "notice" hook is set out. **Decide.** |
 | — | ⚠ `GatedAccess` | **NOT LANDED** **on the family** — `gemma-2-2b-it` is `gated: manual`; moved to `ComponentLicense::gated`, U7 closed |
 | | *(no `NonCommercial*`)* | §3.3 "Google claims no rights in Outputs you generate using Gemma." |
 
@@ -947,7 +1014,7 @@ difference discussed in Q2.
 | [ ] | `DeployerObligation{...}` *(landed text = the quote at right, verbatim)* | §2 "If You bypass, disable, reduce the efficacy of, or circumvent any technical limitation, safety guardrail or associated safety guardrail hyperparameter, encryption, security, digital rights management, or authentication mechanism … contained in the Model without a substantially similar Guardrail appropriate for your use case, your rights under this Agreement will automatically terminate." |
 | [ ] | `DownstreamLicenseCopy{"nvidia-open-model"}` | §3 "If you distribute the Model, You must give any other recipients of the Model a copy of this Agreement" |
 | [ ] | `NoticeFileRequired` | §3 "include the following attribution notice within a \"Notice\" text file with such copies: \"Licensed by NVIDIA Corporation under the NVIDIA Open Model License\"" |
-| [ ] | `AttributionRequired` | same clause as above |
+| [ ] | ⚠ `AttributionRequired` | **Same §3 clause as the row above** — the text calls it "the following **attribution** notice", so one clause yields two terms here. **That is the move withheld from `gemma-terms` §3.1, whose clause says only "notice" — see U11, which now decides both.** |
 | [ ] | `AcceptableUsePolicy{Some("https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/")}` | §3 "AI Ethics. Use of the Models under the Agreement must be consistent with NVIDIA's Trustworthy AI terms found at https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/." |
 | | *(commercially usable)* | §1 "Models are commercially usable." — a fact, no term |
 
@@ -1211,11 +1278,11 @@ For each family: read the quote in its section above, decide whether it supports
 | 4 `creativeml-openrail-pp-m` | [ ] | AUP has no address — U2 |
 | 5 `stability-ai-community` | [ ] | merged #5/#6; ceiling **Exclusive** |
 | 6 `flux-1-dev-non-commercial` | [ ] | AUP has no address — U2 |
-| 7 `krea-2-community` | [ ] | **ceiling boundary Inclusive is a new determination** |
-| 8 `ltx-2-community` | [ ] | **two upstream texts — U10 is the decision** |
+| 7 `krea-2-community` | [ ] | **ceiling boundary Inclusive is a new determination**; `AttributionRequired` rests on a model-naming duty — U11 |
+| 8 `ltx-2-community` | [ ] | **two upstream texts — U10 is the decision**; the `DeployerObligation` string carries the source's "…" |
 | 9 `circlestone-labs-non-commercial` | [ ] | |
-| 10 `gemma-terms` | [ ] | `AttributionRequired` withheld — U11 |
-| 11 `nvidia-open-model` | [ ] | may have no checkpoint — U4 |
+| 10 `gemma-terms` | [ ] | `AttributionRequired` withheld — U11 (decided with #11 and #7) |
+| 11 `nvidia-open-model` | [ ] | may have no checkpoint — U4; **two terms from one §3 clause — U11 (decided with #10 and #7)** |
 | 12 `nvidia-nsclv1` | [ ] | `NonCommercialOutputs` dropped — U3 |
 | 13 `insightface-research-only` | [ ] | README prose is the whole evidence; `NonCommercialOutputs` dropped — U3 |
 | 14 `chatglm3-model-license` | [ ] | |
@@ -1239,7 +1306,7 @@ marked **confirm** are readings the evidence supports but a human has not endors
 | U8 Llama 700M MAU has no variant | **confirm.** Landed as a verbatim `DeployerObligation`, per the contract's own guidance. Not laundered into a `RevenueCeiling`, and a contract test asserts that |
 | U9 Apache-2.0 §4(a) as flow-down | **confirm.** Landed as `DownstreamLicenseCopy{"apache-2-0"}`. The sc-16898 split makes the answer mechanical: §4(a) is a copy duty and Apache states no restrictions to flow down |
 | U10 which of LTX-2's two texts governs | **DECIDE — the most consequential open item.** Landed from the copy **shipped beside the weights** (`Lightricks/LTX-2.3` `LICENSE`), so `RegistrationRequired{contact: None}`. Choosing the GitHub copy instead adds `https://ltx.io/model/licensing` and flips `"Control"` from "50% or more" to "more than 50%" |
-| U11 Gemma `AttributionRequired` (new) | **DECIDE.** Not landed; `gemma-terms` carries `NoticeFileRequired` only |
+| U11 notice clause → `AttributionRequired`? Gemma, NVIDIA and Krea (widened by the review pass) | **DECIDE — one decision, three rows.** `gemma-terms` carries `NoticeFileRequired` only; `nvidia-open-model` derives **both** it and `AttributionRequired` from a single §3 clause; `krea-2-community` carries `AttributionRequired` on §3.1(b)'s model-name-prefix duty. The divergence is currently an artefact of transcription order, not a reading. Candidate distinguisher, stated in U11 and asserted nowhere in the code: NVIDIA's clause says "attribution notice", Gemma's says only "notice". Options A–D are tabulated in U11; three of the four change a term list and so trip the term census by design |
 | Krea ceiling boundary (new) | **confirm.** §2.3's "meet or exceed" reads **Inclusive** — the same $1,000,000 as Stability with the opposite boundary. This determination was made in the transcription pass, not the evidence pass |
 | Q1 SVD-XT revenue ceiling | ✅ **ANSWERED** — yes, $1,000,000, same text as SD3.5 |
 | Q2 do the flow-downs differ? | ✅ **ANSWERED and shipped** — materially different; two variants, each carrying its family |
