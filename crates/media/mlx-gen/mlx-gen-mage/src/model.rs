@@ -1304,6 +1304,7 @@ mod tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {
@@ -1418,6 +1419,7 @@ mod tests {
             height: 768,
             batch: 3,
             frames: 1,
+            reference_count: 0,
         };
         let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         let context = MemoryRunContext {

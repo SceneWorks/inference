@@ -380,7 +380,7 @@ pub(crate) fn registered_valid_fixture(
     };
     let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
         mode: mode.clone(),
-        has_reference,
+        reference_count: u32::from(has_reference),
         use_pid,
         has_phases: false,
         overlay: None,

@@ -119,10 +119,11 @@ use crate::{
 /// provider changes tensor layout, quantization floors, execution structure, or another detail that
 /// invalidates its measurements.
 ///
-/// ABI 2 adds the typed load-shape axis to calibration identities, run contexts, and evidence keys.
-/// ABI-1 records are intentionally stale because eager and deferred measurements are not
-/// interchangeable.
-pub const MEMORY_CALIBRATION_ABI: u32 = 2;
+/// ABI 2 added the typed load-shape axis to calibration identities, run contexts, and evidence
+/// keys. ABI 3 adds the typed reference-count geometry axis. Earlier records are intentionally
+/// stale because reference-sensitive request peaks cannot be keyed by a boolean or an overlay
+/// identity string.
+pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1320,6 +1321,24 @@ impl MemoryProviderContract {
                         capability.strategy
                     ));
                 }
+                let has_implementation_hook = match capability.strategy {
+                    MemoryStrategy::Resident => false,
+                    MemoryStrategy::StagedResidency => {
+                        !self.lifecycle.phases.is_empty()
+                            || self.lifecycle.synchronized_phase_release
+                    }
+                    MemoryStrategy::BoundedDecode => self.lifecycle.decode_tiling,
+                    MemoryStrategy::BoundedAttention => self.lifecycle.attention_chunking,
+                    MemoryStrategy::BoundedTransformerResidency => {
+                        self.lifecycle.transformer_window_materialization
+                    }
+                };
+                if has_implementation_hook {
+                    errors.push(format!(
+                        "{:?} cannot be StructurallyNotApplicable while its implementation hook is declared",
+                        capability.strategy
+                    ));
+                }
             }
             validate_ranges(capability, &mut errors);
             validate_owned_parameter_domain(capability, &mut errors);
@@ -1590,6 +1609,22 @@ pub fn standard_memory_strategy_safety_check(
     route_gate: Option<&dyn Fn() -> Result<()>>,
 ) -> MemorySafetyDecision {
     let reject = |reason| MemorySafetyDecision::Reject { reason };
+    if context.has_reference != (context.geometry.reference_count > 0) {
+        return reject(format!(
+            "{}: has_reference={} is inconsistent with reference_count={}",
+            contract.provider_id, context.has_reference, context.geometry.reference_count
+        ));
+    }
+    if context
+        .overlay
+        .as_deref()
+        .is_some_and(|overlay| overlay.contains('='))
+    {
+        return reject(format!(
+            "{}: overlay is an identity axis and must not encode structured key/value data",
+            contract.provider_id
+        ));
+    }
     if let Some(calibration) = contract.calibration.as_ref() {
         if context.calibration_abi != calibration.abi
             || context.calibration_fingerprint != calibration.fingerprint
@@ -1893,6 +1928,9 @@ pub struct MemoryGeometry {
     pub height: u32,
     pub batch: u32,
     pub frames: u32,
+    /// Number of reference images consumed by this provider forward pass. This is request
+    /// geometry, not overlay identity; zero means the request has no reference input.
+    pub reference_count: u32,
 }
 
 /// Canonical live-budget accounting owned by the caller.
@@ -1964,12 +2002,14 @@ pub struct MemoryRunContext {
     /// Typed materialization shape covered by the calibration handshake.
     pub load_shape: LoadShape,
     pub mode: MemoryMode,
-    /// Provider safety input. Reference-sensitive routes use this to reject a context that does not
-    /// describe the request they are about to execute.
+    /// Compatibility summary for older callers. It must equal `geometry.reference_count > 0`;
+    /// provider safety rejects inconsistent contexts before any provider-owned route gate runs.
     pub has_reference: bool,
     pub use_pid: bool,
     pub has_phases: bool,
     pub geometry: MemoryGeometry,
+    /// Exact overlay identity used for evidence keying. Structured request data belongs in typed
+    /// context or geometry fields; key/value encodings such as `references=2` are rejected.
     pub overlay: Option<String>,
     pub budget: MemoryBudget,
     pub predicted_peak_bytes: u64,
@@ -1991,7 +2031,8 @@ impl MemoryRunContext {
 /// Build a deterministic, finite, weights-free context from provider-owned route facts.
 pub struct MemoryBehaviorRoute {
     pub mode: MemoryMode,
-    pub has_reference: bool,
+    /// Exact number of reference images in the provider-owned weights-free fixture.
+    pub reference_count: u32,
     pub use_pid: bool,
     pub has_phases: bool,
     pub overlay: Option<String>,
@@ -2015,7 +2056,7 @@ pub fn standard_memory_behavior_context(
         calibration_fingerprint: calibration.fingerprint.clone(),
         load_shape: calibration.load_shape,
         mode: route.mode,
-        has_reference: route.has_reference,
+        has_reference: route.reference_count > 0,
         use_pid: route.use_pid,
         has_phases: route.has_phases,
         geometry: MemoryGeometry {
@@ -2023,6 +2064,7 @@ pub fn standard_memory_behavior_context(
             height: 1024,
             batch: 1,
             frames: 1,
+            reference_count: route.reference_count,
         },
         overlay: route.overlay,
         budget: MemoryBudget {
@@ -2463,6 +2505,7 @@ mod tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {
@@ -2475,6 +2518,38 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "test".to_owned(),
         }
+    }
+
+    #[test]
+    fn behavior_fixture_preserves_exact_reference_cardinality() {
+        let contract = adopted_contract();
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let context = standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::Resident,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Edit,
+                reference_count: 4,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("behavior context");
+        let fixture = crate::MemoryBehaviorFixture::new(context);
+        assert!(fixture.context.has_reference);
+        assert_eq!(fixture.context.geometry.reference_count, 4);
+        assert_eq!(fixture.request.conditioning.len(), 4);
+        assert!(fixture
+            .request
+            .conditioning
+            .iter()
+            .all(|conditioning| matches!(conditioning, crate::Conditioning::Reference { .. })));
     }
 
     #[test]
@@ -2758,6 +2833,7 @@ mod tests {
                     height: 1024,
                     batch: 1,
                     frames: 1,
+                    reference_count: 0,
                 },
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
@@ -2963,6 +3039,23 @@ mod tests {
             .conformance_errors()
             .iter()
             .any(|error| error.contains("attention_chunking")));
+    }
+
+    #[test]
+    fn provider_contract_rejects_structural_absence_when_an_implementation_hook_exists() {
+        let mut contract = adopted_contract();
+        contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::BoundedAttention)
+            .expect("bounded attention capability")
+            .support = MemoryStrategySupport::StructurallyNotApplicable {
+            reason: "mutated contradiction".to_owned(),
+        };
+        assert!(contract.conformance_errors().iter().any(|error| {
+            error.contains("BoundedAttention cannot be StructurallyNotApplicable")
+                && error.contains("implementation hook")
+        }));
     }
 
     /// **SC-16090.** A rung-4 realization that converts formats per window may ship, but not silently:
@@ -3189,6 +3282,7 @@ mod tests {
                     height: 512,
                     batch: 1,
                     frames: 1,
+                    reference_count: 0,
                 },
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),

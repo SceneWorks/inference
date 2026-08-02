@@ -173,7 +173,7 @@ impl MemoryBehaviorFixture {
             use_pid: context.use_pid,
             ..Default::default()
         };
-        if context.has_reference {
+        for _ in 0..context.geometry.reference_count {
             request.conditioning.push(crate::Conditioning::Reference {
                 image: crate::Image {
                     width: 1,
