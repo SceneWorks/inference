@@ -139,6 +139,7 @@ pub fn descriptor() -> ModelDescriptor {
             // wired-memory pressure) through denoise + decode. Advertised so the worker's fit-gate can
             // tell "bounds footprint here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -757,6 +758,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1705,6 +1707,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

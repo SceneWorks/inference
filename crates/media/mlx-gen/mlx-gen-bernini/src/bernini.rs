@@ -559,6 +559,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Resident-warm mode to toggle. The one thing NOT split is the two experts, which the
             // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

@@ -818,6 +818,7 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

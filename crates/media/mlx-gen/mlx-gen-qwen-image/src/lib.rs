@@ -94,14 +94,27 @@ mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
-        let explicit: Vec<String> = registry
+        let descriptors: Vec<_> = registry
             .generators()
-            .map(|registration| (registration.descriptor)().id.to_string())
+            .map(|registration| (registration.descriptor)())
             .collect();
+        let explicit: Vec<_> = descriptors.iter().map(|descriptor| descriptor.id).collect();
 
         assert_eq!(
             explicit,
             ["qwen_image", "qwen_image_control", "qwen_image_edit"]
+        );
+        let preview_support: std::collections::BTreeMap<_, _> = descriptors
+            .iter()
+            .map(|descriptor| (descriptor.id, descriptor.capabilities.supports_preview))
+            .collect();
+        assert_eq!(
+            preview_support,
+            std::collections::BTreeMap::from([
+                ("qwen_image", true),
+                ("qwen_image_control", false),
+                ("qwen_image_edit", true),
+            ])
         );
     }
 

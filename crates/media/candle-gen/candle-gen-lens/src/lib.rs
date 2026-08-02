@@ -1325,6 +1325,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

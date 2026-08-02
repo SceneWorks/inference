@@ -105,6 +105,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
             // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

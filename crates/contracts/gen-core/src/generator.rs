@@ -445,8 +445,10 @@ pub struct GenerationRequest {
     ///
     /// A request **field** (the [`CancelFlag`] pattern), deliberately not a [`Progress`] variant:
     /// `Progress` stays `Copy` and no exhaustive match downstream changes. Support is per-engine
-    /// and opt-in — an engine that never emits simply never calls it, which is indistinguishable
-    /// from an inert sink at the consumer. See [`PreviewSink`] for the frame contract.
+    /// and opt-in — an engine that never emits simply never calls it. Consumers distinguish an
+    /// unsupported engine from a supporting engine that has not emitted yet through
+    /// [`Capabilities::supports_preview`]; the sink callback alone cannot distinguish those states.
+    /// See [`PreviewSink`] for the frame contract.
     pub preview: PreviewSink,
 }
 
@@ -1742,6 +1744,15 @@ pub struct Capabilities {
     /// admitting [`ConditioningKind::AudioEdit`] in [`conditioning`](Self::conditioning) it names
     /// exactly the editable surface.
     pub audio_edit_modes: Vec<AudioEditMode>,
+    /// Whether this model can emit **intermediate denoise previews** through
+    /// [`GenerationRequest::preview`]. `Default` is `false`: existing and unwired providers are
+    /// unsupported, so a consumer must not wait for preview frames from them. A provider sets this
+    /// to `true` only when every generation route behind the descriptor forwards the request's
+    /// [`PreviewSink`] into its denoise loop. That lets a weights-free consumer distinguish
+    /// `false` (unsupported) from `true` with no frame received yet (supported, but not emitted yet,
+    /// including before the first denoise step). This is advisory discoverability: it does not gate
+    /// [`GenerationRequest::preview`] and [`PreviewSink`] itself does not report support.
+    pub supports_preview: bool,
     /// Whether this model synthesizes audio **incrementally** through
     /// [`Generator::generate_streaming`] (sc-12846) — the opt-in signal for the realtime/streaming
     /// TTS path. `Default` is `false`: a non-streaming generator (every image/video model and the
@@ -2544,6 +2555,18 @@ mod tests {
             max_count: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn preview_support_is_weights_free_and_defaults_to_unsupported() {
+        let unsupported = Capabilities::default();
+        let supported_waiting_for_first_frame = Capabilities {
+            supports_preview: true,
+            ..Default::default()
+        };
+
+        assert!(!unsupported.supports_preview);
+        assert!(supported_waiting_for_first_frame.supports_preview);
     }
 
     fn base_req() -> GenerationRequest {
