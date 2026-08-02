@@ -411,17 +411,15 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
-    let memory_strategy =
-        crate::block_memory_strategy::memory_strategy_contract(descriptor.id, spec)?;
-    let streamable_transformer = memory_strategy.lifecycle.transformer_window_materialization;
-    let quant = effective_base_quant_tier(spec, descriptor.id)?;
-    let residency = build_residency(spec, descriptor.id, streamable_transformer)?;
+    let (memory_strategy, load_plan) =
+        crate::block_memory_strategy::memory_strategy_contract_with_plan(descriptor.id, spec)?;
+    let residency = build_residency(spec, descriptor.id, load_plan)?;
     Ok(Box::new(Krea {
         descriptor,
         memory_strategy,
         precision: spec.precision,
-        quant,
-        streamable_transformer,
+        quant: load_plan.effective_quant,
+        streamable_transformer: load_plan.streamable_transformer,
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
@@ -483,7 +481,7 @@ fn resolve_transformer_window(req: &GenerationRequest, streamable: bool) -> Resu
 pub(crate) fn build_residency(
     spec: &LoadSpec,
     id: &'static str,
-    streamable_transformer: bool,
+    load_plan: ResolvedLoadPlan,
 ) -> Result<Residency<KreaText, KreaHeavyOwned>> {
     // Up-front fail-fast for both policies (precision override + single-file rejection).
     let _ = resolve_root(spec, id)?;
@@ -491,14 +489,18 @@ pub(crate) fn build_residency(
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_krea_text(&spec_text, resolve_root(&spec_text, id)?, id),
+        move || {
+            load_krea_text_resolved(
+                resolve_root(&spec_text, id)?,
+                load_plan.load_time_quant_bits,
+            )
+        },
         move |use_pid| {
             load_krea_heavy(
                 &spec_heavy,
                 resolve_root(&spec_heavy, id)?,
-                id,
                 use_pid,
-                streamable_transformer,
+                load_plan,
             )
         },
     )
@@ -527,15 +529,60 @@ fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
 /// bits (`quantize()` would be a no-op). Errors on a packed-vs-requested mismatch so e.g. Q4 over a Q8
 /// turnkey never silently serves Q8. Shared by the text + heavy loaders (the marker in
 /// `transformer/config.json` is model-wide), so both phases decide identically.
-pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
-    let Some(q) = spec.quantize else {
-        return Ok(None);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedLoadPlan {
+    pub(crate) load_time_quant_bits: Option<i32>,
+    pub(crate) effective_quant: Option<Quant>,
+    pub(crate) streamable_transformer: bool,
+}
+
+pub(crate) fn resolve_load_plan(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+) -> Result<ResolvedLoadPlan> {
+    // Parse the marker even without a quantization override. Contract construction, admission, and
+    // loading must all reject the same malformed/unreadable packed snapshot instead of letting rung 4
+    // advertise a source the generator cannot subsequently load.
+    let packed_bits = mlx_gen::quant::packed_quant_bits(root, "transformer")?;
+    let requested_bits = match spec.quantize {
+        Some(quant @ (Quant::Q4 | Quant::Q8)) => Some(quant.bits()),
+        Some(quant) => {
+            return Err(Error::Unsupported(format!(
+                "{id}: unsupported MLX quantization tier {quant:?}; expected Q4 or Q8"
+            )))
+        }
+        None => None,
     };
-    if mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), id)? {
-        Ok(Some(q.bits()))
-    } else {
-        Ok(None)
+    if let (Some(packed), Some(requested)) = (packed_bits, requested_bits) {
+        if packed != requested {
+            return Err(Error::Msg(format!(
+                "{id}: transformer/ is a pre-quantized Q{packed} turnkey but Q{requested} was \
+                 requested; quantize is a no-op on packed weights so the request would silently \
+                 serve Q{packed}. Point at a Q{requested} snapshot (or a dense one)."
+            )));
+        }
     }
+    let load_time_quant_bits = packed_bits.is_none().then_some(requested_bits).flatten();
+    let effective_bits = packed_bits.or(load_time_quant_bits);
+    let effective_quant = effective_bits
+        .map(|bits| {
+            crate::memory::tier_from_bits(bits).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{id}: transformer declares unsupported packed quantization width {bits}"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(ResolvedLoadPlan {
+        load_time_quant_bits,
+        effective_quant,
+        streamable_transformer: false,
+    })
+}
+
+pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
+    Ok(resolve_load_plan(spec, root, id)?.load_time_quant_bits)
 }
 
 /// The base DiT's **effective** quant bits for the pose-control branch gate (sc-11748): the tier the base
@@ -549,14 +596,9 @@ pub(crate) fn effective_base_quant_bits(
     root: &Path,
     id: &str,
 ) -> Result<Option<i32>> {
-    if let Some(packed) = mlx_gen::quant::packed_quant_bits(root, "transformer")? {
-        // Pre-packed turnkey: run load_time_quant_bits for its packed-vs-requested mismatch guard (e.g. a
-        // Q4 request over a Q8 turnkey), then report the on-disk tier (load_time_quant_bits itself
-        // returns None here).
-        load_time_quant_bits(spec, root, id)?;
-        return Ok(Some(packed));
-    }
-    load_time_quant_bits(spec, root, id)
+    Ok(resolve_load_plan(spec, root, id)?
+        .effective_quant
+        .map(Quant::bits))
 }
 
 /// Resolve the tier the base transformer actually uses. Unlike `LoadSpec::quantize`, this observes a
@@ -564,15 +606,7 @@ pub(crate) fn effective_base_quant_bits(
 /// choosing a tier-specific snapshot without requesting an in-place quantization pass.
 pub(crate) fn effective_base_quant_tier(spec: &LoadSpec, id: &str) -> Result<Option<Quant>> {
     let root = resolve_root(spec, id)?;
-    effective_base_quant_bits(spec, root, id)?
-        .map(|bits| {
-            crate::memory::tier_from_bits(bits).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{id}: transformer declares unsupported packed quantization width {bits}"
-                ))
-            })
-        })
-        .transpose()
+    Ok(resolve_load_plan(spec, root, id)?.effective_quant)
 }
 
 /// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component
@@ -580,8 +614,13 @@ pub(crate) fn effective_base_quant_tier(spec: &LoadSpec, id: &str) -> Result<Opt
 /// VAE + vision tower stay dense (the monolithic `KreaPipeline::quantize` quantized `te` + `dit`, not
 /// the VAE/vision), so the `Resident` and `Sequential` paths build byte-identical text phases.
 pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
+    let plan = resolve_load_plan(spec, root, id)?;
+    load_krea_text_resolved(root, plan.load_time_quant_bits)
+}
+
+fn load_krea_text_resolved(root: &Path, load_time_quant_bits: Option<i32>) -> Result<KreaText> {
     let mut text = KreaText::from_snapshot(root)?;
-    if let Some(bits) = load_time_quant_bits(spec, root, id)? {
+    if let Some(bits) = load_time_quant_bits {
         text.quantize(bits)?;
     }
     Ok(text)
@@ -595,15 +634,14 @@ pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<K
 fn load_krea_heavy(
     spec: &LoadSpec,
     root: &Path,
-    id: &str,
     load_pid: bool,
-    streamable_transformer: bool,
+    load_plan: ResolvedLoadPlan,
 ) -> Result<KreaHeavyOwned> {
-    let mut heavy = KreaHeavy::from_snapshot_with_stream(root, streamable_transformer)?;
+    let mut heavy = KreaHeavy::from_snapshot_with_stream(root, load_plan.streamable_transformer)?;
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
     }
-    if let Some(bits) = load_time_quant_bits(spec, root, id)? {
+    if let Some(bits) = load_plan.load_time_quant_bits {
         heavy.quantize(bits)?;
     }
     // Optional PiD decoder overlay (sc-7845): Krea reuses the Qwen-Image latent space, so it loads the
@@ -1995,12 +2033,15 @@ mod tests {
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         // Sequential defers every heavy/text load, so a missing snapshot dir is NOT touched here.
-        let res = build_residency(
-            &missing_snapshot_spec(OffloadPolicy::Sequential),
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let plan = resolve_load_plan(
+            &spec,
+            resolve_root(&spec, KREA_2_TURBO_ID).unwrap(),
             KREA_2_TURBO_ID,
-            false,
         )
-        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        .unwrap();
+        let res = build_residency(&spec, KREA_2_TURBO_ID, plan)
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
             res.is_sequential(),
             "Sequential policy must build a Sequential residency (the deferred state machine)"
@@ -2011,13 +2052,16 @@ mod tests {
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         // Resident eager-loads the text encoder now, so the missing snapshot dir surfaces as an error
         // at construction — the flip side that proves the Sequential test's `Ok` came from deferral.
-        let err = build_residency(
-            &missing_snapshot_spec(OffloadPolicy::Resident),
+        let spec = missing_snapshot_spec(OffloadPolicy::Resident);
+        let plan = resolve_load_plan(
+            &spec,
+            resolve_root(&spec, KREA_2_TURBO_ID).unwrap(),
             KREA_2_TURBO_ID,
-            false,
         )
-        .err()
-        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        .unwrap();
+        let err = build_residency(&spec, KREA_2_TURBO_ID, plan)
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
         // A load/IO error, not the precision/single-file guard (which a Dir source passes).
         let msg = err.to_string();
         assert!(

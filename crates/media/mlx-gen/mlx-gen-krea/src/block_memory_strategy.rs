@@ -41,19 +41,42 @@ pub(crate) fn is_streamable_spec(provider_id: &str, spec: &LoadSpec) -> CoreResu
     let WeightsSource::Dir(root) = &spec.weights else {
         return Ok(false);
     };
-    if !matches!(spec.offload_policy, OffloadPolicy::Sequential)
-        || !matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        || crate::model::adapters_have_diff_patch(&spec.adapters)
-    {
-        return Ok(false);
-    }
-    Ok(crate::model::load_time_quant_bits(spec, root, provider_id)?.is_none())
+    let mut plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
+    plan.streamable_transformer = matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && plan.load_time_quant_bits.is_none();
+    Ok(plan.streamable_transformer)
+}
+
+fn resolved_load_plan(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<crate::model::ResolvedLoadPlan> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Msg(
+            "krea memory facts require a snapshot directory".to_owned(),
+        ));
+    };
+    let mut plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
+    plan.streamable_transformer = matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && plan.load_time_quant_bits.is_none();
+    Ok(plan)
 }
 
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    Ok(memory_strategy_contract_with_plan(provider_id, spec)?.0)
+}
+
+pub(crate) fn memory_strategy_contract_with_plan(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<(MemoryProviderContract, crate::model::ResolvedLoadPlan)> {
     let _ = crate::model::component_footprint(spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(
@@ -82,12 +105,15 @@ pub fn memory_strategy_contract(
         })?,
         vae: project(&root.join("vae"), &|_| false)?,
     };
-    let streamable = is_streamable_spec(provider_id, spec)?;
-    Ok(memory_strategy_contract_with_components(
-        provider_id,
-        spec,
-        components,
-        streamable,
+    let plan = resolved_load_plan(provider_id, spec)?;
+    Ok((
+        memory_strategy_contract_with_components(
+            provider_id,
+            spec,
+            components,
+            plan.streamable_transformer,
+        ),
+        plan,
     ))
 }
 
@@ -96,12 +122,12 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    let streamable = is_streamable_spec(provider_id, spec)?;
+    let plan = resolved_load_plan(provider_id, spec)?;
     Ok(memory_strategy_contract_with_components(
         provider_id,
         spec,
         Default::default(),
-        streamable,
+        plan.streamable_transformer,
     ))
 }
 
@@ -633,12 +659,12 @@ mod tests {
                 is_streamable_spec("krea_2_turbo", &packed).unwrap(),
                 "a matching prepacked Q{bits} override is a no-op and must remain streamable"
             );
-            assert!(
-                memory_strategy_contract("krea_2_turbo", &packed)
-                    .unwrap()
-                    .lifecycle
-                    .transformer_window_materialization
-            );
+            let (contract, plan) =
+                memory_strategy_contract_with_plan("krea_2_turbo", &packed).unwrap();
+            assert!(contract.lifecycle.transformer_window_materialization);
+            assert_eq!(plan.effective_quant, Some(quant));
+            assert_eq!(plan.load_time_quant_bits, None);
+            assert!(plan.streamable_transformer);
         }
 
         std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
@@ -668,6 +694,21 @@ mod tests {
             mismatch.contains("Q8") && mismatch.contains("Q4"),
             "{mismatch}"
         );
+
+        let mut no_override = spec.clone();
+        no_override.quantize = None;
+        std::fs::write(root.join("transformer/config.json"), "{ malformed").unwrap();
+        let eligibility_error = is_streamable_spec("krea_2_turbo", &no_override)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            eligibility_error.contains("packed quant"),
+            "{eligibility_error}"
+        );
+        let contract_error = memory_strategy_contract("krea_2_turbo", &no_override)
+            .unwrap_err()
+            .to_string();
+        assert!(contract_error.contains("packed quant"), "{contract_error}");
         std::fs::remove_dir_all(root).ok();
     }
 
