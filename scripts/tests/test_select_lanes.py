@@ -104,6 +104,60 @@ class SelectLanesTests(unittest.TestCase):
         self.assertFalse(lanes["macos_metal"])
         self.assertFalse(lanes["candle_cpu"])
 
+    def test_sa3_reference_fixture_selects_every_consumer_platform(self) -> None:
+        lanes = select_lanes(
+            ["docs/migration/sa3-sampler-reference/guidance.safetensors"]
+        )
+        selected = {lane for lane, enabled in lanes.items() if enabled}
+        self.assertEqual(
+            selected,
+            {
+                "workspace",
+                "docs",
+                "candle_cpu",
+                "macos_metal",
+                "windows_cuda",
+            },
+        )
+
+    def test_sa3_migration_prose_remains_docs_only(self) -> None:
+        lanes = select_lanes(["docs/migration/SC_14540_CHUNKED_SAME.md"])
+        selected = {lane for lane, enabled in lanes.items() if enabled}
+        self.assertEqual(selected, {"workspace", "docs"})
+
+    def test_sa3_fixture_matching_is_normalized_and_boundary_safe(self) -> None:
+        normalized = select_lanes(
+            [r".\docs\migration\sa3-reference\manifest.json"]
+        )
+        normalized_selected = {
+            lane for lane, enabled in normalized.items() if enabled
+        }
+        self.assertEqual(
+            normalized_selected,
+            {
+                "workspace",
+                "docs",
+                "candle_cpu",
+                "macos_metal",
+                "windows_cuda",
+            },
+        )
+
+        for path in (
+            "docs/migration/sa3-reference-notes.md",
+            "docs/migration/sa3-reference-copy/manifest.json",
+            "docs/migration/sa3ish-reference/manifest.json",
+            "docs/migration/archive/sa3-reference/manifest.json",
+            "docs/migration/sa3-reference/../SC_14534_SA3_REFERENCE_PARITY.md",
+        ):
+            with self.subTest(path=path):
+                selected = {
+                    lane
+                    for lane, enabled in select_lanes([path]).items()
+                    if enabled
+                }
+                self.assertEqual(selected, {"workspace", "docs"})
+
     def test_root_doc_and_meta_files_are_docs_only(self) -> None:
         for path in (
             ".github/CODEOWNERS",
