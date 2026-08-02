@@ -54,6 +54,18 @@ def validate_model_weight_licenses(document: dict[str, Any]) -> list[dict[str, A
     recomputing each provider's derived term union and comparing it to the emitted one, merging
     manifests across catalogs with byte-identical-component enforcement, and mirroring the Rust-side
     calendar-date and blank-field rules.
+
+    Known and accepted loss, recorded here so sc-16664 does not rediscover it as a surprise: schema 2
+    carried a free-text ``restriction`` string per row and schema 3 has no field for it, by decision
+    in sc-16661/16662 rather than by oversight. Almost all of that prose was legal *conclusion*
+    ("Non-commercial only", "SceneWorks is non-commercial, so the weights are usable"), which the
+    disclosure-only rule excludes on purpose and which the typed terms now express as facts. One
+    sentence was genuine disclosure and is not represented anywhere in schema 3: MMAudio's note that
+    its checkpoints were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset
+    terms a downstream user must honour. That is training-data provenance, a different axis from the
+    licence of the artifact, so it does not belong in an existing ``LicenseTerm``. If a consumer is
+    ever shown to need it, it wants its own field and its own story — do not smuggle it back as
+    free text.
     """
     if document.get("kind") != "model-weight-licenses":
         raise RuntimeError("model-licenses manifest has the wrong kind")

@@ -724,6 +724,15 @@ const MEDIUM_BASE_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
 // commercial use, it names a revenue threshold and a registration — which the family records as
 // facts a consumer evaluates against its own situation.
 //
+// The two `source_url` shapes below are one rule, not two conventions: `ComponentLicense::source_url`
+// names the document `declared` was transcribed from, so it follows the declaration. Each `*_root`
+// row therefore points at the bare model card, where the `stable-audio-community` tag is published
+// and re-readable — deliberately dropping v2's revision-pinned `.../blob/<sha>/LICENSE.md`, which
+// addressed licence *text* (schema 3 keeps that once, on the family) and, being frozen, could never
+// show a re-licensing. `retrieved` is the as-of anchor the pin used to stand in for. Each `*_gemma`
+// row keeps a pinned LICENSE_GEMMA.md blob because that file is the only place the "Gemma Terms of
+// Use" declaration exists for this bundled copy; the repository tag says something else.
+//
 // DISCLOSURE ONLY. Nothing here decides whether any use is permitted.
 // -------------------------------------------------------------------------------------------------
 

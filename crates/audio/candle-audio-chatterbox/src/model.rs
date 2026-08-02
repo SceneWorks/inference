@@ -108,7 +108,7 @@ pub const COMPONENT_KEY: &str = "chatterbox";
 /// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
 /// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
 /// the `ResembleAI/chatterbox` model card on `retrieved`, and `family` normalizes that declaration onto
-/// [`gen_core::families::MIT`].
+/// [`gen_core::license::families::MIT`].
 pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
     component: COMPONENT_KEY,
     source_url: "https://huggingface.co/ResembleAI/chatterbox",

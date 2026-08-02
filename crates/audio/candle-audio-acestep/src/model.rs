@@ -92,6 +92,13 @@ pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
 /// row of its own in schema 3, so the Apache-2.0 attribution and notice duties reach the derived
 /// provider union instead of sitting in a sentence nothing joins over. `declared` was read from the
 /// upstream `Qwen/Qwen3-Embedding-0.6B` model card on `retrieved`.
+///
+/// `source_url` names that upstream card rather than the ACE-Step repository this copy is
+/// redistributed in, per the rule on [`ComponentLicense::source_url`]: the field points at the
+/// document `declared` was transcribed from, and the ACE-Step card declares the *bundle's* licence,
+/// not this component's. Re-reading `apache-2.0` is only possible at Qwen's card.
+///
+/// [`ComponentLicense::source_url`]: candle_audio::gen_core::ComponentLicense::source_url
 pub const TEXT_ENCODER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
     candle_audio::gen_core::ComponentLicense {
         component: TEXT_ENCODER_COMPONENT_KEY,

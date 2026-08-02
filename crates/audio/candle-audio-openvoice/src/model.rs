@@ -58,7 +58,7 @@ pub const COMPONENT_KEY: &str = "openvoice_v2";
 /// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
 /// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
 /// the `myshell-ai/OpenVoiceV2` model card on `retrieved`, and `family` normalizes that declaration onto
-/// [`candle_audio::gen_core::families::MIT`].
+/// [`candle_audio::gen_core::license::families::MIT`].
 pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
     candle_audio::gen_core::ComponentLicense {
         component: COMPONENT_KEY,

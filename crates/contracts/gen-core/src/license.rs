@@ -440,7 +440,35 @@ impl LicenseFamily {
 pub struct ComponentLicense {
     /// Stable component key, e.g. `"arcface_antelopev2"`. Unique across the table.
     pub component: &'static str,
-    /// The upstream artifact this row describes.
+    /// **The document [`declared`](Self::declared) was transcribed from** — the one place a drift
+    /// job can re-read it.
+    ///
+    /// The rule is re-readability, not provenance-in-general: this is not "the upstream project",
+    /// not "where we downloaded the weights", and not "the licence text" (that lives once on the
+    /// family, as [`LicenseFamily::text_url`]). Pick whichever document actually carries the string
+    /// in [`declared`](Self::declared) for *this artifact*, so that fetching this URL and comparing
+    /// is a mechanical check. In practice that resolves to one of two shapes, and which one applies
+    /// is decided by where the declaration lives rather than by taste:
+    ///
+    /// * **A model-card / repository URL**, when the declaration is the card's own licence tag —
+    ///   `"apache-2.0"` on `openai/whisper-base`, `"stable-audio-community"` on
+    ///   `stabilityai/stable-audio-3-small-music`. For an artifact *bundled inside* another party's
+    ///   repository this is the **upstream** card, not the redistributor's: the redistributor's tag
+    ///   declares the bundle's licence, not the bundled component's, so ACE-Step's bundled
+    ///   `Qwen3-Embedding-0.6B` row points at `Qwen/Qwen3-Embedding-0.6B`, where `"apache-2.0"` is
+    ///   the value actually published.
+    /// * **A blob URL for a licence file shipped beside the weights**, when the artifact's
+    ///   declaration exists nowhere else — Stable Audio 3's bundled T5Gemma is declared only by the
+    ///   `LICENSE_GEMMA.md` committed next to the checkpoint, whose title *is* the
+    ///   `"Gemma Terms of Use"` string in [`declared`](Self::declared). The repository's own tag
+    ///   says `"stable-audio-community"` and would be the wrong document for that row.
+    ///
+    /// Prefer the artifact's **current** location, unpinned, because a re-read that cannot observe a
+    /// change cannot detect one — that is the entire purpose of the field. The blob shape above is
+    /// the exception the rule tolerates rather than a second convention: a revision-pinned URL still
+    /// makes the transcription auditable (the quote check), but it is frozen, so re-licensing after
+    /// [`retrieved`](Self::retrieved) is invisible to it. A gate that wants both properties for such
+    /// a row has to fetch the unpinned path itself; nothing in this table can supply it.
     pub source_url: &'static str,
     /// Whether the upstream distributes **this checkpoint** behind an access gate, as observed at
     /// [`retrieved`](Self::retrieved).

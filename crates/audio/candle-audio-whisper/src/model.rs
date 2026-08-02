@@ -67,7 +67,7 @@ pub const COMPONENT_KEY: &str = "whisper_base";
 /// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
 /// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
 /// the `openai/whisper-base` model card on `retrieved`, and `family` normalizes that declaration onto
-/// [`candle_audio::gen_core::families::APACHE_2_0`].
+/// [`candle_audio::gen_core::license::families::APACHE_2_0`].
 pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
     candle_audio::gen_core::ComponentLicense {
         component: COMPONENT_KEY,

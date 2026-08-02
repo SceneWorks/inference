@@ -68,7 +68,7 @@ pub const COMPONENT_KEY: &str = "moss_tts_realtime_1_7b";
 /// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
 /// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
 /// the `OpenMOSS-Team/MOSS-TTS-Realtime` model card on `retrieved`, and `family` normalizes that declaration onto
-/// [`gen_core::families::APACHE_2_0`].
+/// [`gen_core::license::families::APACHE_2_0`].
 pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
     component: COMPONENT_KEY,
     source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
