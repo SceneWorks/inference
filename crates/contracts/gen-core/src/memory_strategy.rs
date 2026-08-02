@@ -1609,6 +1609,13 @@ pub fn standard_memory_strategy_safety_check(
     route_gate: Option<&dyn Fn() -> Result<()>>,
 ) -> MemorySafetyDecision {
     let reject = |reason| MemorySafetyDecision::Reject { reason };
+    if context.budget.reclaimable_bytes > context.budget.committed_bytes {
+        return reject(format!(
+            "{}: reclaimable bytes {} exceed committed bytes {}; reclaim credit must be a subset \
+             of the charged snapshot",
+            contract.provider_id, context.budget.reclaimable_bytes, context.budget.committed_bytes
+        ));
+    }
     if context.has_reference != (context.geometry.reference_count > 0) {
         return reject(format!(
             "{}: has_reference={} is inconsistent with reference_count={}",
@@ -1660,7 +1667,7 @@ pub fn standard_memory_strategy_safety_check(
     if !context.budget.fits(context.predicted_peak_bytes) {
         return MemorySafetyDecision::Reject {
             reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
+                "{}: incremental live demand {} exceeds effective budget {}",
                 contract.provider_id,
                 context.predicted_peak_bytes,
                 context.budget.effective_bytes()
@@ -1936,9 +1943,38 @@ pub struct MemoryGeometry {
 /// Canonical live-budget accounting owned by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryBudget {
+    /// The platform-enforced capacity available to this process or worker, in bytes. This and every
+    /// other budget field are one caller snapshot taken immediately before request admission.
     pub total_bytes: u64,
+    /// Bytes already charged against [`total_bytes`](Self::total_bytes) at that snapshot, including
+    /// unrelated live allocations and any request-owned resident assets loaded before admission.
+    /// A caller must not subtract these bytes again from `total_bytes` before constructing the
+    /// budget.
     pub committed_bytes: u64,
+    /// Memory a backend is holding but could return under pressure — chiefly an allocator's
+    /// freed-buffer reuse cache.
+    ///
+    /// **Creditable only if something will actually reclaim it before the platform's killer fires.**
+    /// [`effective_bytes`](Self::effective_bytes) adds this back into the budget, which assumes a
+    /// reclaimer exists. That assumption holds where the OS applies backpressure and fails where it
+    /// terminates the process instead.
+    ///
+    /// iOS is the failing case, measured: jetsam reads `phys_footprint` — which counts an allocator's
+    /// reuse cache in full — and does not ask anyone to release anything first. An MLX process there
+    /// sat at `active + cache` pinned to the per-process cap across an entire decode, with ~3.9 GB
+    /// cached and reclaimable, and was killed with 4 MiB of headroom. Every byte counted here was
+    /// genuinely reclaimable and none of it was reclaimed, because nothing asked.
+    ///
+    /// What makes it creditable is bounding the allocator's own cache limit so the *allocator*
+    /// reclaims continuously rather than waiting to be asked (`runtime_ios`'s
+    /// `bound_mlx_to_platform_limits`). A caller that cannot name such a mechanism should pass `0`
+    /// here rather than credit memory that will still be resident at the moment of the kill.
+    /// Reclaimable bytes are a subset of `committed_bytes`, never a separate pool: the shared safety
+    /// gate rejects `reclaimable_bytes > committed_bytes` rather than inventing capacity that was not
+    /// first charged to the snapshot.
     pub reclaimable_bytes: u64,
+    /// Capacity deliberately unavailable to the request, in the same process-residency currency as
+    /// `total_bytes` and `committed_bytes`.
     pub reserved_headroom_bytes: u64,
 }
 
@@ -1957,9 +1993,28 @@ impl MemoryBudget {
         available.clamp(0, i128::from(ceiling)) as u64
     }
 
-    /// Exact-boundary fits are accepted.
-    pub fn fits(self, predicted_peak_bytes: u64) -> bool {
-        predicted_peak_bytes <= self.effective_bytes()
+    /// Whether the request's **incremental** live demand fits; exact boundaries are accepted.
+    ///
+    /// `incremental_live_demand_bytes` is the additional live allocation above this budget's
+    /// committed snapshot, not an absolute request high-water and not process footprint. Evidence
+    /// records an absolute request live peak; before calling `fits`, the caller subtracts only the
+    /// request-owned resident bytes already included in `committed_bytes`. Unrelated committed bytes
+    /// are already charged by [`effective_bytes`](Self::effective_bytes) and must not be subtracted
+    /// from the request peak.
+    pub fn fits(self, incremental_live_demand_bytes: u64) -> bool {
+        incremental_live_demand_bytes <= self.effective_bytes()
+    }
+
+    /// Total platform capacity required by this snapshot and an incremental request demand.
+    ///
+    /// This is the user-facing inverse of [`fits`](Self::fits): already committed bytes remain
+    /// charged, valid reclaim credit is removed, then reserved headroom and new live demand are
+    /// added. Saturation keeps an invalidly large input conservative.
+    pub fn required_total_bytes(self, incremental_live_demand_bytes: u64) -> u64 {
+        self.committed_bytes
+            .saturating_sub(self.reclaimable_bytes.min(self.committed_bytes))
+            .saturating_add(self.reserved_headroom_bytes)
+            .saturating_add(incremental_live_demand_bytes)
     }
 }
 
@@ -2012,6 +2067,9 @@ pub struct MemoryRunContext {
     /// context or geometry fields; key/value encodings such as `references=2` are rejected.
     pub overlay: Option<String>,
     pub budget: MemoryBudget,
+    /// Incremental live-allocation demand above `budget.committed_bytes`. The selected evidence owns
+    /// an absolute request peak; the caller removes exactly the request-resident portion already
+    /// present in the budget snapshot before building this context.
     pub predicted_peak_bytes: u64,
     /// Caller-facing telemetry for cold/warm admission and cache-poisoning regression checks.
     pub cache_state: MemoryCacheState,
@@ -2022,9 +2080,12 @@ pub struct MemoryRunContext {
 impl MemoryRunContext {
     pub fn predicted_peak_breakdown(
         &self,
-        contract: &MemoryProviderContract,
+        _contract: &MemoryProviderContract,
     ) -> MemoryPeakBreakdown {
-        contract.decompose_predicted_peak(self.predicted_peak_bytes)
+        // Context demand is incremental after the caller credits request-owned resident bytes.
+        // Provider formula components describe the evidence-owned absolute peak and cannot be
+        // subtracted from this scalar a second time.
+        MemoryPeakBreakdown::from_unattributed(self.predicted_peak_bytes)
     }
 }
 
@@ -2261,7 +2322,29 @@ pub struct MemoryEvidence {
     pub sceneworks_revision: String,
     pub inference_revision: String,
     pub harness_version: String,
+    /// Absolute request peak **live allocation** the formula predicts — bytes held by the request's
+    /// live tensors at the high-water mark, including request-resident assets but excluding any
+    /// allocator reuse cache. A caller converts this to `MemoryRunContext::predicted_peak_bytes` by
+    /// subtracting exactly the request-resident bytes already charged in its budget snapshot. See
+    /// [`observed_peak_bytes`](Self::observed_peak_bytes) for why the distinction is load-bearing
+    /// and not pedantic.
     pub predicted_peak_bytes: u64,
+    /// Absolute request peak **live allocation** measured by the calibration harness. `None` until
+    /// measured; it uses the same baseline as `predicted_peak_bytes` above.
+    ///
+    /// **Live allocation, not process footprint, and the two are not close.** An allocator's
+    /// freed-buffer reuse cache is excluded here and counted by the OS: a Z-Image 1024² render
+    /// measured 3102 MiB of live peak and 6488 MiB of `active + cache` on the same run. Comparing the
+    /// wrong one against a cap is not conservative in a predictable direction — of three
+    /// configurations measured together, the one with the **lowest** live peak had the **highest**
+    /// footprint and was the only one an iOS device refused. A ladder built on the wrong quantity can
+    /// rank a fatal configuration as the safest of its set.
+    ///
+    /// Live allocation is the right quantity *here* because it is the irreducible working set — the
+    /// part no tuning removes. The cache is modelled on the other side of the comparison, by
+    /// [`MemoryBudget::reclaimable_bytes`], whose docs carry the precondition that makes that
+    /// modelling valid. A calibration that records footprint in this field silently double-counts
+    /// the cache against a budget that already credits it.
     pub observed_peak_bytes: Option<u64>,
     pub parity: MemoryParityContract,
     pub parity_result: MemoryParityResult,
@@ -2641,6 +2724,20 @@ mod tests {
             MemorySafetyDecision::Reject { reason } if reason.contains("route refused")
         ));
 
+        let mut invalid_reclaim_credit = context.clone();
+        invalid_reclaim_credit.budget.committed_bytes = 10;
+        invalid_reclaim_credit.budget.reclaimable_bytes = 11;
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &invalid_reclaim_credit,
+                Some(loaded_tier),
+                None
+            ),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("reclaim credit must be a subset")
+        ));
+
         let mut over_budget = context;
         over_budget.predicted_peak_bytes = 1025;
         assert!(matches!(
@@ -2651,7 +2748,7 @@ mod tests {
                 None
             ),
             MemorySafetyDecision::Reject { reason }
-                if reason.contains("predicted peak 1025 exceeds effective budget 1024")
+                if reason.contains("incremental live demand 1025 exceeds effective budget 1024")
         ));
     }
 
@@ -2962,6 +3059,26 @@ mod tests {
             .effective_bytes(),
             10
         );
+    }
+
+    #[test]
+    fn fits_consumes_incremental_demand_not_the_absolute_request_peak() {
+        let budget = MemoryBudget {
+            total_bytes: 100,
+            committed_bytes: 40,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 10,
+        };
+        let absolute_request_peak = 80;
+        let request_resident_already_committed = 30;
+        let incremental_live_demand = absolute_request_peak - request_resident_already_committed;
+
+        assert_eq!(budget.effective_bytes(), 50);
+        assert!(budget.fits(incremental_live_demand));
+        assert_eq!(budget.required_total_bytes(incremental_live_demand), 100);
+        assert!(!budget.fits(absolute_request_peak));
+        assert_eq!(budget.required_total_bytes(absolute_request_peak), 130);
+        assert!(!budget.fits(incremental_live_demand + 1));
     }
 
     #[test]

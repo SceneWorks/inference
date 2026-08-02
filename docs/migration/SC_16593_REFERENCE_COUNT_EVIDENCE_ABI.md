@@ -21,8 +21,9 @@ calibration ABI is **3**; ABI-1 and ABI-2 records are stale and cannot authorize
 
 The MLX provider no longer owns measured peak coefficients or overwrites the caller's
 `predicted_peak_bytes`. It validates the loaded tier, the typed multi-reference route, and the
-caller-supplied live budget against the exact evidence-owned peak. Non-resident strategies are
-reported as `Missing`.
+caller-supplied live budget against the incremental demand derived from the exact evidence-owned
+absolute peak after removing only request-resident bytes already charged in the committed budget
+snapshot. Non-resident strategies are reported as `Missing`.
 
 SceneWorks must advance its inference pin and migrate atomically:
 

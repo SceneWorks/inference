@@ -34,8 +34,8 @@
 //!   * after `generate()` returns — read `get_peak_memory()` = **decode stage peak**.
 //!
 //! `reset_peak_memory` rebases the high-water to current active, so each read is the true active
-//! high-water of its window — the peak IS the resident-weight + stage-transient concurrent footprint,
-//! which is exactly what an OOM cares about. (Note: `get_active_memory()` BETWEEN forwards reads ~0 on
+//! high-water of its window — the peak is resident-weight + stage-transient concurrent **live
+//! allocation**, which is the calibration/evidence currency. (Note: `get_active_memory()` BETWEEN forwards reads ~0 on
 //! MLX/Metal — safetensors weights are mmap'd into unified memory and are not counted as active
 //! allocator bytes until a forward streams them through — so the resident floor is only observable via
 //! the peak, e.g. the 512² denoise peak where the per-step activation is smallest. This is why the
@@ -56,6 +56,7 @@
 use mlx_gen_krea::memory::{control_denoise_peak_ex_text_gib, qwen_vae_decode_peak_ex_text_gib};
 use mlx_gen_krea::Krea2Config;
 
+use mlx_gen::memory_probe::FootprintProbe;
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
     Progress, Quant, WeightsSource,
@@ -158,6 +159,9 @@ struct Measured {
     size: u32,
     denoise_gib: f64,
     decode_gib: f64,
+    /// Approximate host MLX `active + cache` retention. Diagnostic only: this is not portable
+    /// process footprint and never participates in the calibration fit or evidence peak.
+    allocator_retention_gib: f64,
 }
 
 /// Load `krea_2_turbo_control` (base + overlay) at `tier` under `Sequential` and measure the two stage
@@ -195,6 +199,7 @@ fn measure(size: u32, tier: Option<Quant>) -> Measured {
     let denoise_peak = Cell::new(0usize);
 
     reset_peak_memory();
+    let retention_probe = FootprintProbe::start_default();
     let out = {
         let denoise_peak = &denoise_peak;
         model
@@ -213,6 +218,7 @@ fn measure(size: u32, tier: Option<Quant>) -> Measured {
     };
     // The window since `Decoding` was the VAE decode.
     let decode_peak = get_peak_memory();
+    let allocator_retention = retention_probe.finish();
 
     match out {
         GenerationOutput::Images(v) => assert_eq!(v.len(), 1, "expected a single image"),
@@ -225,6 +231,7 @@ fn measure(size: u32, tier: Option<Quant>) -> Measured {
         size,
         denoise_gib: denoise_peak.get() as f64 / GIB,
         decode_gib: decode_peak as f64 / GIB,
+        allocator_retention_gib: allocator_retention as f64 / GIB,
     };
     assert!(
         m.denoise_gib > 0.0 && m.decode_gib > 0.0,
@@ -243,8 +250,8 @@ fn calibrate_tier(label: &str, tier: Option<Quant>) {
 
     println!("\n=== krea_2_turbo_control memory calibration — base tier {label} ===");
     println!(
-        "{:>6} | {:>10} {:>10} | {:>10} {:>10} | {:>7} {:>7}",
-        "size", "denoise", "decode", "est_dn", "est_dc", "dn_x", "dc_x"
+        "{:>6} | {:>10} {:>10} | {:>10} {:>10} | {:>7} {:>7} | {:>12}",
+        "size", "denoise", "decode", "est_dn", "est_dc", "dn_x", "dc_x", "retention*"
     );
     for m in &ms {
         let est_dn =
@@ -252,7 +259,7 @@ fn calibrate_tier(label: &str, tier: Option<Quant>) {
         let est_dc =
             qwen_vae_decode_peak_ex_text_gib(&cfg, BRANCH_BLOCKS, tier, None, m.size, m.size);
         println!(
-            "{:>6} | {:>10.3} {:>10.3} | {:>10.3} {:>10.3} | {:>7.3} {:>7.3}",
+            "{:>6} | {:>10.3} {:>10.3} | {:>10.3} {:>10.3} | {:>7.3} {:>7.3} | {:>11.3}G",
             m.size,
             m.denoise_gib,
             m.decode_gib,
@@ -260,8 +267,13 @@ fn calibrate_tier(label: &str, tier: Option<Quant>) {
             est_dc,
             est_dn / m.denoise_gib,
             est_dc / m.decode_gib,
+            m.allocator_retention_gib,
         );
     }
+    println!(
+        "* retention is approximate host MLX active+cache telemetry only; it is not a portable \
+         process-footprint estimate and is excluded from calibration/evidence peaks"
+    );
 
     // Backed-out physical slopes (needs ≥2 resolutions). Print the coefficient each stage implies.
     if ms.len() >= 2 {

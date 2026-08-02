@@ -1,9 +1,10 @@
 //! FLUX.2-dev edit's provider-side memory-safety contract.
 //!
 //! The provider already bounds long multi-reference sequences internally with `MemoryConfig::LONG_SEQ`.
-//! SceneWorks supplies request geometry, numeric tier, an evidence-owned predicted peak, and the
-//! live unified-memory budget. This module validates the provider route and tier, then delegates the
-//! canonical budget comparison to `gen-core`; calibration coefficients never live in a provider.
+//! SceneWorks supplies request geometry, numeric tier, incremental live demand derived from the
+//! evidence-owned absolute peak, and the live unified-memory budget. This module validates the
+//! provider route and tier, then delegates the canonical budget comparison to `gen-core`;
+//! calibration coefficients never live in a provider.
 
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
@@ -81,8 +82,10 @@ pub fn safety_check(
         Some(&route_gate),
     ) {
         MemorySafetyDecision::Accept => MemorySafetyDecision::Accept,
-        MemorySafetyDecision::Reject { reason: _ }
-            if route_accepted.get() && !context.budget.fits(context.predicted_peak_bytes) =>
+        MemorySafetyDecision::Reject { reason }
+            if route_accepted.get()
+                && reason.contains("incremental live demand")
+                && reason.contains("exceeds effective budget") =>
         {
             let reference_count = context.geometry.reference_count;
             let gib = 1024.0 * 1024.0 * 1024.0;
@@ -94,7 +97,10 @@ pub fn safety_check(
                      smaller numeric tier, or run on a Mac with more memory.",
                     context.geometry.width,
                     context.geometry.height,
-                    ((context.predicted_peak_bytes + context.budget.reserved_headroom_bytes) as f64
+                    (context
+                        .budget
+                        .required_total_bytes(context.predicted_peak_bytes)
+                        as f64
                         / gib)
                         .round() as i64,
                     (context.budget.total_bytes as f64 / gib).round() as i64,
