@@ -110,11 +110,16 @@ pub fn register_providers(
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::RAW_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -158,10 +163,12 @@ mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
-        let explicit_generators: Vec<String> = registry
+        let descriptors: Vec<_> = registry
             .generators()
-            .map(|registration| (registration.descriptor)().id.to_string())
+            .map(|registration| (registration.descriptor)())
             .collect();
+        let explicit_generators: Vec<_> =
+            descriptors.iter().map(|descriptor| descriptor.id).collect();
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
@@ -178,6 +185,9 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw"]);
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.capabilities.supports_preview));
 
         let contract = registry
             .memory_strategy_contract(
@@ -236,6 +246,7 @@ mod explicit_registry_tests {
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: crate::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
                 .to_owned(),
+            load_shape: mlx_gen::LoadShape::EagerMaterialization,
             mode: mlx_gen::gen_core::MemoryMode::TextToImage,
             has_reference: false,
             use_pid: true,

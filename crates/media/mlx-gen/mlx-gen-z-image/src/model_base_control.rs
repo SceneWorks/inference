@@ -84,6 +84,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -426,6 +427,14 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
         provider_id: MODEL_ID,
         contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
         safety_check: crate::memory_strategy::registered_safety_check,
+    };
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
     };
 
 #[cfg(test)]

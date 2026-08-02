@@ -64,6 +64,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // `max(Qwen3-TE, DiT+conditioner+VAE)`. Q4/Q8 are packed convert-at-install tiers (no
             // load-time re-quant), so no F-181 dense-requant advisory is needed (mirrors SANA).
             supports_sequential_offload: true,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -266,6 +267,7 @@ impl Anima {
                         &sampler,
                         scheduler.as_deref(),
                         seed,
+                        &req.preview,
                         &req.cancel,
                         on_progress,
                     )?;
@@ -347,6 +349,7 @@ mod tests {
         assert!(b.capabilities.supports_negative_prompt);
         assert!(b.capabilities.requires_sigma_shift);
         assert!(b.capabilities.supports_lora && b.capabilities.supports_lokr);
+        assert!(b.capabilities.supports_preview);
         assert!(b.capabilities.mac_only);
         // Q4/Q8 tiers advertised (sc-10517): convert-at-install packs the DiT on-device and the loader
         // packed-detects each tier, so every advertised tier actually loads — an honest advertisement.
@@ -355,6 +358,8 @@ mod tests {
         assert_eq!(b.capabilities.max_size, 1536);
         // Turbo is the CFG-free merged student.
         let t = descriptor_turbo();
+        assert!(descriptor_aesthetic().capabilities.supports_preview);
+        assert!(t.capabilities.supports_preview);
         assert!(!t.capabilities.supports_guidance);
         assert!(!t.capabilities.supports_negative_prompt);
         // er_sde is advertised in the curated menu.

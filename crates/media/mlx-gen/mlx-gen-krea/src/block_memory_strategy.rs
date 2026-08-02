@@ -18,6 +18,9 @@
 //! Every windowed image was byte-identical to its resident control. Low-rank adapters are captured
 //! and replayed per materialized block. A dense `.diff`/`.diff_b` patch is excluded at contract build
 //! time because it mutates the resident base and cannot be reconstructed from the pristine snapshot.
+//! The calibrated rung-4 key includes `engaged_composition=[Resident, StagedResidency,
+//! BoundedTransformerResidency]`: this loader reopens components between phases, so block streaming
+//! is valid only when staged residency is active in the same request.
 
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
@@ -71,6 +74,7 @@ pub fn memory_strategy_contract(
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
     ));
     contract.asset_facts.base_bytes = footprint
         .text_encoder
@@ -98,6 +102,13 @@ pub fn memory_strategy_contract(
             .support = MemoryStrategySupport::Implemented;
     }
     if streamable {
+        contract.additional_prerequisites.push((
+            MemoryStrategy::BoundedTransformerResidency,
+            mlx_gen::gen_core::MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: mlx_gen::gen_core::MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        ));
         let capability = contract
             .strategies
             .iter_mut()
@@ -150,12 +161,79 @@ pub(crate) fn registered_safety_check(
     }
 }
 
+pub(crate) fn registered_valid_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let quant = crate::model::effective_base_quant_tier(spec, &contract.provider_id)?;
+    let is_edit = contract.provider_id.contains("edit");
+    let context = mlx_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: spec.precision,
+            quant,
+            component_precision_floors: &[],
+        },
+        mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: if is_edit {
+                mlx_gen::gen_core::MemoryMode::Edit
+            } else {
+                mlx_gen::gen_core::MemoryMode::TextToImage
+            },
+            has_reference: is_edit,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        },
+    )?;
+    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+pub(crate) fn registered_begin_request(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        spec.precision,
+        crate::model::effective_base_quant_tier(spec, provider_id)?,
+        context,
+        weights_free_cleanup,
+    )
+}
+
 pub(crate) fn begin_request(
     provider_id: &'static str,
     contract: &MemoryProviderContract,
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        precision,
+        quant,
+        context,
+        mlx_cleanup,
+    )
+}
+
+fn begin_request_with_cleanup(
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+    precision: Precision,
+    quant: Option<mlx_gen::Quant>,
+    context: &MemoryRunContext,
+    cleanup: fn() -> CoreResult<()>,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
@@ -164,32 +242,63 @@ pub(crate) fn begin_request(
     }
     Ok(Some(Box::new(KreaMemoryScope {
         provider_id,
-        selection: context.selection,
+        memory: contract.generation_memory(&context.selection),
+        transformer_window: contract
+            .engages(
+                context.selection.strategy,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .then_some(context.selection.parameters.transformer_window_size)
+            .flatten(),
         geometry: context.geometry,
+        cleanup,
         finished: false,
     })))
 }
 
 struct KreaMemoryScope {
     provider_id: &'static str,
-    selection: mlx_gen::gen_core::MemorySelection,
+    memory: Option<GenerationMemory>,
+    transformer_window: Option<u32>,
     geometry: MemoryGeometry,
+    cleanup: fn() -> CoreResult<()>,
     finished: bool,
 }
 
 impl KreaMemoryScope {
+    fn ensure_active(&self) -> CoreResult<()> {
+        if self.finished {
+            Err(CoreError::Msg(format!(
+                "{}: memory-strategy request scope is already finished",
+                self.provider_id
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn finish_inner(&mut self) -> CoreResult<()> {
-        let barrier = mlx_rs::Array::from(0.0_f32);
-        barrier.eval().map_err(mlx_gen::Error::from)?;
-        drop(barrier);
-        mlx_rs::memory::clear_cache();
+        (self.cleanup)()?;
         self.finished = true;
         Ok(())
     }
 }
 
+fn mlx_cleanup() -> CoreResult<()> {
+    let barrier = mlx_rs::Array::from(0.0_f32);
+    barrier.eval().map_err(mlx_gen::Error::from)?;
+    drop(barrier);
+    mlx_rs::memory::clear_cache();
+    Ok(())
+}
+
+fn weights_free_cleanup() -> CoreResult<()> {
+    Ok(())
+}
+
 impl MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
+        self.ensure_active()?;
         if request.width != self.geometry.width
             || request.height != self.geometry.height
             || request.count == 0
@@ -206,35 +315,16 @@ impl MemoryRequestScope for KreaMemoryScope {
                 self.geometry.batch
             )));
         }
-        request.memory = match self.selection.strategy {
-            MemoryStrategy::Resident => None,
-            MemoryStrategy::StagedResidency => Some(GenerationMemory {
-                stage_residency: true,
-                ..Default::default()
-            }),
-            MemoryStrategy::BoundedTransformerResidency => Some(GenerationMemory {
-                stage_residency: true,
-                stream_transformer_blocks: true,
-                transformer_window_size: self.selection.parameters.transformer_window_size,
-                transformer_window_component: Some(self.selection.parameters.window_component()),
-                ..Default::default()
-            }),
-            strategy => {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: strategy {strategy:?} is not implemented",
-                    self.provider_id
-                )))
-            }
-        };
+        request.memory = self.memory;
         Ok(())
     }
 
     fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        Ok(())
+        self.ensure_active()
     }
 
     fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        Ok(())
+        self.ensure_active()
     }
 
     fn configure_decode(
@@ -243,12 +333,14 @@ impl MemoryRequestScope for KreaMemoryScope {
         _overlap: u32,
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
+        self.ensure_active()?;
         Err(CoreError::Unsupported(
             "krea: bounded decode is not implemented by the base provider".into(),
         ))
     }
 
     fn configure_attention(&mut self, _chunk_size: u32) -> CoreResult<()> {
+        self.ensure_active()?;
         Err(CoreError::Unsupported(
             "krea: bounded attention is not implemented".into(),
         ))
@@ -259,10 +351,8 @@ impl MemoryRequestScope for KreaMemoryScope {
         first_block: u32,
         block_count: u32,
     ) -> CoreResult<()> {
-        if self.selection.strategy != MemoryStrategy::BoundedTransformerResidency
-            || block_count != TRANSFORMER_WINDOW_SIZE
-            || first_block >= 28
-        {
+        self.ensure_active()?;
+        if self.transformer_window != Some(block_count) || first_block >= 28 {
             return Err(CoreError::Unsupported(format!(
                 "{}: invalid Krea DiT window ({first_block}, {block_count})",
                 self.provider_id
@@ -272,6 +362,7 @@ impl MemoryRequestScope for KreaMemoryScope {
     }
 
     fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
+        self.ensure_active()?;
         self.finish_inner()
     }
 }
@@ -323,6 +414,24 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[test]
+    fn identical_fingerprint_is_separated_by_typed_load_shape() {
+        let (root, deferred_spec) = fixture();
+        let deferred = memory_strategy_contract("krea_2_turbo", &deferred_spec).unwrap();
+        let mut eager_spec = deferred_spec;
+        eager_spec.load_shape = LoadShape::EagerMaterialization;
+        let eager = memory_strategy_contract("krea_2_turbo", &eager_spec).unwrap();
+        assert_eq!(
+            deferred.calibration.as_ref().unwrap().fingerprint,
+            eager.calibration.as_ref().unwrap().fingerprint
+        );
+        assert_ne!(
+            deferred.calibration.as_ref().unwrap().load_shape,
+            eager.calibration.as_ref().unwrap().load_shape
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     fn resident_context(
         contract: &MemoryProviderContract,
         quant: Option<Quant>,
@@ -340,6 +449,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
@@ -389,6 +499,21 @@ mod tests {
             ));
         }
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rung_four_declares_and_engages_staged_residency_in_the_same_request() {
+        let (root, spec) = fixture();
+        let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        assert_eq!(
+            contract.engaged_composition(MemoryStrategy::BoundedTransformerResidency),
+            vec![
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedTransformerResidency,
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

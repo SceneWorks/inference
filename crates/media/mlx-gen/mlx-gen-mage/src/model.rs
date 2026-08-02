@@ -108,7 +108,11 @@ fn memory_strategy_contract_with_adapters(
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
+        mlx_gen::LoadShape::EagerMaterialization,
     ));
+    // Mage's loaded resident generator uses sequential defaults internally. An explicit shared
+    // Resident selection must therefore carry an all-disabled memory block to override them.
+    contract.resident_request_memory = mlx_gen::gen_core::ResidentRequestMemory::ExplicitResident;
     contract.asset_facts.base_bytes =
         (crate::memory::generation_resident_gb(tier) * 1_000_000_000.0).round() as u64;
     contract
@@ -116,11 +120,22 @@ fn memory_strategy_contract_with_adapters(
 
 struct MageMemoryScope {
     selection: MemorySelection,
+    memory: Option<GenerationMemory>,
     geometry: MemoryGeometry,
     finished: bool,
 }
 
 impl MageMemoryScope {
+    fn ensure_active(&self) -> CoreResult<()> {
+        if self.finished {
+            Err(CoreError::Msg(
+                "mage_flow: memory-strategy request scope is already finished".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn synchronize_and_release(&mut self) -> CoreResult<()> {
         // `mlx_eval` is synchronous. Evaluating a sentinel on MLX's ordered default stream is a
         // terminal barrier for work queued by this request, including an error/cancellation exit
@@ -137,6 +152,7 @@ impl MageMemoryScope {
 
 impl MemoryRequestScope for MageMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
+        self.ensure_active()?;
         if self.selection.strategy != MemoryStrategy::Resident {
             return Err(CoreError::Unsupported(
                 "mage_flow: optimized memory strategies are not implemented yet".into(),
@@ -157,16 +173,16 @@ impl MemoryRequestScope for MageMemoryScope {
                 self.geometry.batch
             )));
         }
-        request.memory = Some(GenerationMemory::default());
+        request.memory = self.memory;
         Ok(())
     }
 
     fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        Ok(())
+        self.ensure_active()
     }
 
     fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        Ok(())
+        self.ensure_active()
     }
 
     fn configure_decode(
@@ -175,12 +191,14 @@ impl MemoryRequestScope for MageMemoryScope {
         _overlap: u32,
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
+        self.ensure_active()?;
         Err(CoreError::Unsupported(
             "mage_flow: bounded decode is reserved for SC-15509".into(),
         ))
     }
 
     fn configure_attention(&mut self, _chunk_size: u32) -> CoreResult<()> {
+        self.ensure_active()?;
         Err(CoreError::Unsupported(
             "mage_flow: bounded attention is reserved for SC-15509".into(),
         ))
@@ -191,12 +209,14 @@ impl MemoryRequestScope for MageMemoryScope {
         _first_block: u32,
         _block_count: u32,
     ) -> CoreResult<()> {
+        self.ensure_active()?;
         Err(CoreError::Unsupported(
             "mage_flow: bounded transformer residency is reserved for SC-15509".into(),
         ))
     }
 
     fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
+        self.ensure_active()?;
         self.synchronize_and_release()
     }
 }
@@ -842,6 +862,9 @@ impl Generator for MageFlow {
         }
         Ok(Some(Box::new(MageMemoryScope {
             selection: context.selection,
+            memory: self
+                .memory_strategy_contract
+                .generation_memory(&context.selection),
             geometry: context.geometry,
             finished: false,
         })))
@@ -1199,6 +1222,7 @@ mod tests {
             },
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            load_shape: mlx_gen::LoadShape::EagerMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
@@ -1324,6 +1348,7 @@ mod tests {
         };
         let mut canceled = MageMemoryScope {
             selection,
+            memory: Some(GenerationMemory::default()),
             geometry,
             finished: false,
         };
@@ -1341,6 +1366,7 @@ mod tests {
 
         let mut warm = MageMemoryScope {
             selection,
+            memory: Some(GenerationMemory::default()),
             geometry,
             finished: false,
         };

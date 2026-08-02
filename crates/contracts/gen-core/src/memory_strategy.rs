@@ -119,9 +119,10 @@ use crate::{
 /// provider changes tensor layout, quantization floors, execution structure, or another detail that
 /// invalidates its measurements.
 ///
-/// SC-16065 is additive and deliberately did not bump this value: existing variables retain their
-/// meanings, while typed auxiliary components opt into the existing `OverlayBytes` input.
-pub const MEMORY_CALIBRATION_ABI: u32 = 1;
+/// ABI 2 adds the typed load-shape axis to calibration identities, run contexts, and evidence keys.
+/// ABI-1 records are intentionally stale because eager and deferred measurements are not
+/// interchangeable.
+pub const MEMORY_CALIBRATION_ABI: u32 = 2;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -632,13 +633,16 @@ impl MemoryBackendRealization {
 pub struct MemoryCalibrationIdentity {
     pub abi: u32,
     pub fingerprint: String,
+    /// Exact intra-phase materialization shape covered by this calibration.
+    pub load_shape: LoadShape,
 }
 
 impl MemoryCalibrationIdentity {
-    pub fn new(fingerprint: impl Into<String>) -> Self {
+    pub fn new(fingerprint: impl Into<String>, load_shape: LoadShape) -> Self {
         Self {
             abi: MEMORY_CALIBRATION_ABI,
             fingerprint: fingerprint.into(),
+            load_shape,
         }
     }
 }
@@ -795,6 +799,16 @@ pub struct MemoryStrategyEngagementExclusion {
     pub evidence: String,
 }
 
+/// Representation of an explicit resident selection in [`crate::GenerationRequest::memory`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResidentRequestMemory {
+    /// Leave the request memory block absent and preserve the loaded provider's historical defaults.
+    #[default]
+    PreserveLoadDefaults,
+    /// Write `Some(GenerationMemory::default())` to disable load-time sequential/windowed defaults.
+    ExplicitResident,
+}
+
 /// Static provider contract returned before weights are loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryProviderContract {
@@ -813,6 +827,11 @@ pub struct MemoryProviderContract {
     /// Documented, provider-verified exceptions to the shared cumulative cost-order default.
     /// Prerequisite edges remain authoritative and cannot be removed through this list.
     pub default_engagement_exclusions: Vec<MemoryStrategyEngagementExclusion>,
+    /// How an explicit shared-contract `Resident` selection is represented on the generation
+    /// request. Most providers preserve their historical load-time defaults by leaving the memory
+    /// block absent. Providers whose load defaults themselves enable sequential/windowed execution
+    /// opt into an explicit all-disabled block so `Resident` can override those defaults.
+    pub resident_request_memory: ResidentRequestMemory,
     pub lifecycle: MemoryLifecycleCapabilities,
     pub formula: MemoryFormulaKind,
     /// `None` is the compatibility default for a provider that has not adopted calibration yet.
@@ -848,6 +867,7 @@ impl MemoryProviderContract {
             load_shape: LoadShape::EagerMaterialization,
             additional_prerequisites: Vec::new(),
             default_engagement_exclusions: Vec::new(),
+            resident_request_memory: ResidentRequestMemory::PreserveLoadDefaults,
             lifecycle: MemoryLifecycleCapabilities::default(),
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
@@ -983,6 +1003,98 @@ impl MemoryProviderContract {
             .into_iter()
             .filter(|rung| self.engages(strategy, *rung))
             .collect()
+    }
+
+    /// Canonical translation from an admitted shared selection into the tensor-neutral request
+    /// controls every provider executes. Engagement is read only through this contract, including
+    /// provider prerequisite edges and verified exclusions; provider implementations must not
+    /// duplicate this mapping.
+    pub fn generation_memory(
+        &self,
+        selection: &MemorySelection,
+    ) -> Option<crate::GenerationMemory> {
+        if selection.strategy == MemoryStrategy::Resident {
+            return match self.resident_request_memory {
+                ResidentRequestMemory::PreserveLoadDefaults => None,
+                ResidentRequestMemory::ExplicitResident => Some(crate::GenerationMemory::default()),
+            };
+        }
+
+        let parameters = selection.parameters;
+        let stage_residency = self.engages(selection.strategy, MemoryStrategy::StagedResidency);
+        let tile_vae_decode = self.engages(selection.strategy, MemoryStrategy::BoundedDecode);
+        let chunk_attention = self.engages(selection.strategy, MemoryStrategy::BoundedAttention);
+        let stream_transformer_blocks = self.engages(
+            selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        );
+        Some(crate::GenerationMemory {
+            stage_residency,
+            tile_vae_decode,
+            chunk_attention,
+            stream_transformer_blocks,
+            decode_tile_edge: tile_vae_decode
+                .then_some(parameters.decode_tile_edge)
+                .flatten(),
+            decode_overlap: tile_vae_decode
+                .then_some(parameters.decode_overlap)
+                .flatten(),
+            transformer_window_size: stream_transformer_blocks
+                .then_some(parameters.transformer_window_size)
+                .flatten(),
+            transformer_window_component: stream_transformer_blocks
+                .then(|| parameters.window_component()),
+            ..Default::default()
+        })
+    }
+
+    /// Deterministic provider-declared selection used by weights-free behavioral conformance.
+    pub fn representative_selection(
+        &self,
+        strategy: MemoryStrategy,
+        tier: MemoryNumericTier,
+        use_pid: bool,
+    ) -> crate::Result<MemorySelection> {
+        let mut parameters = MemoryStrategyParameters::default();
+        if self.engages(strategy, MemoryStrategy::BoundedDecode) {
+            if let Some(routes) = &self.pid_decode_routes {
+                let route = if use_pid { &routes.pid } else { &routes.native };
+                parameters.decode_tile_edge = route.tile_edges.first().copied();
+                parameters.decode_overlap = Some(route.tile_overlap);
+            } else if let Some(capability) = self.capability(MemoryStrategy::BoundedDecode) {
+                parameters.decode_tile_edge =
+                    capability.parameters.decode_tile_edges.first().copied();
+                parameters.decode_overlap = capability.parameters.decode_overlaps.first().copied();
+            }
+        }
+        if self.engages(strategy, MemoryStrategy::BoundedAttention) {
+            parameters.attention_chunk_size = self
+                .capability(MemoryStrategy::BoundedAttention)
+                .and_then(|capability| {
+                    capability.parameters.attention_chunk_sizes.first().copied()
+                });
+        }
+        if self.engages(strategy, MemoryStrategy::BoundedTransformerResidency) {
+            if let Some(capability) = self.capability(MemoryStrategy::BoundedTransformerResidency) {
+                parameters.transformer_window_size = capability
+                    .parameters
+                    .transformer_window_sizes
+                    .first()
+                    .copied();
+                parameters.transformer_window_component = capability
+                    .parameters
+                    .transformer_window_components
+                    .first()
+                    .copied();
+            }
+        }
+        let selection = MemorySelection {
+            strategy,
+            parameters,
+            tier,
+        };
+        self.validate_selection(&selection)?;
+        Ok(selection)
     }
 
     /// What one rung-4 window materialization does for this provider (SC-16090), or `None` if the
@@ -1225,6 +1337,12 @@ impl MemoryProviderContract {
             if calibration.fingerprint.trim().is_empty() {
                 errors.push("calibration fingerprint must be non-empty".to_owned());
             }
+            if calibration.load_shape != self.load_shape {
+                errors.push(format!(
+                    "calibration load shape {:?} does not match contract load shape {:?}",
+                    calibration.load_shape, self.load_shape
+                ));
+            }
         }
 
         if self.backend.backend_id().is_empty() {
@@ -1411,6 +1529,7 @@ pub fn standard_memory_strategy_safety_check(
     if let Some(calibration) = contract.calibration.as_ref() {
         if context.calibration_abi != calibration.abi
             || context.calibration_fingerprint != calibration.fingerprint
+            || context.load_shape != calibration.load_shape
         {
             return reject(format!(
                 "{}: calibration handshake mismatch",
@@ -1766,6 +1885,8 @@ pub struct MemoryRunContext {
     /// this handshake too; optimized-only evidence validation is not sufficient.
     pub calibration_abi: u32,
     pub calibration_fingerprint: String,
+    /// Typed materialization shape covered by the calibration handshake.
+    pub load_shape: LoadShape,
     pub mode: MemoryMode,
     pub has_reference: bool,
     pub use_pid: bool,
@@ -1785,6 +1906,55 @@ impl MemoryRunContext {
     ) -> MemoryPeakBreakdown {
         contract.decompose_predicted_peak(self.predicted_peak_bytes)
     }
+}
+
+/// Build a deterministic, finite, weights-free context from provider-owned route facts.
+pub struct MemoryBehaviorRoute {
+    pub mode: MemoryMode,
+    pub has_reference: bool,
+    pub use_pid: bool,
+    pub has_phases: bool,
+    pub overlay: Option<String>,
+}
+
+pub fn standard_memory_behavior_context(
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+    tier: MemoryNumericTier,
+    route: MemoryBehaviorRoute,
+) -> crate::Result<MemoryRunContext> {
+    let calibration = contract.calibration.as_ref().ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "{} has no calibration identity for optimized behavior",
+            contract.provider_id
+        ))
+    })?;
+    Ok(MemoryRunContext {
+        selection: contract.representative_selection(strategy, tier, route.use_pid)?,
+        calibration_abi: calibration.abi,
+        calibration_fingerprint: calibration.fingerprint.clone(),
+        load_shape: calibration.load_shape,
+        mode: route.mode,
+        has_reference: route.has_reference,
+        use_pid: route.use_pid,
+        has_phases: route.has_phases,
+        geometry: MemoryGeometry {
+            width: 1024,
+            height: 1024,
+            batch: 1,
+            frames: 1,
+        },
+        overlay: route.overlay,
+        budget: MemoryBudget {
+            total_bytes: 8 * 1024 * 1024 * 1024,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        },
+        predicted_peak_bytes: 1024 * 1024 * 1024,
+        cache_state: MemoryCacheState::Cold,
+        evidence_revision: "weights-free-provider-behavior".to_owned(),
+    })
 }
 
 /// Defense-in-depth result. It can accept or reject; it cannot replace the worker's selection.
@@ -1914,6 +2084,8 @@ pub struct MemoryEvidenceKey {
     pub resolved_route: String,
     pub backend: String,
     pub tier: MemoryNumericTier,
+    /// Exact intra-phase materialization shape measured by this evidence cell.
+    pub load_shape: LoadShape,
     pub mode: String,
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
@@ -2054,6 +2226,10 @@ impl MemoryEvidence {
         let Some(identity) = &contract.calibration else {
             return Err(MemoryEvidenceVerdict::Unverified);
         };
+        if self.key.load_shape != contract.load_shape || self.key.load_shape != identity.load_shape
+        {
+            return Err(MemoryEvidenceVerdict::FingerprintMismatch);
+        }
         if self.calibration_abi != identity.abi
             || self.calibration_fingerprint != identity.fingerprint
         {
@@ -2152,6 +2328,7 @@ mod tests {
             load_shape: LoadShape::DeferredMaterialization,
             additional_prerequisites: Vec::new(),
             default_engagement_exclusions: Vec::new(),
+            resident_request_memory: ResidentRequestMemory::PreserveLoadDefaults,
             lifecycle: MemoryLifecycleCapabilities {
                 phases: vec![
                     MemoryPhase::Conditioning,
@@ -2174,7 +2351,10 @@ mod tests {
                     MemoryFormulaVariable::PixelCount,
                 ],
             },
-            calibration: Some(MemoryCalibrationIdentity::new("test-layout-v1")),
+            calibration: Some(MemoryCalibrationIdentity::new(
+                "test-layout-v1",
+                LoadShape::DeferredMaterialization,
+            )),
             asset_facts: MemoryAssetFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
@@ -2194,6 +2374,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
@@ -2234,6 +2415,14 @@ mod tests {
                 if reason.contains("calibration handshake mismatch")
         ));
 
+        let mut wrong_shape = context.clone();
+        wrong_shape.load_shape = LoadShape::EagerMaterialization;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &wrong_shape),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+
         let mut wrong_abi = context;
         wrong_abi.calibration_abi += 1;
         assert!(matches!(
@@ -2241,6 +2430,16 @@ mod tests {
             MemorySafetyDecision::Reject { reason }
                 if reason.contains("calibration handshake mismatch")
         ));
+    }
+
+    #[test]
+    fn calibration_identity_load_shape_must_match_contract() {
+        let mut contract = adopted_contract();
+        contract.calibration.as_mut().unwrap().load_shape = LoadShape::EagerMaterialization;
+        assert!(contract
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("calibration load shape")));
     }
 
     #[test]
@@ -2415,6 +2614,7 @@ mod tests {
                     quant: Some(Quant::Q4),
                     component_precision_floors: &[],
                 },
+                load_shape: contract.load_shape,
                 mode: "text_to_image".to_owned(),
                 overlay: None,
                 geometry: MemoryGeometry {
@@ -2444,6 +2644,28 @@ mod tests {
             parity_result: MemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
+
+        evidence.key.load_shape = LoadShape::EagerMaterialization;
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+        evidence.key.load_shape = contract.load_shape;
+
+        let mut eager_contract = contract.clone();
+        eager_contract.load_shape = LoadShape::EagerMaterialization;
+        eager_contract.calibration.as_mut().unwrap().load_shape = LoadShape::EagerMaterialization;
+        assert_eq!(
+            evidence.optimized_eligibility(&eager_contract),
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+
+        evidence.calibration_abi = 1;
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
+        );
+        evidence.calibration_abi = MEMORY_CALIBRATION_ABI;
 
         let mut changed_composition = contract.clone();
         changed_composition.additional_prerequisites.push((
@@ -2778,6 +3000,7 @@ mod tests {
                     quant: None,
                     component_precision_floors: &[],
                 },
+                load_shape: contract.load_shape,
                 mode: "text_to_image".to_owned(),
                 overlay: None,
                 geometry: MemoryGeometry {

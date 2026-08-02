@@ -104,6 +104,34 @@ pub fn emit_spatial_preview(
     });
 }
 
+/// Project and emit a singleton-frame Qwen-VAE latent `[1, 16, 1, h, w]`.
+///
+/// Anima reuses [`crate::QwenVae`] and its normalized 16-channel latent space, but Cosmos keeps a
+/// singleton temporal axis during still-image denoise. The reshape stays inside the shared
+/// best-effort projection closure so an invalid layout loses only that decorative frame while still
+/// consuming its schedule position; it can never fail the generation or be retried as a duplicate.
+pub fn emit_single_frame_preview(
+    sink: &PreviewSink,
+    counter: &mlx_gen::preview::PreviewCounter,
+    sigmas: &[f32],
+    sigma: f32,
+    latents: &Array,
+) {
+    if !sink.is_active() {
+        return;
+    }
+    mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
+        let shape = latents.shape();
+        if shape.len() != 5 || shape[0] != 1 || shape[1] != 16 || shape[2] != 1 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "single-frame Qwen preview latent must have shape [1, 16, 1, h, w], got {shape:?}"
+            )));
+        }
+        let spatial = latents.reshape(&[1, shape[1], shape[3], shape[4]])?;
+        project_spatial_latents(&spatial)
+    });
+}
+
 fn project_spatial_latents(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
     mlx_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
 }
@@ -191,5 +219,24 @@ mod tests {
             packed_frames.lock().unwrap()[0].image,
             spatial_frames.lock().unwrap()[0].image
         );
+    }
+
+    #[test]
+    fn failed_single_frame_reshape_is_decorative_and_consumes_position() {
+        let invalid_video = Array::zeros::<f32>(&[1, 16, 2, 2, 2]).unwrap();
+        let valid_still = Array::zeros::<f32>(&[1, 16, 1, 2, 2]).unwrap();
+        let sigmas = [1.0_f32, 0.5, 0.0];
+        let counter = mlx_gen::preview::PreviewCounter::new(&sigmas);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+
+        emit_single_frame_preview(&sink, &counter, &sigmas, sigmas[0], &invalid_video);
+        emit_single_frame_preview(&sink, &counter, &sigmas, sigmas[0], &valid_still);
+        emit_single_frame_preview(&sink, &counter, &sigmas, sigmas[1], &valid_still);
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].current, frames[0].total), (2, 2));
     }
 }

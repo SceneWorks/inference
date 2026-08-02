@@ -143,9 +143,9 @@ use mlx_gen::gen_core::{
     MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
     MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
-    PerComponentBytes, Result as CoreResult, TransformerComponent,
+    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{Quant, WeightsSource};
 
@@ -385,19 +385,8 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// Calibration content fingerprint. It must change whenever quantization floors, tensor layout, or
 /// execution structure change in a way that invalidates measurements taken against this provider.
 ///
-/// The shape suffix is load-bearing: SC-15998 measured Eager and Deferred baselines at 9.550 and
-/// 4.847 GiB respectively, so evidence from one must never authorize the other.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "z-image-mlx-independent-materialization-v3-deferred";
-pub const EAGER_MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "z-image-mlx-independent-materialization-v3-eager";
-
-pub const fn memory_calibration_fingerprint(load_shape: mlx_gen::LoadShape) -> &'static str {
-    match load_shape {
-        mlx_gen::LoadShape::EagerMaterialization => EAGER_MEMORY_CALIBRATION_FINGERPRINT,
-        mlx_gen::LoadShape::DeferredMaterialization => MEMORY_CALIBRATION_FINGERPRINT,
-    }
-}
+/// Load shape is a typed evidence-key axis; this content fingerprint remains shape-independent.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materialization-v3";
 
 /// This provider's two bounded-decode routes, reconciled by the shared
 /// [`DecodeRoutes`](mlx_gen_pid::DecodeRoutes) (SC-15775).
@@ -543,6 +532,7 @@ pub fn memory_strategy_contract(
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
         default_engagement_exclusions: Vec::new(),
+        resident_request_memory: mlx_gen::gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -556,7 +546,8 @@ pub fn memory_strategy_contract(
         },
         formula,
         calibration: Some(MemoryCalibrationIdentity::new(
-            memory_calibration_fingerprint(spec.load_shape),
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
         )),
         asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
@@ -693,50 +684,6 @@ fn control_resident_components(
 ///
 /// `Resident` returns `None`, which is the historical fast path (`GenerationRequest::memory`
 /// untouched).
-pub(crate) fn z_image_generation_memory(
-    contract: &MemoryProviderContract,
-    selection: &MemorySelection,
-) -> Option<GenerationMemory> {
-    if selection.strategy == MemoryStrategy::Resident {
-        return None;
-    }
-    // SC-15510: the selected *parameters* travel with the levers. `validate_selection` has already
-    // established that a rung carries exactly the parameters it owns and no more. Each parameter is
-    // additionally gated on its OWN rung being engaged, so a lever that is off never ships the
-    // values it would have been driven with.
-    let parameters = selection.parameters;
-    let stage_residency = contract.engages(selection.strategy, MemoryStrategy::StagedResidency);
-    let tile_vae_decode = contract.engages(selection.strategy, MemoryStrategy::BoundedDecode);
-    let chunk_attention = contract.engages(selection.strategy, MemoryStrategy::BoundedAttention);
-    let stream_transformer_blocks = contract.engages(
-        selection.strategy,
-        MemoryStrategy::BoundedTransformerResidency,
-    );
-    Some(GenerationMemory {
-        stage_residency,
-        tile_vae_decode,
-        decode_tile_edge: tile_vae_decode
-            .then_some(parameters.decode_tile_edge)
-            .flatten(),
-        decode_overlap: tile_vae_decode
-            .then_some(parameters.decode_overlap)
-            .flatten(),
-        chunk_attention,
-        stream_transformer_blocks,
-        transformer_window_size: stream_transformer_blocks
-            .then_some(parameters.transformer_window_size)
-            .flatten(),
-        // SC-15794: carry the COMPONENT scope, not only the window size. Dropping it here would
-        // silently execute the DiT-only default while the evidence writer recorded whatever the
-        // selector chose — a rung-4-with-encoder-scope row for a run whose encoder never streamed.
-        // `window_component()` resolves `None` to the DiT default, so a pre-SC-15794 selection is
-        // unchanged.
-        transformer_window_component: stream_transformer_blocks
-            .then(|| parameters.window_component()),
-        ..Default::default()
-    })
-}
-
 /// Request-scoped lifecycle state for one admitted Z-Image generation.
 ///
 /// Holds no MLX arrays: its whole job is to translate the shared selection into
@@ -753,6 +700,7 @@ pub(crate) struct ZImageMemoryScope {
     /// hook's `(first_block, block_count)` against the plan actually running instead of accepting any
     /// pair. `None` below rung 4.
     pub(crate) transformer_window: Option<u32>,
+    cleanup: fn() -> CoreResult<()>,
     pub(crate) finished: bool,
 }
 
@@ -776,13 +724,22 @@ impl ZImageMemoryScope {
     /// Without both, a canceled or errored request can leave partially-resident buffers that poison
     /// the next request's budget. This runs on every exit path, including [`Drop`].
     fn synchronize_and_release(&mut self) -> CoreResult<()> {
-        let barrier = mlx_rs::Array::from(0.0_f32);
-        barrier.eval().map_err(mlx_gen::Error::from)?;
-        drop(barrier);
-        mlx_rs::memory::clear_cache();
+        (self.cleanup)()?;
         self.finished = true;
         Ok(())
     }
+}
+
+fn mlx_cleanup() -> CoreResult<()> {
+    let barrier = mlx_rs::Array::from(0.0_f32);
+    barrier.eval().map_err(mlx_gen::Error::from)?;
+    drop(barrier);
+    mlx_rs::memory::clear_cache();
+    Ok(())
+}
+
+fn weights_free_cleanup() -> CoreResult<()> {
+    Ok(())
 }
 
 impl MemoryRequestScope for ZImageMemoryScope {
@@ -978,6 +935,65 @@ pub(crate) fn registered_safety_check(
     }
 }
 
+pub(crate) fn registered_valid_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let tier = loaded_tier(spec, &contract.provider_id)?;
+    let is_control = contract.provider_id.ends_with("_control");
+    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
+        mode: if is_control {
+            mlx_gen::gen_core::MemoryMode::ImageToImage
+        } else {
+            mlx_gen::gen_core::MemoryMode::TextToImage
+        },
+        has_reference: is_control,
+        use_pid,
+        has_phases: false,
+        overlay: None,
+    };
+    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
+        mlx_gen::gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            tier,
+            route(false),
+        )?,
+    )];
+    if contract.pid_decode_routes.is_some()
+        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
+    {
+        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
+            mlx_gen::gen_core::standard_memory_behavior_context(
+                contract,
+                strategy,
+                tier,
+                route(true),
+            )?,
+        ));
+    }
+    Ok(fixtures)
+}
+
+pub(crate) fn registered_begin_request(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        loaded_tier(spec, provider_id)?,
+        context,
+        weights_free_cleanup,
+    )
+}
+
 /// Open a request scope after `safety_check` accepted `context`.
 pub(crate) fn begin_request(
     provider_id: &'static str,
@@ -985,20 +1001,39 @@ pub(crate) fn begin_request(
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_with_cleanup(provider_id, contract, loaded_tier, context, mlx_cleanup)
+}
+
+fn begin_request_with_cleanup(
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+    loaded_tier: MemoryNumericTier,
+    context: &MemoryRunContext,
+    cleanup: fn() -> CoreResult<()>,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
     Ok(Some(Box::new(ZImageMemoryScope {
         provider_id,
         geometry: context.geometry,
-        memory: z_image_generation_memory(contract, &context.selection),
+        memory: contract.generation_memory(&context.selection),
         use_pid: context.use_pid,
         transformer_window: (context.selection.strategy
             == MemoryStrategy::BoundedTransformerResidency)
             .then_some(())
             .and(context.selection.parameters.transformer_window_size),
+        cleanup,
         finished: false,
     })))
+}
+
+#[cfg(test)]
+fn z_image_generation_memory(
+    contract: &MemoryProviderContract,
+    selection: &mlx_gen::gen_core::MemorySelection,
+) -> Option<GenerationMemory> {
+    contract.generation_memory(selection)
 }
 
 /// The strategy parameters this provider accepts, for a caller that wants the whole domain in one
@@ -1019,8 +1054,8 @@ mod tests {
     use mlx_gen::attention::AttentionBudget;
     use mlx_gen::gen_core::WeightsSource;
     use mlx_gen::gen_core::{
-        MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, Precision, Quant,
-        MEMORY_CALIBRATION_ABI,
+        MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemorySelection, Precision,
+        Quant, MEMORY_CALIBRATION_ABI,
     };
 
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
@@ -1086,6 +1121,7 @@ mod tests {
             selection: selection_for(strategy, use_pid),
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            load_shape: mlx_gen::LoadShape::DeferredMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid,
@@ -1143,6 +1179,7 @@ mod tests {
         let calibration = contract.calibration.as_ref().unwrap();
         context.calibration_abi = calibration.abi;
         context.calibration_fingerprint = calibration.fingerprint.clone();
+        context.load_shape = calibration.load_shape;
         context.selection.tier.quant = quant;
         context
     }
@@ -1474,11 +1511,11 @@ mod tests {
         );
         assert_eq!(
             eager.calibration.as_ref().unwrap().fingerprint,
-            EAGER_MEMORY_CALIBRATION_FINGERPRINT
+            MEMORY_CALIBRATION_FINGERPRINT
         );
         assert_ne!(
-            deferred.calibration.as_ref().unwrap().fingerprint,
-            eager.calibration.as_ref().unwrap().fingerprint
+            deferred.calibration.as_ref().unwrap().load_shape,
+            eager.calibration.as_ref().unwrap().load_shape
         );
 
         // Use a lower rung implemented by both contracts so rejection proves evidence identity,
@@ -1492,7 +1529,8 @@ mod tests {
         ));
 
         let mut eager_context = context(MemoryStrategy::BoundedAttention);
-        eager_context.calibration_fingerprint = EAGER_MEMORY_CALIBRATION_FINGERPRINT.to_owned();
+        eager_context.calibration_fingerprint = MEMORY_CALIBRATION_FINGERPRINT.to_owned();
+        eager_context.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         assert!(matches!(
             safety_check(&deferred, eager_context.selection.tier, &eager_context),
             MemorySafetyDecision::Reject { reason }

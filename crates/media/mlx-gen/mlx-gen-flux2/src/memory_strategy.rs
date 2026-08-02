@@ -45,7 +45,10 @@ fn build_contract() -> MemoryProviderContract {
             MemoryFormulaVariable::ConditioningTokenCount,
         ],
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(CALIBRATION_FINGERPRINT));
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        CALIBRATION_FINGERPRINT,
+        LoadShape::EagerMaterialization,
+    ));
     for capability in &mut contract.strategies {
         if capability.strategy != MemoryStrategy::Resident {
             capability.support = MemoryStrategySupport::StructurallyNotApplicable {
@@ -208,6 +211,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint,
+            load_shape: calibration.load_shape,
             mode: MemoryMode::Edit,
             has_reference: true,
             use_pid: false,

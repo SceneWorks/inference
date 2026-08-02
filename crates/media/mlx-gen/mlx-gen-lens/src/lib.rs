@@ -117,7 +117,9 @@ pub fn register_providers(
         .register_generator(registry::TURBO_REGISTRATION)
         .register_generator(registry::BASE_REGISTRATION)
         .register_memory_strategy(registry::TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(registry::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(registry::BASE_MEMORY_REGISTRATION)
+        .register_memory_behavior(registry::BASE_MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 

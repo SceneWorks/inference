@@ -10,8 +10,8 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, Error, Progress, Result, TimestepConvention,
-    WeightsSource,
+    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
 
 use crate::conditioner::AnimaTextConditioner;
@@ -233,6 +233,7 @@ impl AnimaPipeline {
             scheduler,
             seed,
             dtype,
+            &PreviewSink::default(),
             cancel,
             on_progress,
         )
@@ -269,6 +270,7 @@ impl AnimaPipeline {
             None,
             0,
             dit_dtype,
+            &PreviewSink::default(),
             &cancel,
             &mut prog,
         )
@@ -371,11 +373,68 @@ impl AnimaPipeline {
     }
 }
 
+/// One inference denoise trajectory's preview state. Anima owns schedule cadence; Qwen owns the
+/// single-frame layout conversion and latent-to-RGB fit because both families use the same VAE.
+struct AnimaPreview<'a> {
+    sink: &'a PreviewSink,
+    counter: mlx_gen::preview::PreviewCounter,
+    sigmas: &'a [f32],
+}
+
+impl<'a> AnimaPreview<'a> {
+    fn new(sink: &'a PreviewSink, sigmas: &'a [f32]) -> Self {
+        Self {
+            sink,
+            counter: mlx_gen::preview::PreviewCounter::new(sigmas),
+            sigmas,
+        }
+    }
+
+    fn emit(&self, sigma: f32, latents: &Array) {
+        mlx_gen_qwen_image::preview::emit_single_frame_preview(
+            self.sink,
+            &self.counter,
+            self.sigmas,
+            sigma,
+            latents,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_anima_sampler<F>(
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    preview: &AnimaPreview<'_>,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: F,
+) -> Result<Array>
+where
+    F: FnMut(&Array, f32) -> Result<Array>,
+{
+    run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x, timestep| {
+            preview.emit(timestep, x);
+            predict(x, timestep)
+        },
+    )
+}
+
 /// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling; hoisted to a
 /// free fn over the DiT in sc-10840 so the resident struct API AND the staged-residency generator share
 /// one integrator): run `sampler` over [`anima_schedule`] from `init`, evaluating `dit` in `dit_dtype`,
 /// with CFG when `uncond` is `Some`. Byte-identical to the pre-hoist method — it took `&self` only to
-/// reach `self.components.dit`.
+/// reach `self.components.dit`. `preview` is advisory and cannot fail the denoise.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn denoise_loop(
     dit: &CosmosDiT,
@@ -388,10 +447,12 @@ pub(crate) fn denoise_loop(
     scheduler: Option<&str>,
     seed: u64,
     dit_dtype: Dtype,
+    preview: &PreviewSink,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let sigmas = anima_schedule(scheduler, steps);
+    let previews = AnimaPreview::new(preview, &sigmas);
     let guidance = Array::from_slice(&[guidance], &[1]);
     let predict = |x: &Array, sigma: f32| -> Result<Array> {
         let s = Array::from_slice(&[sigma], &[1]);
@@ -407,13 +468,13 @@ pub(crate) fn denoise_loop(
         // Integrate in f32 (the reference keeps latents f32).
         Ok(v.as_dtype(Dtype::Float32)?)
     };
-    run_flow_sampler(
+    run_anima_sampler(
         Some(sampler),
-        TimestepConvention::Sigma,
         &sigmas,
         init.clone(),
         seed,
         cancel,
+        &previews,
         on_progress,
         predict,
     )
@@ -565,6 +626,7 @@ impl AnimaHeavy {
         sampler: &str,
         scheduler: Option<&str>,
         seed: u64,
+        preview: &PreviewSink,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
@@ -580,6 +642,7 @@ impl AnimaHeavy {
             scheduler,
             seed,
             Dtype::Bfloat16,
+            preview,
             cancel,
             on_progress,
         )?;
@@ -732,7 +795,141 @@ pub(crate) fn render_latent_with_enc(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
+        Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    fn captured_sink() -> (PreviewSink, Arc<Mutex<Vec<mlx_gen::PreviewFrame>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        (sink, frames)
+    }
+
+    #[test]
+    fn active_preview_emits_one_numbered_frame_per_euler_step() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let (sink, frames) = captured_sink();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+
+        run_anima_sampler(
+            Some("euler"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 1, 2, 3]).unwrap(),
+            16629,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 3), (2, 3), (3, 3)]
+        );
+        assert!(frames
+            .iter()
+            .all(|frame| (frame.image.width, frame.image.height) == (3, 2)));
+    }
+
+    #[test]
+    fn active_preview_deduplicates_multieval_heun_steps() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let (sink, frames) = captured_sink();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+
+        run_anima_sampler(
+            Some("heun"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 1, 2, 2]).unwrap(),
+            16629,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.last().map(|frame| frame.current), Some(3));
+        assert!(frames.iter().all(|frame| frame.total == 3));
+    }
+
+    #[test]
+    fn inert_preview_preserves_fixed_seed_default_sampler_bytes() {
+        let sigmas = anima_sigmas(4);
+        let seed = 16629;
+        let initial = create_noise(seed, 16, 16).unwrap();
+        let direct = run_flow_sampler(
+            Some(DEFAULT_SAMPLER),
+            TimestepConvention::Sigma,
+            &sigmas,
+            initial.clone(),
+            seed,
+            &CancelFlag::new(),
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        let sink = PreviewSink::default();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+        let wrapped = run_anima_sampler(
+            Some(DEFAULT_SAMPLER),
+            &sigmas,
+            initial,
+            seed,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        assert_eq!(
+            direct.try_as_slice::<f32>().unwrap(),
+            wrapped.try_as_slice::<f32>().unwrap()
+        );
+        assert_eq!(previews.counter.next(&sigmas, sigmas[0]), Some(1));
+    }
+
+    #[test]
+    fn single_frame_layout_reuses_qwen_projection_exactly() {
+        let sigmas = [1.0_f32, 0.0];
+        let latents = create_noise(42, 16, 24).unwrap();
+        assert_eq!(latents.shape(), &[1, 16, 1, 3, 2]);
+
+        let (anima_sink, anima_frames) = captured_sink();
+        AnimaPreview::new(&anima_sink, &sigmas).emit(sigmas[0], &latents);
+
+        let spatial = latents.reshape(&[1, 16, 3, 2]).unwrap();
+        let (qwen_sink, qwen_frames) = captured_sink();
+        mlx_gen_qwen_image::preview::emit_spatial_preview(
+            &qwen_sink,
+            &mlx_gen::preview::PreviewCounter::new(&sigmas),
+            &sigmas,
+            sigmas[0],
+            &spatial,
+        );
+
+        let anima_frames = anima_frames.lock().unwrap();
+        let qwen_frames = qwen_frames.lock().unwrap();
+        assert_eq!(anima_frames.len(), 1);
+        assert_eq!(qwen_frames.len(), 1);
+        assert_eq!(anima_frames[0].current, qwen_frames[0].current);
+        assert_eq!(anima_frames[0].total, qwen_frames[0].total);
+        assert_eq!(anima_frames[0].image, qwen_frames[0].image);
+    }
 
     #[test]
     fn sigma_schedule_linspace_shift3() {

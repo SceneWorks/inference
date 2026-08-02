@@ -8,7 +8,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadSpec, MemoryGeometry, MemoryNumericTier,
     MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, Precision, Quant, WeightsSource,
+    MemorySafetyDecision, MemoryStrategy, Precision, Quant, WeightsSource,
 };
 #[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
@@ -32,45 +32,13 @@ pub(crate) const CALIBRATION_FINGERPRINT: &str =
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
-pub(crate) fn generation_memory(
-    contract: &MemoryProviderContract,
-    selection: MemorySelection,
-) -> Option<GenerationMemory> {
-    if selection.strategy == MemoryStrategy::Resident {
-        return None;
-    }
-    let parameters = selection.parameters;
-    let stage_residency = contract.engages(selection.strategy, MemoryStrategy::StagedResidency);
-    let tile_vae_decode = contract.engages(selection.strategy, MemoryStrategy::BoundedDecode);
-    let chunk_attention = contract.engages(selection.strategy, MemoryStrategy::BoundedAttention);
-    let stream_transformer_blocks = contract.engages(
-        selection.strategy,
-        MemoryStrategy::BoundedTransformerResidency,
-    );
-    Some(GenerationMemory {
-        stage_residency,
-        tile_vae_decode,
-        decode_tile_edge: tile_vae_decode
-            .then_some(parameters.decode_tile_edge)
-            .flatten(),
-        decode_overlap: tile_vae_decode
-            .then_some(parameters.decode_overlap)
-            .flatten(),
-        chunk_attention,
-        stream_transformer_blocks,
-        transformer_window_size: stream_transformer_blocks
-            .then_some(parameters.transformer_window_size)
-            .flatten(),
-        ..Default::default()
-    })
-}
-
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let streamable = matches!(spec.weights, gen_core::WeightsSource::Dir(_));
+    let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, gen_core::WeightsSource::Dir(_));
     let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
             .unwrap_or_default();
@@ -125,7 +93,7 @@ pub(crate) fn provider_contract(
         // this provider's bounded host-decode route, the request safety gate rejects optimized PiD
         // runs.
         pid_decode_routes: None,
-        load_shape: LoadShape::DeferredMaterialization,
+        load_shape: spec.load_shape,
         additional_prerequisites: [
             MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
@@ -143,6 +111,7 @@ pub(crate) fn provider_contract(
         })
         .collect(),
         default_engagement_exclusions: Vec::new(),
+        resident_request_memory: gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases.clone(),
             synchronized_phase_release: true,
@@ -163,7 +132,10 @@ pub(crate) fn provider_contract(
                 MemoryFormulaVariable::TransformerWindowSize,
             ],
         },
-        calibration: Some(MemoryCalibrationIdentity::new(CALIBRATION_FINGERPRINT)),
+        calibration: Some(MemoryCalibrationIdentity::new(
+            CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        )),
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -208,6 +180,7 @@ pub(crate) fn control_contract(
     contract.asset_facts.overlay_bytes = overlay_bytes;
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         CONTROL_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
     ));
     Ok(contract)
 }
@@ -233,7 +206,7 @@ impl ZImageMemoryScope {
             provider_id,
             device,
             geometry: context.geometry,
-            memory: generation_memory(contract, context.selection),
+            memory: contract.generation_memory(&context.selection),
             transformer_window: contract
                 .engages(
                     context.selection.strategy,
@@ -461,16 +434,128 @@ pub(crate) fn registered_safety_check(
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn registered_valid_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: snapshot_quant_tier(spec, &contract.provider_id)?,
+            component_precision_floors: &[],
+        },
+        gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        },
+    )?;
+    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn registered_begin_request(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    let quant = snapshot_quant_tier(spec, provider_id)?;
+    validate_context(provider_id, contract, context, quant)?;
+    Ok(Some(Box::new(ZImageMemoryScope::new(
+        provider_id,
+        Device::Cpu,
+        contract,
+        context,
+    ))))
+}
+
+#[cfg(test)]
+fn generation_memory(
+    contract: &MemoryProviderContract,
+    selection: gen_core::MemorySelection,
+) -> Option<GenerationMemory> {
+    contract.generation_memory(&selection)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::gen_core::{
-        MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemoryStrategyParameters,
-        Precision, WeightsSource,
+        MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemorySelection,
+        MemoryStrategyParameters, Precision, WeightsSource,
     };
 
     fn spec() -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        spec
+    }
+
+    #[test]
+    fn plain_contract_shape_controls_streaming_and_rung_four() {
+        let deferred = provider_contract(crate::MODEL_ID, &spec()).unwrap();
+        assert_eq!(deferred.load_shape, LoadShape::DeferredMaterialization);
+        assert_eq!(
+            deferred.calibration.as_ref().unwrap().load_shape,
+            LoadShape::DeferredMaterialization
+        );
+        assert!(deferred.lifecycle.transformer_window_materialization);
+        assert!(matches!(
+            deferred
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        ));
+
+        let mut eager_spec = spec();
+        eager_spec.load_shape = LoadShape::EagerMaterialization;
+        let eager = provider_contract(crate::MODEL_ID, &eager_spec).unwrap();
+        assert_eq!(eager.load_shape, LoadShape::EagerMaterialization);
+        assert_eq!(
+            eager.calibration.as_ref().unwrap().load_shape,
+            LoadShape::EagerMaterialization
+        );
+        assert!(!eager.lifecycle.transformer_window_materialization);
+        assert!(matches!(
+            eager
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        ));
+    }
+
+    #[test]
+    fn weights_free_behavior_uses_the_cpu_scope_path() {
+        let spec = spec();
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+        let mut fixture =
+            registered_valid_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+        let mut scope =
+            registered_begin_request(crate::MODEL_ID, &spec, &contract, &fixture.context)
+                .unwrap()
+                .unwrap();
+        scope.configure_request(&mut fixture.request).unwrap();
+        assert_eq!(
+            fixture.request.memory,
+            contract.generation_memory(&fixture.context.selection)
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
     }
 
     #[test]
@@ -530,6 +615,7 @@ mod tests {
             selection: rung_four_selection(),
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

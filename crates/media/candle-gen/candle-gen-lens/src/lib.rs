@@ -892,6 +892,7 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
             .into_iter()
             .collect(),
         default_engagement_exclusions: Vec::new(),
+        resident_request_memory: gen_core::ResidentRequestMemory::ExplicitResident,
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -943,37 +944,18 @@ fn lens_memory_strategy_safety_decision(
 }
 
 #[cfg(any(feature = "cuda", test))]
-fn lens_generation_memory(
-    contract: &gen_core::MemoryProviderContract,
-    selection: gen_core::MemorySelection,
-) -> Option<gen_core::GenerationMemory> {
-    use gen_core::MemoryStrategy;
-
-    // `Some(default)` is intentional for Resident: it distinguishes a request-scoped explicit
-    // Resident selection from `request.memory == None`, which means "honor this generator's load
-    // defaults". An eligible Sequential+Deferred generator defaults to staged/windowed execution,
-    // but the shared scope must still be able to select the resident baseline on that same instance.
-    let stream_transformer_blocks = contract.engages(
-        selection.strategy,
-        MemoryStrategy::BoundedTransformerResidency,
-    );
-    Some(gen_core::GenerationMemory {
-        stage_residency: contract.engages(selection.strategy, MemoryStrategy::StagedResidency),
-        stream_transformer_blocks,
-        transformer_window_size: stream_transformer_blocks
-            .then_some(selection.parameters.transformer_window_size)
-            .flatten(),
-        transformer_window_component: stream_transformer_blocks
-            .then_some(gen_core::TransformerComponent::TextEncoder),
-        ..Default::default()
-    })
-}
-
-#[cfg(any(feature = "cuda", test))]
 struct LensMemoryScope {
     device: Device,
     memory: Option<gen_core::GenerationMemory>,
     finished: bool,
+}
+
+#[cfg(test)]
+fn lens_generation_memory(
+    contract: &gen_core::MemoryProviderContract,
+    selection: gen_core::MemorySelection,
+) -> Option<gen_core::GenerationMemory> {
+    contract.generation_memory(&selection)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1242,7 +1224,7 @@ impl Generator for LensGenerator {
             }
             Ok(Some(Box::new(LensMemoryScope {
                 device: self.pipeline.device.clone(),
-                memory: lens_generation_memory(contract, context.selection),
+                memory: contract.generation_memory(&context.selection),
                 finished: false,
             })))
         }
@@ -1325,6 +1307,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1556,7 +1539,10 @@ fn memory_calibration(
         Some(Quant::Q8) if bounded_text => "lens-turbo-candle-cuda-q8-text-window-v1",
         _ => "lens-turbo-candle-cuda-resident-v1",
     };
-    Some(gen_core::MemoryCalibrationIdentity::new(fingerprint))
+    Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ))
 }
 
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
@@ -1638,7 +1624,7 @@ fn registered_lens_turbo_memory_strategy_contract(
     Ok(build_lens_turbo_memory_strategy_contract(spec))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn registered_lens_turbo_memory_strategy_safety_check(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -1653,12 +1639,96 @@ fn registered_lens_turbo_memory_strategy_safety_check(
     )
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn registered_lens_valid_fixture(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    strategy: gen_core::MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        gen_core::MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: descriptor_turbo().capabilities.component_precision_floors,
+        },
+        gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        },
+    )?;
+    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_lens_begin_request(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    if let gen_core::MemorySafetyDecision::Reject { reason } =
+        registered_lens_turbo_memory_strategy_safety_check(spec, contract, context)
+    {
+        return Err(gen_core::Error::Unsupported(reason));
+    }
+    Ok(Some(Box::new(LensMemoryScope {
+        device: Device::Cpu,
+        memory: contract.generation_memory(&context.selection),
+        finished: false,
+    })))
+}
+
+#[cfg(test)]
+mod weights_free_behavior_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_scope_executes_the_registered_lens_behavior() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()))
+            .with_offload_policy(candle_gen::gen_core::OffloadPolicy::Sequential)
+            .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization);
+        let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
+        let mut fixture = registered_lens_valid_fixture(
+            &spec,
+            &contract,
+            gen_core::MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let mut scope = registered_lens_begin_request(&spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut fixture.request).unwrap();
+        assert_eq!(
+            fixture.request.memory,
+            contract.generation_memory(&fixture.context.selection)
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+    }
+}
+
 #[cfg(feature = "cuda")]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID_TURBO,
     contract: registered_lens_turbo_memory_strategy_contract,
     safety_check: registered_lens_turbo_memory_strategy_safety_check,
 };
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_TURBO,
+        valid_fixtures: registered_lens_valid_fixture,
+        begin_request: registered_lens_begin_request,
+    };
 
 /// Add all Candle Lens generators and trainers to an explicit media registry builder.
 pub fn register_providers(
@@ -1668,7 +1738,9 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(BASE_REGISTRATION);
     #[cfg(feature = "cuda")]
-    let registry = registry.register_memory_strategy(TURBO_MEMORY_REGISTRATION);
+    let registry = registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR);
     registry.register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -2409,6 +2481,7 @@ mod integration_tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: gen_core::MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

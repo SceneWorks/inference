@@ -1161,6 +1161,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
