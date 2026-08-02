@@ -9,6 +9,7 @@
 | Evidence gathered by | Claude (Opus 5), automated agent, on behalf of Michael Trefry |
 | Retrieval date for **every** quote below | **2026-08-02** (unless a row says otherwise) |
 | Method | `curl` of the canonical licence file (upstream HF `raw/main/LICENSE*`, the licensor's own domain, or the licensor's own GitHub), then verbatim extraction of the operative clause |
+| Gated repos | Files behind an HF gate were retrieved **2026-08-02** with the authenticated Hugging Face CLI (`hf download <repo> <file>`) by Claude (Opus 5) on Michael Trefry's Windows host, under HF account **`SceneWorks`** (`hf auth whoami` → `user: SceneWorks`). See "Authenticated reads" below. |
 | Reviewed and signed off by | **_(unsigned — Michael)_** |
 | Sign-off date | **_(pending)_** |
 
@@ -44,36 +45,190 @@ The typed vocabulary is fixed by the landed contract (`crates/contracts/gen-core
 Every item below is either **AMBIGUOUS** (the text does not settle it) or **NOT FOUND** (no
 canonical text was reachable). None of them has been resolved by guessing.
 
-## U1. SD3.5's own `LICENSE.md` could not be read — the repo is gated (AMBIGUOUS)
+**Update 2026-08-02 (second pass, authenticated).** U1 is **RESOLVED**; U2 is **narrowed** — one of
+the four URLs was found and the other three are now positively established as having no address. A
+new item **U10** was opened by the authenticated read. Everything else stands.
 
-`https://huggingface.co/stabilityai/stable-diffusion-3.5-large/raw/main/LICENSE.md` returns **HTTP
-401** unauthenticated (2026-08-02). The HF model-card metadata declares
-`license_name: stabilityai-ai-community`, `license_link: LICENSE.md`, `gated: auto`. The identically
-named agreement published at `https://stability.ai/community-license-agreement` and the ungated copy
-committed in the SVD-XT repo were both read in full and are textually the same document (Last
-Updated: July 5, 2024). **What has not been verified is that SD3.5's gated `LICENSE.md` is that same
-text.** Michael has an HF account and can settle this in one click. Until then, family 5's terms are
-sourced from the SVD-XT copy and the stability.ai page, not from SD3.5's own file.
+## U1. SD3.5's own `LICENSE.md` — **RESOLVED. Read under authentication; cosmetic differences only.**
 
-## U2. `AcceptableUsePolicy{url}` has no URL to carry for four families (AMBIGUOUS)
+**Status: closed.** The first pass could not read the file (HTTP 401 anonymous) and *asserted* that
+SD3.5's gated `LICENSE.md` was the same text as the ungated SVD-XT copy. That assertion has now been
+tested directly and it **holds**.
 
-The typed variant requires a `url`. Four families impose an acceptable-use / prohibited-use
-obligation whose restrictions are **inline in the licence text** or **incorporated by reference with
-no address given**:
+| | |
+| --- | --- |
+| Read by | Claude (Opus 5), automated agent, on Michael Trefry's Windows host |
+| HF account | **`SceneWorks`** (verified with `hf auth whoami` → `user: SceneWorks`) |
+| Date | **2026-08-02** |
+| Command | `hf download stabilityai/stable-diffusion-3.5-large LICENSE.md` |
+| Local path | `E:\huggingface\hub\models--stabilityai--stable-diffusion-3.5-large\snapshots\ceddf0a7fdf2064ea28e2213e3b84e4afa170a0f\LICENSE.md` |
+| Revision | snapshot `ceddf0a7fdf2064ea28e2213e3b84e4afa170a0f` — **confirmed equal to the repo's current `main` `sha`** via `https://huggingface.co/api/models/stabilityai/stable-diffusion-3.5-large` |
+| Card metadata (unchanged) | `license_name: stabilityai-ai-community`, `license_link: LICENSE.md`, `gated: auto` |
 
-| family | what the text does | quote |
+Both files were then compared byte-for-byte against
+`stabilityai/stable-video-diffusion-img2vid-xt` `LICENSE.md` (also re-fetched with the same CLI,
+snapshot `9e43909513c6714f1bc78bcb44d96e733cd242aa`).
+
+- SD3.5 `LICENSE.md`: **11,726 bytes**, LF-only, no BOM.
+- SVD-XT `LICENSE.md`: **11,852 bytes**, LF-only, no BOM.
+- Both carry the identical title line and date: `STABILITY AI COMMUNITY LICENSE AGREEMENT` /
+  `Last Updated: July 5, 2024`.
+
+### Verdict: **COSMETIC_DIFF — no substantive divergence**
+
+The 126-byte delta is entirely typographic. After normalising curly quotes to straight, collapsing
+whitespace, and mapping the section headings, both documents reduce to **36 lines each**, of which
+only **3 still differ** — rows 4–6 below: two are punctuation around an **identical** URL, and the
+third is a missing space. No word of operative text differs. Full inventory, including the three
+differences that normalisation absorbs:
+
+| # | difference | character of it |
 | --- | --- | --- |
-| `creativeml-openrail-pp-m` | inline use restrictions, no external policy | restrictions are enumerated in the licence's own "Use Restrictions" section |
-| `flux-1-dev-non-commercial` | inline prohibited-use list in §4; no AUP URL anywhere in v1.1.1 | the only external address in the whole licence is "Please see www.bfl.ai if you would like a commercial license" |
-| `krea-2-community` | incorporated by reference, address not stated | "You must comply with the Acceptable Use Policy, which is incorporated herein by reference." |
-| `ltx-2-community` | referenced in Attachment A, address not stated | "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use Policy." |
+| 1 | headings: SD3.5 `I.`–`V.` (Roman) vs SVD-XT `1.`–`5.` (Arabic) | Formatting. Note both bodies cross-reference "Section III", "Section IV(a)", "Section V below", so **SD3.5's Roman numbering is the internally consistent one**; SVD-XT's Arabic headings disagree with its own cross-references |
+| 2 | SD3.5 uses straight quotes `"` `'`; SVD-XT uses curly `“” ’` | Typographic |
+| 3 | SVD-XT blank-line-separates the definitions; SD3.5 does not | Whitespace |
+| 4 | AUP: SVD-XT `available at (https://stability.ai/use-policy),` vs SD3.5 `available at https://stability.ai/use-policy,` | **Same URL**, parentheses vs bare |
+| 5 | Core Models: SVD-XT `available at (https://stability.ai/core-models)` vs SD3.5 `available at, https://stability.ai/core-models,` | **Same URL**, punctuation only |
+| 6 | SD3.5 has a missing space: `including"fine tune"` vs SVD-XT `including “fine tune”` | Typo; same words |
 
-Michael must decide the convention: point `url` at the licence text itself (the restrictions *are*
-the policy), leave `AcceptableUsePolicy` off these families, or change the variant. **Do not invent a
-URL.** Note that the sc-16661 test fixture currently guesses
-`AcceptableUsePolicy { url: "https://blackforestlabs.ai/aup" }` for FLUX — **that URL 404s**
-(redirects to `https://bfl.ai/aup`, HTTP 404, checked 2026-08-02) and appears nowhere in the FLUX.1
-[dev] licence. It is a fixture, not evidence, but it should not be copied into the real table.
+### The revenue-ceiling clause is **byte-identical** in both files
+
+Tested with case-sensitive string equality on the extracted sentence (887 characters in both):
+
+> "If You are using or distributing the Stability AI Materials for a Commercial Purpose, You must
+> register with Stability AI at (https://stability.ai/community-license). If at any time You or Your
+> Affiliate(s), either individually or in aggregate, generate **more than USD $1,000,000** in annual
+> revenue (or the equivalent thereof in Your local currency), regardless of whether that revenue is
+> generated directly or indirectly from the Stability AI Materials or Derivative Works, any licenses
+> granted to You under this Agreement shall terminate as of such date."
+
+— `stabilityai/stable-diffusion-3.5-large` `LICENSE.md` §III, retrieved 2026-08-02 under HF account
+`SceneWorks`. The same sentence, character for character, is in the SVD-XT file.
+
+**Boundary wording confirmed EXCLUSIVE.** SD3.5 says **"generate more than USD $1,000,000 in annual
+revenue"**. It does **not** say "at least". The string `at least` does not occur anywhere in either
+file. The introductory paragraph is likewise identical in both and states the complementary side:
+
+> "this Agreement  preserves free access to the Models for people or organizations  generating annual
+> revenue of **less than US $1,000,000** (or local currency equivalent)."
+
+— same source. So $1,000,000 exactly sits **below** the threshold under this licence — contrast
+LTX-2's "at least $10,000,000", which is inclusive (family 8).
+
+### Consequence
+
+**The #5/#6 single-family merge stands.** `stable-video-diffusion-community` and
+`stabilityai-ai-community` are two declared identifier strings over one licence text, and family 5's
+terms are now sourced from **SD3.5's own file**, not from a proxy. Family 5's `text_url` has been
+updated accordingly. No term in family 5 changes as a result of this read.
+
+## U2. `AcceptableUsePolicy{url}` for four families — **NARROWED. One URL found; three confirmed to have none.**
+
+The typed variant requires a `url`. On the second pass each of the four families was re-checked
+against the upstream repo itself under authentication — licence text, `README.md`, the model card's
+`extra_gated_prompt`, and the licensor's own GitHub. Result:
+
+| family | outcome | address |
+| --- | --- | --- |
+| `krea-2-community` | ✅ **RESOLVED** | `https://www.krea.ai/krea-2-use-policy` |
+| `creativeml-openrail-pp-m` | **inline, no canonical URL** (positively established) | — |
+| `flux-1-dev-non-commercial` | **inline, no canonical URL**; the card's own cited policy file **does not exist** | — |
+| `ltx-2-community` | **referenced but never defined and no address anywhere** | — |
+
+### ✅ Krea 2 — RESOLVED: `https://www.krea.ai/krea-2-use-policy`
+
+The address is not in the licence PDF; it is in the model card's gate prompt.
+`krea/Krea-2-Turbo` `README.md` (retrieved 2026-08-02 with the authenticated CLI), YAML
+`extra_gated_prompt`, verbatim:
+
+> "…and acknowledge the [Acceptable Use Policy](https://www.krea.ai/krea-2-use-policy)."
+
+That URL was fetched and **resolves: HTTP 200**. Its title is **"Krea Acceptable Use Policy"** and
+its opening sentence scopes it to exactly the weights this repo loads:
+
+> "This Acceptable Use Policy applies to all use of Krea 2 Raw model weights and Krea 2 Turbo model
+> weights obtained through download, including any Derivatives and any Outputs generated from such
+> weights."
+
+— `https://www.krea.ai/krea-2-use-policy`, retrieved 2026-08-02. The page is dated **June 22, 2026**,
+the same date as the Krea 2 Community License Agreement v.1, which corroborates that this is the
+document §4.4 incorporates by reference. Family 7's row is updated.
+
+### `creativeml-openrail-pp-m` (SDXL) — inline, no canonical URL
+
+`stabilityai/stable-diffusion-xl-base-1.0` `LICENSE.md` (14,105 chars, retrieved 2026-08-02) contains
+**zero `http(s)://` URLs of any kind** — verified by regex over the whole file. The restrictions are
+enumerated in the licence's own Attachment A, and the body designates them as the operative
+restriction set:
+
+> "Use-based restrictions. The restrictions set forth in Attachment A are considered Use-based
+> restrictions. Therefore You cannot use the Model and the Derivatives of the Model for the specified
+> restricted uses."
+
+— same source. There is no external policy to point at. **"Inline, no canonical URL" is the finding**,
+not a gap.
+
+### `flux-1-dev-non-commercial` — inline; and the card's cited `POLICY.md` **does not exist**
+
+The licence text itself was re-read under authentication (see U10 note below: the gated HF copy is
+**identical** to the GitHub copy the first pass used). Grepping the full 18,491-char text for
+`acceptable use` / `prohibited use` / `use polic` / `aup` returns **no match at all** — the prohibited
+uses are enumerated inline in §4.
+
+`black-forest-labs/FLUX.1-dev` `README.md` YAML `extra_gated_prompt` does cite a policy, verbatim:
+
+> "…and acknowledge the [Acceptable Use Policy](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/POLICY.md)."
+
+**That file does not exist.** Three independent confirmations, all 2026-08-02:
+
+1. `hf download black-forest-labs/FLUX.1-dev POLICY.md` → `Entry Not Found for url:
+   https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/POLICY.md` (authenticated, so this
+   is a genuine absence and not a gate refusal).
+2. The repo's **complete** file listing from the HF API at `main` contains `LICENSE.md` and
+   `README.md` and **no `POLICY.md`**.
+3. `https://raw.githubusercontent.com/black-forest-labs/flux/main/POLICY.md` → **404**, as does
+   `.../model_licenses/POLICY.md`.
+
+So FLUX's gate asks you to acknowledge a document that is not published at the address it names.
+**AMBIGUOUS** — recorded, not resolved. The honest entry for this family is a blank.
+
+### `ltx-2-community` — referenced, never defined, no address
+
+`Acceptable Use Policy` occurs **exactly once** in the whole LTX-2 licence, in Attachment A:
+
+> "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use
+> Policy. In addition, you agree not to use the Outputs, LTX-2 or its Derivatives in any of the
+> following ways: …"
+
+— `Lightricks/LTX-2.3` `LICENSE`, retrieved 2026-08-02. Note **"In addition"**: the enumerated list
+that follows is presented as *additional to* the Acceptable Use Policy, so the AUP is not simply a
+label for Attachment A — it reads as a separate document. But the term is capitalised without ever
+being defined, and:
+
+- the licence's definitions section never defines it;
+- the only URL in the HF copy of the licence is `https://github.com/Lightricks/LTX-2`;
+- the `Lightricks/LTX-2` GitHub repo root contains only `LICENSE`, `README.md`, `pyproject.toml`,
+  `uv.lock` and dotfiles — **no policy document**;
+- `https://raw.githubusercontent.com/Lightricks/LTX-2/main/POLICY.md` and
+  `.../ACCEPTABLE_USE_POLICY.md` both **404**;
+- `Lightricks/LTX-2.3` `README.md` never mentions a policy.
+
+**AMBIGUOUS — dangling defined-term with no address.** Blank is the honest entry.
+
+### The sc-16661 fixture's FLUX URL
+
+The fixture guesses `AcceptableUsePolicy { url: "https://blackforestlabs.ai/aup" }`. Re-checked
+2026-08-02: `https://blackforestlabs.ai/aup` → **HTTP 404**, and `https://bfl.ai/aup` → **HTTP 404**.
+Neither string appears anywhere in the FLUX.1 [dev] licence. **There is no correct URL to substitute**
+— see the FLUX subsection above. It is a fixture, not evidence, and must not be copied into the real
+table.
+
+### What is still Michael's to decide
+
+For the three families with no address, the convention question is unchanged: point `url` at the
+licence text itself (the restrictions *are* the policy), leave `AcceptableUsePolicy` off those
+families, or relax the variant so the URL is optional. **Do not invent a URL** — a 404 in this table
+is worse than an honest blank.
 
 ## U3. Whether `NonCommercialOutputs` follows from a non-commercial *use* restriction (AMBIGUOUS ×4)
 
@@ -171,6 +326,52 @@ of the licence must reach downstream recipients", Apache-2.0 qualifies; if it me
 the *use restrictions* on downstream users as enforceable provisions", it does not (Apache has no use
 restrictions). See Q2 below — this distinction is the crux.
 
+## U10. LTX-2 ships **two different licence texts**, and they differ substantively (NEW — AMBIGUOUS)
+
+Opened by the second (authenticated) pass. The first pass sourced family 8 from the GitHub copy,
+because that is what the HF card's `license_link` points at. But `Lightricks/LTX-2.3` — the repo whose
+weights this codebase actually loads — **commits its own `LICENSE`, and it is not the same text**.
+
+| | HF: `Lightricks/LTX-2.3` `LICENSE` | GitHub: `Lightricks/LTX-2` `main` `LICENSE` |
+| --- | --- | --- |
+| size | 21,393 bytes | 21,461 bytes |
+| licence date | `License date: January 5, 2026` | `License date: January 5, 2026` (same) |
+| revenue ceiling | "at least $10,000,000" | "at least $10,000,000" (same) |
+| **registration address** | **no URL** | `https://ltx.io/model/licensing` |
+| **"Control" threshold** | **50% or more** (inclusive) | **more than 50%** (exclusive) |
+
+Both differences are operative, not cosmetic.
+
+**1. The `RegistrationRequired` URL is absent from the shipped copy.** Verbatim, same sentence in each:
+
+> HF `LTX-2.3`: "…Commercial Entities interested in such a commercial license are required to contact
+> Licensor."
+
+> GitHub `LTX-2`: "…Commercial Entities interested in such a commercial license are required to
+> [contact Licensor](https://ltx.io/model/licensing)."
+
+— both retrieved 2026-08-02. So family 8's `RegistrationRequired{"https://ltx.io/model/licensing"}`
+is supported **only** by the GitHub copy. The text distributed alongside the checkpoint names no
+address at all. (`https://ltx.io/model/licensing` itself resolves, HTTP 200.)
+
+**2. The `"Control"` definition flips its boundary**, which changes which entities aggregate as
+Affiliates and therefore who is a "Commercial Entity" against the $10,000,000 ceiling:
+
+> HF `LTX-2.3`: "\"Control\" means the direct or indirect ownership of **fifty percent (50%) or more**
+> of the voting securities or other ownership interests…"
+
+> GitHub `LTX-2`: "\"Control\" means the direct or indirect ownership of **more than fifty percent
+> (50%)** of the voting securities or other ownership interests…"
+
+— both retrieved 2026-08-02. At exactly 50%, the two texts disagree about whether an entity is
+controlled.
+
+**Which one governs is not settled by the evidence.** Both are upstream Lightricks publications: the
+HF card's `license_link` field points at the GitHub blob, while the HF repo simultaneously commits a
+different `LICENSE` beside the weights. **AMBIGUOUS** — Michael must decide which text family 8 is
+transcribed from, and the answer determines whether `RegistrationRequired` has a URL at all. This is
+the same defect class as U1, caught the same way; it is recorded rather than resolved.
+
 ---
 
 # Q1 — Does the Stable Video Diffusion community licence carry a revenue ceiling?
@@ -213,7 +414,9 @@ is declared by `stabilityai/SAME-L`, and the six `stable-audio-3-*` rows already
 collapse to **one** `LicenseFamily`, with the differing strings recorded per-component in
 `ComponentLicense::declared` — which is exactly what that field is for.
 
-Subject to U1 (SD3.5's own file is gated and was not read).
+**No longer subject to U1.** SD3.5's own gated `LICENSE.md` has since been read under authentication
+(HF account `SceneWorks`, 2026-08-02) and its revenue-ceiling clause is **byte-identical** to
+SVD-XT's. The merge is confirmed on primary sources for both members. See U1.
 
 ---
 
@@ -389,7 +592,7 @@ Draft asserts both NC terms; only `NonCommercialWeights` is quotable.
 | [ ] | `DownstreamFlowDown` | Section III "Use-based restrictions as referenced in paragraph 5 MUST be included as an enforceable provision by You in any type of legal agreement … and You shall give notice to subsequent users You Distribute to, that the Model or Derivatives of the Model are subject to paragraph 5." |
 | [ ] | `AttributionRequired` | Section III "You must retain all copyright, patent, trademark, and attribution notices excluding those notices that do not pertain to any part of the Model" |
 | [ ] | `NoticeFileRequired` | Section III "You must cause any modified files to carry prominent notices stating that You changed the files" |
-| [ ] | ⚠ `AcceptableUsePolicy{url: ?}` | restrictions are inline in the licence's "Use Restrictions" section; **no external policy URL — see U2** |
+| [ ] | ⚠ `AcceptableUsePolicy{url: —}` | **inline, no canonical URL.** The file contains **zero URLs of any kind**. Body: "The restrictions set forth in Attachment A are considered Use-based restrictions. Therefore You cannot use the Model and the Derivatives of the Model for the specified restricted uses." — **see U2** |
 
 Draft has `AcceptableUsePolicy, DownstreamFlowDown`. Evidence adds `AttributionRequired` and
 `NoticeFileRequired`; the AUP URL is unresolved. The draft's note "commercial permitted" is a
@@ -399,13 +602,17 @@ conclusion, not a term — correctly absent from `terms`.
 
 ## 5. `stability-ai-community` — Stability AI Community License Agreement
 
-- **text_url**: `https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/raw/main/LICENSE.md`
-  (HTTP 200, 11,852 bytes, retrieved 2026-08-02) — the ungated committed copy.
-  Cross-checked against `https://stability.ai/community-license-agreement` (HTTP 200, same date).
-  Both: "STABILITY AI COMMUNITY LICENSE AGREEMENT / Last Updated: July 5, 2024".
+- **text_url**: `https://huggingface.co/stabilityai/stable-diffusion-3.5-large/raw/main/LICENSE.md`
+  — **SD3.5's own file, 11,726 bytes, read 2026-08-02 with the authenticated HF CLI under account
+  `SceneWorks`** at revision `ceddf0a7fdf2064ea28e2213e3b84e4afa170a0f` (= current `main`).
+  Corroborated by two independent copies with **byte-identical operative clauses**:
+  `https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/raw/main/LICENSE.md`
+  (HTTP 200, 11,852 bytes, ungated) and `https://stability.ai/community-license-agreement`
+  (HTTP 200). All three: "STABILITY AI COMMUNITY LICENSE AGREEMENT / Last Updated: July 5, 2024".
+  Differences between the SD3.5 and SVD-XT files are typographic only — **see U1** for the full diff.
 - **declared upstream — three different strings, one text**:
   - `stable-video-diffusion-community` (`stabilityai/stable-video-diffusion-img2vid-xt`)
-  - `stabilityai-ai-community` (`stabilityai/stable-diffusion-3.5-large`) — **see U1**
+  - `stabilityai-ai-community` (`stabilityai/stable-diffusion-3.5-large`) — ✅ **U1 resolved**
   - `stable-audio-community` (`stabilityai/SAME-L`)
   - plus `LicenseRef-Stability-AI-Community` already committed for the six `stable-audio-3-*` rows
 - **In-catalog checkpoints**: SVD-XT (`mlx-gen-svd`, `candle-gen-svd`); SD3.5 large / large-turbo /
@@ -414,7 +621,7 @@ conclusion, not a term — correctly absent from `terms`.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `RevenueCeiling{1_000_000}` | §III "If at any time You or Your Affiliate(s), either individually or in aggregate, generate more than USD $1,000,000 in annual revenue … any licenses granted to You under this Agreement shall terminate as of such date." |
+| [ ] | `RevenueCeiling{1_000_000}` | §III "If at any time You or Your Affiliate(s), either individually or in aggregate, generate **more than** USD $1,000,000 in annual revenue … any licenses granted to You under this Agreement shall terminate as of such date." — **boundary is EXCLUSIVE**; the string "at least" appears nowhere in either file. Verified byte-identical in SD3.5's own file and SVD-XT's (U1). Cf. the intro: "free access … for people or organizations  generating annual revenue of less than US $1,000,000" |
 | [ ] | `RegistrationRequired{"https://stability.ai/community-license"}` | §III "If You are using or distributing the Stability AI Materials for a Commercial Purpose, You must register with Stability AI at (https://stability.ai/community-license)." |
 | [ ] | `AttributionRequired` | §IV(a) "prominently display \"Powered by Stability AI\" on a related website, user interface, blogpost, about page, or product documentation" |
 | [ ] | `NoticeFileRequired` | §IV(a) "retain the following attribution notice within a \"Notice\" text file distributed as a part of such copies: \"This Stability AI Model is licensed under the Stability AI Community License, Copyright © Stability AI Ltd. All Rights Reserved\"" |
@@ -432,8 +639,12 @@ the two are one family, both carry the ceiling, and **both additionally carry
 ## 6. `flux-1-dev-non-commercial` — FLUX.1 [dev] Non-Commercial License v1.1.1
 
 - **text_url**: `https://raw.githubusercontent.com/black-forest-labs/flux/main/model_licenses/LICENSE-FLUX1-dev`
-  (HTTP 200, 18,621 bytes, retrieved 2026-08-02). First line: "FLUX.1 [dev] Non-Commercial License v1.1.1".
-  The HF copy at `black-forest-labs/FLUX.1-dev/raw/main/LICENSE.md` returns **HTTP 401** (gated).
+  (HTTP 200, 18,491 bytes, retrieved 2026-08-02). First line: "FLUX.1 [dev] Non-Commercial License v1.1.1".
+  The HF copy at `black-forest-labs/FLUX.1-dev/raw/main/LICENSE.md` returns **HTTP 401** anonymously,
+  but was **read 2026-08-02 with the authenticated HF CLI** (account `SceneWorks`, revision
+  `3de623fc3c33e44ffbe2bad470d0f45bccf2eb21`) and is **identical to the GitHub copy** — same 18,491
+  bytes, zero differences after whitespace normalisation. The gated-vs-proxy risk flagged for SD3.5
+  in U1 does **not** materialise here either.
 - **declared upstream**: `flux-1-dev-non-commercial-license` (HF card `license_name`)
 - **In-catalog checkpoints**: `black-forest-labs/FLUX.1-dev` (`mlx-gen-flux`, `candle-gen-flux`),
   FLUX.1-Krea-dev (same `license_name`), and transitively `mlx-gen-pulid` / `candle-gen-pulid`
@@ -446,7 +657,7 @@ the two are one family, both carry the ceiling, and **both additionally carry
 | [ ] | *(NOT `NonCommercialOutputs`)* | §2(d) "You may use Output for any purpose (including for commercial purposes), except as expressly prohibited herein." — draft is **correct** to exclude it |
 | [ ] | `DownstreamFlowDown` | §3(a) "you must make available a copy of this License to third-party recipients of the FLUX.1 [dev] Models and/or Derivatives you Distribute, and specify that any rights to use the FLUX.1 [dev] Models and/or Derivatives shall be directly granted by Company to said third-party recipients pursuant to this License" |
 | [ ] | `DeployerObligation{"implement and maintain content filtering measures"}` | §2(e) "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX.1 [dev] Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful or infringing content" |
-| [ ] | ⚠ `AcceptableUsePolicy{url: ?}` | prohibited uses are inline in §4; **no AUP URL in the text — see U2** |
+| [ ] | ⚠ `AcceptableUsePolicy{url: —}` | **inline, no canonical URL.** Prohibited uses are inline in §4; the strings "acceptable use" / "use policy" / "AUP" do **not occur anywhere** in the 18,491-char text. The model card's gate prompt cites `.../FLUX.1-dev/blob/main/POLICY.md`, but **that file does not exist** (authenticated `hf download` → "Entry Not Found"; absent from the repo's complete file list) — **see U2** |
 | [ ] | ⚠ `GatedAccess` | not a licence-text fact; HF `gated: auto` — **see U7** |
 
 **Draft correction.** Draft #7 had `NonCommercialWeights, GatedAccess, AcceptableUsePolicy`. Evidence
@@ -475,7 +686,7 @@ content filtering only to Krea. The draft's note that outputs are commercial-OK 
 | [ ] | `NoticeFileRequired` | §3.1(c) "retain the following attribution notice within a \"Notice\" text file distributed as part of such copies: \"Krea 2 is licensed under the Krea 2 Community License Agreement.\"" |
 | [ ] | `DeployerObligation{"implement reasonable and appropriate Content Filter measures"}` | §4.2 "You must implement reasonable and appropriate Content Filter measures to detect, prevent, and mitigate the generation or distribution of prohibited, harmful, or unlawful content through your deployment of the Krea Model or any Derivative." |
 | [ ] | `DeployerObligation{"disclose that Outputs were generated using artificial intelligence where required by law"}` | §4.3 "Where required by applicable law, regulation, or platform policy, you must clearly disclose that Outputs were generated using artificial intelligence." |
-| [ ] | ⚠ `AcceptableUsePolicy{url: ?}` | §4.4 "You must comply with the Acceptable Use Policy, which is incorporated herein by reference." — **no address given, see U2** |
+| [ ] | ✅ `AcceptableUsePolicy{"https://www.krea.ai/krea-2-use-policy"}` | §4.4 "You must comply with the Acceptable Use Policy, which is incorporated herein by reference." The address is **not** in the PDF but **is** in `krea/Krea-2-Turbo`'s model-card gate prompt: "acknowledge the [Acceptable Use Policy](https://www.krea.ai/krea-2-use-policy)". **URL resolves, HTTP 200**, titled "Krea Acceptable Use Policy", dated June 22, 2026 (= the licence's own date), and scoped to "all use of Krea 2 Raw model weights and Krea 2 Turbo model weights obtained through download". **U2 resolved for this family** |
 | [ ] | ⚠ `GatedAccess` | HF `gated: auto` — see U7 |
 
 **Draft correction.** Draft #8 had `GatedAccess, AcceptableUsePolicy, DeployerObligation{content
@@ -491,9 +702,15 @@ and a second `DeployerObligation`.
 
 ## 8. `ltx-2-community` — LTX-2 Community License Agreement
 
-- **text_url**: `https://raw.githubusercontent.com/Lightricks/LTX-2/main/LICENSE`
-  (HTTP 200, 21,467 bytes, retrieved 2026-08-02; this is the `license_link` in the HF card metadata).
-  Header: "LTX-2 Community License Agreement / License date: January 5, 2026"
+- **text_url**: ⚠ **two upstream texts exist and they differ — see U10.**
+  - `https://raw.githubusercontent.com/Lightricks/LTX-2/main/LICENSE` (HTTP 200, 21,461 bytes,
+    retrieved 2026-08-02; this is the `license_link` in the HF card metadata) — the copy the quotes
+    below are taken from unless noted.
+  - `https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE` (21,393 bytes, retrieved 2026-08-02)
+    — the copy committed **beside the weights this repo loads**. Same title and date, but it omits
+    the registration URL and inverts the `"Control"` threshold.
+
+  Both headers: "LTX-2 Community License Agreement / License date: January 5, 2026"
 - **declared upstream**: `ltx-2-community-license-agreement` (HF card `license_name`)
 - **In-catalog checkpoints**: `Lightricks/LTX-2.3` (`mlx-gen-ltx`, `candle-gen-ltx`). Note the crate
   targets LTX-**2.3**, which declares the LTX-**2** community licence.
@@ -501,12 +718,12 @@ and a second `DeployerObligation`.
 
 | ✔ | term | verbatim support |
 | --- | --- | --- |
-| [ ] | `RevenueCeiling{10_000_000}` | §2 "Entities with annual revenues of at least $10,000,000 (the \"Commercial Entities\") are required to obtain a paid commercial use license in order to use LTX-2 and Derivatives of LTX-2" |
-| [ ] | `RegistrationRequired{"https://ltx.io/model/licensing"}` | §2 "Commercial Entities interested in such a commercial license are required to [contact Licensor](https://ltx.io/model/licensing)." |
+| [ ] | `RevenueCeiling{10_000_000}` | §2 "Entities with annual revenues of **at least** $10,000,000 (the \"Commercial Entities\") are required to obtain a paid commercial use license in order to use LTX-2 and Derivatives of LTX-2" — **boundary is INCLUSIVE**, and this clause is **identical in both upstream copies** (U10), so the ceiling itself is not in doubt |
+| [ ] | ⚠ `RegistrationRequired{"https://ltx.io/model/licensing"}` | **GitHub copy only** — §2 "Commercial Entities interested in such a commercial license are required to [contact Licensor](https://ltx.io/model/licensing)." The HF `LTX-2.3` copy shipped with the weights reads "…are required to contact Licensor." with **no URL**. The URL resolves (HTTP 200) but is not in the shipped text — **see U10** |
 | [ ] | `DownstreamFlowDown` | §3(a) "Use-based restrictions as referenced in paragraph 4 and all provisions of Attachment A MUST be included as an enforceable provision by you in any type of legal agreement … governing the use and/or distribution of LTX-2" ; §3(b) "You must provide any third party recipients of LTX-2 or Derivatives of LTX-2 a copy of this Agreement, including all attachments and use policies." |
 | [ ] | `AttributionRequired` | §3(d) "You must retain all copyright, patent, trademark, and attribution notices excluding those notices that do not pertain to any part of LTX-2" |
 | [ ] | `NoticeFileRequired` | §3(c) "You must cause any modified files to carry prominent notices stating that you changed the files" |
-| [ ] | ⚠ `AcceptableUsePolicy{url: ?}` | Attachment A "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use Policy." — **no address given, see U2** |
+| [ ] | ⚠ `AcceptableUsePolicy{url: —}` | **referenced, never defined, no address anywhere.** Attachment A "When using the Outputs, LTX-2 and any Derivatives thereof, you will comply with the Acceptable Use Policy. **In addition**, you agree not to use the Outputs…" — the "In addition" implies the AUP is a *separate* document from the enumerated list, yet the term is never defined, the licence's only URL is the GitHub repo, and that repo root holds no policy file — **see U2** |
 
 **Draft correction.** Draft #9 had `RevenueCeiling{10_000_000}, AcceptableUsePolicy,
 DownstreamFlowDown`. The ceiling amount is confirmed, but note the framing is **inverted** relative
@@ -758,6 +975,29 @@ into per-component rows under the v3 schema rather than becoming `LicenseFamily`
 
 ---
 
+# Authenticated reads (gated repos)
+
+Everything in this section was retrieved on **2026-08-02** by Claude (Opus 5), automated agent, on
+Michael Trefry's Windows host, using the Hugging Face CLI logged in as **`SceneWorks`**
+(`hf auth whoami` → `user: SceneWorks`). Command form: `hf download <repo> <file>` — single text
+files only, no weights. These reads closed U1 and narrowed U2.
+
+| repo | file | anonymous | authenticated result |
+| --- | --- | --- | --- |
+| `stabilityai/stable-diffusion-3.5-large` | `LICENSE.md` | 401 | **200** — 11,726 bytes, rev `ceddf0a7…` (= `main`). Closes **U1** |
+| `stabilityai/stable-video-diffusion-img2vid-xt` | `LICENSE.md` | 200 | 200 — 11,852 bytes, rev `9e439095…` (re-fetched for the byte comparison) |
+| `black-forest-labs/FLUX.1-dev` | `LICENSE.md` | 401 | **200** — 18,491 bytes, rev `3de623fc…`; identical to the GitHub copy |
+| `black-forest-labs/FLUX.1-dev` | `README.md` | — | 200 — gate prompt cites a `POLICY.md` |
+| `black-forest-labs/FLUX.1-dev` | `POLICY.md` | — | ❌ **Entry Not Found** — the file does not exist. Confirms **U2/FLUX** |
+| `krea/Krea-2-Turbo` | `README.md` | — | 200 — gate prompt yields the AUP URL. Resolves **U2/Krea** |
+| `krea/Krea-2-Turbo` | `LICENSE.pdf` | 401 | ❌ **still refused** — "Access to model krea/Krea-2-Turbo is restricted and you are not in the authorized list." The `SceneWorks` account is **not** on Krea's allow-list, so the licence text remains sourced from the `license_link` CDN mirror in the card metadata (unchanged from the first pass) |
+| `Lightricks/LTX-2.3` | `LICENSE`, `README.md` | 200 | 200 — surfaced the two-texts divergence, **U10** |
+| `stabilityai/stable-diffusion-xl-base-1.0` | `LICENSE.md`, `README.md` | 200 | 200 — confirmed zero URLs in the licence |
+
+Gating status (`gated` field) and card metadata were read from `https://huggingface.co/api/models/<id>`.
+
+---
+
 # Retrieval log
 
 Every URL below was fetched on **2026-08-02** with `curl -sSL`. HTTP status recorded as observed.
@@ -770,10 +1010,16 @@ Every URL below was fetched on **2026-08-02** with `curl -sSL`. HTTP status reco
 | creativeml-openrail-pp-m | `https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/raw/main/LICENSE.md` | 200 |
 | stability-ai-community | `https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/raw/main/LICENSE.md` | 200 |
 | stability-ai-community (cross-check) | `https://stability.ai/community-license-agreement` | 200 |
-| stability-ai-community (SD3.5's own copy) | `https://huggingface.co/stabilityai/stable-diffusion-3.5-large/raw/main/LICENSE.md` | **401 — U1** |
+| stability-ai-community (SD3.5's own copy) | `https://huggingface.co/stabilityai/stable-diffusion-3.5-large/raw/main/LICENSE.md` | 401 anon → **200 authenticated — U1 CLOSED** |
 | flux-1-dev-non-commercial | `https://raw.githubusercontent.com/black-forest-labs/flux/main/model_licenses/LICENSE-FLUX1-dev` | 200 |
-| flux-1-dev-non-commercial (HF copy) | `https://huggingface.co/black-forest-labs/FLUX.1-dev/raw/main/LICENSE.md` | **401 (gated)** |
+| flux-1-dev-non-commercial (HF copy) | `https://huggingface.co/black-forest-labs/FLUX.1-dev/raw/main/LICENSE.md` | 401 anon → **200 authenticated; identical to GitHub copy** |
+| flux AUP cited by FLUX's own gate prompt | `https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/POLICY.md` | **does not exist — U2** |
 | flux AUP guess in sc-16661 fixture | `https://blackforestlabs.ai/aup` | **404 — U2** |
+| flux AUP guess, redirect target | `https://bfl.ai/aup` | **404 — U2** |
+| krea-2-community AUP (from card gate prompt) | `https://www.krea.ai/krea-2-use-policy` | **200 — U2 RESOLVED for Krea** |
+| ltx-2-community (copy shipped with the weights) | `https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE` | 200 — 21,393 bytes, **differs from GitHub — U10** |
+| ltx-2-community registration URL | `https://ltx.io/model/licensing` | 200 (present in GitHub copy only) |
+| ltx-2 AUP probes | `.../LTX-2/main/POLICY.md`, `.../ACCEPTABLE_USE_POLICY.md` | **404 both — U2** |
 | krea-2-community | `https://cdn.jsdelivr.net/gh/krea-ai/krea-2@db3984fb…/assets/hf_samples/LICENSE.pdf` | 200 |
 | ltx-2-community | `https://raw.githubusercontent.com/Lightricks/LTX-2/main/LICENSE` | 200 |
 | circlestone-labs-non-commercial | `https://huggingface.co/circlestone-labs/Anima/raw/main/LICENSE.md` | 200 |
@@ -822,8 +1068,8 @@ a guess.
 
 | decision | outcome |
 | --- | --- |
-| U1 SD3.5 gated text | |
-| U2 `AcceptableUsePolicy` with no URL | |
+| U1 SD3.5 gated text | ✅ **CLOSED 2026-08-02** — read under HF account `SceneWorks`; cosmetic differences only, revenue clause byte-identical, ceiling "more than USD $1,000,000" (exclusive). #5/#6 merge stands. No decision needed |
+| U2 `AcceptableUsePolicy` with no URL | **Narrowed.** Krea resolved → `https://www.krea.ai/krea-2-use-policy`. OpenRAIL++ / FLUX / LTX-2 confirmed to have **no canonical URL**; decision still needed on the convention for those three |
 | U3 `NonCommercialOutputs` from a use restriction | |
 | U4 `nvidia-open-model` has no checkpoint | |
 | U5 `candle-gen-sana/NOTICE` correction | |
@@ -831,4 +1077,5 @@ a guess.
 | U7 `GatedAccess` on family vs component | |
 | U8 Llama 700M MAU has no variant | |
 | U9 Apache-2.0 §4(a) as flow-down | |
+| U10 which of LTX-2's two texts governs | |
 | Q2 does `DownstreamFlowDown` carry the family id? | |
