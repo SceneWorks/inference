@@ -433,7 +433,7 @@ pub(crate) fn registered_valid_fixture(
             } else {
                 MemoryMode::TextToImage
             },
-            has_reference: edit,
+            reference_count: u32::from(edit),
             use_pid: false,
             has_phases: false,
             overlay: None,
