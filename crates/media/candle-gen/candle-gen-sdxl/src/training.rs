@@ -354,6 +354,7 @@ fn preview_latents(
         seed,
         &cancel,
         &mut on_progress,
+        None,
         |x_in, timestep| -> Result<Tensor> {
             // `x_in` is already `1/√(σ²+1)`-scaled by the solver; CFG-batch the single row to
             // `[uncond, cond]` and cast to the UNet compute dtype (exactly the inference closure).

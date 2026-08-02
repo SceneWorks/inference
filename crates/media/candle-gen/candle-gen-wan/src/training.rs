@@ -310,6 +310,7 @@ fn render_one_preview(
         seed,
         &cancel,
         &mut on_progress,
+        None,
         |x, sigma| -> Result<Tensor> {
             // σ → integer timestep (σ·1000); MoE: high-noise expert at/above the boundary, low below.
             let ts = sigma as f64 * NUM_TRAIN_TIMESTEPS as f64;

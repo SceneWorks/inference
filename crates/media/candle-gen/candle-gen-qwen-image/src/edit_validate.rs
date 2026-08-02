@@ -70,6 +70,7 @@ fn real_weight_edit() {
         seed: 12345,
         lightning: false,
         stage_residency: false,
+        memory: None,
         cancel: CancelFlag::new(),
     };
 
@@ -190,6 +191,7 @@ fn high_res_edit_avoids_i32_overflow() {
         seed: 12345,
         lightning: false,
         stage_residency: false,
+        memory: None,
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};
@@ -250,6 +252,7 @@ fn lightning_edit_4steps() {
         seed: 12345,
         lightning: true,
         stage_residency: false,
+        memory: None,
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};

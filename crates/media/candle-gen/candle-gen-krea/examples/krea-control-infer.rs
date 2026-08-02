@@ -199,6 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         a.seed,
         &cancel,
         &mut on_progress,
+        None,
         |x, timestep| {
             let t = Tensor::from_vec(vec![timestep], (1,), &device)?;
             let v = match (&branch, &ctrl_latent) {

@@ -365,6 +365,7 @@ impl Krea2ControlHeavy {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = forward_with_control(

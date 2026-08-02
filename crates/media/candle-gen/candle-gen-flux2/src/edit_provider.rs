@@ -247,6 +247,7 @@ impl Flux2Edit {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
                 // Joint image stream [target, refs] — references re-concatenated with the current target.

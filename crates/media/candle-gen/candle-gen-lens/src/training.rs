@@ -554,6 +554,7 @@ impl FlowMatchTrainer for LensTrainer {
             seed,
             &cancel,
             &mut on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call over the
                 // pre-encoded `[2, S, 2880]` features + `[2, S]` mask (frame = 1).

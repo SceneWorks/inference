@@ -52,19 +52,50 @@ The schema has three fact sections (see `sceneworks-gen-core::license`):
   hand-authored: a hand-typed "effective licence" is a second place to be wrong and can drift from
   the components it claims to summarize.
 
-Provider crates own their component rows beside their pinned `HUB_REPO`/`HUB_REVISION`;
-`candle-audio-catalog` aggregates them into the committed
-`release/model-weight-licenses.json`. Two gates keep it honest:
+### One manifest per catalog, one file in the bundle (sc-16664)
+
+Provider crates own their component rows beside their pinned `HUB_REPO`/`HUB_REVISION`; each
+composition root aggregates the rows it ships into a committed manifest under `release/`. Today that
+is `candle-audio-catalog` → `release/model-weight-licenses.json`; the two media catalogs land theirs
+with sc-16665/16666/16667.
+
+`build_release.py` **discovers every `release/model-weight-licenses*.json` by shape**, merges them,
+and emits one `<tag>.model-licenses.json`. Discovery is by glob rather than by an enumerated list of
+filenames on purpose: a list that failed to predict a filename would silently *skip* that catalog,
+and a release whose licences page is missing an entire backend would pass every gate. A new catalog
+manifest therefore needs no edit to the release tooling — committing the file is the whole wiring.
+Only the audio manifest is required to exist; the media manifests are merged as soon as they appear.
+
+A licence is a property of the *checkpoint*, and MLX and Candle load the same checkpoints, so
+component rows repeat across catalogs by design (sc-16665 authors them once in a shared table both
+media catalogs read). A key carried by more than one manifest must therefore agree, and
+**disagreement fails the build** — naming both source files, the fields that differ, and both rows in
+full, because which one is wrong is a question about the upstream licence that the tooling cannot
+answer. The rule covers families and provider ids too: a provider id registered by two catalogs
+against different components is a genuine registry collision, invisible until the merge. That is also
+why conformance runs over the **merged** table rather than over each manifest in turn.
+
+Three gates keep the committed manifests honest:
 
 - `candle-audio-catalog::every_shipped_provider_has_a_weight_license` — the ship-gate in the
   composition root: a provider that reaches the catalog without resolving to well-formed component
   rows fails the build, so **no audio provider can ship without its weight licence recorded**;
 - `candle-audio-catalog::component_licenses_manifest_matches_committed_file` — the drift gate: the
   committed JSON must equal what the catalog produces (regenerate with
-  `UPDATE_WEIGHT_LICENSES=1 cargo test -p candle-audio-catalog component_licenses_manifest_matches_committed_file`).
+  `UPDATE_WEIGHT_LICENSES=1 cargo test -p candle-audio-catalog component_licenses_manifest_matches_committed_file`);
+- `build_release.validate_model_weight_licenses` — the release gate, the Python mirror of
+  `license_table_conformance_errors`, run by the builder over the merged table and by
+  `verify_release.py` over the bundled copy (it *imports* the validator, so emit-time and bundle-time
+  cannot drift). Beyond the structural fields it resolves every `family` reference against the
+  families in the same document, requires an attribution wherever the family names
+  `attribution_required`, rejects whitespace-only identity fields and non-calendar `retrieved` dates
+  (`2026-02-31` is not a date; `2024-02-29` is), and **recomputes each provider's derived term
+  union** — same sort order, same dedup semantics as `provider_terms` — and compares it to the
+  emitted one, so a stale or hand-edited derived section cannot ship.
 
-`build_release.py` copies the committed manifest into the bundle (and fails if it is absent or
-structurally incomplete); `verify_release.py` re-checks the bundled copy.
+These are completeness checks on data we author, and they fail our own build. Nothing here runs at
+inference time and nothing withholds a provider: an incomplete licence table is a defect in what we
+would show a user, not a reason to refuse them a model.
 
 **What schema 2 stored, and why it is gone.** The retired schema recorded a `commercial_use` boolean
 — a legal *conclusion* depending on facts inference does not have. Several shipped checkpoints had no

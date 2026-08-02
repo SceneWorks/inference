@@ -71,13 +71,18 @@ def verify_sbom(bundle: Path, manifest: dict) -> None:
 
 
 def verify_model_licenses(bundle: Path, manifest: dict) -> None:
-    """Assert the model-weight-license manifest is present in the bundle and complete (sc-13332).
+    """Assert the model-weight-licence manifest is present in the bundle and sound (sc-13332).
 
-    Every shipped audio provider's pinned weight-checkpoint license must be recorded so SceneWorks
-    can surface it. The registry-completeness authority is the Rust catalog ship-gate
-    (`every_shipped_provider_has_a_weight_license`); this release-level gate confirms the emitted
-    artifact is present and that each entry carries its required fields (and any non-commercial
-    entry its restriction note).
+    One artifact, aggregated from every catalog's manifest at build time (sc-16664), so a consumer
+    reads exactly one file for its end-product licences page. The registry-completeness authority is
+    the Rust catalog ship-gate (`every_shipped_provider_has_a_weight_license`); this release-level
+    gate re-runs the full schema-3 conformance pass over the bundled copy — family resolution,
+    calendar-accurate `retrieved` dates, non-blank identity fields, and each provider's derived term
+    union recomputed and compared against the emitted one.
+
+    Deliberately the *same* `validate_model_weight_licenses` the builder runs, imported rather than
+    reimplemented: a second copy of these rules would let emit-time and bundle-time drift, and the
+    bundle is the only artifact a consumer ever sees.
     """
     artifacts = [
         artifact for artifact in manifest["artifacts"] if artifact["kind"] == MODEL_LICENSES_KIND

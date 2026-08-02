@@ -485,6 +485,7 @@ impl FlowMatchTrainer for KreaTrainer {
             seed,
             &cancel,
             &mut on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v_cond = dit.forward(x, &t, &ctx_pos)?;

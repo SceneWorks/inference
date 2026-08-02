@@ -21,12 +21,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, Progress};
+use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, OffloadPolicy, Progress};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -80,6 +81,8 @@ pub struct QwenEditRequest {
     pub lightning: bool,
     /// Release the text/VAE-encode phase before loading the DiT/VAE-decode phase for this request.
     pub stage_residency: bool,
+    /// Shared memory-ladder selection configured by the worker's request scope.
+    pub memory: Option<GenerationMemory>,
     pub cancel: CancelFlag,
 }
 
@@ -95,6 +98,7 @@ impl Default for QwenEditRequest {
             seed: 0,
             lightning: false,
             stage_residency: false,
+            memory: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -156,6 +160,8 @@ fn load_transformer(
     adapters: &[AdapterSpec],
     dtype: DType,
     device: &Device,
+    stream_transformer_blocks: bool,
+    cancel: &CancelFlag,
 ) -> Result<QwenTransformer> {
     let cfg = TransformerConfig::qwen_image();
     let dit_dir = root.join("transformer");
@@ -165,11 +171,49 @@ fn load_transformer(
     // the dense path). See `crate::transformer_group_size`.
     let gs = crate::transformer_group_size(&dit_dir);
     if adapters.is_empty() {
+        if stream_transformer_blocks {
+            let files = candle_gen::sorted_safetensors(&dit_dir, "qwen edit")?;
+            if let Some(packed) = crate::transformer_packed_config(&dit_dir) {
+                use candle_gen::candle_core::safetensors::MmapedSafetensors;
+                use candle_gen::quant::PackedWeightSidecars;
+
+                // SAFETY: read-only mmap over immutable snapshot files. Sidecar preparation converts
+                // only packed block weights and checks the request cancellation flag throughout.
+                let source = unsafe { MmapedSafetensors::multi(&files)? };
+                let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
+                    &source,
+                    &dit_dir,
+                    packed,
+                    device,
+                    cancel,
+                    "transformer_blocks.",
+                );
+                if cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let sidecars = Arc::new(prepared?);
+                let vb = VarBuilder::from_backend(Box::new(source), dtype, device.clone());
+                return Ok(QwenTransformer::new_block_streamed_with_sidecars_gs(
+                    &cfg, vb, gs, sidecars,
+                )?);
+            }
+            return Ok(QwenTransformer::new_block_streamed_gs(
+                &cfg,
+                component_vb(root, "transformer", dtype, device)?,
+                gs,
+            )?);
+        }
         return Ok(QwenTransformer::new_gs(
             &cfg,
             component_vb(root, "transformer", dtype, device)?,
             gs,
         )?);
+    }
+    if stream_transformer_blocks {
+        return Err(CandleError::Msg(
+            "qwen edit: bounded transformer residency is unavailable when adapters are attached"
+                .into(),
+        ));
     }
     // Additive residual for anything with a deferred form — REQUIRED on a packed base (no dense `W` to
     // fold), and now the default on a DENSE base too (sc-11684) so the adapted DiT loads at the base's
@@ -259,6 +303,8 @@ fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
 pub struct QwenEdit {
     device: Device,
     residency: candle_gen::Residency<EditText, EditHeavy>,
+    lifecycle: Mutex<()>,
+    stream_cancel: Arc<Mutex<CancelFlag>>,
     processor: QwenImageProcessor,
     tokenizer: TextTokenizer,
     zero_cond_t: bool,
@@ -300,6 +346,8 @@ impl QwenEdit {
         let heavy_root = root.clone();
         let heavy_device = device.clone();
         let heavy_adapters = paths.adapters.clone();
+        let stream_cancel = Arc::new(Mutex::new(CancelFlag::default()));
+        let heavy_cancel = stream_cancel.clone();
         let residency = candle_gen::Residency::request_scoped_with_resident(
             move |_| {
                 Ok((
@@ -318,6 +366,8 @@ impl QwenEdit {
                             &resident_adapters,
                             DIT_DTYPE,
                             &resident_device,
+                            false,
+                            &CancelFlag::default(),
                         )?,
                         vae: QwenVae::new(component_vb(
                             &resident_root,
@@ -339,13 +389,15 @@ impl QwenEdit {
                     )?)?,
                 })
             },
-            move |_, _| {
+            move |_, stream_transformer_blocks| {
                 Ok(EditHeavy {
                     transformer: load_transformer(
                         &heavy_root,
                         &heavy_adapters,
                         DIT_DTYPE,
                         &heavy_device,
+                        stream_transformer_blocks,
+                        &candle_gen::lock_recover(&heavy_cancel),
                     )?,
                     vae: QwenVae::new(component_vb(&heavy_root, "vae", ENC_DTYPE, &heavy_device)?)?,
                 })
@@ -356,6 +408,8 @@ impl QwenEdit {
             zero_cond_t: read_zero_cond_t(&root)?,
             device,
             residency,
+            lifecycle: Mutex::new(()),
+            stream_cancel,
             processor: QwenImageProcessor::default(),
             tokenizer,
         })
@@ -478,6 +532,22 @@ impl QwenEdit {
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            candle_gen::gen_core::attention_budget::AttentionBudget::CONSTRAINED
+        } else {
+            candle_gen::gen_core::attention_budget::AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )
+        };
+        let attention_plan =
+            candle_gen::gen_core::attention_budget::AttentionPlan::budgeted(attention_budget)
+                .with_cancel(&req.cancel);
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::TRANSFORMER_BLOCKS as usize);
 
         let latents = candle_gen::run_flow_sampler(
             None,
@@ -487,11 +557,12 @@ impl QwenEdit {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 // Concatenate the (updating) noise with the (static) reference latents over the sequence.
                 let joint = Tensor::cat(&[latents, static_latents], 1)?;
                 let pos_v = transformer
-                    .forward_edit(
+                    .forward_edit_with_memory(
                         &joint,
                         pos,
                         sigma,
@@ -499,12 +570,15 @@ impl QwenEdit {
                         lat_w,
                         cond_grids,
                         self.zero_cond_t,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
                     )?
                     .narrow(1, 0, noise_seq)?;
                 match neg {
                     Some(neg) => {
                         let neg_v = transformer
-                            .forward_edit(
+                            .forward_edit_with_memory(
                                 &joint,
                                 neg,
                                 sigma,
@@ -512,6 +586,9 @@ impl QwenEdit {
                                 lat_w,
                                 cond_grids,
                                 self.zero_cond_t,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
                             )?
                             .narrow(1, 0, noise_seq)?;
                         Ok(pipeline::compute_guided_noise(
@@ -527,7 +604,19 @@ impl QwenEdit {
 
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
-        let decoded = vae.decode(&lat)?;
+        let decoded = vae.decode_with_tile(
+            &lat,
+            memory.tile_vae_decode.then(|| {
+                (
+                    memory
+                        .decode_tile_edge
+                        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                    memory
+                        .decode_overlap
+                        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                )
+            }),
+        )?;
         crate::control_common::to_image(&decoded)
     }
 
@@ -541,9 +630,21 @@ impl QwenEdit {
         references: &[Image],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+        let memory = req.memory.unwrap_or_default();
+        let stage_residency = req.stage_residency || memory.stage_residency;
+        if (memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks)
+            && !stage_residency
+        {
+            return Err(CandleError::Msg(
+                "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
+                    .into(),
+            ));
+        }
         self.residency.run_request_scoped(
-            req.stage_residency,
-            false,
+            stage_residency,
+            memory.stream_transformer_blocks,
             &req.cancel,
             false,
             on_progress,

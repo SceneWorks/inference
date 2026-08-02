@@ -170,6 +170,7 @@ impl AnimaPipeline {
             opts.seed,
             cancel,
             on_progress,
+            None,
             predict,
         )?;
 
