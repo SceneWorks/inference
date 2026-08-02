@@ -202,7 +202,7 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 /// each variant happens to sit in this `enum`, so inserting a future variant mid-enum would silently
 /// reorder every `terms` array in the manifest and trip the committed-manifest drift gate for
 /// reasons unrelated to any licence change. `Ord` is therefore deliberately **not** derived: the
-/// union is ordered by [`sort_key`](Self::sort_key) — the stable string [`tag`](Self::tag), then the
+/// union is ordered by a private `sort_key` — the stable string [`tag`](Self::tag), then the
 /// variant's payload — so adding, removing, or reordering variants moves nothing that a consumer
 /// already reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,11 +368,15 @@ pub struct ComponentLicense {
 impl ComponentLicense {
     /// Whether this row is well-formed against `families`: the identity fields
     /// ([`component`](Self::component), [`source_url`](Self::source_url),
-    /// [`declared`](Self::declared)) are non-empty, [`family`](Self::family) resolves to a known
+    /// [`declared`](Self::declared)) are non-blank, [`family`](Self::family) resolves to a known
     /// [`LicenseFamily`], [`retrieved`](Self::retrieved) parses as a real ISO `YYYY-MM-DD` calendar
-    /// date, [`attribution`](Self::attribution) is not `Some("")`, and a family imposing
-    /// [`LicenseTerm::AttributionRequired`] implies a **non-empty**
+    /// date, [`attribution`](Self::attribution) is not `Some("")` or `Some("   ")`, and a family
+    /// imposing [`LicenseTerm::AttributionRequired`] implies a **non-blank**
     /// [`attribution`](Self::attribution).
+    ///
+    /// "Non-blank" throughout means neither empty nor whitespace-only: a placeholder that renders as
+    /// nothing on a licences page discharges no obligation, so it is rejected exactly like an
+    /// absent value.
     ///
     /// Row-local counterpart to [`license_table_conformance_errors`], which runs exactly these
     /// checks plus the table-level ones (family-id and component-key uniqueness, provider-id
@@ -389,10 +393,10 @@ impl ComponentLicense {
     fn row_errors(&self, families: &[LicenseFamily]) -> Vec<String> {
         let key = self.component;
         let mut errors = Vec::new();
-        if self.source_url.is_empty() {
+        if is_blank(self.source_url) {
             errors.push(format!("component {key:?} has no source_url"));
         }
-        if self.declared.is_empty() {
+        if is_blank(self.declared) {
             errors.push(format!(
                 "component {key:?} has no declared licence identifier"
             ));
@@ -403,9 +407,10 @@ impl ComponentLicense {
                 self.retrieved
             ));
         }
-        // An `attribution: Some("")` is not an attribution — it satisfies nothing, and treating it
-        // as present would let a CC-BY-* obligation ship unrecorded behind a placeholder.
-        let attribution = self.attribution.filter(|text| !text.is_empty());
+        // An `attribution: Some("")` — or `Some("   ")` — is not an attribution: it satisfies
+        // nothing, and treating it as present would let a CC-BY-* obligation ship unrecorded behind
+        // a placeholder.
+        let attribution = self.attribution.filter(|text| !is_blank(text));
         if self.attribution.is_some() && attribution.is_none() {
             errors.push(format!(
                 "component {key:?} records an empty attribution string"
@@ -426,7 +431,7 @@ impl ComponentLicense {
                 }
             }
         }
-        if key.is_empty() {
+        if is_blank(key) {
             // Reported by the table checker, which sees the key before anything else; keep the
             // row-local predicate honest about it too.
             errors.push("component row has an empty component key".to_string());
@@ -443,6 +448,17 @@ pub struct ProviderComponents {
     pub provider_id: &'static str,
     /// Component keys resolving into the [`ComponentLicense`] table.
     pub components: &'static [&'static str],
+}
+
+/// Whether `value` carries no information — empty, **or nothing but whitespace**.
+///
+/// Every identity check in this module goes through here rather than through `str::is_empty`, so the
+/// gate cannot be satisfied by a placeholder. `"   "` passes `!is_empty()` while rendering as nothing
+/// on a licences page, which is the same hole `Some("")` opened, one space wider; a single predicate
+/// keeps a future field from re-opening it. The reported messages say "empty" for both cases — the
+/// distinction is not one a table author needs to act on differently.
+fn is_blank(value: &str) -> bool {
+    value.trim().is_empty()
 }
 
 /// Whether `value` is an ISO `YYYY-MM-DD` **calendar** date. Dependency-free on purpose — the
@@ -536,15 +552,18 @@ pub fn provider_terms(
 ///
 /// Checks, per section:
 ///
-/// * **Families** — ids are non-empty and unique (a shadowed family would make an entire set of
+/// * **Families** — ids are non-blank and unique (a shadowed family would make an entire set of
 ///   obligations vanish from the [`provider_terms`] union depending on input order, since
 ///   [`resolve_family`] takes the first match); `spdx_id`, `name` and `text_url` are populated.
-/// * **Components** — keys are non-empty and unique; `source_url` and `declared` are populated;
+/// * **Components** — keys are non-blank and unique; `source_url` and `declared` are populated;
 ///   every `family` resolves; `retrieved` is a real ISO calendar date; an attribution-requiring
-///   family implies a non-empty attribution, and `Some("")` never counts as one.
-/// * **Providers** — `provider_id` is non-empty and unique (duplicates are not byte-stable under
+///   family implies a non-blank attribution, and `Some("")` never counts as one.
+/// * **Providers** — `provider_id` is non-blank and unique (duplicates are not byte-stable under
 ///   the manifest's stable sort); every provider maps to at least one component; a provider does
 ///   not list the same component twice; every referenced component exists.
+///
+/// Every "non-blank" above rejects whitespace-only as well as empty: `"   "` satisfies `!is_empty()`
+/// but is a placeholder, not a value, and would otherwise pass the gate carrying no information.
 ///
 /// Uniqueness is checked here rather than at the lookup sites deliberately: the resolvers stay
 /// total-order-free single scans, and this is the one boundary that has the whole table in hand.
@@ -558,20 +577,20 @@ pub fn license_table_conformance_errors(
     let mut seen_families: Vec<&str> = Vec::new();
     for family in families {
         let id = family.id;
-        if id.is_empty() {
+        if is_blank(id) {
             errors.push("licence family has an empty id".to_string());
         } else if seen_families.contains(&id) {
             errors.push(format!("duplicate licence family {id:?}"));
         } else {
             seen_families.push(id);
         }
-        if family.spdx_id.is_empty() {
+        if is_blank(family.spdx_id) {
             errors.push(format!("licence family {id:?} has no spdx_id"));
         }
-        if family.name.is_empty() {
+        if is_blank(family.name) {
             errors.push(format!("licence family {id:?} has no name"));
         }
-        if family.text_url.is_empty() {
+        if is_blank(family.text_url) {
             errors.push(format!("licence family {id:?} has no text_url"));
         }
     }
@@ -579,7 +598,7 @@ pub fn license_table_conformance_errors(
     let mut seen: Vec<&str> = Vec::new();
     for row in components {
         let key = row.component;
-        if key.is_empty() {
+        if is_blank(key) {
             errors.push("component row has an empty component key".to_string());
             continue;
         }
@@ -594,7 +613,7 @@ pub fn license_table_conformance_errors(
     let mut seen_providers: Vec<&str> = Vec::new();
     for provider in providers {
         let id = provider.provider_id;
-        if id.is_empty() {
+        if is_blank(id) {
             errors.push("provider row has an empty provider_id".to_string());
         } else if seen_providers.contains(&id) {
             errors.push(format!("duplicate provider row {id:?}"));
@@ -1276,6 +1295,137 @@ mod v3_tests {
             ..COMPONENTS[0]
         };
         assert!(!flux_placeholder.is_well_formed(FAMILIES));
+    }
+
+    /// The `Some("")` hole, one space wider: `"   "` satisfies `!is_empty()` while printing as
+    /// nothing on a licences page, so a CC-BY-* obligation could ship unrecorded behind it. Both the
+    /// row-local predicate and the table checker must reject it.
+    #[test]
+    fn whitespace_only_attribution_does_not_satisfy_attribution_required() {
+        // t5_xxl's family imposes AttributionRequired.
+        let placeholder = ComponentLicense {
+            attribution: Some("   "),
+            ..COMPONENTS[1]
+        };
+        assert!(
+            !placeholder.is_well_formed(FAMILIES),
+            "a whitespace-only attribution string is not an attribution"
+        );
+        let errors = license_table_conformance_errors(FAMILIES, &[placeholder], &[]);
+        assert!(
+            errors.iter().any(|e| e.contains("requires attribution")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("empty attribution")),
+            "{errors:?}"
+        );
+
+        // Tabs and newlines are whitespace too, and a family requiring no attribution still must not
+        // record a blank one.
+        let flux_placeholder = ComponentLicense {
+            attribution: Some("\t\n "),
+            ..COMPONENTS[0]
+        };
+        assert!(!flux_placeholder.is_well_formed(FAMILIES));
+        assert!(
+            license_table_conformance_errors(FAMILIES, &[flux_placeholder], &[])
+                .iter()
+                .any(|e| e.contains("empty attribution")),
+        );
+    }
+
+    /// The blank-placeholder rule is not attribution-specific: every identity field the gate checks
+    /// goes through the same predicate, so none of them can be satisfied by whitespace.
+    #[test]
+    fn whitespace_only_identity_fields_are_rejected() {
+        let good_family = FAMILIES[0];
+        let family_cases: [(&str, LicenseFamily, &str); 4] = [
+            (
+                "id",
+                LicenseFamily {
+                    id: "   ",
+                    ..good_family
+                },
+                "empty id",
+            ),
+            (
+                "spdx_id",
+                LicenseFamily {
+                    spdx_id: " ",
+                    ..good_family
+                },
+                "no spdx_id",
+            ),
+            (
+                "name",
+                LicenseFamily {
+                    name: "\t",
+                    ..good_family
+                },
+                "no name",
+            ),
+            (
+                "text_url",
+                LicenseFamily {
+                    text_url: "\n",
+                    ..good_family
+                },
+                "no text_url",
+            ),
+        ];
+        for (label, family, needle) in family_cases {
+            let errors = license_table_conformance_errors(&[family], &[], &[]);
+            assert!(
+                errors.iter().any(|e| e.contains(needle)),
+                "whitespace-only {label} must be reported, got {errors:?}"
+            );
+        }
+
+        let good_row = COMPONENTS[1]; // t5_xxl.
+        let row_cases: [(&str, ComponentLicense); 3] = [
+            (
+                "component",
+                ComponentLicense {
+                    component: "   ",
+                    ..good_row
+                },
+            ),
+            (
+                "source_url",
+                ComponentLicense {
+                    source_url: " ",
+                    ..good_row
+                },
+            ),
+            (
+                "declared",
+                ComponentLicense {
+                    declared: "\t",
+                    ..good_row
+                },
+            ),
+        ];
+        for (label, row) in row_cases {
+            assert!(
+                !row.is_well_formed(FAMILIES),
+                "whitespace-only {label} must be rejected row-locally"
+            );
+            assert!(
+                !license_table_conformance_errors(FAMILIES, &[row], &[]).is_empty(),
+                "whitespace-only {label} must also be reported by the table checker"
+            );
+        }
+
+        const BLANK_PROVIDER: ProviderComponents = ProviderComponents {
+            provider_id: "   ",
+            components: &["t5_xxl"],
+        };
+        let errors = license_table_conformance_errors(FAMILIES, COMPONENTS, &[BLANK_PROVIDER]);
+        assert!(
+            errors.iter().any(|e| e.contains("empty provider_id")),
+            "{errors:?}"
+        );
     }
 
     /// The emitted order of a term union is keyed on [`LicenseTerm::tag`], not on where each variant
