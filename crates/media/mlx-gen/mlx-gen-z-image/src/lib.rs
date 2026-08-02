@@ -34,6 +34,7 @@ pub mod model_base;
 pub mod model_base_control;
 pub mod model_control;
 pub mod pipeline;
+pub mod preview;
 pub mod quant;
 pub mod rope_embedder;
 pub mod text_encoder;
@@ -71,9 +72,11 @@ pub use model_base_control::ZImageControl;
 pub use model_control::ZImageTurboControl;
 pub use pipeline::{
     add_noise_by_interpolation, create_noise, decoded_to_image, denoise, denoise_cfg_with_progress,
-    denoise_control_cfg_with_progress, denoise_control_with_progress, denoise_with_progress,
-    encode_control_context, encode_init_latents, init_time_step, pack_latents,
-    preprocess_init_image, slice_valid, unpack_latents,
+    denoise_cfg_with_progress_and_preview, denoise_control_cfg_with_progress,
+    denoise_control_cfg_with_progress_and_preview, denoise_control_with_progress,
+    denoise_control_with_progress_and_preview, denoise_with_progress,
+    denoise_with_progress_and_preview, encode_control_context, encode_init_latents, init_time_step,
+    pack_latents, preprocess_init_image, slice_valid, unpack_latents,
 };
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;

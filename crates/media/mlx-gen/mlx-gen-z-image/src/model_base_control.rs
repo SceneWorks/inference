@@ -36,8 +36,8 @@ use crate::model::validate_request;
 use crate::model_base::{DEFAULT_GUIDANCE, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::model_control::{load_control_residency, ZImageControlHeavyOwned};
 use crate::pipeline::{
-    self, denoise_control_cfg_with_progress, encode_control_context, encode_init_latents,
-    init_time_step,
+    self, denoise_control_cfg_with_progress_and_preview, encode_control_context,
+    encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 
@@ -84,7 +84,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -323,7 +323,7 @@ impl ZImageControl {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_control_cfg_with_progress(
+                        denoise_control_cfg_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -338,6 +338,7 @@ impl ZImageControl {
                             attention_budget,
                             block_window,
                             &req.cancel,
+                            &req.preview,
                             op,
                         )
                     },

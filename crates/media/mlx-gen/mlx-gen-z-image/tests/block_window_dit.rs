@@ -793,3 +793,185 @@ fn every_denoise_entry_point_threads_the_window_through_to_the_blocks() {
         );
     }
 }
+
+/// sc-16631: every public legacy denoise entry remains an exact inert-preview wrapper. This covers
+/// all four registered routes independently; a future signature/body drift in any one cannot hide
+/// behind the other three.
+#[test]
+fn every_legacy_denoise_entry_is_exactly_inert() {
+    use mlx_gen::attention::AttentionBudget;
+    use mlx_gen::{FlowMatchEuler, PreviewSink};
+
+    let w = Weights::from_file(CONTROL_FIXTURE).unwrap();
+    let base = ZImageTransformer::from_weights(&w, "w", control_cfg()).unwrap();
+    let control = ZImageControlTransformer::from_weights(
+        ZImageTransformer::from_weights(&w, "w", control_cfg()).unwrap(),
+        &w,
+        "w",
+    )
+    .unwrap();
+    let x = w.require("in.x").unwrap().clone();
+    let cap = w.require("in.cap_feats").unwrap().clone();
+    let cc = w.require("in.control_context").unwrap().clone();
+    let scheduler = FlowMatchEuler {
+        sigmas: vec![1.0, 0.5, 0.0],
+    };
+    let cancel = CancelFlag::default();
+    let inert = PreviewSink::default();
+
+    let assert_exact = |label: &str, legacy: Array, explicit: Array| {
+        let legacy = legacy.reshape(&[-1]).unwrap();
+        let explicit = explicit.reshape(&[-1]).unwrap();
+        assert_eq!(legacy.shape(), explicit.shape(), "{label} shape");
+        assert_eq!(
+            legacy.as_slice::<f32>(),
+            explicit.as_slice::<f32>(),
+            "{label}: inert preview changed latent bytes"
+        );
+    };
+
+    assert_exact(
+        "z_image_turbo",
+        mlx_gen_z_image::denoise_with_progress(
+            &base,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap(),
+        mlx_gen_z_image::denoise_with_progress_and_preview(
+            &base,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &inert,
+            &mut |_| {},
+        )
+        .unwrap(),
+    );
+    assert_exact(
+        "z_image",
+        mlx_gen_z_image::denoise_cfg_with_progress(
+            &base,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            Some(&cap),
+            3.5,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap(),
+        mlx_gen_z_image::denoise_cfg_with_progress_and_preview(
+            &base,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            Some(&cap),
+            3.5,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &inert,
+            &mut |_| {},
+        )
+        .unwrap(),
+    );
+    assert_exact(
+        "z_image_turbo_control",
+        mlx_gen_z_image::denoise_control_with_progress(
+            &control,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            &cc,
+            1.0,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap(),
+        mlx_gen_z_image::denoise_control_with_progress_and_preview(
+            &control,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            &cc,
+            1.0,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &inert,
+            &mut |_| {},
+        )
+        .unwrap(),
+    );
+    assert_exact(
+        "z_image_control",
+        mlx_gen_z_image::denoise_control_cfg_with_progress(
+            &control,
+            &scheduler,
+            None,
+            7,
+            x.clone(),
+            &cap,
+            Some(&cap),
+            3.5,
+            &cc,
+            1.0,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap(),
+        mlx_gen_z_image::denoise_control_cfg_with_progress_and_preview(
+            &control,
+            &scheduler,
+            None,
+            7,
+            x,
+            &cap,
+            Some(&cap),
+            3.5,
+            &cc,
+            1.0,
+            0,
+            AttentionBudget::UNBOUNDED,
+            None,
+            &cancel,
+            &inert,
+            &mut |_| {},
+        )
+        .unwrap(),
+    );
+}

@@ -21,7 +21,9 @@ use mlx_rs::Dtype;
 use std::path::Path;
 
 use crate::loader;
-use crate::pipeline::{self, denoise_with_progress, encode_init_latents, init_time_step};
+use crate::pipeline::{
+    self, denoise_with_progress_and_preview, encode_init_latents, init_time_step,
+};
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
@@ -95,7 +97,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -676,7 +678,7 @@ impl ZImageTurbo {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_with_progress(
+                        denoise_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -687,6 +689,7 @@ impl ZImageTurbo {
                             attention_budget,
                             block_window,
                             &req.cancel,
+                            &req.preview,
                             op,
                         )
                     },
