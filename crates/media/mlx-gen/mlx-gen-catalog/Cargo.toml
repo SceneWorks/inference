@@ -46,3 +46,5 @@ mlx-gen-z-image = { path = "../mlx-gen-z-image" }
 [dev-dependencies]
 gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../../contracts/gen-core-testkit" }
 image = { workspace = true }
+# The licence-manifest round-trip test in `src/licenses.rs` parses the emitted schema-3 document.
+serde_json = { workspace = true }

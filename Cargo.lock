@@ -2162,6 +2162,7 @@ dependencies = [
  "mlx-gen-wan",
  "mlx-gen-z-image",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]
