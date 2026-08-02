@@ -108,6 +108,7 @@ fn memory_strategy_contract_with_adapters(
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
+        mlx_gen::LoadShape::EagerMaterialization,
     ));
     // Mage's loaded resident generator uses sequential defaults internally. An explicit shared
     // Resident selection must therefore carry an all-disabled memory block to override them.
@@ -1221,6 +1222,7 @@ mod tests {
             },
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            load_shape: mlx_gen::LoadShape::EagerMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

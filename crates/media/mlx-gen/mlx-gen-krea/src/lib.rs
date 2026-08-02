@@ -246,6 +246,7 @@ mod explicit_registry_tests {
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: crate::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
                 .to_owned(),
+            load_shape: mlx_gen::LoadShape::EagerMaterialization,
             mode: mlx_gen::gen_core::MemoryMode::TextToImage,
             has_reference: false,
             use_pid: true,

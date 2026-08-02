@@ -64,6 +64,7 @@ fn context(
         },
         calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
         calibration_fingerprint: mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+        load_shape: mlx_gen::LoadShape::EagerMaterialization,
         mode: MemoryMode::TextToImage,
         has_reference: false,
         use_pid: false,

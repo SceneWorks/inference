@@ -1539,7 +1539,10 @@ fn memory_calibration(
         Some(Quant::Q8) if bounded_text => "lens-turbo-candle-cuda-q8-text-window-v1",
         _ => "lens-turbo-candle-cuda-resident-v1",
     };
-    Some(gen_core::MemoryCalibrationIdentity::new(fingerprint))
+    Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ))
 }
 
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
@@ -2478,6 +2481,7 @@ mod integration_tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: gen_core::MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

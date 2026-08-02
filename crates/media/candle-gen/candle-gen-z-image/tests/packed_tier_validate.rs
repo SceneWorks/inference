@@ -303,6 +303,7 @@ fn render_base_ladder(
         selection,
         calibration_abi: calibration.abi,
         calibration_fingerprint: calibration.fingerprint.clone(),
+        load_shape: calibration.load_shape,
         mode: MemoryMode::TextToImage,
         has_reference: false,
         use_pid: false,

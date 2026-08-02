@@ -74,6 +74,7 @@ pub fn memory_strategy_contract(
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
     ));
     contract.asset_facts.base_bytes = footprint
         .text_encoder
@@ -413,6 +414,24 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[test]
+    fn identical_fingerprint_is_separated_by_typed_load_shape() {
+        let (root, deferred_spec) = fixture();
+        let deferred = memory_strategy_contract("krea_2_turbo", &deferred_spec).unwrap();
+        let mut eager_spec = deferred_spec;
+        eager_spec.load_shape = LoadShape::EagerMaterialization;
+        let eager = memory_strategy_contract("krea_2_turbo", &eager_spec).unwrap();
+        assert_eq!(
+            deferred.calibration.as_ref().unwrap().fingerprint,
+            eager.calibration.as_ref().unwrap().fingerprint
+        );
+        assert_ne!(
+            deferred.calibration.as_ref().unwrap().load_shape,
+            eager.calibration.as_ref().unwrap().load_shape
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     fn resident_context(
         contract: &MemoryProviderContract,
         quant: Option<Quant>,
@@ -430,6 +449,7 @@ mod tests {
             },
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,

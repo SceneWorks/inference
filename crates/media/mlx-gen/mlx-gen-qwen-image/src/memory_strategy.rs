@@ -15,17 +15,8 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "qwen-image-mlx-shared-ladder-2026-08-01-v1-deferred";
-pub const EAGER_MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "qwen-image-mlx-shared-ladder-2026-08-01-v1-eager";
-
-pub const fn memory_calibration_fingerprint(load_shape: LoadShape) -> &'static str {
-    match load_shape {
-        LoadShape::EagerMaterialization => EAGER_MEMORY_CALIBRATION_FINGERPRINT,
-        LoadShape::DeferredMaterialization => MEMORY_CALIBRATION_FINGERPRINT,
-    }
-}
+/// Load shape is a typed evidence-key axis; this content fingerprint remains shape-independent.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-mlx-shared-ladder-2026-08-01-v1";
 
 /// Native Qwen-VAE production tile ladder in output pixels, measured against the exact untiled
 /// decode on the real bf16 VAE. SC-15511's same-process Metal A/B found overlap 96 increased the
@@ -153,7 +144,8 @@ pub fn memory_strategy_contract(
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        memory_calibration_fingerprint(spec.load_shape),
+        MEMORY_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
     ));
     let overlay_bytes = spec.control.as_ref().and_then(source_bytes).unwrap_or(0);
     contract.asset_facts.base_bytes = footprint
@@ -758,8 +750,18 @@ mod tests {
 
     #[test]
     fn eager_and_resident_loads_do_not_advertise_rung_four() {
+        let deferred_contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
         let mut eager = spec();
         eager.load_shape = LoadShape::EagerMaterialization;
+        let eager_contract = memory_strategy_contract("qwen_image", &eager).unwrap();
+        assert_eq!(
+            deferred_contract.calibration.as_ref().unwrap().fingerprint,
+            eager_contract.calibration.as_ref().unwrap().fingerprint
+        );
+        assert_ne!(
+            deferred_contract.calibration.as_ref().unwrap().load_shape,
+            eager_contract.calibration.as_ref().unwrap().load_shape
+        );
         let mut resident = spec();
         resident.offload_policy = OffloadPolicy::Resident;
         for spec in [eager, resident] {
