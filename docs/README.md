@@ -22,6 +22,16 @@ Documentation for the SceneWorks inference workspace.
   is Candle-native on every platform (no ONNX/third backend), and how the runtime catalog's
   dedicated audio section carries a `candle` audio lane inside the mlx macOS bundle.
 
+## Licensing
+
+The [`licensing/`](licensing/) directory holds the primary-source evidence behind the model-weight
+licence surface — the canonical text URL, the verbatim upstream identifier, and a quoted operative
+clause for every term assigned to a licence family.
+
+- **[Licence family evidence pack (sc-16662)](licensing/sc-16662-licence-family-evidence.md)** —
+  sixteen families, quote-checkable, with an explicit unresolved list. **Draft, unsigned.** It
+  records facts, not legal conclusions.
+
 ## Migration records
 
 The [`migration/`](migration/) directory records how this repository was assembled from the
