@@ -250,7 +250,7 @@ impl Generator for ZImageGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return gen_core::MemorySafetyDecision::Accept;
         };
-        memory_strategy::safety_check(MODEL_ID, contract, context, self.loaded_quant)
+        memory_strategy::admission_safety_check(MODEL_ID, contract, context, self.loaded_quant)
     }
 
     fn begin_memory_strategy_request(

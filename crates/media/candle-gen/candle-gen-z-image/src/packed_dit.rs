@@ -978,8 +978,20 @@ impl ZImageTransformer2DModel {
             cap_feats,
             cap_mask,
             attention_plan,
-            self.cfg.n_layers.max(1),
+            self.plain_forward_transformer_window(),
         )
+    }
+
+    /// Compatibility forwards do not carry an admitted transformer window. Resident storage can
+    /// traverse its already-live trunk in one pass; streamed storage must retain the provider's
+    /// bounded default rather than silently materializing every block at once.
+    fn plain_forward_transformer_window(&self) -> usize {
+        match &self.layers {
+            TransformerLayers::Resident(_) => self.cfg.n_layers.max(1),
+            TransformerLayers::Streamed { .. } => {
+                crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW
+            }
+        }
     }
 
     /// Request-scoped forward with both the bounded-attention plan and the admitted transformer
@@ -1469,6 +1481,27 @@ mod parity_tests {
             )
             .expect_err("a canceled streamed request must stop before producing output");
         assert!(matches!(canceled, candle_gen::CandleError::Canceled));
+    }
+
+    #[test]
+    fn plain_forward_window_is_storage_aware() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        assert!(
+            cfg.n_layers > crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW,
+            "the fixture must distinguish the bounded default from full-trunk residency"
+        );
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let resident = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb).unwrap();
+
+        assert_eq!(resident.plain_forward_transformer_window(), cfg.n_layers);
+        assert_eq!(
+            streamed.plain_forward_transformer_window(),
+            crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW,
+            "the implicit streamed path must not materialize the full trunk"
+        );
     }
 
     #[test]
