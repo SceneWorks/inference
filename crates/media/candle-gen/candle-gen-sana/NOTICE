@@ -13,9 +13,12 @@ seam. It does not include or redistribute any model weights.
 Model weights (NOT distributed with this crate)
 ------------------------------------------------------------------------------
 
-The candle-gen-sana-txt2img example downloads model weights at runtime, on the
-user's machine, from the official public Hugging Face repository. Those weights
-are NOT part of this crate and remain subject to the licenses of their
+Model weights are supplied by the caller. Neither this crate nor its examples
+download them: inference never self-fetches and never derives a hub-cache
+location (epic 13657). Both examples take a local snapshot directory you have
+staged out-of-band — `--snapshot <dir>`, or the `SANA_SNAPSHOT` /
+`SANA_SPRINT_SNAPSHOT` env var — and load it via `WeightsSource::Dir`. Those
+weights are NOT part of this crate and remain subject to the licenses of their
 respective providers:
 
   * SANA-1.6B transformer + DC-AE autoencoder
@@ -39,9 +42,9 @@ respective providers:
       This crate reuses candle-gen-pid's gemma-2-2b-it loader; the example loads
       the gemma weights bundled in the SANA diffusers repository above.
 
-Use of the downloaded weights is governed by the above licenses. By downloading
-and using them you agree to the applicable terms. This crate's Apache-2.0
-license covers the source code only, not the model weights.
+Use of those weights is governed by the above licenses. By obtaining and using
+them you agree to the applicable terms. This crate's Apache-2.0 license covers
+the source code only, not the model weights.
 
 This crate gratefully acknowledges the following as architectural lineage,
 references, and parity baselines (no source code is copied from them):
