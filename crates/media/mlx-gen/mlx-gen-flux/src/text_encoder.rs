@@ -40,11 +40,13 @@ enum TokenEmbedding {
 }
 
 fn validate_t5_group_size(group_size: i32) -> Result<()> {
-    if matches!(group_size, 32 | 64 | 128) {
+    // T5's relative-attention-bias table has logical width 64. Group 128 is valid for MLX affine
+    // quantization generally, but cannot pack that table and would violate complete-surface parity.
+    if matches!(group_size, 32 | 64) {
         Ok(())
     } else {
         Err(Error::Msg(format!(
-            "T5 quantization group size must be 32, 64, or 128, got {group_size}"
+            "T5 quantization group size must be 32 or 64, got {group_size}"
         )))
     }
 }
@@ -695,10 +697,10 @@ mod tests {
 
     #[test]
     fn t5_group_size_matches_mlx_affine_quantization_contract() {
-        for group_size in [32, 64, 128] {
+        for group_size in [32, 64] {
             assert!(validate_t5_group_size(group_size).is_ok());
         }
-        for group_size in [0, 16, 256] {
+        for group_size in [0, 16, 128, 256] {
             assert!(validate_t5_group_size(group_size).is_err());
         }
     }

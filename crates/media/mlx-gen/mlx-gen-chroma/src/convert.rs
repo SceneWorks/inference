@@ -170,9 +170,9 @@ pub fn prequantize_turnkey_with_t5_group_size(
             "chroma convert: bits must be 4 or 8, got {bits}"
         )));
     }
-    if !matches!(t5_group_size, 32 | 64 | 128) {
+    if !matches!(t5_group_size, 32 | 64) {
         return Err(Error::Msg(format!(
-            "chroma convert: T5 group size must be 32, 64, or 128, got {t5_group_size}"
+            "chroma convert: T5 group size must be 32 or 64, got {t5_group_size}"
         )));
     }
     if dst_root.exists() {
@@ -278,6 +278,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(invalid.contains("bits must be 4 or 8"));
+
+        let invalid_group = prequantize_turnkey_with_t5_group_size(
+            missing,
+            Path::new("unused-chroma-output"),
+            8,
+            128,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_group.contains("T5 group size must be 32 or 64"));
 
         let destination = std::env::temp_dir().join(format!(
             "mlx-gen-chroma-existing-destination-{}",
