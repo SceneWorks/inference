@@ -5,13 +5,14 @@
 //! conditioning peak but did not reduce the full request peak, so it deliberately remains Missing.
 
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
-    Result as CoreResult, TransformerComponent,
+    Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
-use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
+#[cfg(test)]
+use mlx_gen::{gen_core::MemoryGeometry, GenerationRequest};
+use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "lens-text-encoder-window-2026-07-31-v1";
 pub const TEXT_ENCODER_WINDOW: u32 = 1;
@@ -166,7 +167,7 @@ pub(crate) fn registered_begin_request(
         spec.precision,
         spec.quantize,
         context,
-        weights_free_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
@@ -183,7 +184,7 @@ pub(crate) fn begin_request(
         precision,
         quant,
         context,
-        mlx_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
 }
 
@@ -193,150 +194,35 @@ fn begin_request_with_cleanup(
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
-    cleanup: fn() -> CoreResult<()>,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
     {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(LensMemoryScope {
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        memory: contract.generation_memory(&context.selection),
-        transformer_window: contract
-            .engages(
-                context.selection.strategy,
-                MemoryStrategy::BoundedTransformerResidency,
-            )
-            .then_some(context.selection.parameters.transformer_window_size)
-            .flatten(),
-        geometry: context.geometry,
-        cleanup,
-        finished: false,
-    })))
-}
-
-struct LensMemoryScope {
-    provider_id: &'static str,
-    memory: Option<GenerationMemory>,
-    transformer_window: Option<u32>,
-    geometry: MemoryGeometry,
-    cleanup: fn() -> CoreResult<()>,
-    finished: bool,
-}
-
-impl LensMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn finish_inner(&mut self) -> CoreResult<()> {
-        (self.cleanup)()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-fn mlx_cleanup() -> CoreResult<()> {
-    let barrier = mlx_rs::Array::from(0.0_f32);
-    barrier.eval().map_err(mlx_gen::Error::from)?;
-    drop(barrier);
-    mlx_rs::memory::clear_cache();
-    Ok(())
-}
-
-fn weights_free_cleanup() -> CoreResult<()> {
-    Ok(())
-}
-
-impl MemoryRequestScope for LensMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request geometry {}x{}x{} exceeds admitted {}x{}x{}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        _tile_edge: u32,
-        _overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        Err(if self.finished {
-            CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        crate::config::GptOssConfig::lens().num_layers,
+        |_use_pid, _edge, _overlap| {
+            Err(CoreError::Unsupported(
+                "lens: bounded decode is not implemented".into(),
             ))
-        } else {
-            CoreError::Unsupported("lens: bounded decode is not implemented".into())
-        })
-    }
-
-    fn configure_attention(&mut self, _chunk_size: u32) -> CoreResult<()> {
-        self.ensure_active()?;
-        Err(CoreError::Unsupported(
-            "lens: bounded attention is not implemented".into(),
-        ))
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        if self.transformer_window != Some(block_count) || first_block >= 24 {
-            return Err(CoreError::Unsupported(format!(
-                "{}: invalid text-encoder window ({first_block}, {block_count})",
-                self.provider_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.finish_inner()
-    }
-}
-
-impl Drop for LensMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.finish_inner();
-        }
-    }
+        },
+    )?;
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten();
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    )))
 }
 
 #[cfg(test)]

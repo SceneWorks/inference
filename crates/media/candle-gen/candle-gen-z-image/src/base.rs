@@ -131,14 +131,12 @@ impl Generator for ZImageBaseGenerator {
             return Ok(None);
         };
         crate::memory_strategy::validate_context(MODEL_ID, contract, context, self.loaded_quant)?;
-        Ok(Some(Box::new(
-            crate::memory_strategy::ZImageMemoryScope::new(
-                MODEL_ID,
-                self.device.clone(),
-                contract,
-                context,
-            ),
-        )))
+        Ok(Some(Box::new(crate::memory_strategy::request_scope(
+            MODEL_ID,
+            self.device.clone(),
+            contract,
+            context,
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {

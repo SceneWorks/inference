@@ -4,14 +4,15 @@
 //! Exact peak envelopes remain in SceneWorks' promoted calibration bundle.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+#[cfg(test)]
+use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    Result as CoreResult,
+    Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategySupport, Result as CoreResult,
 };
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
@@ -296,7 +297,7 @@ pub fn registered_begin_request(
         spec.precision,
         crate::model::effective_base_quant_tier(spec, provider_id)?,
         context,
-        weights_free_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
@@ -313,7 +314,7 @@ pub fn begin_request(
         precision,
         quant,
         context,
-        mlx_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
 }
 
@@ -323,136 +324,29 @@ fn begin_request_with_cleanup(
     precision: mlx_gen::Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
-    cleanup: fn() -> CoreResult<()>,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
     {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(KreaControlMemoryScope {
+    let routes = decode_routes(provider_id)?;
+    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        decode_routes: decode_routes(provider_id)?,
-        geometry: context.geometry,
-        memory: contract.generation_memory(&context.selection),
-        cleanup,
-        finished: false,
-    })))
-}
-
-struct KreaControlMemoryScope {
-    provider_id: &'static str,
-    decode_routes: mlx_gen_pid::DecodeRoutes,
-    geometry: MemoryGeometry,
-    memory: Option<GenerationMemory>,
-    cleanup: fn() -> CoreResult<()>,
-    finished: bool,
-}
-
-impl KreaControlMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn synchronize_and_release(&mut self) -> CoreResult<()> {
-        (self.cleanup)()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-fn mlx_cleanup() -> CoreResult<()> {
-    let barrier = mlx_rs::Array::from(0.0_f32);
-    barrier.eval().map_err(mlx_gen::Error::from)?;
-    drop(barrier);
-    mlx_rs::memory::clear_cache();
-    Ok(())
-}
-
-fn weights_free_cleanup() -> CoreResult<()> {
-    Ok(())
-}
-
-impl MemoryRequestScope for KreaControlMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request geometry {}x{} count {} does not match admitted {}x{} count {}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.decode_routes
-            .validate(false, Some(tile_edge), Some(overlap))
-            .map_err(CoreError::Unsupported)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
-        Err(CoreError::Unsupported(format!(
-            "{}: attention chunking is not implemented (requested {chunk_size})",
-            self.provider_id
-        )))
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> CoreResult<()> {
-        Err(CoreError::Unsupported(format!(
-            "{}: transformer windows are not implemented (requested {first_block}/{block_count})",
-            self.provider_id
-        )))
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.synchronize_and_release()
-    }
-}
-
-impl Drop for KreaControlMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.synchronize_and_release();
-        }
-    }
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        crate::config::Krea2Config::turbo().num_layers,
+        move |use_pid, edge, overlap| {
+            routes
+                .validate(use_pid, Some(edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
+        },
+    )?;
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    )))
 }
 
 #[cfg(test)]

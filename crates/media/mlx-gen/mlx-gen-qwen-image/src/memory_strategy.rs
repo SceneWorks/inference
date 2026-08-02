@@ -6,13 +6,15 @@
 //! primitive from SC-16353. The provider contract is the only selector surface.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+#[cfg(test)]
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult,
+    TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
@@ -46,7 +48,14 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// [`mlx_gen::block_residency::BlockPlan::is_bounded`] defines it as fully resident.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[TRANSFORMER_WINDOW_SIZE];
-pub const TRANSFORMER_BLOCKS: u32 = 60;
+
+fn transformer_blocks(provider_id: &str) -> usize {
+    if provider_id == crate::model_edit::MODEL_ID {
+        crate::transformer::QwenTransformerConfig::qwen_image_edit().num_layers
+    } else {
+        crate::transformer::QwenTransformerConfig::qwen_image().num_layers
+    }
+}
 
 pub(crate) fn is_streamable_spec(spec: &LoadSpec) -> bool {
     let matching_device_format = match (&spec.weights, spec.quantize) {
@@ -103,7 +112,7 @@ pub(crate) fn resolve_window_size(
                 .unwrap_or(TRANSFORMER_WINDOW_SIZE) as usize,
         ));
     }
-    Ok(Some(TRANSFORMER_BLOCKS as usize))
+    Ok(Some(transformer_blocks(&contract.provider_id)))
 }
 
 pub fn memory_strategy_contract(
@@ -280,14 +289,15 @@ fn memory_strategy_contract_with_asset_facts(
         staged.support = MemoryStrategySupport::Implemented;
     }
     if streamable && !has_unbounded_control_branch {
+        let transformer_blocks = transformer_blocks(provider_id);
         let plan = mlx_gen::block_residency::BlockPlan::new(
-            TRANSFORMER_BLOCKS as usize,
+            transformer_blocks,
             TRANSFORMER_WINDOW_SIZE as usize,
         )?;
         if !plan.is_bounded() {
             return Err(CoreError::Unsupported(format!(
                 "{provider_id}: published transformer window {} does not bound the {}-block stack",
-                TRANSFORMER_WINDOW_SIZE, TRANSFORMER_BLOCKS
+                TRANSFORMER_WINDOW_SIZE, transformer_blocks
             )));
         }
         let rung = contract
@@ -408,7 +418,7 @@ pub(crate) fn registered_begin_request(
         spec.precision,
         spec.quantize,
         context,
-        weights_free_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
@@ -433,7 +443,7 @@ pub(crate) fn begin_request(
         precision,
         quant,
         context,
-        mlx_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
 }
 
@@ -443,163 +453,38 @@ fn begin_request_with_cleanup(
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
-    cleanup: fn() -> CoreResult<()>,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } =
         safety_check(contract, precision, quant, context)
     {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(QwenMemoryScope {
+    let routes = decode_routes(provider_id)?;
+    let transformer_blocks = transformer_blocks(provider_id);
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        decode_routes: decode_routes(provider_id)?,
-        memory: contract.generation_memory(&context.selection),
-        geometry: context.geometry,
-        use_pid: context.use_pid,
-        transformer_window: contract
-            .engages(
-                context.selection.strategy,
-                MemoryStrategy::BoundedTransformerResidency,
-            )
-            .then_some(context.selection.parameters.transformer_window_size)
-            .flatten(),
-        cleanup,
-        finished: false,
-    })))
-}
-
-struct QwenMemoryScope {
-    provider_id: &'static str,
-    decode_routes: mlx_gen_pid::DecodeRoutes,
-    memory: Option<GenerationMemory>,
-    geometry: MemoryGeometry,
-    use_pid: bool,
-    transformer_window: Option<u32>,
-    cleanup: fn() -> CoreResult<()>,
-    finished: bool,
-}
-
-impl QwenMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn finish_inner(&mut self) -> CoreResult<()> {
-        (self.cleanup)()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-fn mlx_cleanup() -> CoreResult<()> {
-    let barrier = mlx_rs::Array::from(0.0_f32);
-    barrier.eval().map_err(mlx_gen::Error::from)?;
-    drop(barrier);
-    mlx_rs::memory::clear_cache();
-    Ok(())
-}
-
-fn weights_free_cleanup() -> CoreResult<()> {
-    Ok(())
-}
-
-impl MemoryRequestScope for QwenMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        if request.use_pid != self.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request use_pid={} does not match admitted use_pid={}",
-                self.provider_id, request.use_pid, self.use_pid
-            )));
-        }
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request geometry {}x{}x{} exceeds admitted {}x{}x{}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.decode_routes
-            .validate(self.use_pid, Some(tile_edge), Some(overlap))
-            .map_err(CoreError::Unsupported)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
-        self.ensure_active()?;
-        if chunk_size == ATTENTION_CHUNK_SIZE {
-            Ok(())
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "{}: attention chunk size must be {ATTENTION_CHUNK_SIZE}, got {chunk_size}",
-                self.provider_id
-            )))
-        }
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        if self.transformer_window != Some(TRANSFORMER_WINDOW_SIZE)
-            || block_count != TRANSFORMER_WINDOW_SIZE
-            || first_block >= TRANSFORMER_BLOCKS
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: invalid DiT window ({first_block}, {block_count})",
-                self.provider_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.finish_inner()
-    }
-}
-
-impl Drop for QwenMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.finish_inner();
-        }
-    }
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        transformer_blocks,
+        move |use_pid, edge, overlap| {
+            routes
+                .validate(use_pid, Some(edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
+        },
+    )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten();
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    )))
 }
 
 #[cfg(test)]

@@ -6,8 +6,7 @@
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, GenerationMemory, GenerationRequest, LoadSpec, MemoryGeometry, MemoryNumericTier,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    self, LoadSpec, MemoryNumericTier, MemoryProviderContract, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, Precision, Quant, WeightsSource,
 };
 #[cfg(any(feature = "cuda", test))]
@@ -17,6 +16,10 @@ use candle_gen::gen_core::{
     MemoryPrerequisiteScope, MemoryStrategyCapability, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes,
 };
+#[cfg(test)]
+use gen_core::{GenerationMemory, GenerationRequest, MemoryGeometry, MemoryRunOutcome};
+#[cfg(any(feature = "cuda", test))]
+use gen_core::{MemoryPhase, MemoryRequestScope};
 
 pub(crate) const DECODE_TILE_EDGE: u32 = 512;
 pub(crate) const DECODE_OVERLAP: u32 = 128;
@@ -171,172 +174,45 @@ pub(crate) fn control_contract(
     Ok(contract)
 }
 
-pub(crate) struct ZImageMemoryScope {
+pub(crate) fn request_scope(
     provider_id: &'static str,
     device: Device,
-    geometry: MemoryGeometry,
-    memory: Option<GenerationMemory>,
-    transformer_window: Option<u32>,
-    use_pid: bool,
-    finished: bool,
-}
-
-impl ZImageMemoryScope {
-    pub(crate) fn new(
-        provider_id: &'static str,
-        device: Device,
-        contract: &MemoryProviderContract,
-        context: &MemoryRunContext,
-    ) -> Self {
-        Self {
-            provider_id,
-            device,
-            geometry: context.geometry,
-            memory: contract.generation_memory(&context.selection),
-            transformer_window: contract
-                .engages(
-                    context.selection.strategy,
-                    MemoryStrategy::BoundedTransformerResidency,
-                )
-                .then_some(context.selection.parameters.transformer_window_size)
-                .flatten(),
-            use_pid: context.use_pid,
-            finished: false,
-        }
-    }
-
-    fn ensure_active(&self) -> gen_core::Result<()> {
-        if self.finished {
-            Err(gen_core::Error::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl MemoryRequestScope for ZImageMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        self.ensure_active()?;
-        if request.use_pid != self.use_pid {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: request PiD route changed after memory admission",
-                self.provider_id
-            )));
-        }
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count != self.geometry.batch
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: request geometry {}x{} count {} does not match admitted {}x{} count {}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> gen_core::Result<()> {
-        self.ensure_active()
-    }
-
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> gen_core::Result<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.ensure_active()?;
-        if self.use_pid {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: PiD uses an alternate decoder whose explicit tile plan is not yet wired",
-                self.provider_id
-            )));
-        }
-        if tile_edge == DECODE_TILE_EDGE && overlap == DECODE_OVERLAP {
-            Ok(())
-        } else {
-            Err(gen_core::Error::Unsupported(format!(
-                "{}: native decode tiling is fixed at {DECODE_TILE_EDGE}/{DECODE_OVERLAP}, got \
-                 {tile_edge}/{overlap}",
-                self.provider_id
-            )))
-        }
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
-        self.ensure_active()?;
-        if chunk_size == ATTENTION_CHUNK_SIZE {
-            Ok(())
-        } else {
-            Err(gen_core::Error::Unsupported(format!(
-                "{}: attention chunk size is fixed at {ATTENTION_CHUNK_SIZE}, got {chunk_size}",
-                self.provider_id
-            )))
-        }
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> gen_core::Result<()> {
-        self.ensure_active()?;
-        let Some(window) = self.transformer_window else {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: bounded transformer residency was not selected",
-                self.provider_id
-            )));
-        };
-        const BLOCKS: u32 = 30;
-        if first_block >= BLOCKS {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: transformer window starts past the {BLOCKS}-block stack",
-                self.provider_id
-            )));
-        }
-        let expected = window.min(BLOCKS - first_block);
-        if block_count == expected {
-            Ok(())
-        } else {
-            Err(gen_core::Error::Unsupported(format!(
-                "{}: admitted window {window} requires {expected} blocks at {first_block}, got \
-                 {block_count}",
-                self.provider_id
-            )))
-        }
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> gen_core::Result<()> {
-        self.ensure_active()?;
-        self.device
-            .synchronize()
-            .map_err(gen_core::Error::backend)?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-impl Drop for ZImageMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.device.synchronize();
-            self.finished = true;
-        }
-    }
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<candle_gen::request_scope::CandleRequestScopeCore> {
+    let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
+        provider_id,
+        device,
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        candle_transformers::models::z_image::transformer::Config::z_image_turbo().n_layers,
+        move |use_pid, tile_edge, overlap| {
+            if use_pid {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{provider_id}: PiD uses an alternate decoder whose explicit tile plan is not yet wired"
+                )));
+            }
+            if tile_edge == DECODE_TILE_EDGE && overlap == DECODE_OVERLAP {
+                Ok(())
+            } else {
+                Err(gen_core::Error::Unsupported(format!(
+                    "{provider_id}: native decode tiling is fixed at {DECODE_TILE_EDGE}/{DECODE_OVERLAP}, got {tile_edge}/{overlap}"
+                )))
+            }
+        },
+    )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten();
+    Ok(candle_gen::request_scope::CandleRequestScopeCore::new(
+        config,
+    ))
 }
 
 pub(crate) fn validate_context(
@@ -474,12 +350,12 @@ pub(crate) fn registered_begin_request(
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     let quant = snapshot_quant_tier(spec, provider_id)?;
     validate_context(provider_id, contract, context, quant)?;
-    Ok(Some(Box::new(ZImageMemoryScope::new(
+    Ok(Some(Box::new(request_scope(
         provider_id,
         Device::Cpu,
         contract,
         context,
-    ))))
+    )?)))
 }
 
 #[cfg(test)]
@@ -660,7 +536,7 @@ mod tests {
         let contract = provider_contract(crate::MODEL_ID, &spec()).unwrap();
         let context = context(&contract);
         validate_context(crate::MODEL_ID, &contract, &context, None).unwrap();
-        let mut scope = ZImageMemoryScope::new(crate::MODEL_ID, Device::Cpu, &contract, &context);
+        let mut scope = request_scope(crate::MODEL_ID, Device::Cpu, &contract, &context).unwrap();
         scope
             .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, context.geometry)
             .unwrap();
@@ -681,6 +557,72 @@ mod tests {
         scope.finish(MemoryRunOutcome::Complete).unwrap();
         assert!(scope.enter_phase(MemoryPhase::Denoise).is_err());
         assert!(scope.finish(MemoryRunOutcome::Complete).is_err());
+    }
+
+    #[test]
+    fn registered_behavior_treats_admitted_batch_as_a_maximum() {
+        let spec = spec();
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+        let mut context = context(&contract);
+        context.geometry.batch = 3;
+        let mut scope = (crate::TURBO_MEMORY_BEHAVIOR.begin_request)(&spec, &contract, &context)
+            .unwrap()
+            .expect("registered behavior must construct the Candle scope core");
+        let mut prefix = GenerationRequest {
+            width: 768,
+            height: 768,
+            count: 1,
+            ..Default::default()
+        };
+        scope.configure_request(&mut prefix).unwrap();
+        scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    batch: 1,
+                    ..context.geometry
+                },
+            )
+            .unwrap();
+        for geometry in [
+            MemoryGeometry {
+                width: context.geometry.width / 2,
+                ..context.geometry
+            },
+            MemoryGeometry {
+                height: context.geometry.height / 2,
+                ..context.geometry
+            },
+            MemoryGeometry {
+                frames: context.geometry.frames + 1,
+                ..context.geometry
+            },
+            MemoryGeometry {
+                batch: 0,
+                ..context.geometry
+            },
+            MemoryGeometry {
+                batch: 4,
+                ..context.geometry
+            },
+        ] {
+            assert!(scope
+                .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, geometry)
+                .is_err());
+        }
+        scope.materialize_transformer_window(0, 4).unwrap();
+        assert!(scope.materialize_transformer_window(0, 0).is_err());
+        assert!(scope.materialize_transformer_window(1, 4).is_err());
+        let mut overflow = GenerationRequest {
+            width: 768,
+            height: 768,
+            count: 4,
+            ..Default::default()
+        };
+        assert!(scope.configure_request(&mut overflow).is_err());
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        assert!(scope.configure_request(&mut prefix).is_err());
     }
 
     #[test]

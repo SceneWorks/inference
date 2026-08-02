@@ -46,7 +46,8 @@
 //! so the scope of every quoted number matters: see `gen_core::attention_budget` for the full table.
 //!
 //! **Rung 1 is request-scoped (SC-15806).** `z_image_generation_memory` sets
-//! [`GenerationMemory::stage_residency`] only when the contract says rung 1 is engaged. The same
+//! [`mlx_gen::gen_core::GenerationMemory::stage_residency`] only when the contract says rung 1 is
+//! engaged. The same
 //! cached generator can therefore serve warm → staged → warm without reconstruction. Z-Image ignores
 //! the legacy load-time [`OffloadPolicy`](mlx_gen::OffloadPolicy); the shared contract selection is
 //! the authority.
@@ -141,14 +142,17 @@ use mlx_gen::asset_facts::{
     projected_safetensors_bytes, projected_safetensors_tensors, ResidentProjection,
 };
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters,
-    MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategyParameters, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
+#[cfg(test)]
+use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
+#[cfg(test)]
+use mlx_gen::GenerationRequest;
 use mlx_gen::{Quant, WeightsSource};
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
@@ -704,197 +708,6 @@ fn control_resident_components(
 ///
 /// `Resident` returns `None`, which is the historical fast path (`GenerationRequest::memory`
 /// untouched).
-/// Request-scoped lifecycle state for one admitted Z-Image generation.
-///
-/// Holds no MLX arrays: its whole job is to translate the shared selection into
-/// [`GenerationRequest::memory`], reject parameters this provider does not implement, and guarantee
-/// the terminal synchronize-and-release on success, cancellation, **and** error.
-pub(crate) struct ZImageMemoryScope {
-    pub(crate) provider_id: &'static str,
-    pub(crate) geometry: MemoryGeometry,
-    pub(crate) memory: Option<GenerationMemory>,
-    /// Which decode this request runs, so `configure_decode` validates the route's own candidate
-    /// subset rather than the published union (see [`decode_routes`]).
-    pub(crate) use_pid: bool,
-    /// The window a rung-4 selection admitted, so `materialize_transformer_window` can check the
-    /// hook's `(first_block, block_count)` against the plan actually running instead of accepting any
-    /// pair. `None` below rung 4.
-    pub(crate) transformer_window: Option<u32>,
-    cleanup: fn() -> CoreResult<()>,
-    pub(crate) finished: bool,
-}
-
-impl ZImageMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(format!(
-                "{}: memory-strategy request scope is already finished",
-                self.provider_id
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Terminal barrier + cache eviction, idempotent.
-    ///
-    /// MLX is lazy and its allocator retains freed buffers in a cache, so "the request is over" is
-    /// only true after (a) a synchronous barrier on the default stream — which is what
-    /// [`mlx_rs::Array::eval`] is — and (b) an explicit [`clear_cache`](mlx_rs::memory::clear_cache).
-    /// Without both, a canceled or errored request can leave partially-resident buffers that poison
-    /// the next request's budget. This runs on every exit path, including [`Drop`].
-    fn synchronize_and_release(&mut self) -> CoreResult<()> {
-        (self.cleanup)()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-fn mlx_cleanup() -> CoreResult<()> {
-    let barrier = mlx_rs::Array::from(0.0_f32);
-    barrier.eval().map_err(mlx_gen::Error::from)?;
-    drop(barrier);
-    mlx_rs::memory::clear_cache();
-    Ok(())
-}
-
-fn weights_free_cleanup() -> CoreResult<()> {
-    Ok(())
-}
-
-impl MemoryRequestScope for ZImageMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        // Route drift is as fatal as geometry drift, and for the same reason. The scope's decode
-        // parameters are route-specific — a PiD-admitted scope carries a 1024-4096 px super-resolved
-        // tile — so applying it to a non-PiD request would write a PiD edge into a NATIVE decode. At
-        // 1024² a 4096 px tile collapses to a single tile, i.e. an effectively untiled decode while the
-        // evidence records a bounded one. That is the exact "executed a different strategy than the
-        // selector chose" failure the contract exists to prevent, so it is checked here beside the
-        // geometry it is a sibling of.
-        if request.use_pid != self.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request use_pid={} does not match the admitted route (use_pid={}); the decode \
-                 parameters are route-specific and cannot be carried across",
-                self.provider_id, request.use_pid, self.use_pid
-            )));
-        }
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: request geometry {}x{} count {} does not match admitted {}x{} count {}",
-                self.provider_id,
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        // The shared selection is authoritative and request-scoped: overwrite (never merge) whatever
-        // a reused warm request carried, so a deeper prior rung cannot leak into this run.
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        // The phase boundaries themselves are owned by `Residency::run_staged`, which already
-        // evaluates and drops between phases; the scope only has to stay live across them.
-        self.ensure_active()
-    }
-
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        // The same shared, route-aware gate `safety_check` uses (SC-15775) — one implementation, so
-        // the scope cannot admit a geometry admission refused, or vice versa.
-        decode_routes(self.provider_id)?
-            .validate(self.use_pid, Some(tile_edge), Some(overlap))
-            .map_err(CoreError::Unsupported)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
-        self.ensure_active()?;
-        if chunk_size == ATTENTION_CHUNK_SIZE {
-            Ok(())
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "{}: attention chunk size is fixed at {ATTENTION_CHUNK_SIZE} score elements, got \
-                 {chunk_size}",
-                self.provider_id
-            )))
-        }
-    }
-
-    /// SC-15754. The window schedule itself is driven by
-    /// [`mlx_gen::block_residency::run_windowed`] inside the DiT forward — this hook is the shared
-    /// contract's *validation* seam, not a second driver: it answers "would the window you are about
-    /// to run be the one this request was admitted for?".
-    ///
-    /// Accepting an arbitrary `(first_block, block_count)` here would let a harness record a sweep
-    /// point that the provider never executed, which is the same class of false green as declaring a
-    /// rung Implemented because its Candle twin exists.
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        let Some(window) = self.transformer_window else {
-            return Err(CoreError::Unsupported(format!(
-                "{}: this request did not select bounded transformer residency, so no transformer \
-                 window is active",
-                self.provider_id
-            )));
-        };
-        let n_blocks = crate::transformer::ZImageTransformerConfig::turbo().n_layers as u32;
-        if first_block >= n_blocks {
-            return Err(CoreError::Unsupported(format!(
-                "{}: transformer window starts at block {first_block}, past the {n_blocks}-block \
-                 stack",
-                self.provider_id
-            )));
-        }
-        // Every window is `window` blocks except a ragged tail at the end of the stack.
-        let expected = window.min(n_blocks - first_block);
-        if block_count != expected {
-            return Err(CoreError::Unsupported(format!(
-                "{}: transformer window at block {first_block} is {block_count} blocks, but the \
-                 admitted window size {window} makes it {expected}",
-                self.provider_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        // Deliberately outcome-independent: cancellation and error need the barrier + eviction at
-        // least as much as success does.
-        self.ensure_active()?;
-        self.synchronize_and_release()
-    }
-}
-
-impl Drop for ZImageMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.synchronize_and_release();
-        }
-    }
-}
-
 /// The provider safety check every Z-Image variant shares: the calibration handshake, then the shared
 /// contract's own selection validation, then the budget. Defense in depth only — it can reject, it can
 /// never swap in a different strategy or numeric tier.
@@ -1010,7 +823,7 @@ pub(crate) fn registered_begin_request(
         contract,
         loaded_tier(spec, provider_id)?,
         context,
-        weights_free_cleanup,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
@@ -1021,7 +834,13 @@ pub(crate) fn begin_request(
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    begin_request_with_cleanup(provider_id, contract, loaded_tier, context, mlx_cleanup)
+    begin_request_with_cleanup(
+        provider_id,
+        contract,
+        loaded_tier,
+        context,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
+    )
 }
 
 fn begin_request_with_cleanup(
@@ -1029,23 +848,32 @@ fn begin_request_with_cleanup(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
-    cleanup: fn() -> CoreResult<()>,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(ZImageMemoryScope {
+    let routes = decode_routes(provider_id)?;
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        geometry: context.geometry,
-        memory: contract.generation_memory(&context.selection),
-        use_pid: context.use_pid,
-        transformer_window: (context.selection.strategy
-            == MemoryStrategy::BoundedTransformerResidency)
-            .then_some(())
-            .and(context.selection.parameters.transformer_window_size),
-        cleanup,
-        finished: false,
-    })))
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        crate::transformer::ZImageTransformerConfig::turbo().n_layers,
+        move |use_pid, tile_edge, overlap| {
+            routes
+                .validate(use_pid, Some(tile_edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
+        },
+    )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = (context.selection.strategy
+        == MemoryStrategy::BoundedTransformerResidency)
+        .then_some(())
+        .and(context.selection.parameters.transformer_window_size);
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    )))
 }
 
 #[cfg(test)]
@@ -2345,6 +2173,32 @@ mod tests {
         scope
             .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, ctx.geometry)
             .unwrap();
+        for geometry in [
+            MemoryGeometry {
+                width: ctx.geometry.width / 2,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                height: ctx.geometry.height / 2,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                frames: ctx.geometry.frames + 1,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                batch: 0,
+                ..ctx.geometry
+            },
+            MemoryGeometry {
+                batch: ctx.geometry.batch + 1,
+                ..ctx.geometry
+            },
+        ] {
+            assert!(scope
+                .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, geometry)
+                .is_err());
+        }
         // Off-ladder edges and the wrong overlap are refused.
         assert!(scope
             .configure_decode(500, DECODE_OVERLAP, ctx.geometry)
@@ -2374,6 +2228,7 @@ mod tests {
             first += w;
         }
         assert!(scope.materialize_transformer_window(n, w).is_err());
+        assert!(scope.materialize_transformer_window(0, 0).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
 
         // Below rung 4 there is no window at all, so the hook refuses everything.
@@ -2383,6 +2238,57 @@ mod tests {
             .unwrap();
         assert!(scope.materialize_transformer_window(0, 1).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
+    }
+
+    #[test]
+    fn registered_behavior_enforces_decode_geometry_batch_prefixes_and_terminal_request_state() {
+        let spec = spec().with_quant(Quant::Q4);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
+        ctx.geometry.batch = 3;
+        let mut scope =
+            (crate::model::MEMORY_BEHAVIOR_REGISTRATION.begin_request)(&spec, &contract, &ctx)
+                .unwrap()
+                .expect("registered behavior must adopt the shared MLX scope");
+        scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    batch: 1,
+                    ..ctx.geometry
+                },
+            )
+            .unwrap();
+        assert!(scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    width: ctx.geometry.width / 2,
+                    ..ctx.geometry
+                },
+            )
+            .is_err());
+        assert!(scope
+            .configure_decode(
+                DECODE_TILE_EDGE,
+                DECODE_OVERLAP,
+                MemoryGeometry {
+                    batch: 4,
+                    ..ctx.geometry
+                },
+            )
+            .is_err());
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        let mut request = GenerationRequest {
+            prompt: "after-finish".to_owned(),
+            width: ctx.geometry.width,
+            height: ctx.geometry.height,
+            count: 1,
+            ..Default::default()
+        };
+        assert!(scope.configure_request(&mut request).is_err());
     }
 
     #[test]
