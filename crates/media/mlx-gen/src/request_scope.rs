@@ -127,22 +127,25 @@ impl MlxRequestScopeCore {
         if geometry.width == self.config.geometry.width
             && geometry.height == self.config.geometry.height
             && geometry.frames == self.config.geometry.frames
+            && geometry.reference_count == self.config.geometry.reference_count
             && geometry.batch > 0
             && geometry.batch <= self.config.geometry.batch
         {
             return Ok(());
         }
         Err(Error::Unsupported(format!(
-            "{}: hook geometry {}x{}x{} frames={} does not fit admitted {}x{}x{} frames={}",
+            "{}: hook geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
             self.config.provider_id,
             geometry.width,
             geometry.height,
             geometry.batch,
             geometry.frames,
+            geometry.reference_count,
             self.config.geometry.width,
             self.config.geometry.height,
             self.config.geometry.batch,
-            self.config.geometry.frames
+            self.config.geometry.frames,
+            self.config.geometry.reference_count
         )))
     }
 }
@@ -160,16 +163,19 @@ impl MemoryRequestScope for MlxRequestScopeCore {
             || request.height != self.config.geometry.height
             || request.count == 0
             || request.count > self.config.geometry.batch
+            || request.image_reference_count() != self.config.geometry.reference_count
         {
             return Err(Error::Unsupported(format!(
-                "{}: request geometry {}x{}x{} exceeds admitted {}x{}x{}",
+                "{}: request geometry {}x{}x{} references={} does not fit admitted {}x{}x{} references={}",
                 self.config.provider_id,
                 request.width,
                 request.height,
                 request.count,
+                request.image_reference_count(),
                 self.config.geometry.width,
                 self.config.geometry.height,
-                self.config.geometry.batch
+                self.config.geometry.batch,
+                self.config.geometry.reference_count
             )));
         }
         request.memory = self.config.memory;
@@ -259,7 +265,7 @@ impl Drop for MlxRequestScopeCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gen_core::MemoryRunOutcome;
+    use crate::gen_core::{Conditioning, Image, MemoryRunOutcome};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -271,6 +277,7 @@ mod tests {
                 height: 64,
                 batch: 3,
                 frames: 1,
+                reference_count: 0,
             },
             None,
             false,
@@ -282,6 +289,47 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn reference() -> Conditioning {
+        Conditioning::Reference {
+            image: Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0],
+            },
+            strength: None,
+        }
+    }
+
+    #[test]
+    fn configured_request_must_match_exact_reference_cardinality() {
+        let mut cfg = config(7);
+        cfg.geometry.reference_count = 2;
+        let mut scope = MlxRequestScopeCore::with_cleanup(cfg, MlxScopeCleanup::None);
+        let mut exact = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 1,
+            conditioning: vec![reference(), reference()],
+            ..Default::default()
+        };
+        scope.configure_request(&mut exact).unwrap();
+
+        for conditioning in [
+            vec![],
+            vec![reference()],
+            vec![reference(), reference(), reference(), reference()],
+        ] {
+            let mut mismatch = GenerationRequest {
+                width: 64,
+                height: 64,
+                count: 1,
+                conditioning,
+                ..Default::default()
+            };
+            assert!(scope.configure_request(&mut mismatch).is_err());
+        }
     }
 
     #[test]
@@ -348,6 +396,10 @@ mod tests {
             },
             MemoryGeometry {
                 frames: 2,
+                ..admitted
+            },
+            MemoryGeometry {
+                reference_count: 1,
                 ..admitted
             },
             MemoryGeometry {

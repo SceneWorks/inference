@@ -276,7 +276,7 @@ pub fn registered_valid_fixture(
         },
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: mlx_gen::gen_core::MemoryMode::ImageToImage,
-            has_reference: true,
+            reference_count: 1,
             use_pid: false,
             has_phases: false,
             overlay: Some("pose-control".to_owned()),
@@ -418,6 +418,7 @@ mod tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {

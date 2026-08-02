@@ -317,6 +317,7 @@ mod explicit_registry_tests {
                 height: 768,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: Some("control:1".to_owned()),
             budget: mlx_gen::gen_core::MemoryBudget {

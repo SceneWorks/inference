@@ -332,7 +332,7 @@ pub(crate) fn registered_valid_fixture(
         },
         gen_core::MemoryBehaviorRoute {
             mode: gen_core::MemoryMode::TextToImage,
-            has_reference: false,
+            reference_count: 0,
             use_pid: false,
             has_phases: false,
             overlay: None,
@@ -504,6 +504,7 @@ mod tests {
                 height: 768,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: MemoryBudget {
@@ -596,6 +597,10 @@ mod tests {
             },
             MemoryGeometry {
                 frames: context.geometry.frames + 1,
+                ..context.geometry
+            },
+            MemoryGeometry {
+                reference_count: 1,
                 ..context.geometry
             },
             MemoryGeometry {

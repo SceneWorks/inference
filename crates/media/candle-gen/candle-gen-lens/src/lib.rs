@@ -1658,7 +1658,7 @@ fn registered_lens_valid_fixture(
         },
         gen_core::MemoryBehaviorRoute {
             mode: gen_core::MemoryMode::TextToImage,
-            has_reference: false,
+            reference_count: 0,
             use_pid: false,
             has_phases: false,
             overlay: None,
@@ -2491,6 +2491,7 @@ mod integration_tests {
                 height: 512,
                 batch: 1,
                 frames: 1,
+                reference_count: 0,
             },
             overlay: None,
             budget: gen_core::MemoryBudget {
