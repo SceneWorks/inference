@@ -49,25 +49,25 @@ pub const MODEL_ID: &str = "kokoro_82m";
 pub const HUB_REPO: &str = "hexgrad/Kokoro-82M";
 pub const HUB_REVISION: &str = "f3ff3571791e39611d31c381e3a41a3af07b4987";
 
-/// The license of the pinned Kokoro-82M weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. Apache-2.0 (permissive), verified against the `hexgrad/Kokoro-82M`
-/// model card.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/hexgrad/Kokoro-82M",
-        attribution: Some("Kokoro-82M © hexgrad — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned Kokoro-82M checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "kokoro_82m";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned Kokoro-82M checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `hexgrad/Kokoro-82M` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/hexgrad/Kokoro-82M",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some("Kokoro-82M © hexgrad — licensed under Apache-2.0"),
+        retrieved: "2026-08-02",
     };
 
 /// The advertised voice surface: every English voice the pinned snapshot ships (leading

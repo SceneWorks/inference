@@ -59,23 +59,24 @@ pub const CODEC_HUB_REVISION: &str = "3cd226ba2947efa357ef453bcad111b6eafba782";
 /// from the staged directory.
 pub const CODEC_COMPONENT_ID: &str = "codec";
 
-/// The license of the pinned MOSS-TTS-Realtime weight checkpoint (sc-13332) — surfaced for
-/// SceneWorks' end-product licenses page. Apache-2.0 (permissive), verified against the
-/// `OpenMOSS-Team/MOSS-TTS-Realtime` model card.
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "Apache-2.0",
-    name: "Apache License 2.0",
-    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
-    attribution: Some("MOSS-TTS-Realtime-1.7B © OpenMOSS Team — licensed under Apache-2.0"),
-    commercial_use: true,
-    restriction: None,
-};
+/// Stable component key for the pinned MOSS-TTS-Realtime-1.7B checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "moss_tts_realtime_1_7b";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    component: None,
-    license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned MOSS-TTS-Realtime-1.7B checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `OpenMOSS-Team/MOSS-TTS-Realtime` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`gen_core::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: COMPONENT_KEY,
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-TTS-Realtime-1.7B © OpenMOSS Team — licensed under Apache-2.0"),
+    retrieved: "2026-08-02",
 };
 
 /// Native output sample rate of the codec (Hz).
@@ -1075,10 +1076,17 @@ mod tests {
     }
 
     #[test]
-    fn weight_license_is_apache() {
-        let lic = WEIGHT_LICENSE;
-        assert_eq!(lic.spdx_id, "Apache-2.0");
-        assert!(lic.commercial_use, "Apache-2.0 permits commercial use");
-        assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
+    fn component_licence_resolves_to_the_apache_family() {
+        use gen_core::{resolve_family, LicenseTerm, LICENSE_FAMILIES};
+        assert!(COMPONENT_LICENSE.is_well_formed(LICENSE_FAMILIES));
+        assert_eq!(COMPONENT_LICENSE.declared, "apache-2.0");
+        let family = resolve_family(LICENSE_FAMILIES, COMPONENT_LICENSE.family).unwrap();
+        assert_eq!(family.spdx_id, "Apache-2.0");
+        // Apache-2.0 states three duties; a "permissive" flag recorded none of them.
+        assert!(family.imposes(LicenseTerm::AttributionRequired));
+        assert!(family.imposes(LicenseTerm::NoticeFileRequired));
+        assert!(family.imposes(LicenseTerm::DownstreamLicenseCopy {
+            family: "apache-2-0"
+        }));
     }
 }

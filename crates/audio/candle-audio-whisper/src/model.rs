@@ -58,26 +58,25 @@ pub const FAMILY: &str = "whisper";
 pub const HUB_REPO: &str = "openai/whisper-base";
 pub const HUB_REVISION: &str = "e37978b90ca9030d5170a5c07aadb050351a65bb";
 
-/// The license of the pinned Whisper weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. Apache-2.0 (permissive), verified against the `openai/whisper-base`
-/// model-card metadata (`license: apache-2.0`) — note this is the checkpoint's license, distinct
-/// from the MIT license on OpenAI's Whisper *source* repository.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/openai/whisper-base",
-        attribution: Some("Whisper © OpenAI — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned Whisper base checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "whisper_base";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned Whisper base checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `openai/whisper-base` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/openai/whisper-base",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some("Whisper © OpenAI — licensed under Apache-2.0"),
+        retrieved: "2026-08-02",
     };
 
 /// The three files inside the pinned repo the provider resolves.

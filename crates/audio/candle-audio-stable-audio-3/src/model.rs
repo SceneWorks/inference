@@ -447,16 +447,28 @@ impl Variant {
         }
     }
 
-    /// Every weight-license row this registration contributes to the catalog: the composite
-    /// effective-restriction row, the root checkpoint row, and the bundled T5Gemma component row.
-    pub const fn weight_licenses(self) -> &'static [gen_core::WeightLicenseEntry] {
+    /// The two schema-3 component licence rows this registration loads: the root artifact and the
+    /// bundled T5Gemma stack. The provider's effective terms are derived from them, not listed here.
+    pub const fn component_licenses(self) -> [gen_core::ComponentLicense; 2] {
         match self {
-            Self::SmallMusic => MUSIC_WEIGHT_LICENSES,
-            Self::SmallSfx => SFX_WEIGHT_LICENSES,
-            Self::Medium => MEDIUM_WEIGHT_LICENSES,
-            Self::SmallMusicBase => MUSIC_BASE_WEIGHT_LICENSES,
-            Self::SmallSfxBase => SFX_BASE_WEIGHT_LICENSES,
-            Self::MediumBase => MEDIUM_BASE_WEIGHT_LICENSES,
+            Self::SmallMusic => [MUSIC_ROOT_COMPONENT_LICENSE, MUSIC_GEMMA_COMPONENT_LICENSE],
+            Self::SmallSfx => [SFX_ROOT_COMPONENT_LICENSE, SFX_GEMMA_COMPONENT_LICENSE],
+            Self::Medium => [
+                MEDIUM_ROOT_COMPONENT_LICENSE,
+                MEDIUM_GEMMA_COMPONENT_LICENSE,
+            ],
+            Self::SmallMusicBase => [
+                MUSIC_BASE_ROOT_COMPONENT_LICENSE,
+                MUSIC_BASE_GEMMA_COMPONENT_LICENSE,
+            ],
+            Self::SmallSfxBase => [
+                SFX_BASE_ROOT_COMPONENT_LICENSE,
+                SFX_BASE_GEMMA_COMPONENT_LICENSE,
+            ],
+            Self::MediumBase => [
+                MEDIUM_BASE_ROOT_COMPONENT_LICENSE,
+                MEDIUM_BASE_GEMMA_COMPONENT_LICENSE,
+            ],
         }
     }
 
@@ -700,269 +712,261 @@ const MEDIUM_BASE_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
     },
 ];
 
-pub const ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE.md",
+// -------------------------------------------------------------------------------------------------
+// Schema-3 licence rows (sc-16663). Two loaded artifacts per registered variant: the single root
+// safetensors (DiT + SAME pretransform + learned conditioner, all governed by the repository's
+// Stability AI Community License) and the bundled T5Gemma stack, which ships its own LICENSE_GEMMA.md
+// and is therefore a separately licensed artifact.
+//
+// v2 additionally carried a hand-authored composite row per variant, duplicating the root row's
+// fields. Schema 3 DERIVES the provider view from these components instead, so there is no second
+// place to be wrong. `commercial_use: false` is gone with it: the Stability text does not forbid
+// commercial use, it names a revenue threshold and a registration — which the family records as
+// facts a consumer evaluates against its own situation.
+//
+// DISCLOSURE ONLY. Nothing here decides whether any use is permitted.
+// -------------------------------------------------------------------------------------------------
+
+/// Component key for the Stable Audio 3 Small Music root safetensors artifact.
+pub const MUSIC_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_music_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small Music.
+pub const MUSIC_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_music_t5gemma";
+
+/// The schema-3 licence row for the Stable Audio 3 Small Music root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-music` model card on `retrieved`.
+pub const MUSIC_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MUSIC_ROOT_COMPONENT_KEY,
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music",
+    gated: true,
+    declared: "stable-audio-community",
+    family: "stability-ai-community",
     attribution: Some("Stable Audio 3 Small Music © Stability AI — Powered by Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
+    retrieved: "2026-08-02",
 };
 
-pub const GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small Music. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MUSIC_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MUSIC_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE_GEMMA.md",
+    gated: true,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const SFX_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE.md",
+/// Component key for the Stable Audio 3 Small SFX root safetensors artifact.
+pub const SFX_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small SFX.
+pub const SFX_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_t5gemma";
+
+/// The schema-3 licence row for the Stable Audio 3 Small SFX root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-sfx` model card on `retrieved`.
+pub const SFX_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: SFX_ROOT_COMPONENT_KEY,
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx",
+    gated: true,
+    declared: "stable-audio-community",
+    family: "stability-ai-community",
     attribution: Some("Stable Audio 3 Small SFX © Stability AI — Powered by Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
+    retrieved: "2026-08-02",
 };
 
-pub const SFX_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small SFX. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const SFX_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: SFX_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
+    gated: true,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const MEDIUM_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE.md",
+/// Component key for the Stable Audio 3 Medium root safetensors artifact.
+pub const MEDIUM_ROOT_COMPONENT_KEY: &str = "stable_audio_3_medium_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Medium.
+pub const MEDIUM_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_medium_t5gemma";
+
+/// The schema-3 licence row for the Stable Audio 3 Medium root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-medium` model card on `retrieved`.
+pub const MEDIUM_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MEDIUM_ROOT_COMPONENT_KEY,
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium",
+    gated: true,
+    declared: "stable-audio-community",
+    family: "stability-ai-community",
     attribution: Some("Stable Audio 3 Medium © Stability AI — Powered by Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
+    retrieved: "2026-08-02",
 };
 
-pub const MEDIUM_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Medium. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MEDIUM_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MEDIUM_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE_GEMMA.md",
+    gated: true,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-/// The `-base` repositories are **ungated** on the Hub, unlike the three post-trained ones.
-///
-/// That changes acquisition, not terms: each base repository ships the same `LICENSE.md` (Stability
-/// AI Community License) and `LICENSE_GEMMA.md` (Gemma Terms of Use) as its post-trained sibling, so
-/// the rows below carry exactly the same restrictions. "No click-through" is not "no license".
-pub const MUSIC_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
-};
+/// Component key for the Stable Audio 3 Small Music Base root safetensors artifact.
+pub const MUSIC_BASE_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_music_base_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small Music Base.
+pub const MUSIC_BASE_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_music_base_t5gemma";
 
-pub const MUSIC_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the Stable Audio 3 Small Music Base root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-music-base` model card on `retrieved`.
+pub const MUSIC_BASE_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense =
+    gen_core::ComponentLicense {
+        component: MUSIC_BASE_ROOT_COMPONENT_KEY,
+        source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base",
+        gated: false,
+        declared: "stable-audio-community",
+        family: "stability-ai-community",
+        attribution: Some(
+            "Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI",
+        ),
+        retrieved: "2026-08-02",
+    };
+
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small Music Base. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MUSIC_BASE_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MUSIC_BASE_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE_GEMMA.md",
+    gated: false,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const SFX_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
-};
+/// Component key for the Stable Audio 3 Small SFX Base root safetensors artifact.
+pub const SFX_BASE_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_base_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small SFX Base.
+pub const SFX_BASE_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_base_t5gemma";
 
-pub const SFX_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the Stable Audio 3 Small SFX Base root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-sfx-base` model card on `retrieved`.
+pub const SFX_BASE_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense =
+    gen_core::ComponentLicense {
+        component: SFX_BASE_ROOT_COMPONENT_KEY,
+        source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base",
+        gated: false,
+        declared: "stable-audio-community",
+        family: "stability-ai-community",
+        attribution: Some("Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI"),
+        retrieved: "2026-08-02",
+    };
+
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small SFX Base. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const SFX_BASE_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: SFX_BASE_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE_GEMMA.md",
+    gated: false,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const MEDIUM_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
-    attribution: Some("Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
-};
+/// Component key for the Stable Audio 3 Medium Base root safetensors artifact.
+pub const MEDIUM_BASE_ROOT_COMPONENT_KEY: &str = "stable_audio_3_medium_base_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Medium Base.
+pub const MEDIUM_BASE_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_medium_base_t5gemma";
 
-pub const MEDIUM_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the Stable Audio 3 Medium Base root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-medium-base` model card on `retrieved`.
+pub const MEDIUM_BASE_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense =
+    gen_core::ComponentLicense {
+        component: MEDIUM_BASE_ROOT_COMPONENT_KEY,
+        source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base",
+        gated: false,
+        declared: "stable-audio-community",
+        family: "stability-ai-community",
+        attribution: Some("Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI"),
+        retrieved: "2026-08-02",
+    };
+
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Medium Base. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MEDIUM_BASE_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MEDIUM_BASE_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE_GEMMA.md",
+    gated: false,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-const MUSIC_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("root"),
-        license: ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("t5gemma"),
-        license: GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const SFX_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_MODEL_ID,
-        component: None,
-        license: SFX_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_MODEL_ID,
-        component: Some("root"),
-        license: SFX_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_MODEL_ID,
-        component: Some("t5gemma"),
-        license: SFX_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const MEDIUM_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_MODEL_ID,
-        component: None,
-        license: MEDIUM_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_MODEL_ID,
-        component: Some("root"),
-        license: MEDIUM_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_MODEL_ID,
-        component: Some("t5gemma"),
-        license: MEDIUM_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const MUSIC_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MUSIC_BASE_MODEL_ID,
-        component: None,
-        license: MUSIC_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MUSIC_BASE_MODEL_ID,
-        component: Some("root"),
-        license: MUSIC_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MUSIC_BASE_MODEL_ID,
-        component: Some("t5gemma"),
-        license: MUSIC_BASE_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const SFX_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_BASE_MODEL_ID,
-        component: None,
-        license: SFX_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_BASE_MODEL_ID,
-        component: Some("root"),
-        license: SFX_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_BASE_MODEL_ID,
-        component: Some("t5gemma"),
-        license: SFX_BASE_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const MEDIUM_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_BASE_MODEL_ID,
-        component: None,
-        license: MEDIUM_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_BASE_MODEL_ID,
-        component: Some("root"),
-        license: MEDIUM_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_BASE_MODEL_ID,
-        component: Some("t5gemma"),
-        license: MEDIUM_BASE_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-/// Every Stable Audio 3 weight-license row, in registration order.
+/// Every Stable Audio 3 component licence row, in registration order — two per registered variant.
 ///
-/// The DiT, SAME pretransform, and learned conditioner all live inside the single
-/// `model.safetensors` root artifact and are covered by the `root` row; the bundled T5Gemma stack
-/// is a separately licensed component and carries its own row. Three rows per registration, not
-/// four: medium's SAME-L is not a separate artifact, it is a namespace inside the same file.
-///
-/// Eighteen rows since sc-14546 (six registrations x three). The `-base` repositories are ungated on
-/// the Hub, which is an acquisition difference and nothing else — they ship the same Stability
-/// Community and Gemma license files, so their rows carry the same restrictions and the same
-/// `commercial_use: false` on the root.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    MUSIC_WEIGHT_LICENSES[0],
-    MUSIC_WEIGHT_LICENSES[1],
-    MUSIC_WEIGHT_LICENSES[2],
-    SFX_WEIGHT_LICENSES[0],
-    SFX_WEIGHT_LICENSES[1],
-    SFX_WEIGHT_LICENSES[2],
-    MEDIUM_WEIGHT_LICENSES[0],
-    MEDIUM_WEIGHT_LICENSES[1],
-    MEDIUM_WEIGHT_LICENSES[2],
-    MUSIC_BASE_WEIGHT_LICENSES[0],
-    MUSIC_BASE_WEIGHT_LICENSES[1],
-    MUSIC_BASE_WEIGHT_LICENSES[2],
-    SFX_BASE_WEIGHT_LICENSES[0],
-    SFX_BASE_WEIGHT_LICENSES[1],
-    SFX_BASE_WEIGHT_LICENSES[2],
-    MEDIUM_BASE_WEIGHT_LICENSES[0],
-    MEDIUM_BASE_WEIGHT_LICENSES[1],
-    MEDIUM_BASE_WEIGHT_LICENSES[2],
+/// The DiT, SAME pretransform and learned conditioner all live inside the single `model.safetensors`
+/// root artifact and are covered by its row; medium's SAME-L is a namespace inside that same file,
+/// not a separate artifact, so it adds no row. The `-base` repositories are **ungated** on the Hub,
+/// which is an acquisition difference and nothing else — they ship the same Stability Community and
+/// Gemma licence files, so their rows resolve to exactly the same families.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[
+    MUSIC_ROOT_COMPONENT_LICENSE,
+    MUSIC_GEMMA_COMPONENT_LICENSE,
+    SFX_ROOT_COMPONENT_LICENSE,
+    SFX_GEMMA_COMPONENT_LICENSE,
+    MEDIUM_ROOT_COMPONENT_LICENSE,
+    MEDIUM_GEMMA_COMPONENT_LICENSE,
+    MUSIC_BASE_ROOT_COMPONENT_LICENSE,
+    MUSIC_BASE_GEMMA_COMPONENT_LICENSE,
+    SFX_BASE_ROOT_COMPONENT_LICENSE,
+    SFX_BASE_GEMMA_COMPONENT_LICENSE,
+    MEDIUM_BASE_ROOT_COMPONENT_LICENSE,
+    MEDIUM_BASE_GEMMA_COMPONENT_LICENSE,
+];
+
+/// The provider→component mapping for all six registrations. Terms are **derived** from the rows
+/// above by [`gen_core::provider_terms`], never hand-authored.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
+    gen_core::ProviderComponents {
+        provider_id: MODEL_ID,
+        components: &[MUSIC_ROOT_COMPONENT_KEY, MUSIC_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: SFX_MODEL_ID,
+        components: &[SFX_ROOT_COMPONENT_KEY, SFX_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: MEDIUM_MODEL_ID,
+        components: &[MEDIUM_ROOT_COMPONENT_KEY, MEDIUM_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: MUSIC_BASE_MODEL_ID,
+        components: &[
+            MUSIC_BASE_ROOT_COMPONENT_KEY,
+            MUSIC_BASE_GEMMA_COMPONENT_KEY,
+        ],
+    },
+    gen_core::ProviderComponents {
+        provider_id: SFX_BASE_MODEL_ID,
+        components: &[SFX_BASE_ROOT_COMPONENT_KEY, SFX_BASE_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: MEDIUM_BASE_MODEL_ID,
+        components: &[
+            MEDIUM_BASE_ROOT_COMPONENT_KEY,
+            MEDIUM_BASE_GEMMA_COMPONENT_KEY,
+        ],
+    },
 ];
 
 /// Build the descriptor for one registered variant.
@@ -2661,32 +2665,33 @@ mod tests {
     }
 
     #[test]
-    fn every_variant_contributes_composite_and_component_license_rows() {
-        // Six registered variants x (composite, root, t5gemma). sc-14545 added the medium trio;
-        // sc-14546 the three `-base` trios. The base repositories are ungated on the Hub but ship
-        // the same Stability Community and Gemma license files, so the rows are not weaker.
-        assert_eq!(WEIGHT_LICENSES.len(), 18);
+    fn every_variant_contributes_a_root_and_a_t5gemma_component_row() {
+        // Six registered variants x (root, t5gemma) = twelve rows. v2 carried an extra hand-authored
+        // composite row per variant; schema 3 derives the provider view instead (sc-16663).
+        assert_eq!(COMPONENT_LICENSES.len(), 12);
         assert_eq!(VARIANTS.len(), 6);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 6);
         for variant in VARIANTS {
-            let rows = variant.weight_licenses();
-            assert_eq!(rows.len(), 3);
-            assert!(rows.iter().all(|row| row.provider_id == variant.model_id()));
-            assert_eq!(rows[0].component, None);
-            assert_eq!(rows[1].component, Some("root"));
-            assert_eq!(rows[2].component, Some("t5gemma"));
-            assert_eq!(rows[0].license.spdx_id, "LicenseRef-Stability-AI-Community");
-            assert!(!rows[0].license.commercial_use);
-            assert!(rows[0].license.restriction.is_some());
-            assert_eq!(rows[2].license.spdx_id, "LicenseRef-Gemma-Terms");
-            assert!(rows[1].license.source_url.contains(variant.hub_revision()));
-            assert!(rows[2].license.source_url.contains(variant.hub_revision()));
-            assert!(
-                WEIGHT_LICENSES
-                    .iter()
-                    .filter(|row| row.provider_id == variant.model_id())
-                    .count()
-                    == 3
-            );
+            let [root, gemma] = variant.component_licenses();
+            assert_eq!(root.family, "stability-ai-community");
+            assert_eq!(root.declared, "stable-audio-community");
+            assert_eq!(gemma.family, "gemma-terms");
+            // The `-base` repositories are ungated; the three post-trained ones are not. That is an
+            // acquisition difference recorded on the row, not a licence difference (sc-14546).
+            assert_eq!(root.gated, !variant.model_id().ends_with("_base"));
+            assert_eq!(gemma.gated, root.gated);
+            // The T5Gemma row still points at the revision-pinned licence file shipped with the
+            // weights, which is the evidence behind its `declared` string.
+            assert!(gemma.source_url.contains(variant.hub_revision()));
+            let mapping = PROVIDER_COMPONENTS
+                .iter()
+                .find(|p| p.provider_id == variant.model_id())
+                .expect("every variant maps to components");
+            assert_eq!(mapping.components, &[root.component, gemma.component]);
+            for row in [root, gemma] {
+                assert!(COMPONENT_LICENSES.contains(&row));
+                assert!(row.is_well_formed(gen_core::LICENSE_FAMILIES), "{row:?}");
+            }
         }
     }
 

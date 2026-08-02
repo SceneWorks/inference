@@ -54,31 +54,55 @@ pub const MODEL_ID: &str = "acestep_v15_turbo";
 pub const HUB_REPO: &str = "ACE-Step/acestep-v15-xl-turbo-diffusers";
 pub const HUB_REVISION: &str = "200ba991ae448051e14b0183157e35c2d27c9fb0";
 
-/// The license of the pinned ACE-Step v1.5 XL Turbo weight checkpoint (sc-13332) — surfaced for
-/// SceneWorks' end-product licenses page. MIT (permissive), verified against the
-/// `ACE-Step/acestep-v15-xl-turbo-diffusers` model card. The bundled `text_encoder`
-/// (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0 — noted so the product surfaces the
-/// full picture even though the primary weight license governs.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// Component keys for the artifacts the ACE-Step provider loads (sc-16663). One key per loaded
+/// artifact, not one per provider: the turbo primary and its bundled Qwen3 text encoder are two
+/// separately licensed artifacts inside one repository, and the three sft cover modules are three
+/// more.
+pub const COMPONENT_KEY: &str = "acestep_v15_xl_turbo";
+/// Component key for the bundled `text_encoder` (Qwen3-Embedding-0.6B), redistributed under its own
+/// Apache-2.0 grant inside the MIT-licensed turbo repository.
+pub const TEXT_ENCODER_COMPONENT_KEY: &str = "acestep_v15_turbo_text_encoder";
+/// Component key for the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint.
+pub const SFT_AUDIO_TOKENIZER_COMPONENT_KEY: &str = "acestep_v15_sft_audio_tokenizer";
+/// Component key for the sft `audio_token_detokenizer` cover-conditioning checkpoint.
+pub const SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_KEY: &str =
+    "acestep_v15_sft_audio_token_detokenizer";
+/// Component key for the sft `transformer` — the non-distilled reference cover DiT.
+pub const SFT_TRANSFORMER_COMPONENT_KEY: &str = "acestep_v15_sft_transformer";
+
+/// The schema-3 licence row for the pinned ACE-Step v1.5 XL Turbo checkpoint (sc-16663).
+///
+/// **Disclosure only.** `declared` and `gated` were read from the
+/// `ACE-Step/acestep-v15-xl-turbo-diffusers` model card on `retrieved`.
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some("ACE-Step v1.5 XL Turbo © ACE-Step — licensed under MIT"),
-        commercial_use: true,
-        restriction: Some(
-            "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0.",
-        ),
+        retrieved: "2026-08-02",
     };
 
-/// This provider's **composite** weight-license entry (keyed by [`MODEL_ID`], `component == None`)
-/// for catalog aggregation — the at-a-glance effective license. All ACE-Step checkpoints (turbo
-/// primary + the sft cover FSQ modules) are MIT, so the composite is MIT.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the bundled `text_encoder` (Qwen3-Embedding-0.6B).
+///
+/// v2 carried this fact as prose on the provider's composite row ("Bundled text_encoder
+/// (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0."). A separately licensed artifact is a
+/// row of its own in schema 3, so the Apache-2.0 attribution and notice duties reach the derived
+/// provider union instead of sitting in a sentence nothing joins over. `declared` was read from the
+/// upstream `Qwen/Qwen3-Embedding-0.6B` model card on `retrieved`.
+pub const TEXT_ENCODER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: TEXT_ENCODER_COMPONENT_KEY,
+        source_url: "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some(
+            "Qwen3-Embedding-0.6B © Alibaba Cloud — licensed under Apache-2.0; redistributed as the text_encoder of ACE-Step/acestep-v15-xl-turbo-diffusers",
+        ),
+        retrieved: "2026-08-02",
     };
 
 /// Hub pin for the Cover checkpoint (sc-13251): `ACE-Step/acestep-v15-xl-sft-diffusers` at an
@@ -100,68 +124,47 @@ pub const SFT_HUB_REVISION: &str = "4bf7b60a63b27144f539f980927eeb89f5f912b0";
 /// `transformer/`); a Cover request without it errors actionably at generate and never self-fetches.
 pub const COVER_COMPONENT_ID: &str = "sft_cover";
 
-/// License of the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint — MIT, verified against
-/// the `acestep-v15-xl-sft-diffusers` model card.
-pub const AUDIO_TOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// The schema-3 licence row for the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint.
+/// `declared` was read from the `ACE-Step/acestep-v15-xl-sft-diffusers` model card on `retrieved`.
+pub const SFT_AUDIO_TOKENIZER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: SFT_AUDIO_TOKENIZER_COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "ACE-Step v1.5 XL SFT audio_tokenizer (FSQ) © ACE-Step — licensed under MIT",
         ),
-        commercial_use: true,
-        restriction: None,
+        retrieved: "2026-08-02",
     };
 
-/// License of the sft `audio_token_detokenizer` cover-conditioning checkpoint — MIT.
-pub const AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// The schema-3 licence row for the sft `audio_token_detokenizer` cover-conditioning checkpoint.
+pub const SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "ACE-Step v1.5 XL SFT audio_token_detokenizer © ACE-Step — licensed under MIT",
         ),
-        commercial_use: true,
-        restriction: None,
+        retrieved: "2026-08-02",
     };
 
-/// Per-checkpoint attribution row for the sft `audio_tokenizer` (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKENIZER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("audio_tokenizer"),
-        license: AUDIO_TOKENIZER_WEIGHT_LICENSE,
-    };
-
-/// Per-checkpoint attribution row for the sft `audio_token_detokenizer` (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("audio_token_detokenizer"),
-        license: AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE,
-    };
-
-/// License of the sft `transformer` — the non-distilled reference cover DiT (sc-13251) — MIT.
-pub const SFT_TRANSFORMER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// The schema-3 licence row for the sft `transformer` — the non-distilled reference cover DiT.
+pub const SFT_TRANSFORMER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: SFT_TRANSFORMER_COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "ACE-Step v1.5 XL SFT transformer (cover DiT) © ACE-Step — licensed under MIT",
         ),
-        commercial_use: true,
-        restriction: None,
-    };
-
-/// Per-checkpoint attribution row for the sft `transformer` cover DiT (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_SFT_TRANSFORMER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("transformer"),
-        license: SFT_TRANSFORMER_WEIGHT_LICENSE,
+        retrieved: "2026-08-02",
     };
 
 /// Native output sample rate (Hz).

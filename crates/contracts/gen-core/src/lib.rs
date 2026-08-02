@@ -78,7 +78,6 @@ pub use license::{
     resolve_component, resolve_family, CeilingBoundary, ComponentLicense, LicenseFamily,
     LicenseTerm, ProviderComponents,
 };
-pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
     adapter_stack_resident_bytes, default_memory_strategy_safety_check,

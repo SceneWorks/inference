@@ -53,93 +53,135 @@ class ReleaseTests(unittest.TestCase):
                 {"workspace": {"package_count": len(packages) + 1, "packages": packages}}
             )
 
-    def _permissive_manifest(self) -> dict:
+    def _schema3_manifest(self) -> dict:
+        """A minimal but shaped-correctly schema-3 manifest (sc-16663).
+
+        Two providers sharing one component row is the case schema 2 could not express: an artifact
+        loaded by more than one provider is ONE row, keyed by artifact rather than by provider.
+        """
         return {
-            "schema_version": 1,
+            "schema_version": 3,
             "kind": "model-weight-licenses",
+            "families": [
+                {
+                    "id": "apache-2-0",
+                    "spdx_id": "Apache-2.0",
+                    "name": "Apache License 2.0",
+                    "text_url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+                    "terms": [{"term": "attribution_required"}],
+                }
+            ],
+            "components": [
+                {
+                    "component": "kokoro_82m",
+                    "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
+                    "gated": False,
+                    "declared": "apache-2.0",
+                    "family": "apache-2-0",
+                    "attribution": "Kokoro-82M © hexgrad",
+                    "retrieved": "2026-08-02",
+                }
+            ],
             "providers": [
                 {
                     "provider_id": "kokoro_82m",
-                    "spdx_id": "Apache-2.0",
-                    "license_name": "Apache License 2.0",
-                    "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
-                    "commercial_use": True,
-                    "attribution": "Kokoro-82M © hexgrad",
-                    "restriction": None,
+                    "components": ["kokoro_82m"],
+                    "terms": [{"term": "attribution_required"}],
                 }
             ],
         }
 
-    def test_model_licenses_accepts_a_complete_permissive_manifest(self) -> None:
-        providers = validate_model_weight_licenses(self._permissive_manifest())
+    def test_model_licenses_accepts_a_complete_schema3_manifest(self) -> None:
+        providers = validate_model_weight_licenses(self._schema3_manifest())
         self.assertEqual(providers[0]["provider_id"], "kokoro_82m")
 
     def test_model_licenses_rejects_wrong_kind_or_empty(self) -> None:
         with self.assertRaises(RuntimeError):
             validate_model_weight_licenses({"kind": "something-else", "providers": []})
+        for section in ("families", "components", "providers"):
+            manifest = self._schema3_manifest()
+            manifest[section] = []
+            with self.assertRaises(RuntimeError):
+                validate_model_weight_licenses(manifest)
+
+    def test_model_licenses_rejects_schema_2(self) -> None:
+        """The retired schema must not validate: its rows carry no family and no provenance."""
+        manifest = self._schema3_manifest()
+        manifest["schema_version"] = 2
         with self.assertRaises(RuntimeError):
-            validate_model_weight_licenses({"kind": "model-weight-licenses", "providers": []})
+            validate_model_weight_licenses(manifest)
+
+    def test_model_licenses_rejects_commercial_use(self) -> None:
+        """`commercial_use` stored a legal conclusion and is gone; a row carrying it is rejected
+        rather than ignored, so a stale emitter cannot slip one back into a release bundle."""
+        for section, key in (("components", "component"), ("providers", "provider_id")):
+            manifest = self._schema3_manifest()
+            manifest[section][0]["commercial_use"] = False
+            with self.assertRaises(RuntimeError) as caught:
+                validate_model_weight_licenses(manifest)
+            self.assertIn("commercial_use", str(caught.exception))
+            self.assertIn(manifest[section][0][key], str(caught.exception))
 
     def test_model_licenses_rejects_missing_field(self) -> None:
-        manifest = self._permissive_manifest()
-        del manifest["providers"][0]["source_url"]
+        for section, field in (
+            ("families", "text_url"),
+            ("components", "source_url"),
+            ("components", "declared"),
+            ("components", "retrieved"),
+        ):
+            manifest = self._schema3_manifest()
+            del manifest[section][0][field]
+            with self.assertRaises(RuntimeError):
+                validate_model_weight_licenses(manifest)
+
+    def test_model_licenses_rejects_blank_field(self) -> None:
+        manifest = self._schema3_manifest()
+        manifest["components"][0]["declared"] = "   "
         with self.assertRaises(RuntimeError):
             validate_model_weight_licenses(manifest)
 
-    def test_model_licenses_rejects_duplicate_provider_id(self) -> None:
-        manifest = self._permissive_manifest()
-        manifest["providers"].append(copy.deepcopy(manifest["providers"][0]))
-        with self.assertRaises(RuntimeError):
-            validate_model_weight_licenses(manifest)
+    def test_model_licenses_rejects_duplicate_keys(self) -> None:
+        for section in ("families", "components", "providers"):
+            manifest = self._schema3_manifest()
+            manifest[section].append(copy.deepcopy(manifest[section][0]))
+            with self.assertRaises(RuntimeError):
+                validate_model_weight_licenses(manifest)
 
-    def test_model_licenses_accepts_multi_component_provider(self) -> None:
-        # A multi-checkpoint provider contributes a composite row (component null) plus per-checkpoint
-        # attribution rows sharing the provider id, keyed by (provider_id, component) (sc-13493).
-        manifest = self._permissive_manifest()
+    def test_model_licenses_accepts_one_component_shared_by_two_providers(self) -> None:
+        # `chatterbox_tts` and `chatterbox_ve` load the same artifact. Schema 2 duplicated the row
+        # per provider; schema 3 points both at one (sc-16663).
+        manifest = self._schema3_manifest()
+        manifest["components"][0]["component"] = "chatterbox"
         manifest["providers"] = [
             {
-                "provider_id": "mmaudio_small_16k",
-                "component": None,
-                "spdx_id": "LicenseRef-MMAudio-small-16k-composite",
-                "license_name": "MMAudio small_16k composite",
-                "source_url": "https://huggingface.co/hkchengrex/MMAudio",
-                "commercial_use": False,
-                "attribution": "MMAudio assembles five checkpoints",
-                "restriction": "Research / non-commercial only.",
+                "provider_id": "chatterbox_tts",
+                "components": ["chatterbox"],
+                "terms": [{"term": "attribution_required"}],
             },
             {
-                "provider_id": "mmaudio_small_16k",
-                "component": "synchformer_vfeat",
-                "spdx_id": "MIT",
-                "license_name": "MIT License",
-                "source_url": "https://github.com/v-iashin/Synchformer",
-                "commercial_use": True,
-                "attribution": "Synchformer © 2024 Vladimir Iashin — MIT",
-                "restriction": None,
+                "provider_id": "chatterbox_ve",
+                "components": ["chatterbox"],
+                "terms": [{"term": "attribution_required"}],
             },
         ]
         providers = validate_model_weight_licenses(manifest)
         self.assertEqual(len(providers), 2)
 
-    def test_model_licenses_rejects_duplicate_provider_component_pair(self) -> None:
-        manifest = self._permissive_manifest()
-        row = copy.deepcopy(manifest["providers"][0])
-        row["component"] = "dup"
-        manifest["providers"].append(copy.deepcopy(row))
-        manifest["providers"].append(copy.deepcopy(row))
+    def test_model_licenses_requires_gated_boolean_and_component_mapping(self) -> None:
+        manifest = self._schema3_manifest()
+        manifest["components"][0]["gated"] = "auto"
         with self.assertRaises(RuntimeError):
             validate_model_weight_licenses(manifest)
 
-    def test_model_licenses_requires_restriction_for_non_commercial(self) -> None:
-        manifest = self._permissive_manifest()
-        manifest["providers"][0]["commercial_use"] = False
-        manifest["providers"][0]["restriction"] = None
+        manifest = self._schema3_manifest()
+        manifest["providers"][0]["components"] = []
         with self.assertRaises(RuntimeError):
             validate_model_weight_licenses(manifest)
-        # A non-commercial entry WITH a restriction note is accepted.
-        manifest["providers"][0]["spdx_id"] = "CC-BY-NC-4.0"
-        manifest["providers"][0]["restriction"] = "Non-commercial use only (CC-BY-NC-4.0)."
-        validate_model_weight_licenses(manifest)
+
+        manifest = self._schema3_manifest()
+        del manifest["providers"][0]["terms"]
+        with self.assertRaises(RuntimeError):
+            validate_model_weight_licenses(manifest)
 
 
 if __name__ == "__main__":

@@ -77,8 +77,7 @@
 //! `hkchengrex/MMAudio` @ [`model::HUB_REVISION`], file
 //! [`model::WEIGHTS_PATH`] (`ext_weights/synchformer_state_dict.pth`, ~907 MB). The `.pth` holds the
 //! full Synchformer state dict; only the `vfeat_extractor.*` sub-tree is loaded. License: **MIT**
-//! (© 2024 Vladimir Iashin), recorded in [`model::WEIGHT_LICENSE`] with a training-data-provenance
-//! restriction note.
+//! (© 2024 Vladimir Iashin), recorded in [`model::COMPONENT_LICENSE`].
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -101,8 +100,7 @@ pub mod vae;
 pub use clip::DfnClipEncoder;
 pub use mmdit::{Conditions, Config as MmDitConfig, MmAudioDit};
 pub use model::{
-    load, load_from_pth, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH, WEIGHT_LICENSE,
-    WEIGHT_LICENSE_ENTRY,
+    load, load_from_pth, COMPONENT_LICENSE, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH,
 };
 pub use sync::SynchformerVisualEncoder;
 
@@ -141,102 +139,61 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-/// This crate's **per-component** model-weight-license entries (sc-13332) — one row per ported
-/// checkpoint: the Synchformer visual encoder (sc-13438), the DFN5B-CLIP ViT-H/14 encoder (sc-13437),
-/// the MM-DiT flow-matching generator `mmaudio_small_16k` (sc-13439), and the 16k output path's
-/// mel-VAE + BigVGAN (sc-13440). This is the detailed provenance record (each checkpoint's own SPDX /
-/// attribution / restriction). The **catalog** aggregates the single composite
-/// [`SHIPPED_WEIGHT_LICENSES`] entry instead (its ship-gate keys one license row per *registered*
-/// provider id, and only `mmaudio_small_16k` registers).
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    model::WEIGHT_LICENSE_ENTRY,
-    clip::WEIGHT_LICENSE_ENTRY,
-    mmdit::WEIGHT_LICENSE_ENTRY,
-    output::VAE_WEIGHT_LICENSE_ENTRY,
-    output::BIGVGAN_WEIGHT_LICENSE_ENTRY,
-];
-
-/// The **per-component** model-weight-license entries for the 44.1 kHz path (sc-13441) — one row per
-/// ported checkpoint the `mmaudio_large_44k` provider assembles: the shared Synchformer (MIT) +
-/// DFN5B-CLIP (Apple ML Research) conditioners, the large_44k_v2 MM-DiT (CC-BY-NC-4.0), the 44k
-/// mel-VAE (CC-BY-NC-4.0), and — the new external dependency this slice adds — the **NVIDIA BigVGAN
-/// v2** 44 kHz vocoder (MIT, its own distinct entry). The catalog aggregates the single composite
-/// [`SHIPPED_WEIGHT_LICENSES`] row for the registered provider instead.
-pub const WEIGHT_LICENSES_44K: &[gen_core::WeightLicenseEntry] = &[
-    model::WEIGHT_LICENSE_ENTRY,
-    clip::WEIGHT_LICENSE_ENTRY,
-    mmdit::WEIGHT_LICENSE_ENTRY_44K,
-    output::VAE_WEIGHT_LICENSE_ENTRY_44K,
-    output::BIGVGAN_V2_WEIGHT_LICENSE_ENTRY,
-];
-
-/// The **catalog-facing** weight-license surface (sc-13493): for **each** registered MMAudio
-/// provider, the composite / effective-restriction row (`component == None`) PLUS one per-checkpoint
-/// **component** row (`component == Some(name)`) carrying that upstream's own SPDX id, source URL and
-/// attribution. `candle-audio-catalog::weight_licenses()` folds every row into the model-licenses
-/// manifest, keyed by the `(provider_id, component)` pair — so the manifest carries both the
-/// per-checkpoint attribution obligations (CC-BY-* requires naming each upstream) AND the at-a-glance
-/// effective restriction the composite summarizes.
+/// This crate's schema-3 component licence rows (sc-16663) — **one row per loaded artifact**, not
+/// one per (provider, artifact) pair.
 ///
-/// Both providers assemble the shared Synchformer (MIT) + DFN5B-CLIP (Apple ML Research) conditioners;
-/// the 16k path adds its MM-DiT / mel-VAE / BigVGAN (all CC-BY-NC-4.0), while the 44k path adds the
-/// large_44k_v2 MM-DiT + 44k mel-VAE (CC-BY-NC-4.0) and the external NVIDIA BigVGAN v2 vocoder (MIT).
-/// The composite for each is the *intersection* (strictest) of its five — research / non-commercial,
-/// gated by the Apple ML Research license on DFN5B-CLIP; see [`generator::WEIGHT_LICENSE`] /
-/// [`generator_44k::WEIGHT_LICENSE`] for the rationale.
-pub const SHIPPED_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    // ---- mmaudio_small_16k: composite (effective restriction) + 5 per-checkpoint rows ----
-    generator::WEIGHT_LICENSE_ENTRY,
-    gen_core::WeightLicenseEntry {
+/// Eight rows for two providers. The Synchformer visual encoder and the DFN5B-CLIP conditioner are
+/// each loaded by *both* `mmaudio_small_16k` and `mmaudio_large_44k`, and are the same upstream
+/// artifact in both cases — so each contributes one row that both providers point at. v2 duplicated
+/// them, once per provider, giving two places for one checkpoint's terms to disagree.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[
+    model::COMPONENT_LICENSE,
+    clip::COMPONENT_LICENSE,
+    mmdit::COMPONENT_LICENSE,
+    output::VAE_COMPONENT_LICENSE,
+    output::BIGVGAN_COMPONENT_LICENSE,
+    mmdit::COMPONENT_LICENSE_44K,
+    output::VAE_COMPONENT_LICENSE_44K,
+    output::BIGVGAN_V2_COMPONENT_LICENSE,
+];
+
+/// The provider→component mapping for both registered MMAudio generators (sc-16663).
+///
+/// # The hand-authored composite is gone, and it was under-reporting
+///
+/// v2 gave each provider a hand-typed `component == None` composite row asserting an "effective"
+/// restriction — `commercial_use: false` plus a paragraph naming the strictest of five licences.
+/// Schema 3 **derives** the provider view from the components below with
+/// [`gen_core::provider_terms`], and the derived union is a strict **superset** of what the composite
+/// disclosed: both rows named the Apple ML Research restriction on DFN5B-CLIP, but neither mentioned
+/// that the same Apple text (§2) also requires handing a copy of the agreement to any redistributee.
+/// A union is a set union, so that duty now surfaces; a prose "intersection of five licences" had
+/// nowhere to put it.
+///
+/// The two composites also differed only in prose. `LicenseRef-MMAudio-small-16k-composite` and
+/// `LicenseRef-MMAudio-large-44k-composite` were distinct SPDX-shaped identifiers for term sets that
+/// were in fact identical — the 44k path swaps a CC-BY-NC-4.0 BigVGAN for an MIT one, and MIT's
+/// attribution duty is already carried by four other components. Deriving the view makes that
+/// equality visible instead of implying a difference that does not exist.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
+    gen_core::ProviderComponents {
         provider_id: generator::MODEL_ID,
-        component: Some(model::MODEL_ID),
-        license: model::WEIGHT_LICENSE,
+        components: &[
+            model::MODEL_ID,
+            clip::MODEL_ID,
+            mmdit::COMPONENT_KEY,
+            output::VAE_COMPONENT_KEY,
+            output::BIGVGAN_COMPONENT_KEY,
+        ],
     },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator::MODEL_ID,
-        component: Some(clip::MODEL_ID),
-        license: clip::WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator::MODEL_ID,
-        component: Some("mmaudio_mmdit_small_16k"),
-        license: mmdit::WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator::MODEL_ID,
-        component: Some(output::VAE_MODEL_ID),
-        license: output::VAE_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator::MODEL_ID,
-        component: Some(output::BIGVGAN_MODEL_ID),
-        license: output::BIGVGAN_WEIGHT_LICENSE,
-    },
-    // ---- mmaudio_large_44k: composite (effective restriction) + 5 per-checkpoint rows ----
-    generator_44k::WEIGHT_LICENSE_ENTRY,
-    gen_core::WeightLicenseEntry {
+    gen_core::ProviderComponents {
         provider_id: generator_44k::MODEL_ID,
-        component: Some(model::MODEL_ID),
-        license: model::WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator_44k::MODEL_ID,
-        component: Some(clip::MODEL_ID),
-        license: clip::WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator_44k::MODEL_ID,
-        component: Some("mmaudio_mmdit_large_44k_v2"),
-        license: mmdit::WEIGHT_LICENSE_44K,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator_44k::MODEL_ID,
-        component: Some(output::VAE_MODEL_ID_44K),
-        license: output::VAE_WEIGHT_LICENSE_44K,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: generator_44k::MODEL_ID,
-        component: Some(output::BIGVGAN_V2_MODEL_ID),
-        license: output::BIGVGAN_V2_WEIGHT_LICENSE,
+        components: &[
+            model::MODEL_ID,
+            clip::MODEL_ID,
+            mmdit::COMPONENT_KEY_44K,
+            output::VAE_COMPONENT_KEY_44K,
+            output::BIGVGAN_V2_COMPONENT_KEY,
+        ],
     },
 ];

@@ -30,26 +30,27 @@ pub const HUB_REPO: &str = "laion/clap-htsat-unfused";
 /// Immutable commit SHA of the pinned checkpoint (Apache-2.0).
 pub const HUB_REVISION: &str = "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a";
 
-/// The license of the pinned LAION CLAP weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. Apache-2.0 (permissive), verified against the
-/// `laion/clap-htsat-unfused` model card.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
+/// Stable component key for the pinned CLAP (HTSAT-unfused) checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "clap_htsat_unfused";
+
+/// The schema-3 licence row for the pinned CLAP (HTSAT-unfused) checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `laion/clap-htsat-unfused` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
         source_url: "https://huggingface.co/laion/clap-htsat-unfused",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
         attribution: Some("CLAP (HTSAT-unfused) © LAION — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
+        retrieved: "2026-08-02",
     };
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
-    };
 /// Checkpoint file (pytorch pickle; loaded via `VarBuilder::from_pth`).
 pub const WEIGHTS_FILE: &str = "pytorch_model.bin";
 /// RoBERTa BPE tokenizer.

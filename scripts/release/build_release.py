@@ -21,73 +21,94 @@ TAG_PATTERN = re.compile(r"^runtime-(\d{4})\.(\d{2})\.(\d+)(?:-rc\.(\d+))?$")
 REPOSITORY = "https://github.com/SceneWorks/inference"
 TOOL_NAME = "SceneWorks inference release builder"
 
-# The committed model-weight-license manifest (sc-13332). A separate axis from the SPDX crate SBOM:
-# one row per shipped audio provider, keyed by its registry id, recording the license of its pinned
-# Hugging Face weight checkpoint. The Rust catalog ship-gate
-# (`candle-audio-catalog::every_shipped_provider_has_a_weight_license`) keeps this file complete and
-# in sync with the provider registry; the release tooling emits it beside the SBOM so SceneWorks
-# consumes exactly one file for its end-product licenses page.
+# The committed model-weight-licence manifest (sc-13332, schema 3 since sc-16663). A separate axis
+# from the SPDX crate SBOM: the licence facts for every artifact the shipped providers load. The Rust
+# catalog ship-gate (`candle-audio-catalog::every_shipped_provider_has_a_weight_license`) keeps this
+# file complete and in sync with the provider registry; the release tooling emits it beside the SBOM
+# so a consumer reads exactly one file for its end-product licences page.
+#
+# DISCLOSURE ONLY. Nothing this validator checks gates or withholds anything — it checks that the
+# facts a consumer will display are present and structurally sound.
 MODEL_LICENSES_SOURCE = "release/model-weight-licenses.json"
 MODEL_LICENSES_KIND = "model-weight-licenses-json"
-REQUIRED_LICENSE_FIELDS = (
-    "provider_id",
-    "spdx_id",
-    "license_name",
-    "source_url",
-    "commercial_use",
-)
+MODEL_LICENSES_SCHEMA = 3
+REQUIRED_FAMILY_FIELDS = ("id", "spdx_id", "name", "text_url")
+REQUIRED_COMPONENT_FIELDS = ("component", "source_url", "declared", "family", "retrieved")
 
 
 def validate_model_weight_licenses(document: dict[str, Any]) -> list[dict[str, Any]]:
-    """Assert a model-weight-license manifest is present and complete.
+    """Assert a schema-3 model-weight-licence manifest is present and structurally complete.
 
-    Every row must record its identity + SPDX id + license name + source URL + commercial-use flag,
-    and a non-commercial checkpoint MUST carry a restriction note (the whole point of the surface: a
-    restricted license can never ship with its terms unrecorded).
+    Three fact sections. ``families`` are the reviewed upstream licence texts; ``components`` are the
+    loaded artifacts, each pointing at a family and carrying its own provenance (``source_url`` /
+    ``declared`` / ``retrieved``); ``providers`` map a registry id onto component keys and carry the
+    **derived** term union. Keys are unique within each section, and no section may be empty.
 
-    A single-checkpoint provider contributes one row (``component`` null). A multi-checkpoint
-    provider (e.g. MMAudio) contributes a composite/effective-restriction row (``component`` null)
-    plus one per-checkpoint attribution row (``component`` set), so rows are keyed by the
-    ``(provider_id, component)`` pair rather than ``provider_id`` alone (sc-13493) — the same
-    ``provider_id`` may recur, but each ``(provider_id, component)`` pair is unique. Shared by the
-    builder (emit-time) and the verifier (bundle-time).
+    Schema 2's ``commercial_use`` is deliberately absent and is rejected if present: it stored a legal
+    *conclusion* depending on facts inference does not have, and a join computed over a wrong boolean
+    reads as authoritative (sc-16663). Shared by the builder (emit-time) and the verifier
+    (bundle-time).
+
+    Scope note: this is the structural floor sc-16663 needed to keep the release green. sc-16664 owns
+    the semantic validator — resolving every ``family`` reference against the ``families`` section,
+    recomputing each provider's derived term union and comparing it to the emitted one, merging
+    manifests across catalogs with byte-identical-component enforcement, and mirroring the Rust-side
+    calendar-date and blank-field rules.
     """
     if document.get("kind") != "model-weight-licenses":
         raise RuntimeError("model-licenses manifest has the wrong kind")
-    providers = document.get("providers")
-    if not isinstance(providers, list) or not providers:
-        raise RuntimeError("model-licenses manifest lists no providers")
-    seen: set[tuple[str, str | None]] = set()
-    for provider in providers:
-        for field in REQUIRED_LICENSE_FIELDS:
-            value = provider.get(field)
-            if value is None or (isinstance(value, str) and not value.strip()):
+    schema = document.get("schema_version")
+    if schema != MODEL_LICENSES_SCHEMA:
+        raise RuntimeError(
+            f"model-licenses manifest is schema {schema!r}, expected {MODEL_LICENSES_SCHEMA}"
+        )
+
+    def section(name: str) -> list[dict[str, Any]]:
+        rows = document.get(name)
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(f"model-licenses manifest lists no {name}")
+        return rows
+
+    def require(rows: list[dict[str, Any]], fields: tuple[str, ...], label: str, key: str) -> None:
+        seen: set[str] = set()
+        for row in rows:
+            for field in fields:
+                value = row.get(field)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    raise RuntimeError(
+                        f"model-licenses {label} {row.get(key)!r} is missing {field!r}"
+                    )
+            if "commercial_use" in row:
                 raise RuntimeError(
-                    f"model-licenses entry {provider.get('provider_id')!r} is missing {field!r}"
+                    f"model-licenses {label} {row[key]!r} carries commercial_use, a schema-2 legal "
+                    "conclusion removed in schema 3"
                 )
-        if not isinstance(provider["commercial_use"], bool):
+            identifier = row[key]
+            if identifier in seen:
+                raise RuntimeError(f"duplicate model-licenses {label} {identifier!r}")
+            seen.add(identifier)
+
+    families = section("families")
+    components = section("components")
+    providers = section("providers")
+    require(families, REQUIRED_FAMILY_FIELDS, "family", "id")
+    require(components, REQUIRED_COMPONENT_FIELDS, "component", "component")
+    require(providers, ("provider_id",), "provider", "provider_id")
+
+    for row in components:
+        if not isinstance(row.get("gated"), bool):
             raise RuntimeError(
-                f"model-licenses entry {provider['provider_id']!r} commercial_use must be boolean"
+                f"model-licenses component {row['component']!r} gated must be boolean"
             )
-        identifier = provider["provider_id"]
-        component = provider.get("component")
-        if component is not None and not (
-            isinstance(component, str) and component.strip()
-        ):
+    for provider in providers:
+        keys = provider.get("components")
+        if not isinstance(keys, list) or not keys:
             raise RuntimeError(
-                f"model-licenses entry {identifier!r} has a non-string/empty component discriminator"
+                f"model-licenses provider {provider['provider_id']!r} maps to no components"
             )
-        key = (identifier, component)
-        if key in seen:
+        if not isinstance(provider.get("terms"), list):
             raise RuntimeError(
-                f"duplicate model-licenses row (provider_id={identifier!r}, component={component!r})"
-            )
-        seen.add(key)
-        restriction = provider.get("restriction")
-        if not provider["commercial_use"] and not (restriction or "").strip():
-            raise RuntimeError(
-                f"non-commercial model-licenses entry (provider_id={identifier!r}, "
-                f"component={component!r}) has no restriction note"
+                f"model-licenses provider {provider['provider_id']!r} has no derived terms array"
             )
     return providers
 

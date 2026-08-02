@@ -65,22 +65,24 @@ pub const CODEC_CHECKPOINT_FILE: &str = "xy_tokenizer.ckpt";
 /// [`gen_core::require_component`]; the codec is then built lazily from the staged path.
 pub const CODEC_COMPONENT_ID: &str = "codec";
 
-/// The license of the pinned MOSS-TTSD-v0.5 weight checkpoint (Apache-2.0, permissive) — surfaced for
-/// SceneWorks' end-product licenses page. Verified against the `OpenMOSS-Team/MOSS-TTSD-v0.5` card.
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "Apache-2.0",
-    name: "Apache License 2.0",
-    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
-    attribution: Some("MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0"),
-    commercial_use: true,
-    restriction: None,
-};
+/// Stable component key for the pinned MOSS-TTSD-v0.5 checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "moss_ttsd_v05";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    component: None,
-    license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned MOSS-TTSD-v0.5 checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `OpenMOSS-Team/MOSS-TTSD-v0.5` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`gen_core::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: COMPONENT_KEY,
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0"),
+    retrieved: "2026-08-02",
 };
 
 /// Native output sample rate of the XY_Tokenizer codec (Hz).
@@ -666,10 +668,13 @@ mod tests {
     }
 
     #[test]
-    fn weight_license_is_apache() {
-        let lic = WEIGHT_LICENSE;
-        assert_eq!(lic.spdx_id, "Apache-2.0");
-        assert!(lic.commercial_use);
-        assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
+    fn component_licence_resolves_to_the_apache_family() {
+        use gen_core::{resolve_family, LicenseTerm, LICENSE_FAMILIES};
+        assert!(COMPONENT_LICENSE.is_well_formed(LICENSE_FAMILIES));
+        assert_eq!(COMPONENT_LICENSE.declared, "apache-2.0");
+        let family = resolve_family(LICENSE_FAMILIES, COMPONENT_LICENSE.family).unwrap();
+        assert_eq!(family.spdx_id, "Apache-2.0");
+        assert!(family.imposes(LicenseTerm::AttributionRequired));
+        assert!(family.imposes(LicenseTerm::NoticeFileRequired));
     }
 }

@@ -99,24 +99,24 @@ fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, Audio
     }))
 }
 
-/// The license of the pinned Chatterbox weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. MIT (permissive), verified against the `ResembleAI/chatterbox`
-/// model card. The clone TTS generator ships the same `ResembleAI/chatterbox` weights the
-/// `chatterbox_ve` sibling does, keyed here by this provider's own [`MODEL_ID`].
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "MIT",
-    name: "MIT License",
-    source_url: "https://huggingface.co/ResembleAI/chatterbox",
-    attribution: Some("Chatterbox © Resemble AI — licensed under MIT"),
-    commercial_use: true,
-    restriction: None,
-};
+/// Stable component key for the pinned Chatterbox checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "chatterbox";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    component: None,
-    license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned Chatterbox checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `ResembleAI/chatterbox` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`gen_core::families::MIT`].
+pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: COMPONENT_KEY,
+    source_url: "https://huggingface.co/ResembleAI/chatterbox",
+    gated: false,
+    declared: "mit",
+    family: "mit",
+    attribution: Some("Chatterbox © Resemble AI — licensed under MIT"),
+    retrieved: "2026-08-02",
 };
 
 /// Advertised language codes (the base English model).
