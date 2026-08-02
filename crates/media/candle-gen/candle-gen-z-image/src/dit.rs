@@ -38,8 +38,23 @@
 use candle_core::{DType, Module, Result, Tensor, D};
 use candle_nn::{RmsNorm, VarBuilder};
 
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear_no_bias, LoraHost, LoraLinear};
+
+fn default_attention_plan() -> AttentionPlan<'static> {
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        candle_gen::ATTN_SCORES_BUDGET as u64,
+        false,
+    ))
+}
+
+fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_core::Error::Msg(other.to_string()),
+    })
+}
 
 // Reused verbatim from candle-transformers — frozen, non-adapter sub-modules + the patchify/RoPE
 // helpers. Vendoring these would add ~600 lines of drift surface for zero benefit (they hold no
@@ -147,6 +162,7 @@ impl ZImageAttention {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -154,6 +170,23 @@ impl ZImageAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            hidden_states,
+            attention_mask,
+            cos,
+            sin,
+            default_attention_plan(),
+        ))
+    }
+
+    pub fn forward_with_attention_plan(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
         // Project to Q, K, V (through the LoRA-adapted projections).
@@ -194,19 +227,19 @@ impl ZImageAttention {
             }
             None => None,
         };
-        let context = candle_gen::sdpa_budgeted_bhsd(
+        let context = candle_gen::sdpa_planned_bhsd(
             &q,
             &k,
             &v,
             scale,
             mask.as_ref(),
             |s| candle_nn::ops::softmax(s, D::Minus1),
-            candle_gen::ATTN_SCORES_BUDGET,
+            attention_plan,
         )?;
 
         // (B, n, seq, hd) -> (B, seq, dim)
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
-        context.apply(&self.to_out)
+        Ok(context.apply(&self.to_out)?)
     }
 }
 
@@ -276,6 +309,25 @@ impl ZImageTransformerBlock {
         sin: &Tensor,
         adaln_input: Option<&Tensor>,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            x,
+            attn_mask,
+            cos,
+            sin,
+            adaln_input,
+            default_attention_plan(),
+        ))
+    }
+
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln_input: Option<&Tensor>,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
             let modulation = adaln_input.apply(adaln)?.unsqueeze(1)?;
@@ -291,7 +343,13 @@ impl ZImageTransformerBlock {
             // Attention block
             let normed = self.attention_norm1.forward_diff(x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward(&scaled, attn_mask, cos, sin)?;
+            let attn_out = self.attention.forward_with_attention_plan(
+                &scaled,
+                attn_mask,
+                cos,
+                sin,
+                attention_plan,
+            )?;
             let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
 
@@ -300,17 +358,23 @@ impl ZImageTransformerBlock {
             let scaled = normed.broadcast_mul(&scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
-            x + gate_mlp.broadcast_mul(&ffn_out)?
+            Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
             let normed = self.attention_norm1.forward_diff(x)?;
-            let attn_out = self.attention.forward(&normed, attn_mask, cos, sin)?;
+            let attn_out = self.attention.forward_with_attention_plan(
+                &normed,
+                attn_mask,
+                cos,
+                sin,
+                attention_plan,
+            )?;
             let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
             let x = (x + attn_out)?;
 
             let normed = self.ffn_norm1.forward_diff(&x)?;
             let ffn_out = self.feed_forward.forward(&normed)?;
             let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
-            x + ffn_out
+            Ok((x + ffn_out)?)
         }
     }
 }

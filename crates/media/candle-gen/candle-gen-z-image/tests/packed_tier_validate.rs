@@ -654,6 +654,7 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
         negative_prompt: Some("blurry, malformed".into()),
         seed: 16170,
         use_pid: false,
+        memory: Default::default(),
         cancel: candle_gen::gen_core::CancelFlag::new(),
     };
     let render = |request: &ZImageControlRequest, control_image: &Image| {

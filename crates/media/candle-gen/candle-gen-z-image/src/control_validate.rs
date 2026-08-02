@@ -98,6 +98,7 @@ fn run_control_validation(
         seed: 12345,
         // Native VAE: this harness validates the pose-control pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        memory: Default::default(),
         cancel: CancelFlag::new(),
     };
 
@@ -177,6 +178,15 @@ fn run_control_validation(
         "mid-cancel should stop right after step 3 (saw {steps_seen})"
     );
     println!("[{tag}][cancel:mid] Err(Canceled) after {steps_seen} steps ✓");
+
+    let after_cancel = model
+        .generate(&req, &skeleton, &mut noop)
+        .expect("warm render after mid-denoise cancellation");
+    assert_eq!(
+        after_cancel, out_ctrl,
+        "mid-denoise cancellation poisoned the warm provider"
+    );
+    println!("[{tag}][cancel:cleanup] fixed-seed warm follow-up matched ✓");
 
     // The gate: the control path meaningfully changes the output (it actually conditions the image).
     assert!(

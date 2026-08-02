@@ -702,6 +702,7 @@ enum TransformerLayers {
     Streamed {
         weights: VarBuilder<'static>,
         sidecars: Option<Arc<PackedWeightSidecars>>,
+        adapters: Option<crate::adapters::AdditivePlan>,
     },
 }
 
@@ -786,6 +787,7 @@ impl ZImageTransformer2DModel {
             TransformerLayers::Streamed {
                 weights: vb.clone(),
                 sidecars,
+                adapters: None,
             }
         } else {
             let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -844,6 +846,7 @@ impl ZImageTransformer2DModel {
         self.rope_embedder.forward(position_ids)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn control_refine_noise<F>(
         &self,
         mut hidden: Tensor,
@@ -851,6 +854,7 @@ impl ZImageTransformer2DModel {
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
+        attention_plan: AttentionPlan<'_>,
         mut after_layer: F,
     ) -> candle_gen::Result<Tensor>
     where
@@ -863,7 +867,7 @@ impl ZImageTransformer2DModel {
                 cos,
                 sin,
                 Some(adaln),
-                AttentionPlan::UNBOUNDED,
+                attention_plan,
             )?;
             hidden = after_layer(index, hidden)?;
         }
@@ -881,6 +885,7 @@ impl ZImageTransformer2DModel {
         attention_mask: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
         for layer in &self.context_refiner {
             hidden = layer.forward_with_attention_plan(
@@ -889,40 +894,105 @@ impl ZImageTransformer2DModel {
                 cos,
                 sin,
                 None,
-                AttentionPlan::UNBOUNDED,
+                attention_plan,
             )?;
         }
         Ok(hidden)
     }
 
-    pub(crate) fn control_run_resident_layers<F>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn control_run_layers<F>(
         &self,
         mut hidden: Tensor,
         attention_mask: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
         mut after_layer: F,
     ) -> candle_gen::Result<Tensor>
     where
         F: FnMut(usize, Tensor) -> candle_gen::Result<Tensor>,
     {
-        let TransformerLayers::Resident(layers) = &self.layers else {
-            return Err(candle_gen::CandleError::Msg(
-                "z-image control: streamed base transformer is not supported by the eager control provider"
-                    .into(),
-            ));
-        };
-        for (index, layer) in layers.iter().enumerate() {
-            hidden = layer.forward_with_attention_plan(
-                &hidden,
-                Some(attention_mask),
-                cos,
-                sin,
-                Some(adaln),
-                AttentionPlan::UNBOUNDED,
-            )?;
-            hidden = after_layer(index, hidden)?;
+        match &self.layers {
+            TransformerLayers::Resident(layers) => {
+                for (index, layer) in layers.iter().enumerate() {
+                    hidden = layer.forward_with_attention_plan(
+                        &hidden,
+                        Some(attention_mask),
+                        cos,
+                        sin,
+                        Some(adaln),
+                        attention_plan,
+                    )?;
+                    hidden = after_layer(index, hidden)?;
+                }
+            }
+            TransformerLayers::Streamed {
+                weights,
+                sidecars,
+                adapters,
+            } => {
+                let block_plan = BlockPlan::new(self.cfg.n_layers, transformer_window)?;
+                let uncancelled = candle_gen::gen_core::CancelFlag::default();
+                let cancel = attention_plan.cancel.unwrap_or(&uncancelled);
+                hidden = candle_gen::block_window::run_windowed(
+                    self.device(),
+                    &block_plan,
+                    cancel,
+                    hidden,
+                    || Ok(weights.clone()),
+                    |mut state, view, range| {
+                        let first = range.start;
+                        let mut blocks = range
+                            .map(|index| {
+                                match sidecars.as_deref() {
+                                    Some(sidecars) => ZImageTransformerBlock::new_streamed(
+                                        &self.cfg,
+                                        true,
+                                        view.pp("layers").pp(index),
+                                        sidecars,
+                                        index,
+                                    ),
+                                    None => ZImageTransformerBlock::new(
+                                        &self.cfg,
+                                        true,
+                                        view.pp("layers").pp(index),
+                                    ),
+                                }
+                                .map_err(candle_gen::CandleError::from)
+                            })
+                            .collect::<candle_gen::Result<Vec<_>>>()?;
+                        if let Some(plan) = adapters {
+                            for (offset, block) in blocks.iter_mut().enumerate() {
+                                let index = first + offset;
+                                block.visit_adaptable_mut(
+                                    &format!("layers.{index}"),
+                                    &mut |path, linear| {
+                                        plan.apply_projection(path, linear, self.device())?;
+                                        Ok(())
+                                    },
+                                )?;
+                            }
+                        }
+                        for (offset, block) in blocks.iter().enumerate() {
+                            candle_gen::check_cancel(cancel)?;
+                            let index = first + offset;
+                            state = block.forward_with_attention_plan(
+                                &state,
+                                Some(attention_mask),
+                                cos,
+                                sin,
+                                Some(adaln),
+                                attention_plan,
+                            )?;
+                            state = after_layer(index, state)?;
+                        }
+                        Ok(state)
+                    },
+                )?;
+            }
         }
         Ok(hidden)
     }
@@ -1081,7 +1151,11 @@ impl ZImageTransformer2DModel {
                     )?;
                 }
             }
-            TransformerLayers::Streamed { weights, sidecars } => {
+            TransformerLayers::Streamed {
+                weights,
+                sidecars,
+                adapters,
+            } => {
                 let block_plan = BlockPlan::new(self.cfg.n_layers, transformer_window)?;
                 let uncancelled = candle_gen::gen_core::CancelFlag::default();
                 let cancel = attention_plan.cancel.unwrap_or(&uncancelled);
@@ -1097,7 +1171,8 @@ impl ZImageTransformer2DModel {
                             .push((range.start, range.end));
                         // Materialize the whole window before the first forward. Loading inside the
                         // block loop would silently execute a window of one regardless of selection.
-                        let blocks = range
+                        let first = range.start;
+                        let mut blocks = range
                             .map(|index| {
                                 match sidecars.as_deref() {
                                     Some(sidecars) => ZImageTransformerBlock::new_streamed(
@@ -1116,6 +1191,18 @@ impl ZImageTransformer2DModel {
                                 .map_err(candle_gen::CandleError::from)
                             })
                             .collect::<candle_gen::Result<Vec<_>>>()?;
+                        if let Some(plan) = adapters {
+                            for (offset, block) in blocks.iter_mut().enumerate() {
+                                let index = first + offset;
+                                block.visit_adaptable_mut(
+                                    &format!("layers.{index}"),
+                                    &mut |path, linear| {
+                                        plan.apply_projection(path, linear, self.device())?;
+                                        Ok(())
+                                    },
+                                )?;
+                            }
+                        }
                         for block in &blocks {
                             candle_gen::check_cancel(cancel)?;
                             state = block.forward_with_attention_plan(
@@ -1161,16 +1248,10 @@ impl ZImageTransformer2DModel {
     /// stacks, and the final layer). The additive installer
     /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
     /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
-    pub fn visit_adaptable_mut(
+    pub(crate) fn visit_adaptable_for_install(
         &mut self,
         f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        if matches!(&self.layers, TransformerLayers::Streamed { .. }) {
-            return Err(candle_gen::CandleError::Msg(
-                "z-image adapters must be installed before selecting streamed transformer blocks"
-                    .to_owned(),
-            ));
-        }
         f("cap_embedder.1", &mut self.cap_embedder_linear)?;
         f("all_x_embedder.2-1", &mut self.x_embedder)?;
         self.t_embedder.visit_adaptable_mut("t_embedder", f)?;
@@ -1180,14 +1261,33 @@ impl ZImageTransformer2DModel {
         for (i, blk) in self.context_refiner.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("context_refiner.{i}"), f)?;
         }
-        if let TransformerLayers::Resident(layers) = &mut self.layers {
-            for (i, blk) in layers.iter_mut().enumerate() {
-                blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        match &mut self.layers {
+            TransformerLayers::Resident(layers) => {
+                for (i, blk) in layers.iter_mut().enumerate() {
+                    blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+                }
+            }
+            TransformerLayers::Streamed { weights, .. } => {
+                for i in 0..self.cfg.n_layers {
+                    let mut block =
+                        ZImageTransformerBlock::new(&self.cfg, true, weights.pp("layers").pp(i))?;
+                    let visited = block.visit_adaptable_mut(&format!("layers.{i}"), f);
+                    let synchronized = weights.device().synchronize();
+                    drop(block);
+                    visited?;
+                    synchronized?;
+                }
             }
         }
         self.final_layer
             .visit_adaptable_mut("all_final_layer.2-1", f)?;
         Ok(())
+    }
+
+    pub(crate) fn retain_streamed_adapter_plan(&mut self, plan: crate::adapters::AdditivePlan) {
+        if let TransformerLayers::Streamed { adapters, .. } = &mut self.layers {
+            *adapters = Some(plan);
+        }
     }
 }
 

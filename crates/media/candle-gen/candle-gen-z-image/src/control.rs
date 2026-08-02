@@ -38,11 +38,13 @@
 
 use std::path::{Path, PathBuf};
 
+use candle_gen::block_window::BlockPlan;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, PidWeights, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, LoadPhase, PidWeights, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
@@ -175,6 +177,9 @@ pub struct ZImageControlRequest {
     /// PiD student (the FLUX.1 latent space; 4× SR → 2K/4K) instead of the native Z-Image VAE. `false`
     /// (default) keeps the VAE decode.
     pub use_pid: bool,
+    /// Request-scoped lifecycle controls selected from exact calibration evidence. The default keeps
+    /// the historical resident, unbounded path byte-for-byte unchanged.
+    pub memory: GenerationMemory,
     pub cancel: CancelFlag,
 }
 
@@ -190,6 +195,7 @@ impl Default for ZImageControlRequest {
             negative_prompt: None,
             seed: 0,
             use_pid: false,
+            memory: GenerationMemory::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -200,13 +206,23 @@ impl Default for ZImageControlRequest {
 struct ZImageControlTransformer {
     base: PackedTransformer,
     control_x_embedder: Linear,
-    control_layers: Vec<ZImageControlBlock>,
+    control_layers: ControlLayers,
     control_noise_refiner: Vec<ZImageControlBlock>,
+}
+
+enum ControlLayers {
+    Resident(Vec<ZImageControlBlock>),
+    Streamed(VarBuilder<'static>),
 }
 
 impl ZImageControlTransformer {
     /// Build from an already-loaded base transformer + the Fun-Controlnet-Union checkpoint VarBuilder.
-    fn from_weights(base: PackedTransformer, cfg: &DitConfig, vb: VarBuilder) -> Result<Self> {
+    fn from_weights(
+        base: PackedTransformer,
+        cfg: &DitConfig,
+        vb: VarBuilder<'static>,
+        stream_layers: bool,
+    ) -> Result<Self> {
         let dim = cfg.dim;
         let key = format!("{}-{}", cfg.all_patch_size[0], cfg.all_f_patch_size[0]);
         let control_in = cfg.all_f_patch_size[0]
@@ -216,11 +232,22 @@ impl ZImageControlTransformer {
         let control_x_embedder =
             nn::linear(control_in, dim, vb.pp("control_all_x_embedder").pp(key))?;
 
-        let control_layers = (0..CONTROL_LAYERS_PLACES.len())
-            .map(|i| {
-                ZImageControlBlock::from_weights(cfg, vb.pp("control_layers").pp(i), dim, i == 0)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let control_layers = if stream_layers {
+            ControlLayers::Streamed(vb.clone())
+        } else {
+            ControlLayers::Resident(
+                (0..CONTROL_LAYERS_PLACES.len())
+                    .map(|i| {
+                        ZImageControlBlock::from_weights(
+                            cfg,
+                            vb.pp("control_layers").pp(i),
+                            dim,
+                            i == 0,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
         let control_noise_refiner = (0..CONTROL_REFINER_PLACES.len())
             .map(|i| {
                 ZImageControlBlock::from_weights(
@@ -240,6 +267,79 @@ impl ZImageControlTransformer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_control_main(
+        &self,
+        c: Tensor,
+        x_base: &Tensor,
+        attn_mask: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &CancelFlag,
+    ) -> Result<(Vec<Tensor>, Tensor)> {
+        match &self.control_layers {
+            ControlLayers::Resident(blocks) => self.run_control_blocks(
+                blocks,
+                c,
+                x_base,
+                attn_mask,
+                cos,
+                sin,
+                adaln,
+                attention_plan,
+            ),
+            ControlLayers::Streamed(weights) => {
+                let plan = BlockPlan::new(CONTROL_LAYERS_PLACES.len(), transformer_window)?;
+                let device = c.device().clone();
+                let (state, hints) = candle_gen::block_window::run_windowed(
+                    &device,
+                    &plan,
+                    cancel,
+                    (c, Vec::with_capacity(CONTROL_LAYERS_PLACES.len())),
+                    || Ok(weights.clone()),
+                    |(mut state, mut hints), view, range| {
+                        let blocks = range
+                            .map(|index| {
+                                ZImageControlBlock::from_weights(
+                                    self.base.control_config(),
+                                    view.pp("control_layers").pp(index),
+                                    self.base.control_config().dim,
+                                    index == 0,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        for (index, block) in blocks.iter().enumerate() {
+                            candle_gen::check_cancel(cancel)?;
+                            if hints.is_empty() && index == 0 {
+                                let before = block.before_proj.as_ref().ok_or_else(|| {
+                                    CandleError::Msg(
+                                        "z-image streamed control block 0 is missing before_proj"
+                                            .into(),
+                                    )
+                                })?;
+                                state = (before.forward(&state)? + x_base)?;
+                            }
+                            state = block.base.forward_with_attention_plan(
+                                &state,
+                                Some(attn_mask),
+                                cos,
+                                sin,
+                                Some(adaln),
+                                attention_plan,
+                            )?;
+                            hints.push(block.after_proj.forward(&state)?);
+                        }
+                        Ok((state, hints))
+                    },
+                )?;
+                Ok((hints, state))
+            }
+        }
+    }
+
     /// Run a parallel control stack, returning `(per-block hints, threaded control state)`. Block 0
     /// seeds the branch via `before_proj(c) + x_base`; each block runs the base-block forward on the
     /// threaded state `c` and emits `after_proj(c)` as its hint.
@@ -253,6 +353,7 @@ impl ZImageControlTransformer {
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<(Vec<Tensor>, Tensor)> {
         let mut c = c;
         let mut hints = Vec::with_capacity(blocks.len());
@@ -263,9 +364,14 @@ impl ZImageControlTransformer {
                 })?;
                 c = (bp.forward(&c)? + x_base)?;
             }
-            c = block
-                .base
-                .forward(&c, Some(attn_mask), cos, sin, Some(adaln))?;
+            c = block.base.forward_with_attention_plan(
+                &c,
+                Some(attn_mask),
+                cos,
+                sin,
+                Some(adaln),
+                attention_plan,
+            )?;
             hints.push(block.after_proj.forward(&c)?);
         }
         Ok((hints, c))
@@ -276,6 +382,7 @@ impl ZImageControlTransformer {
     /// and adding its scaled hints. Returns the **raw** velocity `(B, C, F, H, W)` (the caller negates,
     /// the Z-Image sign convention). `control_context`: the `(B, 33, F, H/8, W/8)` VAE-encoded control;
     /// `scale`: `control_scale`.
+    #[allow(clippy::too_many_arguments)]
     fn forward_control(
         &self,
         x: &Tensor,
@@ -284,6 +391,8 @@ impl ZImageControlTransformer {
         cap_mask: &Tensor,
         control_context: &Tensor,
         scale: f64,
+        memory: GenerationMemory,
+        cancel: &CancelFlag,
     ) -> Result<Tensor> {
         let base = &self.base;
         let cfg = base.control_config();
@@ -291,6 +400,20 @@ impl ZImageControlTransformer {
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = cfg.all_patch_size[0];
         let f_patch_size = cfg.all_f_patch_size[0];
+        let attention_budget = if memory.chunk_attention {
+            crate::memory_strategy::ATTENTION_CHUNK_SIZE as u64
+        } else {
+            u64::MAX
+        };
+        let attention_plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            attention_budget,
+            false,
+        ))
+        .with_cancel(cancel);
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
 
         // 1. Timestep embedding.
         let t_scaled = (t * cfg.t_scale)?;
@@ -324,23 +447,35 @@ impl ZImageControlTransformer {
             &x_cos,
             &x_sin,
             &adaln,
+            attention_plan,
         )?;
 
         // 6. Base noise refiner, injecting the control refiner hints.
-        x_emb =
-            base.control_refine_noise(x_emb, &x_attn_mask, &x_cos, &x_sin, &adaln, |i, hidden| {
-                match hint_index(&CONTROL_REFINER_PLACES, i) {
-                    Some(n) => add_hint(&hidden, &refiner_hints[n], scale),
-                    None => Ok(hidden),
-                }
-            })?;
+        x_emb = base.control_refine_noise(
+            x_emb,
+            &x_attn_mask,
+            &x_cos,
+            &x_sin,
+            &adaln,
+            attention_plan,
+            |i, hidden| match hint_index(&CONTROL_REFINER_PLACES, i) {
+                Some(n) => add_hint(&hidden, &refiner_hints[n], scale),
+                None => Ok(hidden),
+            },
+        )?;
 
         // 7. Caption stream: RMSNorm → linear → context refiner.
         let mut cap_emb = base.control_embed_caption(cap_feats)?;
         let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
         let (cap_cos, cap_sin) = base.control_rope(&cap_pos_ids)?;
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-        cap_emb = base.control_refine_context(cap_emb, &cap_attn_mask, &cap_cos, &cap_sin)?;
+        cap_emb = base.control_refine_context(
+            cap_emb,
+            &cap_attn_mask,
+            &cap_cos,
+            &cap_sin,
+            attention_plan,
+        )?;
 
         // 8. Unify [image, caption].
         let mut unified = Tensor::cat(&[&x_emb, &cap_emb], 1)?;
@@ -351,23 +486,27 @@ impl ZImageControlTransformer {
         // 9. Main control pass: thread the (refined) control state + caption through the 15 control
         // layers → the per-block hints for the unified main loop.
         let control_unified = Tensor::cat(&[&threaded, &cap_emb], 1)?;
-        let (main_hints, _) = self.run_control_blocks(
-            &self.control_layers,
+        let (main_hints, _) = self.run_control_main(
             control_unified,
             &unified,
             &unified_attn_mask,
             &unified_cos,
             &unified_sin,
             &adaln,
+            attention_plan,
+            transformer_window,
+            cancel,
         )?;
 
         // 10. Base main layers, injecting the control hints at CONTROL_LAYERS_PLACES.
-        unified = base.control_run_resident_layers(
+        unified = base.control_run_layers(
             unified,
             &unified_attn_mask,
             &unified_cos,
             &unified_sin,
             &adaln,
+            attention_plan,
+            transformer_window,
             |i, hidden| match hint_index(&CONTROL_LAYERS_PLACES, i) {
                 Some(n) => add_hint(&hidden, &main_hints[n], scale),
                 None => Ok(hidden),
@@ -392,17 +531,19 @@ impl ZImageControlTransformer {
 /// pose skeleton into the control context).
 pub struct ZImageControl {
     device: Device,
+    pipeline: Pipeline,
+    control_file: PathBuf,
     /// Base (undistilled, full-CFG) vs Turbo (distilled, no-CFG) treatment (sc-8680). Selected at load
     /// from [`ZImageControlPaths::base`]; drives the scheduler (shift 6.0 vs 3.0), the default step
     /// count, and whether the denoise runs real CFG.
     base: bool,
-    text_encoder: TextEnc,
+    text_encoder: Option<TextEnc>,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/uncond branch.
-    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
-    transformer: ZImageControlTransformer,
-    vae: AutoEncoderKL,
-    vae_encoder: VaeEncoder,
+    tokenizer: Option<candle_gen::gen_core::tokenizer::TextTokenizer>,
+    transformer: Option<ZImageControlTransformer>,
+    vae: Option<AutoEncoderKL>,
+    vae_encoder: Option<VaeEncoder>,
     vae_shift: f64,
     vae_scale: f64,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
@@ -412,6 +553,18 @@ pub struct ZImageControl {
 }
 
 impl ZImageControl {
+    fn resident_missing(component: &str) -> CandleError {
+        CandleError::Msg(format!(
+            "z-image control {component} is phase-loaded; use the staged generation path"
+        ))
+    }
+
+    fn resident_transformer(&self) -> Result<&ZImageControlTransformer> {
+        self.transformer
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("transformer"))
+    }
+
     /// Load the base Z-Image components (Qwen3 encoder + vendored DiT + VAE) + the Fun-Controlnet-Union
     /// control overlay + a VAE encoder for the pose. The control transformer runs bf16; the VAE encoder
     /// runs f32.
@@ -431,20 +584,50 @@ impl ZImageControl {
                 )),
             };
         let control_file = resolve_control_file(&paths.control)?;
-        let control_vb = candle_gen::mmap_var_builder(&[control_file], DTYPE, &device)?;
-        let transformer = ZImageControlTransformer::from_weights(base, &dit_cfg, control_vb)?;
+        let control_vb =
+            candle_gen::mmap_var_builder(std::slice::from_ref(&control_file), DTYPE, &device)?;
+        let transformer =
+            ZImageControlTransformer::from_weights(base, &dit_cfg, control_vb, false)?;
 
         let vae_cfg = VaeConfig::z_image();
         let vae = pipeline.load_vae()?;
         let vae_encoder = pipeline.load_vae_encoder()?;
         Ok(Self {
             device,
+            pipeline,
+            control_file,
             base: paths.base,
-            text_encoder: text.text_encoder,
-            tokenizer: text.tokenizer,
-            transformer,
-            vae,
-            vae_encoder,
+            text_encoder: Some(text.text_encoder),
+            tokenizer: Some(text.tokenizer),
+            transformer: Some(transformer),
+            vae: Some(vae),
+            vae_encoder: Some(vae_encoder),
+            vae_shift: vae_cfg.shift_factor,
+            vae_scale: vae_cfg.scaling_factor,
+            pid: None,
+        })
+    }
+
+    /// Construct a lightweight phase loader for constrained-memory requests. Heavy components remain
+    /// absent until their request phase and are synchronized before release.
+    pub fn load_with_memory(paths: &ZImageControlPaths, memory: GenerationMemory) -> Result<Self> {
+        if !memory.stage_residency {
+            return Self::load(paths);
+        }
+        let device = candle_gen::default_device()?;
+        let pipeline = Pipeline::load(&paths.snapshot, &device, DTYPE, &[], None);
+        let control_file = resolve_control_file(&paths.control)?;
+        let vae_cfg = VaeConfig::z_image();
+        Ok(Self {
+            device,
+            pipeline,
+            control_file,
+            base: paths.base,
+            text_encoder: None,
+            tokenizer: None,
+            transformer: None,
+            vae: None,
+            vae_encoder: None,
             vae_shift: vae_cfg.shift_factor,
             vae_scale: vae_cfg.scaling_factor,
             pid: None,
@@ -484,6 +667,290 @@ impl ZImageControl {
         )
     }
 
+    fn load_control_transformer(
+        &self,
+        stream_transformer_blocks: bool,
+    ) -> Result<ZImageControlTransformer> {
+        let base =
+            match self
+                .pipeline
+                .load_transformer(false, stream_transformer_blocks)?
+            {
+                DiT::Packed(base) => *base,
+                DiT::Dense(_) => return Err(CandleError::Msg(
+                    "z-image control: packed-aware transformer loader returned a dense-only model"
+                        .into(),
+                )),
+            };
+        let cfg = DitConfig::z_image_turbo();
+        let control_vb = candle_gen::mmap_var_builder(
+            std::slice::from_ref(&self.control_file),
+            DTYPE,
+            &self.device,
+        )?;
+        ZImageControlTransformer::from_weights(base, &cfg, control_vb, stream_transformer_blocks)
+    }
+
+    fn text_embeddings_with(
+        &self,
+        text_encoder: &TextEnc,
+        tokenizer: &candle_gen::gen_core::tokenizer::TextTokenizer,
+        prompt: &str,
+    ) -> Result<Tensor> {
+        let ids = common::prompt_ids(tokenizer, prompt, "z-image control")?;
+        common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
+            text_encoder.forward(input_ids)
+        })
+    }
+
+    fn uncond_embeddings_with(
+        &self,
+        text_encoder: &TextEnc,
+        tokenizer: &candle_gen::gen_core::tokenizer::TextTokenizer,
+        negative_prompt: &str,
+    ) -> Result<Tensor> {
+        let ids = common::uncond_ids(tokenizer, negative_prompt, "z-image control")?;
+        common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
+            text_encoder.forward(input_ids)
+        })
+    }
+
+    fn encode_control_context_with(
+        &self,
+        vae_encoder: &VaeEncoder,
+        skeleton: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let img = common::preprocess_image(
+            skeleton,
+            width,
+            height,
+            ResizePolicy::RequireExact,
+            &self.device,
+            "z-image control",
+        )?;
+        let control_latents =
+            common::encode_mean(vae_encoder, &img, self.vae_shift, self.vae_scale, ENC_DTYPE)?;
+        let (b, c, lh, lw) = control_latents.dims4()?;
+        let control_latents = control_latents.reshape((b, c, 1, lh, lw))?;
+        let mask = Tensor::zeros((b, 1, 1, lh, lw), ENC_DTYPE, &self.device)?;
+        let inpaint = Tensor::zeros((b, c, 1, lh, lw), ENC_DTYPE, &self.device)?;
+        Ok(Tensor::cat(&[&control_latents, &mask, &inpaint], 1)?.to_dtype(DTYPE)?)
+    }
+
+    fn denoise_turbo_with(
+        &self,
+        transformer: &ZImageControlTransformer,
+        req: &ZImageControlRequest,
+        cap: &Tensor,
+        control_context: &Tensor,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        let steps = req.steps.max(1);
+        let total = steps as u32;
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let noise = self.seed_noise(req.seed, lat_h, lat_w)?;
+        let image_seq_len = ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
+        let mu = calculate_shift(
+            image_seq_len,
+            BASE_IMAGE_SEQ_LEN,
+            MAX_IMAGE_SEQ_LEN,
+            BASE_SHIFT,
+            MAX_SHIFT,
+        );
+        let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+        scheduler.set_timesteps(steps, Some(mu));
+        let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), &self.device)?;
+        let mut latents = prepared.latents;
+        for step_i in 0..steps {
+            candle_gen::check_cancel(&req.cancel)?;
+            let t = Tensor::from_vec(
+                vec![scheduler.current_timestep_normalized() as f32],
+                (1,),
+                &self.device,
+            )?;
+            let velocity = transformer
+                .forward_control(
+                    &latents,
+                    &t,
+                    &prepared.cap_feats,
+                    &prepared.cap_mask,
+                    control_context,
+                    req.control_scale as f64,
+                    req.memory,
+                    &req.cancel,
+                )?
+                .neg()?;
+            latents = scheduler.step(&velocity, &latents)?;
+            on_progress(Progress::Step {
+                current: step_i as u32 + 1,
+                total,
+            });
+        }
+        Ok(latents)
+    }
+
+    fn denoise_base_with(
+        &self,
+        transformer: &ZImageControlTransformer,
+        req: &ZImageControlRequest,
+        cap: &Tensor,
+        neg_cap: Option<&Tensor>,
+        control_context: &Tensor,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        let steps = if req.steps == 0 {
+            BASE_DEFAULT_STEPS
+        } else {
+            req.steps
+        };
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let noise = self.seed_noise(req.seed, lat_h, lat_w)?;
+        let mut scheduler =
+            FlowMatchEulerDiscreteScheduler::new(crate::pipeline::base_scheduler_config());
+        scheduler.set_timesteps(steps, None);
+        let sigmas: Vec<f32> = scheduler.sigmas.iter().map(|&sigma| sigma as f32).collect();
+        let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), &self.device)?;
+        let uncond = match neg_cap {
+            Some(negative) => {
+                let prepared =
+                    prepare_inputs(&noise, std::slice::from_ref(negative), &self.device)?;
+                Some((prepared.cap_feats, prepared.cap_mask))
+            }
+            None => None,
+        };
+        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            prepared.latents,
+            req.seed,
+            &req.cancel,
+            on_progress,
+            None,
+            |latents, timestep| {
+                let t = Tensor::from_vec(vec![timestep], (1,), &self.device)?;
+                let conditional = transformer
+                    .forward_control(
+                        latents,
+                        &t,
+                        &prepared.cap_feats,
+                        &prepared.cap_mask,
+                        control_context,
+                        req.control_scale as f64,
+                        req.memory,
+                        &req.cancel,
+                    )?
+                    .neg()?;
+                match uncond.as_ref() {
+                    Some((features, mask)) => {
+                        let unconditional = transformer
+                            .forward_control(
+                                latents,
+                                &t,
+                                features,
+                                mask,
+                                control_context,
+                                req.control_scale as f64,
+                                req.memory,
+                                &req.cancel,
+                            )?
+                            .neg()?;
+                        let delta = (&conditional - &unconditional)?;
+                        Ok((unconditional + (delta * guidance as f64)?)?)
+                    }
+                    None => Ok(conditional),
+                }
+            },
+        )
+    }
+
+    fn generate_staged(
+        &self,
+        req: &ZImageControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        candle_gen::check_cancel(&req.cancel)?;
+        on_progress(Progress::Loading(LoadPhase::Renderer));
+        let encoder = self.pipeline.load_vae_encoder()?;
+        let control = self.encode_control_context_with(&encoder, skeleton, req.width, req.height);
+        let sync = self.device.synchronize();
+        drop(encoder);
+        let control = control?;
+        sync?;
+
+        candle_gen::check_cancel(&req.cancel)?;
+        on_progress(Progress::Loading(LoadPhase::TextEncoder));
+        let text = self.pipeline.load_text_phase()?;
+        let encoded: Result<(Tensor, Option<Tensor>)> = (|| {
+            let cap =
+                self.text_embeddings_with(&text.text_encoder, &text.tokenizer, &req.prompt)?;
+            let neg = if self.base && req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE) != 1.0 {
+                Some(self.uncond_embeddings_with(
+                    &text.text_encoder,
+                    &text.tokenizer,
+                    req.negative_prompt.as_deref().unwrap_or(""),
+                )?)
+            } else {
+                None
+            };
+            Ok((cap, neg))
+        })();
+        let sync = self.device.synchronize();
+        drop(text);
+        let (cap, neg) = encoded?;
+        sync?;
+
+        candle_gen::check_cancel(&req.cancel)?;
+        on_progress(Progress::Loading(LoadPhase::Renderer));
+        let transformer = self.load_control_transformer(req.memory.stream_transformer_blocks)?;
+        let latents = if self.base {
+            self.denoise_base_with(&transformer, req, &cap, neg.as_ref(), &control, on_progress)
+        } else {
+            self.denoise_turbo_with(&transformer, req, &cap, &control, on_progress)
+        };
+        let sync = self.device.synchronize();
+        drop(transformer);
+        let latents = latents?;
+        sync?;
+
+        candle_gen::check_cancel(&req.cancel)?;
+        on_progress(Progress::Loading(LoadPhase::Renderer));
+        let pid = self.pid_decoder_for(req)?;
+        let bounded_decode = req.memory.tile_vae_decode && pid.is_none();
+        let vae = if bounded_decode {
+            self.pipeline.load_vae_cpu()?
+        } else {
+            self.pipeline.load_vae()?
+        };
+        on_progress(Progress::Decoding);
+        let output = if bounded_decode {
+            self.pipeline.decode_cpu(
+                &vae,
+                &latents,
+                &req.cancel,
+                req.memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                req.memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+            )
+        } else {
+            common::decode(&vae, pid.as_ref(), &latents)
+        };
+        let sync = self.device.synchronize();
+        drop(vae);
+        let output = output?;
+        sync?;
+        Ok(output)
+    }
+
     /// Strict-pose generation: condition the Z-Image generation on `skeleton` (a rendered OpenPose /
     /// canny / depth image at the request size) via the Fun-ControlNet. The worker renders the control
     /// image; this VAE-encodes it into the 33ch control context once, then runs the dual-injection
@@ -501,6 +968,15 @@ impl ZImageControl {
     ) -> Result<Image> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
+        }
+        if self.transformer.is_none() {
+            if !req.memory.stage_residency {
+                return Err(CandleError::Msg(
+                    "z-image control was phase-loaded but the request did not select staged residency"
+                        .into(),
+                ));
+            }
+            return self.generate_staged(req, skeleton, on_progress);
         }
         if self.base {
             self.generate_base(req, skeleton, on_progress)
@@ -565,8 +1041,17 @@ impl ZImageControl {
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
             // Dual-injection control forward; the velocity is negated (Z-Image sign convention).
             let velocity = self
-                .transformer
-                .forward_control(&latents, &t, &cap_feats, &cap_mask, &control_context, scale)?
+                .resident_transformer()?
+                .forward_control(
+                    &latents,
+                    &t,
+                    &cap_feats,
+                    &cap_mask,
+                    &control_context,
+                    scale,
+                    req.memory,
+                    &req.cancel,
+                )?
                 .neg()?;
             latents = scheduler.step(&velocity, &latents)?;
             on_progress(Progress::Step {
@@ -668,7 +1153,7 @@ impl ZImageControl {
                 // Conditional velocity (Z-Image sign convention: the DiT output is negated before the
                 // flow-match step). The control context + scale thread through this forward.
                 let v_cond = self
-                    .transformer
+                    .resident_transformer()?
                     .forward_control(
                         latents,
                         &t_tensor,
@@ -676,6 +1161,8 @@ impl ZImageControl {
                         &cap_mask,
                         &control_context,
                         scale,
+                        req.memory,
+                        &req.cancel,
                     )?
                     .neg()?;
                 let velocity = match uncond.as_ref() {
@@ -683,7 +1170,7 @@ impl ZImageControl {
                         // The uncond branch threads the SAME constant control context + scale (residuals
                         // inject identically on both passes — the MLX base control loop's behaviour).
                         let v_uncond = self
-                            .transformer
+                            .resident_transformer()?
                             .forward_control(
                                 latents,
                                 &t_tensor,
@@ -691,6 +1178,8 @@ impl ZImageControl {
                                 neg_mask,
                                 &control_context,
                                 scale,
+                                req.memory,
+                                &req.cancel,
                             )?
                             .neg()?;
                         // v = v_uncond + guidance·(v_cond − v_uncond). Combining the negated velocities is
@@ -720,9 +1209,17 @@ impl ZImageControl {
     /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the shared Qwen chat template
     /// ([`common::prompt_ids`] + [`common::encode_ids`]).
     fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
-        let ids = common::prompt_ids(&self.tokenizer, prompt, "z-image control")?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("tokenizer"))?;
+        let text_encoder = self
+            .text_encoder
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("text encoder"))?;
+        let ids = common::prompt_ids(tokenizer, prompt, "z-image control")?;
         common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
-            self.text_encoder.forward(input_ids)
+            text_encoder.forward(input_ids)
         })
     }
 
@@ -731,9 +1228,17 @@ impl ZImageControl {
     /// through the QwenInstruct chat-template scaffolding rather than the empty-short-circuiting
     /// `tokenize` (the sc-8646 fix). Mirrors [`crate::pipeline::Pipeline::uncond_embeddings`].
     fn uncond_embeddings(&self, negative_prompt: &str) -> Result<Tensor> {
-        let ids = common::uncond_ids(&self.tokenizer, negative_prompt, "z-image control")?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("tokenizer"))?;
+        let text_encoder = self
+            .text_encoder
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("text encoder"))?;
+        let ids = common::uncond_ids(tokenizer, negative_prompt, "z-image control")?;
         common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
-            self.text_encoder.forward(input_ids)
+            text_encoder.forward(input_ids)
         })
     }
 
@@ -754,13 +1259,12 @@ impl ZImageControl {
         )?; // f32 (1,3,H,W) [-1,1]
             // Deterministic mean encode at f32 (the control context is assembled at ENC_DTYPE, then cast to
             // bf16 once at the end — matching the original per-channel-group dtype).
-        let control_latents = common::encode_mean(
-            &self.vae_encoder,
-            &img,
-            self.vae_shift,
-            self.vae_scale,
-            ENC_DTYPE,
-        )?;
+        let vae_encoder = self
+            .vae_encoder
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("VAE encoder"))?;
+        let control_latents =
+            common::encode_mean(vae_encoder, &img, self.vae_shift, self.vae_scale, ENC_DTYPE)?;
         let (b, c, lh, lw) = control_latents.dims4()?;
         // Add the singleton frame axis → (1, 16, 1, H/8, W/8).
         let control_latents = control_latents.reshape((b, c, 1, lh, lw))?;
@@ -773,7 +1277,11 @@ impl ZImageControl {
     /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the shared txt2img decode),
     /// or — when a `pid` decoder is supplied (epic 7840, sc-8044) — the `zimage-turbo` PiD student (4× SR).
     fn decode(&self, latents: &Tensor, pid: Option<&PidDecoder>) -> Result<Image> {
-        common::decode(&self.vae, pid, latents)
+        let vae = self
+            .vae
+            .as_ref()
+            .ok_or_else(|| Self::resident_missing("VAE decoder"))?;
+        common::decode(vae, pid, latents)
     }
 }
 

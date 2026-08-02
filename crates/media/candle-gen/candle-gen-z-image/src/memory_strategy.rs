@@ -31,6 +31,9 @@ pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
+#[cfg(any(feature = "cuda", test))]
+pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
+    "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn provider_contract(
@@ -38,8 +41,7 @@ pub(crate) fn provider_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && matches!(spec.weights, gen_core::WeightsSource::Dir(_))
-        && spec.adapters.is_empty();
+        && matches!(spec.weights, gen_core::WeightsSource::Dir(_));
     let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
             .unwrap_or_default();
@@ -91,7 +93,8 @@ pub(crate) fn provider_contract(
         },
         strategies,
         // PiD replaces the native VAE with a separately planned decoder. Until that decoder accepts
-        // this provider's explicit tile plan, the request safety gate rejects optimized PiD runs.
+        // this provider's bounded host-decode route, the request safety gate rejects optimized PiD
+        // runs.
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: [
@@ -150,26 +153,37 @@ pub(crate) fn provider_contract(
     })
 }
 
-/// Explicit contract for bespoke control routes. Their eager dual-network implementation has not
-/// adopted the request lifecycle, so every constrained rung is `Missing`; recording the provider ids
-/// prevents the catalog from inheriting the plain provider's declaration.
+/// Explicit contract for the bespoke dual-network control routes. The control encoder, text encoder,
+/// denoiser, and decoder are phase-loaded; both the base and control main stacks honor the selected
+/// transformer window.
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn control_contract(
     provider_id: &str,
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let mut contract = MemoryProviderContract::compatibility_default(
-        provider_id,
-        MemoryBackendRealization::CandleCuda {
-            device_residency: true,
-            host_backed_weights: true,
-            host_to_device_block_materialization: false,
-            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
-        },
-    );
+    let mut contract = provider_contract(provider_id, spec)?;
+    let overlay_bytes = match spec.control.as_ref() {
+        Some(gen_core::WeightsSource::Dir(path)) | Some(gen_core::WeightsSource::File(path)) => {
+            gen_core::safetensors_path_bytes(path)
+        }
+        None => 0,
+    };
+    contract.asset_facts.base_bytes = contract
+        .asset_facts
+        .base_bytes
+        .saturating_add(overlay_bytes);
+    contract.asset_facts.transformer_bytes = contract
+        .asset_facts
+        .transformer_bytes
+        .saturating_add(overlay_bytes);
+    contract.asset_facts.conditioning_bytes = contract
+        .asset_facts
+        .conditioning_bytes
+        .max(contract.asset_facts.decoder_bytes);
+    contract.asset_facts.overlay_bytes = overlay_bytes;
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        format!("{}-cuda-control-v1", provider_id.replace('_', "-")),
-        LoadShape::EagerMaterialization,
+        CONTROL_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
     ));
     Ok(contract)
 }
@@ -742,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn adapters_keep_lower_rungs_but_cannot_claim_streamed_blocks() {
+    fn adapters_preserve_the_full_streamed_transformer_ladder() {
         let mut spec = spec();
         spec.adapters.push(gen_core::AdapterSpec::new(
             "/adapter.safetensors".into(),
@@ -755,7 +769,7 @@ mod tests {
                 .capability(MemoryStrategy::BoundedTransformerResidency)
                 .unwrap()
                 .support,
-            MemoryStrategySupport::Missing
+            MemoryStrategySupport::Implemented
         );
         assert_eq!(
             contract
@@ -801,21 +815,27 @@ mod tests {
     }
 
     #[test]
-    fn control_routes_are_explicit_and_do_not_inherit_plain_capabilities() {
+    fn control_routes_publish_the_full_executable_ladder() {
         for id in ["z_image_turbo_control", "z_image_control"] {
             let contract = control_contract(id, &spec()).unwrap();
             assert!(contract.conformance_errors().is_empty());
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
-                format!("{}-cuda-control-v1", id.replace('_', "-"))
+                CONTROL_CALIBRATION_FINGERPRINT
             );
-            assert_eq!(
-                contract
-                    .capability(MemoryStrategy::BoundedTransformerResidency)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Missing
+            assert_ne!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                CALIBRATION_FINGERPRINT
             );
+            assert_eq!(contract.load_shape, LoadShape::DeferredMaterialization);
+            assert!(contract
+                .strategies
+                .iter()
+                .all(|capability| { capability.support == MemoryStrategySupport::Implemented }));
+            assert!(contract.lifecycle.synchronized_phase_release);
+            assert!(contract.lifecycle.decode_tiling);
+            assert!(contract.lifecycle.attention_chunking);
+            assert!(contract.lifecycle.transformer_window_materialization);
         }
     }
 }

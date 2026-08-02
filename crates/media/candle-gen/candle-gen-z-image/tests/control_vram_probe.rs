@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, Progress};
 use candle_gen_z_image::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
 
 fn assert_coherent(image: &Image, tier: &str) {
@@ -82,15 +82,58 @@ fn measure_z_image_base_control_tier() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(2usize);
+    let strategy = std::env::var("Z_IMAGE_MEMORY").unwrap_or_else(|_| "resident".into());
+    let decode_tile_edge = std::env::var("Z_IMAGE_DECODE_TILE_EDGE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512);
+    let decode_overlap = std::env::var("Z_IMAGE_DECODE_OVERLAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128);
+    let memory = match strategy.as_str() {
+        "resident" => GenerationMemory::default(),
+        "staged" => GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        },
+        "decode" => GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(decode_tile_edge),
+            decode_overlap: Some(decode_overlap),
+            ..Default::default()
+        },
+        "attention" => GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(decode_tile_edge),
+            decode_overlap: Some(decode_overlap),
+            chunk_attention: true,
+            ..Default::default()
+        },
+        "transformer" => GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            decode_tile_edge: Some(decode_tile_edge),
+            decode_overlap: Some(decode_overlap),
+            chunk_attention: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(1),
+            ..Default::default()
+        },
+        other => panic!("unknown Z_IMAGE_MEMORY strategy {other}"),
+    };
 
     let mut probe = candle_gen::testkit::VramProbe::start_rendered();
     let load_phase = probe.phase();
-    let model = ZImageControl::load(&ZImageControlPaths {
+    let paths = ZImageControlPaths {
         snapshot,
         control,
         base: true,
-    })
-    .expect("load Z-Image base-control provider");
+    };
+    let model = ZImageControl::load_with_memory(&paths, memory)
+        .expect("load Z-Image base-control provider");
     probe.end_load(load_phase);
 
     let control_image = control_fixture(width, height);
@@ -104,6 +147,7 @@ fn measure_z_image_base_control_tier() {
         negative_prompt: Some("blurry, malformed".into()),
         seed: 16170,
         use_pid: false,
+        memory,
         cancel: candle_gen::gen_core::CancelFlag::new(),
     };
     let mut reference = None;
@@ -128,12 +172,12 @@ fn measure_z_image_base_control_tier() {
         let decode_peak = decode_phase.map(|phase| probe.end_observed(phase));
         probe.end_gen(generate_phase);
         eprintln!(
-            "ZIMAGE_CONTROL_PHASE tier={tier} repeat={repeat} phase=predecode peak_gb={:.3}",
+            "ZIMAGE_CONTROL_PHASE tier={tier} strategy={strategy} repeat={repeat} phase=predecode peak_gb={:.3}",
             predecode_peak.unwrap()
         );
         if let Some(decode_peak) = decode_peak {
             eprintln!(
-                "ZIMAGE_CONTROL_PHASE tier={tier} repeat={repeat} phase=decode peak_gb={decode_peak:.3}"
+                "ZIMAGE_CONTROL_PHASE tier={tier} strategy={strategy} repeat={repeat} phase=decode peak_gb={decode_peak:.3}"
             );
         }
         assert_coherent(&image, &tier);
@@ -146,13 +190,15 @@ fn measure_z_image_base_control_tier() {
 
     let report = probe.report().assert_trustworthy(1.0);
     eprintln!(
-        "ZIMAGE_CONTROL_VRAM tier={tier} gpu={} {width}x{height} steps={steps} guidance=4 control_scale=1 count=1 cold=true repeats={repeats} | {report}",
+        "ZIMAGE_CONTROL_VRAM tier={tier} strategy={strategy} gpu={} {width}x{height} steps={steps} guidance=4 control_scale=1 count=1 cold=true repeats={repeats} | {report}",
         candle_gen::testkit::probe_gpu()
     );
     let image = reference.unwrap();
     let output_path = std::env::var("Z_IMAGE_OUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join(format!("z_image_control_{tier}.png")));
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("z_image_control_{tier}_{strategy}.png"))
+        });
     image::RgbImage::from_raw(image.width, image.height, image.pixels)
         .expect("RGB geometry")
         .save(&output_path)
