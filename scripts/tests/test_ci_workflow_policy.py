@@ -147,9 +147,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
         self.assertIn("mage_edit_oracle_manifest.json", workflow)
         self.assertIn("mage_candle_transfer_manifest.json", workflow)
+        # End-delimiter only — the first job of the audio lane, which follows the Mage upload
+        # step. sc-16981 split the single `candle-audio` job into per-family
+        # `candle-audio-<family>` jobs, so this bound moved to the first of them. If the audio
+        # lane is reordered or renamed again, this is the anchor to update.
         upload_block = workflow[
             workflow.index("Upload Candle Mage acceptance oracles") :
-            workflow.index("\n  candle-audio:")
+            workflow.index("\n  candle-audio-kokoro:")
         ]
         uploaded = set(
             re.findall(
