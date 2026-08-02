@@ -364,6 +364,23 @@ pub(crate) fn validate_context(
     Ok(())
 }
 
+/// The complete pre-request admission predicate shared by loaded generators and the weights-free
+/// registry. Keep this as the decision-form adapter over [`validate_context`] so neither route can
+/// admit a context that [`registered_begin_request`] (or a loaded generator's begin hook) rejects.
+pub(crate) fn admission_safety_check(
+    provider_id: &str,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> MemorySafetyDecision {
+    match validate_context(provider_id, contract, context, loaded_quant) {
+        Ok(()) => MemorySafetyDecision::Accept,
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
 pub(crate) fn safety_check(
     _provider_id: &str,
     contract: &MemoryProviderContract,
@@ -413,7 +430,7 @@ pub(crate) fn registered_safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     match snapshot_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => safety_check(&contract.provider_id, contract, context, quant),
+        Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
         Err(error) => MemorySafetyDecision::Reject {
             reason: error.to_string(),
         },
@@ -680,37 +697,48 @@ mod tests {
     }
 
     #[test]
-    fn tier_admission_does_not_advance_phase_or_pid_policy_beyond_begin_request() {
+    fn registered_admission_matches_loaded_begin_request_policy() {
         let spec = spec();
         let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
 
         let mut phases = context(&contract);
         phases.has_phases = true;
-        assert_eq!(
-            safety_check(crate::MODEL_ID, &contract, &phases, None),
-            MemorySafetyDecision::Accept,
-            "loaded-generator admission is tier-only until sc-16600"
-        );
-        assert_eq!(
-            registered_safety_check(&spec, &contract, &phases),
-            MemorySafetyDecision::Accept,
-            "weights-free admission is tier-only until sc-16600"
-        );
         let error = validate_context(crate::MODEL_ID, &contract, &phases, None).unwrap_err();
         assert!(error.to_string().contains("multi-phase"));
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &phases),
+            admission_safety_check(crate::MODEL_ID, &contract, &phases, None)
+        );
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &phases),
+            MemorySafetyDecision::Reject { reason } if reason == error.to_string()
+        ));
 
         let mut pid = context(&contract);
         pid.use_pid = true;
-        assert_eq!(
-            safety_check(crate::MODEL_ID, &contract, &pid, None),
-            MemorySafetyDecision::Accept
-        );
-        assert_eq!(
-            registered_safety_check(&spec, &contract, &pid),
-            MemorySafetyDecision::Accept
-        );
         let error = validate_context(crate::MODEL_ID, &contract, &pid, None).unwrap_err();
         assert!(error.to_string().contains("PiD"));
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &pid),
+            admission_safety_check(crate::MODEL_ID, &contract, &pid, None)
+        );
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &pid),
+            MemorySafetyDecision::Reject { reason } if reason == error.to_string()
+        ));
+
+        let mut stale = context(&contract);
+        stale.calibration_fingerprint.push_str("-stale");
+        let error = validate_context(crate::MODEL_ID, &contract, &stale, None).unwrap_err();
+        assert!(error.to_string().contains("calibration handshake mismatch"));
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &stale),
+            admission_safety_check(crate::MODEL_ID, &contract, &stale, None)
+        );
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &stale),
+            MemorySafetyDecision::Reject { reason } if reason == error.to_string()
+        ));
     }
 
     #[test]

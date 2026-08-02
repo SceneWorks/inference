@@ -115,7 +115,12 @@ impl Generator for ZImageBaseGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return gen_core::MemorySafetyDecision::Accept;
         };
-        crate::memory_strategy::safety_check(MODEL_ID, contract, context, self.loaded_quant)
+        crate::memory_strategy::admission_safety_check(
+            MODEL_ID,
+            contract,
+            context,
+            self.loaded_quant,
+        )
     }
 
     fn begin_memory_strategy_request(
@@ -322,9 +327,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let loaded_quant = crate::memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype.
     let device = candle_gen::default_device()?;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     let memory_strategy = Some(crate::memory_strategy::provider_contract(MODEL_ID, spec)?);
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", test)))]
     let memory_strategy = None;
     Ok(Box::new(ZImageBaseGenerator {
         descriptor: descriptor(),

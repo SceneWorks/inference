@@ -351,41 +351,39 @@ fn resolve_render_size(
 }
 
 /// Reject a requested or driving-video-resolved geometry outside SCAIL-2's advertised edge and area
-/// envelope. The area is measured after projection onto the same lattice the render uses; source
-/// media can be off-grid, while explicit off-grid requests have already failed the shared floor.
+/// envelope. Sentinel-resolved edges and every area are measured after projection onto the same
+/// lattice the render uses; source media can be off-grid, while explicit off-grid requests have
+/// already failed the shared floor and retain exact requested-edge policy here.
 fn reject_unrenderable_geometry(
     caps: &Capabilities,
     req: &GenerationRequest,
     width: u32,
     height: u32,
 ) -> gen_core::Result<()> {
-    let origin = if req.width == 0 && req.height == 0 {
+    let auto_sized = req.width == 0 && req.height == 0;
+    let origin = if auto_sized {
         "resolved from the driving video"
     } else {
         "requested"
     };
-    let outside_range = width < caps.min_size
-        || width > caps.max_size
-        || height < caps.min_size
-        || height > caps.max_size;
-    let area = reject_over_area(MODEL_ID, width, height);
-    if !outside_range && area.is_ok() {
-        return Ok(());
+    let (bounded_width, bounded_height) = if auto_sized {
+        (align(width) as u32, align(height) as u32)
+    } else {
+        (width, height)
+    };
+    let outside_range = bounded_width < caps.min_size
+        || bounded_width > caps.max_size
+        || bounded_height < caps.min_size
+        || bounded_height > caps.max_size;
+
+    if !outside_range {
+        return reject_over_area(MODEL_ID, width, height);
     }
 
-    let reason = if outside_range {
-        format!(
-            "each edge must be within {}..={}",
-            caps.min_size, caps.max_size
-        )
-    } else {
-        let (aligned_width, aligned_height) = (align(width), align(height));
-        let aligned_area = aligned_width * aligned_height;
-        format!(
-            "the rendered {aligned_width}×{aligned_height} is {aligned_area} px, over the max area \
-             {MAX_AREA_14B} px"
-        )
-    };
+    let reason = format!(
+        "each edge must be within {}..={}",
+        caps.min_size, caps.max_size
+    );
     let advice = match suggest_in_envelope(width, height, caps.min_size, caps.max_size) {
         Some((suggested_width, suggested_height)) => format!(
             "pass an explicit width/height — the largest geometry this engine accepts at this \
@@ -883,53 +881,72 @@ mod tests {
         Generator::validate(&m, &auto_sized(832, 480))
             .expect("an in-envelope driving clip must clear preflight");
 
-        for (width, height, suggestion, reason) in [
-            (3840, 2160, "1280×704", "outside the edge bounds"),
-            (
-                1280,
-                1280,
-                "960×960",
-                "inside the edge bounds but over the area cap",
-            ),
+        for (width, height, suggestion, over_area) in [
+            (3840, 2160, "1280×704", false),
+            (1280, 1280, "960×960", true),
         ] {
             let over = auto_sized(width, height);
             let preflight = Generator::validate(&m, &over)
                 .expect_err("unsafe resolved geometry must fail before model loading")
                 .to_string();
-            assert!(
-                preflight.contains("advertised size envelope")
-                    && preflight.contains(&format!("{width}×{height}"))
-                    && preflight.contains("resolved from the driving video")
-                    && preflight.contains(suggestion),
-                "the preflight refusal must name the unsafe resolved geometry and a usable \
-                 alternative ({reason}): {preflight}"
-            );
+            if over_area {
+                assert_eq!(
+                    preflight,
+                    reject_over_area(MODEL_ID, width, height)
+                        .expect_err("fixture is over-area")
+                        .to_string(),
+                    "the geometry seam must preserve the canonical area refusal verbatim"
+                );
+            } else {
+                assert!(
+                    preflight.contains("advertised size envelope")
+                        && preflight.contains(&format!("{width}×{height}"))
+                        && preflight.contains("resolved from the driving video")
+                        && preflight.contains(suggestion),
+                    "the edge refusal must name the unsafe resolved geometry and a usable \
+                     alternative: {preflight}"
+                );
+            }
 
             let rendered = m
                 .run(&over, &mut |_| {})
                 .expect_err("the render path must independently bound resolved geometry")
                 .to_string();
-            assert!(
-                rendered.contains("advertised size envelope")
-                    && rendered.contains(&format!("{width}×{height}")),
-                "the render refusal must come from the resolved-geometry gate ({reason}): \
-                 {rendered}"
+            assert_eq!(
+                rendered, preflight,
+                "preflight and render must expose the same geometry refusal"
             );
         }
     }
 
     #[test]
     fn auto_size_projects_source_media_onto_the_render_lattice() {
-        let req = auto_sized(640, 360);
-        let first = req
-            .control_clip()
-            .and_then(|clip| clip.frames.first())
-            .expect("fixture has a driving frame");
-        assert_eq!(
-            resolve_render_size(&descriptor().capabilities, &req, first)
-                .expect("640×360 is inside the advertised envelope"),
-            (640, 352)
-        );
+        for (source, rendered) in [((640, 360), (640, 352)), ((1290, 704), (1280, 704))] {
+            let req = auto_sized(source.0, source.1);
+            let first = req
+                .control_clip()
+                .and_then(|clip| clip.frames.first())
+                .expect("fixture has a driving frame");
+            assert_eq!(
+                resolve_render_size(&descriptor().capabilities, &req, first)
+                    .expect("the rendered geometry is inside the advertised envelope"),
+                rendered
+            );
+        }
+
+        let explicit = GenerationRequest {
+            width: 1290,
+            height: 704,
+            ..Default::default()
+        };
+        let error = resolve_render_size(
+            &descriptor().capabilities,
+            &explicit,
+            &img(explicit.width, explicit.height),
+        )
+        .expect_err("explicit geometry keeps the exact edge-bound policy")
+        .to_string();
+        assert!(error.contains("requested") && error.contains("each edge must be within"));
     }
 
     #[test]
