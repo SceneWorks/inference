@@ -131,6 +131,39 @@
       ]
     },
     {
+      "id": "flux-non-commercial-v2-1",
+      "spdx_id": "LicenseRef-FLUX-Non-Commercial-v2.1",
+      "name": "FLUX Non-Commercial License v2.1",
+      "text_url": "https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "flux-non-commercial-v2-1"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful or infringing content"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "ensure Output includes disclosure (or other indication) that the Output was generated or modified using artificial intelligence technologies to the extent required under applicable law."
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://bfl.ai/legal/usage-policy"
+        }
+      ]
+    },
+    {
       "id": "gemma-terms",
       "spdx_id": "LicenseRef-Gemma-Terms",
       "name": "Gemma Terms of Use",
@@ -150,6 +183,39 @@
         {
           "term": "acceptable_use_policy",
           "url": "https://ai.google.dev/gemma/prohibited_use_policy"
+        }
+      ]
+    },
+    {
+      "id": "ideogram-4-non-commercial",
+      "spdx_id": "LicenseRef-Ideogram-4-Non-Commercial",
+      "name": "Ideogram Non-Commercial Model Agreement",
+      "text_url": "https://huggingface.co/ideogram-ai/ideogram-4-fp8/blob/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "ideogram-4-non-commercial"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "ideogram-4-non-commercial"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": "https://ideogram.ai/legal/usage-policy"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You are responsible for implementing appropriate safety measures, including content filters and human oversight, suitable for your use case and to prevent the creation, display, generation or reproduction of unlawful or infringing content"
         }
       ]
     },
@@ -265,6 +331,26 @@
         {
           "term": "acceptable_use_policy",
           "url": null
+        }
+      ]
+    },
+    {
+      "id": "meta-sam-license",
+      "spdx_id": "LicenseRef-Meta-SAM",
+      "name": "SAM License",
+      "text_url": "https://huggingface.co/facebook/sam3/blob/main/LICENSE",
+      "terms": [
+        {
+          "term": "downstream_restrictions",
+          "family": "meta-sam-license"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "meta-sam-license"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you submit for publication the results of research you perform on, using, or otherwise in connection with SAM Materials, you must acknowledge the use of SAM Materials in your publication."
         }
       ]
     },

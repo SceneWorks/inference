@@ -72,6 +72,7 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
+pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
 pub use license::{
     component_licenses_manifest_json, license_table_conformance_errors, provider_terms,
