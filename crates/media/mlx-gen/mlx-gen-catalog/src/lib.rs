@@ -118,7 +118,10 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
-    const PREVIEW_PROVIDER_IDS: [&str; 7] = [
+    const PREVIEW_PROVIDER_IDS: [&str; 10] = [
+        "anima_base",
+        "anima_aesthetic",
+        "anima_turbo",
         "krea_2_turbo",
         "krea_2_raw",
         "krea_2_edit",
