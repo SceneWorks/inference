@@ -118,7 +118,7 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
-    const PREVIEW_PROVIDER_IDS: [&str; 33] = [
+    const PREVIEW_PROVIDER_IDS: [&str; 36] = [
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
@@ -142,6 +142,9 @@ mod tests {
         "lens_turbo",
         "qwen_image",
         "qwen_image_edit",
+        "sd3_5_large",
+        "sd3_5_large_turbo",
+        "sd3_5_medium",
         "sdxl",
         "kolors",
         "chroma1_hd",

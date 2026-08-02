@@ -67,6 +67,7 @@ pub mod convert;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod preview;
 pub mod text;
 pub mod training;
 pub mod transformer;
