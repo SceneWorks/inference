@@ -274,12 +274,8 @@ fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>
     let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     if let Some(bits) = quantize_at_load {
-        t5.quantize_progressive(
-            bits,
-            mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
-            t5_group_size_env(),
-        )
-        .expect("load-time complete progressive T5 quantization");
+        mlx_gen_chroma::loader::quantize_t5_for_dense_source(&mut t5, bits, t5_group_size_env())
+            .expect("load-time complete progressive T5 quantization");
     }
     let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
         &tokenizer,

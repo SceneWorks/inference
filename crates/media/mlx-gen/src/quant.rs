@@ -295,14 +295,18 @@ pub fn load_dir_map(dir: &Path) -> Result<HashMap<String, Array>> {
 
 /// Materialize (`eval`) + write a key→`Array` map to a single `path` safetensors (one file — a packed
 /// component is small enough not to need sharding; the loaders glob `*.safetensors`, so one file
-/// replaces the source's shards). The write side of the converters.
+/// replaces the source's shards). Keys are sorted before serialization so rebuilding an identical
+/// validated artifact produces byte-identical files that can be bound to publication by SHA-256.
+/// The write side of the converters.
 pub fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
     eval(map.values().collect::<Vec<_>>())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut entries = map.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| *key);
     Array::save_safetensors(
-        map.iter().map(|(k, v)| (k.as_str(), v)),
+        entries.into_iter().map(|(k, v)| (k.as_str(), v)),
         None::<&HashMap<String, String>>,
         path,
     )?;

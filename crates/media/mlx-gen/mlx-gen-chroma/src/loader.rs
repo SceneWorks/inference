@@ -9,6 +9,7 @@
 //! and (2) the tokenizer ships only `spiece.model`, so we load a vendored, prebuilt `tokenizer.json`
 //! (materialized by `tools/build_chroma_t5_tokenizer.py`) — never the network.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
@@ -16,6 +17,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_gen_flux::T5TextEncoder;
 use mlx_gen_z_image::vae::Vae;
+use mlx_rs::Dtype;
 
 use crate::config::{ChromaTransformerConfig, MAX_SEQUENCE_LENGTH};
 use crate::transformer::ChromaTransformer;
@@ -43,12 +45,24 @@ pub fn load_tokenizer_with_max_len(max_length: usize) -> Result<TextTokenizer> {
 pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
     // Chroma diffusers layout: T5 is `text_encoder/` (FLUX puts it in `text_encoder_2/`).
     let component = root.join("text_encoder");
+    let primary_bits = mlx_gen::quant::packed_quant_bits_at(&component)?;
     let group_size = mlx_gen::quant::packed_quant_group_size_at(&component)?
         .unwrap_or(mlx_gen::quant::DEFAULT_GROUP_SIZE);
     let residual_bits = t5_residual_bits(&component)?;
     let w = Weights::from_dir(component)?;
-    validate_t5_progressive_surface(&w, residual_bits, group_size)?;
+    validate_t5_progressive_surface(&w, primary_bits, residual_bits, group_size)?;
     T5TextEncoder::from_weights_with_group_size(&w, "", group_size)
+}
+
+/// Apply the same progressive packed-T5 policy used by the offline Chroma converter to a dense
+/// source. Keeping this provider-owned seam shared by production and the real-weight identity test
+/// prevents the test from validating a hand-written quantization recipe that production never uses.
+pub fn quantize_t5_for_dense_source(
+    t5: &mut T5TextEncoder,
+    bits: i32,
+    group_size: i32,
+) -> Result<()> {
+    t5.quantize_progressive(bits, crate::convert::T5_RESIDUAL_BITS, group_size)
 }
 
 fn t5_residual_bits(component: &Path) -> Result<Option<i32>> {
@@ -93,16 +107,72 @@ fn t5_residual_bits(component: &Path) -> Result<Option<i32>> {
 
 fn validate_t5_progressive_surface(
     w: &Weights,
+    primary_bits: Option<i32>,
     residual_bits: Option<i32>,
     group_size: i32,
 ) -> Result<()> {
     let keys = w.keys().map(str::to_string).collect::<Vec<_>>();
-    let residual_keys = keys
+    let primary_bases = keys
         .iter()
-        .filter(|key| key.ends_with(".residual.scales"))
-        .count();
+        .filter_map(|key| key.strip_suffix(".scales"))
+        .filter(|base| !base.ends_with(".residual"))
+        .collect::<BTreeSet<_>>();
+    let residual_bases = keys
+        .iter()
+        .filter_map(|key| {
+            ["weight", "scales", "biases"]
+                .into_iter()
+                .find_map(|suffix| key.strip_suffix(&format!(".residual.{suffix}")))
+        })
+        .collect::<BTreeSet<_>>();
+    match primary_bits {
+        None if !primary_bases.is_empty() => {
+            return Err(Error::Msg(
+                "chroma T5: packed primary tensors require quantization.bits provenance".into(),
+            ))
+        }
+        Some(_) if primary_bases.is_empty() => return Err(Error::Msg(
+            "chroma T5: quantization marker is present but no primary packed weights were found"
+                .into(),
+        )),
+        _ => {}
+    }
+    if let Some(primary_bits) = primary_bits {
+        for base in &primary_bases {
+            let weight = w.require(&format!("{base}.weight"))?;
+            let scales = w.require(&format!("{base}.scales"))?;
+            w.require(&format!("{base}.biases"))?;
+            let actual_bits = mlx_gen::quant::packed_bits(weight, scales, group_size)?;
+            if actual_bits != primary_bits {
+                return Err(Error::Msg(format!(
+                    "chroma T5: {base} primary is Q{actual_bits}, but config declares Q{primary_bits}"
+                )));
+            }
+        }
+        for key in keys
+            .iter()
+            .filter(|key| key.ends_with(".weight") && !key.ends_with(".residual.weight"))
+        {
+            let base = key.strip_suffix(".weight").expect("filtered suffix");
+            if primary_bases.contains(base) {
+                continue;
+            }
+            let weight = w.require(key)?;
+            let shape = weight.shape();
+            if weight.dtype() == Dtype::Uint32 {
+                return Err(Error::Msg(format!(
+                    "chroma T5: {base} has packed codes but no scales"
+                )));
+            }
+            if shape.len() == 2 && shape[1] >= group_size && shape[1] % group_size == 0 {
+                return Err(Error::Msg(format!(
+                    "chroma T5: progressive packed surface is incomplete; {base}.weight remains dense"
+                )));
+            }
+        }
+    }
     if residual_bits.is_none() {
-        if residual_keys != 0 {
+        if !residual_bases.is_empty() {
             return Err(Error::Msg(
                 "chroma T5: residual tensors require quantization.residual_bits provenance".into(),
             ));
@@ -112,26 +182,26 @@ fn validate_t5_progressive_surface(
     let residual_bits = residual_bits.ok_or_else(|| {
         Error::Msg("chroma T5: residual bit-width disappeared after validation".into())
     })?;
-    for residual_base in keys
-        .iter()
-        .filter_map(|key| key.strip_suffix(".residual.scales"))
-    {
-        if w.get(&format!("{residual_base}.scales")).is_none() {
+    if primary_bits.is_none() {
+        return Err(Error::Msg(
+            "chroma T5: residual packing requires quantization.bits provenance for the primary term"
+                .into(),
+        ));
+    }
+    for residual_base in &residual_bases {
+        if !primary_bases.contains(residual_base) {
             return Err(Error::Msg(format!(
                 "chroma T5: residual {residual_base} has no primary packed term"
             )));
         }
-    }
-    let primary_bases = keys
-        .iter()
-        .filter_map(|key| key.strip_suffix(".scales"))
-        .filter(|base| !base.ends_with(".residual"))
-        .collect::<Vec<_>>();
-    if primary_bases.is_empty() {
-        return Err(Error::Msg(
-            "chroma T5: progressive marker is present but no primary packed weights were found"
-                .into(),
-        ));
+        for suffix in ["weight", "scales", "biases"] {
+            let key = format!("{residual_base}.residual.{suffix}");
+            if w.get(&key).is_none() {
+                return Err(Error::Msg(format!(
+                    "chroma T5: progressive packed surface is incomplete; missing {key}"
+                )));
+            }
+        }
     }
     for base in primary_bases {
         for suffix in ["weight", "scales", "biases"] {
@@ -193,7 +263,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    fn progressive_fixture(residual_weight_cols: i32) -> Weights {
+    fn progressive_fixture(residual_weight_cols: i32, dense_hole: bool) -> Weights {
         let base = "encoder.block.0.layer.0.SelfAttention.q";
         let mut map = HashMap::new();
         map.insert(
@@ -220,19 +290,43 @@ mod tests {
             format!("{base}.residual.biases"),
             Array::zeros::<f32>(&[2, 2]).unwrap(),
         );
+        if dense_hole {
+            map.insert(
+                "encoder.block.0.layer.1.DenseReluDense.wi_0.weight".into(),
+                Array::zeros::<f32>(&[2, 128]).unwrap(),
+            );
+        }
         Weights::from_map(map)
     }
 
     #[test]
     fn progressive_surface_requires_complete_q4_residuals() {
-        validate_t5_progressive_surface(&progressive_fixture(16), Some(4), 64).unwrap();
+        validate_t5_progressive_surface(&progressive_fixture(16, false), Some(8), Some(4), 64)
+            .unwrap();
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(32), Some(4), 64).is_err(),
+            validate_t5_progressive_surface(&progressive_fixture(32, false), Some(8), Some(4), 64)
+                .is_err(),
             "a Q8 residual must not pass a Q4 marker"
         );
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(16), None, 64).is_err(),
+            validate_t5_progressive_surface(&progressive_fixture(16, false), Some(8), None, 64)
+                .is_err(),
             "residual tensors without provenance must fail"
+        );
+        assert!(
+            validate_t5_progressive_surface(&progressive_fixture(16, false), Some(4), Some(4), 64)
+                .is_err(),
+            "a Q8 primary must not pass a Q4 marker"
+        );
+        assert!(
+            validate_t5_progressive_surface(&progressive_fixture(16, false), None, None, 64)
+                .is_err(),
+            "packed primaries without provenance must fail"
+        );
+        assert!(
+            validate_t5_progressive_surface(&progressive_fixture(16, true), Some(8), Some(4), 64,)
+                .is_err(),
+            "a group-packable dense weight must not pass a progressive artifact marker"
         );
     }
 }

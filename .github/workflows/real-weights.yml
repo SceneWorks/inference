@@ -116,6 +116,7 @@ jobs:
           SC8777_MODEL: ${{ matrix.model }}
           SC8777_KEEP: "1"
           CHROMA_PACKED_ROOT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          CHROMA_PAYLOAD_MANIFEST: ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462
         run: |
           set -o pipefail
@@ -153,6 +154,38 @@ jobs:
           done
           test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl" | tr -d ' ')" = 2
           test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-component.jsonl" | tr -d ' ')" = 2
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["CHROMA_PACKED_ROOT"])
+          files = {}
+          for tier in ("q4", "q8"):
+              tier_root = root / tier
+              for path in sorted(tier_root.rglob("*")):
+                  if path.is_file() and ".cache" not in path.parts:
+                      digest = hashlib.sha256()
+                      with path.open("rb") as handle:
+                          for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                              digest.update(chunk)
+                      relative = f"{tier}/{path.relative_to(tier_root).as_posix()}"
+                      files[relative] = {
+                          "size": path.stat().st_size,
+                          "sha256": digest.hexdigest(),
+                      }
+          manifest = {
+              "model": os.environ["CHROMA_MODEL"],
+              "inferenceRevision": os.environ["GITHUB_SHA"],
+              "sourceRevision": os.environ["CHROMA_SOURCE_REVISION"],
+              "t5GroupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
+              "files": files,
+          }
+          Path(os.environ["CHROMA_PAYLOAD_MANIFEST"]).write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
       - name: Upload Chroma calibration evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -162,6 +195,7 @@ jobs:
           path: |
             ${{ runner.temp }}/chroma-sc16462-calibration.jsonl
             ${{ runner.temp }}/chroma-sc16462-component.jsonl
+            ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
 
   # SC-16462 diagnostic lane: rank four single-sublayer T5 carve-outs at Chroma's production
   # sequence length before spending another full Base/HD/Flash render matrix. This lane never
@@ -252,11 +286,17 @@ jobs:
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
+      - name: Download the validated payload manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: chroma-sc16462-${{ matrix.model }}
+          path: ${{ runner.temp }}/chroma-sc16462-validated-${{ matrix.model }}
       - name: Rebuild the validated payload from the immutable source
         env:
           CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-publish-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_BUILT: ${{ runner.temp }}/chroma-publish-built-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PACKED: ${{ runner.temp }}/chroma-publish-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          CHROMA_VALIDATED_MANIFEST: ${{ runner.temp }}/chroma-sc16462-validated-${{ matrix.model }}/chroma-sc16462-payload-sha256.json
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-publish
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
         run: |
@@ -287,6 +327,52 @@ jobs:
             cp -R "$CHROMA_BUILT/q$bits/vae" "$CHROMA_PACKED/q$bits/vae"
             diff -qr -x text_encoder -x vae "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
           done
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["CHROMA_PACKED"])
+          expected = json.loads(Path(os.environ["CHROMA_VALIDATED_MANIFEST"]).read_text())
+          identity = {
+              "model": os.environ["CHROMA_MODEL"],
+              "inferenceRevision": os.environ["GITHUB_SHA"],
+              "sourceRevision": os.environ["CHROMA_SOURCE_REVISION"],
+              "t5GroupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
+          }
+          for key, value in identity.items():
+              if expected.get(key) != value:
+                  raise SystemExit(
+                      f"validated payload {key} mismatch: {expected.get(key)!r} != {value!r}"
+                  )
+          files = {}
+          for tier in ("q4", "q8"):
+              tier_root = root / tier
+              for path in sorted(tier_root.rglob("*")):
+                  if path.is_file() and ".cache" not in path.parts:
+                      digest = hashlib.sha256()
+                      with path.open("rb") as handle:
+                          for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                              digest.update(chunk)
+                      relative = f"{tier}/{path.relative_to(tier_root).as_posix()}"
+                      files[relative] = {
+                          "size": path.stat().st_size,
+                          "sha256": digest.hexdigest(),
+                      }
+          if files != expected.get("files"):
+              missing = sorted(set(expected.get("files", {})) - set(files))
+              extra = sorted(set(files) - set(expected.get("files", {})))
+              changed = sorted(
+                  key
+                  for key in set(files) & set(expected.get("files", {}))
+                  if files[key] != expected["files"][key]
+              )
+              raise SystemExit(
+                  f"rebuilt payload differs from validation: missing={missing}, extra={extra}, changed={changed}"
+              )
+          print(f"verified {len(files)} rebuilt files against validation SHA-256 manifest")
+          PY
       - name: Publish or verify the complete q4/q8 replacement
         env:
           CHROMA_PACKED: ${{ runner.temp }}/chroma-publish-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
