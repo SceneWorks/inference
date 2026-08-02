@@ -106,7 +106,9 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
         .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION);
     registry.register_trainer(training::REGISTRATION)
@@ -623,6 +625,15 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     contract: registered_turbo_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(feature = "cuda")]
 const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -630,6 +641,15 @@ const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryR
     contract: registered_base_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
+#[cfg(feature = "cuda")]
+const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: base::MODEL_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(base::MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(feature = "cuda")]
 const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =

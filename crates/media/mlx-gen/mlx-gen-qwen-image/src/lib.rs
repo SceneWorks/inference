@@ -80,8 +80,11 @@ pub fn register_providers(
         .register_generator(model_control::REGISTRATION)
         .register_generator(model_edit::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_edit::MEMORY_REGISTRATION)
+        .register_memory_behavior(model_edit::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Qwen-Image provider catalog.

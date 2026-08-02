@@ -75,6 +75,15 @@ pub trait Generator {
         &self,
         context: &MemoryRunContext,
     ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
+        if self
+            .memory_strategy_contract()
+            .is_some_and(requires_memory_request_scope)
+        {
+            return Err(Error::Unsupported(format!(
+                "{} advertises an implemented optimized memory strategy but does not open a request scope",
+                self.descriptor().id
+            )));
+        }
         let _ = context;
         Ok(None)
     }
@@ -176,6 +185,16 @@ pub trait Generator {
             self.descriptor().id
         )))
     }
+}
+
+fn requires_memory_request_scope(contract: &MemoryProviderContract) -> bool {
+    contract.strategies.iter().any(|capability| {
+        capability.strategy.is_optimized()
+            && matches!(
+                capability.support,
+                crate::MemoryStrategySupport::Implemented
+            )
+    })
 }
 
 /// A **stateful multi-turn conversational TTS session** (sc-14150, path **B**) — opened from a loaded
@@ -2383,6 +2402,27 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_scope_is_allowed_only_for_resident_only_contracts() {
+        let mut contract = MemoryProviderContract::compatibility_default(
+            "fixture",
+            crate::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: true,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        );
+        assert!(!requires_memory_request_scope(&contract));
+        contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+            .unwrap()
+            .support = crate::MemoryStrategySupport::Implemented;
+        assert!(requires_memory_request_scope(&contract));
+    }
 
     #[test]
     fn a_component_cannot_be_raised_without_a_visible_floor_declaration() {

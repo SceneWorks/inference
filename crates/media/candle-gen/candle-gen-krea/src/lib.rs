@@ -239,7 +239,16 @@ pub struct KreaGenerator {
 struct KreaMemoryScope {
     device: Device,
     memory: Option<gen_core::GenerationMemory>,
+    requires_reference: bool,
     finished: bool,
+}
+
+#[cfg(test)]
+fn krea_generation_memory(
+    contract: &gen_core::MemoryProviderContract,
+    selection: gen_core::MemorySelection,
+) -> Option<gen_core::GenerationMemory> {
+    contract.generation_memory(&selection)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -259,14 +268,14 @@ impl KreaMemoryScope {
 impl gen_core::MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if img2img_reference(request).is_some()
+        let has_reference = img2img_reference(request).is_some();
+        if has_reference != self.requires_reference
             || request.phases.is_some()
             || request.use_pid
-            || !request.conditioning.is_empty()
+            || (!self.requires_reference && !request.conditioning.is_empty())
         {
             return Err(gen_core::Error::Unsupported(
-                "krea_2_turbo: optimized memory strategies require ordinary text-to-image \
-                 without reference/edit conditioning, PiD, or multi-phase denoise"
+                "krea: request conditioning does not match the admitted base/control memory route"
                     .to_owned(),
             ));
         }
@@ -357,37 +366,6 @@ impl Drop for KreaMemoryScope {
 /// underneath a provider that has not declared that rung `Implemented`. Krea Turbo's contract
 /// declares every rung `Implemented`, so the two agree exactly today; this is a consistency fix,
 /// not a behavior change.
-#[cfg(any(feature = "cuda", test))]
-fn krea_generation_memory(
-    contract: &gen_core::MemoryProviderContract,
-    selection: gen_core::MemorySelection,
-) -> Option<gen_core::GenerationMemory> {
-    use gen_core::MemoryStrategy;
-
-    if selection.strategy == MemoryStrategy::Resident {
-        return None;
-    }
-    let stream_transformer_blocks = contract.engages(
-        selection.strategy,
-        MemoryStrategy::BoundedTransformerResidency,
-    );
-    Some(gen_core::GenerationMemory {
-        stage_residency: contract.engages(selection.strategy, MemoryStrategy::StagedResidency),
-        tile_vae_decode: contract.engages(selection.strategy, MemoryStrategy::BoundedDecode),
-        chunk_attention: contract.engages(selection.strategy, MemoryStrategy::BoundedAttention),
-        stream_transformer_blocks,
-        // SC-15792: carry the SELECTED window through, rather than dropping it and letting the
-        // pipeline fall back to the provider default. Leaving it at `None` made the executed window
-        // independent of the chosen one — so calibration evidence recorded against a selection would
-        // have described a run that never happened. Only forwarded when the rung is actually
-        // engaged, so a selection that does not stream blocks stays byte-for-byte as before.
-        transformer_window_size: stream_transformer_blocks
-            .then_some(selection.parameters.transformer_window_size)
-            .flatten(),
-        ..Default::default()
-    })
-}
-
 /// The rung-4 windows this provider will execute — the same list
 /// `krea_turbo_memory_strategy_contract` publishes as `transformer_window_sizes`.
 ///
@@ -468,10 +446,8 @@ impl Generator for KreaGenerator {
             }
             Ok(Some(Box::new(KreaMemoryScope {
                 device: self.device.clone(),
-                memory: krea_generation_memory(
-                    krea_turbo_memory_strategy_contract(),
-                    context.selection,
-                ),
+                memory: krea_turbo_memory_strategy_contract().generation_memory(&context.selection),
+                requires_reference: false,
                 finished: false,
             })))
         }
@@ -1330,6 +1306,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
         })
         .collect(),
         default_engagement_exclusions: Vec::new(),
+        resident_request_memory: gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1414,6 +1391,93 @@ fn registered_krea_safety_check(
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn registered_krea_valid_fixture(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    strategy: gen_core::MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let is_control = contract.provider_id.ends_with("_control");
+    let context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: actual_quant_tier(spec, &contract.provider_id)?,
+            component_precision_floors: &[],
+        },
+        gen_core::MemoryBehaviorRoute {
+            mode: if is_control {
+                gen_core::MemoryMode::ImageToImage
+            } else {
+                gen_core::MemoryMode::TextToImage
+            },
+            has_reference: is_control,
+            use_pid: false,
+            has_phases: false,
+            overlay: is_control.then(|| "pose-control".to_owned()),
+        },
+    )?;
+    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_krea_begin_request(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    if let gen_core::MemorySafetyDecision::Reject { reason } =
+        registered_krea_safety_check(spec, contract, context)
+    {
+        return Err(gen_core::Error::Unsupported(reason));
+    }
+    Ok(Some(Box::new(KreaMemoryScope {
+        device: Device::Cpu,
+        memory: contract.generation_memory(&context.selection),
+        requires_reference: contract.provider_id.ends_with("_control"),
+        finished: false,
+    })))
+}
+
+#[cfg(test)]
+mod weights_free_behavior_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_scope_executes_the_registered_base_and_control_behaviors() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        for (contract, strategy) in [
+            (
+                krea_turbo_memory_strategy_contract().clone(),
+                gen_core::MemoryStrategy::BoundedDecode,
+            ),
+            (
+                build_krea_control_memory_strategy_contract(&spec).unwrap(),
+                gen_core::MemoryStrategy::BoundedAttention,
+            ),
+        ] {
+            let mut fixture = registered_krea_valid_fixture(&spec, &contract, strategy)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let mut scope = registered_krea_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .unwrap();
+            scope.configure_request(&mut fixture.request).unwrap();
+            assert_eq!(
+                fixture.request.memory,
+                contract.generation_memory(&fixture.context.selection)
+            );
+            scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        }
+    }
+}
+
 fn krea_memory_strategy_safety_check(
     contract: &gen_core::MemoryProviderContract,
     loaded_quant: Option<Quant>,
@@ -1439,6 +1503,13 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     contract: registered_krea_turbo_memory_strategy_contract,
     safety_check: registered_krea_safety_check,
 };
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: KREA_2_TURBO_ID,
+        valid_fixtures: registered_krea_valid_fixture,
+        begin_request: registered_krea_begin_request,
+    };
 
 /// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
 /// route. The worker owns measured evidence and live-budget selection; this declaration owns which
@@ -1561,6 +1632,13 @@ const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memo
     contract: registered_krea_control_memory_strategy_contract,
     safety_check: registered_krea_safety_check,
 };
+#[cfg(feature = "cuda")]
+const CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "krea_2_turbo_control",
+        valid_fixtures: registered_krea_valid_fixture,
+        begin_request: registered_krea_begin_request,
+    };
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
@@ -1573,9 +1651,12 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
         .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry.register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
@@ -1870,6 +1951,7 @@ mod tests {
                 chunk_attention: true,
                 ..Default::default()
             }),
+            requires_reference: false,
             finished: false,
         };
         scope
@@ -1948,6 +2030,8 @@ mod tests {
             Some(gen_core::GenerationMemory {
                 stage_residency: true,
                 tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
                 ..Default::default()
             })
         );
@@ -1959,6 +2043,8 @@ mod tests {
             Some(gen_core::GenerationMemory {
                 stage_residency: true,
                 tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
                 chunk_attention: true,
                 ..Default::default()
             })
@@ -1971,6 +2057,8 @@ mod tests {
             Some(gen_core::GenerationMemory {
                 stage_residency: true,
                 tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
                 chunk_attention: true,
                 stream_transformer_blocks: true,
                 // SC-15792: the SELECTED window travels with the selection. Pinned as a non-default
@@ -1978,6 +2066,7 @@ mod tests {
                 // pass with the propagation deleted, which is exactly how the field came to be
                 // dropped on the floor in the first place.
                 transformer_window_size: Some(1),
+                transformer_window_component: Some(gen_core::TransformerComponent::Dit),
                 ..Default::default()
             })
         );
@@ -2149,6 +2238,7 @@ mod tests {
         let mut scope = KreaMemoryScope {
             device: Device::Cpu,
             memory: Some(attention_memory),
+            requires_reference: false,
             finished: false,
         };
         let mut request = GenerationRequest {
@@ -2175,6 +2265,7 @@ mod tests {
         let mut rejected = KreaMemoryScope {
             device: Device::Cpu,
             memory: Some(attention_memory),
+            requires_reference: false,
             finished: false,
         };
         let mut img2img = GenerationRequest {

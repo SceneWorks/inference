@@ -143,6 +143,58 @@ pub struct MemoryRegistration {
         fn(&LoadSpec, &MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
 }
 
+/// Provider-owned, weights-free executable fixture for one implemented memory strategy.
+///
+/// The request is intentionally provider-owned: edit/control routes can supply their real mode and
+/// conditioning shape instead of being forced through a synthetic text-to-image fixture.
+pub struct MemoryBehaviorFixture {
+    pub context: crate::MemoryRunContext,
+    pub request: crate::GenerationRequest,
+}
+
+impl MemoryBehaviorFixture {
+    pub fn new(context: crate::MemoryRunContext) -> Self {
+        let mut request = crate::GenerationRequest {
+            width: context.geometry.width,
+            height: context.geometry.height,
+            count: context.geometry.batch,
+            use_pid: context.use_pid,
+            ..Default::default()
+        };
+        if context.has_reference {
+            request.conditioning.push(crate::Conditioning::Reference {
+                image: crate::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                },
+                strength: Some(1.0),
+            });
+        }
+        Self { context, request }
+    }
+}
+
+pub type MemoryBehaviorBeginRequest = fn(
+    &LoadSpec,
+    &MemoryProviderContract,
+    &crate::MemoryRunContext,
+) -> Result<Option<Box<dyn crate::MemoryRequestScope>>>;
+
+/// Additive executable conformance seam paired by `provider_id` with a [`MemoryRegistration`].
+/// Existing resident-only adopters need no behavior registration; every provider advertising an
+/// optimized implemented rung must register one.
+#[derive(Clone, Copy)]
+pub struct MemoryBehaviorRegistration {
+    pub provider_id: &'static str,
+    pub valid_fixtures: fn(
+        &LoadSpec,
+        &MemoryProviderContract,
+        crate::MemoryStrategy,
+    ) -> Result<Vec<MemoryBehaviorFixture>>,
+    pub begin_request: MemoryBehaviorBeginRequest,
+}
+
 /// Provider-owned, weights-free activation measurements for one registered generator route.
 ///
 /// Kept separate from [`ModelRegistration`] and [`crate::Capabilities`] so providers opt in without a
@@ -234,6 +286,7 @@ pub struct AudioEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
+    memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
     transforms: Vec<TransformRegistration>,
@@ -273,6 +326,11 @@ impl ProviderRegistryBuilder {
         register_memory_strategy,
         memory_strategy,
         MemoryRegistration
+    );
+    builder_registration_method!(
+        register_memory_behavior,
+        memory_behavior,
+        MemoryBehaviorRegistration
     );
 
     /// Register memory policy for a real platform-composed route that is not represented by a
@@ -383,6 +441,27 @@ impl ProviderRegistryBuilder {
         }
         {
             let mut ids = std::collections::BTreeSet::new();
+            for registration in &self.memory_behavior {
+                if !ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate memory-behavior provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .memory_strategy
+                    .iter()
+                    .any(|memory| memory.provider_id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "memory-behavior registration '{}' has no matching memory strategy",
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
+        {
+            let mut ids = std::collections::BTreeSet::new();
             let mut composed_ids = std::collections::BTreeSet::new();
             for id in &self.composed_memory_strategy_ids {
                 if !composed_ids.insert(*id) {
@@ -424,6 +503,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
+            memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
@@ -444,6 +524,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
+    memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
     transforms: Box<[TransformRegistration]>,
@@ -505,6 +586,12 @@ impl ProviderRegistry {
         &self,
     ) -> impl ExactSizeIterator<Item = &MemoryRegistration> {
         self.memory_strategy.iter()
+    }
+
+    pub fn memory_behavior_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &MemoryBehaviorRegistration> {
+        self.memory_behavior.iter()
     }
 
     /// Reject a [`LoadSpec`] whose requested quant tier this platform's backend does not implement,

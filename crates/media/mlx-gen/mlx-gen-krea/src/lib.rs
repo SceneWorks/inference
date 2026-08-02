@@ -110,11 +110,16 @@ pub fn register_providers(
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::RAW_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
