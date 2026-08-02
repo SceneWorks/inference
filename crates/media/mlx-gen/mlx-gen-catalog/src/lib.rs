@@ -7,6 +7,13 @@
 pub use mlx_gen as media;
 pub use mlx_gen::gen_core::{ProviderRegistry, ProviderRegistryBuilder};
 
+pub mod licenses;
+
+pub use licenses::{
+    component_licenses, component_licenses_manifest_json, license_families, provider_components,
+    MLX_MEDIA_PROVIDER_COMPONENTS,
+};
+
 /// Complete backend package surface owned by the macOS runtime.
 ///
 /// Some modules are ordinary registry providers; `depth`, `face`, `instantid`, `pid`, `sam2`, and
@@ -469,6 +476,23 @@ mod tests {
         );
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
+
+        // sc-16666: the licence mapping in [`crate::licenses`] is keyed off exactly these lists, so
+        // this is where a surface change and a mapping change meet. All fifteen trainer ids are
+        // also generator ids, which is why 65 + 15 + 1 + 2 registrations are 68 distinct ids.
+        //
+        // Registration is never conditioned on the mapping — 59 < 68 because nine ids load nothing
+        // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
+        // our metadata for CI to report, and `licenses::tests` pins which nine and why.
+        let distinct: std::collections::BTreeSet<&String> = generators
+            .iter()
+            .chain(&trainers)
+            .chain(&captioners)
+            .chain(&image_embedders)
+            .chain(&text_embedders)
+            .collect();
+        assert_eq!(distinct.len(), 68);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 59);
     }
 
     /// The scaffolded Mage-Flow crate is compiled into the platform package but must **not** reach
