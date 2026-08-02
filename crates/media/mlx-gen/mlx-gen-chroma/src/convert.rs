@@ -9,9 +9,8 @@
 //! * The transformer's own `x_embedder` / `context_embedder` / top-level `proj_out` and the entire
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
-//! * T5 packs every quantizable attention/FFN Linear. Its token embedding and shared relative-
-//!   position bias remain at source precision as an explicit sensitivity-calibration hypothesis;
-//!   RMSNorm scales likewise remain dense.
+//! * T5 packs every group-quantizable 2-D weight, including its token embedding and shared relative-
+//!   position bias. RMSNorm scales remain dense because affine quantization does not target vectors.
 //! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
@@ -92,11 +91,10 @@ fn is_transformer_target(base: &str) -> bool {
     false
 }
 
-/// T5-XXL's Chroma policy packs the complete attention/FFN Linear surface while retaining the token
-/// embedding and the block-0 relative-position-bias table at source precision. The shared
-/// [`quantize_map`] shape guard keeps 1-D LayerNorm/RMSNorm vectors dense as well.
-fn is_t5_linear_target(base: &str) -> bool {
-    base != "shared" && !base.ends_with("SelfAttention.relative_attention_bias")
+/// T5-XXL's Chroma policy packs every group-quantizable 2-D weight. The shared [`quantize_map`]
+/// shape guard keeps 1-D LayerNorm/RMSNorm vectors dense.
+fn is_t5_target(_base: &str) -> bool {
+    true
 }
 
 /// FLUX.1 VAE packed surface: encoder/decoder mid-block attention QKV/out projections. Convolutions
@@ -131,6 +129,7 @@ fn quantize_component(
     dst: &Path,
     file: &str,
     bits: i32,
+    group_size: i32,
     is_target: fn(&str) -> bool,
 ) -> Result<()> {
     if !src.is_dir() {
@@ -140,9 +139,9 @@ fn quantize_component(
         )));
     }
     std::fs::create_dir_all(dst)?;
-    let map = quantize_map(load_component_map(src)?, bits, GROUP_SIZE, is_target)?;
+    let map = quantize_map(load_component_map(src)?, bits, group_size, is_target)?;
     save_map(&dst.join(file), &map)?;
-    write_quantized_config(src, dst, bits, GROUP_SIZE)
+    write_quantized_config(src, dst, bits, group_size)
 }
 
 /// Assemble a full pre-quantized turnkey Chroma snapshot in `dst_root`: pack the DiT `transformer/`
@@ -154,9 +153,26 @@ fn quantize_component(
 /// tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion — mirror it; see
 /// the tier builder in `tests/prequantize_real_weights.rs`).
 pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
+    prequantize_turnkey_with_t5_group_size(src_root, dst_root, bits, GROUP_SIZE)
+}
+
+/// As [`prequantize_turnkey`], with an explicit T5 group size for real-weight calibration. The DiT
+/// and VAE retain Chroma's established group size; only the independently resident T5 artifact uses
+/// `t5_group_size` and records it in `text_encoder/config.json` for the loader.
+pub fn prequantize_turnkey_with_t5_group_size(
+    src_root: &Path,
+    dst_root: &Path,
+    bits: i32,
+    t5_group_size: i32,
+) -> Result<()> {
     if !matches!(bits, 4 | 8) {
         return Err(Error::Msg(format!(
             "chroma convert: bits must be 4 or 8, got {bits}"
+        )));
+    }
+    if !matches!(t5_group_size, 32 | 64 | 128) {
+        return Err(Error::Msg(format!(
+            "chroma convert: T5 group size must be 32, 64, or 128, got {t5_group_size}"
         )));
     }
     if dst_root.exists() {
@@ -183,7 +199,7 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
             staging.display()
         )));
     }
-    let result = prequantize_turnkey_into(src_root, &staging, bits);
+    let result = prequantize_turnkey_into(src_root, &staging, bits, t5_group_size);
     if let Err(error) = result {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(error);
@@ -195,7 +211,12 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     Ok(())
 }
 
-fn prequantize_turnkey_into(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
+fn prequantize_turnkey_into(
+    src_root: &Path,
+    dst_root: &Path,
+    bits: i32,
+    t5_group_size: i32,
+) -> Result<()> {
     std::fs::create_dir_all(dst_root)?;
 
     // Transformer: pack the block Linears into one flat file + annotate config.
@@ -222,13 +243,15 @@ fn prequantize_turnkey_into(src_root: &Path, dst_root: &Path, bits: i32) -> Resu
         &dst_root.join("text_encoder"),
         AUXILIARY_FILE,
         bits,
-        is_t5_linear_target,
+        t5_group_size,
+        is_t5_target,
     )?;
     quantize_component(
         &src_root.join("vae"),
         &dst_root.join("vae"),
         AUXILIARY_FILE,
         bits,
+        GROUP_SIZE,
         is_vae_target,
     )?;
 
@@ -322,19 +345,12 @@ mod tests {
             "encoder.block.23.layer.1.DenseReluDense.wi_0",
             "encoder.block.23.layer.1.DenseReluDense.wi_1",
             "encoder.block.23.layer.1.DenseReluDense.wo",
-        ] {
-            assert!(
-                is_t5_linear_target(base),
-                "{base} should be considered for packing"
-            );
-        }
-        for base in [
             "shared",
             "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
         ] {
             assert!(
-                !is_t5_linear_target(base),
-                "{base} is an explicit sensitivity-calibration carve-out"
+                is_t5_target(base),
+                "{base} should be considered for packing"
             );
         }
 
@@ -374,7 +390,7 @@ mod tests {
         for (base, predicate) in [
             (
                 "encoder.block.0.layer.1.DenseReluDense.wi_0",
-                is_t5_linear_target as fn(&str) -> bool,
+                is_t5_target as fn(&str) -> bool,
             ),
             (
                 "decoder.mid_block.attentions.0.to_q",

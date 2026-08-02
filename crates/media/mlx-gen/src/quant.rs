@@ -108,6 +108,62 @@ pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
     Ok(Some(bits))
 }
 
+/// Read the affine quantization group size declared by a packed component's `config.json`.
+///
+/// Dense components return `None`. A packed marker must declare one of the group sizes implemented
+/// by MLX (`32`, `64`, or `128`); rejecting any other value here keeps corrupt or hand-edited
+/// manifests from failing later inside `quantized_matmul` with an opaque backend error.
+pub fn packed_quant_group_size_at(component_dir: &Path) -> Result<Option<i32>> {
+    let config_path = component_dir.join("config.json");
+    let bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(crate::Error::Msg(format!(
+                "packed quant: read {}: {err}",
+                config_path.display()
+            )))
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+        crate::Error::Msg(format!(
+            "packed quant: parse {}: {err}",
+            config_path.display()
+        ))
+    })?;
+    let Some(marker) = config.get("quantization") else {
+        return Ok(None);
+    };
+    let marker = marker.as_object().ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: {} `quantization` must be an object",
+            config_path.display()
+        ))
+    })?;
+    let group_size_i64 = marker
+        .get("group_size")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "packed quant: {} `quantization.group_size` must be an integer",
+                config_path.display()
+            ))
+        })?;
+    let group_size = i32::try_from(group_size_i64).map_err(|_| {
+        crate::Error::Msg(format!(
+            "packed quant: {} `quantization.group_size` is out of range: {group_size_i64}",
+            config_path.display()
+        ))
+    })?;
+    if !matches!(group_size, 32 | 64 | 128) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: {} declares unsupported `quantization.group_size` {group_size}; expected 32, 64, or 128",
+            config_path.display()
+        )));
+    }
+    Ok(Some(group_size))
+}
+
 /// Decide whether a requested Q4/Q8 tier must be produced by load-time quantization.
 ///
 /// Packed turnkeys must match the request exactly; a mismatch is a hard error because provider
@@ -421,6 +477,32 @@ mod tests {
         assert!(error.contains("transformer"), "{error}");
         assert!(error.contains("Q8") && error.contains("Q4"), "{error}");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn packed_group_size_accepts_only_mlx_affine_geometries() {
+        for group_size in [32, 64, 128] {
+            let body = format!(r#"{{"quantization":{{"bits":8,"group_size":{group_size}}}}}"#);
+            let root = marker_fixture(Some(&body));
+            assert_eq!(
+                packed_quant_group_size_at(&root.join("transformer")).unwrap(),
+                Some(group_size)
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+        for marker in [
+            r#"{"quantization":{"bits":8}}"#,
+            r#"{"quantization":{"bits":8,"group_size":"32"}}"#,
+            r#"{"quantization":{"bits":8,"group_size":16}}"#,
+            r#"{"quantization":{"bits":8,"group_size":2147483648}}"#,
+        ] {
+            let root = marker_fixture(Some(marker));
+            assert!(
+                packed_quant_group_size_at(&root.join("transformer")).is_err(),
+                "group-size marker must fail: {marker}"
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
     }
 
     #[test]

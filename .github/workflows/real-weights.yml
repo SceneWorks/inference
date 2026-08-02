@@ -32,6 +32,12 @@ on:
         type: string
         required: false
         default: ""
+      chroma_t5_group_size:
+        description: T5 affine group size for Chroma auxiliary validation
+        type: choice
+        required: false
+        default: "64"
+        options: ["32", "64", "128"]
 
 permissions:
   contents: read
@@ -68,6 +74,7 @@ jobs:
       CHROMA_MODEL: ${{ matrix.model }}
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
+      SC16462_T5_GROUP_SIZE: ${{ inputs.chroma_t5_group_size }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -235,6 +242,7 @@ jobs:
       CHROMA_MODEL: ${{ matrix.model }}
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
+      SC16462_T5_GROUP_SIZE: ${{ inputs.chroma_t5_group_size }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate publication authorization

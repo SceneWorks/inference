@@ -39,6 +39,16 @@ enum TokenEmbedding {
     },
 }
 
+fn validate_t5_group_size(group_size: i32) -> Result<()> {
+    if matches!(group_size, 32 | 64 | 128) {
+        Ok(())
+    } else {
+        Err(Error::Msg(format!(
+            "T5 quantization group size must be 32, 64, or 128, got {group_size}"
+        )))
+    }
+}
+
 impl TokenEmbedding {
     /// Load `{base}` — **packed** ([`Self::Quantized`]) when `{base}.scales` is present (a
     /// pre-quantized snapshot; bit-width inferred from the packed shapes at `group_size`), else
@@ -89,13 +99,17 @@ impl TokenEmbedding {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.quantize_with_group_size(bits, GROUP_SIZE)
+    }
+
+    fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
         if let Self::Dense(w) = self {
-            let (wq, scales, biases) = quantize(&w.as_dtype(Dtype::Bfloat16)?, 64, bits)?;
+            let (wq, scales, biases) = quantize(&w.as_dtype(Dtype::Bfloat16)?, group_size, bits)?;
             *self = Self::Quantized {
                 wq,
                 scales,
                 biases,
-                group_size: 64,
+                group_size,
                 bits,
             };
         }
@@ -322,22 +336,43 @@ pub enum T5Sublayer {
 
 impl T5TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Self::from_weights_with_group_size(w, prefix, GROUP_SIZE)
+    }
+
+    /// Load T5 with the group size declared by its packed component manifest. Dense FLUX callers
+    /// retain [`GROUP_SIZE`]; Chroma uses this seam for its independently calibrated T5 artifacts.
+    pub fn from_weights_with_group_size(
+        w: &Weights,
+        prefix: &str,
+        group_size: i32,
+    ) -> Result<Self> {
+        validate_t5_group_size(group_size)?;
         let p = |suffix: &str| join(prefix, suffix);
         let mut blocks = Vec::with_capacity(24);
         for i in 0..24 {
-            blocks.push(T5Block::from_weights(w, &p(&format!("encoder.block.{i}")))?);
+            blocks.push(T5Block::from_weights(
+                w,
+                &p(&format!("encoder.block.{i}")),
+                group_size,
+            )?);
         }
         Ok(Self {
-            shared: TokenEmbedding::from_weights(w, &p("shared"), GROUP_SIZE)?,
+            shared: TokenEmbedding::from_weights(w, &p("shared"), group_size)?,
             blocks,
             final_ln_w: w.require(&p("encoder.final_layer_norm.weight"))?.clone(),
         })
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.shared.quantize(bits)?;
+        self.quantize_with_group_size(bits, GROUP_SIZE)
+    }
+
+    /// Quantize the complete packable T5 surface at an explicit MLX affine group size.
+    pub fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        validate_t5_group_size(group_size)?;
+        self.shared.quantize_with_group_size(bits, group_size)?;
         for block in &mut self.blocks {
-            block.quantize(bits)?;
+            block.quantize(bits, group_size)?;
         }
         Ok(())
     }
@@ -408,10 +443,10 @@ struct T5Block {
 }
 
 impl T5Block {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
         Ok(Self {
-            attn: T5Attention::from_weights(w, &join(prefix, "layer.0"))?,
-            ff: T5FeedForward::from_weights(w, &join(prefix, "layer.1"))?,
+            attn: T5Attention::from_weights(w, &join(prefix, "layer.0"), group_size)?,
+            ff: T5FeedForward::from_weights(w, &join(prefix, "layer.1"), group_size)?,
         })
     }
 
@@ -420,9 +455,9 @@ impl T5Block {
         self.ff.forward(&hidden)
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.attn.quantize(bits)?;
-        self.ff.quantize(bits)?;
+    fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.attn.quantize_with_group_size(bits, group_size)?;
+        self.ff.quantize_with_group_size(bits, group_size)?;
         Ok(())
     }
 
@@ -457,10 +492,15 @@ struct T5Attention {
 }
 
 impl T5Attention {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
         let linear = |name: &str| {
-            crate::quant::lin(w, &join(prefix, &format!("SelfAttention.{name}")), false)
+            mlx_gen::quant::lin(
+                w,
+                &join(prefix, &format!("SelfAttention.{name}")),
+                false,
+                group_size,
+            )
         };
         Ok(Self {
             ln_w: w.require(&join(prefix, "layer_norm.weight"))?.clone(),
@@ -478,7 +518,7 @@ impl T5Attention {
                 } else {
                     "encoder.block.0.layer.0.SelfAttention.relative_attention_bias".to_string()
                 };
-                TokenEmbedding::from_weights(w, &base, GROUP_SIZE)?
+                TokenEmbedding::from_weights(w, &base, group_size)?
             },
         })
     }
@@ -508,12 +548,12 @@ impl T5Attention {
         Ok(values.transpose_axes(&[2, 0, 1])?.expand_dims(0)?)
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.q.quantize(bits, None)?;
-        self.k.quantize(bits, None)?;
-        self.v.quantize(bits, None)?;
-        self.o.quantize(bits, None)?;
-        self.rel_bias.quantize(bits)?;
+    fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.q.quantize(bits, Some(group_size))?;
+        self.k.quantize(bits, Some(group_size))?;
+        self.v.quantize(bits, Some(group_size))?;
+        self.o.quantize(bits, Some(group_size))?;
+        self.rel_bias.quantize_with_group_size(bits, group_size)?;
         Ok(())
     }
 
@@ -534,10 +574,15 @@ struct T5FeedForward {
 }
 
 impl T5FeedForward {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
         let linear = |name: &str| {
-            crate::quant::lin(w, &join(prefix, &format!("DenseReluDense.{name}")), false)
+            mlx_gen::quant::lin(
+                w,
+                &join(prefix, &format!("DenseReluDense.{name}")),
+                false,
+                group_size,
+            )
         };
         Ok(Self {
             ln_w: w.require(&join(prefix, "layer_norm.weight"))?.clone(),
@@ -559,9 +604,13 @@ impl T5FeedForward {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.wi0.quantize(bits, None)?;
-        self.wi1.quantize(bits, None)?;
-        self.wo.quantize(bits, None)?;
+        self.quantize_with_group_size(bits, GROUP_SIZE)
+    }
+
+    fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.wi0.quantize(bits, Some(group_size))?;
+        self.wi1.quantize(bits, Some(group_size))?;
+        self.wo.quantize(bits, Some(group_size))?;
         Ok(())
     }
 }
@@ -642,5 +691,15 @@ mod tests {
         assert_eq!(relative_position_bucket(-1), 1);
         assert_eq!(relative_position_bucket(128), 31);
         assert_eq!(relative_position_bucket(-128), 15);
+    }
+
+    #[test]
+    fn t5_group_size_matches_mlx_affine_quantization_contract() {
+        for group_size in [32, 64, 128] {
+            assert!(validate_t5_group_size(group_size).is_ok());
+        }
+        for group_size in [0, 16, 256] {
+            assert!(validate_t5_group_size(group_size).is_err());
+        }
     }
 }

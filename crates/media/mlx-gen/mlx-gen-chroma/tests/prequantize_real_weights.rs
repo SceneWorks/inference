@@ -6,10 +6,8 @@
 //! as dense floats → a degenerate (flat) render, which the pixel-std assertion catches.
 //!
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
-//! converter packs the **DiT `transformer/` block Linears**, T5-XXL's complete attention/FFN Linear
-//! surface, and the FLUX.1 VAE mid-block attention. T5's token-embedding and relative-position-bias
-//! tables remain dense as an explicit sensitivity carve-out; its large attention/FFN Linear surface
-//! is packed. Shipping q4 preserves the existing q4 transformer and uses q8 auxiliaries because
+//! converter packs the **DiT `transformer/` block Linears**, every group-quantizable T5-XXL 2-D
+//! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer and uses q8 auxiliaries because
 //! hosted image calibration rejects all-q4 quality; both routes load without a full dense auxiliary
 //! transient. A packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
@@ -22,7 +20,8 @@
 //! Env knobs: SC8777_SRC (source snapshot dir; default the cached Chroma1-Base snapshot),
 //! SC8777_OUT (tier output dir), SC8777_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8777_MODEL
 //! (registry id: `chroma1_base` default / `chroma1_hd` / `chroma1_flash`), SC8777_KEEP (retain the
-//! tier), and SC16462_AUX_BITS (optional T5/VAE bit width for mixed-precision shipping evidence).
+//! tier), SC16462_AUX_BITS (optional T5/VAE bit width for mixed-precision shipping evidence), and
+//! SC16462_T5_GROUP_SIZE (optional T5 affine group size; 64 by default).
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
@@ -80,6 +79,13 @@ fn auxiliary_bits_env(route_bits: i32) -> i32 {
         .unwrap_or(route_bits)
 }
 
+fn t5_group_size_env() -> i32 {
+    std::env::var("SC16462_T5_GROUP_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(mlx_gen::quant::DEFAULT_GROUP_SIZE)
+}
+
 fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
     let complete = out
         .join("transformer/diffusion_pytorch_model.safetensors")
@@ -92,8 +98,13 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
             "refusing to reuse incomplete packed destination {}",
             out.display()
         );
-        mlx_gen_chroma::convert::prequantize_turnkey(src, out, bits)
-            .expect("prequantize_turnkey succeeds");
+        mlx_gen_chroma::convert::prequantize_turnkey_with_t5_group_size(
+            src,
+            out,
+            bits,
+            t5_group_size_env(),
+        )
+        .expect("prequantize_turnkey succeeds");
     }
     for component in ["transformer", "text_encoder", "vae"] {
         let config: serde_json::Value = serde_json::from_str(
@@ -109,6 +120,15 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
         assert_eq!(
             config["quantization"]["bits"], expected_bits,
             "{component} packed bit-width provenance"
+        );
+        let expected_group_size = if component == "text_encoder" {
+            t5_group_size_env()
+        } else {
+            mlx_gen::quant::DEFAULT_GROUP_SIZE
+        };
+        assert_eq!(
+            config["quantization"]["group_size"], expected_group_size,
+            "{component} packed group-size provenance"
         );
         let safetensors = std::fs::read_dir(out.join(component))
             .expect("packed component dir")
@@ -238,8 +258,8 @@ fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>
     let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     if let Some(bits) = quantize_at_load {
-        t5.quantize_linears(bits)
-            .expect("load-time T5 Linear quantization");
+        t5.quantize_with_group_size(bits, t5_group_size_env())
+            .expect("load-time complete T5 quantization");
     }
     let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
         &tokenizer,
@@ -577,18 +597,18 @@ fn packed_auxiliaries_match_load_time_quantization() {
 
     let packed_weights =
         mlx_gen::weights::Weights::from_dir(out.join("text_encoder")).expect("packed T5 weights");
-    assert_ne!(
+    assert_eq!(
         packed_weights.require("shared.weight").unwrap().dtype(),
         Dtype::Uint32,
-        "T5 token embedding is the explicit source-precision carve-out"
+        "T5 token embedding must be stored as packed codes"
     );
-    assert!(packed_weights.get("shared.scales").is_none());
+    assert!(packed_weights.get("shared.scales").is_some());
     let relative_bias = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias";
     assert!(
         packed_weights
             .get(&format!("{relative_bias}.scales"))
-            .is_none(),
-        "T5 relative-position bias is the explicit source-precision carve-out"
+            .is_some(),
+        "T5 relative-position bias must be stored as packed codes"
     );
     let t5_probe = "encoder.block.0.layer.0.SelfAttention.q";
     assert_eq!(
@@ -661,11 +681,12 @@ fn packed_auxiliaries_match_load_time_quantization() {
     );
 
     println!(
-        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
         bits,
         auxiliary_bits,
         auxiliary_bits,
+        t5_group_size_env(),
         t5_all_positions_cosine,
         t5_active_span_cosine,
         vae_decode_cosine,
@@ -736,11 +757,12 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         gib(baseline_peak)
     );
     println!(
-        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
         id,
         bits,
         auxiliary_bits,
         auxiliary_bits,
+        t5_group_size_env(),
         minimum_cosine,
         maximum_mae,
         baseline_peak,

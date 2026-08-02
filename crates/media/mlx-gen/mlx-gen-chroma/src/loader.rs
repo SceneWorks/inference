@@ -42,8 +42,11 @@ pub fn load_tokenizer_with_max_len(max_length: usize) -> Result<TextTokenizer> {
 
 pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
     // Chroma diffusers layout: T5 is `text_encoder/` (FLUX puts it in `text_encoder_2/`).
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    T5TextEncoder::from_weights(&w, "")
+    let component = root.join("text_encoder");
+    let group_size = mlx_gen::quant::packed_quant_group_size_at(&component)?
+        .unwrap_or(mlx_gen::quant::DEFAULT_GROUP_SIZE);
+    let w = Weights::from_dir(component)?;
+    T5TextEncoder::from_weights_with_group_size(&w, "", group_size)
 }
 
 pub fn load_vae(root: &Path) -> Result<Vae> {
