@@ -114,9 +114,10 @@ pub use runtime::{
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,
-    run_av_curated_sampler, run_cfgpp_sampler, run_curated_sampler, run_flow_sampler,
-    AlphaSchedule, AvLatents, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler,
-    MlxAvLatentOps, MlxLatentOps, TcdSampler,
+    run_av_curated_sampler, run_cfgpp_sampler, run_cfgpp_sampler_with_latent_hook,
+    run_curated_sampler, run_curated_sampler_with_latent_hook, run_flow_sampler, AlphaSchedule,
+    AvLatents, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps,
+    MlxLatentOps, TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};

@@ -32,8 +32,9 @@ use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, denoise_cfgpp, denoise_curated, denoise_inpaint, denoise_ip,
-    denoise_multi_control, encode_conditioning, encode_init_latents, preprocess_control_image,
+    decode_image, denoise_cfgpp_with_preview, denoise_curated_with_preview,
+    denoise_inpaint_with_preview, denoise_ip_with_preview, denoise_multi_control_with_preview,
+    denoise_with_preview, encode_conditioning, encode_init_latents, preprocess_control_image,
     text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -195,7 +196,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -975,7 +976,7 @@ impl Sdxl {
                     && Solver::from_name(sampler_name)
                         .is_some_and(mlx_gen::gen_core::sampling::base_supports_cfgpp);
                 let latents = if want_cfgpp {
-                    denoise_cfgpp(
+                    denoise_cfgpp_with_preview(
                         heavy.unet,
                         Some(sampler_name),
                         &ms,
@@ -987,12 +988,13 @@ impl Sdxl {
                         cfg,
                         &req.cancel,
                         on_progress,
+                        &req.preview,
                         &control_ctxs,
                         ip,
                         None,
                     )?
                 } else {
-                    denoise_curated(
+                    denoise_curated_with_preview(
                         heavy.unet,
                         Some(sampler_name),
                         &ms,
@@ -1005,6 +1007,7 @@ impl Sdxl {
                         seed,
                         &req.cancel,
                         on_progress,
+                        &req.preview,
                         &control_ctxs,
                         ip,
                         None,
@@ -1111,7 +1114,7 @@ impl Sdxl {
                 sampler: sampler.as_ref(),
             };
             let latents = if let Some(tokens) = &ip_tokens {
-                denoise_ip(
+                denoise_ip_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1120,11 +1123,12 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                     tokens,
                     ip_scale,
                 )?
             } else if !control_ctxs.is_empty() {
-                denoise_multi_control(
+                denoise_multi_control_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1133,10 +1137,11 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                     &control_ctxs,
                 )?
             } else if let Some(b) = &blend {
-                denoise_inpaint(
+                denoise_inpaint_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1145,10 +1150,11 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                     b,
                 )?
             } else {
-                denoise(
+                denoise_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1157,6 +1163,7 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                 )?
             };
 
@@ -1387,6 +1394,7 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_preview);
     }
 
     #[test]
