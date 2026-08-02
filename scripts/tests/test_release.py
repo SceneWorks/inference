@@ -1,12 +1,14 @@
 import copy
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.release.build_release import (
     _provider_term_union,
+    _validate_term,
     load_model_weight_licenses,
     merge_model_weight_licenses,
     render_model_licenses,
@@ -558,6 +560,92 @@ class ProviderTermUnionTests(unittest.TestCase):
             ],
         )
 
+    def _family(self, identifier: str, terms: list) -> dict:
+        return {
+            "id": identifier,
+            "spdx_id": f"LicenseRef-{identifier}",
+            "name": identifier,
+            "text_url": f"https://example.invalid/{identifier}",
+            "terms": terms,
+        }
+
+    def test_two_deployer_obligations_order_by_their_text(self) -> None:
+        """The `deployer_obligation` slot of the sort key carries the text, not a constant.
+
+        No provider union carries even one `deployer_obligation` today, so the committed table
+        cannot tell a key that reads the text from one that returns `""` — under the latter the two
+        duties compare equal and a stable sort leaves them in whatever order the components happened
+        to be listed in. Rust iterates the declared component order while the manifest emits the
+        sorted key list, so that is precisely the divergence that would make the two disagree the
+        day a media catalog lands a licence with deployer duties.
+        """
+        families = [
+            self._family("aup-first", [{"term": "deployer_obligation", "text": "Aaa: label AI"}]),
+            self._family("dup-last", [{"term": "deployer_obligation", "text": "Zzz: no scraping"}]),
+        ]
+        components = [self._component("a", "aup-first"), self._component("b", "dup-last")]
+        expected = [
+            {"term": "deployer_obligation", "text": "Aaa: label AI"},
+            {"term": "deployer_obligation", "text": "Zzz: no scraping"},
+        ]
+        # Both component orders: a constant slot keeps both elements (they differ by value, so the
+        # dedup spares them) and fails only by ordering.
+        for keys in (["a", "b"], ["b", "a"]):
+            with self.subTest(keys=keys):
+                self.assertEqual(self._union(families, components, keys), expected)
+
+    def test_two_ceilings_sort_by_amount_numerically_not_lexicographically(self) -> None:
+        """The ceiling amount is an integer in the key, and $900 vs $1,000,000 is where that shows.
+
+        As strings `"1000000" < "900"`, as integers `900 < 1000000` — so the two orderings disagree,
+        and a key that stringified the amount would emit the larger ceiling first. No union carries
+        two ceilings today, which is why the committed manifest cannot catch it; the existing
+        boundary case pins the third slot at one shared amount and never exercises the second.
+        """
+        families = [
+            self._family(
+                "small", [{"term": "revenue_ceiling", "amount_usd": 900, "boundary": "inclusive"}]
+            ),
+            self._family(
+                "large",
+                [{"term": "revenue_ceiling", "amount_usd": 1000000, "boundary": "inclusive"}],
+            ),
+        ]
+        components = [self._component("a", "small"), self._component("b", "large")]
+        expected = [
+            {"term": "revenue_ceiling", "amount_usd": 900, "boundary": "inclusive"},
+            {"term": "revenue_ceiling", "amount_usd": 1000000, "boundary": "inclusive"},
+        ]
+        for keys in (["a", "b"], ["b", "a"]):
+            with self.subTest(keys=keys):
+                self.assertEqual(self._union(families, components, keys), expected)
+
+    def test_a_term_carries_exactly_its_declared_payload_fields(self) -> None:
+        """The field-set assertion is what makes `None` and "absent" different values.
+
+        `_term_sort_key` reads an optional address with `term.get(...)`, so a term that simply
+        omitted `contact` would sort identically to one carrying an explicit `null` — the field-set
+        check in `_validate_term` is the only place the difference is enforced, and it is what pins
+        Rust's contract that an `Option` payload serializes as an explicit null rather than being
+        skipped. Nothing else in the document would notice either shape.
+        """
+        # The contract itself: `None` is a real, required value, not an omission.
+        _validate_term({"term": "registration_required", "contact": None}, "families[0]")
+        _validate_term({"term": "attribution_required"}, "families[0]")
+
+        # Missing payload field — an emitter that skipped a `None` instead of serializing null.
+        with self.assertRaises(RuntimeError) as caught:
+            _validate_term({"term": "registration_required"}, "families[0]")
+        self.assertIn("registration_required", str(caught.exception))
+        self.assertIn("contact", str(caught.exception))
+
+        # Extra payload field — a bare variant handed a payload it does not declare, which would
+        # otherwise sort and dedup as though the extra field were not there.
+        with self.assertRaises(RuntimeError) as caught:
+            _validate_term({"term": "attribution_required", "contact": None}, "families[0]")
+        self.assertIn("attribution_required", str(caught.exception))
+        self.assertIn("contact", str(caught.exception))
+
     def test_a_null_address_sorts_before_a_named_one_and_does_not_collapse(self) -> None:
         families = [
             {
@@ -738,16 +826,40 @@ class ModelLicenseDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="sc16664-"))
         self.addCleanup(shutil.rmtree, self.root, True)
+        # A real repository, because discovery now asks git which manifests are tracked. Every
+        # setting below is local to this throwaway fixture and exists only to keep it hermetic
+        # against whatever the host's global git config says about identity, signing and hooks.
+        self._git("init", "--quiet")
+        self._git("config", "user.email", "release-tests@example.invalid")
+        self._git("config", "user.name", "release tests")
+        self._git("config", "commit.gpgsign", "false")
+        self._git("config", "core.hooksPath", str(self.root / "no-such-hooks"))
         (self.root / "release").mkdir()
         self.audio = json.loads(
             (REPOSITORY_ROOT / "release/model-weight-licenses.json").read_text(encoding="utf-8")
         )
         self._write("model-weight-licenses.json", self.audio)
+        self._commit()
+
+    def _git(self, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True)
+
+    def _commit(self) -> None:
+        self._git("add", "-A")
+        self._git("commit", "--quiet", "-m", "licence manifests")
 
     def _write(self, name: str, document: dict) -> None:
         (self.root / "release" / name).write_text(
             json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+
+    def _media_manifest(self, provider_id: str) -> dict:
+        """A media catalog's manifest: the shared component rows plus its own provider id."""
+        media = copy.deepcopy(self.audio)
+        borrowed = copy.deepcopy(self.audio["providers"][0])
+        borrowed["provider_id"] = provider_id
+        media["providers"] = [borrowed]
+        return media
 
     def test_absent_media_manifests_do_not_fail_the_build(self) -> None:
         document, sources = load_model_weight_licenses(self.root)
@@ -756,12 +868,11 @@ class ModelLicenseDiscoveryTests(unittest.TestCase):
 
     def test_a_landing_media_manifest_is_picked_up_with_no_code_edit(self) -> None:
         # A media catalog that reuses the shared component rows and registers its own provider id —
-        # the shape sc-16665/16666/16667 land. Its derived union has to be right too.
-        media = copy.deepcopy(self.audio)
-        borrowed = copy.deepcopy(self.audio["providers"][0])
-        borrowed["provider_id"] = "flux1_dev"
-        media["providers"] = [borrowed]
-        self._write("model-weight-licenses-mlx-media.json", media)
+        # the shape sc-16665/16666/16667 land. Committing the file is the whole change: no filename
+        # is enumerated anywhere in the tooling, so nothing here or in build_release.py is edited.
+        # Its derived union has to be right too.
+        self._write("model-weight-licenses-mlx-media.json", self._media_manifest("flux1_dev"))
+        self._commit()
         document, sources = load_model_weight_licenses(self.root)
         self.assertEqual(
             sources,
@@ -783,9 +894,64 @@ class ModelLicenseDiscoveryTests(unittest.TestCase):
         media = copy.deepcopy(self.audio)
         media["components"][0]["retrieved"] = "2020-01-01"
         self._write("model-weight-licenses-candle-media.json", media)
+        self._commit()
         with self.assertRaises(RuntimeError) as caught:
             load_model_weight_licenses(self.root)
         self.assertIn("2020-01-01", str(caught.exception))
+
+    def test_an_untracked_manifest_is_refused_and_the_same_file_committed_is_merged(self) -> None:
+        """The shipped table is built from what git carries, not from what the filesystem holds.
+
+        The dirty gate runs `git status --untracked-files=no` and the source archive comes from
+        `git archive <revision>`; neither can see an untracked file. Merging one would put licence
+        rows in the shipped table that appear in no commit and in no archive, while `release.dirty`
+        still read `false` and `release.revision` named a commit without them — a provenance
+        document asserting provenance it does not have.
+
+        Symmetric on purpose: the same bytes, one `git commit` apart. Refusing an untracked match
+        must not cost the property the glob exists for, so the second half is the load-bearing one —
+        landing a manifest is still *only* committing a file, with no edit to the tooling.
+        """
+        self._write("model-weight-licenses-mlx-media.json", self._media_manifest("flux1_dev"))
+
+        with self.assertRaises(RuntimeError) as caught:
+            load_model_weight_licenses(self.root)
+        message = str(caught.exception)
+        self.assertIn("release/model-weight-licenses-mlx-media.json", message)
+        self.assertIn("untracked", message)
+
+        self._commit()
+        document, sources = load_model_weight_licenses(self.root)
+        self.assertIn("release/model-weight-licenses-mlx-media.json", sources)
+        self.assertIn("flux1_dev", [row["provider_id"] for row in document["providers"]])
+
+    def test_a_mergetool_leftover_matching_the_shape_is_refused(self) -> None:
+        """`git mergetool` writes `*_BACKUP_123.json` beside the file it is merging, which matches
+        the shape. Left behind, it would contribute a *stale* copy of the rows nobody chose to
+        ship — the failure mode that makes untracked discovery worse than no discovery."""
+        stale = copy.deepcopy(self.audio)
+        stale["components"][0]["retrieved"] = "2020-01-01"
+        self._write("model-weight-licenses_BACKUP_123.json", stale)
+        with self.assertRaises(RuntimeError) as caught:
+            load_model_weight_licenses(self.root)
+        self.assertIn("model-weight-licenses_BACKUP_123.json", str(caught.exception))
+        # Refused for being untracked, not merged and then caught by the row-disagreement check —
+        # a leftover that happened to *agree* would otherwise sail through.
+        self.assertIn("untracked", str(caught.exception))
+
+    def test_discovery_outside_a_git_checkout_fails_rather_than_falling_back(self) -> None:
+        """The fallback that would keep a non-repo working is exactly the filesystem glob this
+        replaced, so there must not be one."""
+        loose = Path(tempfile.mkdtemp(prefix="sc16664-nogit-"))
+        self.addCleanup(shutil.rmtree, loose, True)
+        (loose / "release").mkdir()
+        shutil.copyfile(
+            self.root / "release/model-weight-licenses.json",
+            loose / "release/model-weight-licenses.json",
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            load_model_weight_licenses(loose)
+        self.assertIn("git checkout", str(caught.exception))
 
     def test_the_merged_document_renders_as_the_rust_emitter_would(self) -> None:
         """One source in, the committed bytes back out: today's release artifact is unchanged."""

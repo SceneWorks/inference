@@ -36,6 +36,8 @@ MODEL_LICENSES_DIRECTORY = "release"
 # a catalog landing its manifest is picked up with no edit here — and, more importantly, a catalog
 # that names its file something this module did not predict cannot be silently *skipped*, which would
 # ship a release whose licences page is missing a whole backend while every gate stayed green.
+# Discovery is intersected with git's tracked set (`discover_model_license_sources`); the shape is
+# still the only rule, so landing a manifest remains "commit the file", with no edit here.
 MODEL_LICENSES_GLOB = "model-weight-licenses*.json"
 MODEL_LICENSES_KIND = "model-weight-licenses-json"
 MODEL_LICENSES_SCHEMA = 3
@@ -509,22 +511,67 @@ def merge_model_weight_licenses(
     return document
 
 
+def _tracked_release_manifests(root: Path) -> set[Path]:
+    """Every path git has under version control in the licence-manifest directory.
+
+    Asked of git rather than derived from the shape, so this function contributes no second opinion
+    about *which* filenames count — `MODEL_LICENSES_GLOB` stays the only rule for that.
+    """
+    try:
+        listing = str(run("git", "ls-files", "-z", "--", MODEL_LICENSES_DIRECTORY, cwd=root))
+    except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError) as error:
+        raise RuntimeError(
+            f"model-weight-license discovery needs a git checkout at {root}: the manifests that "
+            "ship must be the manifests the source archive carries, which only git can answer"
+        ) from error
+    return {root / name for name in listing.split("\0") if name}
+
+
 def discover_model_license_sources(root: Path) -> list[Path]:
     """Every committed catalog licence manifest, in a stable order.
 
     Discovery is by filename shape (``MODEL_LICENSES_GLOB``) rather than by an enumerated list, so a
     catalog that lands its manifest is aggregated with no edit to this module. That is the safe
     direction: an enumerated list that did not predict a filename would *skip* that catalog, and a
-    release whose licences page is missing an entire backend would pass every gate. A stray file
-    matching the shape is merged and validated like any other, which is the correct handling for
-    something that claims to be a licence manifest.
+    release whose licences page is missing an entire backend would pass every gate. Landing a
+    manifest is therefore exactly "commit the file" (sc-16665/16666/16667) — no tooling edit.
+
+    **Committed**, not merely present. The shape match is intersected with git's tracked set because
+    the two other statements the release makes about these rows are both answered by git and neither
+    can see an untracked file: the dirty gate runs ``git status --untracked-files=no``, and the
+    source archive comes from ``git archive <revision>``. An untracked
+    ``release/model-weight-licenses-media.json`` merged off the filesystem would put licence rows in
+    the shipped table that appear in no commit and in no archive, while ``release.dirty`` still read
+    ``false`` and ``release.revision`` named a commit that does not contain them. For a document
+    whose entire purpose is provenance, rows with no provenance are the wrong failure — and a
+    ``git mergetool`` leftover such as ``model-weight-licenses_BACKUP_123.json`` matches the shape
+    too, which is how stale rows would arrive without anyone choosing them.
+
+    An untracked match is refused rather than skipped, because silently dropping it is the same
+    missing-a-whole-backend release the glob exists to prevent — the operator must decide. ``git
+    add`` is the whole escape hatch: staging makes the file tracked, and the dirty gate then reports
+    it, so the build refuses until ``--allow-dirty`` is passed and ``release.dirty`` records the
+    truth. Either route leaves the manifest describing what actually shipped.
 
     The audio manifest is required because it is committed today; the media manifests are not yet,
     and their absence must not fail a release (sc-16665/16666/16667).
     """
-    paths = sorted(
+    matches = sorted(
         (root / MODEL_LICENSES_DIRECTORY).glob(MODEL_LICENSES_GLOB), key=lambda path: path.name
     )
+    tracked = _tracked_release_manifests(root)
+    untracked = [path for path in matches if path not in tracked]
+    if untracked:
+        names = ", ".join(path.relative_to(root).as_posix() for path in untracked)
+        raise RuntimeError(
+            f"model-weight-license manifest is untracked: {names}; the shipped licence table is "
+            "built only from files git carries, because the release's dirty gate and source "
+            "archive cannot see an untracked file and would describe a table it does not contain. "
+            "Commit it (or `git add` it and pass --allow-dirty) to ship those rows, or delete it "
+            "if it is a leftover"
+        )
+    # Every match is tracked past that raise, so the glob's own order is the merge order.
+    paths = matches
     if (root / MODEL_LICENSES_SOURCE) not in paths:
         raise RuntimeError(f"model-weight-license manifest is absent: {MODEL_LICENSES_SOURCE}")
     return paths
