@@ -445,7 +445,15 @@ impl LicenseTerm {
             Self::DeployerObligation { text } => {
                 object.insert("text".into(), text.into());
             }
-            _ => {}
+            // Listed rather than a wildcard, deliberately: this is the only layer a consumer reads,
+            // so a new payload-carrying variant falling through here would serialize as a bare
+            // `{"term": …}` and collapse into another term inside one `terms` array — silently, and
+            // after `sort_key` had already separated them. Adding a variant must break this match.
+            Self::AttributionRequired
+            | Self::NoticeFileRequired
+            | Self::NonCommercialWeights
+            | Self::NonCommercialOutputs
+            | Self::GatedAccess => {}
         }
         value
     }
@@ -2576,7 +2584,8 @@ mod v3_amendment_tests {
     /// sorted list. Two distinct terms sharing a key would therefore make one of them VANISH from a
     /// consumer's disclosure — so injectivity is a disclosure-accuracy property, not a tidiness one.
     /// It matters more after sc-16898 than before it: three variants now carry a field that was not
-    /// in the key at all.
+    /// in the key at all. The same assertion runs over `to_json`, because separating two terms in
+    /// the sort order buys nothing if they serialize to the same bytes.
     #[test]
     fn sort_key_is_injective_across_every_variant() {
         // No wildcard arm: adding a `LicenseTerm` variant stops this compiling, which is the prompt
@@ -2687,6 +2696,21 @@ mod v3_amendment_tests {
                     a.sort_key() == b.sort_key(),
                     a == b,
                     "sort_key must separate {a:?} from {b:?}"
+                );
+            }
+        }
+
+        // The same property one layer down, at the only layer a consumer actually reads: a payload
+        // dropped on the way into JSON collapses two distinct terms into byte-identical objects
+        // inside one `terms` array, even though `sort_key` kept them apart. `to_json` matches
+        // exhaustively so a new variant cannot fall through, and this catches it anyway if someone
+        // reintroduces a wildcard there.
+        for a in SAMPLES {
+            for b in SAMPLES {
+                assert_eq!(
+                    a.to_json() == b.to_json(),
+                    a == b,
+                    "to_json must separate {a:?} from {b:?}"
                 );
             }
         }
