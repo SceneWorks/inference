@@ -7,9 +7,10 @@
 //!
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
 //! converter packs the **DiT `transformer/` block Linears**, every group-quantizable T5-XXL 2-D
-//! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer and uses q8 auxiliaries because
-//! hosted image calibration rejects all-q4 quality; both routes load without a full dense auxiliary
-//! transient. A packed tier is loaded with `Quant::None` (the
+//! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer
+//! and uses q8 T5 primaries plus q4-packed T5 residuals because hosted image calibration rejects
+//! single-term q4 and q8 quality; both routes load without a full dense auxiliary transient. A
+//! packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
 //! tier is the mirrored source, loaded directly.
 //!
@@ -130,6 +131,13 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
             config["quantization"]["group_size"], expected_group_size,
             "{component} packed group-size provenance"
         );
+        if component == "text_encoder" {
+            assert_eq!(
+                config["quantization"]["residual_bits"],
+                mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
+                "T5 progressive residual bit-width provenance"
+            );
+        }
         let safetensors = std::fs::read_dir(out.join(component))
             .expect("packed component dir")
             .filter_map(|entry| entry.ok())
@@ -169,6 +177,7 @@ fn exact_f32(a: &[f32], b: &[f32]) -> bool {
 #[derive(Clone, Copy)]
 enum T5ProbePolicy {
     Dense,
+    Q8Q4Progressive,
     Q8Linears,
     Q8Except { block: usize, sublayer: T5Sublayer },
 }
@@ -188,6 +197,13 @@ fn t5_probe_outputs(
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     match policy {
         T5ProbePolicy::Dense => {}
+        T5ProbePolicy::Q8Q4Progressive => t5
+            .quantize_progressive(
+                8,
+                mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
+                t5_group_size_env(),
+            )
+            .expect("load-time progressive T5 quantization"),
         T5ProbePolicy::Q8Linears => t5
             .quantize_linears(8)
             .expect("load-time T5 Linear quantization"),
@@ -258,8 +274,12 @@ fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>
     let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     if let Some(bits) = quantize_at_load {
-        t5.quantize_with_group_size(bits, t5_group_size_env())
-            .expect("load-time complete T5 quantization");
+        t5.quantize_progressive(
+            bits,
+            mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
+            t5_group_size_env(),
+        )
+        .expect("load-time complete progressive T5 quantization");
     }
     let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
         &tokenizer,
@@ -484,6 +504,11 @@ fn t5_precision_sensitivity_sweep() {
         T5ProbePolicy::Dense,
     );
     let candidates = [
+        (
+            "q8-plus-q4-packed-residual",
+            T5ProbePolicy::Q8Q4Progressive,
+            None,
+        ),
         ("q8-linears", T5ProbePolicy::Q8Linears, None),
         (
             "q8-except-block0-attention",
@@ -620,6 +645,12 @@ fn packed_auxiliaries_match_load_time_quantization() {
         "T5 attention/FFN surface must be stored as packed codes"
     );
     assert!(packed_weights.get(&format!("{t5_probe}.scales")).is_some());
+    assert!(
+        packed_weights
+            .get(&format!("{t5_probe}.residual.scales"))
+            .is_some(),
+        "T5 progressive correction must also be stored as packed codes"
+    );
     let packed_weights =
         mlx_gen::weights::Weights::from_dir(out.join("vae")).expect("packed VAE weights");
     let vae_probe = "decoder.mid_block.attentions.0.to_q";
@@ -681,11 +712,12 @@ fn packed_auxiliaries_match_load_time_quantization() {
     );
 
     println!(
-        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
         bits,
         auxiliary_bits,
         auxiliary_bits,
+        mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
         t5_group_size_env(),
         t5_all_positions_cosine,
         t5_active_span_cosine,
@@ -757,11 +789,12 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         gib(baseline_peak)
     );
     println!(
-        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
         id,
         bits,
         auxiliary_bits,
         auxiliary_bits,
+        mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
         t5_group_size_env(),
         minimum_cosine,
         maximum_mae,

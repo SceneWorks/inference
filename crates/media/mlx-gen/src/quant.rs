@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path};
 
-use mlx_rs::ops::quantize;
+use mlx_rs::ops::{dequantize, quantize, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
@@ -342,6 +342,56 @@ pub fn quantize_map(
     Ok(out)
 }
 
+/// As [`quantize_map`], but encode each selected weight as a primary affine pack plus a second
+/// affine pack of its reconstruction residual. Both terms stay Q4/Q8 on disk and at runtime; the
+/// residual pack recovers most of the primary pack's error without ever materializing a dense
+/// weight during loading. The correction tensors use the `{base}.residual.{weight,scales,biases}`
+/// namespace so loaders that do not opt into progressive packing continue to read the primary term
+/// exactly as before.
+pub fn quantize_map_with_residual(
+    map: HashMap<String, Array>,
+    bits: i32,
+    residual_bits: i32,
+    group_size: i32,
+    is_target: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Array>> {
+    if !matches!(bits, 4 | 8) || !matches!(residual_bits, 4 | 8) {
+        return Err(crate::Error::Msg(format!(
+            "progressive quant: primary and residual bits must be 4 or 8, got {bits} + {residual_bits}"
+        )));
+    }
+    if !matches!(group_size, 32 | 64 | 128) {
+        return Err(crate::Error::Msg(format!(
+            "progressive quant: group size must be 32, 64, or 128, got {group_size}"
+        )));
+    }
+    let mut out = HashMap::with_capacity(map.len() * 2);
+    for (k, v) in map {
+        let base = k.strip_suffix(".weight").filter(|b| is_target(b));
+        let packable = base.is_some()
+            && v.shape().len() == 2
+            && v.shape()[1] % group_size == 0
+            && v.shape()[1] >= group_size;
+        if let (Some(base), true) = (base, packable) {
+            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
+            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
+            let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
+            let residual = subtract(&wbf16, &restored)?;
+            let (residual_wq, residual_scales, residual_biases) =
+                quantize(&residual, group_size, residual_bits)?;
+            out.insert(format!("{base}.weight"), wq);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+            out.insert(format!("{base}.residual.weight"), residual_wq);
+            out.insert(format!("{base}.residual.scales"), residual_scales);
+            out.insert(format!("{base}.residual.biases"), residual_biases);
+        } else {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
+}
+
 // ============================================================================================
 // Turnkey-assembly glue — the Group-B converter tail the provider `convert.rs` modules used to
 // clone verbatim (sc-9108 / F-045). Each provider still owns its per-component pack predicates and
@@ -439,6 +489,22 @@ pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progressive_quant_rejects_invalid_geometry_before_touching_weights() {
+        assert!(
+            quantize_map_with_residual(HashMap::new(), 3, 4, 64, |_| true).is_err(),
+            "primary width must be Q4 or Q8"
+        );
+        assert!(
+            quantize_map_with_residual(HashMap::new(), 8, 3, 64, |_| true).is_err(),
+            "residual width must be Q4 or Q8"
+        );
+        assert!(
+            quantize_map_with_residual(HashMap::new(), 8, 4, 0, |_| true).is_err(),
+            "group size zero must not reach modulo arithmetic"
+        );
+    }
 
     fn marker_fixture(body: Option<&str>) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(

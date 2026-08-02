@@ -9,8 +9,9 @@
 //! * The transformer's own `x_embedder` / `context_embedder` / top-level `proj_out` and the entire
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
-//! * T5 packs every group-quantizable 2-D weight, including its token embedding and shared relative-
-//!   position bias. RMSNorm scales remain dense because affine quantization does not target vectors.
+//! * T5 progressively packs every group-quantizable 2-D weight as a primary Q4/Q8 term plus a
+//!   Q4-packed reconstruction residual, including its token embedding and shared relative-position
+//!   bias. RMSNorm scales remain dense because affine quantization does not target vectors.
 //! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
@@ -25,7 +26,8 @@ use std::path::Path;
 use mlx_rs::Array;
 
 use mlx_gen::quant::{
-    copy_dir, copy_turnkey_assets, quantize_map, save_map, write_quantized_config,
+    copy_dir, copy_turnkey_assets, quantize_map, quantize_map_with_residual, save_map,
+    write_quantized_config,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -38,6 +40,8 @@ use crate::quant::GROUP_SIZE;
 /// changes.
 const TRANSFORMER_FILE: &str = "diffusion_pytorch_model.safetensors";
 const AUXILIARY_FILE: &str = "model.safetensors";
+/// The second-stage packed correction applied to Chroma's Q8 T5 surface.
+pub const T5_RESIDUAL_BITS: i32 = 4;
 
 // ============================================================================================
 // Pack predicate (operates on the **base** = the on-disk key minus its `.weight`).
@@ -144,10 +148,49 @@ fn quantize_component(
     write_quantized_config(src, dst, bits, group_size)
 }
 
+fn quantize_t5_component(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
+    if !src.is_dir() {
+        return Err(Error::Msg(format!(
+            "chroma convert: source snapshot has no {} component",
+            src.display()
+        )));
+    }
+    std::fs::create_dir_all(dst)?;
+    let map = quantize_map_with_residual(
+        load_component_map(src)?,
+        bits,
+        T5_RESIDUAL_BITS,
+        group_size,
+        is_t5_target,
+    )?;
+    save_map(&dst.join(AUXILIARY_FILE), &map)?;
+    write_quantized_config(src, dst, bits, group_size)?;
+    let config_path = dst.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path)?).map_err(|error| {
+            Error::Msg(format!(
+                "chroma convert: parse {} after quantization: {error}",
+                config_path.display()
+            ))
+        })?;
+    config["quantization"]["residual_bits"] = serde_json::json!(T5_RESIDUAL_BITS);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).map_err(|error| {
+            Error::Msg(format!(
+                "chroma convert: serialize {}: {error}",
+                config_path.display()
+            ))
+        })?,
+    )?;
+    Ok(())
+}
+
 /// Assemble a full pre-quantized turnkey Chroma snapshot in `dst_root`: pack the DiT `transformer/`
 /// block Linears into one `transformer/diffusion_pytorch_model.safetensors` (+ annotated
-/// `config.json`), pack T5 into `text_encoder/model.safetensors`, pack the VAE attention into
-/// `vae/model.safetensors`, and copy the tokenizer / scheduler / `model_index.json` / license. The
+/// `config.json`), progressively pack T5 into `text_encoder/model.safetensors`, pack the VAE
+/// attention into `vae/model.safetensors`, and copy the tokenizer / scheduler / `model_index.json` /
+/// license. The
 /// result loads via
 /// [`crate::model::load_chroma`] (packed weights auto-detect) with no dense transient. `bits` = 4 (Q4
 /// tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion — mirror it; see
@@ -238,13 +281,11 @@ fn prequantize_turnkey_into(
     save_map(&tr_dst.join(TRANSFORMER_FILE), &map)?;
     write_quantized_config(&tr_src, &tr_dst, bits, GROUP_SIZE)?;
 
-    quantize_component(
+    quantize_t5_component(
         &src_root.join("text_encoder"),
         &dst_root.join("text_encoder"),
-        AUXILIARY_FILE,
         bits,
         t5_group_size,
-        is_t5_target,
     )?;
     quantize_component(
         &src_root.join("vae"),
@@ -268,7 +309,7 @@ fn prequantize_turnkey_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::{eq, quantize};
+    use mlx_rs::ops::{dequantize, eq, quantize, subtract};
     use mlx_rs::{Array, Dtype};
 
     #[test]
@@ -422,6 +463,48 @@ mod tests {
                 out.get(&format!("{base}.biases")).unwrap(),
                 &expected_biases
             ));
+        }
+    }
+
+    #[test]
+    fn t5_progressive_pack_matches_two_stage_affine_quantization() {
+        let base = "encoder.block.0.layer.1.DenseReluDense.wi_0";
+        let weight = Array::from_slice(
+            &(0..64 * 128)
+                .map(|i| ((i as f32) * 0.017).cos())
+                .collect::<Vec<_>>(),
+            &[64, 128],
+        );
+        let wbf16 = weight.as_dtype(Dtype::Bfloat16).unwrap();
+        let (primary_weight, primary_scales, primary_biases) =
+            quantize(&wbf16, GROUP_SIZE, 8).unwrap();
+        let restored = dequantize(
+            &primary_weight,
+            &primary_scales,
+            &primary_biases,
+            GROUP_SIZE,
+            8,
+        )
+        .unwrap();
+        let residual = subtract(&wbf16, &restored).unwrap();
+        let (residual_weight, residual_scales, residual_biases) =
+            quantize(&residual, GROUP_SIZE, T5_RESIDUAL_BITS).unwrap();
+        let mut map = HashMap::new();
+        map.insert(format!("{base}.weight"), weight);
+        let out =
+            quantize_map_with_residual(map, 8, T5_RESIDUAL_BITS, GROUP_SIZE, is_t5_target).unwrap();
+        for (suffix, expected) in [
+            ("weight", &primary_weight),
+            ("scales", &primary_scales),
+            ("biases", &primary_biases),
+            ("residual.weight", &residual_weight),
+            ("residual.scales", &residual_scales),
+            ("residual.biases", &residual_biases),
+        ] {
+            assert!(
+                byte_equal(out.get(&format!("{base}.{suffix}")).unwrap(), expected),
+                "progressive tensor mismatch: {suffix}"
+            );
         }
     }
 

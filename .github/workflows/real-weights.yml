@@ -33,7 +33,7 @@ on:
         required: false
         default: ""
       chroma_t5_group_size:
-        description: T5 affine group size for Chroma auxiliary validation
+        description: T5 primary/residual affine group size for Chroma auxiliary validation
         type: choice
         required: false
         default: "64"
@@ -48,9 +48,10 @@ concurrency:
 
 jobs:
   # SC-16462: build the complete packed Chroma tier from the exact currently-shipped bf16 source,
-  # then prove T5/VAE packed-vs-load-time identity, component quality, T5 residency, and a coherent
-  # end-to-end render for base/HD/Flash at q4 and q8. Publication is a separate, explicit mode of the
-  # same green lane; it fails closed on the expected current Hub revision and runner-local HF auth.
+  # then prove progressive T5/VAE packed-vs-load-time identity, component quality, T5 residency,
+  # and a coherent end-to-end render for base/HD/Flash at q4 and q8. Publication is a separate,
+  # explicit mode of the same green lane; it fails closed on the expected current Hub revision and
+  # runner-local HF auth.
   mlx-chroma-auxiliary:
     name: Chroma packed auxiliaries (${{ matrix.model }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary'
