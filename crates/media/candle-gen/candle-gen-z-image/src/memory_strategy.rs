@@ -30,7 +30,7 @@ pub(crate) const CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
-    "z-image-cuda-base-control-host-decode-streamed-blocks-v1";
+    "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
 pub(crate) fn generation_memory(
     contract: &MemoryProviderContract,
@@ -758,6 +758,14 @@ mod tests {
         for id in ["z_image_turbo_control", "z_image_control"] {
             let contract = control_contract(id, &spec()).unwrap();
             assert!(contract.conformance_errors().is_empty());
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                CONTROL_CALIBRATION_FINGERPRINT
+            );
+            assert_ne!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                CALIBRATION_FINGERPRINT
+            );
             assert_eq!(contract.load_shape, LoadShape::DeferredMaterialization);
             assert!(contract
                 .strategies
