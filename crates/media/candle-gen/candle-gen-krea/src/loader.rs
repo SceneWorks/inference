@@ -100,14 +100,46 @@ pub struct Weights {
 impl Weights {
     /// mmap every `*.safetensors` in `dir` (sorted; later files win on name collision), reading the
     /// component `config.json`'s `quantization` block (if any) for the packed-tier path.
+    ///
+    /// Packed q4/q8 projections use content-addressed, file-backed Candle-format sidecars. A writable
+    /// component keeps those artifacts beside the model; a read-only component automatically uses the
+    /// shared per-user external cache documented by [`PackedWeightSidecars`]. A complete valid cache is
+    /// reused read-only without creating or acquiring its preparation lock.
     pub fn from_dir(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        Self::from_dir_impl(dir, device, dtype, None)
+    }
+
+    /// Load a component while choosing the non-model cache root used when `dir` is read-only.
+    ///
+    /// This gives embedders an explicit disk-placement policy instead of requiring writes beside a
+    /// caller-provisioned snapshot or relying on `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`.
+    pub fn from_dir_with_external_cache_root(
+        dir: &Path,
+        device: &Device,
+        dtype: DType,
+        external_cache_root: &Path,
+    ) -> Result<Self> {
+        Self::from_dir_impl(dir, device, dtype, Some(external_cache_root))
+    }
+
+    fn from_dir_impl(
+        dir: &Path,
+        device: &Device,
+        dtype: DType,
+        external_cache_root: Option<&Path>,
+    ) -> Result<Self> {
         let files = candle_gen::sorted_safetensors(dir, "krea")
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
         // SAFETY: read-only mmap of weight files; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
         let packed = read_packed_config(dir)?;
         let sidecars = packed
-            .map(|cfg| PackedWeightSidecars::prepare(&st, dir, cfg, device))
+            .map(|cfg| match external_cache_root {
+                Some(root) => PackedWeightSidecars::prepare_with_external_cache_root(
+                    &st, dir, cfg, device, root,
+                ),
+                None => PackedWeightSidecars::prepare(&st, dir, cfg, device),
+            })
             .transpose()?;
         Ok(Self {
             st,
@@ -839,7 +871,7 @@ fn detect_native_prefix(st: &MmapedSafetensors) -> String {
 /// packed snapshot surfaces instead of loading the wrong (dense) tier with no diagnostic (sc-9426,
 /// F-073 sibling — the `component_is_packed` twin in flux2). Mirrors boogu's `read_packed_config`
 /// (sc-9410) and z-image's `component_is_packed` (sc-9408).
-fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
+pub(crate) fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     let path = dir.join("config.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -1198,6 +1230,64 @@ mod tests {
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// F-189: a caller-provisioned packed Krea component may be an immutable snapshot. The loader
+    /// keeps the packed projection active and places its file-backed Candle representation under the
+    /// configured external cache root instead of requiring a write beside the model.
+    #[cfg(unix)]
+    #[test]
+    fn packed_krea_loads_from_a_cold_read_only_snapshot() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (128usize, 256usize);
+        let (wq, scales, biases, grid) = q4_packed(out_dim, in_dim);
+        let map = HashMap::from([
+            ("attn.to_q.weight".to_owned(), wq),
+            ("attn.to_q.scales".to_owned(), scales),
+            ("attn.to_q.biases".to_owned(), biases),
+        ]);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sc16587_krea_read_only_{}_{nonce}",
+            std::process::id()
+        ));
+        let component = root.join("snapshot/transformer");
+        let external = root.join("external-cache");
+        write_component(&component, map, true);
+        // Keep this branch deterministic under root-capable test runners; chmod is the production
+        // condition, while the regular-file obstruction prevents privileged writes at the cache path.
+        std::fs::write(
+            component.join(".candle-device-format-v1"),
+            b"immutable snapshot entry",
+        )?;
+        std::fs::set_permissions(&component, std::fs::Permissions::from_mode(0o555))?;
+        let result =
+            Weights::from_dir_with_external_cache_root(&component, &dev, DType::F32, &external);
+        std::fs::set_permissions(&component, std::fs::Permissions::from_mode(0o755))?;
+
+        let weights = result?;
+        let sidecars = weights
+            .packed_sidecars()
+            .expect("packed Krea component prepares sidecars");
+        assert!(sidecars.cache_dir().starts_with(&external));
+        assert_eq!(sidecars.created_count(), 1);
+        let packed = linear_detect(&weights, "attn.to_q", false)?;
+        assert!(
+            packed.is_packed(),
+            "read-only load must retain packed behavior"
+        );
+        let dense = QLinear::dense(Linear::new(grid, None));
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        assert!(cosine(&packed.forward(&x)?, &dense.forward(&x)?) > 0.99999);
+
+        drop(weights);
+        std::fs::remove_dir_all(root).ok();
         Ok(())
     }
 

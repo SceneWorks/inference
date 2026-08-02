@@ -47,6 +47,7 @@ const DEFAULT_FRAMES: u32 = 81;
 /// fixed Self-Forcing few-step sampler; a rolling causal KV cache).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "krea_realtime",
@@ -114,7 +115,9 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            // z16 VAE stride 8 × the Wan DiT's 2×2 latent patch: explicit dimensions must land
+            // on a 16px grid or integer division would silently render a smaller clip.
+            size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
         },
     }
 }
@@ -587,6 +590,48 @@ mod tests {
             "descriptor must be conformant: {:?}",
             mlx_gen::gen_core::registry::model_descriptor_errors(&d)
         );
+    }
+
+    /// Krea's z16 VAE reduces pixels by 8 and the DiT then packs 2x2 latent patches, so an explicit
+    /// request must land on a 16px grid. Exercise the published descriptor and the loaded-provider
+    /// preflight: neither path may accept 644x484 and silently render 640x480.
+    #[test]
+    fn explicit_off_grid_size_is_refused() {
+        let request = |width, height| GenerationRequest {
+            width,
+            height,
+            count: 1,
+            ..Default::default()
+        };
+        let off_grid = request(644, 484);
+
+        let advertised = descriptor()
+            .capabilities
+            .validate_request(MODEL_ID, &off_grid)
+            .expect_err("the descriptor must reject an explicit off-grid size");
+        assert!(
+            matches!(advertised, mlx_gen::gen_core::Error::Msg(_)),
+            "an off-grid request is a typed validation error, got: {advertised:?}"
+        );
+        let advertised_message = advertised.to_string();
+        assert!(
+            advertised_message.contains("multiples of 16")
+                && advertised_message.contains("644×484"),
+            "the rejection must name the 16px grid and requested size, got: {advertised_message}"
+        );
+
+        let provider = unloaded();
+        let provider_error = Generator::validate(&provider, &off_grid)
+            .expect_err("the provider preflight must reject an explicit off-grid size");
+        assert_eq!(provider_error.to_string(), advertised_message);
+
+        let on_grid = request(640, 480);
+        descriptor()
+            .capabilities
+            .validate_request(MODEL_ID, &on_grid)
+            .expect("a representative on-grid size remains advertised");
+        Generator::validate(&provider, &on_grid)
+            .expect("a representative on-grid size remains accepted by provider preflight");
     }
 
     /// S19 (sc-15203): the engine advertises the **three tiers** it actually ships — Q4 and Q8 as

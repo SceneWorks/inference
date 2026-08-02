@@ -704,7 +704,7 @@ pub const ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small Music © Stability AI"),
+    attribution: Some("Stable Audio 3 Small Music © Stability AI — Powered by Stability AI"),
     commercial_use: false,
     restriction: Some(
         "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
@@ -724,7 +724,7 @@ pub const SFX_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLic
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small SFX © Stability AI"),
+    attribution: Some("Stable Audio 3 Small SFX © Stability AI — Powered by Stability AI"),
     commercial_use: false,
     restriction: Some(
         "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
@@ -744,7 +744,7 @@ pub const MEDIUM_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::Weight
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE.md",
-    attribution: Some("Stable Audio 3 Medium © Stability AI"),
+    attribution: Some("Stable Audio 3 Medium © Stability AI — Powered by Stability AI"),
     commercial_use: false,
     restriction: Some(
         "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
@@ -769,7 +769,7 @@ pub const MUSIC_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::We
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small Music Base © Stability AI"),
+    attribution: Some("Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI"),
     commercial_use: false,
     restriction: Some(
         "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
@@ -789,7 +789,7 @@ pub const SFX_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::Weig
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small SFX Base © Stability AI"),
+    attribution: Some("Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI"),
     commercial_use: false,
     restriction: Some(
         "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
@@ -809,7 +809,7 @@ pub const MEDIUM_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::W
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
-    attribution: Some("Stable Audio 3 Medium Base © Stability AI"),
+    attribution: Some("Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI"),
     commercial_use: false,
     restriction: Some(
         "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
@@ -1010,6 +1010,7 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
 /// tracked with the other additive descriptor gaps as `sc-15041`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: variant.model_id(),
         family: "stable_audio_3",

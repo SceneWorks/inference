@@ -7,7 +7,7 @@
 //! trait split (which breaks on multi-modal models).
 
 use crate::media::{AudioChunk, AudioTrack, Image};
-use crate::runtime::{CancelFlag, Progress, Quant};
+use crate::runtime::{CancelFlag, PreviewSink, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
     default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
@@ -435,6 +435,19 @@ pub struct GenerationRequest {
 
     // --- Control ---
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink: a supporting engine emits a small linear latent→RGB
+    /// approximation of the developing image on each denoise evaluation, so a consumer UI can
+    /// render the image developing instead of a bare progress bar. The inert
+    /// [`PreviewSink::default`] costs a supporting engine one
+    /// [`is_active`](PreviewSink::is_active) check per evaluation and nothing else — the
+    /// projection is skipped entirely, so a request that does not ask for previews is
+    /// byte-for-byte unaffected.
+    ///
+    /// A request **field** (the [`CancelFlag`] pattern), deliberately not a [`Progress`] variant:
+    /// `Progress` stays `Copy` and no exhaustive match downstream changes. Support is per-engine
+    /// and opt-in — an engine that never emits simply never calls it, which is indistinguishable
+    /// from an inert sink at the consumer. See [`PreviewSink`] for the frame contract.
+    pub preview: PreviewSink,
 }
 
 /// Quality-preserving execution levers for a single generation.
@@ -714,6 +727,7 @@ impl Default for GenerationRequest {
             audio: None,
             phases: None,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -854,6 +868,7 @@ impl GenerationRequest {
             use_pid: _,
             memory: _,
             cancel: _,
+            preview: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -1494,6 +1509,34 @@ pub struct ModelDescriptor {
     /// [`LoadSpec::components`](crate::LoadSpec::components) (e.g. chatterbox `["perth",
     /// "voice_embedding"]`).
     pub required_components: &'static [&'static str],
+    /// **Which control signals this model admits**, weights-free — the descriptor-level twin of
+    /// [`ControlBranch::accepted_control_kinds`](crate::control::ControlBranch::accepted_control_kinds).
+    ///
+    /// [`capabilities.conditioning`](Capabilities::conditioning) says *whether* a model takes
+    /// [`Conditioning::Control`] but never *which kind*, and the kind policy lived only on the
+    /// loaded control struct (`&self` on a `ControlBranch`). A consumer planning a render therefore
+    /// could not tell a pose-only branch from a pose/canny/depth union without loading multi-GB
+    /// weights, and a depth request aimed at a pose-only branch failed inside `generate` — after
+    /// residency — instead of before it.
+    ///
+    /// The distinction between the two `None`-ish answers is the point, because the permissive
+    /// answer is the dangerous one:
+    ///
+    /// - `None` — **not advertised**. The model may still reject kinds at render time; a consumer
+    ///   must treat control kind as unchecked. This is the `Default` for a reason: a model that
+    ///   forgot to declare must not read as "accepts anything".
+    /// - `Some(`[`Any`](crate::control::AcceptedControlKinds::Any)`)` — deliberately
+    ///   input-agnostic, the Fun-Controlnet-Union position (pose/canny/depth share one VAE-encoded
+    ///   path and differ only by the host-side preprocessor).
+    /// - `Some(`[`Only`](crate::control::AcceptedControlKinds::Only)`(..))` — exactly these kinds;
+    ///   anything else is rejected rather than silently coerced.
+    ///
+    /// A [`ControlBranch`](crate::control::ControlBranch) implementor should declare it here rather
+    /// than override the trait method: the trait's default **reads this field**, so the descriptor
+    /// is the single source of truth and the advertised policy cannot drift from the enforced one.
+    ///
+    /// [`Conditioning::Control`]: Conditioning::Control
+    pub control_kinds: Option<crate::control::AcceptedControlKinds>,
 }
 
 /// How a model's advertised size range is enforced.

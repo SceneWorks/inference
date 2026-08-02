@@ -18,10 +18,10 @@ use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, Error, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor,
-    StagedHeavy, WeightsSource,
+    require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, StagedHeavy,
+    WeightsSource,
 };
 use mlx_rs::Dtype;
 use std::path::Path;
@@ -44,6 +44,7 @@ pub const MODEL_ID: &str = "z_image_turbo_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: Some(crate::model_base_control::accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
         family: "z-image",
@@ -101,6 +102,7 @@ pub struct ZImageTurboControl {
     /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
     /// Request-scoped residency shared with the base control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
@@ -309,8 +311,10 @@ const PRECISION_MSG: &str =
 /// `load_control_residency` builder.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
+    let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImageTurboControl {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        loaded_tier,
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -325,10 +329,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 impl ControlBranch for ZImageTurboControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        crate::model_base_control::accepted_kinds()
     }
 }
 
@@ -535,14 +535,19 @@ impl Generator for ZImageTurboControl {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_tier, context)
     }
 
     fn begin_memory_strategy_request(
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.loaded_tier,
+            context,
+        )
     }
 }
 

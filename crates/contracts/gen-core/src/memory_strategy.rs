@@ -90,22 +90,22 @@
 //!
 //! ## What that leaves undeclared, stated rather than glossed
 //!
-//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization — which ships today — does have
-//! a host cost, and this decision does **not** surface its size. Its per-window conversion allocates
-//! anonymous host memory per projection and frees it again: on the order of the block's unpacked codes
-//! for q4, and for q8 a **full dense f32 grid** (`repack::dequant_mlx_q8_gs`), which for a
-//! 3840 × 15360 projection is a few hundred MiB. Those are transients, not held for the request, and
-//! they are **not measured** — SC-15791 states plainly that q8 host memory is unverified. So on a
-//! low-RAM host a rung-4 Candle selection today carries an unquantified host transient that no gate
-//! sees. That is a consequence of the non-conforming realization, and SC-16096 both removes the
-//! conversion and owes the host measurement; it is recorded here so it is not mistaken for zero.
+//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization does have a host cost, and this
+//! decision does **not** surface its size. The original packed Candle realization converted each
+//! window from MLX-affine source tensors, allocating anonymous host memory per projection: on the
+//! order of the block's unpacked codes for q4, and for q8 a **full dense f32 grid**
+//! (`repack::dequant_mlx_q8_gs`), which for a 3840 × 15360 projection is a few hundred MiB. Those
+//! transients were not held for the request and SC-15791 did not measure them. SC-16096 replaced that
+//! Krea/Lens path with content-addressed device-format sidecars; SC-16510 completed the same transition
+//! for streamed Z-Image blocks. No current media provider declares `HostFormatConversion`, but the
+//! variant remains so a future converting realization must describe itself honestly rather than claim
+//! a device-format transfer.
 //!
 //! **Revisit trigger — deliberately broad enough to catch that case.** The axis is owed if a
 //! realization is measured to need host memory proportional to the model that a fit gate would have to
 //! account for: whether it is held for the request or transient, reclaimable or not, and whether or not
-//! a device-format alternative exists. SC-16096 must raise it rather than absorb it. What is *not* owed
-//! is an axis built ahead of that measurement, on the strength of a figure derived for a fix nobody has
-//! written.
+//! a device-format alternative exists. A provider that crosses that threshold must raise the contract
+//! question rather than absorb it. What is *not* owed is an axis built ahead of that measurement.
 
 use crate::{
     weightsmeta::safetensors_path_bytes, AdapterSpec, Error, GenerationRequest, LoadShape,
@@ -1396,28 +1396,71 @@ fn validate_pid_decode_routes(
     }
 }
 
-/// The shared safety behavior for an adopted provider with no additional admission rules.
+/// The shared safety pipeline for an adopted provider.
 ///
-/// Provider registrations can point at this function without loading a [`Generator`](crate::Generator).
-/// Providers with extra safety rules expose their own function with the same signature.
-pub fn default_memory_strategy_safety_check(
+/// `loaded_tier` binds a weights-free registration or loaded generator to the numeric tier it
+/// actually loaded. `route_gate` is the only provider-owned part of the standard pipeline and runs
+/// after the shared handshake, tier, and selection checks but before the shared budget check.
+pub fn standard_memory_strategy_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+    loaded_tier: Option<MemoryNumericTier>,
+    route_gate: Option<&dyn Fn() -> Result<()>>,
 ) -> MemorySafetyDecision {
-    match contract.validate_selection(&context.selection) {
-        Ok(()) if context.budget.fits(context.predicted_peak_bytes) => MemorySafetyDecision::Accept,
-        Ok(()) => MemorySafetyDecision::Reject {
+    let reject = |reason| MemorySafetyDecision::Reject { reason };
+    if let Some(calibration) = contract.calibration.as_ref() {
+        if context.calibration_abi != calibration.abi
+            || context.calibration_fingerprint != calibration.fingerprint
+        {
+            return reject(format!(
+                "{}: calibration handshake mismatch",
+                contract.provider_id
+            ));
+        }
+    } else if context.selection.strategy.is_optimized() {
+        return reject(format!(
+            "{}: optimized memory strategy {:?} requires a calibration identity",
+            contract.provider_id, context.selection.strategy
+        ));
+    }
+    if let Some(loaded_tier) = loaded_tier {
+        if context.selection.tier != loaded_tier {
+            return reject(format!(
+                "{}: selected tier {:?} does not match loaded tier {:?}",
+                contract.provider_id, context.selection.tier, loaded_tier
+            ));
+        }
+    }
+    if let Err(error) = contract.validate_selection(&context.selection) {
+        return reject(error.to_string());
+    }
+    if let Some(route_gate) = route_gate {
+        if let Err(error) = route_gate() {
+            return reject(error.to_string());
+        }
+    }
+    if !context.budget.fits(context.predicted_peak_bytes) {
+        return MemorySafetyDecision::Reject {
             reason: format!(
                 "{}: predicted peak {} exceeds effective budget {}",
                 contract.provider_id,
                 context.predicted_peak_bytes,
                 context.budget.effective_bytes()
             ),
-        },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        };
     }
+    MemorySafetyDecision::Accept
+}
+
+/// The shared safety behavior for an adopted provider with no additional admission rules.
+///
+/// Provider registrations can point at this function without loading a [`Generator`](crate::Generator).
+/// Providers with extra safety rules delegate to [`standard_memory_strategy_safety_check`].
+pub fn default_memory_strategy_safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    standard_memory_strategy_safety_check(contract, context, None, None)
 }
 
 /// Registry adapter for [`default_memory_strategy_safety_check`].
@@ -1425,11 +1468,20 @@ pub fn default_memory_strategy_safety_check(
 /// The load specification is part of the weights-free registration callback so providers whose
 /// admission rules depend on the requested tier can reproduce their loaded generator's check.
 pub fn default_registered_memory_strategy_safety_check(
-    _spec: &crate::LoadSpec,
+    spec: &crate::LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    default_memory_strategy_safety_check(contract, context)
+    standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        }),
+        None,
+    )
 }
 
 fn validate_ranges(capability: &MemoryStrategyCapability, errors: &mut Vec<String>) {
@@ -2128,6 +2180,128 @@ mod tests {
         }
     }
 
+    fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunContext {
+        let calibration = contract.calibration.as_ref().expect("calibration");
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 512,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn default_safety_check_rejects_mutated_calibration_handshake() {
+        let contract = adopted_contract();
+        let context = admitted_context(&contract);
+        assert_eq!(
+            default_memory_strategy_safety_check(&contract, &context),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut wrong_fingerprint = context.clone();
+        wrong_fingerprint.calibration_fingerprint.push_str("-stale");
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &wrong_fingerprint),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+
+        let mut wrong_abi = context;
+        wrong_abi.calibration_abi += 1;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &wrong_abi),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("calibration handshake mismatch")
+        ));
+    }
+
+    #[test]
+    fn standard_safety_check_runs_tier_route_and_budget_gates() {
+        let contract = adopted_contract();
+        let context = admitted_context(&contract);
+        let loaded_tier = context.selection.tier;
+        assert_eq!(
+            standard_memory_strategy_safety_check(&contract, &context, Some(loaded_tier), None),
+            MemorySafetyDecision::Accept
+        );
+        let matching_spec = crate::LoadSpec::new(crate::WeightsSource::Dir("/weights".into()))
+            .with_quant(Quant::Q4);
+        assert_eq!(
+            default_registered_memory_strategy_safety_check(&matching_spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        let wrong_spec = matching_spec.with_quant(Quant::Q8);
+        assert!(matches!(
+            default_registered_memory_strategy_safety_check(&wrong_spec, &contract, &context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+
+        let mut wrong_tier = context.clone();
+        wrong_tier.selection.tier.quant = Some(Quant::Q8);
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &wrong_tier,
+                Some(loaded_tier),
+                None
+            ),
+            MemorySafetyDecision::Reject { reason } if reason.contains("does not match loaded tier")
+        ));
+
+        let route_gate = || Err(Error::Unsupported("route refused".to_owned()));
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &context,
+                Some(loaded_tier),
+                Some(&route_gate)
+            ),
+            MemorySafetyDecision::Reject { reason } if reason.contains("route refused")
+        ));
+
+        let mut over_budget = context;
+        over_budget.predicted_peak_bytes = 1025;
+        assert!(matches!(
+            standard_memory_strategy_safety_check(
+                &contract,
+                &over_budget,
+                Some(loaded_tier),
+                None
+            ),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("predicted peak 1025 exceeds effective budget 1024")
+        ));
+    }
+
     fn pid_contract() -> MemoryProviderContract {
         let mut contract = adopted_contract();
         contract.strategies[2].parameters.decode_tile_edges = vec![512, 2048];
@@ -2201,6 +2375,32 @@ mod tests {
                 assert_eq!(support, &MemoryStrategySupport::Missing);
             }
         }
+
+        let mut context = admitted_context(&adopted_contract());
+        assert_eq!(
+            default_memory_strategy_safety_check(&contract, &context),
+            MemorySafetyDecision::Accept,
+            "calibration-free compatibility contracts preserve resident admission"
+        );
+        context.selection.strategy = MemoryStrategy::StagedResidency;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&contract, &context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("requires a calibration identity")
+        ));
+
+        let mut mutated = contract.clone();
+        mutated
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+            .unwrap()
+            .support = MemoryStrategySupport::Implemented;
+        assert!(matches!(
+            default_memory_strategy_safety_check(&mutated, &context),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("requires a calibration identity")
+        ));
     }
 
     #[test]

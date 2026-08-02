@@ -46,6 +46,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      - name: Validate append-only code-review finding allocations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/check-review-findings.py --base "$BASE_SHA"
       - name: Expand changed paths through workspace dependencies
         id: select
         env:

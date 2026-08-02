@@ -70,6 +70,7 @@ fn dump_runb_latents() {
             H,
             0,
             &cancel,
+            &mlx_gen::PreviewSink::default(),
             &mut |_| {},
         )
         .unwrap();

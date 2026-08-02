@@ -66,6 +66,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// [`crate::model::Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "kolors",

@@ -85,6 +85,33 @@ use crate::common::{self, ResizePolicy};
 use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
 use crate::packed_te::ZImageTextEncoder as PackedTe;
 
+/// Read a component's packed descriptor without constructing a pipeline. Registry admission and
+/// lazy generators use this same source of truth as component loading, so a tier-specific snapshot
+/// cannot be mislabeled from `LoadSpec::quantize` (which Z-Image deliberately forbids).
+pub(crate) fn packed_config_at(
+    root: &Path,
+    sub: &str,
+) -> Result<Option<candle_gen::quant::PackedConfig>> {
+    let path = root.join(sub).join("config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CandleError::Msg(format!(
+                "z-image: read {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        CandleError::Msg(format!(
+            "z-image: parse {} (corrupt snapshot?): {error}",
+            path.display()
+        ))
+    })?;
+    Ok(candle_gen::quant::PackedConfig::from_config(&value))
+}
+
 /// The DiT, loaded **dense** (the stock `candle-transformers` model — a dense bf16 tier or the
 /// adapter-merged path) or **packed** (the vendored [`PackedDit`] built straight from an MLX-packed tier
 /// — sc-9408). Both expose the same `forward(x, t, cap_feats, cap_mask)` → raw velocity, so the render
@@ -465,6 +492,19 @@ impl Pipeline {
         use_accelerated_attn: bool,
         stream_transformer_blocks: bool,
     ) -> Result<DiT> {
+        self.load_transformer_cancelable(
+            use_accelerated_attn,
+            stream_transformer_blocks,
+            &CancelFlag::default(),
+        )
+    }
+
+    fn load_transformer_cancelable(
+        &self,
+        use_accelerated_attn: bool,
+        stream_transformer_blocks: bool,
+        cancel: &CancelFlag,
+    ) -> Result<DiT> {
         if self.comfyui.is_some() {
             return Err(CandleError::Msg(
                 "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
@@ -473,8 +513,43 @@ impl Pipeline {
         }
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let vb = self.component_vb("transformer")?;
-        let mut dit = if stream_transformer_blocks {
+        let packed = self.component_packed_config("transformer")?;
+        let (vb, sidecars) = if stream_transformer_blocks {
+            if let Some(packed) = packed {
+                use candle_gen::candle_core::safetensors::MmapedSafetensors;
+                use candle_gen::quant::PackedWeightSidecars;
+
+                let files = self.component_files("transformer")?;
+                // SAFETY: read-only mmap of the immutable component files. The same mapping backs
+                // the resident tensors and hashes the packed `layers.N` sources during preparation.
+                let source = unsafe { MmapedSafetensors::multi(&files)? };
+                let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
+                    &source,
+                    &self.root.join("transformer"),
+                    packed,
+                    &self.device,
+                    cancel,
+                    "layers.",
+                );
+                // The shared cache layer reports cancellation through candle-core because it is
+                // reusable below provider boundaries. Restore the provider's typed cancellation
+                // before `?` can erase it into a generic backend error.
+                if cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let sidecars = prepared?;
+                let vb =
+                    VarBuilder::from_backend(Box::new(source), self.dtype, self.device.clone());
+                (vb, Some(Arc::new(sidecars)))
+            } else {
+                (self.component_vb("transformer")?, None)
+            }
+        } else {
+            (self.component_vb("transformer")?, None)
+        };
+        let mut dit = if let Some(sidecars) = sidecars {
+            PackedDit::new_block_streamed_with_sidecars(&dit_cfg, vb, sidecars)?
+        } else if stream_transformer_blocks {
             PackedDit::new_block_streamed(&dit_cfg, vb)?
         } else {
             PackedDit::new(&dit_cfg, vb)?
@@ -740,27 +815,16 @@ impl Pipeline {
     /// missing weights, no diagnostic). A well-formed config with no `quantization` block is a dense tier
     /// → `Ok(false)` (sc-9426, F-073 sibling).
     pub(crate) fn component_is_packed(&self, sub: &str) -> Result<bool> {
-        let path = self.root.join(sub).join("config.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            // No config.json at all → legitimate dense / fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            // Present but unreadable (permissions, partial download) → surface, don't swallow.
-            Err(e) => {
-                return Err(CandleError::Msg(format!(
-                    "z-image: read {}: {e}",
-                    path.display()
-                )))
-            }
-        };
-        // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            CandleError::Msg(format!(
-                "z-image: parse {} (corrupt snapshot?): {e}",
-                path.display()
-            ))
-        })?;
-        Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
+        Ok(self.component_packed_config(sub)?.is_some())
+    }
+
+    /// Read the full packed descriptor so sidecar preparation uses the tier's declared bit width and
+    /// group size instead of re-inferring either from tensor shapes.
+    fn component_packed_config(
+        &self,
+        sub: &str,
+    ) -> Result<Option<candle_gen::quant::PackedConfig>> {
+        packed_config_at(&self.root, sub)
     }
 
     /// Build a VAE [`VarBuilder`] for a **packed** tier by dequantizing the 8 packed mid-block attention
@@ -968,7 +1032,13 @@ impl Pipeline {
             |text| self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
             // sc-9032: accelerated attention is not currently wired; match the resident path's
             // effective false value exactly.
-            || self.load_transformer(false, memory.stream_transformer_blocks),
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
             |transformer, cap, on_progress| {
                 self.denoise_sequential(
                     req,
@@ -1065,7 +1135,13 @@ impl Pipeline {
                 };
                 Ok((cap, neg_cap))
             },
-            || self.load_transformer(false, memory.stream_transformer_blocks),
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
             |transformer, (cap, neg_cap), on_progress| {
                 self.denoise_base_sequential(
                     req,
@@ -1883,6 +1959,44 @@ mod tests {
         assert!(
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streamed_sidecar_preparation_preserves_typed_cancellation() {
+        let dir =
+            std::env::temp_dir().join(format!("sc16510_cancel_sidecar_{}", std::process::id()));
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([(
+                "fixture".to_owned(),
+                Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            transformer.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let pipeline = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[], None);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let error = match pipeline.load_transformer_cancelable(false, true, &cancel) {
+            Ok(_) => panic!("a canceled sidecar preparation must not construct a transformer"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
+        assert!(
+            !transformer.join(".candle-device-format-v1").exists(),
+            "pre-cancellation must stop before creating the cache"
         );
 
         std::fs::remove_dir_all(&dir).ok();

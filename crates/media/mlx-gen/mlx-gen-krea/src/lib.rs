@@ -258,7 +258,12 @@ mod explicit_registry_tests {
             evidence_revision: "test".to_owned(),
         };
         assert!(matches!(
-            crate::memory_strategy::safety_check(&contract, &context),
+            crate::memory_strategy::safety_check(
+                &contract,
+                mlx_gen::Precision::Bf16,
+                Some(mlx_gen::Quant::Q4),
+                &context,
+            ),
             mlx_gen::gen_core::MemorySafetyDecision::Reject { reason }
                 if reason.contains("PiD decode is not implemented")
         ));

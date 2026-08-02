@@ -474,12 +474,103 @@ impl CancelFlag {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Adopt a caller-owned cancellation token, so a consumer's existing
+    /// `Arc<AtomicBool>` **is** the flag the engine polls rather than something a bridge has to
+    /// mirror into.
+    ///
+    /// Without this, a consumer that already has a cancellation token (a job queue, a request
+    /// scope) can only forward cancellation from inside the progress callback, which means a
+    /// cancel is not observed until the next progress event. Sharing the atomic removes that
+    /// hop. Cancellation stays cooperative and unchanged: whoever sets the flag, the engine
+    /// still only observes it where it checks.
+    ///
+    /// **Where the engine checks is the real bound, and it is coarser than this handle.** Polling
+    /// happens at denoise step boundaries; component loading does not poll at all, so a cancel
+    /// raised during a multi-second weight load is not observed until the load finishes. Sharing
+    /// the token does not change that, and a consumer that needs to abandon a load must do it
+    /// above this seam.
+    pub fn from_arc(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    /// The underlying token, so a consumer can observe (or set) the same atomic the engine polls.
+    /// The inverse of [`from_arc`](Self::from_arc); see its note on where the engine checks.
+    pub fn as_arc(&self) -> &Arc<AtomicBool> {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for CancelFlag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("CancelFlag")
             .field(&self.is_cancelled())
+            .finish()
+    }
+}
+
+/// One frame of the developing image, handed to a [`PreviewSink`] during denoise.
+///
+/// The image is a **linear latent→RGB approximation at latent resolution** — for a VAE with an 8×
+/// spatial scale that is `width/8 × height/8` (128×128 for a 1024² render), RGB8, three bytes per
+/// pixel. It is explicitly **not** a VAE decode: producing it costs one small matmul instead of a
+/// full decoder forward, which is what makes a per-step preview affordable. Consumers should
+/// upscale it for display and must not treat it as the render's output.
+///
+/// `current` / `total` are 1-based and mirror [`Progress::Step`], so a consumer can drive one
+/// progress indicator from either. `current` advances monotonically and never exceeds `total`; a
+/// solver that evaluates the model more than once per step (Heun-family) emits at most one frame
+/// per schedule position rather than overrunning the count.
+#[derive(Clone, Debug)]
+pub struct PreviewFrame {
+    /// 1-based schedule position this frame was projected from.
+    pub current: u32,
+    /// Total denoise steps in this trajectory.
+    pub total: u32,
+    /// Latent-resolution RGB8 approximation of the developing image.
+    pub image: crate::media::Image,
+}
+
+/// Per-step preview sink threaded onto a request ([`GenerationRequest::preview`]).
+///
+/// The [`CancelFlag`] pattern: a cheap cloneable handle carried as a request **field**, not a
+/// [`Progress`] variant — `Progress` stays `Copy` and no exhaustive match downstream changes. The
+/// inert [`default`](Default::default) is free: a supporting engine gates the projection on
+/// [`is_active`](Self::is_active) and does no work at all when nobody is listening.
+///
+/// **Emission is synchronous and on the denoise thread**, so the closure must return promptly —
+/// forward the frame to a channel rather than encoding or rendering inside it. Support is
+/// per-engine and opt-in; an engine that never emits is indistinguishable from an inert sink.
+///
+/// [`GenerationRequest::preview`]: crate::GenerationRequest::preview
+#[derive(Clone, Default)]
+pub struct PreviewSink(Option<Arc<dyn Fn(PreviewFrame) + Send + Sync>>);
+
+impl PreviewSink {
+    /// Build an active sink from a callback. The callback runs on the denoise thread, once per
+    /// emitted frame.
+    pub fn new(sink: impl Fn(PreviewFrame) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(sink)))
+    }
+
+    /// Whether anyone is listening. Engines gate the projection work on this so an inert sink
+    /// costs one branch per denoise evaluation.
+    pub fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Deliver one frame. A no-op on an inert sink.
+    pub fn emit(&self, frame: PreviewFrame) {
+        if let Some(sink) = &self.0 {
+            sink(frame);
+        }
+    }
+}
+
+impl std::fmt::Debug for PreviewSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PreviewSink")
+            .field(&self.is_active())
             .finish()
     }
 }
@@ -509,4 +600,96 @@ pub enum LoadPhase {
     TextEncoder,
     /// The heavy render bundle — the transformer/U-Net, the VAE, and any control/PiD overlay.
     Renderer,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn frame(current: u32, total: u32) -> PreviewFrame {
+        PreviewFrame {
+            current,
+            total,
+            image: crate::media::Image {
+                width: 2,
+                height: 1,
+                pixels: vec![0, 0, 0, 255, 255, 255],
+            },
+        }
+    }
+
+    /// A caller-owned token IS the flag the engine polls: cancelling through the consumer's own
+    /// `Arc` is observed by the engine's handle, with no bridge and no progress-callback hop.
+    #[test]
+    fn from_arc_shares_the_callers_token() {
+        let token = Arc::new(AtomicBool::new(false));
+        let flag = CancelFlag::from_arc(Arc::clone(&token));
+
+        assert!(!flag.is_cancelled());
+        token.store(true, Ordering::Relaxed);
+        assert!(
+            flag.is_cancelled(),
+            "the engine handle must see the caller's cancel"
+        );
+    }
+
+    /// And the reverse direction: `cancel()` on the engine handle is visible on the caller's token,
+    /// so a consumer can share one token across several in-flight requests.
+    #[test]
+    fn cancel_is_visible_on_the_shared_token() {
+        let token = Arc::new(AtomicBool::new(false));
+        let flag = CancelFlag::from_arc(Arc::clone(&token));
+
+        flag.cancel();
+        assert!(token.load(Ordering::Relaxed));
+        assert!(
+            Arc::ptr_eq(flag.as_arc(), &token),
+            "as_arc must expose the same allocation"
+        );
+    }
+
+    /// The inert default is the zero-cost path: engines gate their projection on `is_active`, and
+    /// `emit` on an inert sink must not panic (a provider may emit unconditionally).
+    #[test]
+    fn default_preview_sink_is_inert() {
+        let sink = PreviewSink::default();
+        assert!(!sink.is_active());
+        sink.emit(frame(1, 8)); // must be a no-op, not a panic
+    }
+
+    /// An active sink receives every emitted frame, in order, through a clone of the handle — the
+    /// `CancelFlag` pattern: cloning the request must not detach the sink.
+    #[test]
+    fn active_preview_sink_receives_frames_through_a_clone() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let sink = PreviewSink::new(move |f: PreviewFrame| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((f.current, f.total, f.image.pixels.len()));
+        });
+        assert!(sink.is_active());
+
+        let cloned = sink.clone();
+        sink.emit(frame(1, 8));
+        cloned.emit(frame(2, 8));
+
+        assert_eq!(*seen.lock().unwrap(), vec![(1, 8, 6), (2, 8, 6)]);
+    }
+
+    /// `Debug` reports liveness, never the closure — matching `CancelFlag`'s shape so a request
+    /// stays printable.
+    #[test]
+    fn preview_sink_debug_reports_liveness() {
+        assert_eq!(
+            format!("{:?}", PreviewSink::default()),
+            "PreviewSink(false)"
+        );
+        assert_eq!(
+            format!("{:?}", PreviewSink::new(|_| {})),
+            "PreviewSink(true)"
+        );
+    }
 }

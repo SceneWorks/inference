@@ -10,7 +10,17 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, media, chroma-auxiliary, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+      publish_chroma_artifacts:
+        description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
+        type: boolean
+        required: false
+        default: false
+      chroma_publish_confirmation:
+        description: Type sc-16462 to authorize Chroma artifact publication
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -20,6 +30,341 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # SC-16462: build the complete packed Chroma tier from the exact currently-shipped bf16 source,
+  # then prove T5/VAE packed-vs-load-time identity, component quality, T5 residency, and a coherent
+  # end-to-end render for base/HD/Flash at q4 and q8. Publication is a separate, explicit mode of the
+  # same green lane; it fails closed on the expected current Hub revision and runner-local HF auth.
+  mlx-chroma-auxiliary:
+    name: Chroma packed auxiliaries (${{ matrix.model }})
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model: chroma1_base
+            repository: SceneWorks/chroma1-base-mlx
+            source_revision: e7330dda29d00ffdeeb719b28e92ee74cff0884c
+          - model: chroma1_hd
+            repository: SceneWorks/chroma1-hd-mlx
+            source_revision: 9d99afe1ebca67032476756bc70d4a7152bc1bd5
+          - model: chroma1_flash
+            repository: SceneWorks/chroma1-flash-mlx
+            source_revision: 6a9cb6178709559461506bf247f708d0d1008d00
+    env:
+      CHROMA_MODEL: ${{ matrix.model }}
+      CHROMA_REPOSITORY: ${{ matrix.repository }}
+      CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Validate publication authorization
+        if: inputs.publish_chroma_artifacts
+        run: |
+          if [[ "${{ inputs.chroma_publish_confirmation }}" != "sc-16462" ]]; then
+            echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
+            exit 1
+          fi
+      - name: Materialize the exact shipped bf16 source
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$PYTHONPATH" "huggingface_hub==1.20.1"
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id=os.environ["CHROMA_REPOSITORY"],
+              revision=os.environ["CHROMA_SOURCE_REVISION"],
+              allow_patterns=["bf16/**", "q4/**", "q8/**"],
+              local_dir=os.environ["CHROMA_SNAPSHOT"],
+              token=False,
+          )
+          PY
+          test -d "$CHROMA_SNAPSHOT/bf16/transformer"
+          test -d "$CHROMA_SNAPSHOT/bf16/text_encoder"
+          test -d "$CHROMA_SNAPSHOT/bf16/vae"
+          test -d "$CHROMA_SNAPSHOT/q4/transformer"
+          test -d "$CHROMA_SNAPSHOT/q8/transformer"
+      - name: Build and validate packed q4/q8 tiers
+        env:
+          SC8777_SRC: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}/bf16
+          SC8777_MODEL: ${{ matrix.model }}
+          SC8777_KEEP: "1"
+          CHROMA_PACKED_ROOT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462
+        run: |
+          set -o pipefail
+          : > "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl"
+          : > "$RUNNER_TEMP/chroma-sc16462-component.jsonl"
+          for bits in 4 8; do
+            export SC8777_BITS="$bits"
+            export SC16462_AUX_BITS=8
+            export SC8777_OUT="$CHROMA_PACKED_ROOT/q$bits"
+            export SC16462_BUILT="$CHROMA_PACKED_ROOT/.built-q$bits"
+            export SC16462_BASELINE="$SC8777_SRC/../q$bits"
+            SC8777_BITS="$SC16462_AUX_BITS" SC8777_OUT="$SC16462_BUILT" \
+              cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
+              build_tier_only -- --ignored --exact --nocapture --test-threads=1
+            # Compose from the exact shipped tier and replace only the two auxiliary directories.
+            # This preserves transformer/config/tokenizer/scheduler/top-level bytes verbatim.
+            cp -R "$SC16462_BASELINE" "$SC8777_OUT"
+            rm -rf "$SC8777_OUT/text_encoder" "$SC8777_OUT/vae"
+            cp -R "$SC16462_BUILT/text_encoder" "$SC8777_OUT/text_encoder"
+            cp -R "$SC16462_BUILT/vae" "$SC8777_OUT/vae"
+            diff -qr -x text_encoder -x vae "$SC16462_BASELINE" "$SC8777_OUT"
+            cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
+              packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+              --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits.log"
+            sed -n 's/^.*SC16462_COMPONENT //p' "$RUNNER_TEMP/chroma-q$bits.log" \
+              >> "$RUNNER_TEMP/chroma-sc16462-component.jsonl"
+            cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
+              packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak -- --ignored \
+              --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-calibration.log"
+            sed -n 's/^.*SC16462_CALIBRATION //p' "$RUNNER_TEMP/chroma-q$bits-calibration.log" \
+              >> "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl"
+            cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
+              prequantize_turnkey_loads_packed_and_renders -- --ignored --exact --nocapture \
+              --test-threads=1
+          done
+          test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl" | tr -d ' ')" = 2
+          test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-component.jsonl" | tr -d ' ')" = 2
+      - name: Upload Chroma calibration evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chroma-sc16462-${{ matrix.model }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/chroma-sc16462-calibration.jsonl
+            ${{ runner.temp }}/chroma-sc16462-component.jsonl
+
+  # Publication cannot begin until every Base/HD/Flash validation leg above is green. Each repo
+  # receives q4+q8 in one parent-guarded commit. A retry explicitly verifies an already-published
+  # repo byte-for-byte and treats it as success, making a cross-repository partial run resumable.
+  mlx-chroma-publish:
+    name: Publish Chroma packed auxiliaries (${{ matrix.model }})
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary' && inputs.publish_chroma_artifacts
+    needs: mlx-chroma-auxiliary
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model: chroma1_base
+            repository: SceneWorks/chroma1-base-mlx
+            source_revision: e7330dda29d00ffdeeb719b28e92ee74cff0884c
+          - model: chroma1_hd
+            repository: SceneWorks/chroma1-hd-mlx
+            source_revision: 9d99afe1ebca67032476756bc70d4a7152bc1bd5
+          - model: chroma1_flash
+            repository: SceneWorks/chroma1-flash-mlx
+            source_revision: 6a9cb6178709559461506bf247f708d0d1008d00
+    env:
+      CHROMA_MODEL: ${{ matrix.model }}
+      CHROMA_REPOSITORY: ${{ matrix.repository }}
+      CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Validate publication authorization
+        run: |
+          if [[ "${{ inputs.chroma_publish_confirmation }}" != "sc-16462" ]]; then
+            echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
+            exit 1
+          fi
+      - name: Rebuild the validated payload from the immutable source
+        env:
+          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-publish-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          CHROMA_BUILT: ${{ runner.temp }}/chroma-publish-built-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          CHROMA_PACKED: ${{ runner.temp }}/chroma-publish-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-publish
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$PYTHONPATH" "huggingface_hub==1.20.1"
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id=os.environ["CHROMA_REPOSITORY"],
+              revision=os.environ["CHROMA_SOURCE_REVISION"],
+              allow_patterns=["bf16/**", "q4/**", "q8/**"],
+              local_dir=os.environ["CHROMA_SNAPSHOT"],
+              token=False,
+          )
+          PY
+          mkdir -p "$CHROMA_PACKED"
+          for bits in 4 8; do
+            SC8777_SRC="$CHROMA_SNAPSHOT/bf16" \
+            SC8777_MODEL="$CHROMA_MODEL" \
+            SC8777_BITS=8 \
+            SC8777_OUT="$CHROMA_BUILT/q$bits" \
+              cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
+                build_tier_only -- --ignored --exact --nocapture --test-threads=1
+            cp -R "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
+            rm -rf "$CHROMA_PACKED/q$bits/text_encoder" "$CHROMA_PACKED/q$bits/vae"
+            cp -R "$CHROMA_BUILT/q$bits/text_encoder" "$CHROMA_PACKED/q$bits/text_encoder"
+            cp -R "$CHROMA_BUILT/q$bits/vae" "$CHROMA_PACKED/q$bits/vae"
+            diff -qr -x text_encoder -x vae "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
+          done
+      - name: Publish or verify the complete q4/q8 replacement
+        env:
+          CHROMA_PACKED: ${{ runner.temp }}/chroma-publish-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          CHROMA_REPORT: ${{ runner.temp }}/chroma-sc16462-artifact-${{ matrix.model }}.json
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from huggingface_hub import (
+              CommitOperationAdd,
+              CommitOperationDelete,
+              HfApi,
+              hf_hub_download,
+          )
+
+          api = HfApi()
+          identity = api.whoami()
+          if not identity.get("name"):
+              raise SystemExit("authenticated Hugging Face identity is required for publication")
+
+          repository = os.environ["CHROMA_REPOSITORY"]
+          expected = os.environ["CHROMA_SOURCE_REVISION"]
+          expected_model = api.model_info(repository, revision=expected, files_metadata=True)
+          current = api.model_info(repository).sha
+          current_model = api.model_info(repository, revision=current, files_metadata=True)
+          packed_root = Path(os.environ["CHROMA_PACKED"])
+          additions = {}
+          for tier in ("q4", "q8"):
+              tier_root = packed_root / tier
+              for path in tier_root.rglob("*"):
+                  if path.is_file() and ".cache" not in path.parts:
+                      additions[f"{tier}/{path.relative_to(tier_root).as_posix()}"] = path
+
+          def lfs_sha(sibling):
+              lfs = getattr(sibling, "lfs", None)
+              if lfs is None:
+                  return None
+              return getattr(lfs, "sha256", None) or (
+                  lfs.get("sha256") if isinstance(lfs, dict) else None
+              )
+
+          def remote_signature(model, prefix):
+              return {
+                  sibling.rfilename: (
+                      sibling.size,
+                      lfs_sha(sibling),
+                      getattr(sibling, "blob_id", None),
+                  )
+                  for sibling in model.siblings
+                  if sibling.rfilename.startswith(prefix)
+              }
+
+          if remote_signature(current_model, "bf16/") != remote_signature(expected_model, "bf16/"):
+              raise SystemExit(f"{repository} bf16 tree moved from immutable source; refusing")
+
+          def published_payload_matches(model):
+              siblings = {
+                  sibling.rfilename: sibling
+                  for sibling in model.siblings
+                  if sibling.rfilename.startswith(("q4/", "q8/"))
+              }
+              if siblings.keys() != additions.keys():
+                  return False
+              for remote_path, local_path in additions.items():
+                  sibling = siblings[remote_path]
+                  if sibling.size != local_path.stat().st_size:
+                      return False
+                  remote_sha = lfs_sha(sibling)
+                  if remote_sha:
+                      digest = hashlib.sha256()
+                      with local_path.open("rb") as handle:
+                          for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                              digest.update(chunk)
+                      if digest.hexdigest() != remote_sha:
+                          return False
+                  else:
+                      downloaded = Path(hf_hub_download(
+                          repo_id=repository,
+                          filename=remote_path,
+                          revision=model.sha,
+                      ))
+                      if downloaded.read_bytes() != local_path.read_bytes():
+                          return False
+              return True
+
+          idempotent = current != expected
+          if idempotent:
+              if not published_payload_matches(current_model):
+                  raise SystemExit(
+                      f"{repository} main moved to {current} but is not the verified SC-16462 payload"
+                  )
+              commit_url = f"https://huggingface.co/{repository}/commit/{current}"
+          else:
+              existing_paths = {
+                  sibling.rfilename
+                  for sibling in current_model.siblings
+                  if sibling.rfilename.startswith(("q4/", "q8/"))
+              }
+              operations = [
+                  CommitOperationDelete(path_in_repo=path)
+                  for path in sorted(existing_paths - additions.keys())
+              ]
+              operations.extend(
+                  CommitOperationAdd(path_in_repo=path, path_or_fileobj=local_path)
+                  for path, local_path in sorted(additions.items())
+              )
+              info = api.create_commit(
+                  repo_id=repository,
+                  operations=operations,
+                  commit_message="sc-16462: publish complete packed q4/q8 tiers",
+                  parent_commit=current,
+              )
+              current = info.oid
+              commit_url = str(info.commit_url)
+              current_model = api.model_info(repository, revision=current, files_metadata=True)
+              if not published_payload_matches(current_model):
+                  raise SystemExit(f"{repository}@{current} failed post-publish verification")
+
+          sizes = {
+              tier: sum(
+                  sibling.size or 0
+                  for sibling in current_model.siblings
+                  if sibling.rfilename.startswith(f"{tier}/")
+              )
+              for tier in ("q4", "q8", "bf16")
+          }
+          report = {
+              "repository": repository,
+              "sourceRevision": expected,
+              "resolvedRevision": current,
+              "sizes": sizes,
+              "commit": {"oid": current, "url": commit_url},
+              "publishedBy": identity["name"],
+              "idempotentVerification": idempotent,
+          }
+          Path(os.environ["CHROMA_REPORT"]).write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(report, indent=2))
+          PY
+      - name: Upload immutable artifact report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chroma-sc16462-artifact-${{ matrix.model }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/chroma-sc16462-artifact-${{ matrix.model }}.json
+
   # SC-15507: a narrow, independently dispatchable acceptance lane for the request-scoped
   # MLX lifecycle. The broader `media` profile also runs this test, but it requires the complete
   # frozen-Torch Mage oracle bundle before reaching it. This lane intentionally needs only the

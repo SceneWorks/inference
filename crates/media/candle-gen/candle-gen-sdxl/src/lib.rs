@@ -406,6 +406,7 @@ impl Generator for SdxlGenerator {
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         // epic 13657 (sc-13663): SDXL requires three caller-staged components — the two model-agnostic
         // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned upstream repos
         // on the render path. Advertised so SceneWorks stages them, and `load` fails fast if it doesn't.

@@ -76,17 +76,17 @@ pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEnt
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
     adapter_stack_resident_bytes, default_memory_strategy_safety_check,
-    default_registered_memory_strategy_safety_check, AdapterResidencyMode, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
-    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind, MemoryConformanceState,
-    MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
-    MemoryEvidenceKey, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown,
-    MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRejection, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyEngagementExclusion,
+    default_registered_memory_strategy_safety_check, standard_memory_strategy_safety_check,
+    AdapterResidencyMode, MemoryAssetFacts, MemoryBackendRealization, MemoryBudget,
+    MemoryCacheSemantics, MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics,
+    MemoryComponentKind, MemoryConformanceState, MemoryDecodeRouteDomain, MemoryEvidence,
+    MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey, MemoryEvidenceVerdict,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
+    MemoryPeakBreakdown, MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision,
+    MemorySelection, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyEngagementExclusion,
     MemoryStrategyParameters, MemoryStrategyPrerequisite, MemoryStrategySupport,
     MemoryWarmRunSemantics, MemoryWindowMaterialization, TransformerComponent,
     MEMORY_CALIBRATION_ABI,
@@ -100,8 +100,8 @@ pub use registry::{
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
-    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant,
-    WeightsSource,
+    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
+    PreviewSink, Progress, Quant, WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

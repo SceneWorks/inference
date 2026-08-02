@@ -37,6 +37,7 @@ pub mod img2img;
 pub mod memory;
 pub mod mllm;
 pub mod nn;
+pub mod preview;
 pub mod quant;
 pub mod residency;
 pub mod sampler;
@@ -108,8 +109,8 @@ pub use registry::{
 pub use residency::{Residency, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
-    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant,
-    WeightsSource,
+    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
+    PreviewSink, Progress, Quant, WeightsSource,
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,

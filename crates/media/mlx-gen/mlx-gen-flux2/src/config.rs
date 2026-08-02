@@ -174,6 +174,7 @@ impl Flux2Variant {
             vec![ConditioningKind::Reference]
         };
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "flux2",

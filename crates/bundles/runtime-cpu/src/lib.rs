@@ -172,6 +172,7 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",
                 family: "test-audio",

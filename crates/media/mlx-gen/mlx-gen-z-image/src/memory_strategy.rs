@@ -141,12 +141,13 @@ use mlx_gen::gen_core::{
     safetensors_path_tensor_headers, Error as CoreError, GenerationMemory, GenerationRequest,
     LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
-    Result as CoreResult, TransformerComponent,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
+    PerComponentBytes, Result as CoreResult, TransformerComponent,
 };
+use mlx_gen::{Quant, WeightsSource};
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
 /// GroupNorm VAE (sc-13571). A request that names no geometry decodes here, which is what keeps every
@@ -332,6 +333,42 @@ pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
 /// The historical coupled figures remain useful only as evidence for that exact staged composition;
 /// the v3 calibration fingerprint prevents them from being read as resident+deferred evidence.
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
+
+/// Resolve the numeric tier the transformer actually loads. A packed snapshot marker is
+/// authoritative even when `LoadSpec::quantize` is absent; a requested tier is the fallback only for
+/// a dense snapshot, where the loader performs the quantization in memory. The existing shared guard
+/// rejects a requested tier that disagrees with a packed turnkey before admission can mislabel it.
+pub(crate) fn loaded_tier(spec: &LoadSpec, provider_id: &str) -> CoreResult<MemoryNumericTier> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: actual numeric tier requires a snapshot directory"
+            )))
+        }
+    };
+    if let Some(requested) = spec.quantize {
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", requested.bits(), provider_id)
+            .map_err(CoreError::backend)?;
+    }
+    let packed_bits =
+        mlx_gen::quant::packed_quant_bits(root, "transformer").map_err(CoreError::backend)?;
+    let quant = match packed_bits {
+        Some(4) => Some(Quant::Q4),
+        Some(8) => Some(Quant::Q8),
+        Some(bits) => {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: transformer declares unsupported packed quantization width {bits}"
+            )))
+        }
+        None => spec.quantize,
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
+}
 
 /// Stable identity for the Fun-Controlnet-Union network held beside the base Z-Image model.
 pub const CONTROL_STACK_COMPONENT_ID: &str = "fun_controlnet_union.control_layers";
@@ -886,99 +923,69 @@ impl Drop for ZImageMemoryScope {
 /// never swap in a different strategy or numeric tier.
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
+    loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: no calibration identity declared", contract.provider_id),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: calibration handshake mismatch (admitted abi {} fingerprint {:?}, provider abi \
-                 {} fingerprint {:?})",
-                contract.provider_id,
-                context.calibration_abi,
-                context.calibration_fingerprint,
-                calibration.abi,
-                calibration.fingerprint
-            ),
-        };
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
-    }
-    // Route-aware decode-parameter validation (SC-15510).
-    //
-    // SC-15615 had to REFUSE rungs 2+ on the PiD route outright, because the super-resolving student
-    // planned its own tile edge/overlap from `mlx_gen_pid::budget` and never read this contract's
-    // parameters — admitting a selection would have executed a different strategy than the selector
-    // chose. That is now reconciled rather than refused: `mint_planned_decoder_with_tiling` honours an
-    // explicit plan and validates it against the planner's own invariants, so the PiD route is a
-    // first-class rung-2 route with its own candidate domain.
-    //
-    // The domains do not overlap — the native VAE tiles the output at 512-768 px, the PiD student
-    // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
-    // rejected on the other rather than silently re-planned. The static `validate_selection` above
-    // sees only the published union, which is why this check exists.
-    // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
-    // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
-    // that the cost-order default now lives in exactly one documented place.
-    // SC-15775: the check itself is the shared `DecodeRoutes` gate rather than a per-provider match,
-    // so the next PiD-eligible adopter inherits it instead of re-deriving (or forgetting) it.
-    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-        let routes = match decode_routes(contract.provider_id.as_str()) {
-            Ok(routes) => routes,
-            // Unreachable for a registered provider, but keep the safety check
-            // total so malformed third-party contracts reject without panic.
-            Err(error) => {
-                return MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                };
-            }
-        };
-        if let Err(reason) = routes.validate(
-            context.use_pid,
-            context.selection.parameters.decode_tile_edge,
-            context.selection.parameters.decode_overlap,
-        ) {
-            return MemorySafetyDecision::Reject { reason };
+    let route_gate = || {
+        // Route-aware decode-parameter validation (SC-15510).
+        //
+        // SC-15615 had to REFUSE rungs 2+ on the PiD route outright, because the super-resolving student
+        // planned its own tile edge/overlap from `mlx_gen_pid::budget` and never read this contract's
+        // parameters — admitting a selection would have executed a different strategy than the selector
+        // chose. That is now reconciled rather than refused: `mint_planned_decoder_with_tiling` honours an
+        // explicit plan and validates it against the planner's own invariants, so the PiD route is a
+        // first-class rung-2 route with its own candidate domain.
+        //
+        // The domains do not overlap — the native VAE tiles the output at 512-768 px, the PiD student
+        // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
+        // rejected on the other rather than silently re-planned. The static `validate_selection` above
+        // sees only the published union, which is why this check exists.
+        // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
+        // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
+        // that the cost-order default now lives in exactly one documented place.
+        // SC-15775: the check itself is the shared `DecodeRoutes` gate rather than a per-provider match,
+        // so the next PiD-eligible adopter inherits it instead of re-deriving (or forgetting) it.
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+            let routes = decode_routes(contract.provider_id.as_str())?;
+            routes
+                .validate(
+                    context.use_pid,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                )
+                .map_err(CoreError::Unsupported)?;
         }
-    }
-
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
-                contract.provider_id,
-                context.predicted_peak_bytes,
-                context.budget.effective_bytes()
-            ),
-        };
-    }
-    MemorySafetyDecision::Accept
+        Ok(())
+    };
+    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(loaded_tier),
+        Some(&route_gate),
+    )
 }
 
 pub(crate) fn registered_safety_check(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, context)
+    match loaded_tier(spec, &contract.provider_id) {
+        Ok(tier) => safety_check(contract, tier, context),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 /// Open a request scope after `safety_check` accepted `context`.
 pub(crate) fn begin_request(
     provider_id: &'static str,
     contract: &MemoryProviderContract,
+    loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, context) {
+    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
     Ok(Some(Box::new(ZImageMemoryScope {
@@ -1100,6 +1107,165 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "test".to_owned(),
         }
+    }
+
+    fn tier_spec(
+        tag: &str,
+        packed_bits: Option<i32>,
+        requested: Option<Quant>,
+    ) -> (std::path::PathBuf, LoadSpec) {
+        let root = std::env::temp_dir().join(format!(
+            "z-image-memory-tier-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        if let Some(bits) = packed_bits {
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+        }
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        spec.quantize = requested;
+        (root, spec)
+    }
+
+    fn resident_tier_context(
+        contract: &MemoryProviderContract,
+        quant: Option<Quant>,
+    ) -> MemoryRunContext {
+        let mut context = context_for(MemoryStrategy::Resident, false);
+        let calibration = contract.calibration.as_ref().unwrap();
+        context.calibration_abi = calibration.abi;
+        context.calibration_fingerprint = calibration.fingerprint.clone();
+        context.selection.tier.quant = quant;
+        context
+    }
+
+    fn memory_registrations() -> [mlx_gen::gen_core::MemoryRegistration; 4] {
+        [
+            crate::model::MEMORY_REGISTRATION,
+            crate::model_base::MEMORY_REGISTRATION,
+            crate::model_control::MEMORY_REGISTRATION,
+            crate::model_base_control::MEMORY_REGISTRATION,
+        ]
+    }
+
+    #[test]
+    fn all_four_registrations_bind_prepacked_q4_and_q8_without_an_override() {
+        for (bits, actual, wrong) in [
+            (4, Quant::Q4, Some(Quant::Q8)),
+            (8, Quant::Q8, Some(Quant::Q4)),
+        ] {
+            let (root, spec) = tier_spec(&format!("packed-{bits}"), Some(bits), None);
+            for registration in memory_registrations() {
+                let contract = (registration.contract)(&spec).unwrap();
+                assert_eq!(
+                    loaded_tier(&spec, registration.provider_id).unwrap().quant,
+                    Some(actual),
+                    "{} loaded-generator capture must use the packed marker",
+                    registration.provider_id
+                );
+                assert_eq!(
+                    (registration.safety_check)(
+                        &spec,
+                        &contract,
+                        &resident_tier_context(&contract, Some(actual)),
+                    ),
+                    MemorySafetyDecision::Accept,
+                    "{} must admit its actual packed tier",
+                    registration.provider_id
+                );
+                for selected in [None, wrong] {
+                    assert!(matches!(
+                        (registration.safety_check)(
+                            &spec,
+                            &contract,
+                            &resident_tier_context(&contract, selected),
+                        ),
+                        MemorySafetyDecision::Reject { reason }
+                            if reason.contains("does not match loaded tier")
+                    ));
+                }
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn all_four_registrations_use_requested_quant_only_for_dense_snapshots() {
+        for requested in [Quant::Q4, Quant::Q8] {
+            let (root, spec) = tier_spec("dense-requested", None, Some(requested));
+            for registration in memory_registrations() {
+                let contract = (registration.contract)(&spec).unwrap();
+                assert_eq!(
+                    loaded_tier(&spec, registration.provider_id).unwrap().quant,
+                    Some(requested)
+                );
+                assert_eq!(
+                    (registration.safety_check)(
+                        &spec,
+                        &contract,
+                        &resident_tier_context(&contract, Some(requested)),
+                    ),
+                    MemorySafetyDecision::Accept
+                );
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn packed_request_mismatch_rejects_all_registrations_and_load_entrypoints() {
+        let (root, spec) = tier_spec("packed-mismatch", Some(8), Some(Quant::Q4));
+        for registration in memory_registrations() {
+            let contract = (registration.contract)(&spec).unwrap();
+            let decision = (registration.safety_check)(
+                &spec,
+                &contract,
+                &resident_tier_context(&contract, Some(Quant::Q4)),
+            );
+            assert!(matches!(
+                decision,
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("pre-quantized Q8") && reason.contains("Q4")
+            ));
+        }
+
+        type Loader = fn(&LoadSpec) -> mlx_gen::Result<Box<dyn mlx_gen::Generator>>;
+        let mut control_spec = spec.clone();
+        control_spec.control = Some(WeightsSource::File("/control.safetensors".into()));
+        for (provider_id, load, load_spec) in [
+            (crate::model::MODEL_ID, crate::model::load as Loader, &spec),
+            (
+                crate::model_base::MODEL_ID,
+                crate::model_base::load as Loader,
+                &spec,
+            ),
+            (
+                crate::model_control::MODEL_ID,
+                crate::model_control::load as Loader,
+                &control_spec,
+            ),
+            (
+                crate::model_base_control::MODEL_ID,
+                crate::model_base_control::load as Loader,
+                &control_spec,
+            ),
+        ] {
+            let error = load(load_spec)
+                .err()
+                .expect("tier mismatch must reject")
+                .to_string();
+            assert!(error.contains(provider_id), "{provider_id}: {error}");
+            assert!(error.contains("pre-quantized Q8"), "{provider_id}: {error}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn context(strategy: MemoryStrategy) -> MemoryRunContext {
@@ -1292,7 +1458,7 @@ mod tests {
         ctx.calibration_fingerprint =
             "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2".to_owned();
         assert!(matches!(
-            safety_check(&contract, &ctx),
+            safety_check(&contract, ctx.selection.tier, &ctx),
             MemorySafetyDecision::Reject { .. }
         ));
     }
@@ -1320,7 +1486,7 @@ mod tests {
         let mut deferred_context = context(MemoryStrategy::BoundedAttention);
         deferred_context.calibration_fingerprint = MEMORY_CALIBRATION_FINGERPRINT.to_owned();
         assert!(matches!(
-            safety_check(&eager, &deferred_context),
+            safety_check(&eager, deferred_context.selection.tier, &deferred_context),
             MemorySafetyDecision::Reject { reason }
                 if reason.contains("calibration handshake mismatch")
         ));
@@ -1328,7 +1494,7 @@ mod tests {
         let mut eager_context = context(MemoryStrategy::BoundedAttention);
         eager_context.calibration_fingerprint = EAGER_MEMORY_CALIBRATION_FINGERPRINT.to_owned();
         assert!(matches!(
-            safety_check(&deferred, &eager_context),
+            safety_check(&deferred, eager_context.selection.tier, &eager_context),
             MemorySafetyDecision::Reject { reason }
                 if reason.contains("calibration handshake mismatch")
         ));
@@ -1405,7 +1571,7 @@ mod tests {
                 "rejected edge {rejected} must not validate"
             );
             assert!(matches!(
-                safety_check(&contract, &ctx),
+                safety_check(&contract, ctx.selection.tier, &ctx),
                 MemorySafetyDecision::Reject { .. }
             ));
         }
@@ -1414,12 +1580,16 @@ mod tests {
             let mut ctx = context(MemoryStrategy::BoundedDecode);
             ctx.selection.parameters.decode_tile_edge = Some(edge);
             assert!(
-                matches!(safety_check(&contract, &ctx), MemorySafetyDecision::Accept),
+                matches!(
+                    safety_check(&contract, ctx.selection.tier, &ctx),
+                    MemorySafetyDecision::Accept
+                ),
                 "native candidate {edge} must be admissible"
             );
-            let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
-                .unwrap()
-                .unwrap();
+            let mut scope =
+                begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
+                    .unwrap()
+                    .unwrap();
             scope
                 .configure_decode(edge, DECODE_OVERLAP, ctx.geometry)
                 .unwrap();
@@ -1430,7 +1600,7 @@ mod tests {
         ctx.selection.parameters.decode_tile_edge = Some(500);
         assert!(contract.validate_selection(&ctx.selection).is_err());
         assert!(matches!(
-            safety_check(&contract, &ctx),
+            safety_check(&contract, ctx.selection.tier, &ctx),
             MemorySafetyDecision::Reject { .. }
         ));
     }
@@ -1835,12 +2005,16 @@ mod tests {
         ] {
             let ctx = context_for(strategy, true);
             assert!(
-                matches!(safety_check(&contract, &ctx), MemorySafetyDecision::Accept),
+                matches!(
+                    safety_check(&contract, ctx.selection.tier, &ctx),
+                    MemorySafetyDecision::Accept
+                ),
                 "{strategy:?} must now be admissible on the PiD route"
             );
-            let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
-                .unwrap()
-                .unwrap();
+            let mut scope =
+                begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
+                    .unwrap()
+                    .unwrap();
             scope
                 .configure_decode(pid_edges[0], PID_DECODE_OVERLAP, ctx.geometry)
                 .unwrap();
@@ -1860,7 +2034,10 @@ mod tests {
         // Rungs 0-1 stay available on both routes (they own no decode parameters).
         for strategy in [MemoryStrategy::Resident, MemoryStrategy::StagedResidency] {
             assert!(matches!(
-                safety_check(&contract, &context_for(strategy, true)),
+                {
+                    let ctx = context_for(strategy, true);
+                    safety_check(&contract, ctx.selection.tier, &ctx)
+                },
                 MemorySafetyDecision::Accept
             ));
         }
@@ -1879,12 +2056,16 @@ mod tests {
             ctx.mode = MemoryMode::Edit;
             ctx.has_reference = true;
             assert!(
-                matches!(safety_check(&contract, &ctx), MemorySafetyDecision::Accept),
+                matches!(
+                    safety_check(&contract, ctx.selection.tier, &ctx),
+                    MemorySafetyDecision::Accept
+                ),
                 "{strategy:?} must be admissible in edit mode"
             );
-            let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
-                .unwrap()
-                .expect("edit mode opens a scope");
+            let mut scope =
+                begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
+                    .unwrap()
+                    .expect("edit mode opens a scope");
             scope.finish(MemoryRunOutcome::Complete).unwrap();
         }
     }
@@ -1899,9 +2080,10 @@ mod tests {
         let contract = contract();
         for admitted_pid in [false, true] {
             let ctx = context_for(MemoryStrategy::BoundedDecode, admitted_pid);
-            let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
-                .unwrap()
-                .unwrap();
+            let mut scope =
+                begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
+                    .unwrap()
+                    .unwrap();
             let mut request = GenerationRequest {
                 prompt: "a fox".to_owned(),
                 width: 1024,
@@ -1928,7 +2110,7 @@ mod tests {
         let contract = contract();
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.calibration_fingerprint = "z-image-mlx-something-older".to_owned();
-        match safety_check(&contract, &ctx) {
+        match safety_check(&contract, ctx.selection.tier, &ctx) {
             MemorySafetyDecision::Reject { reason } => {
                 assert!(
                     reason.contains("calibration handshake mismatch"),
@@ -1937,13 +2119,28 @@ mod tests {
             }
             other => panic!("stale fingerprint must be rejected, got {other:?}"),
         }
-        assert!(begin_request(crate::model::MODEL_ID, &contract, &ctx).is_err());
+        assert!(
+            begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx).is_err()
+        );
 
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.calibration_abi = MEMORY_CALIBRATION_ABI + 1;
         assert!(matches!(
-            safety_check(&contract, &ctx),
+            safety_check(&contract, ctx.selection.tier, &ctx),
             MemorySafetyDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn a_selection_for_a_different_numeric_tier_is_rejected() {
+        let contract = contract();
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
+        let loaded_tier = ctx.selection.tier;
+        ctx.selection.tier.quant = Some(Quant::Q8);
+        assert!(matches!(
+            safety_check(&contract, loaded_tier, &ctx),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
         ));
     }
 
@@ -1952,7 +2149,7 @@ mod tests {
         let contract = contract();
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.predicted_peak_bytes = ctx.budget.effective_bytes() + 1;
-        match safety_check(&contract, &ctx) {
+        match safety_check(&contract, ctx.selection.tier, &ctx) {
             MemorySafetyDecision::Reject { reason } => {
                 assert!(reason.contains("exceeds effective budget"), "{reason}")
             }
@@ -1961,7 +2158,7 @@ mod tests {
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.predicted_peak_bytes = ctx.budget.effective_bytes();
         assert!(matches!(
-            safety_check(&contract, &ctx),
+            safety_check(&contract, ctx.selection.tier, &ctx),
             MemorySafetyDecision::Accept
         ));
     }
@@ -1970,7 +2167,7 @@ mod tests {
     fn the_scope_overwrites_warm_request_state_and_finishes_once() {
         let contract = contract();
         let ctx = context(MemoryStrategy::BoundedDecode);
-        let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
+        let mut scope = begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
             .unwrap()
             .expect("an accepted context opens a scope");
 
@@ -2034,7 +2231,7 @@ mod tests {
     fn the_scope_accepts_only_its_declared_parameters() {
         let contract = contract();
         let ctx = context(MemoryStrategy::BoundedTransformerResidency);
-        let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
+        let mut scope = begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
             .unwrap()
             .unwrap();
         scope
@@ -2073,7 +2270,7 @@ mod tests {
 
         // Below rung 4 there is no window at all, so the hook refuses everything.
         let ctx = context(MemoryStrategy::BoundedAttention);
-        let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
+        let mut scope = begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
             .unwrap()
             .unwrap();
         assert!(scope.materialize_transformer_window(0, 1).is_err());
@@ -2090,13 +2287,14 @@ mod tests {
             },
         ] {
             let ctx = context(MemoryStrategy::BoundedDecode);
-            let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
-                .unwrap()
-                .unwrap();
+            let mut scope =
+                begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
+                    .unwrap()
+                    .unwrap();
             scope.finish(outcome).unwrap();
         }
         let ctx = context(MemoryStrategy::BoundedDecode);
-        drop(begin_request(crate::model::MODEL_ID, &contract, &ctx).unwrap());
+        drop(begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx).unwrap());
     }
 
     #[test]

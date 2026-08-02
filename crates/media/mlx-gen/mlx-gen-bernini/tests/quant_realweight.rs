@@ -16,10 +16,25 @@ use mlx_gen::media::Image;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 /// The combined planner+renderer snapshot (assembled by `bernini_e2e::ensure_snapshot`).
 fn snapshot() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/mlx-gen-models/bernini_full_mlx_bf16")
+    converted_root().join("bernini_full_mlx_bf16")
 }
 
 /// Render one 256² / 4-step t2i and return (image, peak GPU GB) for this load tier.

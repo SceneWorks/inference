@@ -90,6 +90,7 @@ fn audio_stub_caps() -> Capabilities {
 
 fn stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id,
         family: "testkit",
@@ -101,6 +102,7 @@ fn stub_desc(id: &'static str) -> ModelDescriptor {
 
 fn audio_stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id,
         family: "testkit",

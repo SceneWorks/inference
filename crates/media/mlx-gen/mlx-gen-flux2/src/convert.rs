@@ -521,12 +521,42 @@ fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) ->
     Ok(())
 }
 
+/// Refuse a `src` component that is **already packed**.
+///
+/// Quantizing packed weights is not a no-op, it is garbage: the packed tensors are `u32` code
+/// words plus scales, so re-quantizing them produces shapes that survive the write and then fail
+/// several layers into the forward pass — historically an `rms_norm` size exception six seconds
+/// into a load, naming a subsystem that has nothing to do with the mistake.
+///
+/// This mirrors the load-time refusal every registry loader already gets from
+/// [`mlx_gen::quant::needs_load_time_quant`], for the offline converters, which had no equivalent
+/// check: a quant tier is a creative choice and must never be silently substituted (epic 11037
+/// SC#5). Failing here also means nothing is written, so a caller that caches its output to a
+/// stable path cannot leave a half-written garbage snapshot behind for the next run to reuse.
+fn reject_packed_source(src: &Path, component: &str, requested_bits: i32) -> Result<()> {
+    match mlx_gen::quant::packed_quant_bits_at(src)? {
+        None => Ok(()),
+        Some(packed) => Err(Error::Msg(format!(
+            "flux2: {} is already a pre-quantized Q{packed} {component}, but Q{requested_bits} \
+             pre-quantization was requested; quantizing packed weights produces garbage that only \
+             fails later, inside the forward pass. Point at a dense snapshot, or use the Q{packed} \
+             snapshot as-is.",
+            src.display()
+        ))),
+    }
+}
+
 /// Offline one-shot: read the dense bf16 `src` **transformer** dir (sharded `*.safetensors` +
 /// `config.json`) and write a pre-quantized `dst` transformer dir — a single packed Q4/Q8
 /// `diffusion_pytorch_model.safetensors` + `config.json` (with the `quantization` manifest). The
 /// VAE / tokenizer / scheduler are unchanged; the caller copies or symlinks them alongside to
 /// complete the turnkey snapshot. `group_size` is the mflux/reference default of 64.
+///
+/// Errors, writing nothing, when `src` is already a packed snapshot: re-quantizing packed weights
+/// produces garbage that only fails later, inside the forward pass, so the converter refuses rather
+/// than substituting a tier (epic 11037 SC#5).
 pub fn quantize_flux2_dit(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
+    reject_packed_source(src, "transformer", bits)?;
     std::fs::create_dir_all(dst)?;
     let map = load_dir_map(src)?;
     let quantized = quantize_flux2_transformer(map, bits, group_size)?;
@@ -539,12 +569,17 @@ pub fn quantize_flux2_dit(src: &Path, dst: &Path, bits: i32, group_size: i32) ->
 /// text_encoder dir — a single packed `model.safetensors` + `config.json` (with the `quantization`
 /// manifest). The unused Pixtral vision tower / projector tensors pass through dense (they are
 /// small relative to the language tower and reserved for the edit path, sc-5919).
+///
+/// Errors, writing nothing, when `src` is already a packed snapshot: re-quantizing packed weights
+/// produces garbage that only fails later, inside the forward pass, so the converter refuses rather
+/// than substituting a tier (epic 11037 SC#5).
 pub fn quantize_flux2_text_encoder_dir(
     src: &Path,
     dst: &Path,
     bits: i32,
     group_size: i32,
 ) -> Result<()> {
+    reject_packed_source(src, "text_encoder", bits)?;
     std::fs::create_dir_all(dst)?;
     let map = load_dir_map(src)?;
     let quantized = quantize_flux2_text_encoder(map, bits, group_size)?;
@@ -558,6 +593,69 @@ mod tests {
     use super::*;
     use mlx_rs::ops::{all_close, quantize};
     use mlx_rs::Dtype;
+
+    /// Write a component dir holding only a `config.json` — enough for the packed-source guard,
+    /// which reads the marker and nothing else. No weights, no device, no GPU.
+    fn component_dir(name: &str, config: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mlx_gen_flux2_guard_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        dir
+    }
+
+    /// The real failure this guard closes: `flux2-dev-q8` is already Q8-packed, a harness asks for
+    /// Q4 over it, and the run dies inside `rms_norm` six seconds later with a message about the
+    /// wrong subsystem. Refuse it up front, naming both tiers and the fix.
+    #[test]
+    fn prequantizing_a_packed_source_is_refused() {
+        let src = component_dir(
+            "packed",
+            r#"{"quantization": {"bits": 8, "group_size": 64}}"#,
+        );
+        let dst =
+            std::env::temp_dir().join(format!("mlx_gen_flux2_guard_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+
+        let err = quantize_flux2_dit(&src, &dst, 4, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Q8"), "must name the on-disk tier: {err}");
+        assert!(err.contains("Q4"), "must name the requested tier: {err}");
+        assert!(
+            !dst.exists(),
+            "a refused conversion must write nothing, so a cached dst cannot hold garbage"
+        );
+
+        // The text-encoder converter carries the identical guard.
+        assert!(quantize_flux2_text_encoder_dir(&src, &dst, 4, 64).is_err());
+        assert!(!dst.exists());
+
+        std::fs::remove_dir_all(&src).unwrap();
+    }
+
+    /// A dense source has no `quantization` marker and must pass the guard untouched — the guard
+    /// only rejects, it never decides a tier. (It fails later for want of weights, which is a
+    /// different error and proves the guard let it through.)
+    #[test]
+    fn a_dense_source_passes_the_guard() {
+        let dense = component_dir("dense", r#"{"_class_name": "Flux2Transformer2DModel"}"#);
+        assert!(mlx_gen::quant::packed_quant_bits_at(&dense)
+            .unwrap()
+            .is_none());
+
+        let no_config =
+            std::env::temp_dir().join(format!("mlx_gen_flux2_guard_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&no_config);
+        std::fs::create_dir_all(&no_config).unwrap();
+        assert!(mlx_gen::quant::packed_quant_bits_at(&no_config)
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&dense).unwrap();
+        std::fs::remove_dir_all(&no_config).unwrap();
+    }
 
     /// Exact (bit-equal) array comparison via `all_close` with zero tolerance.
     fn exact_eq(a: &Array, b: &Array) -> bool {

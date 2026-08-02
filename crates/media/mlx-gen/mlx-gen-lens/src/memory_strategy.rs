@@ -7,9 +7,9 @@
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Result as CoreResult,
-    TransformerComponent,
+    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
@@ -97,50 +97,25 @@ pub(crate) fn safety_check(
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let Some(calibration) = contract.calibration.as_ref() else {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: no calibration identity declared", contract.provider_id),
-        };
-    };
-    if context.calibration_abi != calibration.abi
-        || context.calibration_fingerprint != calibration.fingerprint
-    {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{}: calibration handshake mismatch", contract.provider_id),
-        };
-    }
-    if context.use_pid {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
+    let route_gate = || {
+        if context.use_pid {
+            return Err(CoreError::Unsupported(format!(
                 "{}: the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay",
                 contract.provider_id
-            ),
-        };
-    }
-    if context.selection.tier.precision != precision || context.selection.tier.quant != quant {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: request tier {:?} does not match loaded {precision:?}/{quant:?}",
-                contract.provider_id, context.selection.tier
-            ),
-        };
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{}: predicted peak {} exceeds effective budget {}",
-                contract.provider_id,
-                context.predicted_peak_bytes,
-                context.budget.effective_bytes()
-            ),
-        };
-    }
-    MemorySafetyDecision::Accept
+            )));
+        }
+        Ok(())
+    };
+    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(MemoryNumericTier {
+            precision,
+            quant,
+            component_precision_floors: &[],
+        }),
+        Some(&route_gate),
+    )
 }
 
 pub(crate) fn registered_safety_check(

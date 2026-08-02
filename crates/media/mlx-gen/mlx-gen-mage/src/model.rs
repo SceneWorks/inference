@@ -351,6 +351,7 @@ const EDIT_IDENTITY_SHA256: &str =
 /// the published configs.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage
         // variants — only the 8.232 GB DiT differs — so the SceneWorks mirrors host them once in a
         // shared components repo and stage them as caller-provisioned co-requisite dirs
@@ -722,36 +723,33 @@ fn request_context_error(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> Option<String> {
-    if context.selection.tier.precision != Precision::Bf16 || context.selection.tier.quant != tier {
-        return Some(format!(
-            "{provider_id}: request tier {:?} does not match loaded BF16/{tier:?}",
-            context.selection.tier
-        ));
-    }
     let expected_mode = if variant.is_edit() {
         MemoryMode::Edit
     } else {
         MemoryMode::TextToImage
     };
-    if context.mode != expected_mode {
-        return Some(format!(
-            "{provider_id}: request mode {:?} does not match {expected_mode:?}",
-            context.mode
-        ));
-    }
-    if context.calibration_abi != mlx_gen::gen_core::MEMORY_CALIBRATION_ABI
-        || context.calibration_fingerprint != MEMORY_CALIBRATION_FINGERPRINT
+    let route_gate = || {
+        if context.mode != expected_mode {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: request mode {:?} does not match {expected_mode:?}",
+                context.mode
+            )));
+        }
+        Ok(())
+    };
+    if let MemorySafetyDecision::Reject { reason } =
+        mlx_gen::gen_core::standard_memory_strategy_safety_check(
+            contract,
+            context,
+            Some(mlx_gen::gen_core::MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: tier,
+                component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+            }),
+            Some(&route_gate),
+        )
     {
-        return Some(format!(
-            "{provider_id}: request calibration identity {}/{:?} does not match provider {}/{:?}",
-            context.calibration_abi,
-            context.calibration_fingerprint,
-            mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            MEMORY_CALIBRATION_FINGERPRINT
-        ));
-    }
-    if let Err(error) = contract.validate_selection(&context.selection) {
-        return Some(error.to_string());
+        return Some(reason);
     }
     if context.budget.total_bytes == 0 {
         return Some(format!("{provider_id}: request budget is unavailable"));
@@ -778,13 +776,6 @@ fn request_context_error(
             required_total_peak_bytes,
             maximum_resident_credit,
             context.budget.committed_bytes
-        ));
-    }
-    if !context.budget.fits(context.predicted_peak_bytes) {
-        return Some(format!(
-            "{provider_id}: predicted incremental peak {} exceeds effective budget {}",
-            context.predicted_peak_bytes,
-            context.budget.effective_bytes()
         ));
     }
     None
@@ -1235,7 +1226,7 @@ mod tests {
         assert!(matches!(
             registered,
             MemorySafetyDecision::Reject { reason }
-                if reason.contains("does not match loaded BF16/Some(Q8)")
+                if reason.contains("does not match loaded tier")
         ));
         assert!(request_context_error(
             "mage_flow",
@@ -1248,6 +1239,7 @@ mod tests {
 
         let mut wrong_identity = valid.clone();
         wrong_identity.calibration_fingerprint = "stale".to_owned();
+        wrong_identity.mode = MemoryMode::Edit;
         assert!(request_context_error(
             "mage_flow",
             MageVariant::Rl,
@@ -1256,7 +1248,20 @@ mod tests {
             &wrong_identity
         )
         .unwrap()
-        .contains("calibration identity"));
+        .contains("calibration handshake mismatch"));
+
+        let mut wrong_tier_and_mode = valid.clone();
+        wrong_tier_and_mode.selection.tier.quant = Some(Quant::Q8);
+        wrong_tier_and_mode.mode = MemoryMode::Edit;
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &wrong_tier_and_mode
+        )
+        .unwrap()
+        .contains("does not match loaded tier"));
 
         let mut zero_zero = valid.clone();
         zero_zero.budget.total_bytes = 0;

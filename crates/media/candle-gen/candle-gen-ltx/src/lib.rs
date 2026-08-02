@@ -459,6 +459,7 @@ impl Generator for LtxGenerator {
 /// supported through the shared additive adapter core.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "ltx",
