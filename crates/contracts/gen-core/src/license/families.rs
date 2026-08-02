@@ -772,7 +772,8 @@ pub const IDEOGRAM_4_NON_COMMERCIAL: LicenseFamily = LicenseFamily {
         },
         // §3(iii) "you retain in all copies of the Model or Model Derivatives that you Distribute
         // the following attribution notice within a \"Notice\" text file that accompanies such
-        // copy".
+        // copy". The clause prescribes the notice's exact wording; the component rows carry it
+        // complete — see `IDEOGRAM_4_PRESCRIBED_NOTICE` in `license::components`.
         LicenseTerm::NoticeFileRequired,
         // Same §3(iii) clause, which names it an "attribution notice" — see the U11 note above.
         LicenseTerm::AttributionRequired,
@@ -812,6 +813,18 @@ pub const IDEOGRAM_4_NON_COMMERCIAL: LicenseFamily = LicenseFamily {
 /// and are ungated. Meta licenses SAM 2.1 and SAM 3 differently; this family covers `facebook/sam3`
 /// **only**.
 ///
+/// # The acknowledgement duty is conditional — U8's shape, applied
+///
+/// [`LicenseTerm::AttributionRequired`] is deliberately **not** transcribed. §1(b)(ii)'s
+/// acknowledgement duty binds only on submitting research for publication, while the typed term
+/// reads as an unconditional duty on every use — so transcribing it that way would make every SAM 3
+/// render's derived union name an obligation this text does not impose on it. That is the same
+/// defect sc-16662's open item **U8** settled for [`LLAMA_3_1_COMMUNITY`]: a 700M-MAU threshold is
+/// not a [`LicenseTerm::RevenueCeiling`] because the typed term would be a false transcription, so
+/// the condition is disclosed verbatim as a [`LicenseTerm::DeployerObligation`] instead. This family
+/// applies that existing decision; it does not make a new one. The duty is disclosed in full, with
+/// its condition intact, rather than dropped.
+///
 /// # What the text does not say
 ///
 /// No notice file (`Notice` does not occur), no acceptable-use policy (§1(b)(iii)–(v) enumerate
@@ -833,15 +846,17 @@ pub const META_SAM_LICENSE: LicenseFamily = LicenseFamily {
         LicenseTerm::DownstreamLicenseCopy {
             family: "meta-sam-license",
         },
-        // §1(b)(ii) "If you submit for publication the results of research you perform on, using, or
-        // otherwise in connection with SAM Materials, you must acknowledge the use of SAM Materials
-        // in your publication."
-        //
-        // Flagged as a judgement call by the evidence pack: the duty is real but conditional on
-        // publishing research, which is narrower than any attribution clause in the sixteen families
-        // sc-16662 landed. It is transcribed because the vocabulary carries no narrower variant, and
-        // the condition is recorded here rather than dropped.
-        LicenseTerm::AttributionRequired,
+        // §1(b)(ii), quoted in full (the source sentence carries no elision). The duty is real but
+        // conditional on publishing research, and the vocabulary carries no conditional attribution
+        // variant — so it is disclosed verbatim rather than flattened into AttributionRequired,
+        // which would assert an unconditional duty the text does not impose. Same move, same reason
+        // as LLAMA_3_1_COMMUNITY's MAU threshold (U8); see the doc comment above.
+        LicenseTerm::DeployerObligation {
+            text:
+                "If you submit for publication the results of research you perform on, using, or \
+                   otherwise in connection with SAM Materials, you must acknowledge the use of SAM \
+                   Materials in your publication.",
+        },
     ],
 };
 
@@ -1420,7 +1435,10 @@ mod tests {
                 vec![
                     "downstream_restrictions:meta-sam-license",
                     "downstream_license_copy:meta-sam-license",
-                    "attribution_required",
+                    // §1(b)(ii)'s acknowledgement duty, conditional on publishing research. Not
+                    // `attribution_required`: the typed term would assert an unconditional duty —
+                    // U8's shape, applied. See META_SAM_LICENSE's doc comment.
+                    "deployer_obligation:If you submit for publication the results of res",
                 ],
             ),
             ("mit", vec!["attribution_required"]),

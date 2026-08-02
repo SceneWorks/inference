@@ -494,7 +494,15 @@ attribution notice (same U11 hook as FLUX.2 above):
 
 > "you retain in all copies of the Model or Model Derivatives that you Distribute the following
 > attribution notice within a \"Notice\" text file that accompanies such copy: \"Ideogram 4 is
-> provided under and subject to the Ideogram Non-Commercial Model Agreement…\""
+> provided under and subject to the Ideogram Non-Commercial Model Agreement available at
+> https://github.com/ideogram-oss/ideogram-4/model_licenses/LICENSE-IDEOGRAM-4-NON-COMMERCIAL. All
+> rights reserved. Copyright © Ideogram, Inc.\""
+
+The prescribed notice is quoted **complete** here — an earlier pass of this note recorded it elided
+at "…Model Agreement…", and the component rows had landed that prefix as if it were the whole
+notice. Re-read 2026-08-02 at the same `sha` `ee79a7237b519f1402ceacf952f30c8a31ec5073`; both rows
+now carry the full string from one shared constant, so a drift job comparing the landed attribution
+against §3(iii) matches.
 
 **`AcceptableUsePolicy{Some("https://ideogram.ai/legal/usage-policy")}`** — §4, and here the URL is
 **in the licence text itself**, not merely in a gate prompt:
@@ -538,12 +546,20 @@ opposite of what "a bespoke Meta licence" might be assumed to mean, and worth st
 > party, you may only do so under the terms of this Agreement and you shall provide a copy of this
 > Agreement with any such SAM Materials."
 
-**`AttributionRequired`** — §1(b)(ii). **Flagged as a judgement call**: the duty is real but
-conditional on publishing research, which is narrower than any attribution clause in the landed
-sixteen:
+**`DeployerObligation`** — §1(b)(ii), quoted in full (the sentence carries no elision):
 
 > "If you submit for publication the results of research you perform on, using, or otherwise in
 > connection with SAM Materials, you must acknowledge the use of SAM Materials in your publication."
+
+**No `AttributionRequired`** — and this is **U8 applied, not a new decision**. The duty above is
+real, but it binds only on submitting research for publication, while `AttributionRequired` reads as
+an unconditional duty on every use; landing it would make every SAM 3 render's derived union name an
+obligation this text does not impose on it. sc-16662's open item **U8** already settled that shape
+for `llama-3-1-community`: a 700M-MAU threshold is not a `RevenueCeiling` because the typed term
+would be "a false transcription", so the condition is disclosed verbatim as a `DeployerObligation`
+instead. The same reasoning selects the same shape here. The duty is disclosed with its condition
+intact rather than dropped, and `facebook/sam3`'s component row therefore carries
+`attribution: None`.
 
 **No `NoticeFileRequired`** — the text names no notice file; `Notice` does not occur.
 **No `AcceptableUsePolicy`** — §1(b)(iii)–(v) enumerate restrictions inline (trade controls, ITAR,
@@ -606,7 +622,7 @@ model card, `https://huggingface.co/<repo>`. All `gated: False` unless noted.
 | 46 | `Wan-AI/Wan2.2-TI2V-5B` (+ `-Diffusers`) | `apache-2.0` | |
 | 47 | `Wan-AI/Wan2.2-T2V-A14B` (+ `-Diffusers`) | `apache-2.0` | see the Wan output quote below |
 | 48 | `Wan-AI/Wan2.2-I2V-A14B` (+ `-Diffusers`) | `apache-2.0` | |
-| 49 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` / `-14B-diffusers` | `apache-2.0` | |
+| 49 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` and `Wan-AI/Wan2.1-VACE-14B-diffusers` | `apache-2.0` | Two rows, two repositories, **both ids spelled in full** — each card was read on its own, not inferred from its sibling: 1.3B at `sha` `ec4d2cb0…`, 14B at `sha` `db79b90c…`, both `2026-08-02`, both front matter `license: apache-2.0`. The shorthand this row previously used (`-14B-diffusers`) left `WAN2_1_VACE_14B_DIFFUSERS`'s `source_url` as the only one of the 71 whose repository id the evidence never spelled out |
 | 50 | `alibaba-pai/Wan2.2-VACE-Fun-A14B` | `apache-2.0` | |
 | 55 | `alibaba-pai/Qwen-Image-2512-Fun-Controlnet-Union` | `apache-2.0` | confirms the crate rustdoc |
 | 56 | `alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1` | `apache-2.0` | |
@@ -952,7 +968,7 @@ architecture at most, never a repository id.
 A dead `source_url` in a drift-checking table is worse than no row, and `ComponentLicense::source_url`
 cannot be null — so these could not be written even as placeholders.
 
-## AMBIGUOUS — two primary sources disagree, or the family is genuinely open (7 keys)
+## AMBIGUOUS — two primary sources disagree, or the family is genuinely open (5 keys)
 
 | key | why | see |
 | --- | --- | --- |
@@ -961,16 +977,26 @@ cannot be null — so these could not be written even as placeholders.
 | `flux2_dev_fun_controlnet_union` | ships BFL **v2.0** while BFL's own repos ship v2.1; one family or two is open | [X9](#x9-a-third-bfl-licence-version-is-in-circulation-v20-inside-an-alibaba-pai-controlnet) |
 | `boogu_flux1_vae` | FLUX.1 \[dev\] (non-commercial) or FLUX.1-schnell (Apache-2.0) — never stated. **The epic's own worked example** | [X5](#x5-boogu-declares-apache-20-over-a-flux1-vae-it-does-not-identify) |
 | `amoral_gemma_3_12b_v2_mlx_4bit` | a Gemma-3 derivative declaring `apache-2.0` | [X11](#x11-theclusteramoral-gemma-3-12b-v2-mlx-4bit-declares-apache-20-not-gemma) |
-| `stable_diffusion_3_5_large_turbo`, `stable_diffusion_3_5_medium` | **new to this section.** Both are governed by the Stability AI Community License and sc-16662 recorded a declared string for `stable-diffusion-3.5-large` only (`stabilityai-ai-community`). Assuming the siblings declare the same string is plausible and unverified, so no row was written. This is the cheapest hole on the list to close: one card read each |
 
-## NO DECLARED STRING — a restriction in prose, with no identifier to transcribe (2 keys)
+## NO DECLARED STRING — no string to transcribe as `declared` (4 keys)
 
-`antelopev2_arcface_glintr100` and `antelopev2_scrfd_10g`. The *family* is settled
-(`insightface-research-only`, whose `text_url` is already landed), and these carry the strictest
-terms in the catalog — but insightface publishes **no licence document for the models**, only README
-prose. `ComponentLicense::declared` is "the licence identifier as declared upstream, verbatim", and
-there is no identifier to transcribe; a prose fragment is a quote, not an identifier. One line from
-Michael closes this.
+Two shapes, one class: the upstream publishes prose with no identifier behind it, or no declared
+string was recorded by a read. Neither is AMBIGUOUS — nothing disagrees, there is simply no string.
+The distinction is what tells a reader which holes need research and which need a one-line decision.
+
+**Prose with no identifier —** `antelopev2_arcface_glintr100` and `antelopev2_scrfd_10g`. The
+*family* is settled (`insightface-research-only`, whose `text_url` is already landed), and these
+carry the strictest terms in the catalog — but insightface publishes **no licence document for the
+models**, only README prose. `ComponentLicense::declared` is "the licence identifier as declared
+upstream, verbatim", and there is no identifier to transcribe; a prose fragment is a quote, not an
+identifier. One line from Michael closes this.
+
+**None recorded by a read —** `stable_diffusion_3_5_large_turbo` and `stable_diffusion_3_5_medium`.
+Both are governed by the Stability AI Community License and sc-16662 recorded a declared string for
+`stable-diffusion-3.5-large` only (`stabilityai-ai-community`). Assuming the siblings declare the
+same string is plausible and unverified, so no row was written. **Reclassified from AMBIGUOUS**: the
+stated reason was always "no declared string recorded", which is this class — nothing about these
+two is in dispute. This is the cheapest hole on the list to close: one card read each.
 
 ## SECOND-HAND ONLY — the only declaration is this repository's own record (2 keys)
 
@@ -1004,3 +1030,11 @@ in the code:
 4. **`attribution` is `Some` exactly where the family requires it**, and a test enforces both
    directions. An attribution on a row whose licence asks for none would read as an obligation the
    text never stated.
+5. **U8 was applied, not re-decided.** `meta-sam-license` carries §1(b)(ii)'s acknowledgement duty as
+   a quoted `DeployerObligation` and **no** `AttributionRequired`, because the duty binds only on
+   submitting research for publication while the typed term reads as unconditional. That is the rule
+   sc-16662's U8 already set for `llama-3-1-community`'s 700M-MAU threshold — a typed term that
+   overstates the text is a false transcription, so the condition is disclosed verbatim instead. Two
+   families, one rule; no new decision was taken here. `facebook/sam3` therefore carries
+   `attribution: None`, and its render's derived union no longer names an attribution obligation the
+   licence does not impose on rendering.

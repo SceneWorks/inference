@@ -69,7 +69,9 @@
 //! on every row whose family does not. The conformance gate enforces the first half; the test module
 //! here enforces the second, so an attribution never silently implies an obligation the text does
 //! not state. Where a licence prescribes the notice's wording, the prescribed wording is used
-//! verbatim (`ideogram-4-non-commercial` §3(iii)); otherwise the string follows the house shape the
+//! verbatim and **in full** — one text does, `ideogram-4-non-commercial` §3(iii), and both its rows
+//! share one `IDEOGRAM_4_PRESCRIBED_NOTICE` constant so neither can drift into a fragment of it.
+//! Otherwise the string follows the house shape the
 //! audio lane established, naming the artifact, the publisher as the repository publishes it, and
 //! the licence.
 //!
@@ -86,7 +88,7 @@
 //! | UNDETERMINED | the upstream repository could not be named | FLUX.2's Mistral3 / Pixtral / Qwen3 towers, Anima's Qwen3-0.6B, the four vendor Qwen3-VL towers, PiD's five bundled VAEs |
 //! | NOT FOUND | the upstream is known and declares nothing re-readable | `Kwai-Kolors/Kolors-ControlNet-Pose`, the six `microsoft/Mage-Flow*` repos (404), `microsoft/Lens*` (404), `openai/clip-vit-large-patch14` |
 //! | AMBIGUOUS | two primary sources disagree, or the family is genuinely open | `Kwai-Kolors/Kolors-diffusers` (U6), `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union` (BFL v2.0 vs v2.1), Boogu's FLUX.1 VAE (dev vs schnell) |
-//! | NO DECLARED STRING | the upstream states a restriction in prose and publishes no identifier | the two antelopev2 rows |
+//! | NO DECLARED STRING | there is no string to transcribe as `declared` — the upstream publishes prose with no identifier behind it, or no declared string was recorded by a read | the two antelopev2 rows; the SD3.5 `-large-turbo` and `-medium` siblings |
 //! | SECOND-HAND ONLY | the only declaration is this repository's own record | `fancyfeast/llama-joycaption-beta-one-hf-llava`, `depth-anything/Depth-Anything-V2-Small-hf` |
 //!
 //! Six questions are on Michael's sign-off list and are **not** answered here: the Boogu FLUX.1-VAE
@@ -456,6 +458,22 @@ pub const HYPER_SD_FLUX1_DEV_8STEPS_LORA: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
+/// The attribution notice `ideogram-4-non-commercial` §3(iii) prescribes — **complete**, not a
+/// leading fragment.
+///
+/// Both Ideogram rows carry this one string because the licence prescribes the notice's wording
+/// rather than leaving it to the distributor: §3(iii) requires "the following attribution notice
+/// within a \"Notice\" text file that accompanies such copy", and what follows, between the source's
+/// own curly quotes, is exactly this text. Read from `ideogram-ai/ideogram-4-fp8` `LICENSE.md` at
+/// `sha` `ee79a7237b519f1402ceacf952f30c8a31ec5073` on 2026-08-02 under an authenticated session.
+///
+/// Shared rather than written twice so the two rows cannot drift from each other, and so a job
+/// comparing the landed string against the upstream clause has one place to compare.
+const IDEOGRAM_4_PRESCRIBED_NOTICE: &str = "Ideogram 4 is provided under and subject to the \
+    Ideogram Non-Commercial Model Agreement available at \
+    https://github.com/ideogram-oss/ideogram-4/model_licenses/LICENSE-IDEOGRAM-4-NON-COMMERCIAL. \
+    All rights reserved. Copyright © Ideogram, Inc.";
+
 /// `ideogram-ai/ideogram-4-fp8` — the conditional DiT, the unconditional DiT, the text encoder and
 /// the VAE.
 ///
@@ -469,9 +487,7 @@ pub const IDEOGRAM_4_FP8: ComponentLicense = ComponentLicense {
     gated: true,
     declared: "ideogram-4-non-commercial",
     family: "ideogram-4-non-commercial",
-    attribution: Some(
-        "Ideogram 4 is provided under and subject to the Ideogram Non-Commercial Model Agreement",
-    ),
+    attribution: Some(IDEOGRAM_4_PRESCRIBED_NOTICE),
     retrieved: "2026-08-02",
 };
 
@@ -483,9 +499,7 @@ pub const IDEOGRAM_4_TURBOTIME_LORA: ComponentLicense = ComponentLicense {
     gated: false,
     declared: "ideogram-4-non-commercial",
     family: "ideogram-4-non-commercial",
-    attribution: Some(
-        "Ideogram 4 is provided under and subject to the Ideogram Non-Commercial Model Agreement",
-    ),
+    attribution: Some(IDEOGRAM_4_PRESCRIBED_NOTICE),
     retrieved: "2026-08-02",
 };
 
@@ -746,13 +760,20 @@ pub const SAM2_1_HIERA_LARGE: ComponentLicense = ComponentLicense {
 /// document's own title and `source_url` is that document. Gated for **manual** approval, which
 /// [`ComponentLicense::gated`] records as a plain `true` — whether a gate is click-through or
 /// human-reviewed is not a distinction this field carries.
+///
+/// `attribution` is `None`: the SAM License's only acknowledgement duty (§1(b)(ii)) binds on
+/// submitting research for publication, not on rendering, so
+/// [`META_SAM_LICENSE`](super::families::META_SAM_LICENSE) carries it as a quoted
+/// [`DeployerObligation`](super::LicenseTerm::DeployerObligation) rather than
+/// [`AttributionRequired`](super::LicenseTerm::AttributionRequired). A string here would name an
+/// obligation the text does not impose on a render.
 pub const SAM3: ComponentLicense = ComponentLicense {
     component: "sam3",
     source_url: "https://huggingface.co/facebook/sam3/blob/main/LICENSE",
     gated: true,
     declared: "SAM License",
     family: "meta-sam-license",
-    attribution: Some("SAM 3 © Meta Platforms, Inc. — licensed under the SAM License"),
+    attribution: None,
     retrieved: "2026-08-02",
 };
 
@@ -938,6 +959,11 @@ pub const WAN2_1_T2V_14B_DIFFUSERS: ComponentLicense = ComponentLicense {
 };
 
 /// `Wan-AI/Wan2.1-VACE-14B-diffusers` — transformer only; the base trio is shared.
+///
+/// Read on its own, not inferred from its 1.3B sibling: card `sha`
+/// `db79b90c60bbb45ceec9e41b9d5a4df934538ac4`, front matter `license: apache-2.0`. The evidence
+/// note's row 49 spells both repository ids in full for the same reason — a `retrieved` date has to
+/// stand for a read that actually happened against the id in `source_url`.
 pub const WAN2_1_VACE_14B_DIFFUSERS: ComponentLicense = ComponentLicense {
     component: "wan2_1_vace_14b_diffusers",
     source_url: "https://huggingface.co/Wan-AI/Wan2.1-VACE-14B-diffusers",
@@ -950,7 +976,8 @@ pub const WAN2_1_VACE_14B_DIFFUSERS: ComponentLicense = ComponentLicense {
 
 /// `Wan-AI/Wan2.1-VACE-1.3B-diffusers`. Two rows rather than one for the census's single VACE line:
 /// 1.3B and 14B are different models in different repositories, which is the granularity the licence
-/// attaches at.
+/// attaches at — and each was read at its own repository, card `sha`
+/// `ec4d2cb062b548996b179d493fdd05340de702a1` here.
 pub const WAN2_1_VACE_1_3B_DIFFUSERS: ComponentLicense = ComponentLicense {
     component: "wan2_1_vace_1_3b_diffusers",
     source_url: "https://huggingface.co/Wan-AI/Wan2.1-VACE-1.3B-diffusers",
@@ -1238,9 +1265,11 @@ mod tests {
     ///
     /// The conformance gate enforces one direction (a requiring family implies a non-blank string).
     /// This enforces the other, so a helpful-looking attribution never appears on a row whose text
-    /// does not ask for one and imply an obligation the licence never stated. Four families in this
-    /// table require none: `flux-1-dev-non-commercial`, `gemma-terms`, and — reachable only through
-    /// rows this table does not yet carry — `insightface-research-only` and `apple-mlr`.
+    /// does not ask for one and imply an obligation the licence never stated. Five families in this
+    /// table require none: `flux-1-dev-non-commercial`, `gemma-terms`, `meta-sam-license` (whose
+    /// acknowledgement duty is conditional on publishing research and is carried as a quoted
+    /// [`LicenseTerm::DeployerObligation`] instead), and — reachable only through rows this table
+    /// does not yet carry — `insightface-research-only` and `apple-mlr`.
     #[test]
     fn attribution_is_present_exactly_where_the_family_requires_it() {
         let mut without: Vec<&str> = Vec::new();
@@ -1272,6 +1301,7 @@ mod tests {
                 "gemma_2_2b_it",
                 "gemma_3_12b_it",
                 "hyper_sd_flux1_dev_8steps_lora",
+                "sam3",
                 "xlabs_flux_ip_adapter",
             ]
         );
@@ -1406,8 +1436,9 @@ mod tests {
     /// Every key below is a component the media lane demonstrably loads and for which the evidence
     /// pass could **not** produce a licence: the upstream could not be named (UNDETERMINED), the
     /// upstream declares nothing re-readable (NOT FOUND), two primary sources disagree (AMBIGUOUS),
-    /// the upstream publishes a restriction in prose with no identifier to transcribe, or the only
-    /// declaration is this repository's own record. Each is enumerated in
+    /// there is no string to transcribe as `declared` (NO DECLARED STRING — either prose with no
+    /// identifier behind it, or none recorded by a read), or the only declaration is this
+    /// repository's own record (SECOND-HAND ONLY). Each is enumerated in
     /// `docs/licensing/sc-16665-checkpoint-licence-evidence.md`.
     ///
     /// Omitting them is the designed outcome, not an oversight: sc-16669's ship gate reports a
@@ -1482,15 +1513,20 @@ mod tests {
                 "amoral_gemma_3_12b_v2_mlx_4bit",
                 "AMBIGUOUS — a Gemma-3 derivative declaring `apache-2.0`",
             ),
+            // --- NO DECLARED STRING: nothing to transcribe as `declared` --------------------
+            // Two shapes reach this class. The insightface rows have a restriction stated in
+            // README prose with no identifier behind it; the two SD3.5 siblings simply had no
+            // declared string recorded by a primary-source read. Neither is AMBIGUOUS: nothing
+            // disagrees, there is just no string. The distinction matters to a reader triaging
+            // these — an AMBIGUOUS hole needs a decision, one of these needs a read.
             (
                 "stable_diffusion_3_5_large_turbo",
-                "AMBIGUOUS — no declared string recorded by a primary-source read",
+                "NO DECLARED STRING — none recorded by a primary-source read",
             ),
             (
                 "stable_diffusion_3_5_medium",
-                "AMBIGUOUS — no declared string recorded by a primary-source read",
+                "NO DECLARED STRING — none recorded by a primary-source read",
             ),
-            // --- NO DECLARED STRING: a restriction in prose, with no identifier -------------
             (
                 "antelopev2_arcface_glintr100",
                 "NO DECLARED STRING — insightface publishes README prose, not an identifier",
