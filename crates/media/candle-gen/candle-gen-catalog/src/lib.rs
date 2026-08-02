@@ -7,6 +7,8 @@
 pub use candle_gen as media;
 pub use candle_gen::gen_core::{ProviderRegistry, ProviderRegistryBuilder};
 
+pub mod licenses;
+
 /// Complete backend package surface owned by the Candle runtimes.
 ///
 /// Some modules are ordinary registry providers; `depth`, `face`, `instantid`, `pid`, `pulid`, and
@@ -83,6 +85,60 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
 /// Build the complete explicit Candle media provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
+}
+
+// -------------------------------------------------------------------------------------------------
+// Model-weight licence surface (sc-16667) — the Candle media half.
+//
+// DISCLOSURE ONLY. Nothing in this section blocks, gates, degrades or withholds anything, and
+// nothing added here ever should. It exists so a consumer can SHOW a user which upstream artifacts a
+// render touched and what those texts name; whether a given use is permitted is the consumer's
+// evaluation of those facts against its own situation, which this crate knows nothing about.
+//
+// Three layers (see `gen_core::license`): the reviewed licence FAMILIES, one COMPONENT row per
+// upstream checkpoint — shared with the MLX catalog, because a licence is a property of the
+// checkpoint and both engines load the same ones — and the per-backend provider→component mapping in
+// [`licenses`], whose term union is DERIVED and never hand-authored.
+// -------------------------------------------------------------------------------------------------
+
+/// The licence families every component row this catalog reaches resolves against — the reviewed
+/// unit, shared with the audio and MLX catalogs.
+pub fn license_families() -> &'static [media::gen_core::LicenseFamily] {
+    media::gen_core::LICENSE_FAMILIES
+}
+
+/// The **shared** media checkpoint table: one row per upstream artifact whose licence has been read.
+///
+/// Deliberately not per-backend and deliberately not filtered to what this catalog reaches. It is
+/// the same slice `mlx-gen-catalog` reads, so the two catalogs cannot drift into two different
+/// answers about one upstream artifact; rows no registered Candle id loads are simply unreferenced
+/// by [`provider_components`].
+pub fn component_licenses() -> &'static [media::gen_core::ComponentLicense] {
+    media::gen_core::MEDIA_COMPONENT_LICENSES
+}
+
+/// Which components each registered Candle provider id loads — the mapping
+/// [`media::gen_core::provider_terms`] derives a provider's effective terms from.
+///
+/// Nine registered ids have no row because every component they load is a pinned hole in the shared
+/// table; they are named, with reasons, in [`licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT`]. Those
+/// ids still ship and still render — a missing disclosure never withholds a provider.
+pub fn provider_components() -> &'static [media::gen_core::ProviderComponents] {
+    licenses::PROVIDER_COMPONENTS
+}
+
+/// The model-licences manifest JSON at `schema_version` 3 for **this** catalog, in the same shape
+/// the audio catalog emits and the release tooling ships beside the SPDX SBOM.
+///
+/// Not a committed artifact on its own: `release/model-weight-licenses.json` carries the audio lane
+/// today, and merging the three catalogs' manifests into one file is sc-16664's job. Output is
+/// deterministic, so a merge can compare byte-for-byte.
+pub fn component_licenses_manifest_json() -> String {
+    media::gen_core::component_licenses_manifest_json(
+        license_families(),
+        component_licenses(),
+        provider_components(),
+    )
 }
 
 /// The **advanced** quant tiers this Candle catalog surfaces beyond the universal group-wise affine
@@ -290,6 +346,31 @@ mod tests {
         );
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
+
+        // sc-16667: the pinned surface and the model-weight licence mapping move together. Every id
+        // above is either mapped to at least one shared component row or named — with a reason — in
+        // `licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT`, so adding an id here without triaging its
+        // disclosure is a failure rather than a silently empty licence page. Being on that list
+        // withholds nothing: those ids register, ship and render exactly as the others do.
+        for id in generators
+            .iter()
+            .chain(&trainers)
+            .chain(&captioners)
+            .chain(&image_embedders)
+            .chain(&text_embedders)
+        {
+            let mapped = super::provider_components()
+                .iter()
+                .any(|p| p.provider_id == id);
+            let named_hole = super::licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT
+                .iter()
+                .any(|(hole, _)| hole == id);
+            assert!(
+                mapped ^ named_hole,
+                "{id} must be exactly one of: mapped in licenses::PROVIDER_COMPONENTS, or named in \
+                 licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT"
+            );
+        }
     }
 
     #[test]
