@@ -31,8 +31,11 @@
 //! [`LicenseTerm`], [`ComponentLicense`], [`ProviderComponents`], the derived [`provider_terms`]
 //! union and [`component_licenses_manifest_json`]. It records licence *facts* instead of the legal
 //! *conclusion* `commercial_use` encodes, and keys rows by loaded artifact rather than by provider.
-//! The v2 types in the next section remain only until the audio lane migrates (sc-16663) and the
-//! release tooling moves to schema 3 (sc-16664). **Do not add v2 callers.**
+//! The v2 types in the next section — [`WeightLicense`], [`WeightLicenseEntry`] and the
+//! `schema_version: 2` emitter [`weight_licenses_manifest_json`] — remain only until the audio lane
+//! migrates (sc-16663) and the release tooling moves to schema 3 (sc-16664), which retires
+//! [`weight_licenses_manifest_json`] in favour of [`component_licenses_manifest_json`].
+//! **Do not add v2 callers.**
 
 /// The license under which a provider's **model weights** (its pinned checkpoint) are distributed.
 ///
@@ -180,9 +183,11 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 // A provider's terms are DERIVED from its components ([`provider_terms`]) and never hand-authored:
 // v2's hand-typed composite row is a second place to be wrong and can drift from its own components.
 //
-// The v2 types remain until the audio lane migrates (sc-16663) and the release tooling moves to
-// schema 3 (sc-16664); `commercial_use` has 67 usages across 18 audio provider crates, so deleting
-// it here would break the tree. v2 is superseded, not supported — do not add callers.
+// The v2 types remain until the audio lane migrates (sc-16663); `commercial_use` occurs on 48 lines
+// across 18 files in 13 crates (12 candle-audio providers plus candle-audio-catalog), so deleting it
+// here would break the tree. sc-16664 additionally retires the `schema_version: 2` emitter
+// [`weight_licenses_manifest_json`], moving the release tooling onto
+// [`component_licenses_manifest_json`]. v2 is superseded, not supported — do not add callers.
 // =================================================================================================
 
 /// A typed obligation or condition imposed by a [`LicenseFamily`].
@@ -191,8 +196,16 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 /// text; whether a given use is permitted is the consumer's evaluation of the union of these
 /// against its own situation.
 ///
-/// `Ord` is derived so a union renders deterministically.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// ## Serialized order is keyed on [`tag`](Self::tag), not on declaration order
+///
+/// A derived `Ord` would make the emitted order of a [`provider_terms`] union a function of where
+/// each variant happens to sit in this `enum`, so inserting a future variant mid-enum would silently
+/// reorder every `terms` array in the manifest and trip the committed-manifest drift gate for
+/// reasons unrelated to any licence change. `Ord` is therefore deliberately **not** derived: the
+/// union is ordered by [`sort_key`](Self::sort_key) — the stable string [`tag`](Self::tag), then the
+/// variant's payload — so adding, removing, or reordering variants moves nothing that a consumer
+/// already reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LicenseTerm {
     /// An attribution / copyright notice must be reproduced by the product.
     AttributionRequired,
@@ -247,6 +260,25 @@ impl LicenseTerm {
             Self::DeployerObligation { .. } => "deployer_obligation",
             Self::DownstreamFlowDown => "downstream_flow_down",
             Self::GatedAccess => "gated_access",
+        }
+    }
+
+    /// The total order the serialized union is emitted in: the stable [`tag`](Self::tag) first, then
+    /// the variant's payload (numeric ceilings ascending, string payloads lexicographic). Two
+    /// distinct terms never share a key, so sorting by it is deterministic without depending on the
+    /// declaration order of the `enum` — see the type-level note.
+    fn sort_key(&self) -> (&'static str, u64, &'static str) {
+        match *self {
+            Self::RevenueCeiling { amount_usd } => (self.tag(), amount_usd, ""),
+            Self::RegistrationRequired { contact } => (self.tag(), 0, contact),
+            Self::AcceptableUsePolicy { url } => (self.tag(), 0, url),
+            Self::DeployerObligation { text } => (self.tag(), 0, text),
+            Self::AttributionRequired
+            | Self::NoticeFileRequired
+            | Self::NonCommercialWeights
+            | Self::NonCommercialOutputs
+            | Self::DownstreamFlowDown
+            | Self::GatedAccess => (self.tag(), 0, ""),
         }
     }
 
@@ -337,14 +369,16 @@ impl ComponentLicense {
     /// Whether this row is well-formed against `families`: the identity fields
     /// ([`component`](Self::component), [`source_url`](Self::source_url),
     /// [`declared`](Self::declared)) are non-empty, [`family`](Self::family) resolves to a known
-    /// [`LicenseFamily`], [`retrieved`](Self::retrieved) parses as an ISO `YYYY-MM-DD` date, and a
-    /// family imposing [`LicenseTerm::AttributionRequired`] implies
-    /// [`attribution`](Self::attribution) is present.
+    /// [`LicenseFamily`], [`retrieved`](Self::retrieved) parses as a real ISO `YYYY-MM-DD` calendar
+    /// date, [`attribution`](Self::attribution) is not `Some("")`, and a family imposing
+    /// [`LicenseTerm::AttributionRequired`] implies a **non-empty**
+    /// [`attribution`](Self::attribution).
     ///
     /// Row-local counterpart to [`license_table_conformance_errors`], which runs exactly these
-    /// checks plus the table-level ones (component-key uniqueness, provider→component resolution)
-    /// and reports *why* rather than just *whether*. Prefer the table function at a catalog
-    /// boundary; this is for checking a single row in isolation.
+    /// checks plus the table-level ones (family-id and component-key uniqueness, provider-id
+    /// uniqueness, provider→component resolution) and reports *why* rather than just *whether*.
+    /// Prefer the table function at a catalog boundary; this is for checking a single row in
+    /// isolation.
     pub fn is_well_formed(&self, families: &[LicenseFamily]) -> bool {
         self.row_errors(families).is_empty()
     }
@@ -369,13 +403,21 @@ impl ComponentLicense {
                 self.retrieved
             ));
         }
+        // An `attribution: Some("")` is not an attribution — it satisfies nothing, and treating it
+        // as present would let a CC-BY-* obligation ship unrecorded behind a placeholder.
+        let attribution = self.attribution.filter(|text| !text.is_empty());
+        if self.attribution.is_some() && attribution.is_none() {
+            errors.push(format!(
+                "component {key:?} records an empty attribution string"
+            ));
+        }
         match resolve_family(families, self.family) {
             None => errors.push(format!(
                 "component {key:?} references unknown licence family {:?}",
                 self.family
             )),
             Some(family) => {
-                if family.requires_attribution() && self.attribution.is_none() {
+                if family.requires_attribution() && attribution.is_none() {
                     errors.push(format!(
                         "component {key:?} resolves to {:?}, which requires attribution, but \
                          records none",
@@ -403,8 +445,15 @@ pub struct ProviderComponents {
     pub components: &'static [&'static str],
 }
 
-/// Whether `value` is an ISO `YYYY-MM-DD` calendar date. Dependency-free on purpose — the contracts
-/// crate takes no date dependency for one field.
+/// Whether `value` is an ISO `YYYY-MM-DD` **calendar** date. Dependency-free on purpose — the
+/// contracts crate takes no date dependency for one field.
+///
+/// Calendar-accurate, not merely range-checked: month lengths and the Gregorian leap rule are
+/// applied, so `2026-02-31`, `2026-04-31` and `2026-02-29` are rejected while `2024-02-29` is
+/// accepted, and year `0000` is rejected. That matters because `retrieved` is a hand-transcribed
+/// provenance stamp that downstream tooling parses — Python's `date.fromisoformat` *raises* on
+/// `2026-02-31`, so a date this gate blessed but the calendar rejects would surface as a stack trace
+/// in the sc-16664 validator or the sc-16670 drift job instead of as a message here.
 fn is_iso_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
@@ -418,13 +467,40 @@ fn is_iso_date(value: &str) -> bool {
         return false;
     }
     let number = |from: usize, to: usize| value[from..to].parse::<u32>().unwrap_or(0);
-    let (month, day) = (number(5, 7), number(8, 10));
-    (1..=12).contains(&month) && (1..=31).contains(&day)
+    let (year, month, day) = (number(0, 4), number(5, 7), number(8, 10));
+    if year == 0 || !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if leap => 29,
+        _ => 28,
+    };
+    day <= days_in_month
 }
 
-/// Look up a family by id.
+/// Look up a family by id — the **single** family-resolution path, so the id-uniqueness invariant has
+/// one enforcement point.
+///
+/// Returns the first match in input order. That is only unambiguous because
+/// [`license_table_conformance_errors`] rejects a table carrying two families with the same id: a
+/// shadowed family would otherwise make an entire set of obligations vanish from the
+/// [`provider_terms`] union depending on which order the catalogs were concatenated in. Resolve
+/// through this function rather than open-coding a scan, so that guarantee cannot be bypassed.
 pub fn resolve_family<'a>(families: &'a [LicenseFamily], id: &str) -> Option<&'a LicenseFamily> {
     families.iter().find(|family| family.id == id)
+}
+
+/// Look up a component row by key — the **single** component-resolution path, mirroring
+/// [`resolve_family`]. Component-key uniqueness is likewise enforced by
+/// [`license_table_conformance_errors`].
+pub fn resolve_component<'a>(
+    components: &'a [ComponentLicense],
+    key: &str,
+) -> Option<&'a ComponentLicense> {
+    components.iter().find(|row| row.component == key)
 }
 
 /// The union of every term imposed on `provider` by the components it loads — sorted and
@@ -435,6 +511,9 @@ pub fn resolve_family<'a>(families: &'a [LicenseFamily], id: &str) -> Option<&'a
 /// A component that does not resolve contributes nothing; use
 /// [`license_table_conformance_errors`] to reject that state at the catalog boundary rather than
 /// silently under-reporting here.
+///
+/// Ordering is by [`LicenseTerm::tag`] then payload, **not** by variant declaration order, so a
+/// future variant inserted mid-`enum` cannot reorder an already-committed manifest.
 pub fn provider_terms(
     provider: &ProviderComponents,
     components: &[ComponentLicense],
@@ -443,11 +522,11 @@ pub fn provider_terms(
     let mut terms: Vec<LicenseTerm> = provider
         .components
         .iter()
-        .filter_map(|key| components.iter().find(|row| row.component == *key))
+        .filter_map(|key| resolve_component(components, key))
         .filter_map(|row| resolve_family(families, row.family))
         .flat_map(|family| family.terms.iter().copied())
         .collect();
-    terms.sort();
+    terms.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     terms.dedup();
     terms
 }
@@ -455,18 +534,49 @@ pub fn provider_terms(
 /// Every way the licence table can be malformed, as human-readable messages — the catalog ship-gate
 /// asserts this is empty so no registered provider escapes a resolved, well-formed licence.
 ///
-/// Checks: component keys are unique and non-empty; identity fields are populated; every
-/// `family` resolves; `retrieved` is an ISO date; an attribution-requiring family implies an
-/// attribution on the row; every provider maps to at least one component and every referenced
-/// component exists.
+/// Checks, per section:
+///
+/// * **Families** — ids are non-empty and unique (a shadowed family would make an entire set of
+///   obligations vanish from the [`provider_terms`] union depending on input order, since
+///   [`resolve_family`] takes the first match); `spdx_id`, `name` and `text_url` are populated.
+/// * **Components** — keys are non-empty and unique; `source_url` and `declared` are populated;
+///   every `family` resolves; `retrieved` is a real ISO calendar date; an attribution-requiring
+///   family implies a non-empty attribution, and `Some("")` never counts as one.
+/// * **Providers** — `provider_id` is non-empty and unique (duplicates are not byte-stable under
+///   the manifest's stable sort); every provider maps to at least one component; a provider does
+///   not list the same component twice; every referenced component exists.
+///
+/// Uniqueness is checked here rather than at the lookup sites deliberately: the resolvers stay
+/// total-order-free single scans, and this is the one boundary that has the whole table in hand.
 pub fn license_table_conformance_errors(
     families: &[LicenseFamily],
     components: &[ComponentLicense],
     providers: &[ProviderComponents],
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    let mut seen: Vec<&str> = Vec::new();
 
+    let mut seen_families: Vec<&str> = Vec::new();
+    for family in families {
+        let id = family.id;
+        if id.is_empty() {
+            errors.push("licence family has an empty id".to_string());
+        } else if seen_families.contains(&id) {
+            errors.push(format!("duplicate licence family {id:?}"));
+        } else {
+            seen_families.push(id);
+        }
+        if family.spdx_id.is_empty() {
+            errors.push(format!("licence family {id:?} has no spdx_id"));
+        }
+        if family.name.is_empty() {
+            errors.push(format!("licence family {id:?} has no name"));
+        }
+        if family.text_url.is_empty() {
+            errors.push(format!("licence family {id:?} has no text_url"));
+        }
+    }
+
+    let mut seen: Vec<&str> = Vec::new();
     for row in components {
         let key = row.component;
         if key.is_empty() {
@@ -481,18 +591,29 @@ pub fn license_table_conformance_errors(
         errors.extend(row.row_errors(families));
     }
 
+    let mut seen_providers: Vec<&str> = Vec::new();
     for provider in providers {
-        if provider.components.is_empty() {
-            errors.push(format!(
-                "provider {:?} maps to no components",
-                provider.provider_id
-            ));
+        let id = provider.provider_id;
+        if id.is_empty() {
+            errors.push("provider row has an empty provider_id".to_string());
+        } else if seen_providers.contains(&id) {
+            errors.push(format!("duplicate provider row {id:?}"));
+        } else {
+            seen_providers.push(id);
         }
+        if provider.components.is_empty() {
+            errors.push(format!("provider {id:?} maps to no components"));
+        }
+        let mut seen_keys: Vec<&str> = Vec::new();
         for key in provider.components {
-            if !components.iter().any(|row| row.component == *key) {
+            if seen_keys.contains(key) {
+                errors.push(format!("provider {id:?} lists component {key:?} twice"));
+            } else {
+                seen_keys.push(key);
+            }
+            if resolve_component(components, key).is_none() {
                 errors.push(format!(
-                    "provider {:?} references unknown component {key:?}",
-                    provider.provider_id
+                    "provider {id:?} references unknown component {key:?}"
                 ));
             }
         }
@@ -893,13 +1014,37 @@ mod v3_tests {
         assert_eq!(term["amount_usd"], 1_000_000);
     }
 
+    /// Byte-stability under permutation of **every** input axis, not just the provider slice:
+    /// `FAMILIES` (which arrives pre-sorted by id, so permuting it is the only thing that exercises
+    /// the families sort at all), `COMPONENTS`, the provider slice, and the inner
+    /// `provider.components` list. sc-16664 concatenates three catalog manifests, so every one of
+    /// these arrives in an order nobody controls.
     #[test]
     fn manifest_is_deterministic_across_input_order() {
+        const PLAIN_FLUX_PERMUTED: ProviderComponents = ProviderComponents {
+            provider_id: "flux1_dev",
+            components: &["t5_xxl", "flux1_dev_dit"],
+        };
+        const IDENTITY_FLUX_PERMUTED: ProviderComponents = ProviderComponents {
+            provider_id: "pulid_flux",
+            components: &["arcface_antelopev2", "t5_xxl", "flux1_dev_dit"],
+        };
+
         let forward =
             component_licenses_manifest_json(FAMILIES, COMPONENTS, &[PLAIN_FLUX, IDENTITY_FLUX]);
-        let reversed =
-            component_licenses_manifest_json(FAMILIES, COMPONENTS, &[IDENTITY_FLUX, PLAIN_FLUX]);
-        assert_eq!(forward, reversed);
+
+        let permuted_families: Vec<LicenseFamily> = FAMILIES.iter().rev().copied().collect();
+        let permuted_components: Vec<ComponentLicense> = COMPONENTS.iter().rev().copied().collect();
+        let reversed = component_licenses_manifest_json(
+            &permuted_families,
+            &permuted_components,
+            &[IDENTITY_FLUX_PERMUTED, PLAIN_FLUX_PERMUTED],
+        );
+        assert_eq!(
+            forward, reversed,
+            "permuting families, components, providers and a provider's own component list must \
+             not change one byte of the manifest"
+        );
         assert!(forward.ends_with("}\n"));
 
         let value: serde_json::Value = serde_json::from_str(&forward).unwrap();
@@ -908,12 +1053,293 @@ mod v3_tests {
         // Providers are sorted by id: flux1_dev precedes pulid_flux.
         assert_eq!(value["providers"][0]["provider_id"], "flux1_dev");
         assert_eq!(value["providers"][1]["provider_id"], "pulid_flux");
+        // Families are sorted by id, and the permuted run above proves the sort does the work.
+        let family_ids: Vec<&str> = value["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        let mut expected = family_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(family_ids, expected);
+        // Components are sorted by key.
+        let component_keys: Vec<&str> = value["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["component"].as_str().unwrap())
+            .collect();
+        let mut expected_keys = component_keys.clone();
+        expected_keys.sort_unstable();
+        assert_eq!(component_keys, expected_keys);
     }
 
-    /// `is_well_formed` enforces exactly the four documented conditions, and agrees with the table
-    /// checker on every one of them (they share `row_errors`, and this pins that they stay tied).
+    /// A family shadowed by a second row with the same id silently changes which obligations a
+    /// provider inherits, because [`resolve_family`] takes the first match. The gate must reject the
+    /// table rather than let the join answer differently depending on concatenation order — the
+    /// exact shape sc-16662 (hand-authored families) and sc-16664 (three merged catalogs) hit.
     #[test]
-    fn is_well_formed_enforces_the_four_row_conditions() {
+    fn duplicate_family_id_is_an_error() {
+        const SHADOWED: &[LicenseFamily] = &[
+            LicenseFamily {
+                id: "ambiguous",
+                spdx_id: "LicenseRef-A",
+                name: "A",
+                text_url: "https://example.invalid/a",
+                terms: &[LicenseTerm::NonCommercialOutputs],
+            },
+            LicenseFamily {
+                id: "ambiguous",
+                spdx_id: "LicenseRef-B",
+                name: "B",
+                text_url: "https://example.invalid/b",
+                terms: &[LicenseTerm::GatedAccess],
+            },
+        ];
+        const ROWS: &[ComponentLicense] = &[ComponentLicense {
+            component: "shadowed",
+            source_url: "https://example.invalid/model",
+            declared: "ambiguous",
+            family: "ambiguous",
+            attribution: None,
+            retrieved: "2026-08-01",
+        }];
+        const PROVIDER: ProviderComponents = ProviderComponents {
+            provider_id: "shadowy",
+            components: &["shadowed"],
+        };
+
+        let errors = license_table_conformance_errors(SHADOWED, ROWS, &[PROVIDER]);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate licence family")),
+            "{errors:?}"
+        );
+
+        // And this is why: the derived union — and therefore the manifest — depends on which of the
+        // two rows came first.
+        let reversed: Vec<LicenseFamily> = SHADOWED.iter().rev().copied().collect();
+        assert_ne!(
+            provider_terms(&PROVIDER, ROWS, SHADOWED),
+            provider_terms(&PROVIDER, ROWS, &reversed)
+        );
+        assert_ne!(
+            component_licenses_manifest_json(SHADOWED, ROWS, &[PROVIDER]),
+            component_licenses_manifest_json(&reversed, ROWS, &[PROVIDER])
+        );
+    }
+
+    #[test]
+    fn empty_family_identity_fields_are_errors() {
+        let good = FAMILIES[0];
+        let cases: [(&str, LicenseFamily, &str); 4] = [
+            ("id", LicenseFamily { id: "", ..good }, "empty id"),
+            (
+                "spdx_id",
+                LicenseFamily {
+                    spdx_id: "",
+                    ..good
+                },
+                "no spdx_id",
+            ),
+            ("name", LicenseFamily { name: "", ..good }, "no name"),
+            (
+                "text_url",
+                LicenseFamily {
+                    text_url: "",
+                    ..good
+                },
+                "no text_url",
+            ),
+        ];
+        for (label, family, needle) in cases {
+            let errors = license_table_conformance_errors(&[family], &[], &[]);
+            assert!(
+                errors.iter().any(|e| e.contains(needle)),
+                "empty {label} must be reported, got {errors:?}"
+            );
+        }
+
+        // A component pointing at the empty-id family must not launder it into a conformant table.
+        const ANONYMOUS: &[LicenseFamily] = &[LicenseFamily {
+            id: "",
+            spdx_id: "LicenseRef-Anon",
+            name: "Anon",
+            text_url: "https://example.invalid/anon",
+            terms: &[],
+        }];
+        const ROW: &[ComponentLicense] = &[ComponentLicense {
+            component: "anon",
+            source_url: "https://example.invalid/model",
+            declared: "anon",
+            family: "",
+            attribution: None,
+            retrieved: "2026-08-01",
+        }];
+        assert!(
+            !license_table_conformance_errors(ANONYMOUS, ROW, &[]).is_empty(),
+            "a component resolving against an empty family id must not pass the gate"
+        );
+    }
+
+    #[test]
+    fn duplicate_provider_id_is_an_error() {
+        const A: ProviderComponents = ProviderComponents {
+            provider_id: "twice",
+            components: &["t5_xxl"],
+        };
+        const B: ProviderComponents = ProviderComponents {
+            provider_id: "twice",
+            components: &["flux1_dev_dit"],
+        };
+        let errors = license_table_conformance_errors(FAMILIES, COMPONENTS, &[A, B]);
+        assert!(
+            errors.iter().any(|e| e.contains("duplicate provider row")),
+            "{errors:?}"
+        );
+
+        // The stable sort keeps input order for equal keys, so the manifest is not byte-stable —
+        // which is what the gate above exists to prevent reaching a release.
+        assert_ne!(
+            component_licenses_manifest_json(FAMILIES, COMPONENTS, &[A, B]),
+            component_licenses_manifest_json(FAMILIES, COMPONENTS, &[B, A])
+        );
+    }
+
+    #[test]
+    fn empty_provider_id_is_an_error() {
+        const ANONYMOUS: ProviderComponents = ProviderComponents {
+            provider_id: "",
+            components: &["t5_xxl"],
+        };
+        let errors = license_table_conformance_errors(FAMILIES, COMPONENTS, &[ANONYMOUS]);
+        assert!(
+            errors.iter().any(|e| e.contains("empty provider_id")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn provider_listing_a_component_twice_is_an_error() {
+        const DOUBLED: ProviderComponents = ProviderComponents {
+            provider_id: "stutter",
+            components: &["t5_xxl", "t5_xxl"],
+        };
+        let errors = license_table_conformance_errors(FAMILIES, COMPONENTS, &[DOUBLED]);
+        assert!(
+            errors.iter().any(|e| e.contains("twice")),
+            "a duplicated component key must be reported, got {errors:?}"
+        );
+
+        // It is visible in the manifest too: the emitted list repeats the key.
+        let value: serde_json::Value = serde_json::from_str(&component_licenses_manifest_json(
+            FAMILIES,
+            COMPONENTS,
+            &[DOUBLED],
+        ))
+        .unwrap();
+        assert_eq!(
+            value["providers"][0]["components"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn empty_attribution_does_not_satisfy_attribution_required() {
+        // t5_xxl's family imposes AttributionRequired.
+        let placeholder = ComponentLicense {
+            attribution: Some(""),
+            ..COMPONENTS[1]
+        };
+        assert!(
+            !placeholder.is_well_formed(FAMILIES),
+            "an empty attribution string is not an attribution"
+        );
+        let errors = license_table_conformance_errors(FAMILIES, &[placeholder], &[]);
+        assert!(
+            errors.iter().any(|e| e.contains("requires attribution")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("empty attribution")),
+            "{errors:?}"
+        );
+
+        // Even where the family requires none, an empty string is still not a value.
+        let flux_placeholder = ComponentLicense {
+            attribution: Some(""),
+            ..COMPONENTS[0]
+        };
+        assert!(!flux_placeholder.is_well_formed(FAMILIES));
+    }
+
+    /// The emitted order of a term union is keyed on [`LicenseTerm::tag`], not on where each variant
+    /// sits in the `enum`. Pinning it here means inserting a future variant mid-declaration cannot
+    /// silently reorder an already-committed manifest and trip the drift gate.
+    #[test]
+    fn serialized_term_order_follows_tag_not_declaration_order() {
+        const MIXED: &[LicenseFamily] = &[LicenseFamily {
+            id: "mixed",
+            spdx_id: "LicenseRef-Mixed",
+            name: "Mixed",
+            text_url: "https://example.invalid/mixed",
+            // Declaration order in the enum is: AttributionRequired, NoticeFileRequired,
+            // NonCommercialWeights, …, GatedAccess (last). Tag order is alphabetical, which puts
+            // gated_access second and notice_file_required last — a different sequence.
+            terms: &[
+                LicenseTerm::GatedAccess,
+                LicenseTerm::NoticeFileRequired,
+                LicenseTerm::AttributionRequired,
+                LicenseTerm::NonCommercialWeights,
+            ],
+        }];
+        const ROWS: &[ComponentLicense] = &[ComponentLicense {
+            component: "mixed",
+            source_url: "https://example.invalid/model",
+            declared: "mixed",
+            family: "mixed",
+            attribution: Some("© Example"),
+            retrieved: "2026-08-01",
+        }];
+        const PROVIDER: ProviderComponents = ProviderComponents {
+            provider_id: "mixed",
+            components: &["mixed"],
+        };
+
+        assert!(license_table_conformance_errors(MIXED, ROWS, &[PROVIDER]).is_empty());
+
+        let value: serde_json::Value =
+            serde_json::from_str(&component_licenses_manifest_json(MIXED, ROWS, &[PROVIDER]))
+                .unwrap();
+        let tags: Vec<&str> = value["providers"][0]["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["term"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                "attribution_required",
+                "gated_access",
+                "non_commercial_weights",
+                "notice_file_required",
+            ],
+            "terms serialize in tag order; declaration order would put notice_file_required second \
+             and gated_access last"
+        );
+    }
+
+    /// `is_well_formed` enforces exactly the documented row conditions, and agrees with the table
+    /// checker on every one of them (they share `row_errors`, and this pins that they stay tied).
+    /// The empty-attribution condition has its own test below.
+    #[test]
+    fn is_well_formed_enforces_the_documented_row_conditions() {
         let good = COMPONENTS[1]; // t5_xxl: attribution-requiring family, attribution present.
         assert!(good.is_well_formed(FAMILIES));
 
@@ -1029,6 +1455,52 @@ mod v3_tests {
             retrieved: "sometime",
         }];
         let errors = license_table_conformance_errors(FAMILIES, STALE, &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("non-ISO retrieved date"), "{errors:?}");
+    }
+
+    /// A range check on month 1-12 / day 1-31 is not calendar validation. `retrieved` is
+    /// hand-transcribed and downstream tooling *parses* it — Python's `date.fromisoformat` raises on
+    /// `2026-02-31` — so a date this gate blesses but no calendar contains would fail sc-16664's
+    /// validator with a stack trace instead of a message here.
+    #[test]
+    fn impossible_calendar_dates_are_rejected() {
+        // Month lengths.
+        assert!(!is_iso_date("2026-02-31"), "February has no 31st");
+        assert!(!is_iso_date("2026-02-30"), "February has no 30th");
+        assert!(!is_iso_date("2026-04-31"), "April has 30 days");
+        assert!(!is_iso_date("2026-06-31"));
+        assert!(!is_iso_date("2026-09-31"));
+        assert!(!is_iso_date("2026-11-31"));
+        assert!(is_iso_date("2026-04-30"));
+        assert!(is_iso_date("2026-01-31"));
+        assert!(is_iso_date("2026-12-31"));
+
+        // Leap years: the Gregorian rule, not just "divisible by four".
+        assert!(!is_iso_date("2026-02-29"), "2026 is not a leap year");
+        assert!(is_iso_date("2024-02-29"), "2024 is a leap year");
+        assert!(is_iso_date("2026-02-28"));
+        assert!(
+            !is_iso_date("1900-02-29"),
+            "1900 is a century non-leap year"
+        );
+        assert!(is_iso_date("2000-02-29"), "2000 is a 400-year leap year");
+
+        // Zero components are not dates.
+        assert!(!is_iso_date("0000-01-01"), "there is no year zero here");
+        assert!(!is_iso_date("2026-00-01"), "month 0 is not a date");
+        assert!(!is_iso_date("2026-01-00"), "day 0 is not a date");
+
+        // And the gate reports it rather than passing it downstream.
+        const IMPOSSIBLE: &[ComponentLicense] = &[ComponentLicense {
+            component: "impossible",
+            source_url: "https://example.invalid/model",
+            declared: "apache-2.0",
+            family: "apache-2-0",
+            attribution: Some("© Example"),
+            retrieved: "2026-02-31",
+        }];
+        let errors = license_table_conformance_errors(FAMILIES, IMPOSSIBLE, &[]);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("non-ISO retrieved date"), "{errors:?}");
     }
