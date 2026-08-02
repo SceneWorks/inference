@@ -261,12 +261,12 @@ impl Generator for ZImageGenerator {
             return Ok(None);
         };
         memory_strategy::validate_context(MODEL_ID, contract, context, self.loaded_quant)?;
-        Ok(Some(Box::new(memory_strategy::ZImageMemoryScope::new(
+        Ok(Some(Box::new(memory_strategy::request_scope(
             MODEL_ID,
             self.device.clone(),
             contract,
             context,
-        ))))
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -625,7 +625,7 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     contract: registered_turbo_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID,

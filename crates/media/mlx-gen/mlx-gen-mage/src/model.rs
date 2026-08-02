@@ -28,11 +28,14 @@
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
-    adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, GenerationMemory,
+    adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryMode, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, Result as CoreResult,
+    MemoryFormulaVariable, MemoryMode, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, Result as CoreResult,
+};
+#[cfg(test)]
+use mlx_gen::gen_core::{
+    GenerationMemory, MemoryGeometry, MemoryRunOutcome, MemorySelection, MemoryStrategy,
 };
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
@@ -167,117 +170,6 @@ fn memory_strategy_contract_with_adapters(
         .saturating_add(components.dit)
         .saturating_add(components.vae);
     contract
-}
-
-struct MageMemoryScope {
-    selection: MemorySelection,
-    memory: Option<GenerationMemory>,
-    geometry: MemoryGeometry,
-    finished: bool,
-}
-
-impl MageMemoryScope {
-    fn ensure_active(&self) -> CoreResult<()> {
-        if self.finished {
-            Err(CoreError::Msg(
-                "mage_flow: memory-strategy request scope is already finished".into(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn synchronize_and_release(&mut self) -> CoreResult<()> {
-        // `mlx_eval` is synchronous. Evaluating a sentinel on MLX's ordered default stream is a
-        // terminal barrier for work queued by this request, including an error/cancellation exit
-        // after a progress callback. Only after that barrier may allocator-retained buffers be
-        // evicted for the next warm request.
-        let barrier = mlx_rs::Array::from(0.0_f32);
-        barrier.eval().map_err(Error::from)?;
-        drop(barrier);
-        mlx_rs::memory::clear_cache();
-        self.finished = true;
-        Ok(())
-    }
-}
-
-impl MemoryRequestScope for MageMemoryScope {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        self.ensure_active()?;
-        if self.selection.strategy != MemoryStrategy::Resident {
-            return Err(CoreError::Unsupported(
-                "mage_flow: optimized memory strategies are not implemented yet".into(),
-            ));
-        }
-        if request.width != self.geometry.width
-            || request.height != self.geometry.height
-            || request.count == 0
-            || request.count > self.geometry.batch
-        {
-            return Err(CoreError::Unsupported(format!(
-                "mage_flow: request geometry {}x{} count {} does not match admitted {}x{} count {}",
-                request.width,
-                request.height,
-                request.count,
-                self.geometry.width,
-                self.geometry.height,
-                self.geometry.batch
-            )));
-        }
-        request.memory = self.memory;
-        Ok(())
-    }
-
-    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
-        self.ensure_active()
-    }
-
-    fn configure_decode(
-        &mut self,
-        _tile_edge: u32,
-        _overlap: u32,
-        _geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        Err(CoreError::Unsupported(
-            "mage_flow: bounded decode is reserved for SC-15509".into(),
-        ))
-    }
-
-    fn configure_attention(&mut self, _chunk_size: u32) -> CoreResult<()> {
-        self.ensure_active()?;
-        Err(CoreError::Unsupported(
-            "mage_flow: bounded attention is reserved for SC-15509".into(),
-        ))
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        _first_block: u32,
-        _block_count: u32,
-    ) -> CoreResult<()> {
-        self.ensure_active()?;
-        Err(CoreError::Unsupported(
-            "mage_flow: bounded transformer residency is reserved for SC-15509".into(),
-        ))
-    }
-
-    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
-        self.ensure_active()?;
-        self.synchronize_and_release()
-    }
-}
-
-impl Drop for MageMemoryScope {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.synchronize_and_release();
-        }
-    }
 }
 
 /// Which published checkpoint a registered id serves.
@@ -787,6 +679,29 @@ pub struct MageFlow {
     pipeline: MageFlowPipeline,
 }
 
+fn resident_request_scope(
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    cleanup: mlx_gen::request_scope::MlxScopeCleanup,
+) -> CoreResult<mlx_gen::request_scope::MlxRequestScopeCore> {
+    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+        provider_id,
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        crate::config::MageFlowConfig::mage_flow().depth,
+        |_use_pid, _edge, _overlap| {
+            Err(CoreError::Unsupported(
+                "mage_flow: bounded decode is reserved for SC-15509".into(),
+            ))
+        },
+    )?;
+    Ok(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
+        config, cleanup,
+    ))
+}
+
 fn request_context_error(
     provider_id: &str,
     variant: MageVariant,
@@ -911,14 +826,12 @@ impl Generator for MageFlow {
         {
             return Err(CoreError::Unsupported(reason));
         }
-        Ok(Some(Box::new(MageMemoryScope {
-            selection: context.selection,
-            memory: self
-                .memory_strategy_contract
-                .generation_memory(&context.selection),
-            geometry: context.geometry,
-            finished: false,
-        })))
+        Ok(Some(Box::new(resident_request_scope(
+            self.descriptor.id,
+            &self.memory_strategy_contract,
+            context,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -1506,12 +1419,39 @@ mod tests {
             batch: 3,
             frames: 1,
         };
-        let mut canceled = MageMemoryScope {
+        let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
+        let context = MemoryRunContext {
             selection,
-            memory: Some(GenerationMemory::default()),
+            calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            load_shape: mlx_gen::LoadShape::EagerMaterialization,
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
             geometry,
-            finished: false,
+            overlay: None,
+            budget: mlx_gen::gen_core::MemoryBudget {
+                total_bytes: u64::MAX,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: mlx_gen::gen_core::MemoryCacheState::Warm,
+            evidence_revision: "test".to_owned(),
         };
+        let make_scope = || {
+            resident_request_scope(
+                "mage_flow",
+                &contract,
+                &context,
+                mlx_gen::request_scope::MlxScopeCleanup::None,
+            )
+            .unwrap()
+        };
+        assert_eq!(context.selection.strategy, MemoryStrategy::Resident);
+        let mut canceled = make_scope();
         let mut first = GenerationRequest {
             prompt: "first".to_owned(),
             width: 1024,
@@ -1521,15 +1461,22 @@ mod tests {
         };
         canceled.configure_request(&mut first).unwrap();
         assert_eq!(first.memory, Some(GenerationMemory::default()));
-        canceled.finish(MemoryRunOutcome::Canceled).unwrap();
-        assert!(canceled.finished);
-
-        let mut warm = MageMemoryScope {
-            selection,
-            memory: Some(GenerationMemory::default()),
-            geometry,
-            finished: false,
+        let mut overflow = GenerationRequest {
+            prompt: "overflow".to_owned(),
+            width: 1024,
+            height: 768,
+            count: 4,
+            ..Default::default()
         };
+        assert!(canceled.configure_request(&mut overflow).is_err());
+        assert!(canceled.configure_decode(1, 0, context.geometry).is_err());
+        assert!(canceled.configure_attention(1).is_err());
+        assert!(canceled.materialize_transformer_window(0, 1).is_err());
+        canceled.finish(MemoryRunOutcome::Canceled).unwrap();
+        assert!(canceled.finish(MemoryRunOutcome::Canceled).is_err());
+        assert!(canceled.configure_request(&mut first).is_err());
+
+        let mut warm = make_scope();
         let mut follow_up = GenerationRequest {
             prompt: "follow-up".to_owned(),
             width: 1024,
@@ -1539,7 +1486,26 @@ mod tests {
         };
         warm.configure_request(&mut follow_up).unwrap();
         warm.finish(MemoryRunOutcome::Complete).unwrap();
-        assert!(warm.finished, "a warm follow-up owns fresh terminal state");
+        assert!(
+            warm.finish(MemoryRunOutcome::Complete).is_err(),
+            "a warm follow-up owns fresh terminal state"
+        );
+    }
+
+    #[test]
+    fn actual_begin_hook_delegates_to_the_resident_scope_adopter() {
+        let source = include_str!("model.rs");
+        let begin = source
+            .split_once("fn begin_memory_strategy_request(")
+            .expect("Generator must retain its begin hook")
+            .1
+            .split_once("fn validate(")
+            .expect("begin hook must remain bounded by validate")
+            .0;
+        assert!(
+            begin.contains("resident_request_scope("),
+            "the actual Generator begin hook bypassed the behaviorally tested shared-core adopter"
+        );
     }
 
     /// sc-15154 — the footprint must follow the SPLIT layout's staged components, not the tier dir.

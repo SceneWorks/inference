@@ -687,6 +687,35 @@ pub(crate) fn resolve_reference<'a>(
     Ok(reference)
 }
 
+/// Request-scoped memory-ladder controls shared by every Z-Image variant.
+pub(crate) struct RequestRungs<'a> {
+    pub(crate) stage_residency: bool,
+    pub(crate) streamable: bool,
+    pub(crate) tiling: Option<TilingConfig>,
+    pub(crate) attention_budget: AttentionBudget,
+    pub(crate) block_window: Option<usize>,
+    pub(crate) encoder_window: Option<EncoderWindow<'a>>,
+}
+
+/// Resolve the family memory preamble once. Preview cadence/state deliberately remains outside this
+/// helper and outside the request scope core.
+pub(crate) fn resolve_request_rungs<'a>(
+    req: &'a GenerationRequest,
+    contract: &mlx_gen::gen_core::MemoryProviderContract,
+    model_id: &str,
+) -> Result<RequestRungs<'a>> {
+    let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+    let streamable = contract.lifecycle.transformer_window_materialization;
+    Ok(RequestRungs {
+        stage_residency,
+        streamable,
+        tiling: decode_tiling(req, stage_residency),
+        attention_budget: attention_budget(req),
+        block_window: resolve_block_window(req, streamable, model_id)?,
+        encoder_window: EncoderWindow::resolve(req, streamable, model_id)?,
+    })
+}
+
 /// The decode-time tiling policy for a request (sc-13571, GitHub #1658). `is_sequential` is the
 /// fit-gate's memory-constrained-Mac signal (`OffloadPolicy::Sequential`): under it the VAE decode is
 /// tiled to bound its ~14 GiB 1024² transient; a large-memory `Resident` machine decodes EXACTLY
@@ -1002,6 +1031,28 @@ pub(crate) fn render_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_variant_uses_the_canonical_request_rung_preamble() {
+        for (name, source) in [
+            ("turbo", include_str!("model.rs")),
+            ("base", include_str!("model_base.rs")),
+            ("turbo-control", include_str!("model_control.rs")),
+            ("base-control", include_str!("model_base_control.rs")),
+        ] {
+            assert_eq!(
+                source
+                    .matches("pipeline::resolve_request_rungs(req")
+                    .count(),
+                1,
+                "{name} must use the canonical preamble exactly once"
+            );
+            assert!(
+                !source.contains("pipeline::resolve_block_window(req"),
+                "{name} bypassed the canonical preamble"
+            );
+        }
+    }
 
     fn img(w: u32, h: u32) -> Image {
         Image {

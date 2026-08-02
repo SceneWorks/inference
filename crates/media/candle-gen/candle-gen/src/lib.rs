@@ -106,6 +106,7 @@ pub mod gpu;
 // load the hosted MLX quant tiers (epic 8506) directly — no dense staging, no second artifact
 // matrix. Provider crates' packed-detect loaders build on this.
 pub mod quant;
+pub mod request_scope;
 
 // The shared native training harness (epic 5164 / sc-5165) — the candle twin of `mlx_gen::train`.
 // Provider crates (sdxl/z-image/wan/lens) build their `gen_core::Trainer` on top of this.

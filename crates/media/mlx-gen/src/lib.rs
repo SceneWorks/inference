@@ -40,6 +40,7 @@ pub mod mllm;
 pub mod nn;
 pub mod preview;
 pub mod quant;
+pub mod request_scope;
 pub mod residency;
 pub mod sampler;
 pub mod scheduler;

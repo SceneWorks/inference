@@ -571,24 +571,14 @@ impl ZImageTurbo {
         // fit-gate signal) `run_staged` frees the DiT after denoise and before the (tiled) VAE decode,
         // so the decode peak excludes the ~3.2 GiB DiT; under `Resident` nothing is shed. `tiling` bounds
         // the decode transient on the same small-Mac signal ([`pipeline::decode_tiling`]).
-        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
-        let streamable = self
-            .memory_strategy
-            .lifecycle
-            .transformer_window_materialization;
-        let tiling = pipeline::decode_tiling(req, stage_residency);
-        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
-        // unless this request selected bounded attention, so the default forward is unchanged.
-        let attention_budget = pipeline::attention_budget(req);
-        // SC-15754 / SC-15998: a deferred load always uses the stream. The selected rung-4 window
-        // bounds it; an excluded/unselected DiT gets one all-covering window so it never
-        // materializes the lazy resident stack. An eager load stays resident and rejects rung 4.
-        let deferred_materialization = streamable;
-        let block_window = pipeline::resolve_block_window(req, deferred_materialization, MODEL_ID)?;
-        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
-        // includes the encoder, so an unscoped request conditions exactly as before.
-        let encoder_window =
-            pipeline::EncoderWindow::resolve(req, deferred_materialization, MODEL_ID)?;
+        let pipeline::RequestRungs {
+            stage_residency,
+            streamable,
+            tiling,
+            attention_budget,
+            block_window,
+            encoder_window,
+        } = pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
         let images = self.residency.run_staged_request_scoped(
             stage_residency,
             streamable,
