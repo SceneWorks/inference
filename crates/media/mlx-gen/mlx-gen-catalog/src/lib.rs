@@ -118,6 +118,48 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
+    const PREVIEW_PROVIDER_IDS: [&str; 8] = [
+        "krea_2_turbo",
+        "krea_2_raw",
+        "krea_2_edit",
+        "krea_2_turbo_edit",
+        "krea_2_turbo_control",
+        "qwen_image",
+        "qwen_image_control",
+        "qwen_image_edit",
+    ];
+
+    #[test]
+    fn preview_capability_matches_every_wired_shipped_route_bidirectionally() {
+        let registry = super::provider_registry().unwrap();
+        let descriptors: Vec<_> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)())
+            .collect();
+
+        for id in PREVIEW_PROVIDER_IDS {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.id == id)
+                .unwrap_or_else(|| panic!("preview allowlist contains unshipped provider {id}"));
+            assert!(
+                descriptor.capabilities.supports_preview,
+                "wired preview provider {id} must advertise support"
+            );
+        }
+
+        let advertising: std::collections::BTreeSet<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.capabilities.supports_preview)
+            .map(|descriptor| descriptor.id)
+            .collect();
+        let expected: std::collections::BTreeSet<_> = PREVIEW_PROVIDER_IDS.into_iter().collect();
+        assert_eq!(
+            advertising, expected,
+            "only providers with an actual PreviewSink denoise route may advertise support"
+        );
+    }
+
     #[test]
     fn measured_activation_anchors_are_provider_route_owned() {
         let registry = super::provider_registry().unwrap();

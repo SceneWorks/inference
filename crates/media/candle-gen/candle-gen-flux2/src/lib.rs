@@ -817,6 +817,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
             supports_sequential_offload: true,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

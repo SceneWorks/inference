@@ -94,15 +94,19 @@ mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
-        let explicit: Vec<String> = registry
+        let descriptors: Vec<_> = registry
             .generators()
-            .map(|registration| (registration.descriptor)().id.to_string())
+            .map(|registration| (registration.descriptor)())
             .collect();
+        let explicit: Vec<_> = descriptors.iter().map(|descriptor| descriptor.id).collect();
 
         assert_eq!(
             explicit,
             ["qwen_image", "qwen_image_control", "qwen_image_edit"]
         );
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.capabilities.supports_preview));
     }
 
     #[test]

@@ -158,10 +158,12 @@ mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
-        let explicit_generators: Vec<String> = registry
+        let descriptors: Vec<_> = registry
             .generators()
-            .map(|registration| (registration.descriptor)().id.to_string())
+            .map(|registration| (registration.descriptor)())
             .collect();
+        let explicit_generators: Vec<_> =
+            descriptors.iter().map(|descriptor| descriptor.id).collect();
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
@@ -178,6 +180,9 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw"]);
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.capabilities.supports_preview));
 
         let contract = registry
             .memory_strategy_contract(

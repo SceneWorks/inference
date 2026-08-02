@@ -143,6 +143,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
             supports_sequential_offload: false,
+            supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
