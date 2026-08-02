@@ -7,12 +7,13 @@
 //!
 //! ## The fit is reused, not refitted (sc-16950)
 //!
-//! [`RGB_FACTORS`] / [`RGB_BIAS`] are the least-squares constants epic 16624 committed at
+//! `RGB_FACTORS` / `RGB_BIAS` are the least-squares constants epic 16624 committed at
 //! `mlx-gen-qwen-image/src/preview.rs:42`, transcribed verbatim. They are ordinary numbers over a VAE
 //! *latent space* with no backend in them, so the correct candle move is to reuse them — but only
 //! once the reuse is grounded in **tensor bytes** rather than in a matching Rust type name. That
 //! grounding is recorded in `docs/migration/evidence/sc-16950-krea-candle-preview.md` and pinned by
-//! [`tests::committed_fit_matches_the_mlx_source_block`] plus the Krea-side provenance test:
+//! `tests::committed_fit_matches_the_mlx_source_block` plus the Krea-side provenance row
+//! (`candle-gen-krea/tests/preview_real_weights.rs`):
 //!
 //! * `krea/Krea-2-Turbo` @ `1161245028ef398cd0a951101b2bbf486464f841` — `vae/` SHA-256
 //!   `ab1b61103959913d6c7e628cf793dbb2ca4726a40a3b3ae206c52b8e75bf6f08`;
