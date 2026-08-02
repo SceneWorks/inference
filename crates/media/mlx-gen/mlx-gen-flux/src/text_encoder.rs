@@ -6,7 +6,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::{host_i32, scalar};
 use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::{join, Weights};
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::{add, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis};
 use mlx_rs::{Array, Dtype};
@@ -366,7 +366,7 @@ impl T5TextEncoder {
         dense_sublayer: T5Sublayer,
     ) -> Result<()> {
         if dense_block >= self.blocks.len() {
-            return Err(crate::Error::Msg(format!(
+            return Err(Error::Msg(format!(
                 "T5 dense carve-out block {dense_block} is outside 0..{}",
                 self.blocks.len()
             )));
