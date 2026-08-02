@@ -24,6 +24,15 @@
 //! MUST also carry a human-readable [`WeightLicense::restriction`] note describing the terms the
 //! product has to surface — [`WeightLicense::is_well_formed`] enforces that invariant so a
 //! restricted checkpoint can never ship with its restriction unrecorded.
+//!
+//! ## Schema 3 supersedes the above (sc-16661)
+//!
+//! The current surface is the licence **table** further down this module — [`LicenseFamily`],
+//! [`LicenseTerm`], [`ComponentLicense`], [`ProviderComponents`], the derived [`provider_terms`]
+//! union and [`component_licenses_manifest_json`]. It records licence *facts* instead of the legal
+//! *conclusion* `commercial_use` encodes, and keys rows by loaded artifact rather than by provider.
+//! The v2 types in the next section remain only until the audio lane migrates (sc-16663) and the
+//! release tooling moves to schema 3 (sc-16664). **Do not add v2 callers.**
 
 /// The license under which a provider's **model weights** (its pinned checkpoint) are distributed.
 ///
@@ -324,6 +333,66 @@ pub struct ComponentLicense {
     pub retrieved: &'static str,
 }
 
+impl ComponentLicense {
+    /// Whether this row is well-formed against `families`: the identity fields
+    /// ([`component`](Self::component), [`source_url`](Self::source_url),
+    /// [`declared`](Self::declared)) are non-empty, [`family`](Self::family) resolves to a known
+    /// [`LicenseFamily`], [`retrieved`](Self::retrieved) parses as an ISO `YYYY-MM-DD` date, and a
+    /// family imposing [`LicenseTerm::AttributionRequired`] implies
+    /// [`attribution`](Self::attribution) is present.
+    ///
+    /// Row-local counterpart to [`license_table_conformance_errors`], which runs exactly these
+    /// checks plus the table-level ones (component-key uniqueness, provider→component resolution)
+    /// and reports *why* rather than just *whether*. Prefer the table function at a catalog
+    /// boundary; this is for checking a single row in isolation.
+    pub fn is_well_formed(&self, families: &[LicenseFamily]) -> bool {
+        self.row_errors(families).is_empty()
+    }
+
+    /// The row-local conformance failures, as human-readable messages. Single definition of the
+    /// per-row rules, shared by [`is_well_formed`](Self::is_well_formed) and
+    /// [`license_table_conformance_errors`] so the predicate and the reporter cannot drift.
+    fn row_errors(&self, families: &[LicenseFamily]) -> Vec<String> {
+        let key = self.component;
+        let mut errors = Vec::new();
+        if self.source_url.is_empty() {
+            errors.push(format!("component {key:?} has no source_url"));
+        }
+        if self.declared.is_empty() {
+            errors.push(format!(
+                "component {key:?} has no declared licence identifier"
+            ));
+        }
+        if !is_iso_date(self.retrieved) {
+            errors.push(format!(
+                "component {key:?} has a non-ISO retrieved date {:?}",
+                self.retrieved
+            ));
+        }
+        match resolve_family(families, self.family) {
+            None => errors.push(format!(
+                "component {key:?} references unknown licence family {:?}",
+                self.family
+            )),
+            Some(family) => {
+                if family.requires_attribution() && self.attribution.is_none() {
+                    errors.push(format!(
+                        "component {key:?} resolves to {:?}, which requires attribution, but \
+                         records none",
+                        family.id
+                    ));
+                }
+            }
+        }
+        if key.is_empty() {
+            // Reported by the table checker, which sees the key before anything else; keep the
+            // row-local predicate honest about it too.
+            errors.push("component row has an empty component key".to_string());
+        }
+        errors
+    }
+}
+
 /// The components a registered provider id loads. The per-backend part of the surface — the two
 /// media catalogs ship different id sets, but a component row itself is backend-independent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,35 +478,7 @@ pub fn license_table_conformance_errors(
         }
         seen.push(key);
 
-        if row.source_url.is_empty() {
-            errors.push(format!("component {key:?} has no source_url"));
-        }
-        if row.declared.is_empty() {
-            errors.push(format!(
-                "component {key:?} has no declared licence identifier"
-            ));
-        }
-        if !is_iso_date(row.retrieved) {
-            errors.push(format!(
-                "component {key:?} has a non-ISO retrieved date {:?}",
-                row.retrieved
-            ));
-        }
-        match resolve_family(families, row.family) {
-            None => errors.push(format!(
-                "component {key:?} references unknown licence family {:?}",
-                row.family
-            )),
-            Some(family) => {
-                if family.requires_attribution() && row.attribution.is_none() {
-                    errors.push(format!(
-                        "component {key:?} resolves to {:?}, which requires attribution, but \
-                         records none",
-                        family.id
-                    ));
-                }
-            }
-        }
+        errors.extend(row.row_errors(families));
     }
 
     for provider in providers {
@@ -867,6 +908,77 @@ mod v3_tests {
         // Providers are sorted by id: flux1_dev precedes pulid_flux.
         assert_eq!(value["providers"][0]["provider_id"], "flux1_dev");
         assert_eq!(value["providers"][1]["provider_id"], "pulid_flux");
+    }
+
+    /// `is_well_formed` enforces exactly the four documented conditions, and agrees with the table
+    /// checker on every one of them (they share `row_errors`, and this pins that they stay tied).
+    #[test]
+    fn is_well_formed_enforces_the_four_row_conditions() {
+        let good = COMPONENTS[1]; // t5_xxl: attribution-requiring family, attribution present.
+        assert!(good.is_well_formed(FAMILIES));
+
+        let cases: [(&str, ComponentLicense); 5] = [
+            (
+                "empty identity: component",
+                ComponentLicense {
+                    component: "",
+                    ..good
+                },
+            ),
+            (
+                "empty identity: source_url",
+                ComponentLicense {
+                    source_url: "",
+                    ..good
+                },
+            ),
+            (
+                "empty identity: declared",
+                ComponentLicense {
+                    declared: "",
+                    ..good
+                },
+            ),
+            (
+                "family does not resolve",
+                ComponentLicense {
+                    family: "not-a-family",
+                    ..good
+                },
+            ),
+            (
+                "retrieved is not an ISO date",
+                ComponentLicense {
+                    retrieved: "last tuesday",
+                    ..good
+                },
+            ),
+        ];
+        for (label, row) in cases {
+            assert!(!row.is_well_formed(FAMILIES), "{label} must be rejected");
+            assert!(
+                !license_table_conformance_errors(FAMILIES, &[row], &[]).is_empty(),
+                "{label} must also be reported by the table checker"
+            );
+        }
+
+        // AttributionRequired in the family implies attribution.is_some().
+        let unattributed = ComponentLicense {
+            attribution: None,
+            ..good
+        };
+        assert!(resolve_family(FAMILIES, good.family)
+            .unwrap()
+            .requires_attribution());
+        assert!(!unattributed.is_well_formed(FAMILIES));
+
+        // A family that does NOT require attribution leaves the row well-formed without one.
+        let flux_dit = COMPONENTS[0];
+        assert!(flux_dit.attribution.is_none());
+        assert!(!resolve_family(FAMILIES, flux_dit.family)
+            .unwrap()
+            .requires_attribution());
+        assert!(flux_dit.is_well_formed(FAMILIES));
     }
 
     #[test]
