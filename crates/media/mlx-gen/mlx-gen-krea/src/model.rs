@@ -922,6 +922,7 @@ impl Krea {
                             &opts,
                             decoder,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?);
                     }
@@ -1016,6 +1017,7 @@ impl Krea {
                             // partially-denoised latent it expects, instead of the σ=0 clean one.
                             keep,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?,
                         KreaRenderPlan::Img2ImgRaw { plan, strength } => {
@@ -1030,6 +1032,7 @@ impl Krea {
                                 // partially-denoised latent; `sigmas.len()` (no capture) runs the tail.
                                 keep,
                                 &req.cancel,
+                                &req.preview,
                                 on_progress,
                             )?
                         }
@@ -1042,6 +1045,7 @@ impl Krea {
                                 // from_ldm early-stop (sc-10121): see the Raw arm above.
                                 keep,
                                 &req.cancel,
+                                &req.preview,
                                 on_progress,
                             )?
                         }
@@ -1052,6 +1056,7 @@ impl Krea {
                             decoder,
                             keep,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?,
                         KreaRenderPlan::Turbo(p) => heavy.heavy.render_turbo_from(
@@ -1060,6 +1065,7 @@ impl Krea {
                             decoder,
                             keep,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?,
                     };
