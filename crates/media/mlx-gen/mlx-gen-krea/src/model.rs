@@ -413,14 +413,15 @@ pub(crate) fn build_native_krea(
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
     let memory_strategy =
         crate::block_memory_strategy::memory_strategy_contract(descriptor.id, spec)?;
+    let streamable_transformer = memory_strategy.lifecycle.transformer_window_materialization;
     let quant = effective_base_quant_tier(spec, descriptor.id)?;
-    let residency = build_residency(spec, descriptor.id)?;
+    let residency = build_residency(spec, descriptor.id, streamable_transformer)?;
     Ok(Box::new(Krea {
         descriptor,
         memory_strategy,
         precision: spec.precision,
         quant,
-        streamable_transformer: crate::block_memory_strategy::is_streamable_spec(spec),
+        streamable_transformer,
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
@@ -482,6 +483,7 @@ fn resolve_transformer_window(req: &GenerationRequest, streamable: bool) -> Resu
 pub(crate) fn build_residency(
     spec: &LoadSpec,
     id: &'static str,
+    streamable_transformer: bool,
 ) -> Result<Residency<KreaText, KreaHeavyOwned>> {
     // Up-front fail-fast for both policies (precision override + single-file rejection).
     let _ = resolve_root(spec, id)?;
@@ -490,7 +492,15 @@ pub(crate) fn build_residency(
     Residency::from_policy(
         spec.offload_policy,
         move || load_krea_text(&spec_text, resolve_root(&spec_text, id)?, id),
-        move |use_pid| load_krea_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, id, use_pid),
+        move |use_pid| {
+            load_krea_heavy(
+                &spec_heavy,
+                resolve_root(&spec_heavy, id)?,
+                id,
+                use_pid,
+                streamable_transformer,
+            )
+        },
     )
 }
 
@@ -587,11 +597,9 @@ fn load_krea_heavy(
     root: &Path,
     id: &str,
     load_pid: bool,
+    streamable_transformer: bool,
 ) -> Result<KreaHeavyOwned> {
-    let mut heavy = KreaHeavy::from_snapshot_with_stream(
-        root,
-        crate::block_memory_strategy::is_streamable_spec(spec),
-    )?;
+    let mut heavy = KreaHeavy::from_snapshot_with_stream(root, streamable_transformer)?;
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
     }
@@ -1990,6 +1998,7 @@ mod tests {
         let res = build_residency(
             &missing_snapshot_spec(OffloadPolicy::Sequential),
             KREA_2_TURBO_ID,
+            false,
         )
         .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
@@ -2005,6 +2014,7 @@ mod tests {
         let err = build_residency(
             &missing_snapshot_spec(OffloadPolicy::Resident),
             KREA_2_TURBO_ID,
+            false,
         )
         .err()
         .expect("Resident must eager-load and fail on a missing snapshot dir");

@@ -736,17 +736,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond =
-                    self.dit
-                        .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = match &plan.prep_neg {
                     Some(neg) => {
-                        let uncond =
-                            self.dit
-                                .forward_prepared_windowed(x, &t, neg, block_window)?;
+                        let (cond, uncond) = self.dit.forward_prepared_pair_windowed(
+                            x,
+                            &t,
+                            &plan.prep_pos,
+                            neg,
+                            block_window,
+                        )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
-                    None => cond,
+                    None => {
+                        self.dit
+                            .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?
+                    }
                 };
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
@@ -793,7 +797,6 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = dit.forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = if guidance > 0.0 {
                     let neg = plan.prep_neg.as_ref().ok_or_else(|| {
                         mlx_gen::Error::Msg(
@@ -802,10 +805,16 @@ impl KreaHeavy {
                                 .into(),
                         )
                     })?;
-                    let uncond = dit.forward_prepared_windowed(x, &t, neg, block_window)?;
+                    let (cond, uncond) = dit.forward_prepared_pair_windowed(
+                        x,
+                        &t,
+                        &plan.prep_pos,
+                        neg,
+                        block_window,
+                    )?;
                     krea_cfg_combine(&cond, &uncond, guidance)?
                 } else {
-                    cond
+                    dit.forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?
                 };
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
@@ -1007,17 +1016,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond =
-                    self.dit
-                        .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = match &plan.prep_neg {
                     Some(neg) => {
-                        let uncond =
-                            self.dit
-                                .forward_prepared_windowed(x, &t, neg, block_window)?;
+                        let (cond, uncond) = self.dit.forward_prepared_pair_windowed(
+                            x,
+                            &t,
+                            &plan.prep_pos,
+                            neg,
+                            block_window,
+                        )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
-                    None => cond,
+                    None => {
+                        self.dit
+                            .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?
+                    }
                 };
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
@@ -1161,17 +1174,23 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond =
-                    self.dit
-                        .forward_prepared_edit_windowed(x, &t, &plan.prep_pos, block_window)?;
                 let v = match &plan.prep_neg {
                     Some(neg) => {
-                        let uncond =
-                            self.dit
-                                .forward_prepared_edit_windowed(x, &t, neg, block_window)?;
+                        let (cond, uncond) = self.dit.forward_prepared_edit_pair_windowed(
+                            x,
+                            &t,
+                            &plan.prep_pos,
+                            neg,
+                            block_window,
+                        )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
-                    None => cond,
+                    None => self.dit.forward_prepared_edit_windowed(
+                        x,
+                        &t,
+                        &plan.prep_pos,
+                        block_window,
+                    )?,
                 };
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
@@ -1657,6 +1676,61 @@ mod tests {
 
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn every_cfg_route_uses_one_paired_traversal_and_keeps_its_non_cfg_path() {
+        let source = include_str!("pipeline.rs");
+        let cases = [
+            (
+                "base t2i",
+                "    pub fn render_base_from(",
+                "    fn denoise_phase_from(",
+                "forward_prepared_pair_windowed(",
+                "forward_prepared_windowed(",
+            ),
+            (
+                "multi-phase CFG",
+                "    fn denoise_phase_from(",
+                "    pub fn prepare_multiphase(",
+                "forward_prepared_pair_windowed(",
+                "forward_prepared_windowed(",
+            ),
+            (
+                "base img2img",
+                "    pub fn render_base_img2img_from(",
+                "    pub fn render_edit(",
+                "forward_prepared_pair_windowed(",
+                "forward_prepared_windowed(",
+            ),
+            (
+                "edit",
+                "    pub fn render_edit_from(",
+                "    fn decode_latents(",
+                "forward_prepared_edit_pair_windowed(",
+                "forward_prepared_edit_windowed(",
+            ),
+        ];
+
+        for (route, start, end, paired, single) in cases {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {route} end"))
+                .0;
+            assert_eq!(
+                body.matches(paired).count(),
+                1,
+                "{route} must use exactly one paired CFG traversal"
+            );
+            assert_eq!(
+                body.matches(single).count(),
+                1,
+                "{route} must retain exactly one non-CFG traversal"
+            );
+        }
     }
 
     #[test]

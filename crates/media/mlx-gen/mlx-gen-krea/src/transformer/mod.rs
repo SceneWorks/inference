@@ -392,6 +392,31 @@ impl Krea2Transformer {
         self.finalize(&combined, &j.t, &j)
     }
 
+    /// Run conditional and unconditional prepared states through one block traversal. Under bounded
+    /// residency each block is reconstructed once, then applied to both independent carries before
+    /// both are evaluated and the window is released.
+    pub(crate) fn forward_prepared_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        let positive = self.joint_inputs(latent, timestep, positive)?;
+        let negative = self.joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive.combined.clone(), negative.combined.clone()),
+            (&positive.tvec, &positive.rcos, &positive.rsin),
+            (&negative.tvec, &negative.rcos, &negative.rsin),
+            window,
+        )?;
+        Ok((
+            self.finalize(&positive_combined, &positive.t, &positive)?,
+            self.finalize(&negative_combined, &negative.t, &negative)?,
+        ))
+    }
+
     /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
     pub(crate) fn forward_prepared_edit_windowed(
         &self,
@@ -407,6 +432,86 @@ impl Krea2Transformer {
         let head = prep.cap_len + prep.n_refs * img_len;
         let img_out = split_axis1(&out, head)?.swap_remove(1);
         unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+    }
+
+    /// Paired conditional/unconditional edit forward with one block-window traversal.
+    pub(crate) fn forward_prepared_edit_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        let (positive_combined, positive_t, positive_tvec) =
+            self.edit_joint_inputs(latent, timestep, positive)?;
+        let (negative_combined, negative_t, negative_tvec) =
+            self.edit_joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive_combined, negative_combined),
+            (&positive_tvec, &positive.rcos, &positive.rsin),
+            (&negative_tvec, &negative.rcos, &negative.rsin),
+            window,
+        )?;
+        let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
+            let out = self.final_layer(combined, t)?;
+            let img_len = prep.ht * prep.wt;
+            let head = prep.cap_len + prep.n_refs * img_len;
+            let img_out = split_axis1(&out, head)?.swap_remove(1);
+            unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        };
+        Ok((
+            finish(&positive_combined, &positive_t, positive)?,
+            finish(&negative_combined, &negative_t, negative)?,
+        ))
+    }
+
+    fn run_blocks_paired(
+        &self,
+        mut states: (Array, Array),
+        positive: (&Array, &Array, &Array),
+        negative: (&Array, &Array, &Array),
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        let Some(window) = window else {
+            for block in &self.blocks {
+                states.0 = block.forward(&states.0, positive.0, positive.1, positive.2)?;
+                states.1 = block.forward(&states.1, negative.0, negative.1, negative.2)?;
+            }
+            return Ok(states);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            states,
+            || stream.open(),
+            |states, view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| stream.materialize(view, index),
+                    |block, state| block.forward(&state, positive.0, positive.1, positive.2),
+                    |block, state| block.forward(&state, negative.0, negative.1, negative.2),
+                )
+            },
+            |(positive, negative): &(Array, Array)| {
+                Ok(mlx_rs::transforms::eval([positive, negative])?)
+            },
+        )
     }
 
     fn run_blocks(
@@ -730,6 +835,21 @@ impl Krea2Transformer {
     }
 }
 
+fn run_paired_range<S, B>(
+    mut states: (S, S),
+    range: std::ops::Range<usize>,
+    mut materialize: impl FnMut(usize) -> Result<B>,
+    mut apply_positive: impl FnMut(&B, S) -> Result<S>,
+    mut apply_negative: impl FnMut(&B, S) -> Result<S>,
+) -> Result<(S, S)> {
+    for index in range {
+        let block = materialize(index)?;
+        states.0 = apply_positive(&block, states.0)?;
+        states.1 = apply_negative(&block, states.1)?;
+    }
+    Ok(states)
+}
+
 /// The embed/fuse preamble outputs shared by the dense and checkpointed forwards: the joint hidden
 /// state, the timestep embedding `t`, the shared modulation `tvec`, the joint RoPE tables, and the
 /// patchify/slice geometry the final layer needs.
@@ -903,6 +1023,78 @@ fn unpatchify(tokens: &Array, ht: i32, wt: i32, p: i32, c: i32) -> Result<Array>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn paired_range_matches_two_legacy_states_and_materializes_each_block_once() {
+        let blocks = [2_i32, 3, 5];
+        let legacy_materializations = Cell::new(0usize);
+        let legacy = |mut state: i32| {
+            for block in blocks {
+                legacy_materializations.set(legacy_materializations.get() + 1);
+                state = state * block + 1;
+            }
+            state
+        };
+        let expected = (legacy(1), legacy(7));
+
+        let paired_materializations = Cell::new(0usize);
+        let actual = run_paired_range(
+            (1_i32, 7_i32),
+            0..blocks.len(),
+            |index| {
+                paired_materializations.set(paired_materializations.get() + 1);
+                Ok(blocks[index])
+            },
+            |block, state| Ok(state * block + 1),
+            |block, state| Ok(state * block + 1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "paired traversal must preserve both outputs"
+        );
+        assert_eq!(legacy_materializations.get(), blocks.len() * 2);
+        assert_eq!(paired_materializations.get(), blocks.len());
+    }
+
+    #[test]
+    fn paired_carry_preserves_typed_cancellation_at_window_boundaries() {
+        let cancel = mlx_gen::CancelFlag::new();
+        let opened = Cell::new(0usize);
+        let materialized_blocks = Cell::new(0usize);
+        let error = mlx_gen::block_residency::run_windowed(
+            &mlx_gen::block_residency::BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            (0usize, 10usize),
+            || {
+                opened.set(opened.get() + 1);
+                Ok(Weights::empty())
+            },
+            |states, _view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| {
+                        materialized_blocks.set(materialized_blocks.get() + 1);
+                        Ok(index)
+                    },
+                    |block, state| Ok(state + block + 1),
+                    |block, state| Ok(state + block + 1),
+                )
+            },
+            |_| {
+                cancel.cancel();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, mlx_gen::Error::Canceled));
+        assert_eq!(opened.get(), 1, "cancellation must prevent the next window");
+        assert_eq!(materialized_blocks.get(), 2);
+    }
 
     /// A dense `[out, in]` weight (+ its `[out]` bias) at `base` — values are irrelevant (these tests
     /// route by shape, never forward), so each global projection gets a distinct `out` we can match on.

@@ -37,11 +37,17 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-2-mlx-request-peak-block-residency-2026-08-01-v1";
 
-pub(crate) fn is_streamable_spec(spec: &LoadSpec) -> bool {
-    matches!(spec.weights, WeightsSource::Dir(_))
-        && matches!(spec.offload_policy, OffloadPolicy::Sequential)
-        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+pub(crate) fn is_streamable_spec(provider_id: &str, spec: &LoadSpec) -> CoreResult<bool> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(false);
+    };
+    if !matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        || !matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        || crate::model::adapters_have_diff_patch(&spec.adapters)
+    {
+        return Ok(false);
+    }
+    Ok(crate::model::load_time_quant_bits(spec, root, provider_id)?.is_none())
 }
 
 pub fn memory_strategy_contract(
@@ -76,10 +82,12 @@ pub fn memory_strategy_contract(
         })?,
         vae: project(&root.join("vae"), &|_| false)?,
     };
+    let streamable = is_streamable_spec(provider_id, spec)?;
     Ok(memory_strategy_contract_with_components(
         provider_id,
         spec,
         components,
+        streamable,
     ))
 }
 
@@ -88,10 +96,12 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let streamable = is_streamable_spec(provider_id, spec)?;
     Ok(memory_strategy_contract_with_components(
         provider_id,
         spec,
         Default::default(),
+        streamable,
     ))
 }
 
@@ -99,8 +109,8 @@ fn memory_strategy_contract_with_components(
     provider_id: &str,
     spec: &LoadSpec,
     components: mlx_gen::PerComponentBytes,
+    streamable: bool,
 ) -> MemoryProviderContract {
-    let streamable = is_streamable_spec(spec);
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -406,6 +416,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
@@ -585,12 +600,12 @@ mod tests {
         let low_rank = root.join("low-rank.safetensors");
         std::fs::write(&low_rank, [0_u8; 8]).unwrap();
         spec.adapters = vec![AdapterSpec::new(low_rank, 1.0, AdapterKind::Lora)];
-        assert!(is_streamable_spec(&spec));
+        assert!(is_streamable_spec("krea_2_turbo", &spec).unwrap());
 
         let diff = root.join("dense-diff.safetensors");
         write_diff_patch(&diff);
         spec.adapters = vec![AdapterSpec::new(diff, 1.0, AdapterKind::Lora)];
-        assert!(!is_streamable_spec(&spec));
+        assert!(!is_streamable_spec("krea_2_turbo", &spec).unwrap());
         let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
         assert_eq!(
             contract
@@ -598,6 +613,60 @@ mod tests {
                 .unwrap()
                 .support,
             MemoryStrategySupport::Missing
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rung_four_resolves_load_time_quantization_instead_of_the_override_presence() {
+        let (root, spec) = fixture();
+
+        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+            let mut packed = spec.clone();
+            packed.quantize = Some(quant);
+            assert!(
+                is_streamable_spec("krea_2_turbo", &packed).unwrap(),
+                "a matching prepacked Q{bits} override is a no-op and must remain streamable"
+            );
+            assert!(
+                memory_strategy_contract("krea_2_turbo", &packed)
+                    .unwrap()
+                    .lifecycle
+                    .transformer_window_materialization
+            );
+        }
+
+        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        assert!(
+            !is_streamable_spec("krea_2_turbo", &spec).unwrap(),
+            "a dense snapshot requiring per-window Q4 packing must not be streamable"
+        );
+        let dense = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        assert!(!dense.lifecycle.transformer_window_materialization);
+        assert_eq!(
+            dense
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        let mismatch = memory_strategy_contract("krea_2_turbo", &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatch.contains("Q8") && mismatch.contains("Q4"),
+            "{mismatch}"
         );
         std::fs::remove_dir_all(root).ok();
     }
