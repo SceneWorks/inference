@@ -28,7 +28,7 @@ pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 #[cfg(test)]
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 pub(crate) const TRANSFORMER_BLOCKS: u32 = 60;
-pub(crate) const CALIBRATION_FINGERPRINT: &str =
+pub const CALIBRATION_FINGERPRINT: &str =
     "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
 
 fn streamable(spec: &LoadSpec) -> bool {
@@ -177,6 +177,32 @@ pub(crate) fn snapshot_quant_tier(
             ))),
         })
         .transpose()
+}
+
+pub(crate) fn resolved_numeric_tier(
+    spec: &LoadSpec,
+    provider_id: &str,
+) -> gen_core::Result<MemoryNumericTier> {
+    Ok(MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: snapshot_quant_tier(spec, provider_id)?,
+        component_precision_floors: &[],
+    })
+}
+
+/// Resolve the exact executable contract identity and loaded numeric tier used by V1 evidence.
+#[cfg(test)]
+pub(crate) fn evidence_identity_and_tier(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<(MemoryCalibrationIdentity, MemoryNumericTier)> {
+    let contract = provider_contract(provider_id, spec)?;
+    let calibration = contract.calibration.ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "{provider_id}: executable memory contract has no calibration identity"
+        ))
+    })?;
+    Ok((calibration, resolved_numeric_tier(spec, provider_id)?))
 }
 
 pub(crate) fn validate_context(
@@ -458,11 +484,7 @@ pub(crate) fn registered_valid_fixture(
     let context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: snapshot_quant_tier(spec, &contract.provider_id)?,
-            component_precision_floors: &[],
-        },
+        resolved_numeric_tier(spec, &contract.provider_id)?,
         gen_core::MemoryBehaviorRoute {
             mode: if edit {
                 MemoryMode::Edit
@@ -593,6 +615,33 @@ mod tests {
                 TRANSFORMER_WINDOW_SIZES
             );
         }
+    }
+
+    #[test]
+    fn evidence_identity_and_tier_match_the_executable_contract_and_packed_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "qwen-evidence-identity-tier-{}",
+            std::process::id()
+        ));
+        let transformer = root.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            br#"{"quantization":{"group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+
+        for provider_id in ["qwen_image", "qwen_image_edit"] {
+            let contract = provider_contract(provider_id, &spec).unwrap();
+            let (identity, tier) = evidence_identity_and_tier(provider_id, &spec).unwrap();
+            assert_eq!(identity, contract.calibration.unwrap());
+            assert_eq!(identity.fingerprint, CALIBRATION_FINGERPRINT);
+            assert_eq!(tier.precision, Precision::Bf16);
+            assert_eq!(tier.quant, Some(Quant::Q4));
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

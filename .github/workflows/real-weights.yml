@@ -18,7 +18,12 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, krea-realtime, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, memory-evidence-v1, krea-realtime, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+      sceneworks_revision:
+        description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
+        type: string
+        required: false
+        default: ""
       publish_chroma_artifacts:
         description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
         type: boolean
@@ -457,6 +462,119 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage
           --test request_memory_scope_real_weights -- --ignored --nocapture
+
+  mlx-memory-evidence-v1:
+    name: MLX memory evidence V1 real weights
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'memory-evidence-v1'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 180
+    env:
+      ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
+      # Keep this A/B below the VAE tiling threshold so residency is the only mechanism that differs.
+      ZIMAGE_SEQ_SIZE: 512
+      INFERENCE_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Verify exact clean inference provenance
+        run: |
+          test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=normal)"
+      - name: Resolve and bind exact SceneWorks provenance outside the inference worktree
+        env:
+          SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance
+        run: |
+          git init "$SCENEWORKS_PROVENANCE_ROOT"
+          git -C "$SCENEWORKS_PROVENANCE_ROOT" remote add origin https://github.com/SceneWorks/SceneWorks.git
+          git -C "$SCENEWORKS_PROVENANCE_ROOT" fetch --depth=1 origin "${{ inputs.sceneworks_revision }}"
+          git -C "$SCENEWORKS_PROVENANCE_ROOT" checkout --detach FETCH_HEAD
+          resolved="$(git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD)"
+          if [[ ! "$resolved" =~ ^[0-9a-f]{40}$ || "$resolved" != "${{ inputs.sceneworks_revision }}" ]]; then
+            echo "sceneworks_revision did not resolve to the exact requested commit" >&2
+            exit 1
+          fi
+          test -z "$(git -C "$SCENEWORKS_PROVENANCE_ROOT" status --porcelain --untracked-files=normal)"
+          echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3 --version
+      - name: Materialize and verify immutable Z-Image snapshot
+        env:
+          MEMORY_MODEL_INVENTORY: ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory.json
+        run: |
+          if [[ -z "$ZIMAGE_SNAPSHOT" || "$ZIMAGE_SNAPSHOT" != /* ]]; then
+            echo "ZIMAGE_SNAPSHOT must be an operator-provided absolute path" >&2
+            exit 1
+          fi
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py \
+            --model z-image-turbo \
+            --snapshot "$ZIMAGE_SNAPSHOT"
+          python3 scripts/release/verify_model_snapshot.py \
+            --model z-image-turbo \
+            --snapshot "$ZIMAGE_SNAPSHOT" \
+            --inventory-output "$MEMORY_MODEL_INVENTORY"
+          inventory_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["inventory_sha256"])' "$MEMORY_MODEL_INVENTORY")"
+          model_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["revision"])' "$MEMORY_MODEL_INVENTORY")"
+          if [[ ! "$inventory_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "model inventory did not produce an exact SHA-256" >&2
+            exit 1
+          fi
+          if [[ ! "$model_revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "model inventory did not bind an exact revision" >&2
+            exit 1
+          fi
+          echo "MEMORY_MODEL_INVENTORY_SHA256=$inventory_sha" >> "$GITHUB_ENV"
+          echo "MEMORY_MODEL_REVISION=$model_revision" >> "$GITHUB_ENV"
+      - name: Run and verify Z-Image resident versus staged evidence
+        env:
+          MEMORY_EVIDENCE_OUTPUT_DIR: ${{ runner.temp }}/memory-evidence-v1
+          MEMORY_EVIDENCE_LOG: ${{ runner.temp }}/memory-evidence-v1/z-image-turbo.log
+          MEMORY_MODEL_INVENTORY: ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory.json
+          MEMORY_MODEL_INVENTORY_AFTER: ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory-after.json
+        run: |
+          test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          mkdir -p "$MEMORY_EVIDENCE_OUTPUT_DIR"
+          set -o pipefail
+          cargo test --locked --release -p mlx-gen-z-image \
+            --test sequential_residency_real_weights \
+            sequential_bounds_peak_and_is_byte_identical -- --ignored --exact --test-threads=1 --nocapture \
+            2>&1 | tee "$MEMORY_EVIDENCE_LOG"
+          python3 scripts/release/verify_model_snapshot.py \
+            --model z-image-turbo \
+            --snapshot "$ZIMAGE_SNAPSHOT" \
+            --inventory-output "$MEMORY_MODEL_INVENTORY_AFTER"
+          if ! cmp -s "$MEMORY_MODEL_INVENTORY" "$MEMORY_MODEL_INVENTORY_AFTER"; then
+            echo "Z-Image snapshot content changed during the evidence run" >&2
+            exit 1
+          fi
+          python3 scripts/release/verify_residency_ab.py \
+            --model z_image_turbo \
+            --resident "$MEMORY_EVIDENCE_LOG" \
+            --sequential "$MEMORY_EVIDENCE_LOG" \
+            --min-reduction-mib 512 \
+            --expected-fingerprint z-image-mlx-independent-materialization-v3 \
+            --expected-abi 3 \
+            --expected-model-revision "$MEMORY_MODEL_REVISION" \
+            --expected-model-inventory-sha256 "$MEMORY_MODEL_INVENTORY_SHA256" \
+            --resident-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-resident.rgb" \
+            --sequential-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-staged.rgb" \
+            | tee "$MEMORY_EVIDENCE_OUTPUT_DIR/verifier-result.txt"
+      - name: Upload evidence log and bound output artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: memory-evidence-v1-z-image-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/memory-evidence-v1/z-image-turbo.log
+            ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory.json
+            ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-resident.rgb
+            ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-staged.rgb
+            ${{ runner.temp }}/memory-evidence-v1/verifier-result.txt
 
   mlx-llm:
     name: MLX LLM real weights

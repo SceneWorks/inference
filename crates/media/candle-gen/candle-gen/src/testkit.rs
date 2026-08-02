@@ -27,8 +27,113 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use sha2::{Digest, Sha256};
+
 use crate::candle_core::{Device, Tensor};
-use crate::gen_core::Image;
+use crate::gen_core::{
+    Image, LoadShape, MemoryBackend, MemoryCalibrationIdentity, MemoryEvidenceKey,
+    MemoryEvidenceLogRecord, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryParityContract,
+    MemoryParityResult, MemoryStrategy, MemoryStrategyParameters,
+};
+
+/// Typed inputs for one real-weight calibration observation.
+pub struct MemoryEvidenceProbe<'a> {
+    pub resolved_route: &'a str,
+    pub declared_calibration: MemoryCalibrationIdentity,
+    pub observed_calibration: MemoryCalibrationIdentity,
+    pub tier: MemoryNumericTier,
+    pub load_shape: LoadShape,
+    pub mode: MemoryMode,
+    pub overlay: Option<String>,
+    pub geometry: MemoryGeometry,
+    pub strategy: MemoryStrategy,
+    pub engaged_composition: Vec<MemoryStrategy>,
+    pub parameters: MemoryStrategyParameters,
+    pub observed_peak_bytes: u64,
+    pub harness_version: &'a str,
+    pub output_bytes: &'a [u8],
+}
+
+/// Emit one strict `MEMORY_EVIDENCE_V1` line from a Candle real-weight probe.
+///
+/// The measurement establishes the prediction at this exact calibration cell, so the observed
+/// high-water is written to both peak fields. A later out-of-sample validation must construct
+/// [`MemoryEvidenceLogRecord`] directly with the previously promoted prediction.
+pub fn memory_evidence_v1_line(probe: MemoryEvidenceProbe<'_>) -> String {
+    let output_sha256 = format!("{:x}", Sha256::digest(probe.output_bytes));
+    MemoryEvidenceLogRecord {
+        key: MemoryEvidenceKey {
+            resolved_route: probe.resolved_route.to_owned(),
+            backend: MemoryBackend::Candle,
+            tier: probe.tier,
+            load_shape: probe.load_shape,
+            mode: probe.mode,
+            overlay: probe.overlay,
+            geometry: probe.geometry,
+            strategy: probe.strategy,
+            engaged_composition: probe.engaged_composition,
+            parameters: probe.parameters,
+        },
+        declared_calibration: probe.declared_calibration,
+        observed_calibration: probe.observed_calibration,
+        predicted_peak_bytes: probe.observed_peak_bytes,
+        observed_peak_bytes: probe.observed_peak_bytes,
+        inference_revision: required_git_revision("INFERENCE_REVISION"),
+        sceneworks_revision: required_git_revision("SCENEWORKS_REVISION"),
+        model_revision: required_git_revision("MEMORY_MODEL_REVISION"),
+        model_inventory_sha256: required_sha256("MEMORY_MODEL_INVENTORY_SHA256"),
+        harness_version: probe.harness_version.to_owned(),
+        output_sha256,
+        parity: MemoryParityContract::Exact,
+        parity_result: MemoryParityResult::NotRun,
+    }
+    .to_json_line()
+    .expect("real-weight probe must produce a valid MEMORY_EVIDENCE_V1 record")
+}
+
+fn required_sha256(name: &str) -> String {
+    let value = std::env::var(name).unwrap_or_else(|_| panic!("set {name} to an exact SHA-256"));
+    assert!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{name} must be an exact lowercase 64-character SHA-256"
+    );
+    value
+}
+
+/// The calibration identity the operator/workflow expected before loading the provider.
+///
+/// The observed identity comes from the provider's exported constant or executable contract and is
+/// passed separately to [`MemoryEvidenceProbe`]. Keeping these sources distinct makes a stale runner
+/// fail at the writer instead of stamping its expectation onto the observed record.
+pub fn expected_memory_calibration(load_shape: LoadShape) -> MemoryCalibrationIdentity {
+    let fingerprint = std::env::var("MEMORY_EXPECTED_FINGERPRINT")
+        .expect("set MEMORY_EXPECTED_FINGERPRINT to the provider's exported fingerprint");
+    let abi = std::env::var("MEMORY_EXPECTED_ABI")
+        .expect("set MEMORY_EXPECTED_ABI to the provider's exported ABI")
+        .parse::<u32>()
+        .expect("MEMORY_EXPECTED_ABI must be an unsigned integer");
+    MemoryCalibrationIdentity {
+        abi,
+        fingerprint,
+        load_shape,
+    }
+}
+
+fn required_git_revision(name: &str) -> String {
+    let revision =
+        std::env::var(name).unwrap_or_else(|_| panic!("set {name} to an exact Git commit"));
+    assert!(
+        revision.len() == 40
+            && revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{name} must be an exact lowercase 40-character Git commit"
+    );
+    revision
+}
 
 // ---------------------------------------------------------------------------------------------------
 // Env paths
