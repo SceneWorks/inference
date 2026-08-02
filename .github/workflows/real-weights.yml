@@ -2,7 +2,13 @@ name: Real-weight validation
 
 on:
   schedule:
-    - cron: "17 7 * * 0"
+    # 02:00 UTC Monday = 22:00 EDT Sunday. Every macOS job below targets the single self-hosted
+    # Metal runner and they run strictly one at a time, so this run needs a whole night rather than
+    # a Sunday-morning start that bleeds into the working day. Cron is always UTC and does not
+    # follow US daylight time, so this lands at 21:00 EST once the clocks go back — still Sunday
+    # night, which is what matters. GitHub's scheduler also drifts under load (2026-08-02 the old
+    # cron fired ~2h late), so treat the start time as approximate.
+    - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
       profile:
@@ -10,7 +16,9 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        # `audio` still runs every audio family. The `audio-*` entries are the per-family split
+        # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
+        options: [all, llm, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, krea-realtime, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       publish_chroma_artifacts:
         description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
         type: boolean
@@ -427,6 +435,7 @@ jobs:
     name: MLX request-memory scope real weights
     if: inputs.profile == 'request-memory-scope'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
       MAGE_REQUEST_SCOPE_QUANT: bf16
@@ -453,6 +462,7 @@ jobs:
     name: MLX LLM real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       MLX_LLM_TEST_MODEL: ${{ vars.MLX_LLM_TEST_MODEL }}
       MLX_LLM_QWEN3_MODEL: ${{ vars.MLX_LLM_QWEN3_MODEL }}
@@ -474,6 +484,7 @@ jobs:
     name: MLX media real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
@@ -722,6 +733,7 @@ jobs:
     # Mage-oracle job that shares the `media` profile.
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       # The repo root of the pinned `SceneWorks/krea-realtime-14b-mlx` rehost. Each tier subdir is a
       # complete snapshot, so the tests are pointed one level in (`/q4`).
@@ -811,23 +823,32 @@ jobs:
           run_one real_wan_style_lora_loads_and_changes_the_render
           run_one real_wan_step_distill_lora_installs_over_the_widened_globals
 
-  candle-audio:
-    name: Candle audio real weights
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'
+  # sc-16981: this was ONE `Candle audio real weights` job running 29 real-weight invocations back
+  # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
+  # the snapshot-path fix, and it consumed GitHub's 360-minute default WITHOUT hanging — 17 of 29
+  # invocations finished, all passing, and it was 21 s into #18 when the cap killed it. For six
+  # hours it head-of-line-blocked the single self-hosted Metal runner, and with it every other
+  # macOS real-weights job plus the app repo's `nax-worker` PR lane, which shares this machine
+  # (SceneWorks/SceneWorks and SceneWorks/inference compete for one `nax-macos` since the
+  # 2026-07-25 org promotion).
+  #
+  # Split per provider family, matching how the Stable Audio 3 lane is already split: the runner is
+  # released between families so queued PR work can interleave, a failure isolates to one family
+  # instead of taking every result behind it, each family carries a budget sized to its own cost,
+  # and each is separately dispatchable. Every job also materializes ONLY the snapshots its own
+  # tests read (derived from the `env::var` calls in each crate's tests/).
+  #
+  # Measured debug wall times from run 30741567385, per family:
+  #   kokoro 3.0m · moss-sfx 233.8m · acestep 79.9m · voice 2.7m · chatterbox ~40m (8 of 11 done)
+  # `asr` and `moss-tts` never got to run before the 360-minute cancel, so their budgets are
+  # provisional. Budgets are ~1.5-2x measured, except moss-sfx — see the note on that job.
+  candle-audio-kokoro:
+    name: Candle audio real weights (Kokoro TTS)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-kokoro'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 30
     env:
       KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
-      MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
-      ACESTEP_SNAPSHOT: ${{ vars.ACESTEP_SNAPSHOT }}
-      CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
-      CHATTERBOX_SNAPSHOT: ${{ vars.CHATTERBOX_SNAPSHOT }}
-      CHATTERBOX_PERTH_SNAPSHOT: ${{ vars.CHATTERBOX_PERTH_SNAPSHOT }}
-      OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
-      WHISPER_SNAPSHOT: ${{ vars.WHISPER_SNAPSHOT }}
-      CLAP_SNAPSHOT: ${{ vars.CLAP_SNAPSHOT }}
-      MOSS_TTS_REALTIME_SNAPSHOT: ${{ vars.MOSS_TTS_REALTIME_SNAPSHOT }}
-      MOSS_TTSD_SNAPSHOT: ${{ vars.MOSS_TTSD_SNAPSHOT }}
-      MOSS_XY_TOKENIZER_SNAPSHOT: ${{ vars.MOSS_XY_TOKENIZER_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -836,27 +857,91 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model acestep-v15-turbo --snapshot "$ACESTEP_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-perth --snapshot "$CHATTERBOX_PERTH_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-tts-realtime --snapshot "$MOSS_TTS_REALTIME_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-ttsd-v05 --snapshot "$MOSS_TTSD_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model xy-tokenizer-ttsd --snapshot "$MOSS_XY_TOKENIZER_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_wav_conformance -- --ignored --nocapture
+      # Regression fixture (sc-12854): the validation harness's committed metric envelope +
+      # PCM repeatability hash; this runner IS the fixture's canonical platform
+      # (macos/aarch64), so the exact-hash check gates here.
+      - name: Run regression fixture
+        run: cargo test --locked -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
+
+  # The outlier, and the reason the 2026-08-02 run never finished: these two invocations alone cost
+  # 233.8 min of the 360 (moss_sfx_conformance 57.4m, moss_sfx_wav_conformance 176.4m) — despite
+  # the conformance profile requesting only 2 solver steps, because the gen-core suite loads the
+  # ~11 GB model and re-generates several times per section. The budget below is deliberately large
+  # enough not to false-fail; it is NOT an endorsement of a 4-hour job. Unlike every sibling audio
+  # job (Stable Audio 3, SAME) this lane runs unoptimized: no `--release`, and `metal` is not a
+  # default feature, so it is a CPU debug build of a 1.3B DiT + a 1.7B Qwen3 text encoder. Cutting
+  # that is tracked separately — it needs a measured debug-vs-release comparison of the committed
+  # `kokoro_82m_regression.json` PCM hash first, since that fixture's exact-hash gate keys on
+  # `cpu_build && macos && aarch64` and does not distinguish build profile.
+  candle-audio-moss-sfx:
+    name: Candle audio real weights (MOSS SoundEffect)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-sfx'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 300
+    env:
+      MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
+      - name: Run provider conformance
+        run: |
           cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_wav_conformance -- --ignored --nocapture
+
+  candle-audio-acestep:
+    name: Candle audio real weights (ACE-Step music)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-acestep'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 150
+    env:
+      ACESTEP_SNAPSHOT: ${{ vars.ACESTEP_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model acestep-v15-turbo --snapshot "$ACESTEP_SNAPSHOT"
+      - name: Run provider conformance
+        run: |
           # ACE-Step 1.5 music/song (sc-12842): the flow-matching DiT + Oobleck VAE producing a
           # non-degenerate, rhythmic stereo mix (frame-energy variation, broadband spectrum, beat).
           cargo test --locked -p candle-audio-acestep --test conformance acestep_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-acestep --test conformance acestep_music_wav_conformance -- --ignored --nocapture
+
+  candle-audio-voice:
+    name: Candle audio real weights (voice embed + conversion)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-voice'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 30
+    env:
+      KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
+      CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
+      OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
+      WHISPER_SNAPSHOT: ${{ vars.WHISPER_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
+      - name: Run provider conformance
+        run: |
           # Chatterbox voice embedder (sc-12844): the sc-12838 release gate. Uses the Kokoro
           # snapshot above for the distinct reference voices it embeds.
           cargo test --locked -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_discriminates_speakers -- --ignored --nocapture
@@ -864,10 +949,34 @@ jobs:
           # OpenVoice V2 voice conversion (sc-13223): the sc-12839 release gate. Converts a Kokoro
           # source clip toward a DIFFERENT Kokoro target voice; the timbre shift is measured with
           # chatterbox_ve above. sc-13233 adds a content-preservation gate: whisper_base (snapshot
-          # below) transcribes the converted clip and asserts its CER vs the known source script
+          # above) transcribes the converted clip and asserts its CER vs the known source script
           # stays small — catching linguistic garbling the duration+timbre gate is blind to.
           cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_converts_toward_the_target_voice -- --ignored --nocapture
           cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_is_deterministic -- --ignored --nocapture
+
+  candle-audio-chatterbox:
+    name: Candle audio real weights (Chatterbox clone-TTS)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-chatterbox'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
+    env:
+      KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
+      CHATTERBOX_SNAPSHOT: ${{ vars.CHATTERBOX_SNAPSHOT }}
+      CHATTERBOX_PERTH_SNAPSHOT: ${{ vars.CHATTERBOX_PERTH_SNAPSHOT }}
+      CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-perth --snapshot "$CHATTERBOX_PERTH_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+      - name: Run provider conformance
+        run: |
           # Chatterbox clone-TTS (sc-13222): the T3 speech-token LM stage on real t3_cfg.safetensors
           # weights — a valid, non-degenerate, voice-responsive token sequence, plus the honest
           # VoiceEmbedding-only boundary (a full clone WAV requires ReferenceAudio; sc-13239).
@@ -909,6 +1018,30 @@ jobs:
           # FAILS if the clone ignores the reference). Needs the full CHATTERBOX_SNAPSHOT; PerTh
           # resolves from the SceneWorks/perth-implicit hub pin.
           CHATTERBOX_WAV_OUT="$RUNNER_TEMP/chatterbox_clone_demo.wav" cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_clones_a_reference_voice_end_to_end -- --ignored --nocapture
+
+  # Provisional budget: neither of these families reached the runner before the 2026-08-02 cancel,
+  # so there is no measured wall time for them yet. Revisit once a full weekly run completes.
+  candle-audio-asr:
+    name: Candle audio real weights (Whisper ASR + CLAP)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-asr'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 60
+    env:
+      KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
+      WHISPER_SNAPSHOT: ${{ vars.WHISPER_SNAPSHOT }}
+      CLAP_SNAPSHOT: ${{ vars.CLAP_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
+      - name: Run provider conformance
+        run: |
           # Whisper ASR (sc-12850): the first real Transcriber (audio→text, the Captioner-analog).
           # Kokoro TTS → Whisper ASR round-trip — known text synthesized by kokoro_82m (snapshot
           # above) transcribes back within a small CER, with monotonic segment timestamps.
@@ -920,6 +1053,28 @@ jobs:
           # matching clip highest by cosine — the cross-modal ranking DoD — plus embedding determinism.
           cargo test --locked -p candle-audio-clap --test conformance cross_modal_query_ranks_matching_clip_highest -- --ignored --nocapture
           cargo test --locked -p candle-audio-clap --test conformance embedding_is_deterministic -- --ignored --nocapture
+
+  candle-audio-moss-tts:
+    name: Candle audio real weights (MOSS-TTSD dialogue)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-tts'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
+    env:
+      CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
+      MOSS_TTSD_SNAPSHOT: ${{ vars.MOSS_TTSD_SNAPSHOT }}
+      MOSS_XY_TOKENIZER_SNAPSHOT: ${{ vars.MOSS_XY_TOKENIZER_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-ttsd-v05 --snapshot "$MOSS_TTSD_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model xy-tokenizer-ttsd --snapshot "$MOSS_XY_TOKENIZER_SNAPSHOT"
+      - name: Run provider conformance
+        run: |
           # MOSS-TTSD-v0.5 multi-speaker dialogue TTS (sc-13360 AR brain + sc-13518 XY_Tokenizer
           # codec). The Qwen3 backbone + 8-channel delay-pattern loop emits real, deterministic RVQ
           # frames; a 2-speaker [S1]/[S2] script shapes the token stream vs a single-voice control;
@@ -931,16 +1086,12 @@ jobs:
           cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_two_speaker_script_shapes_the_token_stream -- --ignored --nocapture
           cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_renders_multi_speaker_audio -- --ignored --nocapture
           cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_renders_non_english -- --ignored --nocapture
-      # Regression fixture (sc-12854): the validation harness's committed metric envelope +
-      # PCM repeatability hash; this runner IS the fixture's canonical platform
-      # (macos/aarch64), so the exact-hash check gates here.
-      - name: Run regression fixture
-        run: cargo test --locked -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
 
   same-l-metal:
     name: SAME-L real weights (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_SAME_L_CASE: standalone
       SA3_TEST_METAL: "1"
@@ -973,6 +1124,7 @@ jobs:
     name: SAME outer chunking real weights (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-chunked'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1021,6 +1173,7 @@ jobs:
     name: Stable Audio 3 small-music provider (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1087,6 +1240,7 @@ jobs:
     name: Stable Audio 3 small-sfx provider (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1155,6 +1309,7 @@ jobs:
     name: Stable Audio 3 medium provider (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
       # No SA3_REQUIRE_ALL_SNAPSHOTS here: `variant_binding` is the only target that reads it, and
@@ -1291,6 +1446,7 @@ jobs:
     name: Stable Audio 3 base/post-trained identity matrix (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
       # Every skip branch in `variant_binding` becomes a failure. That matters more here than
@@ -1473,6 +1629,7 @@ jobs:
     name: Stable Audio 3 small base providers (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1535,6 +1692,7 @@ jobs:
     name: SAME-L real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_SAME_L_CASE: standalone
       SA3_TEST_CUDA: "1"
@@ -1662,6 +1820,7 @@ jobs:
     name: Stable Audio 3 small-music provider (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       CUDA_COMPUTE_CAP: "80"
@@ -1728,6 +1887,7 @@ jobs:
     name: Stable Audio 3 small-sfx provider (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       CUDA_COMPUTE_CAP: "80"
@@ -1811,6 +1971,7 @@ jobs:
     name: Stable Audio 3 medium provider (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       # No SA3_REQUIRE_ALL_SNAPSHOTS: only `variant_binding` reads it, and sc-14546 moved that
@@ -2045,6 +2206,7 @@ jobs:
     name: Stable Audio 3 base/post-trained identity matrix (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       SA3_REQUIRE_ALL_SNAPSHOTS: "1"
@@ -2162,6 +2324,7 @@ jobs:
     name: Stable Audio 3 small base providers (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       CUDA_COMPUTE_CAP: "80"
@@ -2234,6 +2397,7 @@ jobs:
     name: Candle LLM real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       CANDLE_LLM_TEST_MODEL: ${{ vars.CANDLE_LLM_TEST_MODEL }}
       CANDLE_LLM_QWEN3_MODEL: ${{ vars.CANDLE_LLM_QWEN3_MODEL }}
@@ -2269,6 +2433,7 @@ jobs:
     name: Candle media real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     needs: mlx-media
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
@@ -2353,6 +2518,7 @@ jobs:
     name: Candle SDXL real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       # SDXL base (UNet + dual CLIP text encoders) + the three passed-in components (epic 13657 /
       # sc-13663): the CLIP-L / CLIP-bigG tokenizer dirs and the fp16-fix VAE dir. inference never
@@ -2423,6 +2589,7 @@ jobs:
     # decision), so running them in the regression guard is in-policy.
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       # Three per-repo snapshot dirs the video->audio harness resolves the 5 components from
       # (tests/common/mod.rs): hkchengrex/MMAudio (synchformer + dit 16k/44k + vae 16k/44k + 16k
