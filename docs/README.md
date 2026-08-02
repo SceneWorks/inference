@@ -31,6 +31,10 @@ clause for every term assigned to a licence family.
 - **[Licence family evidence pack (sc-16662)](licensing/sc-16662-licence-family-evidence.md)** —
   sixteen families, quote-checkable, with an explicit unresolved list. **Draft, unsigned.** It
   records facts, not legal conclusions.
+- **[Media checkpoint census (sc-16665)](licensing/sc-16665-media-checkpoint-census.md)** — which
+  upstream checkpoints every registered media provider actually loads, read from the code. Records
+  component identity only: it assigns no families and asserts no licences, and marks every component
+  whose upstream the repository does not state as UNDETERMINED.
 
 ## Migration records
 
