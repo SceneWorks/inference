@@ -1,0 +1,52 @@
+# Line endings are a repository invariant here, not a local preference.
+#
+# Several gates compare committed artifacts as *bytes*, so the bytes a checkout produces are part
+# of the contract:
+#
+#   * `component_licenses_manifest_matches_committed_file` (crates/audio/candle-audio-catalog)
+#     asserts `release/model-weight-licenses.json` equals what the catalog emits, and the emitter
+#     writes LF.
+#   * `scripts/release/build_release.py` digests the working-copy `Cargo.lock` into a release
+#     manifest's `lockfile.sha256`, while the source archive beside it comes from `git archive`
+#     (index bytes). A CRLF working copy makes those two disagree about the same file.
+#
+# With no attributes file and `core.autocrlf=true` — the Git for Windows install default — every
+# text path checks out CRLF while the index holds LF, so those gates read bytes that never existed
+# in the repository. The licence gate then fails on any Windows checkout with "…is stale", which is
+# indistinguishable from real drift: the failure a contributor sees is identical whether or not the
+# manifest actually needs regenerating. Linux CI stays green, so nothing catches it.
+#
+# `eol=lf` overrides `core.autocrlf`, so this holds for every contributor without anyone editing
+# their Git config. It changes no committed bytes: the index was already LF for all 2897 text
+# paths — only the checkout was wrong.
+* text=auto eol=lf
+
+# Binary payloads: never convert, never diff.
+#
+# `text=auto` guesses from the first 8000 bytes, and a .safetensors file opens with a long ASCII
+# JSON header — a small enough tensor payload can leave that window free of NUL, so the guess can
+# come back "text" and the eol rewrite would corrupt the weights. These are explicit for that
+# reason; do not rely on detection for a format whose header is text.
+*.safetensors binary
+*.bytes       binary
+*.gguf        binary
+*.npy         binary
+*.npz         binary
+*.pt          binary
+*.pth         binary
+*.bin         binary
+
+# Media and archives.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.wav  binary
+*.flac binary
+*.mp3  binary
+*.mp4  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary

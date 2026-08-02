@@ -796,7 +796,13 @@ def gzip_archive(tar_content: bytes, timestamp: int) -> bytes:
 
 
 def write_json(path: Path, content: dict[str, Any]) -> None:
-    path.write_text(json.dumps(content, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # `newline="\n"` for the same reason the model-licence artifact is rendered to bytes below: a
+    # release artifact's digest must not record which platform built it. Text mode translates "\n"
+    # to os.linesep on write, so on Windows these bytes — and therefore the SHA256SUMS entry and the
+    # manifest's own artifact digests — would differ from a Linux build of the same revision.
+    path.write_text(
+        json.dumps(content, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+    )
 
 
 def build_release(
@@ -931,7 +937,7 @@ def build_release(
     checksums = "".join(
         f"{sha256_file(path)}  {path.name}\n" for path in sorted(checksum_paths)
     )
-    (output / "SHA256SUMS").write_text(checksums, encoding="utf-8")
+    (output / "SHA256SUMS").write_text(checksums, encoding="utf-8", newline="\n")
     return manifest
 
 
