@@ -33,7 +33,9 @@ use mlx_gen::{
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma};
 
 use crate::model::{validate_request, ZImageHeavyOwned};
-use crate::pipeline::{self, denoise_cfg_with_progress, encode_init_latents, init_time_step};
+use crate::pipeline::{
+    self, denoise_cfg_with_progress_and_preview, encode_init_latents, init_time_step,
+};
 use crate::text_encoder::TextEncoder;
 
 /// Base Z-Image default steps — undistilled foundation model. The card recommends 28–50; 50 matches
@@ -94,7 +96,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -362,7 +364,7 @@ impl ZImage {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_cfg_with_progress(
+                        denoise_cfg_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -375,6 +377,7 @@ impl ZImage {
                             attention_budget,
                             block_window,
                             &req.cancel,
+                            &req.preview,
                             op,
                         )
                     },

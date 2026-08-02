@@ -16,8 +16,8 @@ pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preproces
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image,
-    LatentDecoder, Progress, Result, TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, Conditioning, Error, FlowMatchEuler,
+    GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array, Dtype};
@@ -95,6 +95,41 @@ pub fn denoise_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_with_progress`] with decorative per-step latent previews.
+///
+/// The legacy entry point remains an inert wrapper so existing callers retain the exact numerical
+/// path. Preview projection is attempted only for an active sink and never changes render success.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_with_progress_and_preview(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // The patchify metadata + RoPE freqs depend only on the (loop-constant) latent dims and caption,
     // so build them once and reuse across steps instead of rederiving them every forward (F-042).
     let sh = latents.shape();
@@ -114,14 +149,17 @@ pub fn denoise_with_progress(
     let predict =
         |x: &Array, timestep: f32| transformer.forward_with_rungs(&prep, x, timestep, plan, window);
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -186,6 +224,42 @@ pub fn denoise_cfg_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_cfg_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        neg_cap_feats,
+        guidance,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_cfg_with_progress`] with decorative per-step latent previews.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_progress_and_preview(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // Cond (and, when CFG is active, uncond) patchify metadata + RoPE freqs depend only on the
     // loop-constant latent dims + caption — build each once and reuse across steps (F-042).
     let sh = latents.shape();
@@ -215,14 +289,17 @@ pub fn denoise_cfg_with_progress(
         }
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -248,6 +325,42 @@ pub fn denoise_control_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_control_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        control_context,
+        control_context_scale,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_control_with_progress`] with decorative per-step latent previews.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_with_progress_and_preview(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // Patchify metadata, RoPE freqs, and the embedded (constant) control context depend only on the
     // loop-constant latent dims + caption + control context — build once and reuse every step (F-042).
     let sh = latents.shape();
@@ -269,14 +382,17 @@ pub fn denoise_control_with_progress(
         )
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -313,6 +429,46 @@ pub fn denoise_control_cfg_with_progress(
     budget: AttentionBudget,
     block_window: Option<usize>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_control_cfg_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        neg_cap_feats,
+        guidance,
+        control_context,
+        control_context_scale,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_control_cfg_with_progress`] with decorative per-step latent previews.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_cfg_with_progress_and_preview(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // Cond (and, when CFG is active, uncond) control prep — patchify metadata + RoPE freqs + the
@@ -363,14 +519,17 @@ pub fn denoise_control_cfg_with_progress(
         }
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
