@@ -27,6 +27,7 @@ pub use gen_core::{
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
 pub mod array;
+pub mod asset_facts;
 // Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
 pub mod attention;
 // Bounded transformer residency (SC-15750): ladder rung 4, likewise shared — see the module docs for

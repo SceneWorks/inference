@@ -95,12 +95,42 @@ pub fn register_providers(
         .register_generator(model_base_control::REGISTRATION)
         .register_generator(model_control::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
+            },
+        })
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_base::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model_base::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(model_base::MODEL_ID, spec)
+            },
+        })
         .register_memory_behavior(model_base::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model_base_control::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    model_base_control::MODEL_ID,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(model_base_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: model_control::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    model_control::MODEL_ID,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::REGISTRATION)
 }
@@ -154,6 +184,27 @@ mod compile_glue_guard_tests {
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn snapshot(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("z-image-{tag}-{}", std::process::id()));
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        root
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -190,7 +241,8 @@ mod explicit_registry_tests {
         // SC-15998: rung 4 is declared per load — a re-openable snapshot dir with deferred
         // materialization, independent from phase residency.
         // The registry must hand back the same contract the direct builder produces for that load.
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+        let root = snapshot("registry-memory");
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         for id in [
             "z_image_turbo",
@@ -249,5 +301,6 @@ mod explicit_registry_tests {
                 "{id}: the decode ladder must be sweepable, not a single point"
             );
         }
+        std::fs::remove_dir_all(root).ok();
     }
 }

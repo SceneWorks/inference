@@ -3,13 +3,15 @@
 //! This module declares only the quality-preserving mechanisms the provider actually executes.
 //! Exact peak envelopes remain in SceneWorks' promoted calibration bundle.
 
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategySupport, PerComponentBytes, Result as CoreResult,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
+    Result as CoreResult,
 };
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
@@ -34,7 +36,43 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let (asset_facts, resident_components) = asset_facts(spec, provider_id)?;
+    memory_strategy_contract_with_asset_facts(provider_id, spec, asset_facts, resident_components)
+}
+
+/// Declaration-equivalent contract used only by weights-free registry conformance.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        MemoryAssetFacts::default(),
+        Vec::new(),
+    )
+}
+
+fn memory_strategy_contract_with_asset_facts(
+    provider_id: &str,
+    spec: &LoadSpec,
+    asset_facts: MemoryAssetFacts,
+    resident_components: Vec<MemoryResidentComponent>,
+) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::OverlayBytes,
+        MemoryFormulaVariable::DecodeTileArea,
+    ];
     Ok(MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -81,53 +119,88 @@ pub fn memory_strategy_contract(
             attention_chunking: false,
             transformer_window_materialization: false,
         },
-        formula: MemoryFormulaKind::PhaseEnvelope {
-            phases: vec![
-                MemoryPhase::Conditioning,
-                MemoryPhase::Denoise,
-                MemoryPhase::Decode,
-            ],
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::BatchCount,
-                MemoryFormulaVariable::ConditioningTokenCount,
-                MemoryFormulaVariable::OverlayBytes,
-                MemoryFormulaVariable::DecodeTileArea,
-            ],
+        formula: if resident_components.is_empty() {
+            MemoryFormulaKind::PhaseEnvelope { phases, variables }
+        } else {
+            MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases,
+                variables,
+                resident_components,
+            }
         },
         calibration: Some(MemoryCalibrationIdentity::new(
             MEMORY_CALIBRATION_FINGERPRINT,
             spec.load_shape,
         )),
-        asset_facts: asset_facts(spec),
+        asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
     })
 }
 
-fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
-    let overlay_bytes = spec
-        .control
-        .as_ref()
-        .and_then(|source| match source {
-            mlx_gen::WeightsSource::File(path) => std::fs::metadata(path).ok().map(|m| m.len()),
-            mlx_gen::WeightsSource::Dir(_) => None,
+fn asset_facts(
+    spec: &LoadSpec,
+    provider_id: &str,
+) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
+    let mlx_gen::WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Msg(
+            "krea pose memory facts require a snapshot directory".to_owned(),
+        ));
+    };
+    let project = |path: &std::path::Path, select: &dyn Fn(&str) -> bool| -> CoreResult<u64> {
+        projected_safetensors_bytes(path, |tensor| {
+            if let Some(quant) = spec.quantize.filter(|_| select(&tensor.name)) {
+                ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                ResidentProjection::Stored
+            }
         })
-        .unwrap_or(0);
-    MemoryAssetFacts {
-        base_bytes: components
-            .text_encoder
-            .saturating_add(components.dit)
-            .saturating_add(components.vae)
-            .saturating_add(overlay_bytes),
-        conditioning_bytes: components.text_encoder,
-        transformer_bytes: components.dit,
-        decoder_bytes: components.vae,
-        overlay_bytes,
-    }
+    };
+    let conditioning_bytes = project(
+        &root.join("text_encoder"),
+        &crate::convert::is_text_encoder_quant_target,
+    )?;
+    let transformer_bytes = project(&root.join("transformer"), &|name| {
+        crate::convert::is_transformer_quant_target(name)
+    })?;
+    let decoder_bytes = project(&root.join("vae"), &|_| false)?;
+    let overlay_bytes = match &spec.control {
+        Some(mlx_gen::WeightsSource::Dir(path)) | Some(mlx_gen::WeightsSource::File(path)) => {
+            let base_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
+            let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
+            projected_safetensors_bytes(path, |_| match branch_bits {
+                Some(bits) => ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                },
+                None => ResidentProjection::Stored,
+            })?
+        }
+        None => 0,
+    };
+    let resident_components = (overlay_bytes > 0)
+        .then(|| MemoryResidentComponent {
+            id: "pose_control_branch".to_owned(),
+            kind: MemoryComponentKind::ControlBranch,
+            resident_bytes: overlay_bytes,
+            bounded_by: None,
+        })
+        .into_iter()
+        .collect();
+    Ok((
+        MemoryAssetFacts {
+            base_bytes: conditioning_bytes
+                .saturating_add(transformer_bytes)
+                .saturating_add(decoder_bytes),
+            conditioning_bytes,
+            transformer_bytes,
+            decoder_bytes,
+            overlay_bytes,
+        },
+        resident_components,
+    ))
 }
 
 pub fn safety_check(
@@ -390,6 +463,27 @@ mod tests {
         Precision, Quant, WeightsSource,
     };
 
+    fn write_control(path: &std::path::Path) {
+        let mut header =
+            br#"{"control.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
+                .to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 256]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_snapshot(root: &std::path::Path) {
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_control(&dir.join("model.safetensors"));
+        }
+    }
+
     #[test]
     fn prepacked_q8_pose_without_an_override_accepts_only_the_actual_tier() {
         let root = std::env::temp_dir().join(format!(
@@ -399,7 +493,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
         ));
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        write_snapshot(&root);
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"quantization":{"bits":8,"group_size":64}}"#,
@@ -454,6 +548,45 @@ mod tests {
                     if reason.contains("does not match loaded tier")
             ));
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn q4_base_projects_pose_overlay_at_the_declared_q8_floor() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-krea-pose-floor-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        write_snapshot(&root);
+        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        let control = root.join("control.safetensors");
+        write_control(&control);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_quant(Quant::Q4)
+            .with_control(WeightsSource::File(control));
+        let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
+        // Q8: 128 code bytes + two 2x1 bf16 tables (8 bytes). A uniform Q4 projection would be 72.
+        assert_eq!(contract.asset_facts.overlay_bytes, 136);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 256);
+        assert_eq!(contract.asset_facts.transformer_bytes, 256);
+        assert_eq!(contract.asset_facts.decoder_bytes, 256);
+        assert_eq!(contract.asset_facts.base_bytes, 768);
+        assert_eq!(contract.auxiliary_resident_bytes(), 136);
+        assert!(contract.conformance_errors().is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn empty_pose_base_component_cannot_be_reported_as_zero() {
+        let root = std::env::temp_dir().join(format!("mlx-krea-pose-empty-{}", std::process::id()));
+        write_snapshot(&root);
+        std::fs::remove_file(root.join("vae/model.safetensors")).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(memory_strategy_contract("krea_2_turbo_control", &spec).is_err());
+        assert!(weights_free_memory_strategy_contract("krea_2_turbo_control", &spec).is_ok());
         std::fs::remove_dir_all(root).ok();
     }
 }

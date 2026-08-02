@@ -95,9 +95,10 @@ pub use memory_strategy::{
 pub use registry::{
     ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
     CaptionerRegistration, ImageEmbedderRegistration, MemoryBehaviorBeginRequest,
-    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryRegistration, ModelRegistration,
-    PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration,
-    TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
+    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
+    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{

@@ -22,6 +22,7 @@
 //! BoundedTransformerResidency]`: this loader reopens components between phases, so block streaming
 //! is valid only when staged residency is active in the same request.
 
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
@@ -46,8 +47,59 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let _ = crate::model::component_footprint(spec)?;
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Msg(
+            "krea memory facts require a snapshot directory".to_owned(),
+        ));
+    };
+    let project = |path: &std::path::Path, select: &dyn Fn(&str) -> bool| -> CoreResult<u64> {
+        projected_safetensors_bytes(path, |tensor| {
+            if let Some(quant) = spec.quantize.filter(|_| select(&tensor.name)) {
+                ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                ResidentProjection::Stored
+            }
+        })
+    };
+    let components = mlx_gen::PerComponentBytes {
+        text_encoder: project(
+            &root.join("text_encoder"),
+            &crate::convert::is_text_encoder_quant_target,
+        )?,
+        dit: project(&root.join("transformer"), &|name| {
+            crate::convert::is_transformer_quant_target(name)
+        })?,
+        vae: project(&root.join("vae"), &|_| false)?,
+    };
+    Ok(memory_strategy_contract_with_components(
+        provider_id,
+        spec,
+        components,
+    ))
+}
+
+/// Declaration-equivalent contract used only by weights-free registry conformance.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    Ok(memory_strategy_contract_with_components(
+        provider_id,
+        spec,
+        Default::default(),
+    ))
+}
+
+fn memory_strategy_contract_with_components(
+    provider_id: &str,
+    spec: &LoadSpec,
+    components: mlx_gen::PerComponentBytes,
+) -> MemoryProviderContract {
     let streamable = is_streamable_spec(spec);
-    let footprint = crate::model::component_footprint(spec)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -76,13 +128,13 @@ pub fn memory_strategy_contract(
         MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
     ));
-    contract.asset_facts.base_bytes = footprint
+    contract.asset_facts.base_bytes = components
         .text_encoder
-        .saturating_add(footprint.dit)
-        .saturating_add(footprint.vae);
-    contract.asset_facts.conditioning_bytes = footprint.text_encoder;
-    contract.asset_facts.transformer_bytes = footprint.dit;
-    contract.asset_facts.decoder_bytes = footprint.vae;
+        .saturating_add(components.dit)
+        .saturating_add(components.vae);
+    contract.asset_facts.conditioning_bytes = components.text_encoder;
+    contract.asset_facts.transformer_bytes = components.dit;
+    contract.asset_facts.decoder_bytes = components.vae;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -118,6 +170,46 @@ pub fn memory_strategy_contract(
         capability.parameters.transformer_window_sizes = vec![TRANSFORMER_WINDOW_SIZE];
         capability.parameters.transformer_window_components = vec![TransformerComponent::Dit];
     }
+    contract
+}
+
+/// Exact contract for the supported community single-file DiT composition. The native I8 format is
+/// dequantized projection-by-projection to bf16, while its scale/descriptor tensors are consumed and
+/// dropped; the text encoder and VAE remain sourced from the resident base snapshot.
+pub(crate) fn native_memory_strategy_contract(
+    provider_id: &str,
+    dit_file: &std::path::Path,
+    base_snapshot_dir: &std::path::Path,
+) -> CoreResult<MemoryProviderContract> {
+    let base_spec = LoadSpec::new(WeightsSource::Dir(base_snapshot_dir.to_path_buf()));
+    let mut contract = memory_strategy_contract(provider_id, &base_spec).map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native base snapshot asset facts for '{}': {error}",
+            base_snapshot_dir.display()
+        ))
+    })?;
+    let transformer_bytes = projected_safetensors_bytes(dit_file, |tensor| {
+        if tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".comfy_quant") {
+            ResidentProjection::Omit
+        } else if tensor.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8 {
+            ResidentProjection::Bfloat16
+        } else {
+            ResidentProjection::Stored
+        }
+    })
+    .map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native DiT asset facts for '{}': {error}",
+            dit_file.display()
+        ))
+    })?;
+    contract.asset_facts.transformer_bytes = transformer_bytes;
+    contract.asset_facts.base_bytes = contract
+        .asset_facts
+        .conditioning_bytes
+        .checked_add(transformer_bytes)
+        .and_then(|bytes| bytes.checked_add(contract.asset_facts.decoder_bytes))
+        .ok_or_else(|| CoreError::Msg("krea native resident byte sum overflow".to_owned()))?;
     Ok(contract)
 }
 
@@ -387,6 +479,32 @@ mod tests {
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_native_i8_safetensors(path: &std::path::Path) {
+        let mut header = br#"{
+            "model.diffusion_model.proj.weight":{"dtype":"I8","shape":[2,64],"data_offsets":[0,128]},
+            "model.diffusion_model.proj.weight_scale":{"dtype":"F32","shape":[2],"data_offsets":[128,136]},
+            "model.diffusion_model.proj.comfy_quant":{"dtype":"U8","shape":[2],"data_offsets":[136,138]}
+        }"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 138]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn fixture() -> (std::path::PathBuf, LoadSpec) {
         let root = std::env::temp_dir().join(format!(
             "mlx_gen_krea_sc16352_{}_{}",
@@ -396,7 +514,7 @@ mod tests {
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("model.safetensors"), [0_u8; 8]).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
         }
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
@@ -541,6 +659,36 @@ mod tests {
     }
 
     #[test]
+    fn missing_required_component_directory_fails_closed() {
+        let (root, spec) = fixture();
+        std::fs::remove_dir_all(root.join("text_encoder")).unwrap();
+        assert!(memory_strategy_contract("krea_2_turbo", &spec).is_err());
+        assert!(weights_free_memory_strategy_contract("krea_2_turbo", &spec).is_ok());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn native_required_file_rejects_missing_empty_and_corrupt_sources() {
+        let (root, _) = fixture();
+        let native = root.join("native.safetensors");
+        let missing = native_memory_strategy_contract("krea_2_turbo", &native, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("native DiT asset facts"), "{missing}");
+        std::fs::write(&native, []).unwrap();
+        let empty = native_memory_strategy_contract("krea_2_turbo", &native, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("native DiT asset facts"), "{empty}");
+        std::fs::write(&native, b"corrupt").unwrap();
+        let corrupt = native_memory_strategy_contract("krea_2_turbo", &native, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(corrupt.contains("native DiT asset facts"), "{corrupt}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn low_rank_overlay_is_admissible_but_dense_diff_patch_is_not() {
         let (root, mut spec) = fixture();
         let low_rank = root.join("low-rank.safetensors");
@@ -573,7 +721,7 @@ mod tests {
         let file = LoadSpec::new(WeightsSource::File(root.join("single.safetensors")))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
-        for spec in [resident, eager, file] {
+        for spec in [resident, eager] {
             let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
             assert_eq!(
                 contract
@@ -583,6 +731,24 @@ mod tests {
                 MemoryStrategySupport::Missing
             );
         }
+        let error = memory_strategy_contract("krea_2_turbo", &file)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("snapshot directory"), "{error}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn native_i8_contract_counts_bf16_materialization_and_omits_source_companions() {
+        let (root, _) = fixture();
+        let native = root.join("native.safetensors");
+        write_native_i8_safetensors(&native);
+        let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.decoder_bytes, 2);
+        assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
+        assert_eq!(contract.asset_facts.base_bytes, 260);
+        assert!(contract.conformance_errors().is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 }

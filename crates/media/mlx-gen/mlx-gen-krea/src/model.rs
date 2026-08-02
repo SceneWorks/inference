@@ -371,11 +371,15 @@ pub(crate) fn build_native_krea(
     let base = base_snapshot_dir.as_ref();
     let native_spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
         .with_adapters(adapters.to_vec());
-    let memory_strategy =
-        crate::block_memory_strategy::memory_strategy_contract(descriptor.id, &native_spec)?;
-    // Architecture config from the resident turnkey (the single file ships no config.json); the
-    // community merge shares the published Krea 2 architecture exactly.
+    // Architecture config from the resident turnkey (the single file ships no config.json); keep
+    // this as the first native-load stage so adapter-bearing calls prove they entered the same
+    // loader as adapter-free calls before any exact asset sizing is attempted.
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
+    let memory_strategy = crate::block_memory_strategy::native_memory_strategy_contract(
+        descriptor.id,
+        dit_file.as_ref(),
+        base,
+    )?;
     let dit = crate::loader::load_transformer_from_native_file(dit_file.as_ref(), &cfg)?;
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
@@ -1289,9 +1293,6 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    if matches!(spec.weights, WeightsSource::File(_)) {
-        return Ok(mlx_gen::PerComponentBytes::default());
-    }
     mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
@@ -1670,6 +1671,35 @@ mod tests {
             e.contains("config.json") || e.contains("read"),
             "expected the missing-base config-read error, got: {e}"
         );
+    }
+
+    #[test]
+    fn native_load_valid_config_reaches_fail_closed_base_asset_sizing() {
+        let root = std::env::temp_dir().join(format!(
+            "krea-native-asset-stage-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+
+        let e = load_from_native_dit_file(
+            root.join("missing-dit.safetensors"),
+            &root,
+            &[],
+            descriptor(),
+        )
+        .err()
+        .expect("missing required base components must fail")
+        .to_string();
+        assert!(
+            e.contains("native base snapshot asset facts"),
+            "expected the post-config asset-sizing stage, got: {e}"
+        );
+        assert!(!e.contains("config.json"), "config was valid, got: {e}");
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Real-weight harness for the native single-file + adapter fold (sc-14119): the discriminating check

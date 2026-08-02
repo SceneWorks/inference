@@ -26,6 +26,7 @@
 //!
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, GenerationMemory,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
@@ -51,8 +52,16 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
 /// Mage's first shared-contract adoption is intentionally resident-only. The exact measured
 /// request estimator and fail-closed wired-memory boundary are exposed now; SC-15509 owns adding
 /// verified optimized rungs and their provider implementation.
-pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> MemoryProviderContract {
-    memory_strategy_contract_with_adapters(provider_id, tier, &[])
+pub fn memory_strategy_contract(provider_id: &str, _tier: Option<Quant>) -> MemoryProviderContract {
+    memory_strategy_contract_with_adapters(provider_id, &[], Default::default())
+}
+
+/// Declaration-equivalent contract used only by weights-free registry conformance.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    Ok(memory_strategy_contract(provider_id, spec.quantize))
 }
 
 /// Build the load-exact Mage contract. Mage installs every adapter as a forward-time residual after
@@ -62,14 +71,51 @@ pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> Memor
 pub fn memory_strategy_contract_for_spec(
     provider_id: &str,
     spec: &LoadSpec,
-) -> MemoryProviderContract {
-    memory_strategy_contract_with_adapters(provider_id, spec.quantize, &spec.adapters)
+) -> CoreResult<MemoryProviderContract> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Msg(
+            "mage_flow memory facts require a snapshot directory".to_owned(),
+        ));
+    };
+    let dirs = resolve_component_dirs(root, spec)?;
+    let project =
+        |path: &Path, select: &dyn Fn(&str) -> bool, apply_floor: bool| -> CoreResult<u64> {
+            projected_safetensors_bytes(path, |tensor| {
+                let Some(quant) = spec.quantize else {
+                    return ResidentProjection::Stored;
+                };
+                let Some(base) = tensor.name.strip_suffix(".weight") else {
+                    return ResidentProjection::Stored;
+                };
+                if !select(base) {
+                    return ResidentProjection::Stored;
+                }
+                ResidentProjection::GroupQuantized {
+                    bits: if apply_floor {
+                        crate::convert::quant_floor_bits(base, quant.bits())
+                    } else {
+                        quant.bits()
+                    },
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            })
+        };
+    let components = mlx_gen::PerComponentBytes {
+        text_encoder: project(&dirs.text_encoder, &crate::convert::is_te_target, true)?,
+        dit: project(&dirs.transformer, &crate::convert::is_dit_target, true)?,
+        vae: project(&dirs.vae, &|_| false, false)?,
+    };
+    Ok(memory_strategy_contract_with_adapters(
+        provider_id,
+        &spec.adapters,
+        components,
+    ))
 }
 
 fn memory_strategy_contract_with_adapters(
     provider_id: &str,
-    tier: Option<Quant>,
     adapters: &[mlx_gen::AdapterSpec],
+    components: mlx_gen::PerComponentBytes,
 ) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
@@ -113,8 +159,13 @@ fn memory_strategy_contract_with_adapters(
     // Mage's loaded resident generator uses sequential defaults internally. An explicit shared
     // Resident selection must therefore carry an all-disabled memory block to override them.
     contract.resident_request_memory = mlx_gen::gen_core::ResidentRequestMemory::ExplicitResident;
-    contract.asset_facts.base_bytes =
-        (crate::memory::generation_resident_gb(tier) * 1_000_000_000.0).round() as u64;
+    contract.asset_facts.conditioning_bytes = components.text_encoder;
+    contract.asset_facts.transformer_bytes = components.dit;
+    contract.asset_facts.decoder_bytes = components.vae;
+    contract.asset_facts.base_bytes = components
+        .text_encoder
+        .saturating_add(components.dit)
+        .saturating_add(components.vae);
     contract
 }
 
@@ -595,7 +646,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec),
+        memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec)?,
         pipeline,
     }))
 }
@@ -1086,7 +1137,7 @@ macro_rules! mage_memory_registration {
         pub const $name: mlx_gen::gen_core::MemoryRegistration =
             mlx_gen::gen_core::MemoryRegistration {
                 provider_id: $id,
-                contract: |spec| Ok(memory_strategy_contract_for_spec($id, spec)),
+                contract: |spec| memory_strategy_contract_for_spec($id, spec),
                 safety_check: |spec, contract, context| {
                     memory_strategy_safety_check_for(
                         $id,
@@ -1118,6 +1169,41 @@ mage_memory_registration!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_memory_safetensors(path: &Path, entries: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in entries {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut file = (json.len() as u64).to_le_bytes().to_vec();
+        file.extend(json);
+        file.resize(file.len() + offset, 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn write_memory_snapshot(root: &Path) {
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_memory_safetensors(
+                &dir.join("model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+    }
 
     #[test]
     fn memory_strategy_contract_is_truthful_resident_only_mlx_adoption() {
@@ -1162,16 +1248,84 @@ mod tests {
     }
 
     #[test]
+    fn spec_contract_uses_projected_component_bytes_and_mage_q4_floors() {
+        let root = std::env::temp_dir().join(format!(
+            "mage-memory-facts-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        for component in ["text_encoder", "transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        write_memory_safetensors(
+            &root.join("transformer/model.safetensors"),
+            &[
+                ("norm_out.linear.weight", "BF16", &[2, 64], 256),
+                ("blocks.0.proj.weight", "BF16", &[2, 64], 256),
+            ],
+        );
+        write_memory_safetensors(
+            &root.join("text_encoder/model.safetensors"),
+            &[
+                (
+                    "model.visual.pos_embed.weight",
+                    "BF16",
+                    &[2304, 1024],
+                    4_718_592,
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    "BF16",
+                    &[2, 64],
+                    256,
+                ),
+            ],
+        );
+        write_memory_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[("norm.weight", "BF16", &[1], 2)],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
+        let contract = memory_strategy_contract_for_spec("mage_flow", &spec).unwrap();
+        // The documented [2304,1024] vision position embedding stays dense bf16 because its loader
+        // reads it directly. The adjacent LM projection is an actual target and takes Mage's Q8
+        // text-layer floor. A projector that quantizes every packable rank-two weight reports the
+        // old, invalid 1,327,104-byte Q4 position embedding instead of 4,718,592 bytes.
+        assert_eq!(contract.asset_facts.conditioning_bytes, 4_718_592 + 136);
+        assert_eq!(contract.asset_facts.conditioning_bytes - 136, 4_718_592);
+        assert_ne!(contract.asset_facts.conditioning_bytes - 136, 1_327_104);
+        assert_eq!(contract.asset_facts.transformer_bytes, 136 + 72);
+        assert_eq!(contract.asset_facts.decoder_bytes, 2);
+        assert_eq!(contract.asset_facts.base_bytes, 4_718_938);
+        assert!(contract.conformance_errors().is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn empty_mage_component_directory_cannot_be_reported_as_zero() {
+        let root =
+            std::env::temp_dir().join(format!("mage-empty-component-{}", std::process::id()));
+        write_memory_snapshot(&root);
+        std::fs::remove_file(root.join("text_encoder/model.safetensors")).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(memory_strategy_contract_for_spec("mage_flow", &spec).is_err());
+        assert!(weights_free_memory_strategy_contract("mage_flow", &spec).is_ok());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn adapter_contract_adds_load_exact_residency_and_preserves_missing_evidence() {
         let root =
             std::env::temp_dir().join(format!("mage-memory-adapters-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        write_memory_snapshot(&root);
         let adapter = root.join("mage.safetensors");
         std::fs::write(&adapter, vec![0_u8; 4096]).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![
             mlx_gen::AdapterSpec::new(adapter, 1.0, mlx_gen::AdapterKind::Lora),
         ]);
-        let contract = memory_strategy_contract_for_spec("mage_flow", &spec);
+        let contract = memory_strategy_contract_for_spec("mage_flow", &spec).unwrap();
 
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(contract.auxiliary_resident_bytes(), 4096);
@@ -1191,7 +1345,7 @@ mod tests {
                 mlx_gen::AdapterKind::Lora,
             ),
         ]);
-        let missing_contract = memory_strategy_contract_for_spec("mage_flow", &missing);
+        let missing_contract = memory_strategy_contract_for_spec("mage_flow", &missing).unwrap();
         assert_eq!(missing_contract.auxiliary_resident_bytes(), 0);
         assert!(!missing_contract
             .formula
@@ -1206,7 +1360,12 @@ mod tests {
             MEMORY_CALIBRATION_ABI,
         };
 
-        let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
+        let mismatch_root =
+            std::env::temp_dir().join(format!("mage-memory-mismatch-{}", std::process::id()));
+        write_memory_snapshot(&mismatch_root);
+        let loaded_spec =
+            LoadSpec::new(WeightsSource::Dir(mismatch_root.clone())).with_quant(Quant::Q4);
+        let contract = memory_strategy_contract_for_spec("mage_flow", &loaded_spec).unwrap();
         let required = (crate::memory::generation_peak_gb(Some(Quant::Q4), 512, 512, 1)
             * 1_000_000_000.0)
             .round() as u64;
@@ -1245,7 +1404,7 @@ mod tests {
             evidence_revision: "test".to_owned(),
         };
         let mismatched_spec =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
+            LoadSpec::new(WeightsSource::Dir(mismatch_root.clone())).with_quant(Quant::Q8);
         let registered = (MEMORY_REGISTRATION.safety_check)(&mismatched_spec, &contract, &valid);
         assert!(matches!(
             registered,
@@ -1327,6 +1486,7 @@ mod tests {
         )
         .unwrap()
         .contains("committed bytes"));
+        std::fs::remove_dir_all(mismatch_root).ok();
     }
 
     #[test]
