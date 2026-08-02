@@ -6,12 +6,12 @@
 //! as dense floats → a degenerate (flat) render, which the pixel-std assertion catches.
 //!
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
-//! converter packs the **DiT `transformer/` block Linears**, T5-XXL's complete attention/FFN Linear
-//! surface, and the FLUX.1 VAE mid-block attention. T5's token-embedding and relative-position-bias
-//! tables remain dense as an explicit sensitivity carve-out; its large attention/FFN Linear surface
-//! is packed. Shipping q4 preserves the existing q4 transformer and uses q8 auxiliaries because
-//! hosted image calibration rejects all-q4 quality; both routes load without a full dense auxiliary
-//! transient. A packed tier is loaded with `Quant::None` (the
+//! converter packs the **DiT `transformer/` block Linears**, T5-XXL's attention/FFN Linear surface,
+//! and the FLUX.1 VAE mid-block attention. T5's token embedding, relative-position-bias table, and
+//! block-23 FFN remain dense under the production-length sensitivity carve-out; its remaining large
+//! attention/FFN Linear surface is packed. Shipping q4 preserves the existing q4 transformer and
+//! uses q8 auxiliaries because hosted image calibration rejects all-q4 quality; both routes load
+//! without a full dense auxiliary transient. A packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
 //! tier is the mirrored source, loaded directly.
 //!
@@ -238,8 +238,12 @@ fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>
     let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     if let Some(bits) = quantize_at_load {
-        t5.quantize_linears(bits)
-            .expect("load-time T5 Linear quantization");
+        t5.quantize_linears_except(
+            bits,
+            mlx_gen_chroma::T5_DENSE_FFN_BLOCK,
+            T5Sublayer::FeedForward,
+        )
+        .expect("load-time T5 Linear quantization");
     }
     let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
         &tokenizer,
@@ -600,6 +604,19 @@ fn packed_auxiliaries_match_load_time_quantization() {
         "T5 attention/FFN surface must be stored as packed codes"
     );
     assert!(packed_weights.get(&format!("{t5_probe}.scales")).is_some());
+    let dense_ffn = format!(
+        "encoder.block.{}.layer.1.DenseReluDense.wi_0",
+        mlx_gen_chroma::T5_DENSE_FFN_BLOCK
+    );
+    assert_ne!(
+        packed_weights
+            .require(&format!("{dense_ffn}.weight"))
+            .unwrap()
+            .dtype(),
+        Dtype::Uint32,
+        "T5 block-23 FFN is the measured source-precision carve-out"
+    );
+    assert!(packed_weights.get(&format!("{dense_ffn}.scales")).is_none());
     let packed_weights =
         mlx_gen::weights::Weights::from_dir(out.join("vae")).expect("packed VAE weights");
     let vae_probe = "decoder.mid_block.attentions.0.to_q";
@@ -661,7 +678,7 @@ fn packed_auxiliaries_match_load_time_quantization() {
     );
 
     println!(
-        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias-block23-ffn\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
         bits,
         auxiliary_bits,
@@ -736,7 +753,7 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         gib(baseline_peak)
     );
     println!(
-        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias-block23-ffn\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
         id,
         bits,
         auxiliary_bits,

@@ -9,9 +9,9 @@
 //! * The transformer's own `x_embedder` / `context_embedder` / top-level `proj_out` and the entire
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
-//! * T5 packs every quantizable attention/FFN Linear. Its token embedding and shared relative-
-//!   position bias remain at source precision as an explicit sensitivity-calibration hypothesis;
-//!   RMSNorm scales likewise remain dense.
+//! * T5 packs every quantizable attention/FFN Linear except the final block's FFN. Its token
+//!   embedding, shared relative-position bias, and block-23 FFN remain at source precision under the
+//!   production-length SC-16462 sensitivity policy; RMSNorm scales likewise remain dense.
 //! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
@@ -32,6 +32,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::quant::GROUP_SIZE;
+use crate::t5_quantization;
 
 /// The single packed weight file the turnkey ships for the transformer (replaces the source's sharded
 /// `diffusion_pytorch_model-0000N-of-0000M.safetensors`). The loader globs `*.safetensors` under
@@ -92,11 +93,11 @@ fn is_transformer_target(base: &str) -> bool {
     false
 }
 
-/// T5-XXL's Chroma policy packs the complete attention/FFN Linear surface while retaining the token
-/// embedding and the block-0 relative-position-bias table at source precision. The shared
-/// [`quantize_map`] shape guard keeps 1-D LayerNorm/RMSNorm vectors dense as well.
+/// T5-XXL's Chroma policy packs the attention/FFN Linear surface while retaining the token
+/// embedding, block-0 relative-position-bias table, and block-23 FFN at source precision. The
+/// shared [`quantize_map`] shape guard keeps 1-D LayerNorm/RMSNorm vectors dense as well.
 fn is_t5_linear_target(base: &str) -> bool {
-    base != "shared" && !base.ends_with("SelfAttention.relative_attention_bias")
+    t5_quantization::should_pack_linear(base)
 }
 
 /// FLUX.1 VAE packed surface: encoder/decoder mid-block attention QKV/out projections. Convolutions
@@ -319,9 +320,8 @@ mod tests {
     fn auxiliary_component_predicates_cover_the_complete_packed_surface() {
         for base in [
             "encoder.block.0.layer.0.SelfAttention.q",
-            "encoder.block.23.layer.1.DenseReluDense.wi_0",
-            "encoder.block.23.layer.1.DenseReluDense.wi_1",
-            "encoder.block.23.layer.1.DenseReluDense.wo",
+            "encoder.block.22.layer.1.DenseReluDense.wi_0",
+            "encoder.block.23.layer.0.SelfAttention.q",
         ] {
             assert!(
                 is_t5_linear_target(base),
@@ -331,6 +331,9 @@ mod tests {
         for base in [
             "shared",
             "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+            "encoder.block.23.layer.1.DenseReluDense.wi_0",
+            "encoder.block.23.layer.1.DenseReluDense.wi_1",
+            "encoder.block.23.layer.1.DenseReluDense.wo",
         ] {
             assert!(
                 !is_t5_linear_target(base),

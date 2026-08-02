@@ -15,6 +15,7 @@ pub mod convert;
 pub mod loader;
 pub mod model;
 pub mod quant;
+mod t5_quantization;
 pub mod text;
 pub mod transformer;
 
@@ -27,6 +28,7 @@ pub use model::{
     descriptor_base, descriptor_flash, descriptor_hd, load_base, load_chroma, load_flash, load_hd,
     Chroma, SIZE_MULTIPLE,
 };
+pub use t5_quantization::DENSE_FFN_BLOCK as T5_DENSE_FFN_BLOCK;
 pub use text::{encode_prompt, t5_key_mask, transformer_text_mask};
 pub use transformer::ChromaTransformer;
 
