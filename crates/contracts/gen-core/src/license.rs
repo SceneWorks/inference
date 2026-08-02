@@ -163,7 +163,11 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 }
 
 // =================================================================================================
-// v3 — licence families, typed terms, and per-component rows (sc-16661).
+// v3 — licence families, typed terms, and per-component rows (sc-16661), amended by sc-16898.
+//
+// DISCLOSURE ONLY. Everything below exists so a consumer can SHOW a user what the upstream texts
+// say. No value here blocks, gates, degrades, or withholds anything, and none ever should — this
+// surface describes, it does not decide.
 //
 // The v2 surface above records a legal CONCLUSION (`WeightLicense::commercial_use`) that depends on
 // facts inference does not have: the consumer's revenue, whether it redistributes weights or only
@@ -188,13 +192,67 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 // here would break the tree. sc-16664 additionally retires the `schema_version: 2` emitter
 // [`weight_licenses_manifest_json`], moving the release tooling onto
 // [`component_licenses_manifest_json`]. v2 is superseded, not supported — do not add callers.
+//
+// sc-16898 amended three shapes, each forced by reading the actual licence texts
+// (docs/licensing/sc-16662-licence-family-evidence.md) rather than by a design preference:
+//
+//   * `DownstreamFlowDown` was a bare variant, so the eleven families that impose a flow-down
+//     deduped to ONE element of the union. It is now two variants — `DownstreamLicenseCopy` and
+//     `DownstreamRestrictions` — each carrying the family whose text it points at.
+//   * `GatedAccess` sat in `LicenseFamily::terms`, but SVD-XT (ungated) and SD3.5 (gated) are
+//     governed by the SAME Stability text; it moved to `ComponentLicense::gated` and is raised into
+//     the derived union from there.
+//   * `RevenueCeiling` carried an amount with no boundary reading, while Stability says "more than
+//     USD $1,000,000" and LTX-2 says "at least $10,000,000" — different answers at exactly the
+//     amount. It now carries a `CeilingBoundary`.
 // =================================================================================================
 
-/// A typed obligation or condition imposed by a [`LicenseFamily`].
+/// Which side of a [`LicenseTerm::RevenueCeiling`] the named amount itself falls on.
+///
+/// The licences genuinely differ here and the difference is not cosmetic, so the type carries it
+/// rather than picking a house convention and mis-transcribing half the table. Both readings appear
+/// in the catalog at time of writing: the Stability AI Community License names its threshold as
+/// *"more than USD $1,000,000"*, while the LTX-2 Community License names its own as *"at least
+/// $10,000,000"*. Flattening them would put revenue exactly equal to the amount on the wrong side of
+/// one of the two.
+///
+/// This is a description of what the text says, not a computation: nothing in this crate compares a
+/// consumer's revenue against a ceiling, and nothing here changes behaviour based on one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CeilingBoundary {
+    /// The licence states its threshold with a strict comparison — "more than $N" — so the amount
+    /// itself is **below** the threshold the text names. (Stability AI Community License.)
+    Exclusive,
+    /// The licence states its threshold inclusively — "at least $N", "$N or more" — so the amount
+    /// itself is **at** the threshold the text names. (LTX-2 Community License.)
+    Inclusive,
+}
+
+impl CeilingBoundary {
+    /// The stable serialized discriminator for this boundary.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Inclusive => "inclusive",
+        }
+    }
+}
+
+/// A typed obligation or condition a [`LicenseFamily`]'s text states, or — for
+/// [`GatedAccess`](Self::GatedAccess) — a distribution fact a [`ComponentLicense`] records.
 ///
 /// Deliberately **not** a permissive/restrictive flag. Each variant is a fact about the licence
 /// text; whether a given use is permitted is the consumer's evaluation of the union of these
 /// against its own situation.
+///
+/// ## Disclosure only
+///
+/// This vocabulary exists so a consumer can **show** a user what the upstream texts say. Nothing in
+/// this crate blocks, gates, degrades, or withholds anything on the strength of a term, and nothing
+/// added here ever should: a term describes, it does not decide. Doc comments on the variants
+/// therefore report what a licence *states* and avoid asserting that a use is or is not allowed —
+/// that conclusion belongs to the consumer, who alone knows its own revenue, whether it
+/// redistributes weights, and which agreements it has with its own users.
 ///
 /// ## Serialized order is keyed on [`tag`](Self::tag), not on declaration order
 ///
@@ -216,33 +274,94 @@ pub enum LicenseTerm {
     /// Use of the **outputs** (renders) is restricted to non-commercial use. Strictly stronger than
     /// [`NonCommercialWeights`](Self::NonCommercialWeights) for a product that sells renders.
     NonCommercialOutputs,
-    /// Commercial use is permitted only below an annual-revenue ceiling. A union may carry more
-    /// than one ceiling; every one binds, so a consumer at revenue `r` is clear only when `r` is
-    /// below **all** of them. That is why these are not collapsed to a minimum here.
+    /// The licence names an annual-revenue threshold above which different terms apply.
+    ///
+    /// A union may carry more than one ceiling, and they are **not** collapsed to a minimum: each
+    /// one is a separate disclosure a consumer surfaces, and two licences can name the same amount
+    /// with different [`boundary`](Self::RevenueCeiling::boundary) readings, which is a real
+    /// difference at exactly that amount.
+    ///
+    /// Thresholds that are not denominated in revenue have no typed variant — Llama 3.1
+    /// Community's trigger is *700 million monthly active users* — and are transcribed verbatim as
+    /// a [`DeployerObligation`](Self::DeployerObligation) instead; see that variant's note.
     RevenueCeiling {
-        /// The ceiling in whole US dollars.
+        /// The amount the licence names, in whole US dollars.
         amount_usd: u64,
+        /// Whether the licence's wording puts `amount_usd` itself below the threshold
+        /// ([`Exclusive`](CeilingBoundary::Exclusive), "more than $N") or at it
+        /// ([`Inclusive`](CeilingBoundary::Inclusive), "at least $N").
+        boundary: CeilingBoundary,
     },
-    /// Commercial use requires an out-of-band registration or approval with the upstream.
+    /// The licence names an out-of-band registration or approval with the upstream.
     RegistrationRequired {
         /// Where the registration is made (an email address or URL).
         contact: &'static str,
     },
-    /// An acceptable-use / prohibited-use policy binds the deployer.
+    /// The licence names an acceptable-use / prohibited-use policy.
     AcceptableUsePolicy {
         /// The policy text.
         url: &'static str,
     },
-    /// A concrete duty the deployer must discharge (e.g. content filtering on generated media).
+    /// A concrete duty the licence puts on the deployer (e.g. content filtering on generated
+    /// media), in the licence's own words.
+    ///
+    /// Also the landing spot for any condition no typed variant carries — most notably a threshold
+    /// denominated in something other than revenue, such as Llama 3.1 Community's *"greater than
+    /// 700 million monthly active users"*. A free-text quote is a complete disclosure precisely
+    /// because nothing in this system computes against a term: the consumer reads the sentence,
+    /// which is what it would have to do with a typed variant anyway.
     DeployerObligation {
-        /// What the deployer must do, in the licence's own terms.
+        /// The duty, quoted or closely paraphrased from the licence.
         text: &'static str,
     },
-    /// The licence's restrictions must be passed to downstream recipients as enforceable
-    /// provisions. Note that several licences impose this with materially different texts, so a
-    /// union containing it more than once is not redundant at the product layer.
-    DownstreamFlowDown,
-    /// The weights are gated upstream — the terms must be accepted to obtain them at all.
+    /// Downstream recipients must be handed **a copy of the licence text itself**.
+    ///
+    /// The lighter of the two flow-down shapes: Apache-2.0 §4(a), Stability §IV(a), FLUX.1 \[dev\]
+    /// §3(a), Krea §3.1, CircleStone §3(a), the two NVIDIA licences, Apple MLR §2 and Llama 3.1
+    /// §1(b)(i) all read this way. It carries the family whose text travels, because two licences
+    /// imposing it are **two** duties — a distributor hands over two documents, not one — and a
+    /// union that deduped them to a single element would show a user one obligation where the
+    /// catalog carries several. Resolve [`family`](Self::DownstreamLicenseCopy::family) through
+    /// [`resolve_family`] to reach the [`LicenseFamily::text_url`] the duty points at.
+    DownstreamLicenseCopy {
+        /// The [`LicenseFamily::id`] whose text must reach the downstream recipient. Always the id
+        /// of the family declaring the term — [`license_table_conformance_errors`] rejects a term
+        /// naming any other family, since a mis-transcribed id would point a consumer at the wrong
+        /// text.
+        family: &'static str,
+    },
+    /// The licence's own **use restrictions must be written into the deployer's agreement with its
+    /// users** as enforceable provisions, and notice given to subsequent users.
+    ///
+    /// Structurally heavier than [`DownstreamLicenseCopy`](Self::DownstreamLicenseCopy), and
+    /// materially different licence to licence: CreativeML Open RAIL++-M §III requires its
+    /// paragraph 5; LTX-2 §3(a) requires its paragraph 4 *plus the whole of Attachment A*; Gemma
+    /// §3.1 requires its §3.2, which incorporates an externally hosted, unilaterally updatable
+    /// policy. The population bound differs too — OpenRAIL++ and LTX-2 count hosted-service/API
+    /// consumers as recipients, while Gemma §3.1 carves Hosted Services out of its Notice
+    /// requirement. None of that is interchangeable, so the term carries its family for the same
+    /// reason the copy variant does.
+    ///
+    /// A constraint one licence adds and its neighbours do not — LTX-2 §3(b)'s
+    /// "distributed exclusively under the terms of this Agreement" — is transcribed alongside as
+    /// its own [`DeployerObligation`](Self::DeployerObligation) rather than folded in here.
+    DownstreamRestrictions {
+        /// The [`LicenseFamily::id`] whose restrictions must be reproduced. Same self-naming rule
+        /// as [`DownstreamLicenseCopy::family`](Self::DownstreamLicenseCopy::family).
+        family: &'static str,
+    },
+    /// The upstream distributes the checkpoint behind a gate — its terms have to be accepted before
+    /// the artifact can be obtained at all.
+    ///
+    /// **A per-checkpoint distribution fact, not a clause in any licence text**, and therefore
+    /// recorded on [`ComponentLicense::gated`] rather than in a [`LicenseFamily::terms`] list;
+    /// [`license_table_conformance_errors`] rejects a family that declares it. Stability AI's
+    /// Community License governs both `stable-video-diffusion-img2vid-xt` (ungated) and
+    /// `stable-diffusion-3.5-large` (gated) — one text, two distribution settings — so a family
+    /// carrying gating would have to be split in two that differ in no legal respect.
+    ///
+    /// [`provider_terms`] still raises it into the derived union, because a consumer needs to know a
+    /// render touched a gated checkpoint.
     GatedAccess,
 }
 
@@ -258,26 +377,45 @@ impl LicenseTerm {
             Self::RegistrationRequired { .. } => "registration_required",
             Self::AcceptableUsePolicy { .. } => "acceptable_use_policy",
             Self::DeployerObligation { .. } => "deployer_obligation",
-            Self::DownstreamFlowDown => "downstream_flow_down",
+            Self::DownstreamLicenseCopy { .. } => "downstream_license_copy",
+            Self::DownstreamRestrictions { .. } => "downstream_restrictions",
             Self::GatedAccess => "gated_access",
         }
     }
 
+    /// The [`LicenseFamily::id`] a flow-down term names — the route from a term in a
+    /// [`provider_terms`] union back to the specific text it points at, via [`resolve_family`] and
+    /// [`LicenseFamily::text_url`]. `None` for every other variant.
+    pub const fn flow_down_family(&self) -> Option<&'static str> {
+        match *self {
+            Self::DownstreamLicenseCopy { family } | Self::DownstreamRestrictions { family } => {
+                Some(family)
+            }
+            _ => None,
+        }
+    }
+
     /// The total order the serialized union is emitted in: the stable [`tag`](Self::tag) first, then
-    /// the variant's payload (numeric ceilings ascending, string payloads lexicographic). Two
-    /// distinct terms never share a key, so sorting by it is deterministic without depending on the
-    /// declaration order of the `enum` — see the type-level note.
+    /// the variant's payload (numeric ceilings ascending, then string payloads lexicographic). Two
+    /// distinct terms never share a key — every field that distinguishes two values of a variant
+    /// appears in the key — so sorting by it is deterministic without depending on the declaration
+    /// order of the `enum`; see the type-level note.
     fn sort_key(&self) -> (&'static str, u64, &'static str) {
         match *self {
-            Self::RevenueCeiling { amount_usd } => (self.tag(), amount_usd, ""),
+            Self::RevenueCeiling {
+                amount_usd,
+                boundary,
+            } => (self.tag(), amount_usd, boundary.tag()),
             Self::RegistrationRequired { contact } => (self.tag(), 0, contact),
             Self::AcceptableUsePolicy { url } => (self.tag(), 0, url),
             Self::DeployerObligation { text } => (self.tag(), 0, text),
+            Self::DownstreamLicenseCopy { family } | Self::DownstreamRestrictions { family } => {
+                (self.tag(), 0, family)
+            }
             Self::AttributionRequired
             | Self::NoticeFileRequired
             | Self::NonCommercialWeights
             | Self::NonCommercialOutputs
-            | Self::DownstreamFlowDown
             | Self::GatedAccess => (self.tag(), 0, ""),
         }
     }
@@ -288,8 +426,15 @@ impl LicenseTerm {
             .as_object_mut()
             .expect("term is serialized as an object");
         match self {
-            Self::RevenueCeiling { amount_usd } => {
+            Self::RevenueCeiling {
+                amount_usd,
+                boundary,
+            } => {
                 object.insert("amount_usd".into(), amount_usd.into());
+                object.insert("boundary".into(), boundary.tag().into());
+            }
+            Self::DownstreamLicenseCopy { family } | Self::DownstreamRestrictions { family } => {
+                object.insert("family".into(), family.into());
             }
             Self::RegistrationRequired { contact } => {
                 object.insert("contact".into(), contact.into());
@@ -321,7 +466,14 @@ pub struct LicenseFamily {
     pub name: &'static str,
     /// The canonical licence text this family was read from.
     pub text_url: &'static str,
-    /// The typed obligations this licence imposes.
+    /// The typed conditions this licence's **text** states.
+    ///
+    /// Facts about the text only. A fact about how one upstream chose to *distribute* a particular
+    /// checkpoint belongs on the [`ComponentLicense`] row instead — that is why
+    /// [`LicenseTerm::GatedAccess`] is rejected here by
+    /// [`license_table_conformance_errors`] and lives on [`ComponentLicense::gated`]. Mixing the two
+    /// axes forces one licence text into two families that differ in no legal respect, and the
+    /// reviewed unit is the family.
     pub terms: &'static [LicenseTerm],
 }
 
@@ -351,6 +503,20 @@ pub struct ComponentLicense {
     pub component: &'static str,
     /// The upstream artifact this row describes.
     pub source_url: &'static str,
+    /// Whether the upstream distributes **this checkpoint** behind an access gate, as observed at
+    /// [`retrieved`](Self::retrieved).
+    ///
+    /// A property of the artifact, like [`source_url`](Self::source_url) — not of its licence.
+    /// Stability AI's Community License governs `stable-video-diffusion-img2vid-xt` (ungated) and
+    /// `stable-diffusion-3.5-large` (gated) alike, so recording gating on the family would split
+    /// one reviewed text into two rows differing in no legal respect. [`provider_terms`] raises a
+    /// `true` here into the derived union as [`LicenseTerm::GatedAccess`], because a consumer needs
+    /// to know a render touched a gated checkpoint.
+    ///
+    /// A plain `bool`: *whether*, not *how*. Hugging Face additionally distinguishes click-through
+    /// (`auto`) from human approval (`manual`); if a consumer ever needs to show which, that is a
+    /// second field rather than an overload of this one.
+    pub gated: bool,
     /// The licence identifier **as declared upstream**, verbatim (e.g. `"apache-2.0"`,
     /// `"flux-1-dev-non-commercial-license"`). The drift gate re-reads `source_url` and compares
     /// against this string, so it must be transcribed rather than normalized.
@@ -519,14 +685,29 @@ pub fn resolve_component<'a>(
     components.iter().find(|row| row.component == key)
 }
 
-/// The union of every term imposed on `provider` by the components it loads — sorted and
+/// The union of every term the components `provider` loads bring with them — sorted and
 /// deduplicated, so it is deterministic and comparable.
 ///
 /// **Derived, never hand-authored.** This is the "effective terms" answer a consumer joins over,
 /// and computing it from the component rows is what keeps it from drifting away from them.
-/// A component that does not resolve contributes nothing; use
+/// A component key that does not resolve contributes nothing; use
 /// [`license_table_conformance_errors`] to reject that state at the catalog boundary rather than
 /// silently under-reporting here.
+///
+/// Two sources feed the union:
+///
+/// * every term in the [`LicenseFamily::terms`] each resolved row normalizes to, and
+/// * [`LicenseTerm::GatedAccess`] for each resolved row whose [`ComponentLicense::gated`] is set —
+///   a distribution fact that lives on the checkpoint, not in any licence text, but that a consumer
+///   still has to be able to show.
+///
+/// A gated row contributes its `GatedAccess` even if its `family` fails to resolve: gating is not a
+/// property of the family, so losing it to an unrelated table defect would under-report.
+///
+/// Deduplication is by value, so two flow-down duties naming different families stay two elements
+/// and two ceilings at the same amount with different [`CeilingBoundary`] readings stay two
+/// elements — a union that collapsed either would show one obligation where the catalog carries
+/// several.
 ///
 /// Ordering is by [`LicenseTerm::tag`] then payload, **not** by variant declaration order, so a
 /// future variant inserted mid-`enum` cannot reorder an already-committed manifest.
@@ -535,13 +716,19 @@ pub fn provider_terms(
     components: &[ComponentLicense],
     families: &[LicenseFamily],
 ) -> Vec<LicenseTerm> {
-    let mut terms: Vec<LicenseTerm> = provider
+    let mut terms: Vec<LicenseTerm> = Vec::new();
+    for row in provider
         .components
         .iter()
         .filter_map(|key| resolve_component(components, key))
-        .filter_map(|row| resolve_family(families, row.family))
-        .flat_map(|family| family.terms.iter().copied())
-        .collect();
+    {
+        if row.gated {
+            terms.push(LicenseTerm::GatedAccess);
+        }
+        if let Some(family) = resolve_family(families, row.family) {
+            terms.extend(family.terms.iter().copied());
+        }
+    }
     terms.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     terms.dedup();
     terms
@@ -554,7 +741,11 @@ pub fn provider_terms(
 ///
 /// * **Families** — ids are non-blank and unique (a shadowed family would make an entire set of
 ///   obligations vanish from the [`provider_terms`] union depending on input order, since
-///   [`resolve_family`] takes the first match); `spdx_id`, `name` and `text_url` are populated.
+///   [`resolve_family`] takes the first match); `spdx_id`, `name` and `text_url` are populated; the
+///   `terms` list states only facts about the *text*, so [`LicenseTerm::GatedAccess`] — a
+///   per-checkpoint distribution setting — is rejected there and belongs on
+///   [`ComponentLicense::gated`]; and a flow-down term names its own family, so the text a consumer
+///   resolves through it is the text that actually imposed the duty.
 /// * **Components** — keys are non-blank and unique; `source_url` and `declared` are populated;
 ///   every `family` resolves; `retrieved` is a real ISO calendar date; an attribution-requiring
 ///   family implies a non-blank attribution, and `Some("")` never counts as one.
@@ -592,6 +783,24 @@ pub fn license_table_conformance_errors(
         }
         if is_blank(family.text_url) {
             errors.push(format!("licence family {id:?} has no text_url"));
+        }
+        for term in family.terms {
+            if matches!(term, LicenseTerm::GatedAccess) {
+                errors.push(format!(
+                    "licence family {id:?} declares gated_access, which is a per-checkpoint \
+                     distribution fact recorded on ComponentLicense::gated, not a licence term"
+                ));
+            }
+            if let Some(named) = term.flow_down_family() {
+                if named != id {
+                    errors.push(format!(
+                        "licence family {id:?} declares a {} term naming {named:?}; a flow-down \
+                         term must name its own family so the text it points at is the text that \
+                         imposed the duty",
+                        term.tag()
+                    ));
+                }
+            }
         }
     }
 
@@ -676,6 +885,7 @@ pub fn component_licenses_manifest_json(
             serde_json::json!({
                 "component": row.component,
                 "source_url": row.source_url,
+                "gated": row.gated,
                 "declared": row.declared,
                 "family": row.family,
                 "attribution": row.attribution,
@@ -875,12 +1085,15 @@ mod v3_tests {
             name: "FLUX.1 [dev] Non-Commercial License",
             text_url: "https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md",
             // Weights are non-commercial; OUTPUTS are explicitly commercially usable, so
-            // NonCommercialOutputs is deliberately absent.
+            // NonCommercialOutputs is deliberately absent. Gating is NOT here — the checkpoint is
+            // gated upstream, which the `flux1_dev_dit` row records; see A2 below.
             terms: &[
                 LicenseTerm::NonCommercialWeights,
-                LicenseTerm::GatedAccess,
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "flux-1-dev-non-commercial",
+                },
                 LicenseTerm::AcceptableUsePolicy {
-                    url: "https://blackforestlabs.ai/aup",
+                    url: "https://example.invalid/fixture-aup",
                 },
             ],
         },
@@ -900,6 +1113,7 @@ mod v3_tests {
         ComponentLicense {
             component: "flux1_dev_dit",
             source_url: "https://huggingface.co/black-forest-labs/FLUX.1-dev",
+            gated: true,
             declared: "flux-1-dev-non-commercial-license",
             family: "flux-1-dev-non-commercial",
             attribution: None,
@@ -908,6 +1122,7 @@ mod v3_tests {
         ComponentLicense {
             component: "t5_xxl",
             source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+            gated: false,
             declared: "apache-2.0",
             family: "apache-2-0",
             attribution: Some("T5 v1.1 © Google — Apache-2.0"),
@@ -916,6 +1131,7 @@ mod v3_tests {
         ComponentLicense {
             component: "arcface_antelopev2",
             source_url: "https://github.com/deepinsight/insightface/tree/master/model_zoo",
+            gated: false,
             declared: "non-commercial research purposes only",
             family: "insightface-research-only",
             attribution: None,
@@ -1005,13 +1221,20 @@ mod v3_tests {
             spdx_id: "LicenseRef-Stability-Community",
             name: "Stability AI Community License",
             text_url: "https://stability.ai/license",
-            terms: &[LicenseTerm::RevenueCeiling {
-                amount_usd: 1_000_000,
-            }],
+            terms: &[
+                LicenseTerm::RevenueCeiling {
+                    amount_usd: 1_000_000,
+                    boundary: CeilingBoundary::Exclusive,
+                },
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "stability-ai-community",
+                },
+            ],
         }];
         const ROWS: &[ComponentLicense] = &[ComponentLicense {
             component: "sd3_5_large_dit",
             source_url: "https://huggingface.co/stabilityai/stable-diffusion-3.5-large",
+            gated: true,
             declared: "stabilityai-ai-community",
             family: "stability-ai-community",
             attribution: None,
@@ -1028,9 +1251,28 @@ mod v3_tests {
             &[PROVIDER],
         ))
         .unwrap();
-        let term = &value["providers"][0]["terms"][0];
-        assert_eq!(term["term"], "revenue_ceiling");
-        assert_eq!(term["amount_usd"], 1_000_000);
+        let terms = value["providers"][0]["terms"].as_array().unwrap();
+
+        // Tag order: downstream_license_copy, gated_access, revenue_ceiling.
+        let flow_down = &terms[0];
+        assert_eq!(flow_down["term"], "downstream_license_copy");
+        assert_eq!(flow_down["family"], "stability-ai-community");
+        // The family the term names resolves back to the text that imposed the duty.
+        assert_eq!(
+            resolve_family(STABILITY, flow_down["family"].as_str().unwrap())
+                .unwrap()
+                .text_url,
+            "https://stability.ai/license"
+        );
+
+        // Gating rides the component row, not the family, and still reaches the union.
+        assert_eq!(terms[1]["term"], "gated_access");
+        assert!(!STABILITY[0].imposes(LicenseTerm::GatedAccess));
+
+        let ceiling = &terms[2];
+        assert_eq!(ceiling["term"], "revenue_ceiling");
+        assert_eq!(ceiling["amount_usd"], 1_000_000);
+        assert_eq!(ceiling["boundary"], "exclusive");
     }
 
     /// Byte-stability under permutation of **every** input axis, not just the provider slice:
@@ -1113,12 +1355,13 @@ mod v3_tests {
                 spdx_id: "LicenseRef-B",
                 name: "B",
                 text_url: "https://example.invalid/b",
-                terms: &[LicenseTerm::GatedAccess],
+                terms: &[LicenseTerm::NonCommercialWeights],
             },
         ];
         const ROWS: &[ComponentLicense] = &[ComponentLicense {
             component: "shadowed",
             source_url: "https://example.invalid/model",
+            gated: false,
             declared: "ambiguous",
             family: "ambiguous",
             attribution: None,
@@ -1192,6 +1435,7 @@ mod v3_tests {
         const ROW: &[ComponentLicense] = &[ComponentLicense {
             component: "anon",
             source_url: "https://example.invalid/model",
+            gated: false,
             declared: "anon",
             family: "",
             attribution: None,
@@ -1439,10 +1683,11 @@ mod v3_tests {
             name: "Mixed",
             text_url: "https://example.invalid/mixed",
             // Declaration order in the enum is: AttributionRequired, NoticeFileRequired,
-            // NonCommercialWeights, …, GatedAccess (last). Tag order is alphabetical, which puts
-            // gated_access second and notice_file_required last — a different sequence.
+            // NonCommercialWeights, …, GatedAccess (last), and `gated_access` reaches the union
+            // last of all — it is contributed by the component row below, after the family's own
+            // terms. Tag order is alphabetical, which puts gated_access second and
+            // notice_file_required last — a different sequence from either.
             terms: &[
-                LicenseTerm::GatedAccess,
                 LicenseTerm::NoticeFileRequired,
                 LicenseTerm::AttributionRequired,
                 LicenseTerm::NonCommercialWeights,
@@ -1451,6 +1696,7 @@ mod v3_tests {
         const ROWS: &[ComponentLicense] = &[ComponentLicense {
             component: "mixed",
             source_url: "https://example.invalid/model",
+            gated: true,
             declared: "mixed",
             family: "mixed",
             attribution: Some("© Example"),
@@ -1562,6 +1808,7 @@ mod v3_tests {
         const ORPHAN: &[ComponentLicense] = &[ComponentLicense {
             component: "mystery",
             source_url: "https://example.invalid/model",
+            gated: false,
             declared: "who-knows",
             family: "not-a-family",
             attribution: None,
@@ -1577,6 +1824,7 @@ mod v3_tests {
         const MISSING: &[ComponentLicense] = &[ComponentLicense {
             component: "t5_xxl",
             source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+            gated: false,
             declared: "apache-2.0",
             family: "apache-2-0",
             attribution: None,
@@ -1599,6 +1847,7 @@ mod v3_tests {
         const STALE: &[ComponentLicense] = &[ComponentLicense {
             component: "undated",
             source_url: "https://example.invalid/model",
+            gated: false,
             declared: "apache-2.0",
             family: "apache-2-0",
             attribution: Some("© Example"),
@@ -1645,6 +1894,7 @@ mod v3_tests {
         const IMPOSSIBLE: &[ComponentLicense] = &[ComponentLicense {
             component: "impossible",
             source_url: "https://example.invalid/model",
+            gated: false,
             declared: "apache-2.0",
             family: "apache-2-0",
             attribution: Some("© Example"),
@@ -1683,6 +1933,7 @@ mod v3_tests {
             ComponentLicense {
                 component: "t5_xxl",
                 source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+                gated: false,
                 declared: "apache-2.0",
                 family: "apache-2-0",
                 attribution: Some("© Google"),
@@ -1691,6 +1942,7 @@ mod v3_tests {
             ComponentLicense {
                 component: "t5_xxl",
                 source_url: "https://huggingface.co/google/t5-v1_1-xxl",
+                gated: false,
                 declared: "apache-2.0",
                 family: "apache-2-0",
                 attribution: Some("© Google"),
@@ -1702,8 +1954,8 @@ mod v3_tests {
         assert!(errors[0].contains("duplicate component row"), "{errors:?}");
     }
 
-    /// Two ceilings in one union both bind — they are not collapsed to a minimum, so a consumer
-    /// checking "am I below every ceiling" gets the right answer without special-casing.
+    /// Two ceilings in one union are two separate disclosures — they are not collapsed to a
+    /// minimum, so a consumer showing a user the terms of a render shows both amounts.
     #[test]
     fn multiple_revenue_ceilings_are_both_retained() {
         const TWO: &[LicenseFamily] = &[
@@ -1714,6 +1966,7 @@ mod v3_tests {
                 text_url: "https://example.invalid/a",
                 terms: &[LicenseTerm::RevenueCeiling {
                     amount_usd: 1_000_000,
+                    boundary: CeilingBoundary::Exclusive,
                 }],
             },
             LicenseFamily {
@@ -1723,6 +1976,7 @@ mod v3_tests {
                 text_url: "https://example.invalid/b",
                 terms: &[LicenseTerm::RevenueCeiling {
                     amount_usd: 10_000_000,
+                    boundary: CeilingBoundary::Inclusive,
                 }],
             },
         ];
@@ -1730,6 +1984,7 @@ mod v3_tests {
             ComponentLicense {
                 component: "a",
                 source_url: "https://example.invalid/a",
+                gated: false,
                 declared: "a",
                 family: "a",
                 attribution: None,
@@ -1738,6 +1993,7 @@ mod v3_tests {
             ComponentLicense {
                 component: "b",
                 source_url: "https://example.invalid/b",
+                gated: false,
                 declared: "b",
                 family: "b",
                 attribution: None,
@@ -1753,12 +2009,734 @@ mod v3_tests {
             terms,
             vec![
                 LicenseTerm::RevenueCeiling {
-                    amount_usd: 1_000_000
+                    amount_usd: 1_000_000,
+                    boundary: CeilingBoundary::Exclusive,
                 },
                 LicenseTerm::RevenueCeiling {
-                    amount_usd: 10_000_000
+                    amount_usd: 10_000_000,
+                    boundary: CeilingBoundary::Inclusive,
                 },
             ]
         );
+    }
+}
+
+/// The sc-16898 amendments: the three shapes the sc-16662 licence read contradicted.
+///
+/// Fixtures here are miniatures of the real families named in
+/// `docs/licensing/sc-16662-licence-family-evidence.md`, because each amendment exists for a
+/// specific pair of licences that the previous shape could not tell apart.
+#[cfg(test)]
+mod v3_amendment_tests {
+    use super::*;
+
+    // Five families drawn from the evidence, covering both flow-down kinds and both ceiling
+    // boundaries. `text_url`s are fixtures; the ids and clause shapes are the evidenced ones.
+    const FAMILIES: &[LicenseFamily] = &[
+        // "copy of the licence" flow-down (evidence §IV(a)), plus the exclusive ceiling.
+        LicenseFamily {
+            id: "stability-ai-community",
+            spdx_id: "LicenseRef-Stability-AI-Community",
+            name: "Stability AI Community License Agreement",
+            text_url: "https://example.invalid/stability",
+            terms: &[
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "stability-ai-community",
+                },
+                // "more than USD $1,000,000 in annual revenue".
+                LicenseTerm::RevenueCeiling {
+                    amount_usd: 1_000_000,
+                    boundary: CeilingBoundary::Exclusive,
+                },
+            ],
+        },
+        // A second, textually unrelated "copy of the licence" flow-down (evidence §2).
+        LicenseFamily {
+            id: "apple-mlr",
+            spdx_id: "LicenseRef-Apple-MLR",
+            name: "Apple Machine Learning Research Model License Agreement",
+            text_url: "https://example.invalid/apple",
+            terms: &[
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "apple-mlr",
+                },
+                LicenseTerm::NonCommercialWeights,
+            ],
+        },
+        // "restrictions as enforceable provisions" flow-down — paragraph 5 (evidence §III).
+        LicenseFamily {
+            id: "creativeml-openrail-pp-m",
+            spdx_id: "LicenseRef-OpenRAIL-PP-M",
+            name: "CreativeML Open RAIL++-M License",
+            text_url: "https://example.invalid/openrail",
+            terms: &[LicenseTerm::DownstreamRestrictions {
+                family: "creativeml-openrail-pp-m",
+            }],
+        },
+        // The same *kind* as OpenRAIL++, but a different body of text: paragraph 4 plus the whole of
+        // Attachment A, plus a no-relicensing constraint that rides its own DeployerObligation. And
+        // an INCLUSIVE ceiling, unlike Stability's.
+        LicenseFamily {
+            id: "ltx-2-community",
+            spdx_id: "LicenseRef-LTX-2-Community",
+            name: "LTX-2 Community License Agreement",
+            text_url: "https://example.invalid/ltx",
+            terms: &[
+                LicenseTerm::DownstreamRestrictions {
+                    family: "ltx-2-community",
+                },
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "ltx-2-community",
+                },
+                LicenseTerm::DeployerObligation {
+                    text: "Derivatives must be distributed exclusively under the terms of this \
+                           Agreement with a complete copy of this license included.",
+                },
+                // "annual revenues of at least $10,000,000".
+                LicenseTerm::RevenueCeiling {
+                    amount_usd: 10_000_000,
+                    boundary: CeilingBoundary::Inclusive,
+                },
+            ],
+        },
+        // Llama 3.1's threshold is denominated in monthly active users, not revenue — A3.
+        LicenseFamily {
+            id: "llama-3-1-community",
+            spdx_id: "LicenseRef-Llama-3-1-Community",
+            name: "Llama 3.1 Community License Agreement",
+            text_url: "https://example.invalid/llama",
+            terms: &[
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "llama-3-1-community",
+                },
+                LicenseTerm::DeployerObligation {
+                    text: "If, on the Llama 3.1 version release date, the monthly active users of \
+                           the products or services made available by or for Licensee is greater \
+                           than 700 million monthly active users in the preceding calendar month, \
+                           you must request a license from Meta.",
+                },
+            ],
+        },
+    ];
+
+    // SVD-XT and SD3.5 are the A2 pair: ONE licence text, two upstream distribution settings.
+    const COMPONENTS: &[ComponentLicense] = &[
+        ComponentLicense {
+            component: "svd_xt",
+            source_url: "https://example.invalid/stable-video-diffusion-img2vid-xt",
+            gated: false,
+            declared: "stable-video-diffusion-community",
+            family: "stability-ai-community",
+            attribution: None,
+            retrieved: "2026-08-02",
+        },
+        ComponentLicense {
+            component: "sd3_5_large_dit",
+            source_url: "https://example.invalid/stable-diffusion-3.5-large",
+            gated: true,
+            declared: "stabilityai-ai-community",
+            family: "stability-ai-community",
+            attribution: None,
+            retrieved: "2026-08-02",
+        },
+        ComponentLicense {
+            component: "sdxl_unet",
+            source_url: "https://example.invalid/stable-diffusion-xl-base-1.0",
+            gated: false,
+            declared: "openrail++",
+            family: "creativeml-openrail-pp-m",
+            attribution: None,
+            retrieved: "2026-08-02",
+        },
+        ComponentLicense {
+            component: "ltx_dit",
+            source_url: "https://example.invalid/ltx-2.3",
+            gated: false,
+            declared: "ltx-2-community-license-agreement",
+            family: "ltx-2-community",
+            attribution: None,
+            retrieved: "2026-08-02",
+        },
+        ComponentLicense {
+            component: "dfn5b_clip",
+            source_url: "https://example.invalid/DFN5B-CLIP-ViT-H-14-384",
+            gated: false,
+            declared: "apple-ascl",
+            family: "apple-mlr",
+            attribution: None,
+            retrieved: "2026-08-02",
+        },
+        ComponentLicense {
+            component: "joycaption_llama",
+            source_url: "https://example.invalid/llama-joycaption-beta-one-hf-llava",
+            gated: false,
+            declared: "Llama 3.1 Community License",
+            family: "llama-3-1-community",
+            attribution: None,
+            retrieved: "2026-08-02",
+        },
+    ];
+
+    #[test]
+    fn amendment_fixture_table_is_conformant() {
+        const PROVIDERS: &[ProviderComponents] = &[ProviderComponents {
+            provider_id: "everything",
+            components: &[
+                "svd_xt",
+                "sd3_5_large_dit",
+                "sdxl_unet",
+                "ltx_dit",
+                "dfn5b_clip",
+                "joycaption_llama",
+            ],
+        }];
+        assert_eq!(
+            license_table_conformance_errors(FAMILIES, COMPONENTS, PROVIDERS),
+            Vec::<String>::new()
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A1 — flow-down duties stay distinct through the union.
+    // ---------------------------------------------------------------------------------------
+
+    /// The defect the bare `DownstreamFlowDown` variant carried: eleven of sixteen families impose a
+    /// flow-down, and a payload-free variant deduped every one of them to a SINGLE element of the
+    /// union. A consumer surfacing the join then showed a user one obligation where the catalog
+    /// carried several.
+    ///
+    /// Three axes are pinned here: two *kinds* stay distinct, two families of the *same* kind stay
+    /// distinct, and every survivor resolves back to the text that imposed it.
+    #[test]
+    fn distinct_flow_down_duties_do_not_dedupe_to_one_element() {
+        // Stability (hand over a copy) + OpenRAIL++ (write the restrictions into your own user
+        // agreement) — the two structurally different kinds.
+        const TWO_KINDS: ProviderComponents = ProviderComponents {
+            provider_id: "sdxl_then_svd",
+            components: &["sdxl_unet", "svd_xt"],
+        };
+        let terms = provider_terms(&TWO_KINDS, COMPONENTS, FAMILIES);
+        let flow_downs: Vec<LicenseTerm> = terms
+            .iter()
+            .copied()
+            .filter(|term| term.flow_down_family().is_some())
+            .collect();
+        assert_eq!(
+            flow_downs,
+            vec![
+                LicenseTerm::DownstreamLicenseCopy {
+                    family: "stability-ai-community"
+                },
+                LicenseTerm::DownstreamRestrictions {
+                    family: "creativeml-openrail-pp-m"
+                },
+            ],
+            "a copy-of-licence duty and a restrictions-as-provisions duty are two obligations"
+        );
+
+        // Two families imposing the SAME kind are still two duties: a distributor hands over two
+        // documents, not one. This is the case a two-variant split alone would still collapse.
+        const TWO_COPIES: ProviderComponents = ProviderComponents {
+            provider_id: "svd_with_apple_clip",
+            components: &["svd_xt", "dfn5b_clip"],
+        };
+        let copies: Vec<&'static str> = provider_terms(&TWO_COPIES, COMPONENTS, FAMILIES)
+            .iter()
+            .filter_map(|term| match term {
+                LicenseTerm::DownstreamLicenseCopy { family } => Some(*family),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies, vec!["apple-mlr", "stability-ai-community"]);
+
+        // Two families imposing the same RESTRICTIONS kind likewise — OpenRAIL++ requires its
+        // paragraph 5, LTX-2 requires its paragraph 4 plus all of Attachment A.
+        const TWO_RESTRICTIONS: ProviderComponents = ProviderComponents {
+            provider_id: "sdxl_then_ltx",
+            components: &["sdxl_unet", "ltx_dit"],
+        };
+        let restrictions: Vec<&'static str> =
+            provider_terms(&TWO_RESTRICTIONS, COMPONENTS, FAMILIES)
+                .iter()
+                .filter_map(|term| match term {
+                    LicenseTerm::DownstreamRestrictions { family } => Some(*family),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(
+            restrictions,
+            vec!["creativeml-openrail-pp-m", "ltx-2-community"]
+        );
+
+        // And every surviving duty routes back to the specific text, which is what makes the
+        // disclosure actionable rather than a label.
+        for term in flow_downs {
+            let family = resolve_family(FAMILIES, term.flow_down_family().unwrap())
+                .expect("a flow-down term resolves to the family whose text it points at");
+            assert!(!family.text_url.is_empty());
+        }
+    }
+
+    /// The other half of the same property: dedup must still fire where the duty really is one
+    /// duty. Two components under the SAME family contribute one flow-down, not two.
+    #[test]
+    fn one_family_reached_twice_contributes_one_flow_down() {
+        const TWICE: ProviderComponents = ProviderComponents {
+            provider_id: "svd_and_sd35",
+            components: &["svd_xt", "sd3_5_large_dit"],
+        };
+        let copies = provider_terms(&TWICE, COMPONENTS, FAMILIES)
+            .into_iter()
+            .filter(|term| term.flow_down_family().is_some())
+            .count();
+        assert_eq!(
+            copies, 1,
+            "one licence text imposes one flow-down however many of its checkpoints are loaded"
+        );
+    }
+
+    /// The flow-down payload is the route from a term back to its text, so a term naming a family
+    /// other than its own would point a consumer at the wrong licence. The gate rejects it.
+    #[test]
+    fn flow_down_term_naming_another_family_is_an_error() {
+        const MISNAMED: &[LicenseFamily] = &[LicenseFamily {
+            id: "ltx-2-community",
+            spdx_id: "LicenseRef-LTX-2-Community",
+            name: "LTX-2 Community License Agreement",
+            text_url: "https://example.invalid/ltx",
+            terms: &[LicenseTerm::DownstreamRestrictions {
+                // Copy-paste from the OpenRAIL++ row — the transcription slip this catches.
+                family: "creativeml-openrail-pp-m",
+            }],
+        }];
+        let errors = license_table_conformance_errors(MISNAMED, &[], &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("must name its own family"), "{errors:?}");
+
+        // A blank id is caught by the same rule rather than silently resolving to nothing.
+        const BLANK: &[LicenseFamily] = &[LicenseFamily {
+            id: "apple-mlr",
+            spdx_id: "LicenseRef-Apple-MLR",
+            name: "Apple MLR",
+            text_url: "https://example.invalid/apple",
+            terms: &[LicenseTerm::DownstreamLicenseCopy { family: "" }],
+        }];
+        assert!(license_table_conformance_errors(BLANK, &[], &[])
+            .iter()
+            .any(|e| e.contains("must name its own family")));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A2 — gating is a per-checkpoint fact, so one family covers both gating states.
+    // ---------------------------------------------------------------------------------------
+
+    /// `stable-video-diffusion-img2vid-xt` (ungated) and `stable-diffusion-3.5-large` (gated) are
+    /// governed by the SAME Stability AI Community License text. With `GatedAccess` on
+    /// `LicenseFamily::terms` the only way to express that was two families differing in no legal
+    /// respect — defeating the "reviewed unit is the family" principle and manufacturing the exact
+    /// duplicate-family hazard the sc-16661 conformance check exists to catch.
+    #[test]
+    fn one_family_covers_a_gated_and_an_ungated_checkpoint() {
+        const SVD: ProviderComponents = ProviderComponents {
+            provider_id: "svd_xt",
+            components: &["svd_xt"],
+        };
+        const SD35: ProviderComponents = ProviderComponents {
+            provider_id: "sd3_5_large",
+            components: &["sd3_5_large_dit"],
+        };
+        assert!(license_table_conformance_errors(FAMILIES, COMPONENTS, &[SVD, SD35]).is_empty());
+
+        // Both checkpoints resolve to one family — no split, no duplicate id.
+        let svd_family = resolve_component(COMPONENTS, "svd_xt").unwrap().family;
+        let sd35_family = resolve_component(COMPONENTS, "sd3_5_large_dit")
+            .unwrap()
+            .family;
+        assert_eq!(svd_family, sd35_family);
+
+        // Yet the derived unions differ exactly where the upstream distribution differs.
+        let svd = provider_terms(&SVD, COMPONENTS, FAMILIES);
+        let sd35 = provider_terms(&SD35, COMPONENTS, FAMILIES);
+        assert!(
+            !svd.contains(&LicenseTerm::GatedAccess),
+            "SVD-XT is distributed ungated, {svd:?}"
+        );
+        assert!(
+            sd35.contains(&LicenseTerm::GatedAccess),
+            "a consumer must still learn the render touched a gated checkpoint, {sd35:?}"
+        );
+        // The licence terms themselves are identical — the only difference is the gate.
+        let without_gate: Vec<LicenseTerm> = sd35
+            .iter()
+            .copied()
+            .filter(|term| *term != LicenseTerm::GatedAccess)
+            .collect();
+        assert_eq!(without_gate, svd);
+
+        // And the manifest carries one family row, with the gate recorded per component.
+        let value: serde_json::Value = serde_json::from_str(&component_licenses_manifest_json(
+            FAMILIES,
+            COMPONENTS,
+            &[SVD, SD35],
+        ))
+        .unwrap();
+        let stability_rows = value["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "stability-ai-community")
+            .count();
+        assert_eq!(stability_rows, 1, "one licence text, one reviewed family");
+        let component_rows = value["components"].as_array().unwrap();
+        let gated_of = |key: &str| {
+            component_rows
+                .iter()
+                .find(|c| c["component"] == key)
+                .unwrap()["gated"]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(!gated_of("svd_xt"));
+        assert!(gated_of("sd3_5_large_dit"));
+    }
+
+    /// The corollary rule: `gated_access` is not a licence term, so a family may not declare it.
+    /// Without this the old shape is reachable again one hand-authored table at a time.
+    #[test]
+    fn family_declaring_gated_access_is_an_error() {
+        const GATING_FAMILY: &[LicenseFamily] = &[LicenseFamily {
+            id: "stability-ai-community",
+            spdx_id: "LicenseRef-Stability-AI-Community",
+            name: "Stability AI Community License Agreement",
+            text_url: "https://example.invalid/stability",
+            terms: &[LicenseTerm::GatedAccess],
+        }];
+        let errors = license_table_conformance_errors(GATING_FAMILY, &[], &[]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("per-checkpoint distribution fact"),
+            "{errors:?}"
+        );
+    }
+
+    /// Gating is not a property of the family, so a table defect in the family section must not
+    /// swallow it — the consumer still needs to know the checkpoint is gated.
+    #[test]
+    fn gating_survives_a_component_whose_family_does_not_resolve() {
+        const ORPHANED: &[ComponentLicense] = &[ComponentLicense {
+            component: "mystery_gated",
+            source_url: "https://example.invalid/mystery",
+            gated: true,
+            declared: "who-knows",
+            family: "not-a-family",
+            attribution: None,
+            retrieved: "2026-08-02",
+        }];
+        const PROVIDER: ProviderComponents = ProviderComponents {
+            provider_id: "mystery",
+            components: &["mystery_gated"],
+        };
+        assert_eq!(
+            provider_terms(&PROVIDER, ORPHANED, FAMILIES),
+            vec![LicenseTerm::GatedAccess]
+        );
+        // The unresolved family is still a table error — this is under-reporting insurance, not a
+        // licence to ship a dangling row.
+        assert!(!license_table_conformance_errors(FAMILIES, ORPHANED, &[PROVIDER]).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A3 — threshold representability.
+    // ---------------------------------------------------------------------------------------
+
+    /// `RevenueCeiling`'s boundary is load-bearing, not decoration: Stability terminates *above*
+    /// USD $1,000,000 ("more than"), LTX-2 requires a paid licence *at* $10,000,000 ("at least").
+    /// Revenue exactly equal to the named amount therefore falls on opposite sides of the two.
+    #[test]
+    fn revenue_ceiling_boundary_semantics_are_pinned() {
+        // The reading each boundary denotes, spelled out as an executable statement so the meaning
+        // is pinned by more than prose. It lives HERE, in a test: nothing in the contract compares a
+        // consumer's revenue against a ceiling, and nothing in this system changes behaviour on one.
+        fn revenue_is_below_the_named_threshold(term: LicenseTerm, revenue_usd: u64) -> bool {
+            match term {
+                LicenseTerm::RevenueCeiling {
+                    amount_usd,
+                    boundary,
+                } => match boundary {
+                    // "more than $N" — $N itself has not exceeded it.
+                    CeilingBoundary::Exclusive => revenue_usd <= amount_usd,
+                    // "at least $N" — $N itself has reached it.
+                    CeilingBoundary::Inclusive => revenue_usd < amount_usd,
+                },
+                other => panic!("not a ceiling: {other:?}"),
+            }
+        }
+
+        const STABILITY: LicenseTerm = LicenseTerm::RevenueCeiling {
+            amount_usd: 1_000_000,
+            boundary: CeilingBoundary::Exclusive,
+        };
+        const LTX: LicenseTerm = LicenseTerm::RevenueCeiling {
+            amount_usd: 10_000_000,
+            boundary: CeilingBoundary::Inclusive,
+        };
+
+        assert!(revenue_is_below_the_named_threshold(STABILITY, 1_000_000));
+        assert!(!revenue_is_below_the_named_threshold(STABILITY, 1_000_001));
+        assert!(!revenue_is_below_the_named_threshold(LTX, 10_000_000));
+        assert!(revenue_is_below_the_named_threshold(LTX, 9_999_999));
+
+        // Same amount, different reading — two distinct disclosures that must not dedupe, because
+        // at exactly that amount they say opposite things.
+        const EXCLUSIVE_1M: LicenseTerm = LicenseTerm::RevenueCeiling {
+            amount_usd: 1_000_000,
+            boundary: CeilingBoundary::Exclusive,
+        };
+        const INCLUSIVE_1M: LicenseTerm = LicenseTerm::RevenueCeiling {
+            amount_usd: 1_000_000,
+            boundary: CeilingBoundary::Inclusive,
+        };
+        assert_ne!(EXCLUSIVE_1M, INCLUSIVE_1M);
+        assert_ne!(EXCLUSIVE_1M.sort_key(), INCLUSIVE_1M.sort_key());
+        assert!(revenue_is_below_the_named_threshold(
+            EXCLUSIVE_1M,
+            1_000_000
+        ));
+        assert!(!revenue_is_below_the_named_threshold(
+            INCLUSIVE_1M,
+            1_000_000
+        ));
+
+        // Both readings reach the manifest verbatim.
+        const BOTH: ProviderComponents = ProviderComponents {
+            provider_id: "svd_then_ltx",
+            components: &["svd_xt", "ltx_dit"],
+        };
+        let value: serde_json::Value = serde_json::from_str(&component_licenses_manifest_json(
+            FAMILIES,
+            COMPONENTS,
+            &[BOTH],
+        ))
+        .unwrap();
+        let ceilings: Vec<(u64, &str)> = value["providers"][0]["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["term"] == "revenue_ceiling")
+            .map(|t| {
+                (
+                    t["amount_usd"].as_u64().unwrap(),
+                    t["boundary"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ceilings,
+            vec![(1_000_000, "exclusive"), (10_000_000, "inclusive")]
+        );
+    }
+
+    /// A3's resolution for thresholds `RevenueCeiling` cannot express: Llama 3.1 Community's
+    /// *700 million monthly active users* trigger is transcribed verbatim as a
+    /// `DeployerObligation`, which is a complete disclosure because nothing computes against a term.
+    /// Writing it as `RevenueCeiling { amount_usd: 700_000_000 }` would be a false transcription —
+    /// the number is users, not dollars — so no typed variant was added.
+    #[test]
+    fn a_non_revenue_threshold_is_disclosed_verbatim_as_a_deployer_obligation() {
+        const JOYCAPTION: ProviderComponents = ProviderComponents {
+            provider_id: "joycaption",
+            components: &["joycaption_llama"],
+        };
+        let terms = provider_terms(&JOYCAPTION, COMPONENTS, FAMILIES);
+        let quoted: Vec<&'static str> = terms
+            .iter()
+            .filter_map(|term| match term {
+                LicenseTerm::DeployerObligation { text } => Some(*text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quoted.len(), 1, "{terms:?}");
+        assert!(
+            quoted[0].contains("700 million monthly active users"),
+            "the trigger must survive as the licence's own words, got {:?}",
+            quoted[0]
+        );
+        // And it is emphatically NOT laundered into a dollar figure.
+        assert!(
+            !terms.iter().any(|term| term.tag() == "revenue_ceiling"),
+            "a user-count threshold is not a revenue ceiling, {terms:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Invariants the amendments must not break.
+    // ---------------------------------------------------------------------------------------
+
+    /// `sort_key` is the total order the manifest is emitted in, and [`provider_terms`] dedups the
+    /// sorted list. Two distinct terms sharing a key would therefore make one of them VANISH from a
+    /// consumer's disclosure — so injectivity is a disclosure-accuracy property, not a tidiness one.
+    /// It matters more after sc-16898 than before it: three variants now carry a field that was not
+    /// in the key at all.
+    #[test]
+    fn sort_key_is_injective_across_every_variant() {
+        // No wildcard arm: adding a `LicenseTerm` variant stops this compiling, which is the prompt
+        // to add a sample for it to `SAMPLES` below (the tag assertion then checks that you did).
+        fn tag_of(term: LicenseTerm) -> &'static str {
+            match term {
+                LicenseTerm::AttributionRequired => "attribution_required",
+                LicenseTerm::NoticeFileRequired => "notice_file_required",
+                LicenseTerm::NonCommercialWeights => "non_commercial_weights",
+                LicenseTerm::NonCommercialOutputs => "non_commercial_outputs",
+                LicenseTerm::RevenueCeiling { .. } => "revenue_ceiling",
+                LicenseTerm::RegistrationRequired { .. } => "registration_required",
+                LicenseTerm::AcceptableUsePolicy { .. } => "acceptable_use_policy",
+                LicenseTerm::DeployerObligation { .. } => "deployer_obligation",
+                LicenseTerm::DownstreamLicenseCopy { .. } => "downstream_license_copy",
+                LicenseTerm::DownstreamRestrictions { .. } => "downstream_restrictions",
+                LicenseTerm::GatedAccess => "gated_access",
+            }
+        }
+
+        // Every variant at least once, and every payload-carrying variant at least twice so the
+        // payload's contribution to the key is exercised — including the two pairs that differ in
+        // ONLY the field sc-16898 added.
+        const SAMPLES: &[LicenseTerm] = &[
+            LicenseTerm::AttributionRequired,
+            LicenseTerm::NoticeFileRequired,
+            LicenseTerm::NonCommercialWeights,
+            LicenseTerm::NonCommercialOutputs,
+            LicenseTerm::GatedAccess,
+            LicenseTerm::RevenueCeiling {
+                amount_usd: 1_000_000,
+                boundary: CeilingBoundary::Exclusive,
+            },
+            // Same amount, different boundary.
+            LicenseTerm::RevenueCeiling {
+                amount_usd: 1_000_000,
+                boundary: CeilingBoundary::Inclusive,
+            },
+            LicenseTerm::RevenueCeiling {
+                amount_usd: 10_000_000,
+                boundary: CeilingBoundary::Inclusive,
+            },
+            LicenseTerm::RegistrationRequired {
+                contact: "https://example.invalid/register",
+            },
+            LicenseTerm::RegistrationRequired {
+                contact: "opensource@example.invalid",
+            },
+            LicenseTerm::AcceptableUsePolicy {
+                url: "https://example.invalid/aup",
+            },
+            LicenseTerm::AcceptableUsePolicy {
+                url: "https://example.invalid/prohibited_use_policy",
+            },
+            LicenseTerm::DeployerObligation {
+                text: "implement and maintain content filtering measures",
+            },
+            LicenseTerm::DeployerObligation {
+                text: "disclose that Outputs were generated using artificial intelligence",
+            },
+            // Same kind, different family.
+            LicenseTerm::DownstreamLicenseCopy {
+                family: "stability-ai-community",
+            },
+            LicenseTerm::DownstreamLicenseCopy {
+                family: "apple-mlr",
+            },
+            // Same family, different kind.
+            LicenseTerm::DownstreamRestrictions {
+                family: "ltx-2-community",
+            },
+            LicenseTerm::DownstreamLicenseCopy {
+                family: "ltx-2-community",
+            },
+            LicenseTerm::DownstreamRestrictions {
+                family: "creativeml-openrail-pp-m",
+            },
+        ];
+
+        let mut tags: Vec<&str> = SAMPLES.iter().copied().map(tag_of).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags,
+            vec![
+                "acceptable_use_policy",
+                "attribution_required",
+                "deployer_obligation",
+                "downstream_license_copy",
+                "downstream_restrictions",
+                "gated_access",
+                "non_commercial_outputs",
+                "non_commercial_weights",
+                "notice_file_required",
+                "registration_required",
+                "revenue_ceiling",
+            ],
+            "every LicenseTerm variant needs a sample here"
+        );
+        // tag() and the exhaustive match agree, so the tripwire cannot rot into a second opinion.
+        for term in SAMPLES {
+            assert_eq!(term.tag(), tag_of(*term));
+        }
+
+        for a in SAMPLES {
+            for b in SAMPLES {
+                assert_eq!(
+                    a.sort_key() == b.sort_key(),
+                    a == b,
+                    "sort_key must separate {a:?} from {b:?}"
+                );
+            }
+        }
+
+        // The consequence, end to end: a sorted-then-deduped union keeps all of them.
+        let mut union: Vec<LicenseTerm> = SAMPLES.to_vec();
+        union.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        union.dedup();
+        assert_eq!(union.len(), SAMPLES.len());
+    }
+
+    /// The sc-16661 byte-stability guarantee, re-checked over the amended shape: none of the new
+    /// payloads reintroduce an input-order dependency, and a gated component contributes the same
+    /// bytes wherever it sits in the provider's list.
+    #[test]
+    fn amended_manifest_is_deterministic_across_input_order() {
+        const FORWARD: &[ProviderComponents] = &[
+            ProviderComponents {
+                provider_id: "sd3_5_large",
+                components: &["sd3_5_large_dit", "sdxl_unet"],
+            },
+            ProviderComponents {
+                provider_id: "svd_then_ltx",
+                components: &["svd_xt", "ltx_dit", "dfn5b_clip"],
+            },
+        ];
+        const REVERSED: &[ProviderComponents] = &[
+            ProviderComponents {
+                provider_id: "svd_then_ltx",
+                components: &["dfn5b_clip", "ltx_dit", "svd_xt"],
+            },
+            ProviderComponents {
+                provider_id: "sd3_5_large",
+                components: &["sdxl_unet", "sd3_5_large_dit"],
+            },
+        ];
+
+        let forward = component_licenses_manifest_json(FAMILIES, COMPONENTS, FORWARD);
+        let permuted_families: Vec<LicenseFamily> = FAMILIES.iter().rev().copied().collect();
+        let permuted_components: Vec<ComponentLicense> = COMPONENTS.iter().rev().copied().collect();
+        assert_eq!(
+            forward,
+            component_licenses_manifest_json(&permuted_families, &permuted_components, REVERSED),
+            "permuting families, components, providers and a provider's own component list must \
+             not change one byte of the manifest"
+        );
+        assert!(forward.ends_with("}\n"));
+        let value: serde_json::Value = serde_json::from_str(&forward).unwrap();
+        assert_eq!(value["schema_version"], 3);
+        // Still no legal conclusion anywhere in the document.
+        assert!(!forward.contains("commercial_use"));
     }
 }
