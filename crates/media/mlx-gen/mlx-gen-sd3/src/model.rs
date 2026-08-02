@@ -352,7 +352,7 @@ impl Sd3Large {
                 for i in 0..req.count {
                     let seed = base_seed.wrapping_add(i as u64);
                     let latents = if let Some((init, _)) = reference {
-                        pipeline::denoise_img2img_cfg(
+                        pipeline::denoise_img2img_cfg_with_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -368,10 +368,11 @@ impl Sd3Large {
                             guidance,
                             &req.cancel,
                             on_progress,
+                            &req.preview,
                         )?
                     } else {
                         let latents = pipeline::create_noise(seed, req.width, req.height)?;
-                        pipeline::denoise_cfg(
+                        pipeline::denoise_cfg_with_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -382,6 +383,7 @@ impl Sd3Large {
                             guidance,
                             &req.cancel,
                             on_progress,
+                            &req.preview,
                         )?
                     };
                     on_progress(Progress::Decoding);

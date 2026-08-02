@@ -5,6 +5,7 @@ use mlx_gen_sd3::{
     LARGE_IN_CHANNELS, LARGE_JOINT_ATTENTION_DIM, LARGE_NUM_HEADS, LARGE_NUM_LAYERS,
     LARGE_OUT_CHANNELS, LARGE_PATCH_SIZE, LARGE_POOLED_PROJECTION_DIM, LARGE_POS_EMBED_LEN,
     LARGE_POS_EMBED_MAX_SIZE, LARGE_TIME_PROJ_DIM, SD3_5_LARGE_ID, SD3_5_LARGE_TURBO_ID,
+    SD3_5_MEDIUM_ID,
 };
 
 #[test]
@@ -77,6 +78,7 @@ fn descriptor_capabilities() {
     assert!(large.capabilities.supports_negative_prompt);
     assert!(large.capabilities.supports_lora);
     assert!(large.capabilities.supports_lokr);
+    assert!(large.capabilities.supports_preview);
     assert!(large.capabilities.mac_only);
     // F-034: the pipeline schedule is `for_static_shift(steps, 3.0)` — resolution-independent, so
     // the loader hint is false (the z-image precedent).
@@ -86,4 +88,9 @@ fn descriptor_capabilities() {
     assert_eq!(turbo.id, SD3_5_LARGE_TURBO_ID);
     assert!(!turbo.capabilities.supports_true_cfg);
     assert!(!turbo.capabilities.supports_negative_prompt);
+    assert!(turbo.capabilities.supports_preview);
+
+    let medium = Sd3Variant::Medium.descriptor();
+    assert_eq!(medium.id, SD3_5_MEDIUM_ID);
+    assert!(medium.capabilities.supports_preview);
 }

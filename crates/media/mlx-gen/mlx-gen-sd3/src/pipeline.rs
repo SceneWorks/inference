@@ -18,7 +18,8 @@
 
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, FlowMatchEuler, Image, Progress, Result, TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image, PreviewSink, Progress,
+    Result, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -116,6 +117,7 @@ fn denoise_over_sigmas(
     guidance_scale: f32,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
 ) -> Result<Array> {
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the MMDiT embeds `σ·1000`.
@@ -134,7 +136,8 @@ fn denoise_over_sigmas(
             _ => Ok(pred_cond),
         }
     };
-    run_flow_sampler(
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::Sigma,
         sigmas,
@@ -142,6 +145,9 @@ fn denoise_over_sigmas(
         seed,
         cancel,
         on_progress,
+        |latents, sigma| {
+            crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents);
+        },
         predict,
     )
 }
@@ -162,6 +168,36 @@ pub fn denoise_cfg(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_cfg_with_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_cfg`] with an optional best-effort per-outer-step preview sink.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_preview(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas,
@@ -173,6 +209,7 @@ pub fn denoise_cfg(
         guidance_scale,
         cancel,
         on_progress,
+        preview,
     )
 }
 
@@ -205,6 +242,46 @@ pub fn denoise_img2img_cfg(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_img2img_cfg_with_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        vae,
+        init,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_img2img_cfg`] with an optional best-effort per-outer-step preview sink.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_img2img_cfg_with_preview(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    vae: &Vae,
+    init: &Image,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     // Reference → clean latent [1, 16, H/8, W/8]. `Vae::encode` returns the normalized `(mean−shift)·
     // scale` latent (the same space as `create_noise`); SD3.5's MMDiT patchifies internally, so keep it
     // unpacked.
@@ -227,6 +304,7 @@ pub fn denoise_img2img_cfg(
         guidance_scale,
         cancel,
         on_progress,
+        preview,
     )
 }
 
