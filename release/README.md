@@ -23,38 +23,56 @@ The bundle contains:
   lockfile identity, Rust toolchain, backend sources/revisions, and artifact
   hashes;
 - an SPDX 2.3 JSON SBOM for the complete cross-platform lockfile graph;
-- `<tag>.model-licenses.json`, the **model-weight-license manifest** (sc-13332) — one row per
-  shipped audio provider recording the license of its pinned Hugging Face weight checkpoint
-  (SPDX id, license name, source URL, attribution, and a `commercial_use` flag);
+- `<tag>.model-licenses.json`, the **model-weight-licence manifest** (sc-13332, `schema_version` 3
+  since sc-16663) — the reviewed licence families, one row per loaded model artifact, and the
+  provider→component mapping with each provider's derived term union;
 - `SHA256SUMS` covering the source archive, manifest, SBOM, and model-licenses manifest.
 
-## Model-weight licenses (`release/model-weight-licenses.json`)
+## Model-weight licences (`release/model-weight-licenses.json`)
 
-The SPDX SBOM covers the license of every Cargo crate (the *source* axis). Model **weights** are a
-separate axis cargo tooling never sees: each provider pins its own Hugging Face checkpoint, whose
-license (Apache-2.0 / MIT today; possibly CC-BY-NC or research-only for a model that lands later)
-SceneWorks — a **non-commercial** product — must surface on its end-product licenses page.
+The SPDX SBOM covers the licence of every Cargo crate (the *source* axis). Model **weights** are a
+separate axis cargo tooling never sees: each provider loads its own pinned checkpoints, whose
+licences a consumer must be able to surface on its end-product licences page.
 
-The source of truth is a `gen_core::WeightLicense` recorded by each provider crate beside its pinned
-`HUB_REPO`/`HUB_REVISION`; `candle-audio-catalog` aggregates every *registered* provider's license
-into the committed `release/model-weight-licenses.json`. Two gates keep it honest:
+**This surface is disclosure-only.** It records what upstream licence texts *name* so a consumer can
+show a user. Nothing in it blocks, gates, degrades or withholds anything, and nothing added to it
+ever should. Whether a given use is permitted is the consumer's evaluation of these facts against its
+own situation — its revenue, whether it redistributes weights, which agreements it has with its own
+users — and inference has none of that information.
+
+The schema has three fact sections (see `sceneworks-gen-core::license`):
+
+- `families` — one entry per reviewed upstream licence text, with its typed terms. Every term is
+  backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md`.
+- `components` — one row per **loaded artifact**, not per provider. Each carries `source_url`,
+  the verbatim `declared` identifier, the `family` it normalizes to, whether the upstream distributes
+  it `gated`, and the `retrieved` date the declaration was read. An artifact loaded by several
+  providers is one row that all of them point at.
+- `providers` — the registry id, its component keys, and its **derived** term union. Derived, never
+  hand-authored: a hand-typed "effective licence" is a second place to be wrong and can drift from
+  the components it claims to summarize.
+
+Provider crates own their component rows beside their pinned `HUB_REPO`/`HUB_REVISION`;
+`candle-audio-catalog` aggregates them into the committed
+`release/model-weight-licenses.json`. Two gates keep it honest:
 
 - `candle-audio-catalog::every_shipped_provider_has_a_weight_license` — the ship-gate in the
-  composition root: a provider that reaches the catalog without a recorded, well-formed license
-  fails the build, so **no audio provider can ship without its weight license recorded**;
-- `candle-audio-catalog::weight_licenses_manifest_matches_committed_file` — the drift gate: the
+  composition root: a provider that reaches the catalog without resolving to well-formed component
+  rows fails the build, so **no audio provider can ship without its weight licence recorded**;
+- `candle-audio-catalog::component_licenses_manifest_matches_committed_file` — the drift gate: the
   committed JSON must equal what the catalog produces (regenerate with
-  `UPDATE_WEIGHT_LICENSES=1 cargo test -p candle-audio-catalog weight_licenses_manifest_matches_committed_file`).
+  `UPDATE_WEIGHT_LICENSES=1 cargo test -p candle-audio-catalog component_licenses_manifest_matches_committed_file`).
 
 `build_release.py` copies the committed manifest into the bundle (and fails if it is absent or
-incomplete); `verify_release.py` re-checks the bundled copy is present and complete.
+structurally incomplete); `verify_release.py` re-checks the bundled copy.
 
-**Restriction discipline:** `commercial_use = false` marks a non-commercial (CC-BY-NC),
-research-only, or otherwise restricted checkpoint. Such weights are admissible for the
-non-commercial product, but every non-commercial entry MUST carry a `restriction` note describing
-the terms the product has to surface — the Rust `WeightLicense::is_well_formed` check and the
-Python `validate_model_weight_licenses` check both reject a non-commercial entry with no restriction
-note. All seven currently-shipped audio providers are permissive (MIT / Apache-2.0).
+**What schema 2 stored, and why it is gone.** The retired schema recorded a `commercial_use` boolean
+— a legal *conclusion* depending on facts inference does not have. Several shipped checkpoints had no
+correct value: every Stable Audio 3 registration carried `commercial_use: false`, yet the Stability
+AI Community License does not prohibit commercial use at all; it names a revenue threshold and a
+registration. A wrong boolean is worse than an absent field, because a join computed over it reads as
+authoritative. sc-16663 migrated the audio lane onto the layers above and deleted the flag; the
+Python validator rejects any row that still carries it.
 
 The verification step checks the manifest/SBOM relationship graph, requires the
 landed runtime provider bundles, and builds a small external Cargo consumer

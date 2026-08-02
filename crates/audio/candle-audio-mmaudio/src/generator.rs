@@ -85,50 +85,6 @@ pub const GUIDANCE_RANGE: (f32, f32) = (1.0, 20.0);
 /// Prompt language the CLIP text tower was trained on (English; the prompt is advisory and optional).
 pub const LANGUAGES: &[&str] = &["en"];
 
-/// The **composite** model-weight license for the shipping `mmaudio_small_16k` provider (sc-13332).
-///
-/// MMAudio's assembled pipeline pulls **five** checkpoints across two repos, under three different
-/// licenses — the crate's per-component [`crate::WEIGHT_LICENSES`] records each in full. The
-/// `candle-audio-catalog` ship-gate keys exactly one license row per *registered* provider id, so the
-/// governing license the provider ships under is surfaced here as one entry keyed by [`MODEL_ID`]: the
-/// **intersection** of all five, i.e. the strictest terms. That is **research / non-commercial only** —
-/// the DFN5B-CLIP conditioner's Apple ML Research Model License limits use to scientific research and
-/// academic development (excluding commercial products), and the MM-DiT / mel-VAE / BigVGAN checkpoints
-/// add CC-BY-NC-4.0 (non-commercial); the Synchformer visual encoder is MIT. SceneWorks is
-/// non-commercial, so the weights are usable, but the composite restriction MUST be surfaced.
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-MMAudio-small-16k-composite",
-    name: "MMAudio small_16k composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
-    source_url: "https://huggingface.co/hkchengrex/MMAudio",
-    attribution: Some(
-        "MMAudio video→audio (mmaudio_small_16k) assembles five checkpoints: the MM-DiT network + 16k \
-         mel-VAE + 16k BigVGAN (© Sony Research Inc. / MMAudio — CC-BY-NC-4.0), the DFN5B-CLIP \
-         ViT-H/14-384 conditioner (© Apple Inc. — Apple ML Research Model License, research-only), and \
-         the Synchformer visual encoder (© 2024 Vladimir Iashin — MIT).",
-    ),
-    commercial_use: false,
-    restriction: Some(
-        "Research / non-commercial only — the intersection of five component licenses. The strictest, \
-         the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific \
-         research and academic development and excludes any commercial product or service; the MMAudio \
-         MM-DiT / mel-VAE / BigVGAN checkpoints add CC-BY-NC-4.0 (non-commercial); the Synchformer \
-         encoder is MIT. See candle-audio-mmaudio::WEIGHT_LICENSES for each checkpoint's full terms. A \
-         legal read is warranted before any commercial use.",
-    ),
-};
-
-/// This provider's single composite weight-license entry (keyed by [`MODEL_ID`]) — what
-/// `candle-audio-catalog` aggregates into the model-licenses manifest (one row per registered
-/// provider). The five per-component entries live in [`crate::WEIGHT_LICENSES`].
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    // The composite / effective-restriction row (component == None) — the at-a-glance
-    // "can we use this provider" signal. The per-checkpoint attribution rows live in
-    // `crate::SHIPPED_WEIGHT_LICENSES` beside it (sc-13493).
-    component: None,
-    license: WEIGHT_LICENSE,
-};
-
 /// The five named model components (epic 13657) `mmaudio_small_16k` requires, provisioned by the
 /// caller in [`LoadSpec::components`] and read at [`load`] via [`require_component`]. The composite
 /// assembles five checkpoints across two repos: `clip` (the DFN5B-CLIP ViT-H/14 conditioner, from

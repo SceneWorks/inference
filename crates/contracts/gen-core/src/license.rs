@@ -1,41 +1,45 @@
-//! Machine-readable **model-weight license** surface (sc-13332).
+//! Machine-readable **model-weight licence** surface (sc-13332, schema 3 since sc-16661).
 //!
-//! The crate/source license axis is already captured by the release tooling's SPDX SBOM
-//! (`scripts/release/build_release.py`, one entry per resolved Cargo package). The license of a
-//! provider's **model weights** — the pinned Hugging Face checkpoint each provider resolves at an
-//! immutable revision — is a *separate axis* that cargo tooling never sees: Kokoro's weights are
-//! Apache-2.0, Whisper's are Apache-2.0, OpenVoice's are MIT, and a checkpoint that lands later
-//! (e.g. an MMAudio video→audio model) may be CC-BY-NC. SceneWorks is a **non-commercial** product,
-//! so it may lawfully use non-commercially-licensed weights — but every weight license MUST be
-//! surfaced so the product can list it on its licenses page (attribution is mandatory for CC-BY-*
-//! and good practice for MIT/Apache too).
+//! The crate/source licence axis is already captured by the release tooling's SPDX SBOM
+//! (`scripts/release/build_release.py`, one entry per resolved Cargo package). The licence of a
+//! provider's **model weights** — the pinned checkpoint each provider loads — is a *separate axis*
+//! that cargo tooling never sees, and this module is the tensor-free contract for it.
 //!
-//! This module is the tensor-free contract for that surface: each provider records a
-//! [`WeightLicense`] as source-of-truth (it travels with the provider crate, next to its pinned
-//! `HUB_REPO`/`HUB_REVISION`), a catalog aggregates the registered providers' licenses into
-//! [`WeightLicenseEntry`] rows, and the release tooling serializes them into a model-licenses
-//! manifest ([`weight_licenses_manifest_json`]) beside the SPDX SBOM so a consumer reads exactly
-//! one file.
+//! ## Disclosure only
 //!
-//! ## Restriction discipline
+//! Everything here exists so a consumer can **show** a user what the upstream texts say. No value
+//! in this module blocks, gates, degrades or withholds anything, and none ever should — this
+//! surface describes, it does not decide. Whether a given use is permitted is the consumer's
+//! evaluation of these facts against its own situation: its revenue, whether it redistributes
+//! weights, which agreements it has with its own users. This crate has none of that information.
 //!
-//! [`WeightLicense::commercial_use`] is the permissive flag. A `false` entry (CC-BY-NC,
-//! research-only, or otherwise non-commercial) is admissible for the non-commercial product but
-//! MUST also carry a human-readable [`WeightLicense::restriction`] note describing the terms the
-//! product has to surface — [`WeightLicense::is_well_formed`] enforces that invariant so a
-//! restricted checkpoint can never ship with its restriction unrecorded.
+//! ## Three layers
 //!
-//! ## Schema 3 supersedes the above (sc-16661)
+//! * [`LicenseFamily`] — one upstream licence text, reviewed once by a human (~16 rows);
+//! * [`LicenseTerm`] — typed obligations, so a licence join is a **set union** rather than a
+//!   boolean AND, and the consumer applies its own profile;
+//! * [`ComponentLicense`] — one row per loaded artifact, carrying the provenance
+//!   ([`source_url`](ComponentLicense::source_url), [`declared`](ComponentLicense::declared),
+//!   [`retrieved`](ComponentLicense::retrieved)) that makes review a quote check and makes upstream
+//!   re-licensing detectable.
 //!
-//! The current surface is the licence **table** further down this module — [`LicenseFamily`],
-//! [`LicenseTerm`], [`ComponentLicense`], [`ProviderComponents`], the derived [`provider_terms`]
-//! union and [`component_licenses_manifest_json`]. It records licence *facts* instead of the legal
-//! *conclusion* `commercial_use` encodes, and keys rows by loaded artifact rather than by provider.
-//! The v2 types in the next section — [`WeightLicense`], [`WeightLicenseEntry`] and the
-//! `schema_version: 2` emitter [`weight_licenses_manifest_json`] — remain only until the audio lane
-//! migrates (sc-16663) and the release tooling moves to schema 3 (sc-16664), which retires
-//! [`weight_licenses_manifest_json`] in favour of [`component_licenses_manifest_json`].
-//! **Do not add v2 callers.**
+//! A provider's terms are **derived** from its components ([`provider_terms`]) and never
+//! hand-authored: a hand-typed composite is a second place to be wrong and can drift from its own
+//! components. [`license_table_conformance_errors`] is the catalog ship-gate, and
+//! [`component_licenses_manifest_json`] emits the `schema_version: 3` manifest the release tooling
+//! ships beside the SPDX SBOM.
+//!
+//! ## What schema 2 stored, and why it is gone (sc-16663)
+//!
+//! The retired v2 surface recorded a legal **conclusion**, `WeightLicense::commercial_use`, that
+//! depends on facts inference does not have. Several shipped checkpoints had no correct boolean:
+//! FLUX.1 \[dev\] (weights non-commercial, outputs explicitly commercial-OK), SD3.5 and every
+//! Stable Audio 3 registration (no prohibition at all — a revenue threshold and a registration),
+//! and Kolors (commercial weight use only after registering with Kuaishou). Whichever value was
+//! written was silently wrong for half of callers, and a join computed over it read as
+//! authoritative. A wrong bool is worse than an absent field. sc-16663 migrated the audio lane onto
+//! the layers above and deleted `WeightLicense`, `WeightLicenseEntry`, `commercial_use` and the
+//! `schema_version: 2` emitter outright.
 //!
 //! ## The table itself (sc-16662)
 //!
@@ -45,131 +49,6 @@
 
 pub mod families;
 
-/// The license under which a provider's **model weights** (its pinned checkpoint) are distributed.
-///
-/// A separate axis from the crate/source license the SPDX SBOM records. Constructible without
-/// loading weights — every field is `&'static str` / `bool` so the value is a `const` a provider
-/// declares beside its pinned `HUB_REPO` / `HUB_REVISION`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WeightLicense {
-    /// SPDX license identifier, e.g. `"Apache-2.0"`, `"MIT"`, `"CC-BY-NC-4.0"`.
-    pub spdx_id: &'static str,
-    /// Human-readable license name, e.g. `"Apache License 2.0"`.
-    pub name: &'static str,
-    /// The pinned checkpoint the license applies to — the Hugging Face repository URL (the
-    /// provider also pins an immutable revision, recorded separately as its `HUB_REVISION`).
-    pub source_url: &'static str,
-    /// Attribution / copyright notice the license requires the product to surface (the Apache/MIT
-    /// copyright line; the CC-BY-* attribution string). `None` only for a public-domain-equivalent
-    /// dedication (CC0) that requires none.
-    pub attribution: Option<&'static str>,
-    /// Whether the weights may be used **commercially**. `false` flags a non-commercial
-    /// (CC-BY-NC), research-only, or otherwise commercially-restricted checkpoint. SceneWorks is
-    /// non-commercial, so `false` is admissible — but the product must surface the terms, so a
-    /// `false` entry MUST also carry a [`restriction`](Self::restriction) note
-    /// ([`is_well_formed`](Self::is_well_formed)).
-    pub commercial_use: bool,
-    /// A note carrying any additional restriction / terms the product must surface
-    /// (non-commercial, research-only, gated / acceptable-use, or a mixed-component note). Required
-    /// whenever [`commercial_use`](Self::commercial_use) is `false`; optional otherwise (e.g. to
-    /// note that one sub-component of a checkpoint carries a different permissive license).
-    pub restriction: Option<&'static str>,
-}
-
-impl WeightLicense {
-    /// Whether the weights are permissively (commercially) usable.
-    pub const fn is_permissive(&self) -> bool {
-        self.commercial_use
-    }
-
-    /// Whether this record honors the restriction discipline: a non-commercial checkpoint
-    /// (`commercial_use == false`) must carry a [`restriction`](Self::restriction) note, and the
-    /// identity fields must be non-empty. The catalog ship-gate asserts this for every shipped
-    /// provider so a restricted checkpoint can never ship with its terms unrecorded.
-    pub fn is_well_formed(&self) -> bool {
-        !self.spdx_id.is_empty()
-            && !self.name.is_empty()
-            && !self.source_url.is_empty()
-            && (self.commercial_use || self.restriction.is_some())
-    }
-}
-
-/// A `(provider_id, component, WeightLicense)` pairing — the aggregated unit a catalog surfaces and
-/// the release tooling serializes into the model-licenses manifest. `provider_id` is the same stable
-/// registry id the provider's descriptor advertises (e.g. `"kokoro_82m"`).
-///
-/// ## One provider, one *or more* rows (sc-13493)
-///
-/// A single-checkpoint provider contributes exactly one row with [`component`](Self::component) =
-/// `None` — its license is both the attribution AND the effective restriction. A provider assembled
-/// from **multiple** checkpoints (e.g. MMAudio's video→audio Foley, which pulls a CLIP conditioner,
-/// a sync encoder, a DiT, a VAE and a vocoder — each under its own upstream license) contributes:
-///
-/// * one **composite** row (`component == None`) whose [`WeightLicense::restriction`] is the *effective*
-///   (strictest-terms) restriction — the at-a-glance "can we use this provider" signal, and
-/// * one **component** row per checkpoint (`component == Some(name)`) carrying that checkpoint's own
-///   SPDX id, source URL and attribution — the per-upstream attribution obligation CC-BY-* imposes.
-///
-/// Rows are therefore keyed by the `(provider_id, component)` pair, not by `provider_id` alone. A
-/// consumer that only wants the effective restriction reads the `component == None` row per provider;
-/// a consumer building an attributions page reads every row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WeightLicenseEntry {
-    /// The registry id of the provider these weights belong to (matches the provider descriptor's
-    /// `id`).
-    pub provider_id: &'static str,
-    /// The checkpoint/component discriminator within a multi-checkpoint provider. `None` for a
-    /// single-checkpoint provider's sole row, and for a multi-checkpoint provider's **composite**
-    /// (effective-restriction) row; `Some(name)` for each per-checkpoint attribution row. The
-    /// `(provider_id, component)` pair is the manifest's unique key.
-    pub component: Option<&'static str>,
-    /// The license of that provider's pinned weight checkpoint (or, for a composite row, the
-    /// effective/strictest-terms license across the provider's checkpoints).
-    pub license: WeightLicense,
-}
-
-/// Serialize weight-license entries into the canonical **model-licenses manifest** JSON — the file
-/// the release tooling emits beside the SPDX SBOM and SceneWorks aggregates for its licenses page.
-///
-/// The output is deterministic: rows are sorted by the `(provider_id, component)` key (a provider's
-/// composite `component == None` row sorts first, ahead of its `Some(_)` component rows), so the
-/// committed manifest and the catalog-generated value compare byte-for-byte (the drift ship-gate)
-/// regardless of the order providers were registered in. Every row carries a `component` field
-/// (`null` for a single-checkpoint or composite row). A trailing newline is included so the file
-/// matches `write_json`'s convention in the release tooling.
-pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
-    let mut sorted: Vec<&WeightLicenseEntry> = entries.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.provider_id
-            .cmp(b.provider_id)
-            .then_with(|| a.component.cmp(&b.component))
-    });
-    let providers: Vec<serde_json::Value> = sorted
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "provider_id": entry.provider_id,
-                "component": entry.component,
-                "spdx_id": entry.license.spdx_id,
-                "license_name": entry.license.name,
-                "source_url": entry.license.source_url,
-                "commercial_use": entry.license.commercial_use,
-                "attribution": entry.license.attribution,
-                "restriction": entry.license.restriction,
-            })
-        })
-        .collect();
-    let document = serde_json::json!({
-        "schema_version": 2,
-        "kind": "model-weight-licenses",
-        "providers": providers,
-    });
-    let mut rendered = serde_json::to_string_pretty(&document)
-        .expect("weight-license manifest is always serializable");
-    rendered.push('\n');
-    rendered
-}
-
 // =================================================================================================
 // v3 — licence families, typed terms, and per-component rows (sc-16661), amended by sc-16898.
 //
@@ -177,13 +56,13 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 // say. No value here blocks, gates, degrades, or withholds anything, and none ever should — this
 // surface describes, it does not decide.
 //
-// The v2 surface above records a legal CONCLUSION (`WeightLicense::commercial_use`) that depends on
-// facts inference does not have: the consumer's revenue, whether it redistributes weights or only
-// sells renders, whether it registered with the upstream. Three checkpoints already in the media
-// catalog have no correct boolean — FLUX.1-dev (weights non-commercial, outputs commercially
-// usable), SD3.5 (commercial below $1M annual revenue only), and Kolors (commercial weights use
-// only after registering with Kuaishou). Whichever value is written is silently wrong for half of
-// callers, and a join computed over it reads as authoritative.
+// The retired v2 surface recorded a legal CONCLUSION (`WeightLicense::commercial_use`) that depends
+// on facts inference does not have: the consumer's revenue, whether it redistributes weights or only
+// sells renders, whether it registered with the upstream. Several shipped checkpoints had no correct
+// boolean — FLUX.1-dev (weights non-commercial, outputs commercially usable), SD3.5 and every Stable
+// Audio 3 registration (no prohibition at all: a revenue threshold and a registration), and Kolors
+// (commercial weights use only after registering with Kuaishou). Whichever value was written was
+// silently wrong for half of callers, and a join computed over it read as authoritative.
 //
 // v3 stores facts instead, in three layers:
 //   * [`LicenseFamily`] — the reviewed unit, ~14 rows, read by a human once;
@@ -195,11 +74,9 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
 // A provider's terms are DERIVED from its components ([`provider_terms`]) and never hand-authored:
 // v2's hand-typed composite row is a second place to be wrong and can drift from its own components.
 //
-// The v2 types remain until the audio lane migrates (sc-16663); `commercial_use` occurs on 48 lines
-// across 18 files in 13 crates (12 candle-audio providers plus candle-audio-catalog), so deleting it
-// here would break the tree. sc-16664 additionally retires the `schema_version: 2` emitter
-// [`weight_licenses_manifest_json`], moving the release tooling onto
-// [`component_licenses_manifest_json`]. v2 is superseded, not supported — do not add callers.
+// sc-16663 migrated the audio lane (43 rows / 18 providers) onto these layers and deleted the v2
+// types, `commercial_use` and the `schema_version: 2` emitter. There is no compatibility shim: a
+// wrong bool is worse than an absent field, because a join computed over it looks authoritative.
 //
 // sc-16898 amended three shapes, each forced by reading the actual licence texts
 // (docs/licensing/sc-16662-licence-family-evidence.md) rather than by a design preference:
@@ -563,7 +440,35 @@ impl LicenseFamily {
 pub struct ComponentLicense {
     /// Stable component key, e.g. `"arcface_antelopev2"`. Unique across the table.
     pub component: &'static str,
-    /// The upstream artifact this row describes.
+    /// **The document [`declared`](Self::declared) was transcribed from** — the one place a drift
+    /// job can re-read it.
+    ///
+    /// The rule is re-readability, not provenance-in-general: this is not "the upstream project",
+    /// not "where we downloaded the weights", and not "the licence text" (that lives once on the
+    /// family, as [`LicenseFamily::text_url`]). Pick whichever document actually carries the string
+    /// in [`declared`](Self::declared) for *this artifact*, so that fetching this URL and comparing
+    /// is a mechanical check. In practice that resolves to one of two shapes, and which one applies
+    /// is decided by where the declaration lives rather than by taste:
+    ///
+    /// * **A model-card / repository URL**, when the declaration is the card's own licence tag —
+    ///   `"apache-2.0"` on `openai/whisper-base`, `"stable-audio-community"` on
+    ///   `stabilityai/stable-audio-3-small-music`. For an artifact *bundled inside* another party's
+    ///   repository this is the **upstream** card, not the redistributor's: the redistributor's tag
+    ///   declares the bundle's licence, not the bundled component's, so ACE-Step's bundled
+    ///   `Qwen3-Embedding-0.6B` row points at `Qwen/Qwen3-Embedding-0.6B`, where `"apache-2.0"` is
+    ///   the value actually published.
+    /// * **A blob URL for a licence file shipped beside the weights**, when the artifact's
+    ///   declaration exists nowhere else — Stable Audio 3's bundled T5Gemma is declared only by the
+    ///   `LICENSE_GEMMA.md` committed next to the checkpoint, whose title *is* the
+    ///   `"Gemma Terms of Use"` string in [`declared`](Self::declared). The repository's own tag
+    ///   says `"stable-audio-community"` and would be the wrong document for that row.
+    ///
+    /// Prefer the artifact's **current** location, unpinned, because a re-read that cannot observe a
+    /// change cannot detect one — that is the entire purpose of the field. The blob shape above is
+    /// the exception the rule tolerates rather than a second convention: a revision-pinned URL still
+    /// makes the transcription auditable (the quote check), but it is frozen, so re-licensing after
+    /// [`retrieved`](Self::retrieved) is invisible to it. A gate that wants both properties for such
+    /// a row has to fetch the unpinned path itself; nothing in this table can supply it.
     pub source_url: &'static str,
     /// Whether the upstream distributes **this checkpoint** behind an access gate, as observed at
     /// [`retrieved`](Self::retrieved).
@@ -999,143 +904,6 @@ pub fn component_licenses_manifest_json(
         .expect("weight-license manifest is always serializable");
     rendered.push('\n');
     rendered
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const APACHE: WeightLicense = WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/example/model",
-        attribution: Some("© Example"),
-        commercial_use: true,
-        restriction: None,
-    };
-
-    #[test]
-    fn permissive_entry_is_well_formed() {
-        assert!(APACHE.is_well_formed());
-        assert!(APACHE.is_permissive());
-    }
-
-    #[test]
-    fn non_commercial_without_restriction_is_not_well_formed() {
-        let nc = WeightLicense {
-            spdx_id: "CC-BY-NC-4.0",
-            name: "Creative Commons Attribution-NonCommercial 4.0",
-            source_url: "https://huggingface.co/example/nc-model",
-            attribution: Some("© Example"),
-            commercial_use: false,
-            restriction: None,
-        };
-        assert!(!nc.is_permissive());
-        assert!(
-            !nc.is_well_formed(),
-            "a non-commercial license must record its restriction"
-        );
-
-        let fixed = WeightLicense {
-            restriction: Some("Non-commercial use only (CC-BY-NC-4.0)."),
-            ..nc
-        };
-        assert!(fixed.is_well_formed());
-    }
-
-    #[test]
-    fn manifest_json_is_deterministic_and_sorted() {
-        let entries = [
-            WeightLicenseEntry {
-                provider_id: "zeta",
-                component: None,
-                license: APACHE,
-            },
-            WeightLicenseEntry {
-                provider_id: "alpha",
-                component: None,
-                license: APACHE,
-            },
-        ];
-        let json = weight_licenses_manifest_json(&entries);
-        // Stable across input order.
-        let reversed = [
-            WeightLicenseEntry {
-                provider_id: "alpha",
-                component: None,
-                license: APACHE,
-            },
-            WeightLicenseEntry {
-                provider_id: "zeta",
-                component: None,
-                license: APACHE,
-            },
-        ];
-        assert_eq!(json, weight_licenses_manifest_json(&reversed));
-        // Sorted: alpha precedes zeta.
-        assert!(json.find("alpha").unwrap() < json.find("zeta").unwrap());
-        // Trailing newline for file-write parity.
-        assert!(json.ends_with("}\n"));
-        // Parses back and carries the schema envelope.
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["schema_version"], 2);
-        assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 2);
-        // Every row carries a `component` field; a single-checkpoint row's is null.
-        assert!(value["providers"][0]["component"].is_null());
-        // A `None` optional serializes as JSON null (surfaced, not omitted).
-        assert!(value["providers"][0]["restriction"].is_null());
-    }
-
-    #[test]
-    fn multi_component_provider_emits_ordered_rows_with_composite_first() {
-        // A provider assembled from two checkpoints: one composite (effective restriction) row and
-        // two per-checkpoint attribution rows, all sharing the provider id (sc-13493).
-        let composite = WeightLicense {
-            spdx_id: "LicenseRef-Foo-composite",
-            name: "Foo composite",
-            source_url: "https://huggingface.co/example/foo",
-            attribution: Some("Foo assembles two checkpoints"),
-            commercial_use: false,
-            restriction: Some("Research / non-commercial only — strictest of two components."),
-        };
-        let component_b = WeightLicense {
-            spdx_id: "MIT",
-            name: "MIT License",
-            source_url: "https://github.com/example/b",
-            attribution: Some("Component B © Example — MIT"),
-            commercial_use: true,
-            restriction: None,
-        };
-        let entries = [
-            WeightLicenseEntry {
-                provider_id: "foo",
-                component: Some("b_checkpoint"),
-                license: component_b,
-            },
-            WeightLicenseEntry {
-                provider_id: "foo",
-                component: None,
-                license: composite,
-            },
-            WeightLicenseEntry {
-                provider_id: "foo",
-                component: Some("a_checkpoint"),
-                license: APACHE,
-            },
-        ];
-        let value: serde_json::Value =
-            serde_json::from_str(&weight_licenses_manifest_json(&entries)).unwrap();
-        let rows = value["providers"].as_array().unwrap();
-        assert_eq!(rows.len(), 3);
-        // Composite (component == null) sorts first, then components alphabetically.
-        assert!(rows[0]["component"].is_null());
-        assert_eq!(rows[0]["spdx_id"], "LicenseRef-Foo-composite");
-        assert_eq!(rows[1]["component"], "a_checkpoint");
-        assert_eq!(rows[2]["component"], "b_checkpoint");
-        // All three share the provider id.
-        assert!(rows.iter().all(|r| r["provider_id"] == "foo"));
-    }
 }
 
 #[cfg(test)]
