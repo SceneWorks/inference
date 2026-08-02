@@ -276,6 +276,32 @@ impl QwenMemoryScope {
             Ok(())
         }
     }
+
+    fn validate_geometry(&self, geometry: MemoryGeometry) -> gen_core::Result<()> {
+        if geometry.width == self.geometry.width
+            && geometry.height == self.geometry.height
+            && geometry.frames == self.geometry.frames
+            && geometry.reference_count == self.geometry.reference_count
+            && geometry.batch > 0
+            && geometry.batch <= self.geometry.batch
+        {
+            return Ok(());
+        }
+        Err(gen_core::Error::Unsupported(format!(
+            "{}: hook geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
+            self.provider_id,
+            geometry.width,
+            geometry.height,
+            geometry.batch,
+            geometry.frames,
+            geometry.reference_count,
+            self.geometry.width,
+            self.geometry.height,
+            self.geometry.batch,
+            self.geometry.frames,
+            self.geometry.reference_count
+        )))
+    }
 }
 
 impl MemoryRequestScope for QwenMemoryScope {
@@ -290,16 +316,19 @@ impl MemoryRequestScope for QwenMemoryScope {
         if request.width != self.geometry.width
             || request.height != self.geometry.height
             || request.count != self.geometry.batch
+            || request.image_reference_count() != self.geometry.reference_count
         {
             return Err(gen_core::Error::Unsupported(format!(
-                "{}: request geometry {}x{} count {} does not match admitted {}x{} count {}",
+                "{}: request geometry {}x{} count {} references={} does not match admitted {}x{} count {} references={}",
                 self.provider_id,
                 request.width,
                 request.height,
                 request.count,
+                request.image_reference_count(),
                 self.geometry.width,
                 self.geometry.height,
-                self.geometry.batch
+                self.geometry.batch,
+                self.geometry.reference_count
             )));
         }
         request.memory = self.memory;
@@ -318,9 +347,10 @@ impl MemoryRequestScope for QwenMemoryScope {
         &mut self,
         tile_edge: u32,
         overlap: u32,
-        _geometry: MemoryGeometry,
+        geometry: MemoryGeometry,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
+        self.validate_geometry(geometry)?;
         if self.use_pid {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: PiD uses an alternate decoder whose explicit tile plan is not wired",
@@ -361,6 +391,12 @@ impl MemoryRequestScope for QwenMemoryScope {
                 self.provider_id
             )));
         };
+        if window == 0 || block_count == 0 || !first_block.is_multiple_of(window) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: transformer window {window} requires a non-zero block count and aligned start, got {block_count} blocks at {first_block}",
+                self.provider_id
+            )));
+        }
         if first_block >= TRANSFORMER_BLOCKS {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: transformer window starts past the {TRANSFORMER_BLOCKS}-block stack",
@@ -572,15 +608,34 @@ mod tests {
         .into_iter()
         .next()
         .unwrap();
+        fixture.context.selection.parameters.transformer_window_size = Some(4);
         let mut scope =
             registered_begin_request("qwen_image_edit", &spec, &contract, &fixture.context)
                 .unwrap()
                 .unwrap();
+        let admitted_request = fixture.request.clone();
         scope.configure_request(&mut fixture.request).unwrap();
         assert_eq!(
             fixture.request.memory,
             contract.generation_memory(&fixture.context.selection)
         );
+        let mut missing_reference = admitted_request.clone();
+        missing_reference.conditioning.clear();
+        assert!(scope.configure_request(&mut missing_reference).is_err());
+        let mut extra_reference = admitted_request;
+        let duplicate_reference = extra_reference.conditioning[0].clone();
+        extra_reference.conditioning.push(duplicate_reference);
+        assert!(scope.configure_request(&mut extra_reference).is_err());
+        let mut wrong_decode_geometry = fixture.context.geometry;
+        wrong_decode_geometry.reference_count = 0;
+        assert!(scope
+            .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, wrong_decode_geometry)
+            .is_err());
+        assert!(scope
+            .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, fixture.context.geometry)
+            .is_ok());
+        assert!(scope.materialize_transformer_window(1, 4).is_err());
+        assert!(scope.materialize_transformer_window(0, 4).is_ok());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
         assert!(scope.finish(MemoryRunOutcome::Complete).is_err());
     }
