@@ -153,12 +153,14 @@ enum T5ProbePolicy {
     Q8Except { block: usize, sublayer: T5Sublayer },
 }
 
+type T5ProbeOutputs = Vec<(Vec<f32>, Vec<f32>)>;
+
 fn t5_probe_outputs(
     root: &std::path::Path,
     max_length: usize,
     prompts: &[&str],
     policy: T5ProbePolicy,
-) -> (Vec<(Vec<f32>, Vec<f32>)>, usize) {
+) -> (T5ProbeOutputs, usize) {
     clear_cache();
     reset_peak_memory();
     let tokenizer =
@@ -208,7 +210,7 @@ fn t5_probe_outputs(
 }
 
 fn t5_sublayer_dense_bytes(root: &std::path::Path, block: usize, sublayer: T5Sublayer) -> usize {
-    let weights = Weights::from_dir(&root.join("text_encoder")).expect("T5 weights for byte count");
+    let weights = Weights::from_dir(root.join("text_encoder")).expect("T5 weights for byte count");
     let (prefix, names): (String, &[&str]) = match sublayer {
         T5Sublayer::Attention => (
             format!("encoder.block.{block}.layer.0.SelfAttention"),
