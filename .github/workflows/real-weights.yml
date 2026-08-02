@@ -2,7 +2,13 @@ name: Real-weight validation
 
 on:
   schedule:
-    - cron: "17 7 * * 0"
+    # 02:00 UTC Monday = 22:00 EDT Sunday. Every macOS job below targets the single self-hosted
+    # Metal runner and they run strictly one at a time, so this run needs a whole night rather than
+    # a Sunday-morning start that bleeds into the working day. Cron is always UTC and does not
+    # follow US daylight time, so this lands at 21:00 EST once the clocks go back — still Sunday
+    # night, which is what matters. GitHub's scheduler also drifts under load (2026-08-02 the old
+    # cron fired ~2h late), so treat the start time as approximate.
+    - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
       profile:
@@ -432,6 +438,7 @@ jobs:
     name: MLX request-memory scope real weights
     if: inputs.profile == 'request-memory-scope'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
       MAGE_REQUEST_SCOPE_QUANT: bf16
@@ -571,6 +578,7 @@ jobs:
     name: MLX LLM real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       MLX_LLM_TEST_MODEL: ${{ vars.MLX_LLM_TEST_MODEL }}
       MLX_LLM_QWEN3_MODEL: ${{ vars.MLX_LLM_QWEN3_MODEL }}
@@ -592,6 +600,7 @@ jobs:
     name: MLX media real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
@@ -840,6 +849,7 @@ jobs:
     # Mage-oracle job that shares the `media` profile.
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       # The repo root of the pinned `SceneWorks/krea-realtime-14b-mlx` rehost. Each tier subdir is a
       # complete snapshot, so the tests are pointed one level in (`/q4`).
@@ -933,6 +943,7 @@ jobs:
     name: Candle audio real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
       MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
@@ -1059,6 +1070,7 @@ jobs:
     name: SAME-L real weights (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_SAME_L_CASE: standalone
       SA3_TEST_METAL: "1"
@@ -1091,6 +1103,7 @@ jobs:
     name: SAME outer chunking real weights (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-chunked'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1139,6 +1152,7 @@ jobs:
     name: Stable Audio 3 small-music provider (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1205,6 +1219,7 @@ jobs:
     name: Stable Audio 3 small-sfx provider (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1273,6 +1288,7 @@ jobs:
     name: Stable Audio 3 medium provider (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
       # No SA3_REQUIRE_ALL_SNAPSHOTS here: `variant_binding` is the only target that reads it, and
@@ -1409,6 +1425,7 @@ jobs:
     name: Stable Audio 3 base/post-trained identity matrix (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
       # Every skip branch in `variant_binding` becomes a failure. That matters more here than
@@ -1591,6 +1608,7 @@ jobs:
     name: Stable Audio 3 small base providers (Metal)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_METAL: "1"
     steps:
@@ -1653,6 +1671,7 @@ jobs:
     name: SAME-L real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_SAME_L_CASE: standalone
       SA3_TEST_CUDA: "1"
@@ -1780,6 +1799,7 @@ jobs:
     name: Stable Audio 3 small-music provider (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       CUDA_COMPUTE_CAP: "80"
@@ -1846,6 +1866,7 @@ jobs:
     name: Stable Audio 3 small-sfx provider (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       CUDA_COMPUTE_CAP: "80"
@@ -1929,6 +1950,7 @@ jobs:
     name: Stable Audio 3 medium provider (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       # No SA3_REQUIRE_ALL_SNAPSHOTS: only `variant_binding` reads it, and sc-14546 moved that
@@ -2163,6 +2185,7 @@ jobs:
     name: Stable Audio 3 base/post-trained identity matrix (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       SA3_REQUIRE_ALL_SNAPSHOTS: "1"
@@ -2280,6 +2303,7 @@ jobs:
     name: Stable Audio 3 small base providers (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       SA3_TEST_CUDA: "1"
       CUDA_COMPUTE_CAP: "80"
@@ -2352,6 +2376,7 @@ jobs:
     name: Candle LLM real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       CANDLE_LLM_TEST_MODEL: ${{ vars.CANDLE_LLM_TEST_MODEL }}
       CANDLE_LLM_QWEN3_MODEL: ${{ vars.CANDLE_LLM_QWEN3_MODEL }}
@@ -2387,6 +2412,7 @@ jobs:
     name: Candle media real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     needs: mlx-media
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
@@ -2471,6 +2497,7 @@ jobs:
     name: Candle SDXL real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       # SDXL base (UNet + dual CLIP text encoders) + the three passed-in components (epic 13657 /
       # sc-13663): the CLIP-L / CLIP-bigG tokenizer dirs and the fp16-fix VAE dir. inference never
@@ -2541,6 +2568,7 @@ jobs:
     # decision), so running them in the regression guard is in-policy.
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
     env:
       # Three per-repo snapshot dirs the video->audio harness resolves the 5 components from
       # (tests/common/mod.rs): hkchengrex/MMAudio (synchformer + dit 16k/44k + vae 16k/44k + 16k
