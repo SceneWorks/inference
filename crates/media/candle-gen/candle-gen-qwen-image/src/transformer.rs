@@ -14,12 +14,64 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+use candle_gen::quant::PackedWeightSidecars;
+use std::sync::Arc;
 
 use crate::config::TransformerConfig;
 use crate::quant::QLinear;
 use crate::rope::{apply_rope, QwenRope, RopeCache};
 
 const EPS: f64 = 1e-6;
+
+fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        if budget == usize::MAX {
+            u64::MAX
+        } else {
+            budget as u64
+        },
+        false,
+    ))
+}
+
+fn into_candle_core<T>(result: candle_gen::Result<T>) -> Result<T> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_gen::candle_core::Error::Msg(other.to_string()),
+    })
+}
+
+fn streamed_linear_detect(
+    in_dim: usize,
+    out_dim: usize,
+    vb: &VarBuilder,
+    base: &str,
+    bias: bool,
+    gs: usize,
+    sidecars: Option<(&PackedWeightSidecars, &str)>,
+) -> Result<QLinear> {
+    let Some((sidecars, prefix)) = sidecars else {
+        return QLinear::linear_detect_gs(in_dim, out_dim, vb, base, bias, gs);
+    };
+    if !vb.contains_tensor(&format!("{base}.scales")) {
+        return QLinear::linear_detect_gs(in_dim, out_dim, vb, base, bias, gs);
+    }
+    let sidecar_base = format!("{prefix}.{base}");
+    if !sidecars.contains(&sidecar_base) {
+        candle_gen::candle_core::bail!(
+            "qwen-image streamed packed projection `{sidecar_base}` has no prepared device-format sidecar"
+        );
+    }
+    let dense_bias = if bias {
+        Some(vb.get(out_dim, &format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    let qtensor = sidecars.load(&sidecar_base, vb.device())?;
+    let packed = candle_gen::quant::QLinear::from_qtensor_dequant(Arc::new(qtensor), dense_bias);
+    Ok(QLinear::from_packed(packed, in_dim, out_dim))
+}
 
 /// Affine-free LayerNorm over the last axis (dtype-preserving; computed in f32).
 fn layer_norm(x: &Tensor) -> Result<Tensor> {
@@ -106,20 +158,18 @@ fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor>
 /// (24 heads); the dual-latent edit path grows fastest and at ≳1280² trips the guard. The
 /// `softmax_last_dim` closure keeps the exact fused softmax; each query row's softmax is independent, so
 /// the chunked result is byte-identical to the single pass. This crate does the head-merge here.
-fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
+fn attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
     let (b, _h, s, _d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let o = candle_gen::sdpa_budgeted_bhsd(
-        q,
-        k,
-        v,
-        scale,
-        None,
-        softmax_last_dim,
-        candle_gen::ATTN_SCORES_BUDGET,
-    )?; // [B,H,S,D]
+    let o = candle_gen::sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan)?; // [B,H,S,D]
     let (_b, h, _s, d) = o.dims4()?;
-    o.transpose(1, 2)?.reshape((b, s, h * d))
+    Ok(o.transpose(1, 2)?.reshape((b, s, h * d))?)
 }
 
 /// Reshape `[B,S,inner]` → `[B,H,S,head_dim]`, applying per-head RMSNorm (over head_dim) for q/k.
@@ -189,12 +239,18 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn new(inner: usize, hidden: usize, vb: VarBuilder, gs: usize) -> Result<Self> {
+    fn new_with_sidecars(
+        inner: usize,
+        hidden: usize,
+        vb: VarBuilder,
+        gs: usize,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         Ok(Self {
             // `net.0.proj` and `net.2` nest under the ff base — pass the full dotted base so the
             // `.scales`/`.biases` siblings survive the key remap (never `.pp()` past a scales sibling).
-            proj_in: QLinear::linear_detect_gs(inner, hidden, &vb, "net.0.proj", true, gs)?,
-            proj_out: QLinear::linear_detect_gs(hidden, inner, &vb, "net.2", true, gs)?,
+            proj_in: streamed_linear_detect(inner, hidden, &vb, "net.0.proj", true, gs, sidecars)?,
+            proj_out: streamed_linear_detect(hidden, inner, &vb, "net.2", true, gs, sidecars)?,
         })
     }
 
@@ -233,10 +289,15 @@ struct JointAttention {
 }
 
 impl JointAttention {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
+    fn new_with_sidecars(
+        cfg: &TransformerConfig,
+        vb: VarBuilder,
+        gs: usize,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim();
         let hd = cfg.head_dim;
-        let lin = |base: &str| QLinear::linear_detect_gs(inner, inner, &vb, base, true, gs);
+        let lin = |base: &str| streamed_linear_detect(inner, inner, &vb, base, true, gs, sidecars);
         Ok(Self {
             to_q: lin("to_q")?,
             to_k: lin("to_k")?,
@@ -265,7 +326,8 @@ impl JointAttention {
         img_sin: &Tensor,
         txt_cos: &Tensor,
         txt_sin: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+        plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
         let (h, hd) = (self.heads, self.head_dim);
         let txt_seq = txt.dim(1)?;
 
@@ -299,7 +361,7 @@ impl JointAttention {
         // Chunk the joint attention over query rows when the [B,H,Sq,Sk] scores tensor would exceed the
         // candle CUDA i32-index limit (long edit/joint sequences >~1024²); numerically identical to a
         // single pass, and a no-op single pass for the txt2img / control sizes (sc-6217).
-        let o = attention(&q, &k, &v, hd)?; // [B, seq, h·hd]
+        let o = attention(&q, &k, &v, hd, plan)?; // [B, seq, h·hd]
         let seq = o.dim(1)?;
         let txt_o = o.narrow(1, 0, txt_seq)?.contiguous()?;
         let img_o = o.narrow(1, txt_seq, seq - txt_seq)?.contiguous()?;
@@ -339,15 +401,77 @@ struct Block {
 
 impl Block {
     fn new(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
+        Self::new_with_sidecars(cfg, vb, gs, None)
+    }
+
+    fn new_streamed(
+        cfg: &TransformerConfig,
+        vb: VarBuilder,
+        gs: usize,
+        sidecars: &PackedWeightSidecars,
+        block_index: usize,
+    ) -> Result<Self> {
+        let prefix = format!("transformer_blocks.{block_index}");
+        Self::new_with_sidecars(cfg, vb, gs, Some((sidecars, &prefix)))
+    }
+
+    fn new_with_sidecars(
+        cfg: &TransformerConfig,
+        vb: VarBuilder,
+        gs: usize,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim();
         let ff_hidden = inner * 4;
         Ok(Self {
             // `img_mod`/`txt_mod` nest the projection at `.1` — pass the full dotted base.
-            img_mod: QLinear::linear_detect_gs(inner, 6 * inner, &vb, "img_mod.1", true, gs)?,
-            txt_mod: QLinear::linear_detect_gs(inner, 6 * inner, &vb, "txt_mod.1", true, gs)?,
-            attn: JointAttention::new(cfg, vb.pp("attn"), gs)?,
-            img_ff: FeedForward::new(inner, ff_hidden, vb.pp("img_mlp"), gs)?,
-            txt_ff: FeedForward::new(inner, ff_hidden, vb.pp("txt_mlp"), gs)?,
+            img_mod: streamed_linear_detect(
+                inner,
+                6 * inner,
+                &vb,
+                "img_mod.1",
+                true,
+                gs,
+                sidecars,
+            )?,
+            txt_mod: streamed_linear_detect(
+                inner,
+                6 * inner,
+                &vb,
+                "txt_mod.1",
+                true,
+                gs,
+                sidecars,
+            )?,
+            attn: JointAttention::new_with_sidecars(
+                cfg,
+                vb.pp("attn"),
+                gs,
+                sidecars
+                    .map(|(cache, prefix)| (cache, format!("{prefix}.attn")))
+                    .as_ref()
+                    .map(|(cache, prefix)| (*cache, prefix.as_str())),
+            )?,
+            img_ff: FeedForward::new_with_sidecars(
+                inner,
+                ff_hidden,
+                vb.pp("img_mlp"),
+                gs,
+                sidecars
+                    .map(|(cache, prefix)| (cache, format!("{prefix}.img_mlp")))
+                    .as_ref()
+                    .map(|(cache, prefix)| (*cache, prefix.as_str())),
+            )?,
+            txt_ff: FeedForward::new_with_sidecars(
+                inner,
+                ff_hidden,
+                vb.pp("txt_mlp"),
+                gs,
+                sidecars
+                    .map(|(cache, prefix)| (cache, format!("{prefix}.txt_mlp")))
+                    .as_ref()
+                    .map(|(cache, prefix)| (*cache, prefix.as_str())),
+            )?,
         })
     }
 
@@ -364,7 +488,8 @@ impl Block {
         // `Some` only on the Qwen-Image-Edit-2511 `zero_cond_t` path: then `temb` is the doubled
         // `[real_t ; zero_t]` and the image stream selects modulation per token (0 = noise, 1 = cond).
         modulate_index: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
+        plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
         let act = temb.silu()?; // [1, inner] (or [2, inner] under zero_cond_t)
         let img_mod = self.img_mod.forward(&act)?; // [1 or 2, 6·inner]
                                                    // The text stream always uses the real-timestep modulation (row 0 under zero_cond_t).
@@ -388,7 +513,7 @@ impl Block {
         let (txt_n, txt_g1) = modulate(&layer_norm(encoder)?, &tm0)?;
         let (img_attn, txt_attn) = self
             .attn
-            .forward(&img_n, &txt_n, img_cos, img_sin, txt_cos, txt_sin)?;
+            .forward(&img_n, &txt_n, img_cos, img_sin, txt_cos, txt_sin, plan)?;
         let hidden = gated(hidden, &img_g1, &img_attn)?;
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
@@ -463,7 +588,7 @@ pub struct QwenTransformer {
     txt_norm: RmsNorm,
     txt_in: QLinear,
     time_embed: TimeEmbed,
-    blocks: Vec<Block>,
+    blocks: TransformerBlocks,
     norm_out: NormOut,
     proj_out: QLinear,
     rope: QwenRope,
@@ -472,12 +597,23 @@ pub struct QwenTransformer {
     dtype: DType,
 }
 
+enum TransformerBlocks {
+    Resident(Vec<Block>),
+    Streamed {
+        weights: VarBuilder<'static>,
+        group_size: usize,
+        sidecars: Option<Arc<PackedWeightSidecars>>,
+        config: TransformerConfig,
+        count: usize,
+    },
+}
+
 impl QwenTransformer {
     /// Build the MMDiT from a `transformer/` VarBuilder at the default MLX group size 64. A **dense**
     /// diffusers snapshot (no `.scales`) loads unchanged; a pre-quantized MLX tier at group 64 loads
     /// packed. Callers that read the packed `group_size` from `transformer/config.json` (a non-64 tier)
     /// use [`Self::new_gs`].
-    pub fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &TransformerConfig, vb: VarBuilder<'static>) -> Result<Self> {
         Self::new_gs(cfg, vb, candle_gen::quant::MLX_GROUP_SIZE)
     }
 
@@ -487,12 +623,50 @@ impl QwenTransformer {
     /// sibling and loads straight from the packed parts when present, else the dense path unchanged —
     /// so a dense diffusers snapshot and a q4/q8 packed snapshot both load through this one call. The
     /// only quantized weights in the tier are the DiT projections; the RMSNorm weights stay dense.
-    pub fn new_gs(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
+    pub fn new_gs(cfg: &TransformerConfig, vb: VarBuilder<'static>, gs: usize) -> Result<Self> {
+        Self::new_with_blocks(cfg, vb, gs, false, None)
+    }
+
+    pub fn new_block_streamed_gs(
+        cfg: &TransformerConfig,
+        vb: VarBuilder<'static>,
+        gs: usize,
+    ) -> Result<Self> {
+        Self::new_with_blocks(cfg, vb, gs, true, None)
+    }
+
+    pub fn new_block_streamed_with_sidecars_gs(
+        cfg: &TransformerConfig,
+        vb: VarBuilder<'static>,
+        gs: usize,
+        sidecars: Arc<PackedWeightSidecars>,
+    ) -> Result<Self> {
+        Self::new_with_blocks(cfg, vb, gs, true, Some(sidecars))
+    }
+
+    fn new_with_blocks(
+        cfg: &TransformerConfig,
+        vb: VarBuilder<'static>,
+        gs: usize,
+        stream_blocks: bool,
+        sidecars: Option<Arc<PackedWeightSidecars>>,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim();
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
-            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i), gs)?);
-        }
+        let blocks = if stream_blocks {
+            TransformerBlocks::Streamed {
+                weights: vb.clone(),
+                group_size: gs,
+                sidecars,
+                config: *cfg,
+                count: cfg.num_layers,
+            }
+        } else {
+            let mut blocks = Vec::with_capacity(cfg.num_layers);
+            for i in 0..cfg.num_layers {
+                blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i), gs)?);
+            }
+            TransformerBlocks::Resident(blocks)
+        };
         Ok(Self {
             img_in: QLinear::linear_detect_gs(cfg.in_channels, inner, &vb, "img_in", true, gs)?,
             txt_norm: rms_norm(cfg.joint_attention_dim, cfg.eps, vb.pp("txt_norm"))?,
@@ -541,12 +715,121 @@ impl QwenTransformer {
         f("img_in", &mut self.img_in)?;
         f("txt_in", &mut self.txt_in)?;
         self.time_embed.visit_adaptable_mut("time_text_embed", f)?;
-        for (i, blk) in self.blocks.iter_mut().enumerate() {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "qwen-image adapters must be installed before selecting streamed transformer blocks"
+                    .to_owned(),
+            ));
+        };
+        for (i, blk) in blocks.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
         }
         self.norm_out.visit_adaptable_mut("norm_out", f)?;
         f("proj_out", &mut self.proj_out)?;
         Ok(())
+    }
+
+    fn resident_blocks(&self) -> Result<&[Block]> {
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => Ok(blocks),
+            TransformerBlocks::Streamed { .. } => {
+                candle_gen::candle_core::bail!(
+                    "qwen-image control requires a resident base transformer"
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blocks(
+        &self,
+        hidden: Tensor,
+        encoder: Tensor,
+        temb: &Tensor,
+        img_cos: &Tensor,
+        img_sin: &Tensor,
+        txt_cos: &Tensor,
+        txt_sin: &Tensor,
+        modulate_index: Option<&Tensor>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => {
+                let (mut hidden, mut encoder) = (hidden, encoder);
+                for block in blocks {
+                    let (next_encoder, next_hidden) = block.forward(
+                        &hidden,
+                        &encoder,
+                        temb,
+                        img_cos,
+                        img_sin,
+                        txt_cos,
+                        txt_sin,
+                        modulate_index,
+                        attention_plan,
+                    )?;
+                    encoder = next_encoder;
+                    hidden = next_hidden;
+                }
+                Ok((encoder, hidden))
+            }
+            TransformerBlocks::Streamed {
+                weights,
+                group_size,
+                sidecars,
+                config,
+                count,
+            } => {
+                let plan = candle_gen::block_window::BlockPlan::new(*count, transformer_window)?;
+                candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &plan,
+                    cancel,
+                    (encoder, hidden),
+                    || Ok(weights.clone()),
+                    |(mut encoder, mut hidden), view, range| {
+                        let blocks = range
+                            .map(|index| {
+                                match sidecars.as_deref() {
+                                    Some(sidecars) => Block::new_streamed(
+                                        config,
+                                        view.pp("transformer_blocks").pp(index),
+                                        *group_size,
+                                        sidecars,
+                                        index,
+                                    ),
+                                    None => Block::new(
+                                        config,
+                                        view.pp("transformer_blocks").pp(index),
+                                        *group_size,
+                                    ),
+                                }
+                                .map_err(candle_gen::CandleError::from)
+                            })
+                            .collect::<candle_gen::Result<Vec<_>>>()?;
+                        for block in &blocks {
+                            candle_gen::check_cancel(cancel)?;
+                            let (next_encoder, next_hidden) = block.forward(
+                                &hidden,
+                                &encoder,
+                                temb,
+                                img_cos,
+                                img_sin,
+                                txt_cos,
+                                txt_sin,
+                                modulate_index,
+                                attention_plan,
+                            )?;
+                            encoder = next_encoder;
+                            hidden = next_hidden;
+                        }
+                        Ok((encoder, hidden))
+                    },
+                )
+            }
+        }
     }
 
     /// Predict velocity. `hidden_states` `[1, img_seq, 64]`, `encoder_hidden_states`
@@ -561,15 +844,62 @@ impl QwenTransformer {
     ) -> Result<Tensor> {
         // The plain path is `forward_control` with no residuals — byte-identical (the match below is
         // inert when `residuals = None`), so the txt2img parity path has a single source of truth.
-        self.forward_control(
+        into_candle_core(self.forward_with_memory(
             hidden_states,
             encoder_hidden_states,
             timestep,
             lat_h,
             lat_w,
+            plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+            self.block_count().max(1),
+            &candle_gen::gen_core::CancelFlag::default(),
+        ))
+    }
+
+    fn block_count(&self) -> usize {
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => blocks.len(),
+            TransformerBlocks::Streamed { count, .. } => *count,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        let temb = self
+            .time_embed
+            .forward(timestep, &self.device, self.dtype)?;
+        let hidden = self.img_in.forward(hidden_states)?;
+        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let encoder = self.txt_in.forward(&encoder)?;
+        let txt_seq = encoder.dim(1)?;
+        let (img_cos, img_sin, txt_cos, txt_sin) =
+            self.rope_cache
+                .tables(&self.rope, &[(lat_h, lat_w)], txt_seq, &self.device)?;
+        let (_encoder, hidden) = self.run_blocks(
+            hidden,
+            encoder,
+            &temb,
+            &img_cos,
+            &img_sin,
+            &txt_cos,
+            &txt_sin,
             None,
-            0.0,
-        )
+            attention_plan,
+            transformer_window,
+            cancel,
+        )?;
+        let hidden = self.norm_out.forward(&hidden, &temb)?;
+        Ok(self.proj_out.forward(&hidden)?)
     }
 
     /// `forward` with optional ControlNet residual injection (sc-5489): after base block `i` the
@@ -604,7 +934,8 @@ impl QwenTransformer {
         // Treat an empty slice as "no control" so the group index can't underflow. Pre-scale the (few)
         // control residuals once, before the 60-block loop.
         let residuals = residuals.filter(|r| !r.is_empty());
-        let interval = residuals.map(|r| self.blocks.len().div_ceil(r.len().max(1)));
+        let blocks = self.resident_blocks()?;
+        let interval = residuals.map(|r| blocks.len().div_ceil(r.len().max(1)));
         let scaled: Option<Vec<Tensor>> = match residuals {
             Some(res) => Some(
                 res.iter()
@@ -614,10 +945,18 @@ impl QwenTransformer {
             None => None,
         };
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            let (e, h) = block.forward(
-                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin, None,
-            )?;
+        for (i, block) in blocks.iter().enumerate() {
+            let (e, h) = into_candle_core(block.forward(
+                &hidden,
+                &encoder,
+                &temb,
+                &img_cos,
+                &img_sin,
+                &txt_cos,
+                &txt_sin,
+                None,
+                plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+            ))?;
             encoder = e;
             // After each base block, add the pre-scaled control residual for this block's group:
             // diffusers `hidden_states = hidden_states + controlnet_block_samples[i // interval]`.
@@ -653,10 +992,38 @@ impl QwenTransformer {
         cond_grids: &[(usize, usize)],
         zero_cond_t: bool,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_edit_with_memory(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            lat_h,
+            lat_w,
+            cond_grids,
+            zero_cond_t,
+            plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+            self.block_count().max(1),
+            &candle_gen::gen_core::CancelFlag::default(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_edit_with_memory(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        cond_grids: &[(usize, usize)],
+        zero_cond_t: bool,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         let img_seq = hidden_states.dim(1)?;
-        let mut hidden = self.img_in.forward(hidden_states)?;
+        let hidden = self.img_in.forward(hidden_states)?;
         let encoder = self.txt_norm.forward(encoder_hidden_states)?;
-        let mut encoder = self.txt_in.forward(&encoder)?;
+        let encoder = self.txt_in.forward(&encoder)?;
         let txt_seq = encoder.dim(1)?;
 
         // 3-axis RoPE over the noise grid then each reference grid.
@@ -682,24 +1049,23 @@ impl QwenTransformer {
             (temb_real.clone(), None)
         };
 
-        for block in &self.blocks {
-            let (e, h) = block.forward(
-                &hidden,
-                &encoder,
-                &temb,
-                &img_cos,
-                &img_sin,
-                &txt_cos,
-                &txt_sin,
-                modulate_index.as_ref(),
-            )?;
-            encoder = e;
-            hidden = h;
-        }
+        let (_encoder, hidden) = self.run_blocks(
+            hidden,
+            encoder,
+            &temb,
+            &img_cos,
+            &img_sin,
+            &txt_cos,
+            &txt_sin,
+            modulate_index.as_ref(),
+            attention_plan,
+            transformer_window,
+            cancel,
+        )?;
 
         // norm_out uses only the real-timestep embedding (the fork's temb[:B]).
         let hidden = self.norm_out.forward(&hidden, &temb_real)?;
-        self.proj_out.forward(&hidden)
+        Ok(self.proj_out.forward(&hidden)?)
     }
 }
 
@@ -848,8 +1214,17 @@ impl QwenFunControlBranch {
         let mut encoder = encoder_embed.clone();
         let mut hints = Vec::with_capacity(self.blocks.len());
         for (block, ap) in self.blocks.iter().zip(&self.after_proj) {
-            let (e, new_c) =
-                block.forward(&c, &encoder, temb, img_cos, img_sin, txt_cos, txt_sin, None)?;
+            let (e, new_c) = into_candle_core(block.forward(
+                &c,
+                &encoder,
+                temb,
+                img_cos,
+                img_sin,
+                txt_cos,
+                txt_sin,
+                None,
+                plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+            ))?;
             encoder = e;
             // hint[i] = after_proj(c_after_block_i) (zero-init projection; the fork's `c_skip`).
             hints.push(ap.forward(&new_c)?);
@@ -909,10 +1284,18 @@ impl QwenTransformer {
             None => None,
         };
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            let (e, h) = block.forward(
-                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin, None,
-            )?;
+        for (i, block) in self.resident_blocks()?.iter().enumerate() {
+            let (e, h) = into_candle_core(block.forward(
+                &hidden,
+                &encoder,
+                &temb,
+                &img_cos,
+                &img_sin,
+                &txt_cos,
+                &txt_sin,
+                None,
+                plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+            ))?;
             encoder = e;
             // After base block `i`, add the pre-scaled hint for this block (if `i` is a control layer) —
             // the fork's `hidden_states = hidden_states + hints[block_id] * context_scale`.
@@ -1043,6 +1426,103 @@ mod tests {
 
     fn random_vb(seed: u64) -> VarBuilder<'static> {
         VarBuilder::from_backend(Box::new(RandomBackend::new(seed)), DType::F32, Device::Cpu)
+    }
+
+    /// Name-seeded dense backend: resident and streamed constructors request tensors in different
+    /// orders, so key-local determinism is required for a meaningful parity test.
+    struct NamedBackend {
+        seed: u64,
+    }
+
+    impl SimpleBackend for NamedBackend {
+        fn get(
+            &self,
+            shape: candle_gen::candle_core::Shape,
+            name: &str,
+            _init: candle_gen::candle_nn::Init,
+            dtype: DType,
+            dev: &Device,
+        ) -> candle_gen::candle_core::Result<Tensor> {
+            use rand::SeedableRng;
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            self.seed.hash(&mut hash);
+            name.hash(&mut hash);
+            shape.dims().hash(&mut hash);
+            let mut rng = rand::rngs::StdRng::seed_from_u64(hash.finish());
+            let data: Vec<f32> = candle_gen::seeded_normal_vec(&mut rng, shape.elem_count())
+                .into_iter()
+                .map(|value| value * 0.05)
+                .collect();
+            Tensor::from_vec(data, shape, dev)?.to_dtype(dtype)
+        }
+
+        fn get_unchecked(
+            &self,
+            _name: &str,
+            _dtype: DType,
+            _dev: &Device,
+        ) -> candle_gen::candle_core::Result<Tensor> {
+            candle_gen::candle_core::bail!("NamedBackend requires a shape; use get")
+        }
+
+        fn contains_tensor(&self, name: &str) -> bool {
+            !(name.ends_with(".scales") || name.ends_with(".biases"))
+        }
+    }
+
+    fn named_vb(seed: u64) -> VarBuilder<'static> {
+        VarBuilder::from_backend(Box::new(NamedBackend { seed }), DType::F32, Device::Cpu)
+    }
+
+    #[test]
+    fn streamed_transformer_matches_resident_with_ragged_window_and_cancels() {
+        use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+        use candle_gen::gen_core::CancelFlag;
+
+        let mut cfg = tiny_cfg();
+        cfg.num_layers = 5;
+        let resident = QwenTransformer::new(&cfg, named_vb(41)).unwrap();
+        let streamed = QwenTransformer::new_block_streamed_gs(&cfg, named_vb(41), 64).unwrap();
+        let dev = Device::Cpu;
+        let (lat_h, lat_w) = (2usize, 3usize);
+        let hidden = Tensor::randn(0f32, 1f32, (1, lat_h * lat_w, cfg.in_channels), &dev).unwrap();
+        let encoder = Tensor::randn(0f32, 1f32, (1, 5, cfg.joint_attention_dim), &dev).unwrap();
+        let cancel = CancelFlag::default();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(42, false))
+            .with_cancel(&cancel);
+
+        let expected = resident
+            .forward_with_memory(&hidden, &encoder, 0.7, lat_h, lat_w, plan, 2, &cancel)
+            .unwrap();
+        let actual = streamed
+            .forward_with_memory(&hidden, &encoder, 0.7, lat_h, lat_w, plan, 2, &cancel)
+            .unwrap();
+        let expected = expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let actual = actual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(expected.len(), actual.len());
+        for (expected, actual) in expected.iter().zip(&actual) {
+            assert!(
+                (expected - actual).abs() < 1e-6,
+                "streamed ragged-window output diverged: {expected} vs {actual}"
+            );
+        }
+
+        let canceled = CancelFlag::default();
+        canceled.cancel();
+        let error = streamed
+            .forward_with_memory(
+                &hidden,
+                &encoder,
+                0.7,
+                lat_h,
+                lat_w,
+                AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&canceled),
+                2,
+                &canceled,
+            )
+            .unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
     }
 
     /// scale=0 (and `control = None`) reproduce the plain base forward **byte-exact** — the zero-init

@@ -41,6 +41,8 @@ pub mod control_fun;
 // reference, concatenates it after the noise, and denoises with the reference grids in the RoPE.
 pub mod edit;
 pub mod image_processor;
+#[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
+mod memory_strategy;
 pub mod pipeline;
 // ComfyUI single-file Qwen-Image → in-memory remap seam (epic 10451 Phase 2b): strip the
 // `model.diffusion_model.` prefix + upcast the plain `fp8_e4m3fn` DiT to bf16 (sc-10670), and remap the
@@ -88,7 +90,7 @@ mod edit_validate;
 mod comfyui_vae_validate;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -227,6 +229,17 @@ impl Pipeline {
         candle_gen::mmap_var_builder(&files, dtype, &self.device)
     }
 
+    fn component_files(&self, sub: &str) -> CResult<Vec<PathBuf>> {
+        let dir = self.root.join(sub);
+        if !dir.is_dir() {
+            return Err(CandleError::Msg(format!(
+                "qwen-image snapshot is missing the {sub}/ dir (expected a Qwen-Image diffusers snapshot at {})",
+                self.root.display()
+            )));
+        }
+        candle_gen::sorted_safetensors(&dir, "qwen-image")
+    }
+
     fn load_components(&self) -> CResult<Components> {
         // The fused Qwen2.5-VL text encoder (LM + vision tower) ships DENSE bf16 in every tier — the
         // MLX convert job quantizes only the transformer — so the TE loader is unchanged (it guards
@@ -351,6 +364,21 @@ impl Pipeline {
         let steps = resolve_steps(req.steps);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            gen_core::attention_budget::AttentionBudget::CONSTRAINED
+        } else {
+            gen_core::attention_budget::AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )
+        };
+        let attention_plan = gen_core::attention_budget::AttentionPlan::budgeted(attention_budget)
+            .with_cancel(&req.cancel);
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(memory_strategy::TRANSFORMER_BLOCKS as usize);
 
         // Routed through the unified curated sampler/scheduler framework (epic 7114 P4, sc-7123): the
         // `scheduler` axis picks the σ schedule over the production dynamic-μ shift (`native` = the
@@ -383,10 +411,28 @@ impl Pipeline {
                 &req.cancel,
                 on_progress,
                 |latents, sigma| -> CResult<Tensor> {
-                    let pos = transformer.forward(latents, pos_embeds, sigma, lat_h, lat_w)?;
+                    let pos = transformer.forward_with_memory(
+                        latents,
+                        pos_embeds,
+                        sigma,
+                        lat_h,
+                        lat_w,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
+                    )?;
                     match neg_embeds {
                         Some(neg) => {
-                            let neg = transformer.forward(latents, neg, sigma, lat_h, lat_w)?;
+                            let neg = transformer.forward_with_memory(
+                                latents,
+                                neg,
+                                sigma,
+                                lat_h,
+                                lat_w,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                            )?;
                             Ok(pipeline::compute_guided_noise(&pos, &neg, guidance)?)
                         }
                         None => Ok(pos),
@@ -402,7 +448,19 @@ impl Pipeline {
             // larger `[1,3,4H,4W]` tensor; `to_image` reads the size from it.
             let decoded = match &pid_decoder {
                 Some(pid) => pid.decode(&lat)?,
-                None => vae.decode(&lat)?,
+                None => vae.decode_with_tile(
+                    &lat,
+                    memory.tile_vae_decode.then(|| {
+                        (
+                            memory
+                                .decode_tile_edge
+                                .unwrap_or(memory_strategy::DECODE_TILE_EDGE),
+                            memory
+                                .decode_overlap
+                                .unwrap_or(memory_strategy::DECODE_OVERLAP),
+                        )
+                    }),
+                )?,
             };
             control_common::to_image(&decoded)
         })
@@ -422,8 +480,22 @@ impl Pipeline {
     /// packed-detect load (`transformer_group_size` → `QwenTransformer::new_gs`) as
     /// [`load_components`](Self::load_components).
     fn load_transformer_seq(&self) -> CResult<QwenTransformer> {
+        self.load_transformer_seq_with_memory(false, &gen_core::CancelFlag::default())
+    }
+
+    fn load_transformer_seq_with_memory(
+        &self,
+        stream_transformer_blocks: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<QwenTransformer> {
         match &self.comfyui_dit {
             Some(dit_file) => {
+                if stream_transformer_blocks {
+                    return Err(CandleError::Msg(
+                        "qwen-image transformer streaming is unavailable for bespoke ComfyUI weights"
+                            .into(),
+                    ));
+                }
                 let dit_map = candle_gen::candle_core::safetensors::load(dit_file, &Device::Cpu)
                     .map_err(|error| {
                         CandleError::Msg(format!(
@@ -440,12 +512,51 @@ impl Pipeline {
                 )?)
             }
             None => {
-                let gs = transformer_group_size(&self.root.join("transformer"));
-                Ok(QwenTransformer::new_gs(
-                    &self.dit_cfg,
-                    self.component_vb("transformer", DIT_DTYPE)?,
-                    gs,
-                )?)
+                let dit_dir = self.root.join("transformer");
+                let gs = transformer_group_size(&dit_dir);
+                if !stream_transformer_blocks {
+                    return Ok(QwenTransformer::new_gs(
+                        &self.dit_cfg,
+                        self.component_vb("transformer", DIT_DTYPE)?,
+                        gs,
+                    )?);
+                }
+                let packed = transformer_packed_config(&dit_dir);
+                if let Some(packed) = packed {
+                    use candle_gen::candle_core::safetensors::MmapedSafetensors;
+                    use candle_gen::quant::PackedWeightSidecars;
+
+                    let files = self.component_files("transformer")?;
+                    // SAFETY: read-only mmap over immutable snapshot files. Sidecar preparation hashes
+                    // and converts only the uniform transformer block prefix before generation starts.
+                    let source = unsafe { MmapedSafetensors::multi(&files)? };
+                    let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
+                        &source,
+                        &dit_dir,
+                        packed,
+                        &self.device,
+                        cancel,
+                        "transformer_blocks.",
+                    );
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    let sidecars = Arc::new(prepared?);
+                    let vb =
+                        VarBuilder::from_backend(Box::new(source), DIT_DTYPE, self.device.clone());
+                    Ok(QwenTransformer::new_block_streamed_with_sidecars_gs(
+                        &self.dit_cfg,
+                        vb,
+                        gs,
+                        sidecars,
+                    )?)
+                } else {
+                    Ok(QwenTransformer::new_block_streamed_gs(
+                        &self.dit_cfg,
+                        self.component_vb("transformer", DIT_DTYPE)?,
+                        gs,
+                    )?)
+                }
             }
         }
     }
@@ -511,9 +622,15 @@ impl Pipeline {
     /// generate, so a PiD engine loaded for a request that never asked for it would sit inside the peak
     /// this path exists to bound — while `resolve_pid_decoder` goes on to return `None` for it, so not a
     /// byte of it is read.
-    fn load_heavy_seq(&self, use_pid: bool) -> CResult<SeqHeavy> {
+    fn load_heavy_seq_with_memory(
+        &self,
+        use_pid: bool,
+        stream_transformer_blocks: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<SeqHeavy> {
         Ok(SeqHeavy {
-            transformer: self.load_transformer_seq()?,
+            transformer: self
+                .load_transformer_seq_with_memory(stream_transformer_blocks, cancel)?,
             vae: self.load_vae_seq()?,
             pid: self.load_pid(use_pid)?,
         })
@@ -535,6 +652,13 @@ pub(crate) fn transformer_group_size(dit_dir: &Path) -> usize {
         .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE)
 }
 
+pub(crate) fn transformer_packed_config(dit_dir: &Path) -> Option<candle_gen::quant::PackedConfig> {
+    std::fs::read_to_string(dit_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+}
+
 /// Whether the DiT tier is MLX-**packed** (q4/q8), read from `transformer/config.json`'s `quantization`
 /// block — the MLX convert job stamps it on every quantized tier (`SceneWorks/qwen-image-*-mlx`), and a
 /// dense diffusers snapshot has none. Gates the edit lane's adapter route (sc-11091): a packed base
@@ -554,11 +678,47 @@ pub struct QwenImageGenerator {
     descriptor: ModelDescriptor,
     pipe: Pipeline,
     residency: QwenResidency,
+    lifecycle: Mutex<()>,
+    stream_cancel: Arc<Mutex<gen_core::CancelFlag>>,
+    loaded_quant: Option<Quant>,
+    /// Executable shared-memory contract for registry-loaded CUDA snapshots. Bespoke ComfyUI
+    /// sources remain resident-only because their in-memory remap is not block-addressable.
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
 impl Generator for QwenImageGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        memory_strategy::admission_safety_check(MODEL_ID, contract, context, self.loaded_quant)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(MODEL_ID, contract, context, self.loaded_quant)?;
+        Ok(Some(Box::new(memory_strategy::QwenMemoryScope::new(
+            MODEL_ID,
+            self.pipe.device.clone(),
+            contract,
+            context,
+        ))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -590,13 +750,44 @@ impl Generator for QwenImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
         let stage_residency = req
             .memory
             .as_ref()
             .is_some_and(|memory| memory.stage_residency);
+        let stream_transformer_blocks = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stream_transformer_blocks);
+        if req.memory.as_ref().is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        }) && !stage_residency
+        {
+            return Err(gen_core::Error::Unsupported(
+                "qwen_image: bounded decode, attention, and transformer residency require request-scoped staged residency"
+                    .into(),
+            ));
+        }
+        if stream_transformer_blocks && self.memory_strategy.is_none() {
+            return Err(gen_core::Error::Unsupported(
+                "qwen_image: transformer streaming is unavailable for bespoke ComfyUI component loads"
+                    .into(),
+            ));
+        }
+        if req.use_pid
+            && req.memory.is_some_and(|memory| {
+                memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+            })
+        {
+            return Err(gen_core::Error::Unsupported(
+                "qwen_image: optimized native-VAE memory strategies do not support PiD decode"
+                    .into(),
+            ));
+        }
         let images = self.residency.run_request_scoped(
             stage_residency,
-            false,
+            stream_transformer_blocks,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -670,10 +861,16 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator>> {
+fn generator_from_pipeline(
+    pipe: Pipeline,
+    loaded_quant: Option<Quant>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+) -> gen_core::Result<Box<dyn Generator>> {
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
+    let stream_cancel = Arc::new(Mutex::new(gen_core::CancelFlag::default()));
+    let heavy_cancel = stream_cancel.clone();
     let residency = QwenResidency::request_scoped_with_resident(
         move |_| {
             let comps = resident_pipe.load_components()?;
@@ -683,9 +880,13 @@ fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator
             ))
         },
         move |_| Ok(TextPhase::Sequential(Box::new(text_pipe.load_te_seq()?))),
-        move |use_pid, _| {
+        move |use_pid, stream_transformer_blocks| {
             Ok(HeavyPhase::Sequential(Box::new(
-                heavy_pipe.load_heavy_seq(use_pid)?,
+                heavy_pipe.load_heavy_seq_with_memory(
+                    use_pid,
+                    stream_transformer_blocks,
+                    &candle_gen::lock_recover(&heavy_cancel),
+                )?,
             )))
         },
     );
@@ -693,6 +894,10 @@ fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator
         descriptor: descriptor(),
         pipe,
         residency,
+        lifecycle: Mutex::new(()),
+        stream_cancel,
+        loaded_quant,
+        memory_strategy,
     }))
 }
 
@@ -725,9 +930,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle qwen_image does not support control / Edit yet (txt2img only)".into(),
         ));
     }
+    let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     let device = candle_gen::default_device()?;
     let pipe = Pipeline::load(&root, &device, spec.pid.clone());
-    generator_from_pipeline(pipe)
+    #[cfg(any(feature = "cuda", test))]
+    let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_strategy = None;
+    generator_from_pipeline(pipe, loaded_quant, memory_strategy)
 }
 
 /// Construct a lazy candle Qwen-Image generator that reads its **DiT** (and optionally its **VAE**) in
@@ -754,7 +964,7 @@ pub fn load_from_comfyui_dit(
         transformer_file.into(),
         vae_file,
     );
-    generator_from_pipeline(pipe)
+    generator_from_pipeline(pipe, None, None)
 }
 
 candle_gen::register_generators! {
@@ -765,8 +975,63 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    let registry = registry.register_generator(REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_strategy(QWEN_IMAGE_MEMORY_REGISTRATION)
+        .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
+        .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_behavior(QWEN_EDIT_MEMORY_BEHAVIOR);
+    registry
 }
+
+#[cfg(feature = "cuda")]
+fn registered_qwen_image_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(MODEL_ID, spec)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_qwen_edit_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract("qwen_image_edit", spec)
+}
+
+#[cfg(feature = "cuda")]
+const QWEN_IMAGE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID,
+    contract: registered_qwen_image_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const QWEN_IMAGE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
+#[cfg(feature = "cuda")]
+const QWEN_EDIT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: "qwen_image_edit",
+    contract: registered_qwen_edit_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const QWEN_EDIT_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "qwen_image_edit",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request("qwen_image_edit", spec, contract, context)
+        },
+    };
 
 /// Build the complete explicit Candle Qwen-Image provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
