@@ -104,9 +104,18 @@ mod explicit_registry_tests {
             explicit,
             ["qwen_image", "qwen_image_control", "qwen_image_edit"]
         );
-        assert!(descriptors
+        let preview_support: std::collections::BTreeMap<_, _> = descriptors
             .iter()
-            .all(|descriptor| descriptor.capabilities.supports_preview));
+            .map(|descriptor| (descriptor.id, descriptor.capabilities.supports_preview))
+            .collect();
+        assert_eq!(
+            preview_support,
+            std::collections::BTreeMap::from([
+                ("qwen_image", true),
+                ("qwen_image_control", false),
+                ("qwen_image_edit", true),
+            ])
+        );
     }
 
     #[test]
