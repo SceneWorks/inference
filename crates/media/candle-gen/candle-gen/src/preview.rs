@@ -162,13 +162,31 @@ where
 ///
 /// The closure receives the driver's **running latent** in the family's own native layout; unpacking
 /// to the `[1, C, h, w]` [`project_latents`] contract is the family's job.
+///
+/// ## The sliced-schedule exception (sc-16950)
+///
+/// Driver-owned numbering is right for every route that runs one driver call over one whole schedule.
+/// It is *wrong* for a route that hands the driver a contiguous **slice** of a longer schedule and
+/// calls it repeatedly — Krea's multi-phase Raw denoise resolves ONE global σ schedule and runs a
+/// driver call per phase over `sigmas[start..=end]`. Per-call numbering there would restart each phase
+/// at frame 1 with `total` equal to that phase's length, so a 3-phase 24-step render would report
+/// three separate short progressions instead of one 24-frame run.
+///
+/// [`PreviewHook::over_schedule`] is the narrow escape hatch: the caller supplies the **global**
+/// counter and the **global** σ array, and the hook keys every emission against those instead of the
+/// driver's slice. It is deliberately not the default constructor — the invariant it relaxes is the
+/// one that keeps ordinary families honest.
 pub struct PreviewHook<'a> {
     sink: &'a PreviewSink,
     project: Projector<'a>,
+    /// A caller-owned `(counter, sigmas)` pair that overrides the driver's. `None` — the default — is
+    /// the driver-owned numbering every single-call route uses.
+    schedule: Option<(&'a PreviewCounter, &'a [f32])>,
 }
 
 impl<'a> PreviewHook<'a> {
-    /// Build a hook from a request's sink and the family's projection closure.
+    /// Build a hook from a request's sink and the family's projection closure. Frame numbering is
+    /// owned by whichever driver receives this hook.
     pub fn new<F>(sink: &'a PreviewSink, project: F) -> Self
     where
         F: Fn(&Tensor) -> Result<Image> + 'a,
@@ -176,6 +194,30 @@ impl<'a> PreviewHook<'a> {
         Self {
             sink,
             project: Box::new(project),
+            schedule: None,
+        }
+    }
+
+    /// Build a hook that numbers frames against a caller-owned **global** schedule instead of the
+    /// driver's — for a route that drives one denoise trajectory as several slices of one schedule
+    /// (Krea multi-phase). `sigmas` must be the global array the slices are taken from, and `counter`
+    /// must be built from it, so a sigma the driver reports still resolves to its global position.
+    ///
+    /// One counter per **trajectory**, not per process: a batched route must build a fresh counter for
+    /// each image, or the second image's positions are all already emitted and produce no frames.
+    pub fn over_schedule<F>(
+        sink: &'a PreviewSink,
+        counter: &'a PreviewCounter,
+        sigmas: &'a [f32],
+        project: F,
+    ) -> Self
+    where
+        F: Fn(&Tensor) -> Result<Image> + 'a,
+    {
+        Self {
+            sink,
+            project: Box::new(project),
+            schedule: Some((counter, sigmas)),
         }
     }
 
@@ -185,8 +227,10 @@ impl<'a> PreviewHook<'a> {
         self.sink.is_active()
     }
 
-    /// σ-keyed emission — the curated / flow drivers.
+    /// σ-keyed emission — the curated / flow drivers. The driver's `counter` / `sigmas` are used
+    /// unless this hook carries a caller-owned global schedule ([`Self::over_schedule`]).
     pub fn emit(&self, counter: &PreviewCounter, sigmas: &[f32], sigma: f32, latents: &Tensor) {
+        let (counter, sigmas) = self.schedule.unwrap_or((counter, sigmas));
         emit_preview(self.sink, counter, sigmas, sigma, || {
             (self.project)(latents)
         });
@@ -194,6 +238,7 @@ impl<'a> PreviewHook<'a> {
 
     /// Step-index-keyed emission — the SCM driver, which has no σ schedule.
     pub fn emit_step(&self, counter: &PreviewCounter, step: usize, latents: &Tensor) {
+        let counter = self.schedule.map_or(counter, |(counter, _)| counter);
         emit_preview_at(self.sink, counter, step, || (self.project)(latents));
     }
 }
@@ -436,6 +481,51 @@ mod tests {
 
         assert_eq!(*crate::lock_recover(&seen), vec![vec![1, 4, 2, 3]]);
         assert_eq!(crate::lock_recover(&frames).len(), 1);
+    }
+
+    /// The sliced-schedule escape hatch (sc-16950): a hook built over a GLOBAL schedule numbers every
+    /// frame against it, so several driver calls over contiguous slices read as one continuous run
+    /// rather than restarting at 1 per slice.
+    #[test]
+    fn over_schedule_numbers_slices_against_the_global_schedule() {
+        let (sink, frames) = collecting_sink();
+        let counter = PreviewCounter::new(&SIGMAS);
+        let hook = PreviewHook::over_schedule(&sink, &counter, &SIGMAS, |x: &Tensor| {
+            project_latents(x, &[[0.0; 3]; 4], [0.0; 3])
+        });
+        let latents = zeros((1, 4, 2, 3));
+
+        // Two "phases": the driver would hand its own slice-local counter and sigma slice each time.
+        for slice in [&SIGMAS[0..4], &SIGMAS[3..9]] {
+            let driver_counter = PreviewCounter::new(slice);
+            for &sigma in &slice[..slice.len() - 1] {
+                hook.emit(&driver_counter, slice, sigma, &latents);
+            }
+        }
+
+        let frames = crate::lock_recover(&frames);
+        let numbered: Vec<_> = frames.iter().map(|f| (f.current, f.total)).collect();
+        assert_eq!(
+            numbered,
+            (1..=8).map(|n| (n, 8)).collect::<Vec<_>>(),
+            "the global schedule must number 1..=8 across both slices, with the global total"
+        );
+    }
+
+    /// The default hook keeps the driver's numbering — the invariant `over_schedule` relaxes.
+    #[test]
+    fn default_hook_defers_to_the_driver_counter() {
+        let (sink, frames) = collecting_sink();
+        let hook = PreviewHook::new(&sink, |x: &Tensor| {
+            project_latents(x, &[[0.0; 3]; 4], [0.0; 3])
+        });
+        let latents = zeros((1, 4, 2, 3));
+        let slice = &SIGMAS[3..9];
+        let driver_counter = PreviewCounter::new(slice);
+        hook.emit(&driver_counter, slice, slice[0], &latents);
+
+        let frames = crate::lock_recover(&frames);
+        assert_eq!((frames[0].current, frames[0].total), (1, 5));
     }
 
     // --- Projection --------------------------------------------------------------------------------

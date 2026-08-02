@@ -40,6 +40,9 @@ pub mod multiphase;
 /// validation vehicle. See [`nvfp4_dit`].
 pub mod nvfp4_dit;
 pub mod pipeline;
+/// Krea's per-step latent preview seam (epic 16948, sc-16950) — the projector closure every render
+/// route hands [`candle_gen::run_flow_sampler`], over the **reused** epic-16624 QwenVae fit.
+mod preview;
 pub mod quant;
 pub mod schedule;
 pub mod text_encoder;

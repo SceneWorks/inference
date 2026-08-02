@@ -706,6 +706,7 @@ pub(crate) fn render_three_stage(
         .unwrap_or(crate::transformer::DEFAULT_TRANSFORMER_WINDOW);
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
+        let preview = crate::preview::hook(&req.preview);
         candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -714,7 +715,7 @@ pub(crate) fn render_three_stage(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = dit.forward_with_memory(
@@ -923,6 +924,7 @@ fn render_from_context(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
+        let preview = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -931,7 +933,7 @@ fn render_from_context(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = comps.dit.forward(x, &t, context)?;
@@ -1044,6 +1046,9 @@ fn render_img2img_from_context(
         let lat = if sub.len() < 2 {
             x_start
         } else {
+            // Numbered against the executed window `sub`, not the full schedule: an img2img render
+            // genuinely performs only these steps, and the MLX twin numbers the same way.
+            let preview = crate::preview::hook(&req.preview);
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -1052,7 +1057,7 @@ fn render_img2img_from_context(
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let v = comps.dit.forward(x, &t, context)?;
@@ -1159,6 +1164,9 @@ fn render_base_from_contexts(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
+        // The hook sees the running latent `x`, never the CFG pair: both forwards happen inside this
+        // closure and only the combined velocity leaves it, so no unconditional half can be projected.
+        let preview = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -1167,7 +1175,7 @@ fn render_base_from_contexts(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond = comps.dit.forward(x, &t, context)?;
@@ -1288,6 +1296,11 @@ pub(crate) fn render_multiphase(
         // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
         // phase's output latent at the SHARED boundary sigma.
         let mut latent = init_noise(req.height, req.width, seed, device)?;
+        // ONE preview counter over the GLOBAL schedule, per image: each phase drives the sampler over a
+        // contiguous slice, so per-call numbering would restart every phase at frame 1. Built inside the
+        // seed loop because a counter is per trajectory — reusing it would starve image 2 of frames.
+        let preview_counter = crate::preview::multiphase_counter(&sigmas);
+        let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, &sigmas);
         for (phase, specs) in resolved.iter().zip(&phase_specs) {
             // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
             // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
@@ -1308,7 +1321,7 @@ pub(crate) fn render_multiphase(
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let cond = dit.forward(x, &t, context)?;
@@ -1437,6 +1450,9 @@ fn render_base_img2img_from_contexts(
         let lat = if sub.len() < 2 {
             x_start
         } else {
+            // Numbered against the executed window `sub` (as the Turbo img2img route is), and blind to
+            // the CFG pair, which is formed and combined inside the closure below.
+            let preview = crate::preview::hook(&req.preview);
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -1445,7 +1461,7 @@ fn render_base_img2img_from_contexts(
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let cond = comps.dit.forward(x, &t, context)?;
@@ -1657,6 +1673,10 @@ fn render_edit_from_context(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
+        // The running latent `x` is the TARGET alone: `forward_edit_with_memory` concatenates the
+        // encoded reference latents into the DiT sequence internally, and both CFG legs are combined
+        // inside the closure. A preview here can therefore only ever be the image being generated.
+        let preview = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -1665,7 +1685,7 @@ fn render_edit_from_context(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 // Thread the request's cancel flag into the block loop (sc-16003): an edit step at
