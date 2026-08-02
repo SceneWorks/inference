@@ -2391,6 +2391,7 @@ dependencies = [
 name = "mlx-gen-sana"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",

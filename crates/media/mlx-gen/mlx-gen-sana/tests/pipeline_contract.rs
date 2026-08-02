@@ -25,7 +25,8 @@ use mlx_rs::Array;
 
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Progress};
+use mlx_gen::{CancelFlag, Error, FlowMatchEuler, PreviewFrame, PreviewSink, Progress};
+use std::sync::{Arc, Mutex};
 
 use mlx_gen_sana::pipeline::{self, SCHEDULE_SHIFT};
 use mlx_gen_sana::{
@@ -493,6 +494,78 @@ fn pipeline_wires_trunk_scheduler_decode() {
         steps_seen >= 2,
         "flow sampler should report per-step progress"
     );
+}
+
+#[test]
+fn base_preview_observes_heun_outer_steps_only_and_is_output_inert() {
+    let mut tcfg = tiny_trunk_config();
+    tcfg.in_channels = 32;
+    tcfg.out_channels = 32;
+    let trunk = SanaTransformer::from_weights(&tiny_trunk_weights(&tcfg), tcfg.clone()).unwrap();
+    let latent_h = 6;
+    let latent_w = 4;
+    let latents = normal::<f32>(
+        &[1, 32, latent_h, latent_w],
+        None,
+        None,
+        Some(&key(901).unwrap()),
+    )
+    .unwrap();
+    let cond = rand(&[1, 7, tcfg.caption_channels], 902);
+    let uncond = rand(&[1, 7, tcfg.caption_channels], 903);
+    let scheduler = FlowMatchEuler::for_static_shift(2, SCHEDULE_SHIFT);
+    let cancel = CancelFlag::default();
+    let legacy = pipeline::denoise_cfg(
+        &trunk,
+        &scheduler,
+        Some("heun"),
+        0,
+        17,
+        latents.clone(),
+        &cond,
+        None,
+        Some(&uncond),
+        None,
+        4.5,
+        &cancel,
+        &mut |_| {},
+    )
+    .unwrap();
+    let frames = Arc::new(Mutex::new(Vec::<PreviewFrame>::new()));
+    let captured = Arc::clone(&frames);
+    let active = pipeline::denoise_cfg_with_preview(
+        &trunk,
+        &scheduler,
+        Some("heun"),
+        0,
+        17,
+        latents,
+        &cond,
+        None,
+        Some(&uncond),
+        None,
+        4.5,
+        &cancel,
+        &mut |_| {},
+        &PreviewSink::new(move |frame| captured.lock().unwrap().push(frame)),
+    )
+    .unwrap();
+    assert_eq!(active.as_slice::<f32>(), legacy.as_slice::<f32>());
+    let frames = frames.lock().unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| (frame.current, frame.total))
+            .collect::<Vec<_>>(),
+        vec![(1, 2), (2, 2)],
+        "Heun correction evaluations must not double-emit previews"
+    );
+    assert!(frames.iter().all(|frame| {
+        (frame.image.width, frame.image.height) == (latent_w as u32, latent_h as u32)
+    }));
+    assert!(frames
+        .windows(2)
+        .any(|pair| pair[0].image.pixels != pair[1].image.pixels));
 }
 
 /// Real-weight 1024px e2e. `#[ignore]`d: needs a `Sana_1600M_1024px_diffusers` snapshot

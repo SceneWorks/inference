@@ -135,7 +135,7 @@ pub fn descriptor() -> ModelDescriptor {
             // before the Linear-DiT trunk + DC-AE load — bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -199,7 +199,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Sprint drops the Gemma-2 CHI text encoder before the Sprint Linear-DiT trunk + DC-AE load,
             // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             supports_sequential_offload: true,
-            supports_preview: false,
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -495,8 +495,14 @@ impl Sana {
                         init_image,
                         strength,
                     };
-                    let img =
-                        heavy.render_one(&cond, &sana_req, guidance, &req.cancel, on_progress)?;
+                    let img = heavy.render_one_with_preview(
+                        &cond,
+                        &sana_req,
+                        guidance,
+                        &req.cancel,
+                        on_progress,
+                        &req.preview,
+                    )?;
                     images.push(img);
                 }
                 Ok(GenerationOutput::Images(images))
@@ -552,6 +558,7 @@ mod tests {
         assert!(d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_preview);
         // sc-10190: img2img reference conditioning is now advertised.
         assert_eq!(
             d.capabilities.conditioning,
@@ -782,6 +789,7 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_preview);
         assert!(d.capabilities.supported_guidance_methods.is_empty());
         // sc-10190: Sprint also advertises img2img reference conditioning.
         assert_eq!(
