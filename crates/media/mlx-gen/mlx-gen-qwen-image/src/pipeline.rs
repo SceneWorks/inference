@@ -1050,6 +1050,7 @@ mod tests {
         let injected = GenerationRequest {
             memory: Some(mlx_gen::gen_core::GenerationMemory {
                 calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Denoise),
+                calibration_fault_harness_authorized: true,
                 ..Default::default()
             }),
             ..Default::default()

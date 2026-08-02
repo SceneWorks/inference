@@ -537,7 +537,7 @@ mod tests {
                 panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
             });
             assert!(
-                res.with_resident_parts(|_, _| ()).is_none(),
+                res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }

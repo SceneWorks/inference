@@ -1998,6 +1998,7 @@ mod tests {
             assert!(maybe_inject_calibration_error(clean, phase).is_ok());
             let faulted = gen_core::GenerationMemory {
                 calibration_error_phase: Some(phase),
+                calibration_fault_harness_authorized: true,
                 ..clean
             };
             let error = maybe_inject_calibration_error(faulted, phase)

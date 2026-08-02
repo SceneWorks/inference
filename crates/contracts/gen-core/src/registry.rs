@@ -566,12 +566,14 @@ macro_rules! explicit_registry_kind {
 
 impl ProviderRegistry {
     /// Provider-owned warm 1024² activation transient for `id`.
-    /// `Ok(None)` is the compatibility-safe unmeasured state; unknown ids remain errors.
+    /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
+    /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
     pub fn activation_memory_bytes_1024(&self, id: &str) -> Result<Option<u64>> {
-        if !self
+        let has_generator = self
             .generators()
-            .any(|registration| (registration.descriptor)().id == id)
-        {
+            .any(|registration| (registration.descriptor)().id == id);
+        let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
+        if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
         }
         Ok(self
@@ -1689,6 +1691,15 @@ mod tests {
             .expect("the composed route resolves")
             .expect("the composed route has a contract");
         assert_eq!(contract.provider_id, "dummy_composed_route");
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024("dummy_composed_route")
+                .expect("a known composed route has a truthful unmeasured activation state"),
+            None
+        );
+        assert!(registry
+            .activation_memory_bytes_1024("unknown_composed_route")
+            .is_err());
     }
 
     /// A tier the platform declared unimplemented is rejected at the load boundary — loudly, naming

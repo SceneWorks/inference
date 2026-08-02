@@ -2254,8 +2254,11 @@ mod tests {
         };
         scope.configure_request(&mut request).unwrap();
         assert_eq!(request.memory, Some(attention_memory));
-        request.memory.as_mut().unwrap().calibration_error_phase =
-            Some(gen_core::MemoryPhase::Denoise);
+        request
+            .memory
+            .as_mut()
+            .unwrap()
+            .authorize_calibration_fault(gen_core::MemoryPhase::Denoise);
         scope.configure_request(&mut request).unwrap();
         assert_eq!(
             request.memory,

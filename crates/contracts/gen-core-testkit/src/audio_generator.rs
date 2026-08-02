@@ -1191,16 +1191,26 @@ pub fn check_multi_region_audio_edit(
     let advertises = desc
         .capabilities
         .accepts(ConditioningKind::AudioEditRegions);
-    // Whichever bounded-span mode the model advertises. A provider advertising the kind but no
-    // region mode is refused by the shared `audio_edit_modes` gate — a genuine capability gap, not
-    // this gate's business.
-    let mode = desc
+    // Whichever bounded-span mode the model advertises. For a non-advertiser, retain an Inpaint
+    // request so the default-deny assertion below can exercise the ConditioningKind allowlist. An
+    // advertiser with no bounded-span mode cannot produce a valid positive request and gets a
+    // dedicated capability-surface diagnostic instead of a misleading provider-validation failure.
+    let bounded_mode = desc
         .capabilities
         .audio_edit_modes
         .iter()
         .copied()
-        .find(|m| matches!(m, AudioEditMode::Inpaint | AudioEditMode::Repaint))
-        .unwrap_or(AudioEditMode::Inpaint);
+        .find(|m| matches!(m, AudioEditMode::Inpaint | AudioEditMode::Repaint));
+    let mode = match (advertises, bounded_mode) {
+        (true, None) => {
+            return Err(format!(
+                "multi-region-edit[{id}]: advertises AudioEditRegions but no bounded-span edit mode \
+                 (Inpaint or Repaint)"
+            ));
+        }
+        (_, Some(mode)) => mode,
+        (false, None) => AudioEditMode::Inpaint,
+    };
 
     let two = [edit_span(1.0, 3.0), edit_span(5.0, 7.0)];
     let req = multi_region_request(g, profile, mode, two.to_vec());

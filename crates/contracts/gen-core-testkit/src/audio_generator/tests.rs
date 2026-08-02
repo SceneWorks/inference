@@ -1335,6 +1335,23 @@ fn multi_region_stub_passes_the_check() {
 }
 
 #[test]
+fn multi_region_surface_without_a_bounded_span_mode_gets_a_dedicated_error() {
+    let mut g = MultiRegionStubAudioGen::new(false, false);
+    g.desc.capabilities.audio_edit_modes = vec![AudioEditMode::Cover];
+
+    let error = check_multi_region_audio_edit(&g, &cheap()).unwrap_err();
+    assert!(
+        error.contains("advertises AudioEditRegions")
+            && error.contains("no bounded-span edit mode"),
+        "the testkit must report the malformed capability surface, got: {error}"
+    );
+    assert!(
+        !error.contains("validate() rejected a valid two-region edit"),
+        "the synthetic request is not valid for this advertised mode surface: {error}"
+    );
+}
+
+#[test]
 fn multi_region_stub_passes_full_conformance() {
     audio_conformance(|| MultiRegionStubAudioGen::boxed(false, false), &cheap());
 }
