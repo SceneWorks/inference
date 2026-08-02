@@ -196,11 +196,11 @@ pub fn needs_load_time_quant(
 /// `bits = wq.cols·32/in`. Exact for any group-aligned Q4/Q8 pack, so the bit-width need not be
 /// carried in a side manifest.
 ///
-/// F-011: returns `Result` and validates the shapes a corrupt/mis-converted pre-quantized snapshot
-/// would otherwise mishandle: a 1-D `scales` (or `wq`) panics on the shape index; a `[out, 0]` scales
-/// tensor makes `in_dim == 0` → integer divide-by-zero; a mis-packed `wq` yields bits ∉ {4,8}. The
-/// shared load seam for every Group-B packed snapshot feeds straight off external `.safetensors`, so
-/// these shapes are untrusted.
+/// F-011: returns `Result` and validates the dtype and exact geometry a corrupt/mis-converted
+/// pre-quantized snapshot would otherwise mishandle: codes must be u32, scales floating point, rows
+/// must agree, and packed columns must divide exactly rather than truncating into an apparently valid
+/// Q4/Q8 width. The shared load seam for every Group-B packed snapshot feeds straight off external
+/// `.safetensors`, so these tensors are untrusted.
 pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
     let sshape = scales.shape();
     let wshape = wq.shape();
@@ -210,14 +210,52 @@ pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
             sshape, wshape
         )));
     }
-    let in_dim = sshape[1] * group_size;
+    if wq.dtype() != Dtype::Uint32 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: weight codes must be u32, got {:?}",
+            wq.dtype()
+        )));
+    }
+    if !matches!(
+        scales.dtype(),
+        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+    ) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: scales must be floating point, got {:?}",
+            scales.dtype()
+        )));
+    }
+    if sshape[0] != wshape[0] {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: scales and weight rows differ ({} != {})",
+            sshape[0], wshape[0]
+        )));
+    }
+    let in_dim = sshape[1].checked_mul(group_size).ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: input dimension overflow (scales cols {} × group_size {group_size})",
+            sshape[1]
+        ))
+    })?;
     if in_dim == 0 {
         return Err(crate::Error::Msg(format!(
             "packed quant: zero input dim (scales cols {} × group_size {})",
             sshape[1], group_size
         )));
     }
-    let bits = wshape[1] * 32 / in_dim;
+    let packed_width = wshape[1].checked_mul(32).ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: packed width overflow (weight cols {} × 32)",
+            wshape[1]
+        ))
+    })?;
+    if packed_width % in_dim != 0 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: weight cols {} do not exactly encode scales cols {} × group_size {group_size}",
+            wshape[1], sshape[1]
+        )));
+    }
+    let bits = packed_width / in_dim;
     if !matches!(bits, 4 | 8) {
         // Name the assumed `group_size` (sc-15154). Every term here is derived FROM it, so a caller
         // that passes the wrong one gets an illegal width from a perfectly good artifact — Mage's q8
@@ -652,5 +690,18 @@ mod tests {
         let wq = Array::zeros::<u32>(&[64, 24]).unwrap(); // bits 3
         let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
         assert!(err.contains("∉ {4, 8}"), "{err}");
+    }
+
+    #[test]
+    fn packed_bits_rejects_truncated_width_wrong_rows_and_non_u32_codes() {
+        let scales = Array::zeros::<f32>(&[2, 2]).unwrap();
+        let truncated = Array::zeros::<u32>(&[2, 33]).unwrap();
+        assert!(packed_bits(&truncated, &scales, 64).is_err());
+
+        let wrong_rows = Array::zeros::<u32>(&[3, 32]).unwrap();
+        assert!(packed_bits(&wrong_rows, &scales, 64).is_err());
+
+        let float_codes = Array::zeros::<f32>(&[2, 32]).unwrap();
+        assert!(packed_bits(&float_codes, &scales, 64).is_err());
     }
 }

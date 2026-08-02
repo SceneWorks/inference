@@ -706,6 +706,12 @@ fn packed_auxiliaries_match_load_time_quantization() {
         vae_decode_cosine >= vae_floor && vae_encode_cosine >= vae_floor,
         "Q{auxiliary_bits} VAE cosine fell below {vae_floor:.5} (decode={vae_decode_cosine:.7}, encode={vae_encode_cosine:.7})"
     );
+    assert!(
+        packed_vae_peak < load_time_vae_peak,
+        "packed VAE peak {:.2} GiB must stay below load-time quantization peak {:.2} GiB",
+        gib(packed_vae_peak),
+        gib(load_time_vae_peak)
+    );
 
     println!(
         "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",

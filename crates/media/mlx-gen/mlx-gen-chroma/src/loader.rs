@@ -141,7 +141,8 @@ fn validate_t5_progressive_surface(
         for base in &primary_bases {
             let weight = w.require(&format!("{base}.weight"))?;
             let scales = w.require(&format!("{base}.scales"))?;
-            w.require(&format!("{base}.biases"))?;
+            let biases = w.require(&format!("{base}.biases"))?;
+            validate_packed_companions(base, scales, biases)?;
             let actual_bits = mlx_gen::quant::packed_bits(weight, scales, group_size)?;
             if actual_bits != primary_bits {
                 return Err(Error::Msg(format!(
@@ -214,6 +215,12 @@ fn validate_t5_progressive_surface(
         }
         let residual_weight = w.require(&format!("{base}.residual.weight"))?;
         let residual_scales = w.require(&format!("{base}.residual.scales"))?;
+        let residual_biases = w.require(&format!("{base}.residual.biases"))?;
+        validate_packed_companions(
+            &format!("{base}.residual"),
+            residual_scales,
+            residual_biases,
+        )?;
         let actual_bits =
             mlx_gen::quant::packed_bits(residual_weight, residual_scales, group_size)?;
         if actual_bits != residual_bits {
@@ -221,6 +228,23 @@ fn validate_t5_progressive_surface(
                 "chroma T5: {base} residual is Q{actual_bits}, but config declares Q{residual_bits}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_packed_companions(
+    base: &str,
+    scales: &mlx_rs::Array,
+    biases: &mlx_rs::Array,
+) -> Result<()> {
+    if scales.shape() != biases.shape() || scales.dtype() != biases.dtype() {
+        return Err(Error::Msg(format!(
+            "chroma T5: {base} scales/biases geometry or dtype differs ({:?} {:?} vs {:?} {:?})",
+            scales.shape(),
+            scales.dtype(),
+            biases.shape(),
+            biases.dtype()
+        )));
     }
     Ok(())
 }
@@ -263,7 +287,11 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    fn progressive_fixture(residual_weight_cols: i32, dense_hole: bool) -> Weights {
+    fn progressive_fixture(
+        residual_weight_cols: i32,
+        dense_hole: bool,
+        primary_bias_cols: i32,
+    ) -> Weights {
         let base = "encoder.block.0.layer.0.SelfAttention.q";
         let mut map = HashMap::new();
         map.insert(
@@ -276,7 +304,7 @@ mod tests {
         );
         map.insert(
             format!("{base}.biases"),
-            Array::zeros::<f32>(&[2, 2]).unwrap(),
+            Array::zeros::<f32>(&[2, primary_bias_cols]).unwrap(),
         );
         map.insert(
             format!("{base}.residual.weight"),
@@ -301,32 +329,57 @@ mod tests {
 
     #[test]
     fn progressive_surface_requires_complete_q4_residuals() {
-        validate_t5_progressive_surface(&progressive_fixture(16, false), Some(8), Some(4), 64)
+        validate_t5_progressive_surface(&progressive_fixture(16, false, 2), Some(8), Some(4), 64)
             .unwrap();
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(32, false), Some(8), Some(4), 64)
-                .is_err(),
+            validate_t5_progressive_surface(
+                &progressive_fixture(32, false, 2),
+                Some(8),
+                Some(4),
+                64,
+            )
+            .is_err(),
             "a Q8 residual must not pass a Q4 marker"
         );
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(16, false), Some(8), None, 64)
+            validate_t5_progressive_surface(&progressive_fixture(16, false, 2), Some(8), None, 64)
                 .is_err(),
             "residual tensors without provenance must fail"
         );
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(16, false), Some(4), Some(4), 64)
-                .is_err(),
+            validate_t5_progressive_surface(
+                &progressive_fixture(16, false, 2),
+                Some(4),
+                Some(4),
+                64,
+            )
+            .is_err(),
             "a Q8 primary must not pass a Q4 marker"
         );
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(16, false), None, None, 64)
+            validate_t5_progressive_surface(&progressive_fixture(16, false, 2), None, None, 64)
                 .is_err(),
             "packed primaries without provenance must fail"
         );
         assert!(
-            validate_t5_progressive_surface(&progressive_fixture(16, true), Some(8), Some(4), 64,)
-                .is_err(),
+            validate_t5_progressive_surface(
+                &progressive_fixture(16, true, 2),
+                Some(8),
+                Some(4),
+                64,
+            )
+            .is_err(),
             "a group-packable dense weight must not pass a progressive artifact marker"
+        );
+        assert!(
+            validate_t5_progressive_surface(
+                &progressive_fixture(16, false, 1),
+                Some(8),
+                Some(4),
+                64,
+            )
+            .is_err(),
+            "packed scales and biases must have identical geometry"
         );
     }
 }
