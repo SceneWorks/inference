@@ -764,6 +764,10 @@ impl MemoryPeakBreakdown {
 }
 
 /// Provider-owned, load-exact asset facts used as formula inputs.
+///
+/// `base_bytes` is exactly the sum of the three base-model component fields. Auxiliary networks
+/// never belong in any of those four fields; they are declared once in `overlay_bytes` and, when
+/// non-zero alongside both formula variables, by typed resident components.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryAssetFacts {
     pub base_bytes: u64,
@@ -1347,6 +1351,31 @@ impl MemoryProviderContract {
             }
         }
         let auxiliary_bytes = self.auxiliary_resident_bytes();
+        match self
+            .asset_facts
+            .conditioning_bytes
+            .checked_add(self.asset_facts.transformer_bytes)
+            .and_then(|bytes| bytes.checked_add(self.asset_facts.decoder_bytes))
+        {
+            Some(base_components) if base_components != self.asset_facts.base_bytes => {
+                errors.push(format!(
+                    "base_bytes {} must equal base component bytes {} and exclude overlay_bytes",
+                    self.asset_facts.base_bytes, base_components
+                ));
+            }
+            None => errors.push("base component byte sum overflow".to_owned()),
+            _ => {}
+        }
+        if self.asset_facts.overlay_bytes > 0
+            && self.formula.uses(MemoryFormulaVariable::AssetBytes)
+            && self.formula.uses(MemoryFormulaVariable::OverlayBytes)
+            && auxiliary_bytes == 0
+        {
+            errors.push(
+                "a non-zero overlay declared with AssetBytes and OverlayBytes must use typed auxiliary resident components"
+                    .to_owned(),
+            );
+        }
         if auxiliary_bytes > 0 {
             if auxiliary_bytes != self.asset_facts.overlay_bytes {
                 errors.push(format!(
@@ -2650,6 +2679,63 @@ mod tests {
             MemorySafetyDecision::Reject { reason }
                 if reason.contains("requires a calibration identity")
         ));
+    }
+
+    #[test]
+    fn asset_facts_reject_overlay_contamination_and_ambiguous_overlay_formulas() {
+        let mut contract = adopted_contract();
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 40,
+            decoder_bytes: 10,
+            overlay_bytes: 7,
+        };
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+            resident_components: vec![MemoryResidentComponent {
+                id: "control".to_owned(),
+                kind: MemoryComponentKind::ControlBranch,
+                resident_bytes: 7,
+                bounded_by: None,
+            }],
+        };
+        assert!(contract.conformance_errors().is_empty());
+
+        let mut contaminated = contract.clone();
+        contaminated.asset_facts.base_bytes += contaminated.asset_facts.overlay_bytes;
+        assert!(contaminated
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("exclude overlay_bytes")));
+
+        let mut ambiguous = contract;
+        ambiguous.formula = MemoryFormulaKind::PhaseEnvelope {
+            phases: ambiguous.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        };
+        assert!(ambiguous
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("typed auxiliary resident components")));
+
+        let mut candle_krea_shape = adopted_contract();
+        candle_krea_shape.formula = MemoryFormulaKind::PhaseEnvelope {
+            phases: candle_krea_shape.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        };
+        assert!(candle_krea_shape.conformance_errors().is_empty());
     }
 
     #[test]

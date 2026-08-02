@@ -137,15 +137,17 @@
 //! [`MEMORY_CALIBRATION_FINGERPRINT`]; the worker owns live-budget accounting and least-cost
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_safetensors_tensors, ResidentProjection,
+};
 use mlx_gen::gen_core::{
-    safetensors_path_tensor_headers, Error as CoreError, GenerationMemory, GenerationRequest,
-    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
-    Result as CoreResult, TransformerComponent,
+    Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters,
+    MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{Quant, WeightsSource};
 
@@ -423,8 +425,7 @@ fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
 /// the spec root for a pre-quantized turnkey). A single-file (ComfyUI) source has no component tree,
 /// so its asset facts stay zero rather than reporting a fabricated split.
 ///
-/// Fallible since SC-15775 only because the per-route decode declaration is: an overlapping native
-/// ladder cannot be constructed, so it cannot be published either. Nothing else here can fail.
+/// Fallible when route geometry is invalid or required component assets cannot be inspected.
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -443,10 +444,42 @@ pub fn memory_strategy_contract(
     //    intra-phase block materialization are separate axes.
     let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
         && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization);
+    let (asset_facts, resident_components) = asset_facts(spec, streamable)?;
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        streamable,
+        asset_facts,
+        resident_components,
+    )
+}
+
+/// Declaration-equivalent contract used only by weights-free registry conformance.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
+        && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization);
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        streamable,
+        MemoryAssetFacts::default(),
+        Vec::new(),
+    )
+}
+
+fn memory_strategy_contract_with_asset_facts(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    asset_facts: MemoryAssetFacts,
+    resident_components: Vec<MemoryResidentComponent>,
+) -> CoreResult<MemoryProviderContract> {
     // Bound once: the declaration is checked at construction, so building it twice inside the
     // capability map would re-run the check and re-allocate for no gain.
     let routes = decode_routes(provider_id)?;
-    let (asset_facts, resident_components) = asset_facts(spec, streamable)?;
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -561,9 +594,27 @@ fn asset_facts(
     spec: &LoadSpec,
     streamable: bool,
 ) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
+    let components = match &spec.weights {
+        WeightsSource::Dir(root) => {
+            let project = |path: &std::path::Path| {
+                projected_safetensors_bytes(path, |_| match spec.quantize {
+                    Some(quant) => ResidentProjection::GroupQuantized {
+                        bits: quant.bits(),
+                        group_size: crate::quant::GROUP_SIZE as usize,
+                    },
+                    None => ResidentProjection::Stored,
+                })
+            };
+            mlx_gen::PerComponentBytes {
+                text_encoder: project(&root.join("text_encoder"))?,
+                dit: project(&root.join("transformer"))?,
+                vae: project(&root.join("vae"))?,
+            }
+        }
+        // A combined single-file checkpoint cannot be split into the three contract components.
+        // Zero remains the truthful unknown; the independently addressed control is still exact.
+        WeightsSource::File(_) => mlx_gen::PerComponentBytes::default(),
+    };
     let resident_components = match &spec.control {
         Some(source) => control_resident_components(source, spec.quantize, streamable)?,
         None => Vec::new(),
@@ -602,49 +653,18 @@ fn control_resident_components(
     let path = match source {
         mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => path,
     };
-    let tensors = safetensors_path_tensor_headers(path)?;
-    let packed_bases = tensors
-        .iter()
-        .filter_map(|tensor| tensor.name.strip_suffix(".scales"))
-        .collect::<std::collections::HashSet<_>>();
     let bits = quant.map(|quant| quant.bits());
     let mut stack_bytes = 0_u64;
     let mut persistent_bytes = 0_u64;
+    let tensors = projected_safetensors_tensors(path, |_| match bits {
+        Some(bits) => ResidentProjection::GroupQuantized {
+            bits,
+            group_size: crate::quant::GROUP_SIZE as usize,
+        },
+        None => ResidentProjection::Stored,
+    })?;
     for tensor in &tensors {
-        let base = tensor.name.strip_suffix(".weight");
-        let projected_bytes = match (base, bits, tensor.shape.as_slice()) {
-            (Some(base), Some(bits), [out, input])
-                if !packed_bases.contains(base)
-                    && *input >= crate::quant::GROUP_SIZE as usize
-                    && *input % crate::quant::GROUP_SIZE as usize == 0 =>
-            {
-                let out = u64::try_from(*out).map_err(|_| {
-                    CoreError::Msg("control tensor output dimension overflow".into())
-                })?;
-                let input = u64::try_from(*input).map_err(|_| {
-                    CoreError::Msg("control tensor input dimension overflow".into())
-                })?;
-                let packed_weight = out
-                    .checked_mul(input)
-                    .and_then(|elements| elements.checked_mul(bits as u64))
-                    .map(|packed_bits| packed_bits / 8)
-                    .ok_or_else(|| {
-                        CoreError::Msg("control quantized weight size overflow".into())
-                    })?;
-                let group_entries = out
-                    .checked_mul(input / crate::quant::GROUP_SIZE as u64)
-                    .ok_or_else(|| {
-                        CoreError::Msg("control quantization table size overflow".into())
-                    })?;
-                let table_bytes = group_entries.checked_mul(4).ok_or_else(|| {
-                    CoreError::Msg("control quantization table size overflow".into())
-                })?;
-                packed_weight
-                    .checked_add(table_bytes)
-                    .ok_or_else(|| CoreError::Msg("control resident size overflow".into()))?
-            }
-            _ => tensor.data_bytes,
-        };
+        let projected_bytes = tensor.resident_bytes;
         if tensor.name.starts_with(CONTROL_STACK_PREFIX) {
             stack_bytes = stack_bytes.saturating_add(projected_bytes);
         } else {
@@ -1057,15 +1077,54 @@ mod tests {
         MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemorySelection, Precision,
         Quant, MEMORY_CALIBRATION_ABI,
     };
+    use std::sync::OnceLock;
+
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_snapshot(root: &std::path::Path) {
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+    }
 
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
     fn spec() -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("z-image-memory-spec-{}", std::process::id()));
+            write_snapshot(&root);
+            root
+        });
+        LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
     }
 
     fn contract() -> MemoryProviderContract {
         memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap()
+    }
+
+    #[test]
+    fn required_component_directory_cannot_disappear_into_zero_facts() {
+        let root =
+            std::env::temp_dir().join(format!("z-image-missing-component-{}", std::process::id()));
+        write_snapshot(&root);
+        std::fs::remove_dir_all(root.join("text_encoder")).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(memory_strategy_contract(crate::model::MODEL_ID, &spec).is_err());
+        assert!(weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
@@ -1157,7 +1216,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
         ));
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        write_snapshot(&root);
         if let Some(bits) = packed_bits {
             std::fs::write(
                 root.join("transformer/config.json"),
@@ -1378,6 +1437,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&control, bytes).unwrap();
+        write_snapshot(&root);
+        let base_weight = vec![0_u8; 2 * 64 * 2];
+        let base = TensorView::new(Dtype::BF16, vec![2, 64], &base_weight).unwrap();
+        let base_bytes = serialize([("blocks.0.attn.to_q.weight", base)], &None).unwrap();
+        std::fs::write(root.join("transformer/model.safetensors"), base_bytes).unwrap();
 
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
@@ -1392,6 +1456,10 @@ mod tests {
         const STACK_RESIDENT_BYTES: u64 = 72;
         const PERSISTENT_RESIDENT_BYTES: u64 = 136;
         const CONTROL_RESIDENT_BYTES: u64 = STACK_RESIDENT_BYTES + PERSISTENT_RESIDENT_BYTES;
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.transformer_bytes, 72);
+        assert_eq!(contract.asset_facts.decoder_bytes, 2);
+        assert_eq!(contract.asset_facts.base_bytes, 76);
         assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_RESIDENT_BYTES);
         let component = contract
             .resident_components()
@@ -1503,7 +1571,8 @@ mod tests {
     #[test]
     fn eager_and_deferred_evidence_identities_cannot_cross_authorize() {
         let deferred = contract();
-        let eager_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()));
+        let mut eager_spec = spec();
+        eager_spec.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         let eager = memory_strategy_contract(crate::model::MODEL_ID, &eager_spec).unwrap();
         assert_eq!(
             deferred.calibration.as_ref().unwrap().fingerprint,
@@ -1681,8 +1750,9 @@ mod tests {
     /// layer rather than at generate time.
     #[test]
     fn rung_four_availability_uses_source_and_load_shape_not_offload_policy() {
-        let eager = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
-            .with_offload_policy(mlx_gen::OffloadPolicy::Resident);
+        let mut eager = spec();
+        eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        eager.offload_policy = mlx_gen::OffloadPolicy::Resident;
         let contract = memory_strategy_contract(crate::model::MODEL_ID, &eager).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
@@ -1713,9 +1783,9 @@ mod tests {
             Some(MemoryStrategySupport::Implemented)
         ));
         // Sequential+Eager remains unavailable: staged residency does not imply deferred blocks.
-        let staged_eager =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
-                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        let mut staged_eager = spec();
+        staged_eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        staged_eager.offload_policy = mlx_gen::OffloadPolicy::Sequential;
         let staged_eager =
             super::memory_strategy_contract(crate::model::MODEL_ID, &staged_eager).unwrap();
         assert!(matches!(
