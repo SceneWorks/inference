@@ -5,10 +5,12 @@
 //! Everything here exists so a consumer can **show** a user which upstream artifacts a render
 //! touched and what their licence texts name. Nothing in this module blocks, gates, degrades or
 //! withholds anything, and nothing added here ever should — a mapping describes, it does not
-//! decide. In particular [`IDS_WITHOUT_A_RESOLVABLE_COMPONENT`] is a list of **gaps in the data**,
-//! not a suppression list: every id it names is registered by
-//! [`provider_registry`](super::provider_registry), ships, and renders exactly as it did before
-//! this module existed.
+//! decide. The nine registered ids that reach no shared row at all are a list of **gaps in the
+//! data**, not a suppression list. That list lives in `tests` as
+//! `IDS_WITHOUT_A_RESOLVABLE_COMPONENT` and is deliberately `#[cfg(test)]` rather than a public
+//! const, so no gate can quietly use it to suppress the ids it names. Every one of them is
+//! registered by [`provider_registry`](super::provider_registry), ships, and renders exactly as it
+//! did before this module existed.
 //!
 //! # What this module is, and is not
 //!
@@ -29,6 +31,31 @@
 //! the divergences are pinned by `per_backend_divergences_are_explicit` below rather than papered
 //! over, per `CONTRIBUTING.md`.
 //!
+//! # Reusing a module is not provenance
+//!
+//! Three ids — `bernini`, `wan_vace`, `scail2_14b` — drive the **same two** `candle-gen-wan`
+//! modules (`text_encoder::Umt5Encoder` at `TextEncoderConfig::umt5_xxl()`, `vae16::WanVae16` at
+//! `Vae16Config::wan21()`) over a `text_encoder/` and a `vae/` under their own snapshot root. Only
+//! the first two list `umt5_xxl` and `wan2_2_t2v_a14b`. That looks arbitrary and is not, so the
+//! reason is written here rather than left to be re-litigated:
+//!
+//! * `bernini` — `candle-gen-bernini/src/convert.rs` states the snapshot it builds copies the stock
+//!   Wan2.2 `text_encoder/`, `vae/` and `tokenizer/` **verbatim from a base Wan2.2-T2V-A14B
+//!   diffusers snapshot**. The upstream is named by the code that puts the files there.
+//! * `wan_vace` — `Wan-AI/Wan2.1-VACE-14B-diffusers` ships the transformer alone, so the encoder and
+//!   VAE a VACE run reads can only have been staged from a stock Wan snapshot.
+//! * `scail2_14b` — the loaded artifact is the converted `SceneWorks/scail2-mlx` re-host, which
+//!   ships **its own bundled** `text_encoder/`, `vae/` and `clip/`. No source states where those
+//!   copies came from; `candle-gen-scail2` names the architectures ("UMT5", "z16 Wan VAE") and
+//!   stops, and the sc-16665 evidence pass recorded `google/umt5-xxl` and Wan2.1 as *unestablished
+//!   candidates*. `scail2_umt5` and `scail2_wan2_1_vae` are therefore pinned holes, and the shared
+//!   [`SCAIL_2`](candle_gen::gen_core::license::components::SCAIL_2) row says so in as many words.
+//!
+//! The rule the three cases share: a component is keyed at an upstream when **something states that
+//! upstream** — the crate, the converter, or the repository's contents. Sharing a Rust module is a
+//! fact about architecture. Keying SCAIL-2's bundled copies at the Wan rows on that basis is exactly
+//! the "plausible-looking substitute row" this table exists to refuse.
+//!
 //! # Scope: the components a run **always** loads
 //!
 //! [`ProviderComponents`] carries a flat list with no
@@ -40,9 +67,10 @@
 //!   Qwen-Image-Edit Lightning LoRAs, the Hyper-FLUX 8-step LoRA, the Anima official LoRAs, the
 //!   Kolors ControlNet and IP-Adapter. A run may load none of them, so listing them would report
 //!   obligations a given render never touched.
-//! * **The non-registry overlays** — the PiD latent decoder, the face stack, depth, SAM 3 and the
-//!   bespoke Candle PuLID path. They register **no provider id at all** on this backend (see
-//!   [`BESPOKE_UTILITY_CRATES`](super::BESPOKE_UTILITY_CRATES)), so a provider-keyed table cannot
+//! * **The non-registry overlays** — the PiD latent decoder, the face stack, depth, InstantID,
+//!   SAM 3 and the bespoke Candle PuLID path: all six of
+//!   [`BESPOKE_UTILITY_CRATES`](super::BESPOKE_UTILITY_CRATES). They register **no provider id at
+//!   all** on this backend, so a provider-keyed table cannot
 //!   express them; sc-16668 owns that surface. This is the widest gap in the module and it is
 //!   deliberate: `nvidia/PiD` is an optional decode seam on fourteen Candle crates and no provider
 //!   id distinguishes a run that used it from one that did not.
@@ -60,54 +88,17 @@
 //! CI-visible hole, reported by sc-16669's gate — never a reason to withhold an id, and never
 //! something to paper over by pointing at a plausible-looking substitute row.
 //!
-//! Nine registered ids reach **zero** resolvable components and therefore have no row here at all;
-//! they are named and explained in [`IDS_WITHOUT_A_RESOLVABLE_COMPONENT`].
+//! Nine registered ids reach **zero** resolvable components and therefore have no row here at all.
+//! They register, load and render unchanged; what is missing is our metadata, and it is pinned by
+//! `every_registered_id_is_mapped_or_a_named_hole`:
+//!
+//! | id(s) | why |
+//! | --- | --- |
+//! | the six `mage_flow*` generators | every `microsoft/Mage-Flow*` repository 404s and the Qwen3-VL-4B tower bundled in each `text_encoder/` could not be named, so neither the DiT, the VAE nor the encoder has a row |
+//! | `fancyfeast/llama-joycaption-beta-one-hf-llava` | one snapshot carries the whole captioner, and its only declaration is second-hand (`release/real-weight-models.toml`) |
+//! | `clip_vit_l14`, `clip_vit_l14_text` | both read one `openai/clip-vit-large-patch14` snapshot, whose card declares nothing |
 
 use candle_gen::gen_core::ProviderComponents;
-
-/// The reason string shared by the six `microsoft/Mage-Flow*` ids, so the six cannot drift into six
-/// slightly different explanations of one finding.
-const MAGE_FLOW_REASON: &str = "every component is a NOT FOUND / UNDETERMINED hole — all six \
-                                `microsoft/Mage-Flow*` repositories 404 and the Qwen3-VL-4B tower \
-                                bundled in each `text_encoder/` could not be named";
-
-/// The registered Candle provider ids whose components are **all** pinned holes in the shared
-/// table, with the reason — so they have no [`PROVIDER_COMPONENTS`] row and a consumer reading this
-/// surface gets an empty licence disclosure for them.
-///
-/// **This withholds nothing.** Every id below is registered, ships, and renders. The list exists so
-/// the absence is loud and attributable rather than looking like an oversight, and so filling one
-/// in later is a deliberate diff: the author has to delete the entry here at the same moment the
-/// component row lands in `gen-core`.
-///
-/// A row cannot simply be written empty for these, because
-/// [`license_table_conformance_errors`](candle_gen::gen_core::license_table_conformance_errors)
-/// rejects a provider mapping to no components — an empty list is indistinguishable from a
-/// forgotten one, so the surface spells the absence out here instead.
-pub const IDS_WITHOUT_A_RESOLVABLE_COMPONENT: &[(&str, &str)] = &[
-    ("mage_flow", MAGE_FLOW_REASON),
-    ("mage_flow_base", MAGE_FLOW_REASON),
-    ("mage_flow_turbo", MAGE_FLOW_REASON),
-    ("mage_flow_edit", MAGE_FLOW_REASON),
-    ("mage_flow_edit_base", MAGE_FLOW_REASON),
-    ("mage_flow_edit_turbo", MAGE_FLOW_REASON),
-    // The captioner id *is* its upstream repository id, and the only declaration anywhere is this
-    // repository's own `release/real-weight-models.toml`.
-    (
-        "fancyfeast/llama-joycaption-beta-one-hf-llava",
-        "SECOND-HAND ONLY — `llama_joycaption_beta_one_hf_llava` is a pinned hole",
-    ),
-    // Both embedder ids load one `openai/clip-vit-large-patch14` snapshot — one checkpoint, two
-    // heads, two ids — and that card declares nothing.
-    (
-        "clip_vit_l14",
-        "NOT FOUND — `clip_vit_large_patch14` is a pinned hole",
-    ),
-    (
-        "clip_vit_l14_text",
-        "NOT FOUND — `clip_vit_large_patch14` is a pinned hole",
-    ),
-];
 
 /// Which shared component rows each registered Candle provider id loads, ordered by
 /// [`ProviderComponents::provider_id`].
@@ -302,7 +293,10 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // --- scail2 -----------------------------------------------------------------------------
     // The DiT's own repository is the only settled component: the stock Wan2.1 VAE, the UMT5 tower
     // and the open-CLIP ViT-H visual tower this route loads are all pinned holes, because the code
-    // names the architecture and stops.
+    // names the architecture and stops. **This is not the same case as `bernini` / `wan_vace`
+    // above** even though all three drive `candle-gen-wan`'s `Umt5Encoder` + `WanVae16` from a
+    // `text_encoder/` and `vae/` under their own snapshot root — see the module doc's
+    // "Reusing a module is not provenance" section for why the three diverge.
     ProviderComponents {
         provider_id: "scail2_14b",
         components: &["scail_2"],
@@ -421,6 +415,55 @@ mod tests {
         LICENSE_FAMILIES, MEDIA_COMPONENT_LICENSES,
     };
     use std::collections::BTreeSet;
+
+    /// The reason string shared by the six `microsoft/Mage-Flow*` ids, so the six cannot drift into
+    /// six slightly different explanations of one finding.
+    const MAGE_FLOW_REASON: &str = "every component is a NOT FOUND / UNDETERMINED hole — all six \
+                                    `microsoft/Mage-Flow*` repositories 404 and the Qwen3-VL-4B \
+                                    tower bundled in each `text_encoder/` could not be named";
+
+    /// The registered Candle provider ids whose components are **all** pinned holes in the shared
+    /// table, with the reason — so they have no [`PROVIDER_COMPONENTS`] row and a consumer reading
+    /// this surface gets an empty licence disclosure for them.
+    ///
+    /// **This is an annotation, never a filter.** Every id below is registered, ships, and renders
+    /// exactly as it did before this module existed; what is absent is our metadata, which is a
+    /// hole for CI to report and never a reason to withhold a provider. It is deliberately
+    /// `#[cfg(test)]` rather than a public const, so no gate can quietly use it to suppress the ids
+    /// it names — the epic's product constraint rules out a `PENDING_*`-shaped allowlist keyed on
+    /// missing licence data, and a `pub` list in this repo is a compatibility boundary that cannot
+    /// be withdrawn once something starts reading it. `mlx-gen-catalog` settled the same question
+    /// the same way (sc-16666). The nine ids and their reasons are also in this module's rustdoc,
+    /// so nothing a reader needs is behind `cfg(test)`.
+    ///
+    /// A row cannot simply be written empty for these, because
+    /// [`license_table_conformance_errors`] rejects a provider mapping to no components — an empty
+    /// list is indistinguishable from a forgotten one, so the surface spells the absence out here
+    /// instead.
+    const IDS_WITHOUT_A_RESOLVABLE_COMPONENT: &[(&str, &str)] = &[
+        ("mage_flow", MAGE_FLOW_REASON),
+        ("mage_flow_base", MAGE_FLOW_REASON),
+        ("mage_flow_turbo", MAGE_FLOW_REASON),
+        ("mage_flow_edit", MAGE_FLOW_REASON),
+        ("mage_flow_edit_base", MAGE_FLOW_REASON),
+        ("mage_flow_edit_turbo", MAGE_FLOW_REASON),
+        // The captioner id *is* its upstream repository id, and the only declaration anywhere is
+        // this repository's own `release/real-weight-models.toml`.
+        (
+            "fancyfeast/llama-joycaption-beta-one-hf-llava",
+            "SECOND-HAND ONLY — `llama_joycaption_beta_one_hf_llava` is a pinned hole",
+        ),
+        // Both embedder ids load one `openai/clip-vit-large-patch14` snapshot — one checkpoint, two
+        // heads, two ids — and that card declares nothing.
+        (
+            "clip_vit_l14",
+            "NOT FOUND — `clip_vit_large_patch14` is a pinned hole",
+        ),
+        (
+            "clip_vit_l14_text",
+            "NOT FOUND — `clip_vit_large_patch14` is a pinned hole",
+        ),
+    ];
 
     /// Every registered id across every provider kind — the set this mapping is measured against.
     /// Candle registers generators, trainers, one captioner and two embedders; `transforms` is
@@ -594,9 +637,16 @@ mod tests {
             ("krea_2_edit", &["krea_qwen3_vl_4b"]),
             ("krea_2_raw", &["krea_qwen3_vl_4b"]),
             ("krea_2_turbo", &["krea_qwen3_vl_4b"]),
+            // Convention on the two Lens ids: each names **its own** deleted upstream plus the
+            // shared `lens_transformer` key, because both load an in-snapshot `transformer/`
+            // (`candle-gen-lens/src/lib.rs` `component_vb("transformer", …)` on either route) whose
+            // MIT survives only second-hand. Listing the shared key on one id and not the other
+            // would make the two disclosures differ for identical evidence.
             ("lens", &["microsoft_lens", "lens_transformer"]),
-            ("lens_turbo", &["microsoft_lens_turbo"]),
+            ("lens_turbo", &["microsoft_lens_turbo", "lens_transformer"]),
             ("qwen_image", &["qwen_image_qwen2_5_vl"]),
+            // All three bundled auxiliaries stay holes; the module doc's "Reusing a module is not
+            // provenance" section is why this id is short where `bernini` and `wan_vace` are not.
             (
                 "scail2_14b",
                 &["scail2_umt5", "scail2_open_clip_vit_h", "scail2_wan2_1_vae"],
@@ -700,11 +750,15 @@ mod tests {
         // Rows in the shared table that no registered Candle id reaches. They are not missing rows
         // — they are checkpoints this backend's registered surface does not load, which is exactly
         // what one shared table plus a per-backend mapping exists to express.
+        //
+        // The pin is **total**: the set below is asserted equal to the whole unreferenced remainder,
+        // not merely contained in it. A partial list would let a newly-added shared row sit
+        // unreached and unexplained.
         let referenced: BTreeSet<&str> = PROVIDER_COMPONENTS
             .iter()
             .flat_map(|p| p.components.iter().copied())
             .collect();
-        for elsewhere in [
+        let pinned_elsewhere: BTreeSet<&str> = BTreeSet::from([
             // MLX-registered generator ids with no Candle sibling.
             "flux2_klein_9b_kv",
             "wan2_2_vace_fun_a14b",
@@ -718,12 +772,15 @@ mod tests {
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
-            // no provider id on this backend.
+            // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
+            // rows are unreached here as well.
             "pulid",
             "eva_clip",
             "facexlib_parsing_bisenet",
             "nvidia_pid_students",
             "sam3",
+            "sam2_1_hiera_base_plus",
+            "sam2_1_hiera_large",
             "instantid",
             "controlnet_openpose_sdxl_1_0",
             // Caller-selected add-ons, deliberately out of scope for a list with no optionality.
@@ -734,7 +791,8 @@ mod tests {
             "qwen_image_lightning",
             "qwen_image_edit_2511_lightning",
             "xlabs_flux_ip_adapter",
-        ] {
+        ]);
+        for elsewhere in &pinned_elsewhere {
             assert!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, elsewhere).is_some(),
                 "{elsewhere:?} must still be a shared row"
@@ -745,6 +803,16 @@ mod tests {
                  mapping is right and this pin is stale"
             );
         }
+        let unreferenced: BTreeSet<&str> = MEDIA_COMPONENT_LICENSES
+            .iter()
+            .map(|row| row.component)
+            .filter(|component| !referenced.contains(component))
+            .collect();
+        assert_eq!(
+            unreferenced, pinned_elsewhere,
+            "every shared row no registered Candle id reaches must be pinned above with the reason \
+             it is unreached"
+        );
     }
 
     /// A provider's terms are **derived**, and the derivation is what makes a non-obvious component

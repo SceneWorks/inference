@@ -508,6 +508,7 @@ dependencies = [
  "candle-gen-wan",
  "candle-gen-z-image",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]

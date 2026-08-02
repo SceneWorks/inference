@@ -121,8 +121,9 @@ pub fn component_licenses() -> &'static [media::gen_core::ComponentLicense] {
 /// [`media::gen_core::provider_terms`] derives a provider's effective terms from.
 ///
 /// Nine registered ids have no row because every component they load is a pinned hole in the shared
-/// table; they are named, with reasons, in [`licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT`]. Those
-/// ids still ship and still render — a missing disclosure never withholds a provider.
+/// table; `licenses::tests` names which nine and why, deliberately as `#[cfg(test)]` data so no gate
+/// can read it. Those ids still ship and still render — a missing disclosure never withholds a
+/// provider, and registration is never conditioned on this mapping.
 pub fn provider_components() -> &'static [media::gen_core::ProviderComponents] {
     licenses::PROVIDER_COMPONENTS
 }
@@ -347,30 +348,62 @@ mod tests {
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
-        // sc-16667: the pinned surface and the model-weight licence mapping move together. Every id
-        // above is either mapped to at least one shared component row or named — with a reason — in
-        // `licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT`, so adding an id here without triaging its
-        // disclosure is a failure rather than a silently empty licence page. Being on that list
-        // withholds nothing: those ids register, ship and render exactly as the others do.
-        for id in generators
+        // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
+        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
+        // generator ids, which is why 51 + 7 + 1 + 2 registrations are 56 distinct ids.
+        //
+        // Registration is never conditioned on the mapping: 47 < 56 because nine ids load nothing
+        // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
+        // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
+        // `#[cfg(test)]` data, so no gate can read it and suppress them.
+        let distinct: std::collections::BTreeSet<&String> = generators
             .iter()
             .chain(&trainers)
             .chain(&captioners)
             .chain(&image_embedders)
             .chain(&text_embedders)
-        {
-            let mapped = super::provider_components()
-                .iter()
-                .any(|p| p.provider_id == id);
-            let named_hole = super::licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT
-                .iter()
-                .any(|(hole, _)| hole == id);
+            .collect();
+        assert_eq!(distinct.len(), 56);
+        assert_eq!(super::provider_components().len(), 47);
+    }
+
+    /// The manifest emitter runs on **this** catalog's three slices, and its output is
+    /// deterministic.
+    ///
+    /// Deliberately cheap. Byte-stability of the shared emitter was settled in sc-16663 (#406,
+    /// #411) and the audio lane gates its bytes against a committed file; there is no committed
+    /// Candle media manifest to compare against, because merging the three catalogs into one
+    /// release artifact is sc-16664's job. So this pins only what is this crate's to pin: the
+    /// function is reachable, emits the schema-3 shape with all three layers present, and returns
+    /// the same bytes call to call.
+    #[test]
+    fn component_licenses_manifest_json_is_well_formed_and_stable() {
+        let generated = super::component_licenses_manifest_json();
+        assert!(!generated.is_empty());
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&generated).expect("manifest is valid JSON");
+        assert_eq!(parsed["schema_version"], 3);
+        assert_eq!(parsed["kind"], "model-weight-licenses");
+        // A consumer reads one document and finds all three layers in it.
+        for section in ["families", "components", "providers"] {
             assert!(
-                mapped ^ named_hole,
-                "{id} must be exactly one of: mapped in licenses::PROVIDER_COMPONENTS, or named in \
-                 licenses::IDS_WITHOUT_A_RESOLVABLE_COMPONENT"
+                parsed[section]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty()),
+                "manifest section {section:?} is missing or empty"
             );
         }
+        assert_eq!(
+            parsed["providers"].as_array().expect("providers").len(),
+            super::provider_components().len()
+        );
+
+        assert_eq!(
+            super::component_licenses_manifest_json(),
+            generated,
+            "the emitter must be deterministic — a merged release artifact compares bytes"
+        );
     }
 
     #[test]
