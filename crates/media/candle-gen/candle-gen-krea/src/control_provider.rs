@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, Progress, Quant};
+use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress, Quant};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -133,6 +133,12 @@ pub struct Krea2ControlRequest {
     pub stage_residency: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16950) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview).
+    /// This provider is invoked by name rather than through the registry, so it carries its own field;
+    /// the semantics are identical, including that the [`PreviewSink::default`] inert sink is
+    /// byte-identical to a render with no preview at all.
+    pub preview: PreviewSink,
 }
 
 impl Default for Krea2ControlRequest {
@@ -148,6 +154,7 @@ impl Default for Krea2ControlRequest {
             tile_vae_decode: false,
             stage_residency: false,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -357,6 +364,10 @@ impl Krea2ControlHeavy {
             .to_device(device)?;
 
         let sigmas = turbo_sigmas(req.steps);
+        // The control branch injects its residual inside `forward_with_control`, so the running latent
+        // the preview sees is the ordinary `[1, 16, H/8, W/8]` Krea trajectory — the same latent space
+        // the reused Qwen fit was measured in, packed base tier or not (the branch dequants on load).
+        let preview = crate::preview::hook(&req.preview);
         let latent = candle_gen::run_flow_sampler(
             None,
             TimestepConvention::Sigma,
@@ -365,7 +376,7 @@ impl Krea2ControlHeavy {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = forward_with_control(

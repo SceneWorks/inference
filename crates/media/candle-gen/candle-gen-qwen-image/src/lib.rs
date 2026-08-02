@@ -42,6 +42,10 @@ pub mod control_fun;
 pub mod edit;
 pub mod image_processor;
 pub mod pipeline;
+// The QwenVae latent→RGB preview fit (epic 16948, sc-16950) — the epic-16624 least-squares constants,
+// REUSED rather than refitted, plus the spatial projection that applies them. Owned here because the
+// fit belongs to the VAE: `candle-gen-krea` reuses `vae::QwenVae` wholesale and therefore this fit too.
+pub mod preview;
 // ComfyUI single-file Qwen-Image → in-memory remap seam (epic 10451 Phase 2b): strip the
 // `model.diffusion_model.` prefix + upcast the plain `fp8_e4m3fn` DiT to bf16 (sc-10670), and remap the
 // native WAN-VAE keys of the tree's `vae/qwen_image_vae.safetensors` to the diffusers schema (sc-10830)
