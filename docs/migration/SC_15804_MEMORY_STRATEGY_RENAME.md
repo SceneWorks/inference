@@ -5,10 +5,14 @@ id, weight key, or wire format changes; every edit is an identifier, module path
 
 ## Why
 
-Nothing in the SC-15448 ladder is image-specific. Rung 1 sheds a conditioning component, rung 2
-bounds decoder scratch, rung 3 bounds attention, rung 4 bounds transformer residency — video and
-audio have all four. The `Image` prefix recorded which lane adopted the contract first, not what the
-contract covers, so it is dropped before any other lane adopts it and inherits a second contract.
+Nothing in the SC-15448 ladder's mechanisms is image-specific. Rung 1 sheds a conditioning
+component, rung 2 bounds decoder scratch, rung 3 bounds attention, and rung 4 bounds transformer
+residency. Those mechanisms can apply to video and audio providers; that applicability does not
+claim adoption coverage. At the sc-16595 review point (F-200, 2026-08-01 review), audio had no
+registered memory-strategy contract. sc-16998 separately tracks the first Stable Audio 3 adoption
+and non-vacuous audio-catalog conformance. The `Image` prefix recorded which lane adopted the
+contract first, not the lanes to which its mechanisms can apply, so it was dropped before another
+lane adopted it and inherited a second contract.
 
 ## Why not the bare name `memory`
 
