@@ -282,7 +282,7 @@ mod tests {
     fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
-        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let sink = PreviewSink::new(move |frame| crate::lock_recover(&captured).push(frame));
         (sink, frames)
     }
 
@@ -364,7 +364,7 @@ mod tests {
             project_latents(&latents, &[[0.0; 3]; 4], [0.0; 3])
         });
 
-        let frames = frames.lock().unwrap();
+        let frames = crate::lock_recover(&frames);
         assert_eq!(frames.len(), 1, "the failed projection must not emit");
         // The counter kept its advanced position: the surviving frame is 2, not 1.
         assert_eq!(frames[0].current, 2);
@@ -410,7 +410,7 @@ mod tests {
             panic!("duplicate index must not project")
         });
 
-        let frames = frames.lock().unwrap();
+        let frames = crate::lock_recover(&frames);
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].current, frames[0].total), (2, 3));
     }
@@ -423,7 +423,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
         let hook = PreviewHook::new(&sink, move |x: &Tensor| {
-            recorded.lock().unwrap().push(x.dims().to_vec());
+            crate::lock_recover(&recorded).push(x.dims().to_vec());
             project_latents(x, &[[0.0; 3]; 4], [0.0; 3])
         });
         assert!(hook.is_active());
@@ -434,8 +434,8 @@ mod tests {
         hook.emit(&counter, &SIGMAS, SIGMAS[0], &latents);
         hook.emit(&counter, &SIGMAS, SIGMAS[0], &latents); // deduped
 
-        assert_eq!(*seen.lock().unwrap(), vec![vec![1, 4, 2, 3]]);
-        assert_eq!(frames.lock().unwrap().len(), 1);
+        assert_eq!(*crate::lock_recover(&seen), vec![vec![1, 4, 2, 3]]);
+        assert_eq!(crate::lock_recover(&frames).len(), 1);
     }
 
     // --- Projection --------------------------------------------------------------------------------

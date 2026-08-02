@@ -1074,7 +1074,7 @@ mod tests {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
         (
-            PreviewSink::new(move |frame| captured.lock().unwrap().push(frame)),
+            PreviewSink::new(move |frame| crate::lock_recover(&captured).push(frame)),
             frames,
         )
     }
@@ -1086,7 +1086,7 @@ mod tests {
         seen: &Arc<Mutex<Vec<Vec<f32>>>>,
     ) -> impl Fn(&Tensor) -> Result<Image> + '_ {
         move |x: &Tensor| {
-            seen.lock().unwrap().push(vec1(x));
+            crate::lock_recover(seen).push(vec1(x));
             Ok(Image {
                 width: 1,
                 height: 1,
@@ -1123,12 +1123,12 @@ mod tests {
             )
             .unwrap();
 
-            let frames = frames.lock().unwrap();
+            let frames = crate::lock_recover(&frames);
             let numbering: Vec<u32> = frames.iter().map(|f| f.current).collect();
             assert_eq!(numbering, (1..=8).collect::<Vec<_>>(), "{name} numbering");
             assert!(frames.iter().all(|f| f.total == 8), "{name} total");
             assert_eq!(
-                seen.lock().unwrap().len(),
+                crate::lock_recover(&seen).len(),
                 8,
                 "{name}: a deduped position must not burn a projection"
             );
@@ -1198,7 +1198,7 @@ mod tests {
             "an inert sink must be byte-identical to no hook at all"
         );
         assert!(
-            seen.lock().unwrap().is_empty(),
+            crate::lock_recover(&seen).is_empty(),
             "an inert sink must not invoke the projection"
         );
 
@@ -1208,7 +1208,7 @@ mod tests {
             baseline,
             "an active sink must not perturb the render either"
         );
-        assert_eq!(seen.lock().unwrap().len(), 6);
+        assert_eq!(crate::lock_recover(&seen).len(), 6);
     }
 
     /// Previews are decorative: a projector that always fails loses its frames and nothing else.
@@ -1234,7 +1234,7 @@ mod tests {
         )
         .unwrap();
         assert!(vec1(&out).iter().all(|v| v.is_finite()));
-        assert!(frames.lock().unwrap().is_empty());
+        assert!(crate::lock_recover(&frames).is_empty());
     }
 
     /// The hook must see the RUNNING latent `x`, not the `c_in`-scaled model input `x_in`. Proven over
@@ -1263,14 +1263,14 @@ mod tests {
             &mut progress,
             Some(&hook),
             |xin, _t| {
-                recorded_inputs.lock().unwrap().push(vec1(xin));
+                crate::lock_recover(&recorded_inputs).push(vec1(xin));
                 Ok(t(&[0.7, -0.2, 0.4]))
             },
         )
         .unwrap();
 
-        let seen = seen.lock().unwrap();
-        let inputs = inputs.lock().unwrap();
+        let seen = crate::lock_recover(&seen);
+        let inputs = crate::lock_recover(&inputs);
         assert_eq!(seen[0], vec1(&x_init), "the hook must receive `x`");
         assert_ne!(
             inputs[0], seen[0],
@@ -1534,7 +1534,7 @@ mod tests {
             )
             .unwrap();
 
-            let frames = frames.lock().unwrap();
+            let frames = crate::lock_recover(&frames);
             let numbering: Vec<u32> = frames.iter().map(|f| f.current).collect();
             assert_eq!(
                 numbering,
@@ -1570,7 +1570,7 @@ mod tests {
         )
         .unwrap();
 
-        let seen = seen.lock().unwrap();
+        let seen = crate::lock_recover(&seen);
         let want = vec1(&x_init.affine(scheduler.sigma_data as f64, 0.0).unwrap());
         assert_eq!(seen[0], want, "step 0 sees the σ_data-scaled seed latent");
     }
@@ -1602,14 +1602,14 @@ mod tests {
             run(Some(&PreviewHook::new(&inert, recording_projector(&seen)))),
             baseline
         );
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(crate::lock_recover(&seen).is_empty());
 
         let (active, _frames) = collecting_sink();
         assert_eq!(
             run(Some(&PreviewHook::new(&active, recording_projector(&seen)))),
             baseline
         );
-        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(crate::lock_recover(&seen).len(), 4);
     }
 
     /// A projector that always fails costs the SCM render nothing.
@@ -1633,7 +1633,7 @@ mod tests {
         )
         .unwrap();
         assert!(vec1(&out).iter().all(|v| v.is_finite()));
-        assert!(frames.lock().unwrap().is_empty());
+        assert!(crate::lock_recover(&frames).is_empty());
     }
 }
 
