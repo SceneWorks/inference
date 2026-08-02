@@ -424,8 +424,12 @@ and AI-generation disclosure — **new relative to the landed v1.1.1 family**:
 sc-16662's U2 finding**. The v2.1 licence text enumerates prohibited uses inline in §4 and names no
 policy; but the card's gate prompt does, verbatim:
 
-> "By clicking \"Agree\", you agree to the [FLUX Non-Commercial License Agreement](…) and acknowledge
-> the [Acceptable Use Policy](https://bfl.ai/legal/usage-policy)."
+> "By clicking \"Agree\", you agree to the \[FLUX Non-Commercial License Agreement\]\(…\) and
+> acknowledge the \[Acceptable Use Policy\]\(https://bfl.ai/legal/usage-policy\)."
+
+(Square brackets and parentheses escaped above so the quote is not read as Markdown links; the
+prompt's own link target for the licence is elided in the source quote and is **not** reconstructed
+here.)
 
 — `black-forest-labs/FLUX.2-dev` card metadata `extra_gated_prompt`, HF model-info API, 2026-08-02.
 **That URL was fetched and resolves: HTTP 200.** This is the same evidence shape sc-16662 accepted
@@ -890,3 +894,113 @@ the base). Recorded so the transcription pass does not split it unnecessarily.
    supplies only `license`, that is `declared` (`apache-2.0`, `mit`, `gemma`, `openrail++`,
    `other`). Where neither exists, the document's own title is `declared` (`SAM License`,
    `MIT License`, `模型许可协议`) and the row says where it came from.
+
+---
+
+# Known holes — the rows sc-16665 deliberately did **not** write
+
+**Added by the transcription pass (the Rust half of sc-16665).** The table that landed in
+`crates/contracts/gen-core/src/license/components.rs` carries **71** `ComponentLicense` rows. The
+census counted 90 distinct upstream artifacts and identified further redistributed components inside
+them, so the table is deliberately incomplete. Every gap below is a checkpoint the media lane
+demonstrably loads and for which this document could not produce a licence.
+
+**Nothing was invented to close a gap** — not a row, not a family, not a `declared` string, not a
+`source_url`. Omission is the designed outcome: sc-16669's ship gate reports a missing row and
+**fails CI**, and per the epic's product constraint missing licence data never withholds a provider.
+A hole is therefore loud and tracked; a fabricated row would be silent and wrong.
+
+Each key below is pinned by the `known_holes_stay_absent` test in `license::components`, so adding
+any of these later is a **deliberate diff**: the author has to delete the entry, which is the moment
+to check that a primary source now exists.
+
+## UNDETERMINED — the upstream repository could not be named (22 keys)
+
+| key | what it is | see |
+| --- | --- | --- |
+| `flux2_klein_qwen3_text_encoder` | FLUX.2-klein's Qwen3 dense text encoder | [X12](#x12-eight-components-remain-undetermined) |
+| `flux2_dev_mistral3_tower` | FLUX.2-dev's Mistral3 language tower | X12 |
+| `flux2_dev_pixtral_vision_tower` | FLUX.2-dev's Pixtral vision tower | X12 |
+| `flux2_dev_multimodal_projector` | FLUX.2-dev's multimodal projector (may be BFL-authored — unestablished) | X12 |
+| `anima_qwen3_0_6b_text_encoder` | Anima's Qwen3-0.6B base text encoder | X12 |
+| `anima_qwen_image_vae` | Anima's bundled Qwen-Image VAE | Job 2 |
+| `boogu_qwen3_vl_8b` | Boogu's Qwen3-VL-8B condition encoder | Job 2 |
+| `krea_qwen3_vl_4b` | Krea 2's Qwen3-VL-4B tower | X12 |
+| `mage_qwen3_vl_4b` | Mage's Qwen3-VL-4B tower (and the Mage upstream itself 404s) | X12 |
+| `ideogram_qwen3_vl_8b` | Ideogram 4's Qwen3-VL-8B tower | X12 |
+| `z_image_qwen3_text_encoder` | Z-Image's Qwen3 tower | X12 |
+| `qwen_image_qwen2_5_vl` | qwen-image's Qwen2.5-VL tower | Job 2 |
+| `scail2_umt5`, `scail2_open_clip_vit_h`, `scail2_wan2_1_vae` | SCAIL-2's three bundled auxiliaries | Job 2 |
+| `lightx2v_wan_step_distill_diff_patch` | narrowed to two lightx2v repositories; which one is loaded is stated nowhere | X12 |
+| `sat_scail2_dpo_lora` | **no repository by that name exists** under any search; "sat" as a key layout is a hypothesis, not a finding | X12 |
+| `pid_flux1_vae`, `pid_flux2_vae`, `pid_sdxl_vae`, `pid_sd3_vae`, `pid_qwen_image_vae` | the five third-party encoders `nvidia/PiD` redistributes inside its `checkpoints/` | [exception 2](#granularity-exceptions--where-a-repository-level-row-is-genuinely-wrong) |
+
+The four vendor Qwen3-VL towers are one class of problem, not four: each vendor's card names the
+architecture at most, never a repository id.
+
+## NOT FOUND — the upstream is known and declares nothing re-readable (13 keys)
+
+| key | why | see |
+| --- | --- | --- |
+| `kolors_controlnet_pose` | declares no licence of any kind and has no model card | [X7](#x7-kwai-kolorskolors-controlnet-pose-declares-no-licence-at-all) |
+| `clip_vit_large_patch14` | the card declares nothing; the MIT the repo pins comes from OpenAI's *source* repository. **The most widely shared component in the catalog** | [X8](#x8-openaiclip-vit-large-patch14-declares-no-licence--and-the-repo-pins-it-as-mit) |
+| `clip_vit_large_patch14_336` | same, as the Kolors IP-Adapter's image tower | X8 |
+| `mage_flow`, `mage_flow_base`, `mage_flow_turbo`, `mage_flow_edit`, `mage_flow_edit_base`, `mage_flow_edit_turbo` | all six `microsoft/Mage-Flow*` repositories return 404 under an authenticated read; MIT survives only second-hand | [X1](#x1-every-microsoftmage-flow-repository-is-gone-from-the-hub-not-found) |
+| `microsoft_lens`, `microsoft_lens_turbo`, `lens_transformer` | `microsoft/Lens*` likewise 404; `SceneWorks/Lens`'s `transformer/` inherits the same problem | [X2](#x2-microsoftlens-and-lens-turbo-are-gone-too--mit-survives-only-second-hand) |
+| `krea2_pose_controlnet_beta` | declares `experimental-research-only` with no text behind it — **and it is SceneWorks' own repository**, so it is fixable rather than merely decidable | [X10](#x10-sceneworkskrea2-pose-controlnet-beta-declares-experimental-research-only-with-no-text) |
+
+A dead `source_url` in a drift-checking table is worse than no row, and `ComponentLicense::source_url`
+cannot be null — so these could not be written even as placeholders.
+
+## AMBIGUOUS — two primary sources disagree, or the family is genuinely open (7 keys)
+
+| key | why | see |
+| --- | --- | --- |
+| `kolors_diffusers` | card `apache-2.0` vs the committed `MODEL_LICENSE` | [X6](#x6-kolors-u6-carried-forward-unresolved-and-now-with-both-texts-read) / sc-16662 **U6** |
+| `sceneworks_kolors_chatglm3_tokenizer` | declares `license_name: kolors`, so its family is whatever U6 settles | X6 |
+| `flux2_dev_fun_controlnet_union` | ships BFL **v2.0** while BFL's own repos ship v2.1; one family or two is open | [X9](#x9-a-third-bfl-licence-version-is-in-circulation-v20-inside-an-alibaba-pai-controlnet) |
+| `boogu_flux1_vae` | FLUX.1 \[dev\] (non-commercial) or FLUX.1-schnell (Apache-2.0) — never stated. **The epic's own worked example** | [X5](#x5-boogu-declares-apache-20-over-a-flux1-vae-it-does-not-identify) |
+| `amoral_gemma_3_12b_v2_mlx_4bit` | a Gemma-3 derivative declaring `apache-2.0` | [X11](#x11-theclusteramoral-gemma-3-12b-v2-mlx-4bit-declares-apache-20-not-gemma) |
+| `stable_diffusion_3_5_large_turbo`, `stable_diffusion_3_5_medium` | **new to this section.** Both are governed by the Stability AI Community License and sc-16662 recorded a declared string for `stable-diffusion-3.5-large` only (`stabilityai-ai-community`). Assuming the siblings declare the same string is plausible and unverified, so no row was written. This is the cheapest hole on the list to close: one card read each |
+
+## NO DECLARED STRING — a restriction in prose, with no identifier to transcribe (2 keys)
+
+`antelopev2_arcface_glintr100` and `antelopev2_scrfd_10g`. The *family* is settled
+(`insightface-research-only`, whose `text_url` is already landed), and these carry the strictest
+terms in the catalog — but insightface publishes **no licence document for the models**, only README
+prose. `ComponentLicense::declared` is "the licence identifier as declared upstream, verbatim", and
+there is no identifier to transcribe; a prose fragment is a quote, not an identifier. One line from
+Michael closes this.
+
+## SECOND-HAND ONLY — the only declaration is this repository's own record (2 keys)
+
+| key | why |
+| --- | --- |
+| `llama_joycaption_beta_one_hf_llava` | `release/real-weight-models.toml` records `license = "Llama 3.1 Community License"` for the pinned revision; the upstream card was never read. Same question class as X1 and X8 |
+| `depth_anything_v2_small_hf` | the only statement is a provider crate's own rustdoc ("apache-2.0, ungated"). That is precisely the shape of the SANA defect the census catalogued (`candle-gen-sana/NOTICE`, corrected on `main` by `eef5166a`), so it was not transcribed as an upstream declaration |
+
+## Judgement calls the transcription pass made, and flagged
+
+Recorded here because they are places a reviewer should look first, not because they are unresolved
+in the code:
+
+1. **`source_url` follows the contract, not this note's tables.** `ComponentLicense::source_url` is
+   documented as *the document `declared` was transcribed from*. Where `declared` is a card's
+   `license_name` (the three FLUX.2 rows, the two Ideogram rows, the three FLUX.1-dev adapters), the
+   row therefore points at the **card**, not at the `LICENSE.md` this note cites — the licence text
+   lives once, on the family's `text_url`. Where `declared` is a document's own title (`SAM License`,
+   `MIT License`, `The ChatGLM3-6B License`, `CircleStone Labs Non-Commercial License v1.0`) or lives
+   in a README body (`nvidia/PiD`), the row points at that document.
+2. **The two Gemma rows name Google's card and record `gated: true`**, following the epic's
+   redistributed-component decision (the upstream card, not the redistributor's). This note's own
+   recommendation was `gated: false` on the grounds that no provider reads Google's gated repository.
+   Both readings are defensible; the row comments say so, and **Michael decides.** Nothing about the
+   licence changes either way — one family, one text, per this note's settled section.
+3. **U11 was applied, not answered.** `flux-non-commercial-v2-1` and `ideogram-4-non-commercial` each
+   take `NoticeFileRequired` **and** `AttributionRequired` from a single clause, because both clauses
+   name themselves an *attribution* notice — the textual hook sc-16662's U11 proposes, and the same
+   call the landed `nvidia-open-model` already makes. If U11 settles the other way, all four families
+   move together, which is the point of holding it open.
+4. **`attribution` is `Some` exactly where the family requires it**, and a test enforces both
+   directions. An attribution on a row whose licence asks for none would read as an obligation the
+   text never stated.

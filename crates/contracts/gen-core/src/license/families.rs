@@ -1,13 +1,15 @@
-//! The licence **family** table (sc-16662) — sixteen upstream licence texts, transcribed.
+//! The licence **family** table (sc-16662, extended by sc-16665) — nineteen upstream licence texts,
+//! transcribed.
 //!
 //! # PROVISIONAL — gathered by an agent, not yet signed off by a human
 //!
 //! Every value here was transcribed from a primary-source licence text retrieved on **2026-08-02**
 //! by an automated agent, and each one is backed by a verbatim quote recorded in
-//! `docs/licensing/sc-16662-licence-family-evidence.md`. That note is the sign-off document: it
-//! carries the quote, the source URL and the retrieval date behind every term below, plus the open
-//! items a human still has to decide. **No human has yet checked the quotes.** Treat these values
-//! as provisional until the note's sign-off table is ticked.
+//! `docs/licensing/sc-16662-licence-family-evidence.md` (the sixteen sc-16662 families) or
+//! `docs/licensing/sc-16665-checkpoint-licence-evidence.md` (the three sc-16665 added). Those notes
+//! are the sign-off documents: they carry the quote, the source URL and the retrieval date behind
+//! every term below, plus the open items a human still has to decide. **No human has yet checked the
+//! quotes.** Treat these values as provisional until the notes' sign-off tables are ticked.
 //!
 //! # Disclosure only
 //!
@@ -30,10 +32,11 @@
 //!
 //! # Scope
 //!
-//! Families only. The component rows that point at them ([`super::ComponentLicense`]) and the
-//! provider→component mappings ([`super::ProviderComponents`]) are a later slice (sc-16665), so
-//! `LICENSE_FAMILIES` is the whole of this module's surface. A family being listed here is a
-//! statement that its text was read, **not** that a shipped checkpoint declares it.
+//! Families only. The component rows that point at them live beside this module in
+//! [`super::components`] (sc-16665); the provider→component mappings
+//! ([`super::ProviderComponents`]) are per-backend and belong to the two media catalogs (sc-16666,
+//! sc-16667). A family being listed here is a statement that its text was read, **not** that a
+//! shipped checkpoint declares it.
 
 use super::{CeilingBoundary, LicenseFamily, LicenseTerm};
 
@@ -224,6 +227,89 @@ pub const FLUX_1_DEV_NON_COMMERCIAL: LicenseFamily = LicenseFamily {
         // address to record. Notably `https://blackforestlabs.ai/aup` is NOT it: that URL 404s and
         // appears nowhere in the licence.
         LicenseTerm::AcceptableUsePolicy { url: None },
+    ],
+};
+
+/// FLUX Non-Commercial License v2.1 — the text Black Forest Labs ships with its FLUX.2 checkpoints
+/// (sc-16665).
+///
+/// Text read at <https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/LICENSE.md> on
+/// 2026-08-02 under an authenticated session (the repository is gated), at `sha`
+/// `26afe3a78bb242c0a8bb181dcc8937bb16e5c66c`. `black-forest-labs/FLUX.2-klein-9B`'s copy is
+/// **byte-identical** to it; `FLUX.2-klein-9b-kv`'s is a different blob whose first line is the same
+/// title.
+///
+/// # Why this is not [`FLUX_1_DEV_NON_COMMERCIAL`]
+///
+/// A different document with a different title, a different `Models` definition, and two obligations
+/// the v1.1.1 text does not impose in the same shape — the self-named *Attribution Notice* of §3(b)
+/// and the AI-generation disclosure duty of §2(e). Stretching the FLUX.1 transcription over FLUX.2
+/// would have mis-stated both.
+///
+/// A **third** BFL text is in circulation and is deliberately not merged here: `FLUX [dev]
+/// Non-Commercial License v2.0`, shipped beside `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union`, whose
+/// own `Models` definition enumerates FLUX.2. Whether v2.0 and v2.1 are one family or two is open
+/// item **X9** in `docs/licensing/sc-16665-checkpoint-licence-evidence.md`, so that ControlNet has
+/// **no component row** rather than a guessed one.
+///
+/// # U11 linkage
+///
+/// §3(b) is one clause and it is transcribed as **two** terms, matching [`NVIDIA_OPEN_MODEL`] rather
+/// than [`GEMMA_TERMS`], because the clause names itself an *Attribution* Notice — which is exactly
+/// the textual hook sc-16662's open item **U11** proposes as the distinguisher. If U11 is settled
+/// the other way, this family and [`IDEOGRAM_4_NON_COMMERCIAL`] drop
+/// [`LicenseTerm::AttributionRequired`] with the two landed families that share the shape.
+pub const FLUX_NON_COMMERCIAL_V2_1: LicenseFamily = LicenseFamily {
+    id: "flux-non-commercial-v2-1",
+    spdx_id: "LicenseRef-FLUX-Non-Commercial-v2.1",
+    name: "FLUX Non-Commercial License v2.1",
+    text_url: "https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/LICENSE.md",
+    terms: &[
+        // §2(b) "You may only access, use, Distribute, or create Derivatives of the FLUX Model or
+        // Derivatives for Non-Commercial Purposes."
+        //
+        // §2(d) addresses outputs in the opposite direction — "You may use Output for any purpose
+        // (including for commercial purposes), except as expressly prohibited herein" — so
+        // NonCommercialOutputs is absent, and would be wrong rather than merely unquoted.
+        LicenseTerm::NonCommercialWeights,
+        // §3(a) "you must make available a copy of this License to third-party recipients of the
+        // FLUX Mode and/or Derivatives you Distribute, and specify that any rights to use the FLUX
+        // Model and/or Derivatives shall be directly granted by Company to said third-party
+        // recipients pursuant to this License". (The "Mode" typo is the source's.)
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "flux-non-commercial-v2-1",
+        },
+        // §3(b) "you must prominently display the following notice alongside the Distribution of the
+        // FLUX Model or Derivative (such as via a \"Notice\" text file distributed as part of such
+        // FLUX Model or Derivative) (the \"Attribution Notice\")".
+        LicenseTerm::NoticeFileRequired,
+        // Same §3(b) clause, which names itself the "Attribution Notice" — see the U11 note above.
+        LicenseTerm::AttributionRequired,
+        // §2(e), first of two duties in one sentence.
+        LicenseTerm::DeployerObligation {
+            text:
+                "implement and maintain content filtering measures (\"Content Filters\") for your \
+                   use of the FLUX Model or Derivatives to prevent the creation, display, \
+                   transmission, generation, or dissemination of unlawful or infringing content",
+        },
+        // §2(e), second duty — new relative to the v1.1.1 text.
+        LicenseTerm::DeployerObligation {
+            text: "ensure Output includes disclosure (or other indication) that the Output was \
+                   generated or modified using artificial intelligence technologies to the extent \
+                   required under applicable law.",
+        },
+        // The licence text enumerates prohibited uses inline in §4 and names no policy; the address
+        // is in the model card's `extra_gated_prompt`, verbatim: "you agree to the [FLUX
+        // Non-Commercial License Agreement](…) and acknowledge the [Acceptable Use
+        // Policy](https://bfl.ai/legal/usage-policy)". Fetched 2026-08-02: HTTP 200. Same evidence
+        // shape sc-16662 accepted for `krea-2-community`.
+        //
+        // This address is for FLUX.2 ONLY. FLUX.1 [dev]'s gate prompt still cites a `POLICY.md`
+        // that is not published — re-verified 2026-08-02 — so [`FLUX_1_DEV_NON_COMMERCIAL`] keeps
+        // `url: None` and the live URL must never be back-ported onto it.
+        LicenseTerm::AcceptableUsePolicy {
+            url: Some("https://bfl.ai/legal/usage-policy"),
+        },
     ],
 };
 
@@ -639,18 +725,148 @@ pub const LLAMA_3_1_COMMUNITY: LicenseFamily = LicenseFamily {
     ],
 };
 
+/// Ideogram Non-Commercial Model Agreement, last updated June 3, 2026 (sc-16665).
+///
+/// Text read at <https://huggingface.co/ideogram-ai/ideogram-4-fp8/blob/main/LICENSE.md> on
+/// 2026-08-02 under an authenticated session (the repository is gated), at `sha`
+/// `ee79a7237b519f1402ceacf952f30c8a31ec5073`.
+///
+/// # Outputs are addressed, and not restricted commercially
+///
+/// §7 "We claim no rights in outputs you generate using the Model. … You may not use any Output to
+/// develop, train, fine-tune or distill a model or other product or services that is competitive
+/// with the Model" — an anti-competitive-training restriction, not a commercial one, and the
+/// vocabulary has no variant for it.
+///
+/// §1(d) does fold a *use of Outputs* into the **definition** of Non-Commercial Purposes: "any use …
+/// that involves generating Output to include in, or to advertise or promote, revenue-generating
+/// products or services, in each case, is not a Non-Commercial Purpose." Whether a definition
+/// reaches Outputs as a licence term is a legal read, so [`LicenseTerm::NonCommercialOutputs`] is
+/// **not** transcribed and the passage is recorded in
+/// `docs/licensing/sc-16665-checkpoint-licence-evidence.md` instead.
+///
+/// # U11 linkage
+///
+/// §3(iii) is transcribed as two terms for the same reason as [`FLUX_NON_COMMERCIAL_V2_1`] — the
+/// clause names itself an *attribution* notice. See that family's U11 note.
+pub const IDEOGRAM_4_NON_COMMERCIAL: LicenseFamily = LicenseFamily {
+    id: "ideogram-4-non-commercial",
+    spdx_id: "LicenseRef-Ideogram-4-Non-Commercial",
+    name: "Ideogram Non-Commercial Model Agreement",
+    text_url: "https://huggingface.co/ideogram-ai/ideogram-4-fp8/blob/main/LICENSE.md",
+    terms: &[
+        // §2 "We hereby permit you to use, reproduce, Distribute, copy, create derivative works of
+        // (including Model Derivatives), and make modifications to the Model for Non-Commercial
+        // Purposes subject to the terms of this Agreement".
+        LicenseTerm::NonCommercialWeights,
+        // §3(i) "all permitted use of the reproduced and re-Distributed Model or Model Derivatives
+        // must be on terms that are no less restrictive than those set forth in this Agreement for
+        // the Model" — the heavier flow-down shape.
+        LicenseTerm::DownstreamRestrictions {
+            family: "ideogram-4-non-commercial",
+        },
+        // §3(ii) "you provide all third party recipients of the Model or Model Derivative a copy of
+        // this Agreement".
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "ideogram-4-non-commercial",
+        },
+        // §3(iii) "you retain in all copies of the Model or Model Derivatives that you Distribute
+        // the following attribution notice within a \"Notice\" text file that accompanies such
+        // copy".
+        LicenseTerm::NoticeFileRequired,
+        // Same §3(iii) clause, which names it an "attribution notice" — see the U11 note above.
+        LicenseTerm::AttributionRequired,
+        // §4 "adhere to the Acceptable Use Policy available at
+        // https://ideogram.ai/legal/usage-policy, which is hereby incorporated by reference into
+        // this Agreement". The address is in the licence text itself, not only in a gate prompt.
+        // Fetched 2026-08-02: HTTP 200.
+        LicenseTerm::AcceptableUsePolicy {
+            url: Some("https://ideogram.ai/legal/usage-policy"),
+        },
+        // §4, quoted.
+        LicenseTerm::DeployerObligation {
+            text: "You are responsible for implementing appropriate safety measures, including \
+                   content filters and human oversight, suitable for your use case and to prevent \
+                   the creation, display, generation or reproduction of unlawful or infringing \
+                   content",
+        },
+    ],
+};
+
+/// SAM License, last updated November 19, 2025 — Meta's bespoke licence for SAM 3 (sc-16665).
+///
+/// Text read at <https://huggingface.co/facebook/sam3/blob/main/LICENSE> on 2026-08-02 under an
+/// authenticated session (the repository is gated for manual approval), at `sha`
+/// `3c879f39826c281e95690f02c7821c4de09afae7`.
+///
+/// # This licence is **not** non-commercial
+///
+/// Worth stating plainly, because a bespoke vendor licence is easy to assume otherwise. §1(a) grants
+/// a "non-exclusive, worldwide, non-transferable and royalty-free limited license … to use,
+/// reproduce, distribute, copy, create derivative works of, and make modifications to the SAM
+/// Materials" with no purpose bound, so [`LicenseTerm::NonCommercialWeights`] is absent.
+///
+/// # SAM 2.1 is a different licence
+///
+/// `facebook/sam2.1-hiera-large` and `facebook/sam2.1-hiera-base-plus` declare plain `apache-2.0`
+/// and are ungated. Meta licenses SAM 2.1 and SAM 3 differently; this family covers `facebook/sam3`
+/// **only**.
+///
+/// # What the text does not say
+///
+/// No notice file (`Notice` does not occur), no acceptable-use policy (§1(b)(iii)–(v) enumerate
+/// trade-control and reverse-engineering restrictions inline and reference no external document), no
+/// revenue ceiling, no registration.
+pub const META_SAM_LICENSE: LicenseFamily = LicenseFamily {
+    id: "meta-sam-license",
+    spdx_id: "LicenseRef-Meta-SAM",
+    name: "SAM License",
+    text_url: "https://huggingface.co/facebook/sam3/blob/main/LICENSE",
+    terms: &[
+        // §1(b)(i) "If you distribute or make the SAM Materials, or any derivative works thereof,
+        // available to a third party, you may only do so under the terms of this Agreement and you
+        // shall provide a copy of this Agreement with any such SAM Materials." One sentence, both
+        // flow-down shapes.
+        LicenseTerm::DownstreamRestrictions {
+            family: "meta-sam-license",
+        },
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "meta-sam-license",
+        },
+        // §1(b)(ii) "If you submit for publication the results of research you perform on, using, or
+        // otherwise in connection with SAM Materials, you must acknowledge the use of SAM Materials
+        // in your publication."
+        //
+        // Flagged as a judgement call by the evidence pack: the duty is real but conditional on
+        // publishing research, which is narrower than any attribution clause in the sixteen families
+        // sc-16662 landed. It is transcribed because the vocabulary carries no narrower variant, and
+        // the condition is recorded here rather than dropped.
+        LicenseTerm::AttributionRequired,
+    ],
+};
+
 /// Every licence family whose text has been read, ordered by [`LicenseFamily::id`].
 ///
-/// The reviewed unit of the licence surface. Sixteen entries — the fourteen the story sketched,
-/// with `stable-video-diffusion-community` merged into [`STABILITY_AI_COMMUNITY`] (one text, three
-/// declared strings), the draft's single NVIDIA row split into [`NVIDIA_OPEN_MODEL`] and
-/// [`NVIDIA_NSCLV1`] (two different texts), and [`APPLE_MLR`] and [`LLAMA_3_1_COMMUNITY`] added
-/// because shipped checkpoints declare them.
+/// The reviewed unit of the licence surface. Nineteen entries — the sixteen sc-16662 landed, plus
+/// the three the media checkpoint census forced (sc-16665).
+///
+/// sc-16662 landed sixteen: the fourteen the story sketched, with `stable-video-diffusion-community`
+/// merged into [`STABILITY_AI_COMMUNITY`] (one text, three declared strings), the draft's single
+/// NVIDIA row split into [`NVIDIA_OPEN_MODEL`] and [`NVIDIA_NSCLV1`] (two different texts), and
+/// [`APPLE_MLR`] and [`LLAMA_3_1_COMMUNITY`] added because shipped checkpoints declare them.
+///
+/// sc-16665 added three, each because a shipped checkpoint declares a text none of the sixteen
+/// carries: [`FLUX_NON_COMMERCIAL_V2_1`] (the three FLUX.2 repositories),
+/// [`IDEOGRAM_4_NON_COMMERCIAL`] (`ideogram-ai/ideogram-4-fp8` and the ostris TurboTime LoRA) and
+/// [`META_SAM_LICENSE`] (`facebook/sam3` alone). A fourth candidate, `kolors-model-license`, was
+/// **withheld**: whether `Kwai-Kolors/Kolors-diffusers` is governed by its card's `apache-2.0` or by
+/// the `MODEL_LICENSE` committed beside its weights is sc-16662's open item **U6**, and landing a
+/// family would answer it silently.
 ///
 /// Membership means "this text was read on the date its doc comment records". It does **not** mean a
-/// shipped checkpoint declares it; the component rows that assert that are a later slice
-/// (sc-16665), and at least one family here — [`NVIDIA_OPEN_MODEL`] — has no confirmed checkpoint
-/// in this repository.
+/// shipped checkpoint declares it: [`NVIDIA_OPEN_MODEL`] still has no confirmed checkpoint in this
+/// repository (sc-16662 **U4**, which the census recommends closing as *no shipped checkpoint*), and
+/// several families are reachable only through components sc-16665 deliberately left unwritten.
 pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     APACHE_2_0,
     APPLE_MLR,
@@ -659,11 +875,14 @@ pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     CIRCLESTONE_LABS_NON_COMMERCIAL,
     CREATIVEML_OPENRAIL_PP_M,
     FLUX_1_DEV_NON_COMMERCIAL,
+    FLUX_NON_COMMERCIAL_V2_1,
     GEMMA_TERMS,
+    IDEOGRAM_4_NON_COMMERCIAL,
     INSIGHTFACE_RESEARCH_ONLY,
     KREA_2_COMMUNITY,
     LLAMA_3_1_COMMUNITY,
     LTX_2_COMMUNITY,
+    META_SAM_LICENSE,
     MIT,
     NVIDIA_NSCLV1,
     NVIDIA_OPEN_MODEL,
@@ -690,17 +909,20 @@ mod tests {
             CIRCLESTONE_LABS_NON_COMMERCIAL,
             CREATIVEML_OPENRAIL_PP_M,
             FLUX_1_DEV_NON_COMMERCIAL,
+            FLUX_NON_COMMERCIAL_V2_1,
             GEMMA_TERMS,
+            IDEOGRAM_4_NON_COMMERCIAL,
             INSIGHTFACE_RESEARCH_ONLY,
             KREA_2_COMMUNITY,
             LLAMA_3_1_COMMUNITY,
             LTX_2_COMMUNITY,
+            META_SAM_LICENSE,
             MIT,
             NVIDIA_NSCLV1,
             NVIDIA_OPEN_MODEL,
             STABILITY_AI_COMMUNITY,
         ];
-        assert_eq!(LICENSE_FAMILIES.len(), 16);
+        assert_eq!(LICENSE_FAMILIES.len(), 19);
         assert_eq!(LICENSE_FAMILIES, DECLARED);
 
         for family in LICENSE_FAMILIES {
@@ -744,12 +966,19 @@ mod tests {
         }
     }
 
-    /// The evidence pack found **no quote anywhere** supporting an outputs restriction, in any
+    /// Both evidence packs found **no quote anywhere** supporting an outputs restriction, in any
     /// family. Four texts restrict non-commercial *use of the weights* and are silent on outputs
-    /// (`insightface-research-only`, `nvidia-nsclv1`, `apple-mlr`, `cc-by-nc-4-0`); two others
-    /// address outputs and permit them. Inferring a restriction from silence would be a legal
+    /// (`insightface-research-only`, `nvidia-nsclv1`, `apple-mlr`, `cc-by-nc-4-0`); four others
+    /// address outputs and permit them commercially (`flux-1-dev-non-commercial` §2(d),
+    /// `circlestone-labs-non-commercial` §2(e), `flux-non-commercial-v2-1` §2(d),
+    /// `ideogram-4-non-commercial` §7). Inferring a restriction from silence would be a legal
     /// reading this surface does not make, so the term appears nowhere — and re-adding it must
     /// require producing a quote, which is what this test is here to force.
+    ///
+    /// The nearest miss is Ideogram §1(d), which folds a use of Outputs into the *definition* of
+    /// Non-Commercial Purposes. That is recorded in
+    /// `docs/licensing/sc-16665-checkpoint-licence-evidence.md` and deliberately not transcribed:
+    /// a definition is not an outputs restriction without a legal reading.
     #[test]
     fn no_family_infers_an_outputs_restriction_from_a_use_restriction() {
         for family in LICENSE_FAMILIES {
@@ -773,6 +1002,8 @@ mod tests {
                 "cc-by-nc-4-0",
                 "circlestone-labs-non-commercial",
                 "flux-1-dev-non-commercial",
+                "flux-non-commercial-v2-1",
+                "ideogram-4-non-commercial",
                 "insightface-research-only",
                 "nvidia-nsclv1",
             ]
@@ -850,7 +1081,9 @@ mod tests {
             vec![
                 "creativeml-openrail-pp-m",
                 "gemma-terms",
+                "ideogram-4-non-commercial",
                 "ltx-2-community",
+                "meta-sam-license",
                 "nvidia-nsclv1",
             ],
             "restrictions-as-enforceable-provisions is the heavier duty and only these state it"
@@ -862,19 +1095,28 @@ mod tests {
                 "apple-mlr",
                 "circlestone-labs-non-commercial",
                 "flux-1-dev-non-commercial",
+                "flux-non-commercial-v2-1",
                 "gemma-terms",
+                "ideogram-4-non-commercial",
                 "krea-2-community",
                 "llama-3-1-community",
                 "ltx-2-community",
+                "meta-sam-license",
                 "nvidia-nsclv1",
                 "nvidia-open-model",
                 "stability-ai-community",
             ]
         );
 
-        // Three texts impose both, and CreativeML Open RAIL++-M imposes only the heavier one — so
+        // Five texts impose both, and CreativeML Open RAIL++-M imposes only the heavier one — so
         // neither list is a subset of the other and neither variant can stand in for the other.
-        for id in ["gemma-terms", "ltx-2-community", "nvidia-nsclv1"] {
+        for id in [
+            "gemma-terms",
+            "ideogram-4-non-commercial",
+            "ltx-2-community",
+            "meta-sam-license",
+            "nvidia-nsclv1",
+        ] {
             let family = resolve_family(LICENSE_FAMILIES, id).unwrap();
             assert!(family.imposes(LicenseTerm::DownstreamLicenseCopy { family: id }));
             assert!(family.imposes(LicenseTerm::DownstreamRestrictions { family: id }));
@@ -933,13 +1175,31 @@ mod tests {
         );
         assert_eq!(registration_without_contact, vec!["ltx-2-community"]);
 
-        // The four addressed policies, and the three addressed registrations.
+        // The addressed policies, and the addressed registrations.
         assert!(GEMMA_TERMS.imposes(LicenseTerm::AcceptableUsePolicy {
             url: Some("https://ai.google.dev/gemma/prohibited_use_policy")
         }));
         assert!(KREA_2_COMMUNITY.imposes(LicenseTerm::AcceptableUsePolicy {
             url: Some("https://www.krea.ai/krea-2-use-policy")
         }));
+
+        // sc-16665 found that BFL now publishes a live usage policy — but only for FLUX.2. FLUX.1
+        // [dev]'s gate prompt still cites a `POLICY.md` that does not exist (re-verified
+        // 2026-08-02), so back-porting the live address onto the FLUX.1 family would invent an
+        // address for a text that names none. The two families must disagree here.
+        assert!(
+            FLUX_NON_COMMERCIAL_V2_1.imposes(LicenseTerm::AcceptableUsePolicy {
+                url: Some("https://bfl.ai/legal/usage-policy")
+            })
+        );
+        assert!(
+            FLUX_1_DEV_NON_COMMERCIAL.imposes(LicenseTerm::AcceptableUsePolicy { url: None }),
+            "sc-16662's U2 finding for FLUX.1 [dev] stands: the v2.1 address must not be back-ported"
+        );
+        assert!(!FLUX_1_DEV_NON_COMMERCIAL
+            .terms
+            .iter()
+            .any(|t| matches!(t, LicenseTerm::AcceptableUsePolicy { url: Some(_) })));
 
         let json = component_licenses_manifest_json(LICENSE_FAMILIES, &[], &[]);
         assert!(
@@ -991,8 +1251,9 @@ mod tests {
     /// The tripwire for "no term without a quote".
     ///
     /// Each row below is the exact term set transcribed for one family, and every term in it is
-    /// backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md` — the
-    /// source comments beside each const carry the same quote. Full linkage is not mechanisable
+    /// backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md` or, for
+    /// the three families sc-16665 added, `docs/licensing/sc-16665-checkpoint-licence-evidence.md`
+    /// — the source comments beside each const carry the same quote. Full linkage is not mechanisable
     /// from here (the quotes live in Markdown, and this crate reads no files at test time), so this
     /// census is the mechanism: adding, removing or re-parameterising any term fails this test and
     /// sends the author back to the note to record or produce the quote.
@@ -1084,12 +1345,36 @@ mod tests {
                 ],
             ),
             (
+                "flux-non-commercial-v2-1",
+                vec![
+                    "non_commercial_weights",
+                    "downstream_license_copy:flux-non-commercial-v2-1",
+                    "notice_file_required",
+                    "attribution_required",
+                    "deployer_obligation:implement and maintain content filtering measure",
+                    "deployer_obligation:ensure Output includes disclosure (or other indi",
+                    "acceptable_use_policy:https://bfl.ai/legal/usage-policy",
+                ],
+            ),
+            (
                 "gemma-terms",
                 vec![
                     "downstream_restrictions:gemma-terms",
                     "downstream_license_copy:gemma-terms",
                     "notice_file_required",
                     "acceptable_use_policy:https://ai.google.dev/gemma/prohibited_use_policy",
+                ],
+            ),
+            (
+                "ideogram-4-non-commercial",
+                vec![
+                    "non_commercial_weights",
+                    "downstream_restrictions:ideogram-4-non-commercial",
+                    "downstream_license_copy:ideogram-4-non-commercial",
+                    "notice_file_required",
+                    "attribution_required",
+                    "acceptable_use_policy:https://ideogram.ai/legal/usage-policy",
+                    "deployer_obligation:You are responsible for implementing appropriate",
                 ],
             ),
             ("insightface-research-only", vec!["non_commercial_weights"]),
@@ -1128,6 +1413,14 @@ mod tests {
                     // The "…" is the source's own elision, preserved in the landed string.
                     "deployer_obligation:Any Derivative of LTX-2 … must be distributed ex",
                     "acceptable_use_policy:<none>",
+                ],
+            ),
+            (
+                "meta-sam-license",
+                vec![
+                    "downstream_restrictions:meta-sam-license",
+                    "downstream_license_copy:meta-sam-license",
+                    "attribution_required",
                 ],
             ),
             ("mit", vec!["attribution_required"]),

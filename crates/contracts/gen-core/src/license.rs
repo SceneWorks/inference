@@ -15,7 +15,7 @@
 //!
 //! ## Three layers
 //!
-//! * [`LicenseFamily`] — one upstream licence text, reviewed once by a human (~16 rows);
+//! * [`LicenseFamily`] — one upstream licence text, reviewed once by a human (19 rows);
 //! * [`LicenseTerm`] — typed obligations, so a licence join is a **set union** rather than a
 //!   boolean AND, and the consumer applies its own profile;
 //! * [`ComponentLicense`] — one row per loaded artifact, carrying the provenance
@@ -41,12 +41,25 @@
 //! the layers above and deleted `WeightLicense`, `WeightLicenseEntry`, `commercial_use` and the
 //! `schema_version: 2` emitter outright.
 //!
-//! ## The table itself (sc-16662)
+//! ## The tables themselves (sc-16662, sc-16665)
 //!
-//! [`families`] carries the transcribed [`LicenseFamily`] rows — sixteen upstream texts, each term
-//! backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md`. The values
-//! are **provisional**: an agent gathered the quotes and no human has yet signed them off.
+//! [`families`] carries the transcribed [`LicenseFamily`] rows — nineteen upstream texts, each term
+//! backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md` or
+//! `docs/licensing/sc-16665-checkpoint-licence-evidence.md`.
+//!
+//! [`components`] carries the media lane's shared [`ComponentLicense`] rows — one per upstream
+//! checkpoint, read by **both** media catalogs, because a licence is a property of the checkpoint
+//! and the MLX and Candle engines load the same checkpoints. Only the provider→component mapping
+//! ([`ProviderComponents`]) differs per backend, and that lives in each catalog. The audio lane
+//! keeps its rows in its provider crates instead, which predates this table and is not affected by
+//! it.
+//!
+//! Both tables are **provisional**: an agent gathered the quotes and no human has yet signed them
+//! off. The component table is also deliberately **incomplete** — a checkpoint whose licence the
+//! evidence could not settle has no row rather than a guessed one, and the gaps are enumerated in
+//! [`components`] and in its evidence note.
 
+pub mod components;
 pub mod families;
 
 // =================================================================================================
