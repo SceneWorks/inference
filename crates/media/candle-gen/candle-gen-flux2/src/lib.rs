@@ -58,6 +58,9 @@ pub use transformer::{
     Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, CONTROL_IN_DIM,
 };
 
+/// Content identity for the CUDA resident/staged real-weight calibration harness.
+pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-v1";
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1393,7 +1396,7 @@ mod tests {
     /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008
     /// klein). Loads `label`'s snapshot from the `dir_env` env var and runs ONE probed 1024²
     /// generation whose residency mode is carried by `GenerationMemory::stage_residency`, calibrated
-    /// with `FLUX2_OFFLOAD_MODE=request-staged`; it prints the device peak VRAM (`SEQ_AB` line) and writes the raw RGB pixels to
+    /// with `FLUX2_OFFLOAD_MODE=request-staged`; it prints one strict `MEMORY_EVIDENCE_V1` record and writes the raw RGB pixels to
     /// `FLUX2_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and compare: the pixel
     /// files must be byte-identical (parity) and the sequential peak materially lower (the dense text
     /// encoder dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc caching
@@ -1443,6 +1446,10 @@ mod tests {
             }),
             ..Default::default()
         };
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let g = load(&spec).unwrap_or_else(|e| panic!("load {label}: {e}"));
@@ -1450,26 +1457,73 @@ mod tests {
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report();
-        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let mode = if stage_residency {
-            "request-staged"
+        let strategy = if stage_residency {
+            gen_core::MemoryStrategy::StagedResidency
         } else {
-            "resident"
+            gen_core::MemoryStrategy::Resident
         };
         eprintln!(
-            "SEQ_AB model={label} mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: label,
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        spec.load_shape,
+                    ),
+                    observed_calibration: gen_core::MemoryCalibrationIdentity::new(
+                        RESIDENCY_CALIBRATION_FINGERPRINT,
+                        spec.load_shape,
+                    ),
+                    tier: gen_core::MemoryNumericTier {
+                        precision: spec.precision,
+                        quant: spec.quantize,
+                        component_precision_floors: &[],
+                    },
+                    load_shape: spec.load_shape,
+                    mode: gen_core::MemoryMode::TextToImage,
+                    overlay: None,
+                    geometry: gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: req.count,
+                        frames: 1,
+                        reference_count: 0,
+                    },
+                    strategy,
+                    engaged_composition: if stage_residency {
+                        vec![
+                            gen_core::MemoryStrategy::Resident,
+                            gen_core::MemoryStrategy::StagedResidency,
+                        ]
+                    } else {
+                        vec![gen_core::MemoryStrategy::Resident]
+                    },
+                    parameters: gen_core::MemoryStrategyParameters::default(),
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-flux2-residency-v1",
+                    output_bytes: &img.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC gpu={} {report} bytes={} {}x{} out={out}",
             candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
         );
-        report.assert_trustworthy(1.0);
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868) for FLUX.2-**dev** (Mistral

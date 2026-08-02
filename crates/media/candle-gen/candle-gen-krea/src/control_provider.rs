@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, Progress, Quant};
+use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress, Quant};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -133,6 +133,12 @@ pub struct Krea2ControlRequest {
     pub stage_residency: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16950) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview).
+    /// This provider is invoked by name rather than through the registry, so it carries its own field;
+    /// the semantics are identical, including that the [`PreviewSink::default`] inert sink is
+    /// byte-identical to a render with no preview at all.
+    pub preview: PreviewSink,
 }
 
 impl Default for Krea2ControlRequest {
@@ -148,6 +154,7 @@ impl Default for Krea2ControlRequest {
             tile_vae_decode: false,
             stage_residency: false,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -357,6 +364,10 @@ impl Krea2ControlHeavy {
             .to_device(device)?;
 
         let sigmas = turbo_sigmas(req.steps);
+        // The control branch injects its residual inside `forward_with_control`, so the running latent
+        // the preview sees is the ordinary `[1, 16, H/8, W/8]` Krea trajectory — the same latent space
+        // the reused Qwen fit was measured in, packed base tier or not (the branch dequants on load).
+        let preview = crate::preview::hook(&req.preview);
         let latent = candle_gen::run_flow_sampler(
             None,
             TimestepConvention::Sigma,
@@ -365,7 +376,7 @@ impl Krea2ControlHeavy {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = forward_with_control(
@@ -642,6 +653,14 @@ mod tests {
             .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
         let chunk_attention = std::env::var("KREA_CHUNK_ATTN")
             .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
+        let mut tier_spec = candle_gen::gen_core::LoadSpec::new(
+            candle_gen::gen_core::WeightsSource::Dir(root.clone()),
+        );
+        if let Some(path) = convrot_dit.as_ref() {
+            tier_spec.text_encoder = Some(candle_gen::gen_core::WeightsSource::File(path.clone()));
+        }
+        let base_quant = crate::actual_quant_tier(&tier_spec, "krea_2_turbo_control")
+            .expect("resolve measured Krea control base tier");
 
         let pose = image::open(pose_path).expect("decode pose PNG").to_rgb8();
         let pose = image::imageops::resize(&pose, res, res, image::imageops::FilterType::Lanczos3);
@@ -671,6 +690,10 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let model = Krea2Control::load(&paths).expect("load Krea control provider");
@@ -680,16 +703,99 @@ mod tests {
             .generate(&request, &pose, &mut |_| {})
             .expect("generate Krea control image");
         probe.end_gen(gen_phase);
-        let report = probe.report();
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
         std::fs::write(&out, &image.pixels).expect("write raw pixels");
 
-        let mode = if stage_residency {
-            "request-staged"
+        let strategy = if chunk_attention {
+            candle_gen::gen_core::MemoryStrategy::BoundedAttention
+        } else if tile_vae_decode {
+            candle_gen::gen_core::MemoryStrategy::BoundedDecode
+        } else if stage_residency {
+            candle_gen::gen_core::MemoryStrategy::StagedResidency
         } else {
-            "resident"
+            candle_gen::gen_core::MemoryStrategy::Resident
         };
+        let memory_contract = crate::build_krea_control_memory_strategy_contract(&tier_spec)
+            .expect("build Krea control memory contract");
+        let engaged_composition = memory_contract.engaged_composition(strategy);
+        assert_eq!(
+            stage_residency,
+            engaged_composition.contains(&candle_gen::gen_core::MemoryStrategy::StagedResidency),
+            "Krea control probe flags must execute the contract's staged-residency composition"
+        );
+        assert_eq!(
+            tile_vae_decode,
+            engaged_composition.contains(&candle_gen::gen_core::MemoryStrategy::BoundedDecode),
+            "Krea control probe flags must execute the contract's bounded-decode composition"
+        );
+        assert_eq!(
+            chunk_attention,
+            engaged_composition.contains(&candle_gen::gen_core::MemoryStrategy::BoundedAttention),
+            "Krea control probe flags must execute the contract's bounded-attention composition"
+        );
+        let parameters = candle_gen::gen_core::MemoryStrategyParameters {
+            decode_tile_edge: engaged_composition
+                .contains(&candle_gen::gen_core::MemoryStrategy::BoundedDecode)
+                .then_some(512),
+            decode_overlap: engaged_composition
+                .contains(&candle_gen::gen_core::MemoryStrategy::BoundedDecode)
+                .then_some(128),
+            attention_chunk_size: engaged_composition
+                .contains(&candle_gen::gen_core::MemoryStrategy::BoundedAttention)
+                .then_some(KREA_ATTN_CHUNK_BUDGET as u32),
+            ..Default::default()
+        };
+        let overlay = match branch_tier {
+            Some(Quant::Q8) => "pose-control-q8",
+            Some(Quant::Q4) => "pose-control-q4",
+            Some(Quant::Nvfp4) => "pose-control-nvfp4",
+            None => "pose-control-bf16",
+        };
+        let observed_calibration = memory_contract
+            .calibration
+            .clone()
+            .expect("Krea control contract must export its calibration identity");
         eprintln!(
-            "SEQ_AB id=krea_2_turbo_control mode={mode} gpu={} {}x{} steps={} branch_tier={branch_tier:?} convrot={} tile_vae_decode={tile_vae_decode} chunk_attention={chunk_attention} | {report} | bytes={} out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: "krea_2_turbo_control",
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        observed_calibration.load_shape,
+                    ),
+                    observed_calibration: observed_calibration.clone(),
+                    tier: candle_gen::gen_core::MemoryNumericTier {
+                        precision: candle_gen::gen_core::Precision::Bf16,
+                        quant: base_quant,
+                        component_precision_floors: &[],
+                    },
+                    load_shape: observed_calibration.load_shape,
+                    mode: candle_gen::gen_core::MemoryMode::ImageToImage,
+                    overlay: Some(overlay.to_owned()),
+                    geometry: candle_gen::gen_core::MemoryGeometry {
+                        width: request.width,
+                        height: request.height,
+                        batch: 1,
+                        frames: 1,
+                        reference_count: 1,
+                    },
+                    strategy,
+                    engaged_composition,
+                    parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-krea-control-residency-v1",
+                    output_bytes: &image.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC id=krea_2_turbo_control gpu={} {}x{} steps={} branch_tier={branch_tier:?} convrot={} tile_vae_decode={tile_vae_decode} chunk_attention={chunk_attention} | {report} | bytes={} out={out}",
             candle_gen::testkit::probe_gpu(),
             image.width,
             image.height,

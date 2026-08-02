@@ -1085,6 +1085,12 @@ mod tests {
         // Historical triggers, unchanged: Sequential, or an output edge above 2048.
         assert!(decode_tiling(&req(1024, 1024, None), true).is_some());
         assert!(decode_tiling(&req(2560, 1024, None), false).is_some());
+        let evidence_probe = decode_tiling(&req(512, 512, None), true)
+            .expect("sequential requests retain the historical tiling configuration");
+        assert!(
+            !evidence_probe.needs_tiling(mlx_gen::VaeTiling::QWEN_IMAGE, 1, 64, 64),
+            "the 512px residency A/B must fall back to the exact single-pass decode"
+        );
         // The default resident 1024² render still decodes EXACTLY (untiled) — no behaviour change.
         assert!(decode_tiling(&req(1024, 1024, None), false).is_none());
         // A staged-only selection does not ask for tiling, so it must not get it.

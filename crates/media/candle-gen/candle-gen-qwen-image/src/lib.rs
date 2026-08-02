@@ -44,6 +44,10 @@ pub mod image_processor;
 #[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
 mod memory_strategy;
 pub mod pipeline;
+// The QwenVae latent→RGB preview fit (epic 16948, sc-16950) — the epic-16624 least-squares constants,
+// REUSED rather than refitted, plus the spatial projection that applies them. Owned here because the
+// fit belongs to the VAE: `candle-gen-krea` reuses `vae::QwenVae` wholesale and therefore this fit too.
+pub mod preview;
 // ComfyUI single-file Qwen-Image → in-memory remap seam (epic 10451 Phase 2b): strip the
 // `model.diffusion_model.` prefix + upcast the plain `fp8_e4m3fn` DiT to bf16 (sc-10670), and remap the
 // native WAN-VAE keys of the tree's `vae/qwen_image_vae.safetensors` to the diffusers schema (sc-10830)
@@ -69,6 +73,7 @@ pub use control_fun::{
     DEFAULT_CONTROL_SCALE,
 };
 pub use edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
+pub use memory_strategy::CALIBRATION_FINGERPRINT as MEMORY_CALIBRATION_FINGERPRINT;
 pub use vision_language::{load_vision_language_encoder, QwenVisionLanguageEncoder};
 
 /// Qwen-Image 2512-Fun-Controlnet-Union (VACE) real-weight GPU validation (sc-8350) — env-driven,
@@ -1163,6 +1168,9 @@ mod tests {
             .expect("set QWEN_IMAGE_SNAPSHOT to a real-file (hardlink-staged) Qwen-Image snapshot");
         let out = std::env::var("QWEN_OUT").expect("set QWEN_OUT to the pixel-dump path");
         let spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        let (registered_calibration, tier) =
+            memory_strategy::evidence_identity_and_tier(MODEL_ID, &spec)
+                .expect("resolve qwen_image executable evidence identity and tier");
         let stage_residency =
             std::env::var("QWEN_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
         let req = GenerationRequest {
@@ -1178,33 +1186,86 @@ mod tests {
             }),
             ..Default::default()
         };
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let g = load(&spec).expect("load qwen_image");
         probe.end_load(load_phase);
+        let observed_calibration = g
+            .memory_strategy_contract()
+            .and_then(|contract| contract.calibration.clone())
+            .expect("loaded qwen_image executable contract calibration");
+        assert_eq!(
+            observed_calibration, registered_calibration,
+            "loaded and registered qwen_image calibration identities diverged"
+        );
+        let evidence_load_shape = observed_calibration.load_shape;
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report();
-        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let mode = if stage_residency {
-            "request-staged"
+        let strategy = if stage_residency {
+            gen_core::MemoryStrategy::StagedResidency
         } else {
-            "resident"
+            gen_core::MemoryStrategy::Resident
         };
         eprintln!(
-            "SEQ_AB mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: MODEL_ID,
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        evidence_load_shape,
+                    ),
+                    observed_calibration,
+                    tier,
+                    load_shape: evidence_load_shape,
+                    mode: gen_core::MemoryMode::TextToImage,
+                    overlay: None,
+                    geometry: gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: req.count,
+                        frames: 1,
+                        reference_count: 0,
+                    },
+                    strategy,
+                    engaged_composition: if stage_residency {
+                        vec![
+                            gen_core::MemoryStrategy::Resident,
+                            gen_core::MemoryStrategy::StagedResidency,
+                        ]
+                    } else {
+                        vec![gen_core::MemoryStrategy::Resident]
+                    },
+                    parameters: gen_core::MemoryStrategyParameters::default(),
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-qwen-image-residency-v1",
+                    output_bytes: &img.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC gpu={} {report} bytes={} {}x{} out={out}",
             candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
         );
-        report.assert_trustworthy(1.0);
     }
 
     /// `transformer_group_size` reads the packed `transformer/config.json`'s `quantization.group_size`

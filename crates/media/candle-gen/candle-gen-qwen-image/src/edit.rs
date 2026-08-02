@@ -800,7 +800,7 @@ mod tests {
     #[test]
     #[ignore = "needs QWEN_EDIT_SNAPSHOT + QWEN_EDIT_REF (a reference PPM) + a CUDA GPU"]
     fn qwen_edit_probed_generate_for_offload_ab() {
-        use candle_gen::gen_core::AdapterKind;
+        use candle_gen::gen_core::{AdapterKind, LoadSpec, WeightsSource};
         use candle_gen::testkit::{env_path, probe_gpu, read_ppm, VramProbe};
 
         let root = env_path("QWEN_EDIT_SNAPSHOT");
@@ -826,6 +826,12 @@ mod tests {
         } else {
             vec![]
         };
+        let mut memory_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        memory_spec.adapters = adapters.clone();
+        let (observed_calibration, tier) =
+            crate::memory_strategy::evidence_identity_and_tier("qwen_image_edit", &memory_spec)
+                .expect("resolve qwen_image_edit executable evidence identity and tier");
+        let evidence_load_shape = observed_calibration.load_shape;
         let req = QwenEditRequest {
             prompt: "make the background a snowy mountain at sunset".into(),
             width: 1024,
@@ -838,6 +844,10 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
         let mut probe = VramProbe::start_rendered();
         let load_phase = probe.phase();
         let model = QwenEdit::load(&QwenEditPaths {
@@ -852,23 +862,67 @@ mod tests {
             .generate(&req, &[reference], &mut |_| {})
             .expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report();
-        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
-        let mode = if stage_residency {
-            "request-staged"
+        let strategy = if stage_residency {
+            candle_gen::gen_core::MemoryStrategy::StagedResidency
         } else {
-            "resident"
+            candle_gen::gen_core::MemoryStrategy::Resident
         };
         let path = if lightning { "lightning" } else { "base" };
         eprintln!(
-            "SEQ_AB path={path} mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: if lightning {
+                        "qwen_image_edit_lightning"
+                    } else {
+                        "qwen_image_edit"
+                    },
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        evidence_load_shape,
+                    ),
+                    load_shape: evidence_load_shape,
+                    observed_calibration,
+                    tier,
+                    mode: candle_gen::gen_core::MemoryMode::Edit,
+                    overlay: lightning.then(|| "lightning".to_owned()),
+                    geometry: candle_gen::gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: 1,
+                        frames: 1,
+                        reference_count: 1,
+                    },
+                    strategy,
+                    engaged_composition: if stage_residency {
+                        vec![
+                            candle_gen::gen_core::MemoryStrategy::Resident,
+                            candle_gen::gen_core::MemoryStrategy::StagedResidency,
+                        ]
+                    } else {
+                        vec![candle_gen::gen_core::MemoryStrategy::Resident]
+                    },
+                    parameters: candle_gen::gen_core::MemoryStrategyParameters::default(),
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-qwen-image-edit-residency-v1",
+                    output_bytes: &img.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC path={path} gpu={} {report} bytes={} {}x{} out={out}",
             probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
         );
-        report.assert_trustworthy(1.0);
     }
 }

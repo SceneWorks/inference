@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from scripts.release.ensure_model_snapshot import ensure_snapshot
-from scripts.release.verify_model_snapshot import MARKER, verify_snapshot
+from scripts.release.verify_model_snapshot import MARKER, snapshot_inventory, verify_snapshot
 
 
 MODEL = {
@@ -32,6 +32,50 @@ class ModelSnapshotTests(unittest.TestCase):
             snapshot = self.make_snapshot(Path(temporary), "materialized")
             (snapshot / MARKER).write_text(MODEL["revision"] + "\n", encoding="utf-8")
             verify_snapshot(MODEL, snapshot)
+
+    def test_inventory_binds_every_dereferenced_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_snapshot(Path(temporary), MODEL["revision"])
+            first = snapshot_inventory(MODEL, snapshot)
+            self.assertEqual(first["revision"], MODEL["revision"])
+            self.assertEqual(
+                {item["path"] for item in first["files"]},
+                {"config.json", "weights/model.safetensors"},
+            )
+            (snapshot / "weights/model.safetensors").write_bytes(b"mutated")
+            second = snapshot_inventory(MODEL, snapshot)
+            self.assertNotEqual(first["inventory_sha256"], second["inventory_sha256"])
+
+    def test_inventory_hashes_symlink_target_content_and_rejects_broken_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = self.make_snapshot(root, MODEL["revision"])
+            target = root / "blob"
+            target.write_bytes(b"one")
+            linked = snapshot / "extra.safetensors"
+            linked.write_bytes(b"one")
+            file_backed = snapshot_inventory(MODEL, snapshot)
+            linked.unlink()
+            linked.symlink_to(target)
+            first = snapshot_inventory(MODEL, snapshot)
+            self.assertEqual(file_backed["inventory_sha256"], first["inventory_sha256"])
+            target.write_bytes(b"two")
+            second = snapshot_inventory(MODEL, snapshot)
+            self.assertNotEqual(first["inventory_sha256"], second["inventory_sha256"])
+            target.unlink()
+            with self.assertRaisesRegex(RuntimeError, "cannot inventory model file"):
+                snapshot_inventory(MODEL, snapshot)
+
+    def test_inventory_excludes_revision_marker_and_local_cache_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_snapshot(Path(temporary), MODEL["revision"])
+            before = snapshot_inventory(MODEL, snapshot)
+            (snapshot / MARKER).write_text(MODEL["revision"], encoding="utf-8")
+            cache = snapshot / ".cache" / "huggingface"
+            cache.mkdir(parents=True)
+            (cache / "download.json").write_text("transient", encoding="utf-8")
+            after = snapshot_inventory(MODEL, snapshot)
+            self.assertEqual(before["inventory_sha256"], after["inventory_sha256"])
 
     def test_rejects_revision_drift_and_missing_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

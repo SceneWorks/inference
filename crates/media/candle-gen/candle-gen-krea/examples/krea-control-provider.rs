@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, OffloadPolicy, Progress, Quant};
+use candle_gen::gen_core::{Image, OffloadPolicy, PreviewSink, Progress, Quant};
 use candle_gen_krea::{
     Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
 };
@@ -138,6 +138,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tile_vae_decode = std::env::var("KREA_TILE_VAE")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    // `KREA_PREVIEW_DIR=<dir>` attaches a live per-step preview sink (epic 16948, sc-16950) and writes
+    // each latent-resolution frame as a PNG — the control route's real-weight preview check, since it
+    // is a bespoke by-name provider rather than a registered generator a test can drive. Unset leaves
+    // the inert default, which is byte-identical to a render with no preview at all.
+    let preview = match std::env::var("KREA_PREVIEW_DIR").ok().map(PathBuf::from) {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)?;
+            eprintln!("preview frames → {}", dir.display());
+            PreviewSink::new(move |frame| {
+                let path = dir.join(format!("preview_{:03}.png", frame.current));
+                let saved = image::RgbImage::from_raw(
+                    frame.image.width,
+                    frame.image.height,
+                    frame.image.pixels,
+                )
+                .map(|buf| buf.save(&path));
+                eprintln!(
+                    "  preview {}/{} {}x{} → {}",
+                    frame.current,
+                    frame.total,
+                    frame.image.width,
+                    frame.image.height,
+                    if matches!(saved, Some(Ok(()))) {
+                        path.display().to_string()
+                    } else {
+                        "(write failed)".to_owned()
+                    }
+                );
+            })
+        }
+        None => PreviewSink::default(),
+    };
     let req = Krea2ControlRequest {
         prompt: a.prompt,
         width: a.size,
@@ -149,6 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tile_vae_decode,
         stage_residency: false,
         cancel: CancelFlag::new(),
+        preview,
     };
     let mut on_progress = |p: Progress| {
         if let Progress::Step { current, total } = p {

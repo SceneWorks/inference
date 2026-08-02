@@ -31,12 +31,11 @@ pub const DECODE_OVERLAP: u32 = 64;
 pub const REJECTED_SUB_512_OVERLAP: u32 = 96;
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
-    mlx_gen_pid::DecodeRoutes::new(
+    mlx_gen_pid::DecodeRoutes::new_core(
         provider_id,
         DECODE_TILE_EDGES.iter().copied(),
         DECODE_OVERLAP,
     )
-    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
 }
 
 /// The shared 64-Mi score-element budget used by the MLX rung-3 kernel.

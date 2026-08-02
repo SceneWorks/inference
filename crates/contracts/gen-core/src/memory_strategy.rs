@@ -125,6 +125,12 @@ use crate::{
 /// identity string.
 pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 
+/// Prefix for the single-line calibration observation protocol consumed by release tooling.
+///
+/// The payload after this prefix is compact JSON. Keeping the version outside the JSON makes mixed
+/// test output cheap to scan without accepting a legacy `SEQ_AB` line by accident.
+pub const MEMORY_EVIDENCE_V1_PREFIX: &str = "MEMORY_EVIDENCE_V1 ";
+
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -1417,8 +1423,8 @@ impl MemoryProviderContract {
                     calibration.abi, MEMORY_CALIBRATION_ABI
                 ));
             }
-            if calibration.fingerprint.trim().is_empty() {
-                errors.push("calibration fingerprint must be non-empty".to_owned());
+            if let Err(reason) = validate_calibration_fingerprint(&calibration.fingerprint) {
+                errors.push(format!("calibration fingerprint {reason}"));
             }
             if calibration.load_shape != self.load_shape {
                 errors.push(format!(
@@ -2348,6 +2354,331 @@ pub struct MemoryEvidence {
     pub observed_peak_bytes: Option<u64>,
     pub parity: MemoryParityContract,
     pub parity_result: MemoryParityResult,
+}
+
+/// One machine-readable calibration observation emitted by a real-weight harness.
+///
+/// This is deliberately separate from [`MemoryEvidence`]. A harness observation is the provenance
+/// input used to promote evidence; it must carry both the provider identity declared before the run
+/// and the identity observed at the measurement seam. Making those two fields explicit lets the
+/// verifier reject the exact stale-layout failure calibration fingerprints exist to detect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryEvidenceLogRecord {
+    pub key: MemoryEvidenceKey,
+    pub declared_calibration: MemoryCalibrationIdentity,
+    pub observed_calibration: MemoryCalibrationIdentity,
+    pub predicted_peak_bytes: u64,
+    pub observed_peak_bytes: u64,
+    pub inference_revision: String,
+    pub sceneworks_revision: String,
+    /// Exact immutable model revision used by the probe.
+    pub model_revision: String,
+    /// SHA-256 of the canonical, dereferenced model-file inventory persisted with the evidence.
+    pub model_inventory_sha256: String,
+    pub harness_version: String,
+    /// SHA-256 of the exact output bytes written by this probe. The A/B verifier binds each record
+    /// to its artifact before it may promote the declared parity contract.
+    pub output_sha256: String,
+    pub parity: MemoryParityContract,
+    pub parity_result: MemoryParityResult,
+}
+
+impl MemoryEvidenceLogRecord {
+    /// Validate the persisted protocol invariants before emitting a line.
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.key.has_canonical_engaged_composition() {
+            errors.push(
+                "evidence engaged composition must be a non-empty canonical strategy set"
+                    .to_owned(),
+            );
+        } else if self.key.engaged_composition.first() != Some(&MemoryStrategy::Resident)
+            || self.key.engaged_composition.last() != Some(&self.key.strategy)
+        {
+            errors.push(
+                "evidence engaged composition must start with resident and end with the measured strategy"
+                    .to_owned(),
+            );
+        }
+        if self.predicted_peak_bytes == 0 {
+            errors.push("predicted peak bytes must be positive".to_owned());
+        }
+        if self.observed_peak_bytes == 0 {
+            errors.push("observed peak bytes must be positive".to_owned());
+        }
+        for (label, identity) in [
+            ("declared", &self.declared_calibration),
+            ("observed", &self.observed_calibration),
+        ] {
+            if identity.abi != MEMORY_CALIBRATION_ABI {
+                errors.push(format!(
+                    "{label} calibration ABI {} does not match contract ABI {MEMORY_CALIBRATION_ABI}",
+                    identity.abi
+                ));
+            }
+            if identity.load_shape != self.key.load_shape {
+                errors.push(format!(
+                    "{label} calibration load shape {:?} does not match evidence key {:?}",
+                    identity.load_shape, self.key.load_shape
+                ));
+            }
+            if let Err(reason) = validate_calibration_fingerprint(&identity.fingerprint) {
+                errors.push(format!("{label} calibration fingerprint {reason}"));
+            }
+        }
+        if self.declared_calibration != self.observed_calibration {
+            errors.push("declared and observed calibration identities do not match".to_owned());
+        }
+        for (label, revision) in [
+            ("inference", self.inference_revision.as_str()),
+            ("SceneWorks", self.sceneworks_revision.as_str()),
+            ("model", self.model_revision.as_str()),
+        ] {
+            if revision.len() != 40
+                || !revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                errors.push(format!(
+                    "{label} revision must be an exact 40-character lowercase Git commit"
+                ));
+            }
+        }
+        if self.model_inventory_sha256.len() != 64
+            || !self
+                .model_inventory_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            errors.push(
+                "model inventory SHA-256 must be 64 lowercase hexadecimal characters".to_owned(),
+            );
+        }
+        if self.harness_version.trim().is_empty() {
+            errors.push("harness version must be non-empty".to_owned());
+        }
+        if self.output_sha256.len() != 64
+            || !self
+                .output_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            errors.push("output SHA-256 must be 64 lowercase hexadecimal characters".to_owned());
+        }
+        match &self.parity {
+            MemoryParityContract::Exact => {}
+            MemoryParityContract::Tolerance {
+                metric,
+                maximum_error,
+            } => validate_parity_limit(metric, *maximum_error, &mut errors),
+            MemoryParityContract::Golden {
+                fixture,
+                metric,
+                maximum_error,
+            } => {
+                if fixture.trim().is_empty() {
+                    errors.push("golden parity fixture must be non-empty".to_owned());
+                }
+                validate_parity_limit(metric, *maximum_error, &mut errors);
+            }
+        }
+        errors
+    }
+
+    /// Serialize this observation as one canonical `MEMORY_EVIDENCE_V1` line.
+    pub fn to_json_line(&self) -> Result<String> {
+        let errors = self.validation_errors();
+        if !errors.is_empty() {
+            return Err(Error::Msg(format!(
+                "invalid memory evidence log record: {}",
+                errors.join("; ")
+            )));
+        }
+
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "key": evidence_key_json(&self.key),
+            "declared_calibration": calibration_identity_json(&self.declared_calibration),
+            "observed_calibration": calibration_identity_json(&self.observed_calibration),
+            "predicted_peak_bytes": self.predicted_peak_bytes,
+            "observed_peak_bytes": self.observed_peak_bytes,
+            "inference_revision": self.inference_revision,
+            "sceneworks_revision": self.sceneworks_revision,
+            "model_revision": self.model_revision,
+            "model_inventory_sha256": self.model_inventory_sha256,
+            "harness_version": self.harness_version,
+            "output_sha256": self.output_sha256,
+            "parity": parity_contract_json(&self.parity),
+            "parity_result": parity_result_json(&self.parity_result),
+        });
+        serde_json::to_string(&json)
+            .map(|payload| format!("{MEMORY_EVIDENCE_V1_PREFIX}{payload}"))
+            .map_err(|error| Error::Msg(format!("serialize memory evidence log record: {error}")))
+    }
+}
+
+/// Validate the stable content-fingerprint grammar used at the persisted evidence boundary.
+///
+/// Fingerprints are lowercase kebab tokens and contain exactly one positive `vN` token. Backend,
+/// mode, tier, load shape, geometry, and strategy parameters are typed evidence-key axes and must
+/// not be encoded as substitutes for those fields. Existing descriptive tokens may still mention
+/// implementation facts; the version token is what makes a deliberate calibration change lintable.
+pub fn validate_calibration_fingerprint(fingerprint: &str) -> std::result::Result<(), String> {
+    if fingerprint.is_empty() {
+        return Err("must be non-empty".to_owned());
+    }
+    let tokens = fingerprint.split('-').collect::<Vec<_>>();
+    if tokens.iter().any(|token| {
+        token.is_empty()
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    }) {
+        return Err("must contain only non-empty lowercase ASCII kebab tokens".to_owned());
+    }
+    let version_tokens = tokens
+        .iter()
+        .filter(|token| {
+            token.strip_prefix('v').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .collect::<Vec<_>>();
+    if version_tokens.len() != 1 {
+        return Err("must contain exactly one vN version token".to_owned());
+    }
+    let digits = version_tokens[0].strip_prefix('v').unwrap_or_default();
+    if digits.starts_with('0') {
+        return Err(
+            "version token must be positive and must not contain leading zeroes".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn calibration_identity_json(identity: &MemoryCalibrationIdentity) -> serde_json::Value {
+    serde_json::json!({
+        "abi": identity.abi,
+        "fingerprint": identity.fingerprint,
+        "load_shape": load_shape_key(identity.load_shape),
+    })
+}
+
+fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
+    let component_precision_floors = key
+        .tier
+        .component_precision_floors
+        .iter()
+        .map(|floor| {
+            serde_json::json!({
+                "component": floor.component.as_str(),
+                "selected_tier": quant_key(floor.selected_tier),
+                "resident_tier": quant_key(floor.resident_tier),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "resolved_route": key.resolved_route,
+        "backend": key.backend.as_key(),
+        "tier": {
+            "precision": precision_key(key.tier.precision),
+            "quant": key.tier.quant.map(quant_key),
+            "component_precision_floors": component_precision_floors,
+        },
+        "load_shape": load_shape_key(key.load_shape),
+        "mode": key.mode.as_key(),
+        "overlay": key.overlay,
+        "geometry": {
+            "width": key.geometry.width,
+            "height": key.geometry.height,
+            "batch": key.geometry.batch,
+            "frames": key.geometry.frames,
+            "reference_count": key.geometry.reference_count,
+        },
+        "strategy": memory_strategy_key(key.strategy),
+        "engaged_composition": key.engaged_composition.iter().copied().map(memory_strategy_key).collect::<Vec<_>>(),
+        "parameters": {
+            "decode_tile_edge": key.parameters.decode_tile_edge,
+            "decode_overlap": key.parameters.decode_overlap,
+            "attention_chunk_size": key.parameters.attention_chunk_size,
+            "transformer_window_size": key.parameters.transformer_window_size,
+            "transformer_window_component": key.parameters.transformer_window_component.map(transformer_component_key),
+        },
+    })
+}
+
+fn parity_contract_json(parity: &MemoryParityContract) -> serde_json::Value {
+    match parity {
+        MemoryParityContract::Exact => serde_json::json!({ "kind": "exact" }),
+        MemoryParityContract::Tolerance {
+            metric,
+            maximum_error,
+        } => serde_json::json!({
+            "kind": "tolerance",
+            "metric": metric,
+            "maximum_error": maximum_error,
+        }),
+        MemoryParityContract::Golden {
+            fixture,
+            metric,
+            maximum_error,
+        } => serde_json::json!({
+            "kind": "golden",
+            "fixture": fixture,
+            "metric": metric,
+            "maximum_error": maximum_error,
+        }),
+    }
+}
+
+fn parity_result_json(result: &MemoryParityResult) -> serde_json::Value {
+    match result {
+        MemoryParityResult::Passed => serde_json::json!({ "kind": "passed" }),
+        MemoryParityResult::Failed { reason } => {
+            serde_json::json!({ "kind": "failed", "reason": reason })
+        }
+        MemoryParityResult::NotRun => serde_json::json!({ "kind": "not_run" }),
+    }
+}
+
+const fn memory_strategy_key(strategy: MemoryStrategy) -> &'static str {
+    match strategy {
+        MemoryStrategy::Resident => "resident",
+        MemoryStrategy::StagedResidency => "staged_residency",
+        MemoryStrategy::BoundedDecode => "bounded_decode",
+        MemoryStrategy::BoundedAttention => "bounded_attention",
+        MemoryStrategy::BoundedTransformerResidency => "bounded_transformer_residency",
+    }
+}
+
+const fn transformer_component_key(component: TransformerComponent) -> &'static str {
+    match component {
+        TransformerComponent::Dit => "dit",
+        TransformerComponent::TextEncoder => "text_encoder",
+        TransformerComponent::Both => "both",
+    }
+}
+
+const fn load_shape_key(load_shape: LoadShape) -> &'static str {
+    match load_shape {
+        LoadShape::EagerMaterialization => "eager_materialization",
+        LoadShape::DeferredMaterialization => "deferred_materialization",
+    }
+}
+
+const fn precision_key(precision: Precision) -> &'static str {
+    match precision {
+        Precision::Bf16 => "bf16",
+        Precision::Fp32 => "fp32",
+    }
+}
+
+const fn quant_key(quant: Quant) -> &'static str {
+    match quant {
+        Quant::Q4 => "q4",
+        Quant::Q8 => "q8",
+        Quant::Nvfp4 => "nvfp4",
+    }
 }
 
 impl MemoryEvidence {
@@ -3937,5 +4268,131 @@ mod tests {
             .conformance_errors()
             .iter()
             .any(|error| error.contains("has no verification evidence")));
+    }
+
+    fn evidence_log_record() -> MemoryEvidenceLogRecord {
+        let calibration =
+            MemoryCalibrationIdentity::new("test-layout-v1", LoadShape::EagerMaterialization);
+        MemoryEvidenceLogRecord {
+            key: MemoryEvidenceKey {
+                resolved_route: "test_provider".to_owned(),
+                backend: MemoryBackend::Mlx,
+                tier: bf16(),
+                load_shape: LoadShape::EagerMaterialization,
+                mode: MemoryMode::TextToImage,
+                overlay: None,
+                geometry: MemoryGeometry {
+                    width: 1024,
+                    height: 1024,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 0,
+                },
+                strategy: MemoryStrategy::StagedResidency,
+                engaged_composition: vec![
+                    MemoryStrategy::Resident,
+                    MemoryStrategy::StagedResidency,
+                ],
+                parameters: MemoryStrategyParameters::default(),
+            },
+            declared_calibration: calibration.clone(),
+            observed_calibration: calibration,
+            predicted_peak_bytes: 8_000_000_000,
+            observed_peak_bytes: 7_500_000_000,
+            inference_revision: "a".repeat(40),
+            sceneworks_revision: "b".repeat(40),
+            model_revision: "d".repeat(40),
+            model_inventory_sha256: "e".repeat(64),
+            harness_version: "test-harness-v1".to_owned(),
+            output_sha256: "c".repeat(64),
+            parity: MemoryParityContract::Exact,
+            parity_result: MemoryParityResult::Passed,
+        }
+    }
+
+    #[test]
+    fn memory_evidence_v1_line_contains_the_complete_typed_key_and_provenance() {
+        let line = evidence_log_record().to_json_line().unwrap();
+        assert!(line.starts_with(MEMORY_EVIDENCE_V1_PREFIX));
+        let value: serde_json::Value =
+            serde_json::from_str(&line[MEMORY_EVIDENCE_V1_PREFIX.len()..]).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["key"]["backend"], "mlx");
+        assert_eq!(value["key"]["mode"], "text_to_image");
+        assert_eq!(value["key"]["load_shape"], "eager_materialization");
+        assert_eq!(value["key"]["geometry"]["reference_count"], 0);
+        assert_eq!(value["key"]["strategy"], "staged_residency");
+        assert_eq!(
+            value["key"]["engaged_composition"],
+            serde_json::json!(["resident", "staged_residency"])
+        );
+        assert_eq!(value["declared_calibration"], value["observed_calibration"]);
+        assert_eq!(value["predicted_peak_bytes"], 8_000_000_000_u64);
+        assert_eq!(value["observed_peak_bytes"], 7_500_000_000_u64);
+        assert_eq!(value["model_revision"], "d".repeat(40));
+        assert_eq!(value["model_inventory_sha256"], "e".repeat(64));
+        assert_eq!(value["output_sha256"], "c".repeat(64));
+        assert_eq!(value["parity_result"]["kind"], "passed");
+    }
+
+    #[test]
+    fn evidence_writer_rejects_identity_revision_and_fingerprint_drift() {
+        let mut record = evidence_log_record();
+        record.key.engaged_composition = vec![MemoryStrategy::Resident];
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("end with the measured strategy"));
+
+        let mut record = evidence_log_record();
+        record.observed_calibration.fingerprint = "other-layout-v1".to_owned();
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("identities do not match"));
+
+        let mut record = evidence_log_record();
+        record.inference_revision = "main".to_owned();
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("exact 40-character"));
+
+        let mut record = evidence_log_record();
+        record.model_inventory_sha256 = "mutable-cache".to_owned();
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("model inventory SHA-256"));
+
+        let mut record = evidence_log_record();
+        record.output_sha256 = "not-a-sha".to_owned();
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("output SHA-256"));
+
+        for invalid in [
+            "",
+            "Layout-v1",
+            "layout_v1",
+            "layout",
+            "layout-v0",
+            "layout-v01",
+            "layout-v1-v2",
+        ] {
+            assert!(
+                validate_calibration_fingerprint(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        for valid in ["layout-v1", "sc-16594-layout-v2", "layout-q4-512-v3"] {
+            validate_calibration_fingerprint(valid).unwrap();
+        }
     }
 }

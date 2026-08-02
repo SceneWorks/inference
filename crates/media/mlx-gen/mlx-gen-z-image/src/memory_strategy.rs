@@ -414,12 +414,11 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materi
 /// `no_native_decode_candidate_is_a_legal_pid_tile_edge` proves it — but a future widening of the
 /// ladder into the student's range must fail typed at load rather than panic in a release build.
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
-    mlx_gen_pid::DecodeRoutes::new(
+    mlx_gen_pid::DecodeRoutes::new_core(
         provider_id,
         DECODE_TILE_EDGES.iter().copied(),
         DECODE_OVERLAP,
     )
-    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
 }
 
 /// Build the Z-Image MLX provider contract for `provider_id`.

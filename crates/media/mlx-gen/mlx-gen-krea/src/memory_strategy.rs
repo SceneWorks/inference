@@ -25,12 +25,11 @@ pub const DECODE_OVERLAP: u32 = 64;
 pub const DECODE_TILE_EDGES: [u32; 1] = [DECODE_TILE_EDGE];
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
-    mlx_gen_pid::DecodeRoutes::new(
+    mlx_gen_pid::DecodeRoutes::new_core(
         provider_id,
         DECODE_TILE_EDGES.iter().copied(),
         DECODE_OVERLAP,
     )
-    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
 }
 
 pub fn memory_strategy_contract(

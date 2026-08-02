@@ -40,6 +40,9 @@ pub mod multiphase;
 /// validation vehicle. See [`nvfp4_dit`].
 pub mod nvfp4_dit;
 pub mod pipeline;
+/// Krea's per-step latent preview seam (epic 16948, sc-16950) — the projector closure every render
+/// route hands [`candle_gen::run_flow_sampler`], over the **reused** epic-16624 QwenVae fit.
+mod preview;
 pub mod quant;
 pub mod schedule;
 pub mod text_encoder;
@@ -144,6 +147,12 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 /// directly. Named here so the shared edit path (PiD decode-seam errors, sc-11197) reports the right
 /// surface for the Turbo edit vs the Raw [`KREA_2_EDIT_ID`].
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
+/// Content identity for the CUDA resident/staged and ladder calibration harness.
+pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "krea-cuda-residency-ladder-v1";
+/// Provider contract identity for the Krea Turbo five-rung phase curves.
+pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str = "krea-turbo-cuda-phase-curves-v1";
+/// Provider contract identity for the Krea pose-control direct calibration.
+pub const CONTROL_MEMORY_CALIBRATION_FINGERPRINT: &str = "sc-16013-krea-control-direct-1024-v1";
 
 /// patch_size(2)·vae_downsample(8) = 16 — patchify requires latent dims divisible by this. Exposed as
 /// the pinned-engine stride SceneWorks ties each advertised Krea image bucket to (sc-12612), mirroring
@@ -1331,7 +1340,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             ],
         },
         calibration: Some(MemoryCalibrationIdentity::new(
-            "krea-turbo-cuda-phase-curves-v1",
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
             LoadShape::DeferredMaterialization,
         )),
         // The Krea manifest phase curves already contain the measured resident floors. Asset facts
@@ -1557,7 +1566,7 @@ fn build_krea_control_memory_strategy_contract(
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        "sc-16013-krea-control-direct-1024-v1",
+        CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
     for capability in &mut contract.strategies {
@@ -3054,6 +3063,13 @@ mod tests {
         let raw = std::env::var("KREA_SEQ_RAW").is_ok();
         let edit = std::env::var("KREA_SEQ_EDIT").is_ok();
         assert!(!(raw && edit), "set only one of KREA_SEQ_RAW/KREA_SEQ_EDIT");
+        let id = if edit {
+            KREA_2_EDIT_ID
+        } else if raw {
+            KREA_2_RAW_ID
+        } else {
+            KREA_2_TURBO_ID
+        };
         // `krea_2_raw` is a DIFFERENT CHECKPOINT (the undistilled base DiT), not a mode of the Turbo
         // snapshot — so it reads its own dir (the mlx-gen-krea `KREA_RAW_DIR` convention, sc-11101).
         // Sharing `KREA_TURBO_DIR` across both would silently load the DISTILLED DiT and run it under
@@ -3209,6 +3225,10 @@ mod tests {
         // (weights → device) from the denoise/decode activation spike — the epic's open question is which
         // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
         // at 1024²).
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water after any swap probe"
+        );
         let load_phase = probe.phase();
         let g = if edit {
             load_edit(&spec).expect("load krea_2_edit")
@@ -3296,29 +3316,123 @@ mod tests {
         }
         let elapsed_s = started.elapsed().as_secs_f64();
         probe.end_gen(gen_phase);
-        let report = probe.report();
+        let report = probe.report().assert_trustworthy(max_baseline_gb);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
 
         let img = img.expect("at least one repeated image");
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
-        let mode = if !memory_mode.is_empty() {
-            memory_mode.as_str()
-        } else if stage_residency {
-            "request-staged"
-        } else {
-            "resident"
+        let (strategy, parameters) = match memory_mode.as_str() {
+            "three-stage" => (
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategyParameters::default(),
+            ),
+            "" if stage_residency => (
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategyParameters::default(),
+            ),
+            "" => (
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategyParameters::default(),
+            ),
+            "tiled-vae" => (
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(128),
+                    ..Default::default()
+                },
+            ),
+            "chunked-attention" => (
+                gen_core::MemoryStrategy::BoundedAttention,
+                gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(128),
+                    attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                    ..Default::default()
+                },
+            ),
+            "streamed-blocks" => (
+                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(128),
+                    attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                    transformer_window_size: Some(1),
+                    ..Default::default()
+                },
+            ),
+            other => unreachable!("validated KREA_MEMORY_RUNG {other}"),
         };
-        let id = if edit {
-            KREA_2_EDIT_ID
-        } else if raw {
-            KREA_2_RAW_ID
+        let engaged_composition = if raw || edit {
+            if strategy == gen_core::MemoryStrategy::StagedResidency {
+                vec![
+                    gen_core::MemoryStrategy::Resident,
+                    gen_core::MemoryStrategy::StagedResidency,
+                ]
+            } else {
+                vec![gen_core::MemoryStrategy::Resident]
+            }
         } else {
-            KREA_2_TURBO_ID
+            krea_turbo_memory_strategy_contract().engaged_composition(strategy)
         };
+        let observed_calibration = if raw || edit {
+            gen_core::MemoryCalibrationIdentity::new(
+                RESIDENCY_CALIBRATION_FINGERPRINT,
+                spec.load_shape,
+            )
+        } else {
+            krea_turbo_memory_strategy_contract()
+                .calibration
+                .clone()
+                .expect("Krea Turbo contract must export its calibration identity")
+        };
+        let evidence_load_shape = observed_calibration.load_shape;
         eprintln!(
-            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} repeats={repeats} \
-             elapsed_s={elapsed_s:.3} repeat_elapsed_s={repeat_elapsed:?} | {report} | bytes={} \
-             out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: id,
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        evidence_load_shape,
+                    ),
+                    observed_calibration,
+                    tier: gen_core::MemoryNumericTier {
+                        precision: spec.precision,
+                        quant: actual_quant_tier(&spec, id).expect("resolve measured Krea tier"),
+                        component_precision_floors: &[],
+                    },
+                    load_shape: evidence_load_shape,
+                    mode: if edit {
+                        gen_core::MemoryMode::Edit
+                    } else {
+                        gen_core::MemoryMode::TextToImage
+                    },
+                    overlay: edit.then(|| "edit-adapter".to_owned()),
+                    geometry: gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: req.count,
+                        frames: 1,
+                        reference_count: u32::from(edit),
+                    },
+                    strategy,
+                    engaged_composition,
+                    parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-krea-residency-ladder-v1",
+                    output_bytes: &img.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC id={id} gpu={} {}x{} steps={:?} repeats={repeats} \
+             elapsed_s={elapsed_s:.3} repeat_elapsed_s={repeat_elapsed:?} | {report} | bytes={} out={out}",
             candle_gen::testkit::probe_gpu(),
             req.width,
             req.height,
@@ -3330,7 +3444,6 @@ mod tests {
                 "KREA_PHASE rung={memory_mode} repeat={repeat} phase={phase} peak_gb={peak_gb:.3}"
             );
         }
-        report.assert_trustworthy(max_baseline_gb);
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
