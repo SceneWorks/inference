@@ -239,6 +239,7 @@ pub(crate) fn render_base(
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond_v = comps.dit.forward(x, &t, &cond)?;
@@ -332,6 +333,7 @@ pub(crate) fn render_turbo(
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let v = comps.dit.forward(x, &t, &cond)?;
@@ -498,6 +500,7 @@ pub(crate) fn render_edit(
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;

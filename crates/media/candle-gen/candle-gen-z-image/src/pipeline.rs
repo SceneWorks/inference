@@ -1154,6 +1154,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     Ok(transformer
@@ -1236,6 +1237,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     let plan = request_attention_plan(req, attention_budget);
@@ -1409,6 +1411,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |latents, t| -> Result<Tensor> {
                     // `t` is the 1−σ conditioning (OneMinusSigma) the DiT embeds — the same value the
                     // reference scheduler's `current_timestep_normalized` returns. The embedder upcasts
@@ -1554,6 +1557,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     // Conditional velocity (Z-Image sign convention: the DiT output is negated before

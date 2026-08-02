@@ -487,6 +487,7 @@ impl QwenEdit {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 // Concatenate the (updating) noise with the (static) reference latents over the sequence.
                 let joint = Tensor::cat(&[latents, static_latents], 1)?;

@@ -217,6 +217,7 @@ impl Flux2Control {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
                 Ok(self.transformer.forward(

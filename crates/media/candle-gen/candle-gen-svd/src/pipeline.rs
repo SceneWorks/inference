@@ -201,6 +201,7 @@ pub fn denoise(
         seed,
         cancel,
         on_progress,
+        None,
         |x_in, t| -> CResult<Tensor> {
             // `x_in` is already the `1/√(σ²+1)`-scaled latent (`scale_model_input`) the driver applied
             // via `EdmModelSampling::input_scale`; `t` is the continuous EDM timestep `0.25·ln σ`.

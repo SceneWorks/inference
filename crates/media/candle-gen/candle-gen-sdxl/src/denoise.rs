@@ -413,6 +413,7 @@ pub fn denoise_curated(
         seed,
         cancel,
         on_progress,
+        None,
         |x_in, timestep| -> Result<Tensor> {
             // `x_in` is the `1/√(σ²+1)`-scaled latent (f32 from the solver); cast to the UNet compute
             // dtype, then CFG-batch the single row to [uncond, cond].

@@ -236,6 +236,7 @@ impl QwenFunControl {
             req.seed,
             &req.cancel,
             on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 let pos_v = self.transformer.forward_fun_control(
                     latents,

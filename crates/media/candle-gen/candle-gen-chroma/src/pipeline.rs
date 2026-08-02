@@ -317,6 +317,7 @@ impl Pipeline {
             seed,
             cancel,
             on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 let ts = Tensor::from_vec(vec![sigma], 1, &self.device)?;
                 // pooled_temb depends only on the timestep — compute once and share across both branches.

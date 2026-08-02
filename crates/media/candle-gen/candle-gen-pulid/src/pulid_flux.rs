@@ -396,6 +396,7 @@ impl PulidFlux {
             seed,
             cancel,
             on_progress,
+            None,
             |img, t| -> Result<Tensor> {
                 // The backbone dispatches to the loaded tier's DiT (BFL `IpFlux` or packed
                 // `PackedFluxDit`) `forward_injected`; the PuLID CA identity injection lives inside this

@@ -714,6 +714,7 @@ pub(crate) fn render_three_stage(
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = dit.forward_with_memory(
@@ -930,6 +931,7 @@ fn render_from_context(
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = comps.dit.forward(x, &t, context)?;
@@ -1050,6 +1052,7 @@ fn render_img2img_from_context(
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let v = comps.dit.forward(x, &t, context)?;
@@ -1164,6 +1167,7 @@ fn render_base_from_contexts(
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond = comps.dit.forward(x, &t, context)?;
@@ -1304,6 +1308,7 @@ pub(crate) fn render_multiphase(
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let cond = dit.forward(x, &t, context)?;
@@ -1440,6 +1445,7 @@ fn render_base_img2img_from_contexts(
                 seed,
                 &req.cancel,
                 on_progress,
+                None,
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let cond = comps.dit.forward(x, &t, context)?;
@@ -1659,6 +1665,7 @@ fn render_edit_from_context(
             seed,
             &req.cancel,
             on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 // Thread the request's cancel flag into the block loop (sc-16003): an edit step at

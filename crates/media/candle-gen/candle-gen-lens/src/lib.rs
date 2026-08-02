@@ -507,6 +507,7 @@ impl Pipeline {
             seed,
             cancel,
             on_progress,
+            None,
             |latents, sigma| -> CResult<Tensor> {
                 if !guided {
                     // Guidance disabled: cfg_rescale(cond, ·, 1.0) == cond, so run a single

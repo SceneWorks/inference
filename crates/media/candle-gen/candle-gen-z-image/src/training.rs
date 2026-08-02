@@ -580,6 +580,7 @@ impl FlowMatchTrainer for ZImageTrainer {
             seed,
             &nocancel,
             &mut |_| {},
+            None,
             |latents, t| -> Result<Tensor> {
                 // `t` is the `1 − σ` conditioning the DiT embeds; the raw velocity is NEGATED to match
                 // inference's `noise_pred.neg()` (the Z-Image sign convention).
