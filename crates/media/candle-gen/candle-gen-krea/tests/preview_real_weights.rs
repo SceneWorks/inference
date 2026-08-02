@@ -3,10 +3,11 @@
 //! Two independent things a shape-only smoke cannot establish, and which this epic requires of every
 //! wiring story:
 //!
-//! 1. **The reused fit belongs to this latent space.** [`krea_vae_is_the_qwen_fit_vae`] grounds the
-//!    reuse in tensor bytes — the pinned `vae/` SHA-256, the `latents_mean`/`latents_std` that define
-//!    the normalized space, and (when a second snapshot is supplied) a tensor-by-tensor comparison
-//!    against the Qwen-Image VAE the epic-16624 fit was measured on.
+//! 1. **The reused fit belongs to this latent space.** Two rows, deliberately separate:
+//!    [`krea_vae_bytes_are_the_pinned_shared_snapshot`] pins the Krea side (the `vae/` SHA-256 both
+//!    Krea snapshots publish, and the `latents_mean`/`latents_std` that define the normalized space),
+//!    and [`krea_vae_matches_the_qwen_fit_vae_tensor_for_tensor`] is the reuse gate proper — a
+//!    tensor-by-tensor comparison against the Qwen-Image VAE the epic-16624 fit was measured on.
 //! 2. **The frames actually develop.** [`turbo_preview_frames_evolve_toward_the_final_image`] renders
 //!    through the registered `krea_2_turbo` engine with a live sink, checks the numbering contract,
 //!    checks seeded byte-identity against an inert render, and measures that each frame is closer to
@@ -14,13 +15,18 @@
 //!
 //! ```sh
 //! KREA_TURBO_DIR=D:\models\Krea-2-Turbo \
+//! QWEN_IMAGE_VAE_FILE=D:\models\qwen-image-mlx\q8\vae\diffusion_pytorch_model.safetensors \
 //! KREA_PREVIEW_ARTIFACT_DIR=D:\out\sc-16950 \
 //!   cargo test -p candle-gen-krea --release --features cuda --test preview_real_weights \
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! The provenance row additionally accepts `QWEN_IMAGE_VAE_FILE`, the path to the Qwen-Image
-//! `vae/*.safetensors` the MLX fit was taken against. Without it the row still pins the Krea side.
+//! `QWEN_IMAGE_VAE_FILE` is **required** by the comparison row, which fails rather than skips when it
+//! is unset. That row is the story's central claim — that the epic-16624 fit is legitimately reusable
+//! rather than a guess from a matching Rust type name — and a gate that early-returns reports SUCCESS
+//! having proven nothing, which in a run log is indistinguishable from a gate that ran. The two
+//! halves are separate rows for the same reason: whichever half did not run has to be visible.
+//! `KREA_RAW_DIR` stays genuinely optional; it strengthens the Krea-side row without gating it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -123,15 +129,28 @@ fn read_latent_stats(root: &Path) -> (Vec<f64>, Vec<f64>) {
     (read("latents_mean"), read("latents_std"))
 }
 
-/// **The reuse gate.** `candle-gen-qwen-image::preview` ships the epic-16624 fit unchanged; this is
-/// what makes that legitimate rather than a guess from a matching Rust type name.
+/// An input this row cannot run without. Missing means **fail**, not skip: a row that early-returns
+/// on an unset variable still reports SUCCESS, and a skipped gate is indistinguishable in the run
+/// output from one that ran and proved something.
+fn required_path(name: &str) -> PathBuf {
+    env_path(name).unwrap_or_else(|| {
+        panic!(
+            "{name} must be set for this row — it is a provenance gate, and skipping it would \
+             report success while proving nothing"
+        )
+    })
+}
+
+/// The Krea half: the `vae/` bytes every candle Krea route loads are the pinned file both published
+/// snapshots share, and they define the 16-channel latent space the reused fit lives in.
+///
+/// This is the *weaker* half on its own — it says nothing about Qwen-Image. The comparison that makes
+/// the reuse legitimate is [`krea_vae_matches_the_qwen_fit_vae_tensor_for_tensor`], and it is a
+/// separate row precisely so running only this one cannot read as having proven that.
 #[test]
-#[ignore = "needs a real Krea snapshot (set KREA_TURBO_DIR; optionally KREA_RAW_DIR, QWEN_IMAGE_VAE_FILE)"]
-fn krea_vae_is_the_qwen_fit_vae() {
-    let Some(turbo) = env_path("KREA_TURBO_DIR") else {
-        eprintln!("skipping: set KREA_TURBO_DIR");
-        return;
-    };
+#[ignore = "needs a real Krea snapshot (set KREA_TURBO_DIR; optionally KREA_RAW_DIR)"]
+fn krea_vae_bytes_are_the_pinned_shared_snapshot() {
+    let turbo = required_path("KREA_TURBO_DIR");
 
     let turbo_vae = vae_file(&turbo);
     let turbo_sha = sha256_of(&turbo_vae);
@@ -142,7 +161,8 @@ fn krea_vae_is_the_qwen_fit_vae() {
     );
 
     // Raw publishes the same file. Checking it explicitly is what makes "every Krea route shares one
-    // latent space" a measurement rather than an assumption.
+    // latent space" a measurement rather than an assumption. Genuinely optional: the Turbo snapshot
+    // alone already carries the file every route loads.
     if let Some(raw) = env_path("KREA_RAW_DIR") {
         let raw_vae = vae_file(&raw);
         let raw_sha = sha256_of(&raw_vae);
@@ -151,24 +171,47 @@ fn krea_vae_is_the_qwen_fit_vae() {
             raw_sha, KREA_VAE_SHA256,
             "Krea Raw must load the same VAE bytes as Krea Turbo"
         );
+    } else {
+        eprintln!("note: set KREA_RAW_DIR to also pin the Raw snapshot's vae/ against Turbo's");
     }
 
     let (mean, std) = read_latent_stats(&turbo);
     assert_eq!(mean, LATENTS_MEAN, "latents_mean defines the fitted space");
     assert_eq!(std, LATENTS_STD, "latents_std defines the fitted space");
+}
 
-    let Some(qwen_vae) = env_path("QWEN_IMAGE_VAE_FILE") else {
-        eprintln!(
-            "note: set QWEN_IMAGE_VAE_FILE to the Qwen-Image vae/*.safetensors \
-             (SHA-256 {QWEN_IMAGE_MLX_VAE_SHA256}) for the tensor-by-tensor comparison"
-        );
-        return;
-    };
-    eprintln!(
-        "Qwen-Image vae/  {}  {}",
-        sha256_of(&qwen_vae),
-        qwen_vae.display()
+/// **The reuse gate.** `candle-gen-qwen-image::preview` ships the epic-16624 fit unchanged; a
+/// tensor-by-tensor identity between the VAE Krea loads and the VAE that fit was measured against is
+/// what makes that legitimate rather than a guess from a matching Rust type name.
+///
+/// Both inputs are required. There is no configuration of this row that passes without performing the
+/// comparison.
+#[test]
+#[ignore = "needs both snapshots (set KREA_TURBO_DIR and QWEN_IMAGE_VAE_FILE)"]
+fn krea_vae_matches_the_qwen_fit_vae_tensor_for_tensor() {
+    let turbo = required_path("KREA_TURBO_DIR");
+    let qwen_vae = required_path("QWEN_IMAGE_VAE_FILE");
+
+    // Re-pinned here rather than borrowed from the row above: this row must establish for itself that
+    // the file it compared is the file Krea loads.
+    let turbo_vae = vae_file(&turbo);
+    let turbo_sha = sha256_of(&turbo_vae);
+    eprintln!("Krea Turbo vae/  {turbo_sha}  {}", turbo_vae.display());
+    assert_eq!(
+        turbo_sha, KREA_VAE_SHA256,
+        "the Krea Turbo VAE is not the file the reused fit was grounded against"
     );
+
+    let qwen_sha = sha256_of(&qwen_vae);
+    eprintln!("Qwen-Image vae/  {qwen_sha}  {}", qwen_vae.display());
+    if qwen_sha != QWEN_IMAGE_MLX_VAE_SHA256 {
+        // Not a failure: the comparison below is dtype-agnostic by design, so a different container
+        // of the same values is a legitimate input. Said out loud so the log records which it was.
+        eprintln!(
+            "  note: not the pinned SceneWorks/qwen-image-mlx container \
+             ({QWEN_IMAGE_MLX_VAE_SHA256}) — the tensor comparison below is what decides"
+        );
+    }
 
     let krea_bytes = std::fs::read(&turbo_vae).expect("read the Krea VAE");
     let qwen_bytes = std::fs::read(&qwen_vae).expect("read the Qwen-Image VAE");
@@ -315,10 +358,9 @@ fn one_image(out: GenerationOutput) -> Image {
 #[test]
 #[ignore = "needs the real Krea 2 Turbo snapshot on a CUDA box (set KREA_TURBO_DIR)"]
 fn turbo_preview_frames_evolve_toward_the_final_image() {
-    let Some(root) = env_path("KREA_TURBO_DIR") else {
-        eprintln!("skipping: set KREA_TURBO_DIR");
-        return;
-    };
+    // Required, not skipped, for the same reason the provenance rows are: asking for `--ignored` is
+    // already the opt-in, and past that point a green row must mean the render happened.
+    let root = required_path("KREA_TURBO_DIR");
     let steps: u32 = std::env::var("KREA_PREVIEW_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())

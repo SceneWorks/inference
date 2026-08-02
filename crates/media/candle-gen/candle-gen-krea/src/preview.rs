@@ -335,17 +335,132 @@ mod tests {
 
     // --- Route inventory ---------------------------------------------------------------------------
 
-    /// Split a source file at each `run_flow_sampler(` and return, per call site, the argument text up
-    /// to the predict closure — the window the `preview` argument sits in.
-    fn sampler_call_sites(source: &str) -> Vec<&str> {
-        source
-            .split("run_flow_sampler(")
-            .skip(1)
-            .map(|rest| {
-                let end = rest.find("|x,").unwrap_or(rest.len());
-                &rest[..end]
-            })
-            .collect()
+    /// [`candle_gen::run_flow_sampler`]'s argument count before the predict closure. Pinned so a
+    /// signature change — or a scanner mis-split — fails this inventory loudly instead of quietly
+    /// shifting which argument "the one before the closure" names.
+    const SAMPLER_ARGUMENTS_BEFORE_PREDICT: usize = 8;
+
+    /// The arguments of every `run_flow_sampler(` call in `source`, one entry per call site, covering
+    /// the arguments **before** the predict closure — the window the `preview` argument sits in.
+    ///
+    /// The window is bounded by the call's own bracket balance and ends at the first top-level `|`
+    /// (the predict closure's parameter list). It deliberately does **not** key off a closure
+    /// parameter name. Bounding at a `|x,` literal was the earlier shape of this scan, and a route
+    /// naming that parameter anything else (`|latent,`, `|x_t,`) silently widened its window to the
+    /// next call site — or, for a file's last site, to end of file — swallowing its own closure body
+    /// and every comment after it. Any `Some(&preview)` in that text then satisfied the site,
+    /// including prose: a route left dark reported green. A missing bound is a **failure** here, not
+    /// a wider window.
+    ///
+    /// Comments are dropped and runs of whitespace collapse to one space, so each returned argument
+    /// is its source text on a single line. The match is textual, so writing `run_flow_sampler(` in
+    /// prose is read as a call site and fails the scan — name it without the paren in comments.
+    fn sampler_call_sites(file: &str, source: &str) -> Vec<Vec<String>> {
+        const CALL: &str = "run_flow_sampler(";
+        let mut sites = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(at) = source[cursor..].find(CALL) {
+            let args_start = cursor + at + CALL.len();
+            sites.push(sampler_call_arguments(
+                file,
+                sites.len(),
+                &source[args_start..],
+            ));
+            cursor = args_start;
+        }
+        sites
+    }
+
+    /// The comma-separated top-level arguments of one call, given everything after its open paren.
+    fn sampler_call_arguments(file: &str, index: usize, rest: &str) -> Vec<String> {
+        let site = format!("{file}: run_flow_sampler call #{index}");
+        let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut depth = 1usize;
+        let mut chars = rest.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                // Comments are not code: a `(` or a `|` inside one must not move the scan.
+                '/' if chars.peek() == Some(&'/') => {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                    current.push(' ');
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let (mut nesting, mut prev) = (1usize, '\0');
+                    for c in chars.by_ref() {
+                        match (prev, c) {
+                            ('/', '*') => (nesting, prev) = (nesting + 1, '\0'),
+                            ('*', '/') => {
+                                nesting -= 1;
+                                prev = '\0';
+                                if nesting == 0 {
+                                    break;
+                                }
+                            }
+                            _ => prev = c,
+                        }
+                    }
+                    assert_eq!(nesting, 0, "{site} has an unterminated block comment");
+                    current.push(' ');
+                }
+                // Nor are string literals.
+                '"' => {
+                    current.push('"');
+                    let mut escaped = false;
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        current.push(c);
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    assert!(closed, "{site} has an unterminated string literal");
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    assert!(
+                        depth > 0,
+                        "{site} closes without a predict closure — the scan cannot bound its \
+                         preview argument, so no assertion about that argument would mean anything"
+                    );
+                    current.push(ch);
+                }
+                ',' if depth == 1 => {
+                    args.push(normalize(&current));
+                    current.clear();
+                }
+                // The predict closure's parameter list: the argument window ends here, whatever that
+                // parameter is called.
+                '|' if depth == 1 => {
+                    let trailing = normalize(&current);
+                    assert!(
+                        trailing.is_empty(),
+                        "{site} has unparsed text {trailing:?} between its last argument and the \
+                         predict closure — the scan cannot be trusted to have found the preview \
+                         argument"
+                    );
+                    return args;
+                }
+                _ => current.push(ch),
+            }
+        }
+        panic!("{site} is unterminated: no predict closure and no closing paren before end of file")
     }
 
     /// Every shipped Krea **render** route emits previews. A route left unwired is a route that
@@ -367,7 +482,7 @@ mod tests {
                 1,
             ),
         ] {
-            let sites = sampler_call_sites(source);
+            let sites = sampler_call_sites(file, source);
             assert_eq!(
                 sites.len(),
                 expected,
@@ -376,8 +491,18 @@ mod tests {
                 sites.len()
             );
             for (index, args) in sites.iter().enumerate() {
-                assert!(
-                    args.contains("Some(&preview)"),
+                assert_eq!(
+                    args.len(),
+                    SAMPLER_ARGUMENTS_BEFORE_PREDICT,
+                    "{file} sampler site #{index}: expected \
+                     {SAMPLER_ARGUMENTS_BEFORE_PREDICT} arguments before the predict closure, \
+                     parsed {args:?}"
+                );
+                // Positional, not `contains`: the preview is the argument immediately before the
+                // predict closure, so this cannot be satisfied by the word appearing anywhere else.
+                assert_eq!(
+                    args.last().map(String::as_str),
+                    Some("Some(&preview)"),
                     "{file} sampler site #{index} does not pass a preview hook: {args:?}"
                 );
             }
@@ -387,13 +512,24 @@ mod tests {
     /// The trainer's periodic sample render is deliberately NOT a preview route: it renders a whole
     /// image for the training UI from a synthetic request that carries no sink. Pinned so the
     /// omission stays a decision rather than an oversight.
+    ///
+    /// Asserted as a **negative**. The trainer's window also holds the `None` passed as the sampler
+    /// name, so any `contains("None")` row here would pass whether or not the preview argument was
+    /// the thing that was `None` — it would stay green after somebody wired the trainer up.
     #[test]
     fn the_trainer_sample_render_is_deliberately_unhooked() {
-        let sites = sampler_call_sites(include_str!("training.rs"));
+        let sites = sampler_call_sites("training.rs", include_str!("training.rs"));
         assert_eq!(sites.len(), 1);
+        let args = &sites[0];
+        assert_eq!(args.len(), SAMPLER_ARGUMENTS_BEFORE_PREDICT, "{args:?}");
         assert!(
-            sites[0].contains("None,"),
-            "the trainer sample render has no PreviewSink to emit into"
+            !args.iter().any(|arg| arg.contains("preview")),
+            "the trainer sample render has no PreviewSink to emit into: {args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("None"),
+            "the trainer must pass no preview hook: {args:?}"
         );
     }
 
