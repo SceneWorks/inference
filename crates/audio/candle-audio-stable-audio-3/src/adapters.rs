@@ -445,6 +445,42 @@ impl AdapterPlan {
         self.by_target.values().map(Vec::len).sum()
     }
 
+    /// Copy an already-parsed and already-matched plan onto the compute device.
+    ///
+    /// Adapter files are resolved once, on the host, by the provider load path. Cold pipeline
+    /// construction must only move those retained factor tensors; re-running [`plan_for`] there
+    /// would parse every file and rebuild the same key-matching plan a second time. This transfer
+    /// performs no SVD: the `-xs` bases still come from the base weight later, in [`fold_one`].
+    pub fn to_device(&self, device: &Device) -> Result<Self> {
+        let mut by_target = BTreeMap::new();
+        for (key, ops) in &self.by_target {
+            let mut transferred = Vec::with_capacity(ops.len());
+            for op in ops {
+                let transfer = |tensor: &Option<Tensor>| -> Result<Option<Tensor>> {
+                    tensor
+                        .as_ref()
+                        .map(|tensor| tensor.to_device(device).map_err(AudioError::from))
+                        .transpose()
+                };
+                transferred.push(AdapterOp {
+                    kind: op.kind,
+                    effective_scale: op.effective_scale,
+                    rank: op.rank,
+                    module: AdapterModule {
+                        a: transfer(&op.module.a)?,
+                        b: transfer(&op.module.b)?,
+                        m: transfer(&op.module.m)?,
+                        magnitude_r: transfer(&op.module.magnitude_r)?,
+                        magnitude_c: transfer(&op.module.magnitude_c)?,
+                    },
+                    adapter_index: op.adapter_index,
+                });
+            }
+            by_target.insert(key.clone(), transferred);
+        }
+        Ok(Self { by_target })
+    }
+
     /// Resolve loaded adapters against a checkpoint's adaptable targets, in request order.
     ///
     /// # What this refuses, and why each refusal is loud

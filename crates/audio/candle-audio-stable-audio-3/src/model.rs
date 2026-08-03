@@ -45,8 +45,8 @@ use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
     AudioEdit, EditRegionSecs, ForwardedConditioning, ReferenceAudio, StableAudio3Pipeline,
-    SynthesisParameters, VariantGeometry, BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS,
-    DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
+    SynthesisParameters, ValidatedForwardedConditioning, VariantGeometry, BASE_DEFAULT_GUIDANCE,
+    BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -381,10 +381,10 @@ impl Variant {
     /// # The cost of that on medium, stated plainly
     ///
     /// It means a request that omits `audio.target_duration` renders **380 s** — a 6.3-minute track.
-    /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load, and extrapolating this
-    /// crate's own CPU-vs-Metal ratio, ≈ 10–16 minutes on CPU. The smalls' unspecified-duration render
-    /// is 120 s / ≈ 10 s on Metal, so this is an order of magnitude more expensive for the same
-    /// omission.
+    /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load. The ≈ 10–16 minute CPU
+    /// figure is an estimate inferred from small-model CPU throughput, not a measured 380 s render.
+    /// The smalls' unspecified-duration render is 120 s / ≈ 10 s on Metal, so this is an order of
+    /// magnitude more expensive for the same omission.
     ///
     /// It is kept anyway. A shorter default only for medium would make three ids in one family obey
     /// two different rules for the same missing field, which is a worse contract than an expensive
@@ -404,9 +404,9 @@ impl Variant {
     /// `stable_audio_3_medium_base` inherits the same 380 s default *and* the base operating point
     /// of 50 Euler steps at guidance 7, which is a batch-2 CFG forward per step. That is 100 DiT
     /// forwards where post-trained medium does 8 — **12.5x** the example-work, on the same 380 s of
-    /// audio. Extrapolating medium's measured 92 s Metal render at 380 s / 8 steps, an omitted
-    /// `audio.target_duration` on this id is on the order of **20 minutes** of Metal compute, and
-    /// correspondingly worse on CPU. The default is still not special-cased, for the reason above:
+    /// audio. Extrapolating medium's measured 92 s Metal render at 380 s / 8 steps gives an
+    /// **estimated, not measured**, **20 minutes** of Metal compute when `audio.target_duration` is
+    /// omitted, and correspondingly worse on CPU. The default is still not special-cased, for the reason above:
     /// six ids in one family obeying two rules for the same missing field is a worse contract than
     /// one expensive uniform rule, and no shorter number follows from anything but taste.
     pub const fn default_duration_secs(self) -> f32 {
@@ -1453,6 +1453,28 @@ pub fn audio_edit_for(request: &GenerationRequest) -> Option<AudioEdit<'_>> {
     })
 }
 
+/// Bundle conditioning for the production synthesis entry after [`validate_request`] succeeds.
+///
+/// The wrapper type is accepted only by `synthesize_conditioned_validated`; the public defensive
+/// entry takes the unwrapped receipt. That makes routing a validated provider request back through
+/// the duplicate source scan a compile-time type mismatch.
+fn validated_conditioning_for(request: &GenerationRequest) -> ValidatedForwardedConditioning<'_> {
+    ValidatedForwardedConditioning::new(ForwardedConditioning {
+        request_has_reference: request
+            .conditioning
+            .iter()
+            .any(|item| matches!(item, Conditioning::ReferenceAudio { .. })),
+        request_has_edit: request.conditioning.iter().any(|item| {
+            matches!(
+                item,
+                Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+            )
+        }),
+        reference: reference_audio_for(request),
+        edit: audio_edit_for(request),
+    })
+}
+
 /// Validate a request against one variant's own descriptor, without a snapshot.
 ///
 /// `Generator::validate` needs a loaded generator, which needs multi-gigabyte weights; every
@@ -1511,6 +1533,13 @@ pub(crate) fn validate_request(
         )));
     }
     let method = request.guidance_method.as_deref();
+    if let Some(eta) = request.guidance_eta {
+        if !eta.is_finite() || !(0.0..=1.0).contains(&eta) {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: guidance_eta {eta} outside the finite inclusive range 0..=1"
+            )));
+        }
+    }
     if request.guidance_eta.is_some() && method != Some("apg") {
         return Err(gen_core::Error::Unsupported(format!(
             "{model_id}: guidance_eta is only supported with guidance_method=apg"
@@ -1952,13 +1981,12 @@ pub struct StableAudio3Generator {
     variant: Variant,
     descriptor: ModelDescriptor,
     root: PathBuf,
-    /// The caller's adapter stack, in request order (sc-14550).
+    /// The caller's adapter stack, parsed and matched exactly once on the host at load time.
     ///
-    /// Kept as *specs* rather than as a resolved plan because the plan's tensors must live on the
-    /// compute device, and the device is not chosen until the lazy [`Self::pipeline`] path runs.
-    /// `load_variant` still resolves the identical stack on the host first, so a malformed or
-    /// mismatched adapter fails at **load** rather than at first generate.
-    adapters: Vec<AdapterSpec>,
+    /// The lazy pipeline copies this plan's tensors to the selected compute device. Retaining the
+    /// plan rather than the [`AdapterSpec`] paths preserves fail-fast key-mismatch rejection while
+    /// ensuring cold start cannot re-read adapter files or rebuild their target matching.
+    adapter_plan: crate::adapters::AdapterPlan,
     pipeline: Mutex<Option<Arc<StableAudio3Pipeline>>>,
     generation: Mutex<()>,
 }
@@ -1994,7 +2022,7 @@ impl StableAudio3Generator {
         // window observes it between pins instead of after the full load.
         verify_snapshot_identity(self.variant, &layout.root, Some(cancel))?;
         let device = resolve_device(DevicePolicy::Default)?;
-        let plan = resolve_adapter_plan(&layout, &self.adapters, &device)?;
+        let plan = self.adapter_plan.to_device(&device)?;
         let pipeline = Arc::new(StableAudio3Pipeline::from_layout_with_adapters(
             &layout,
             self.variant.geometry(),
@@ -2051,17 +2079,18 @@ pub fn load_variant(expected: Variant, spec: &LoadSpec) -> gen_core::Result<Stab
     crate::pipeline::validate_layout(&layout, expected.geometry())?;
     // No request is in flight on the load path, so there is no cancel flag to honour here.
     verify_snapshot_identity(expected, &layout.root, None)?;
-    // Resolve the adapter stack against this checkpoint *now*, on the host, and throw the result
-    // away. The plan the pipeline actually folds is rebuilt on the compute device, but doing the
-    // work here is what makes a malformed, mistyped, pickle-format, or key-mismatched adapter fail
+    // Resolve the adapter stack against this checkpoint *now*, on the host, and retain the result.
+    // The lazy pipeline only moves this plan's tensors to the compute device; it never re-opens the
+    // adapter paths or rebuilds target matching. Resolving here is what makes a malformed,
+    // mistyped, pickle-format, or key-mismatched adapter fail
     // at `load_variant` — the moment the caller can still act on it — instead of at the first
     // generate, minutes later, behind a snapshot hash and a cold start.
-    resolve_adapter_plan(&layout, &spec.adapters, &Device::Cpu)?;
+    let adapter_plan = resolve_adapter_plan(&layout, &spec.adapters, &Device::Cpu)?;
     Ok(StableAudio3Generator {
         variant: expected,
         descriptor: descriptor_for(expected),
         root,
-        adapters: spec.adapters.clone(),
+        adapter_plan,
         pipeline: Mutex::new(None),
         generation: Mutex::new(()),
     })
@@ -2186,21 +2215,8 @@ impl Generator for StableAudio3Generator {
         // unguarded, which is the same shape one seam further along. There is deliberately no
         // `match` selecting a synthesis method: that one entry point takes the whole receipt and
         // decides internally, so there is no arm for an edit to be routed into.
-        let conditioning = ForwardedConditioning {
-            request_has_reference: request
-                .conditioning
-                .iter()
-                .any(|item| matches!(item, Conditioning::ReferenceAudio { .. })),
-            request_has_edit: request.conditioning.iter().any(|item| {
-                matches!(
-                    item,
-                    Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
-                )
-            }),
-            reference: reference_audio_for(request),
-            edit: audio_edit_for(request),
-        };
-        let samples = pipeline.synthesize_conditioned(
+        let conditioning = validated_conditioning_for(request);
+        let samples = pipeline.synthesize_conditioned_validated(
             &request.prompt,
             request.negative_prompt.as_deref(),
             parameters,
@@ -2671,6 +2687,15 @@ mod tests {
             .map(|variant| by_name(variant.pins(), "model.safetensors").bytes)
             .collect();
         assert_eq!(lengths.len(), 2, "{lengths:?}");
+        assert_eq!(
+            Variant::Medium
+                .pins()
+                .iter()
+                .map(|pin| pin.bytes)
+                .sum::<u64>(),
+            10_443_755_936,
+            "the documented medium artifact pin set must remain exact"
+        );
     }
 
     #[test]
@@ -2777,6 +2802,42 @@ mod tests {
             let mut invalid = request();
             invalid.guidance = Some(GUIDANCE_RANGE.1 + 0.1);
             assert!(validate_request(variant, &descriptor, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn guidance_eta_requires_a_finite_inclusive_unit_interval() {
+        for variant in VARIANTS {
+            let descriptor = descriptor_for(variant);
+            for endpoint in [0.0, 1.0] {
+                let mut valid = request();
+                valid.guidance_method = Some("apg".into());
+                valid.guidance_eta = Some(endpoint);
+                validate_request(variant, &descriptor, &valid).unwrap_or_else(|error| {
+                    panic!(
+                        "{} must accept guidance_eta endpoint {endpoint}: {error}",
+                        variant.model_id()
+                    )
+                });
+            }
+            for invalid in [
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                -f32::EPSILON,
+                1.0 + f32::EPSILON,
+            ] {
+                let mut request = request();
+                request.guidance_method = Some("apg".into());
+                request.guidance_eta = Some(invalid);
+                let error = validate_request(variant, &descriptor, &request)
+                    .expect_err("non-finite and out-of-range guidance_eta values must be refused");
+                assert!(
+                    error.to_string().contains("guidance_eta"),
+                    "{} guidance_eta {invalid}: {error}",
+                    variant.model_id()
+                );
+            }
         }
     }
 

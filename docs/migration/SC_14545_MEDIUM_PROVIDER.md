@@ -212,10 +212,11 @@ roughly `[2.09, 2.79)` and fails at `3.0`. The gate's actual rejection points ar
 constant: below 57.5% (rms), 51.6% (peak), 40.3% (hf emphasis) and 26.6% (side ratio) of the
 committed F32 minimum. It is a gross-degradation gate, not a fine parity bound, and says so.
 
-The text side was never part of this decision. sc-14537 pinned BF16-on-disk / F32-compute / one BF16
-rounding at the raw-embedding boundary, and `tests/text_oracle.rs` gates it against the frozen
-Transformers 5.8.0 oracle on CPU and Metal. Moving T5Gemma to BF16 *compute* would move a surface
-with a numeric parity gate behind it for 281 MB of a 10.4 GB resident set.
+The text side was never part of this decision. sc-14537 pinned BF16-on-disk / F32-compute; CPU keeps
+the raw output F32, while Metal and CUDA apply one BF16 rounding at the raw-embedding boundary before
+F32 conditioning. `tests/text_oracle.rs` gates that policy against the frozen Transformers 5.8.0
+oracle. Moving T5Gemma to BF16 *compute* would move a surface with a numeric parity gate behind it
+for 281 MB of the exact 10,443,755,936-byte medium artifact pin set.
 
 ### Decision 3 — domain metadata
 
@@ -250,8 +251,9 @@ Wall clock is reported as a range across three runs on the same machine rather t
 machine load, so a single figure would overstate the precision. Nothing in this PR gates on it.
 
 Process peak resident set across all three renders plus the load: **19,380,846,592 B (18.05 GiB)**,
-reproduced at 19,380,813,824 B on the previous run — a 32 KB spread. That covers the 10.4 GB of
-packed Metal weight buffers plus the 380-second activation and decode working set. Darwin's `peak
+reproduced at 19,380,813,824 B on the previous run — a 32 KB spread. That covers the
+10,443,755,936-byte pinned artifact set in packed Metal weight buffers plus the 380-second
+activation and decode working set. Darwin's `peak
 memory footprint`, which excludes clean file-backed pages, is **17,463,895,112 B (16.26 GiB)**.
 
 **How this is measured, and why the first figure survived re-measurement.** Adversarial review
@@ -271,8 +273,8 @@ output, a genuine two-channel image, and neither the white-noise nor the pure-to
 
 Same machine, `--release`, no `metal` feature, so `candle_audio::default_device()` resolves to
 `Device::Cpu`. Wall clock is the whole test, which includes the cold start (snapshot load plus the
-two SHA-256 passes over 10.4 GB of pinned files — measured at ≈ 42.7 s here, against ≈ 6.9 s over the
-smalls' 3.45 GB).
+two SHA-256 passes over 10,443,755,936 bytes of pinned files — measured at ≈ 42.7 s here, against
+≈ 6.9 s over the smalls' 3.45 GB).
 
 | duration | steps | wall clock | peak RSS |
 |---:|---:|---:|---:|
@@ -284,8 +286,9 @@ smalls' 3.45 GB).
 Netting the cold start out of the 30 s / 8-step point leaves ≈ 55.5 s of generation, against ≈ 5.3 s
 for the same configuration on Metal (the 25-render calibration sweep completes in 161.79 s including
 one load). **CPU is ≈ 10× slower**, i.e. ≈ 0.54× realtime at 30 s / 8 steps, where Metal runs at
-≈ 5.7× realtime. Extrapolating the ratio, a 380-second render that takes 57–92 s on Metal would take
-≈ 10–16 minutes on CPU.
+≈ 5.7× realtime. Extrapolating the ratio gives a **10–16 minute estimate** for a 380-second CPU
+render. That number is inferred from small-model CPU throughput and the measured 57–92 s Metal
+render; it is not a measurement of a 380-second CPU render.
 
 That is slow, and it is not unusable — so CPU stays registered and no lane returns
 `Error::Unsupported`. Removing it would delete the only lane available on a machine without an
