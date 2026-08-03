@@ -283,7 +283,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     locks_seen: list[str] = []
     for line_number, command, install_match in install_lines:
         prefix = f"line {line_number}"
-        for required_flag in ("--only-binary=:all:", "--require-hashes"):
+        for required_flag in (
+            "--isolated",
+            "--only-binary=:all:",
+            "--require-hashes",
+        ):
             if required_flag not in command:
                 errors.append(f"{prefix}: missing {required_flag}")
         if command.endswith(("\\", "^")):
@@ -320,6 +324,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             r"(?:^|\s)--target\s+(?:\"[^\"]+\"|'[^']+'|\S+)", "", before_lock
         )
         for allowed_flag in (
+            "--isolated",
             "--disable-pip-version-check",
             "--only-binary=:all:",
             "--require-hashes",
@@ -417,11 +422,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_pip_policy_discriminates_bypass_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         canonical_macos_install = (
-            "python3 -m pip install --disable-pip-version-check "
+            "python3 -m pip install --isolated --disable-pip-version-check "
             "--only-binary=:all: --require-hashes --target \"$PYTHONPATH\" "
             f"-r {MACOS_HUB_LOCK}"
         )
         mutations = {
+            "missing isolated mode": workflow.replace(" --isolated", "", 1),
             "missing hashes": workflow.replace(" --require-hashes", "", 1),
             "missing binary only": workflow.replace(" --only-binary=:all:", "", 1),
             "new inline install": workflow
