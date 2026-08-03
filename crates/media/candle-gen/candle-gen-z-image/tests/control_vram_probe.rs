@@ -149,6 +149,9 @@ fn measure_z_image_base_control_tier() {
         use_pid: false,
         memory,
         cancel: candle_gen::gen_core::CancelFlag::new(),
+        // Inert: this probe measures VRAM, not the preview stream (epic 16948, sc-16957). The preview
+        // stream has its own real-weight harness, `tests/preview_real_weights.rs`.
+        preview: candle_gen::gen_core::PreviewSink::default(),
     };
     let mut reference = None;
     for repeat in 0..repeats {
