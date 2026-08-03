@@ -449,7 +449,7 @@ impl AdapterPlan {
     /// Adapter files are resolved once, on the host, by the provider load path. Cold pipeline
     /// construction must only move those retained factor tensors; re-running [`plan_for`] there
     /// would parse every file and rebuild the same key-matching plan a second time. This transfer
-    /// performs no SVD: the `-xs` bases still come from the base weight later, in [`fold_one`].
+    /// performs no SVD: the `-xs` bases still come from the base weight later, during folding.
     pub fn to_device(&self, device: &Device) -> Result<Self> {
         let mut by_target = BTreeMap::new();
         for (key, ops) in &self.by_target {
