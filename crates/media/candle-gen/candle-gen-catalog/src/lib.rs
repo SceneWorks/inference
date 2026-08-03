@@ -201,13 +201,28 @@ mod preview_advertising {
     /// than hide it behind a family name. sc-16959's Sana base and Sprint will be two rows for the
     /// same reason — they run different drivers and carry different fits.
     ///
-    /// Krea (sc-16950) plus Qwen-Image (sc-16952). Qwen-Image contributes exactly **one** row even
-    /// though sc-16952 wired three render routes: the crate registers a single generator descriptor
-    /// (`qwen_image`), and its edit and ControlNet/Fun lanes are bespoke providers the worker drives
-    /// by name — they carry a `preview` field on their own request types rather than a descriptor,
-    /// so there is no second id to advertise. The derived half still holds all three to account:
-    /// the route inventory on `candle-gen-qwen-image` below pins one hooked site per lane.
-    const PREVIEW_ROUTE_IDS: &[&str] = &["krea_2_turbo", "krea_2_raw", "krea_2_edit", "qwen_image"];
+    /// Krea (sc-16950), Qwen-Image (sc-16952) and Anima (sc-16953). The two Qwen-family entries are
+    /// the two directions in which ids and render lanes fail to correspond, which is why neither may
+    /// ever be inferred from the other:
+    ///
+    /// * **Qwen-Image contributes one row for three lanes.** The crate registers a single generator
+    ///   descriptor (`qwen_image`); its edit and ControlNet/Fun lanes are bespoke providers the worker
+    ///   drives by name, carrying a `preview` field on their own request types rather than a
+    ///   descriptor, so there is no second id to advertise. The derived half still holds all three to
+    ///   account: the route inventory on `candle-gen-qwen-image` below pins one hooked site per lane.
+    /// * **Anima contributes three rows for one lane.** `anima_base`, `anima_aesthetic` and
+    ///   `anima_turbo` are three registered descriptors over one architecture, differing only in the
+    ///   DiT weights file, and they share a single `pipeline::AnimaPipeline::generate` body — so one
+    ///   hooked sampler site wires all three at once, and the inventory below pins exactly one.
+    const PREVIEW_ROUTE_IDS: &[&str] = &[
+        "krea_2_turbo",
+        "krea_2_raw",
+        "krea_2_edit",
+        "qwen_image",
+        "anima_base",
+        "anima_aesthetic",
+        "anima_turbo",
+    ];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
     /// re-measured: an RGB fit is a property of a VAE latent space, not of a backend.
@@ -312,7 +327,16 @@ mod preview_advertising {
             dir: "candle-gen-anima",
             register: candle_gen_anima::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16953's inventory: one hooked `run_flow_sampler` site, in the single txt2img render
+            // lane all three variants share. No dark site — this crate has no trainer and no second
+            // denoise — and no direct emission, because `preview.rs` holds only the 5-D Cosmos →
+            // `[1, C, h, w]` layout adaptation in front of the reused QwenVae fit.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 1,
+                direct: 0,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-bernini",

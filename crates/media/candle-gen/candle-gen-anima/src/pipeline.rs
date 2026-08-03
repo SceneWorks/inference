@@ -4,12 +4,12 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{runtime::CancelFlag, Image, Progress, WeightsSource};
+use candle_gen::gen_core::{runtime::CancelFlag, Image, PreviewSink, Progress, WeightsSource};
 use candle_gen::{CandleError, Result};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
+use crate::config::{Variant, LATENT_TEMPORAL_AXIS, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
 use crate::loader::AnimaComponents;
 
 /// Anima's default flow solver: the recommended **ER-SDE-3** (`er_sde`, sc-10519), matching the MLX
@@ -62,6 +62,13 @@ pub struct GenOptions {
     pub seed: u64,
     /// Curated sampler name; `None` ⇒ [`DEFAULT_SAMPLER`].
     pub sampler: Option<String>,
+    /// The caller's live per-step latent preview sink (epic 16948, sc-16953), carried here rather
+    /// than as a further positional argument to [`AnimaPipeline::generate`] so the hook is built
+    /// next to the sampler call it feeds and the two cannot drift apart.
+    ///
+    /// [`PreviewSink::default`] is inert and costs one branch per denoise evaluation — see
+    /// [`crate::preview`] for what the hook is allowed to see.
+    pub preview: PreviewSink,
 }
 
 /// The assembled Anima pipeline.
@@ -162,6 +169,16 @@ impl AnimaPipeline {
             Ok(v.to_dtype(DType::F32)?)
         };
 
+        // Per-step latent preview (epic 16948, sc-16953). Opting in is the sc-16949 projector hook
+        // and nothing else: the driver owns frame numbering, multi-eval dedup and the
+        // swallow-on-failure contract, so this loop is unchanged and an inert sink costs one branch
+        // per evaluation. The running latent is the 5-D Cosmos `[1, 16, 1, H/8, W/8]` — the projector
+        // drops the same length-1 temporal axis the decode tail below squeezes, then applies the
+        // reused QwenVae fit. Built here, per driver call, so a batched request's second image starts
+        // a fresh trajectory at frame 1. CFG (when `uncond` is `Some`) runs entirely inside `predict`
+        // and returns one combined velocity, so no unconditional half ever becomes the running latent.
+        let preview = crate::preview::hook(&opts.preview);
+
         let latent = candle_gen::run_flow_sampler(
             sampler,
             TimestepConvention::Sigma,
@@ -170,14 +187,14 @@ impl AnimaPipeline {
             opts.seed,
             cancel,
             on_progress,
-            None,
+            Some(&preview),
             predict,
         )?;
 
         on_progress(Progress::Decoding);
         // The Cosmos latent is 5-D `[1,16,1,H/8,W/8]`; the QwenVae decode is NCHW — drop the length-1
         // temporal axis. VAE applies the baked latents_mean/std de-norm → `[1,3,H,W]` f32 in `[-1,1]`.
-        let latent_nchw = latent.squeeze(2)?;
+        let latent_nchw = latent.squeeze(LATENT_TEMPORAL_AXIS)?;
         let decoded = self.components.vae.decode(&latent_nchw)?;
         to_image(&decoded)
     }
