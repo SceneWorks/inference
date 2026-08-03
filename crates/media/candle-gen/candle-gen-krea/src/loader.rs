@@ -106,7 +106,17 @@ impl Weights {
     /// shared per-user external cache documented by [`PackedWeightSidecars`]. A complete valid cache is
     /// reused read-only without creating or acquiring its preparation lock.
     pub fn from_dir(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
-        Self::from_dir_impl(dir, device, dtype, None)
+        Self::from_dir_impl(dir, device, dtype, None, None)
+    }
+
+    /// Request-time component open that preserves the shared sidecar preparation cancellation seam.
+    pub fn from_dir_cancelable(
+        dir: &Path,
+        device: &Device,
+        dtype: DType,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> Result<Self> {
+        Self::from_dir_impl(dir, device, dtype, None, Some(cancel))
     }
 
     /// Load a component while choosing the non-model cache root used when `dir` is read-only.
@@ -119,7 +129,7 @@ impl Weights {
         dtype: DType,
         external_cache_root: &Path,
     ) -> Result<Self> {
-        Self::from_dir_impl(dir, device, dtype, Some(external_cache_root))
+        Self::from_dir_impl(dir, device, dtype, Some(external_cache_root), None)
     }
 
     fn from_dir_impl(
@@ -127,6 +137,7 @@ impl Weights {
         device: &Device,
         dtype: DType,
         external_cache_root: Option<&Path>,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
     ) -> Result<Self> {
         let files = candle_gen::sorted_safetensors(dir, "krea")
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
@@ -134,11 +145,15 @@ impl Weights {
         let st = unsafe { MmapedSafetensors::multi(&files)? };
         let packed = read_packed_config(dir)?;
         let sidecars = packed
-            .map(|cfg| match external_cache_root {
-                Some(root) => PackedWeightSidecars::prepare_with_external_cache_root(
+            .map(|cfg| match (external_cache_root, cancel) {
+                (Some(root), None) => PackedWeightSidecars::prepare_with_external_cache_root(
                     &st, dir, cfg, device, root,
                 ),
-                None => PackedWeightSidecars::prepare(&st, dir, cfg, device),
+                (None, Some(cancel)) => {
+                    PackedWeightSidecars::prepare_cancelable(&st, dir, cfg, device, cancel)
+                }
+                (None, None) => PackedWeightSidecars::prepare(&st, dir, cfg, device),
+                (Some(_), Some(_)) => unreachable!("no public API combines these policies"),
             })
             .transpose()?;
         Ok(Self {

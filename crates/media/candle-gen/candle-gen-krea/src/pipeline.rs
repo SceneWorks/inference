@@ -350,24 +350,48 @@ fn pid_to_load(pid_spec: Option<&PidWeights>, use_pid: bool) -> Option<&PidWeigh
 /// weights are already bf16, so f32 merely widened them; a snapshot whose TE is a wider dtype keeps its
 /// **f32** store rather than being silently truncated to bf16 (the compute is f32 either way — the
 /// encoder upcasts each projection — so both render correctly; only the resident footprint differs).
+#[cfg(test)]
 fn load_te_weights(root: &Path, device: &Device) -> Result<Weights> {
+    load_te_weights_cancelable(root, device, None)
+}
+
+fn load_te_weights_cancelable(
+    root: &Path,
+    device: &Device,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> Result<Weights> {
     let dir = root.join("text_encoder");
-    let w = Weights::from_dir(&dir, device, TE_STORE_DTYPE)?;
+    let open = |dtype| match cancel {
+        Some(cancel) => Weights::from_dir_cancelable(&dir, device, dtype, cancel),
+        None => Weights::from_dir(&dir, device, dtype),
+    };
+    let w = open(TE_STORE_DTYPE)?;
     if w.get_native("language_model.layers.0.input_layernorm.weight")?
         .dtype()
         == TE_STORE_DTYPE
     {
         Ok(w)
     } else {
-        Ok(Weights::from_dir(&dir, device, DType::F32)?)
+        Ok(open(DType::F32)?)
     }
 }
 
 pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
+    load_text_cancelable(root, device, None)
+}
+
+fn load_text_cancelable(
+    root: &Path,
+    device: &Device,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> Result<KreaText> {
+    if let Some(cancel) = cancel {
+        candle_gen::check_cancel(cancel)?;
+    }
     let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
 
     let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = load_te_weights(root, device)?;
+    let te_w = load_te_weights_cancelable(root, device, cancel)?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
     Ok(KreaText {
@@ -426,8 +450,22 @@ fn load_dit(
     adapters: &[AdapterSpec],
     stream_blocks: bool,
 ) -> Result<Krea2Transformer> {
+    load_dit_cancelable(root, device, adapters, stream_blocks, None)
+}
+
+fn load_dit_cancelable(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> Result<Krea2Transformer> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let transformer_dir = root.join("transformer");
+    let mut dit_w = match cancel {
+        Some(cancel) => Weights::from_dir_cancelable(&transformer_dir, device, DIT_DTYPE, cancel)?,
+        None => Weights::from_dir(&transformer_dir, device, DIT_DTYPE)?,
+    };
     crate::convert::validate_transformer(&dit_w, &cfg)?;
     // ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`) full-weight deltas fold into the dense baseline
     // weights (the 12→1 `text_fusion.projector` filter-bypass, front-end projections) BEFORE the DiT
@@ -666,7 +704,7 @@ pub(crate) fn render_three_stage(
         gen_core::MemoryPhase::Conditioning,
         on_progress,
     )?;
-    let text = load_text(root, device)?;
+    let text = load_text_cancelable(root, device, Some(&req.cancel))?;
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
     drop(text);
@@ -679,7 +717,13 @@ pub(crate) fn render_three_stage(
         gen_core::MemoryPhase::Denoise,
         on_progress,
     )?;
-    let dit = load_dit(root, device, adapters, memory.stream_transformer_blocks)?;
+    let dit = load_dit_cancelable(
+        root,
+        device,
+        adapters,
+        memory.stream_transformer_blocks,
+        Some(&req.cancel),
+    )?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = turbo_sigmas(steps);
@@ -690,7 +734,10 @@ pub(crate) fn render_three_stage(
         &native,
     );
     let attention_budget = if memory.chunk_attention {
-        CONSTRAINED_ATTN_SCORES_BUDGET
+        memory
+            .attention_chunk_size
+            .map(|value| value as usize)
+            .unwrap_or(CONSTRAINED_ATTN_SCORES_BUDGET)
     } else {
         candle_gen::ATTN_SCORES_BUDGET
     };
@@ -735,18 +782,17 @@ pub(crate) fn render_three_stage(
     drop(context);
 
     candle_gen::check_cancel(&req.cancel)?;
-    // `Renderer` remains the stable public load-phase name for heavy components. Emitting it again
-    // marks the separately loaded decoder without expanding the exhaustive public enum.
-    on_progress(Progress::Loading(gen_core::LoadPhase::Renderer));
-    let vae = load_vae(root, device)?;
+    let vae = open_decode_component(req, memory, on_progress, || load_vae(root, device))?;
     let images = latents
         .iter()
         .map(|latent| {
             candle_gen::check_cancel(&req.cancel)?;
             enter_decode_boundary(req, memory, on_progress)?;
-            let decoded = vae
-                .decode_with(latent, memory.tile_vae_decode)?
-                .to_dtype(DType::F32)?;
+            let tile = memory.tile_vae_decode.then_some((
+                memory.decode_tile_edge.unwrap_or(512),
+                memory.decode_overlap.unwrap_or(128),
+            ));
+            let decoded = vae.decode_with_tile(latent, tile)?.to_dtype(DType::F32)?;
             to_image(&decoded)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -765,6 +811,25 @@ fn enter_decode_boundary(
     // flag raised there before starting the expensive, otherwise non-interruptible VAE decode.
     candle_gen::check_cancel(&req.cancel)?;
     maybe_inject_calibration_error(memory, gen_core::MemoryPhase::Decode)
+}
+
+fn open_decode_component<T>(
+    req: &GenerationRequest,
+    memory: gen_core::GenerationMemory,
+    on_progress: &mut dyn FnMut(Progress),
+    open: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    // `Renderer` remains the stable public load-phase name for heavy components. The memory phase is
+    // nevertheless Decode: cancellation and calibration faults at this loading callback must fire
+    // before the VAE maps or materializes any weights.
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::Renderer,
+        gen_core::MemoryPhase::Decode,
+        on_progress,
+    )?;
+    open()
 }
 
 fn enter_loading_boundary(
@@ -2055,6 +2120,45 @@ mod tests {
         )
         .expect_err("decode-boundary cancellation must be observed");
         assert!(matches!(error, CandleError::Canceled));
+    }
+
+    #[test]
+    fn decode_loading_cancel_and_fault_prevent_vae_open() {
+        use std::cell::Cell;
+
+        for fault in [false, true] {
+            let request = GenerationRequest {
+                prompt: "test".to_owned(),
+                ..Default::default()
+            };
+            let mut memory = gen_core::GenerationMemory::default();
+            if fault {
+                memory.authorize_calibration_fault(gen_core::MemoryPhase::Decode);
+            }
+            let cancel = request.cancel.clone();
+            let opens = Cell::new(0usize);
+            let error = open_decode_component(
+                &request,
+                memory,
+                &mut |progress| {
+                    assert_eq!(progress, Progress::Loading(gen_core::LoadPhase::Renderer));
+                    if !fault {
+                        cancel.cancel();
+                    }
+                },
+                || {
+                    opens.set(opens.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("decode loading boundary must stop before the VAE open");
+            assert_eq!(opens.get(), 0);
+            if fault {
+                assert!(error.to_string().contains("Decode"));
+            } else {
+                assert!(matches!(error, CandleError::Canceled));
+            }
+        }
     }
 
     #[test]

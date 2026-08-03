@@ -19,6 +19,10 @@
 //! [`QStorage::from_data`] copies it to the device before the mapping is dropped. First creation is
 //! deliberately projection-at-a-time, bounding the q8 dense conversion transient to one projection.
 //! A complete valid cache is opened read-only without creating or acquiring the preparation lock.
+//! After one full validation, a process-local memo keyed by canonical component/cache/config identity
+//! plus source and artifact metadata makes an unchanged reopen metadata/header-only: it hashes zero
+//! source and payload bytes. Any identity or open/header mismatch drops back to the full serialized
+//! validation and recovery path.
 //! Missing or corrupt entries still take the exclusive-lock path so recovery and publication remain
 //! serialized. The external root can be supplied explicitly or through
 //! `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`; otherwise the platform's per-user cache directory is used.
@@ -28,6 +32,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::safetensors::MmapedSafetensors;
@@ -56,7 +62,7 @@ struct SidecarEntry {
     payload_bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PreparedProjection {
     entry_base: String,
     source_hex: String,
@@ -72,18 +78,50 @@ struct PreparedProjection {
     source_bytes: usize,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct FileIdentity {
+    path: PathBuf,
+    len: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ValidationMemoKey {
+    component_dir: PathBuf,
+    cache_identity: PathBuf,
+    bits: usize,
+    group_size: usize,
+    base_prefix: Option<String>,
+    sources: Vec<FileIdentity>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidationMemoValue {
+    projections: Vec<PreparedProjection>,
+    cache_dir: PathBuf,
+    artifacts: Vec<FileIdentity>,
+}
+
+fn validation_memo() -> &'static Mutex<HashMap<ValidationMemoKey, ValidationMemoValue>> {
+    static MEMO: OnceLock<Mutex<HashMap<ValidationMemoKey, ValidationMemoValue>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Prepared device-format sidecars for every MLX-packed projection in one component.
 ///
-/// Construction performs all source hashing and any missing conversions. [`Self::load`] touches only
-/// the sidecar: it does not retain or consult the source `MmapedSafetensors`, which is the property a
+/// A cold construction performs all source hashing and any missing conversions; an unchanged
+/// process-local warm reopen uses the validated metadata memo. [`Self::load`] touches only the
+/// sidecar: it does not retain or consult the source `MmapedSafetensors`, which is the property a
 /// block-window loader needs in order to exclude format conversion from the per-window path.
 #[derive(Debug)]
 pub struct PackedWeightSidecars {
     entries: HashMap<String, SidecarEntry>,
+    prepared: Vec<PreparedProjection>,
     cache_dir: PathBuf,
     created: usize,
     reused: usize,
     source_bytes_hashed: u64,
+    payload_bytes_hashed: u64,
     sidecar_bytes: u64,
 }
 
@@ -201,31 +239,59 @@ impl PackedWeightSidecars {
             )));
         }
 
+        let memo_key = validation_memo_key(
+            component_dir,
+            external_cache_root,
+            bits,
+            group_size,
+            base_prefix,
+        )?;
+        if let Some(value) = validation_memo_hit(&memo_key, cancel)? {
+            return Ok(reused_cache(value.projections, value.cache_dir, 0, 0));
+        }
+
         let projections =
             prepare_projections(source, component_dir, bits, group_size, cancel, base_prefix)?;
         let source_bytes_hashed = projections.iter().fold(0u64, |sum, projection| {
             sum.saturating_add(projection.source_bytes as u64)
         });
 
-        // The common warm path is deliberately read-only: validate every expected content address
-        // before attempting create_dir_all or opening the writable lock. Published files are
-        // immutable, so a complete valid set needs no coordination with writers.
+        // A memo miss still takes the lock-free, read-only full validation path before attempting
+        // create_dir_all or opening the writable lock. Published files are immutable, so a complete
+        // valid set needs no coordination with writers.
         let adjacent_cache = component_dir.join(CACHE_DIR);
-        if cache_is_complete(&adjacent_cache, &projections, cancel)? {
-            return Ok(reused_cache(
+        let mut payload_bytes_hashed = 0u64;
+        if cache_is_complete(
+            &adjacent_cache,
+            &projections,
+            cancel,
+            &mut payload_bytes_hashed,
+        )? {
+            let cache = reused_cache(
                 projections,
                 adjacent_cache,
                 source_bytes_hashed,
-            ));
+                payload_bytes_hashed,
+            );
+            remember_validation(&memo_key, &cache)?;
+            return Ok(cache);
         }
 
         let external_cache = external_cache_dir(component_dir, external_cache_root);
-        if cache_is_complete(&external_cache, &projections, cancel)? {
-            return Ok(reused_cache(
+        if cache_is_complete(
+            &external_cache,
+            &projections,
+            cancel,
+            &mut payload_bytes_hashed,
+        )? {
+            let cache = reused_cache(
                 projections,
                 external_cache,
                 source_bytes_hashed,
-            ));
+                payload_bytes_hashed,
+            );
+            remember_validation(&memo_key, &cache)?;
+            return Ok(cache);
         }
 
         // Prefer the historical model-adjacent location when it is writable. A caller-provisioned
@@ -276,6 +342,7 @@ impl PackedWeightSidecars {
             })?;
         }
 
+        let prepared = projections.clone();
         let mut entries = HashMap::with_capacity(projections.len());
         let mut created = 0usize;
         let mut reused = 0usize;
@@ -287,7 +354,12 @@ impl PackedWeightSidecars {
                 projection.source_hex, projection.dtype_name
             ));
 
-            let valid = validate_sidecar(&path, projection.payload_bytes, cancel)?;
+            let valid = validate_sidecar_counted(
+                &path,
+                projection.payload_bytes,
+                cancel,
+                &mut payload_bytes_hashed,
+            )?;
             if valid {
                 reused += 1;
             } else {
@@ -305,7 +377,12 @@ impl PackedWeightSidecars {
                     device,
                 )?;
                 check_cancel(cancel)?;
-                if !validate_sidecar(&path, projection.payload_bytes, cancel)? {
+                if !validate_sidecar_counted(
+                    &path,
+                    projection.payload_bytes,
+                    cancel,
+                    &mut payload_bytes_hashed,
+                )? {
                     return Err(Error::Msg(format!(
                         "device-format sidecar: freshly written artifact {} failed validation",
                         path.display()
@@ -326,14 +403,18 @@ impl PackedWeightSidecars {
             );
         }
 
-        Ok(Self {
+        let cache = Self {
             entries,
+            prepared,
             cache_dir,
             created,
             reused,
             source_bytes_hashed,
+            payload_bytes_hashed,
             sidecar_bytes,
-        })
+        };
+        remember_validation(&memo_key, &cache)?;
+        Ok(cache)
     }
 
     /// Materialize one already-converted projection on `device` from its mapped sidecar bytes.
@@ -404,6 +485,12 @@ impl PackedWeightSidecars {
 
     pub fn source_bytes_hashed(&self) -> u64 {
         self.source_bytes_hashed
+    }
+
+    /// Payload bytes hashed while validating artifacts during this open. A process-local validated
+    /// warm reopen reports zero; a cold-process validation reports the bytes it actually inspected.
+    pub fn payload_bytes_hashed(&self) -> u64 {
+        self.payload_bytes_hashed
     }
 
     pub fn sidecar_bytes(&self) -> u64 {
@@ -517,6 +604,7 @@ fn cache_is_complete(
     cache_dir: &Path,
     projections: &[PreparedProjection],
     cancel: Option<&CancelFlag>,
+    payload_bytes_hashed: &mut u64,
 ) -> Result<bool> {
     if !cache_dir.is_dir() {
         return Ok(false);
@@ -527,7 +615,12 @@ fn cache_is_complete(
             "{}.{}.safetensors",
             projection.source_hex, projection.dtype_name
         ));
-        let valid = validate_sidecar(&path, projection.payload_bytes, cancel)?;
+        let valid = validate_sidecar_counted(
+            &path,
+            projection.payload_bytes,
+            cancel,
+            payload_bytes_hashed,
+        )?;
         check_cancel(cancel)?;
         if !valid {
             return Ok(false);
@@ -540,7 +633,9 @@ fn reused_cache(
     projections: Vec<PreparedProjection>,
     cache_dir: PathBuf,
     source_bytes_hashed: u64,
+    payload_bytes_hashed: u64,
 ) -> PackedWeightSidecars {
+    let prepared = projections.clone();
     let reused = projections.len();
     let mut entries = HashMap::with_capacity(reused);
     let mut sidecar_bytes = 0u64;
@@ -563,10 +658,12 @@ fn reused_cache(
     }
     PackedWeightSidecars {
         entries,
+        prepared,
         cache_dir,
         created: 0,
         reused,
         source_bytes_hashed,
+        payload_bytes_hashed,
         sidecar_bytes,
     }
 }
@@ -631,6 +728,126 @@ fn default_external_cache_root() -> PathBuf {
     // containers. This last-resort cache is content-validated before every use; deployments that
     // need a durable or policy-controlled location should set the documented override.
     std::env::temp_dir().join("sceneworks-candle-cache")
+}
+
+fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    let metadata = fs::metadata(path)?;
+    let modified_nanos = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(FileIdentity {
+        path: fs::canonicalize(path)?,
+        len: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn validation_memo_key(
+    component_dir: &Path,
+    external_cache_root: Option<&Path>,
+    bits: usize,
+    group_size: usize,
+    base_prefix: Option<&str>,
+) -> Result<ValidationMemoKey> {
+    let component_dir = fs::canonicalize(component_dir).map_err(|error| {
+        Error::Msg(format!(
+            "device-format sidecar: canonicalize component {}: {error}",
+            component_dir.display()
+        ))
+    })?;
+    let mut source_paths = Vec::new();
+    for entry in fs::read_dir(&component_dir)? {
+        let path = entry?.path();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !file_name.starts_with("._")
+            && path.extension().and_then(|ext| ext.to_str()) == Some("safetensors")
+        {
+            source_paths.push(path);
+        }
+    }
+    source_paths.sort();
+    let sources = source_paths
+        .iter()
+        .map(|path| file_identity(path))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let cache_identity = external_cache_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_external_cache_root);
+    let cache_identity = fs::canonicalize(&cache_identity).unwrap_or(cache_identity);
+    Ok(ValidationMemoKey {
+        component_dir,
+        cache_identity,
+        bits,
+        group_size,
+        base_prefix: base_prefix.map(str::to_owned),
+        sources,
+    })
+}
+
+fn validation_memo_hit(
+    key: &ValidationMemoKey,
+    cancel: Option<&CancelFlag>,
+) -> Result<Option<ValidationMemoValue>> {
+    check_cancel(cancel)?;
+    let value = validation_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .cloned();
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let current_artifacts = value
+        .artifacts
+        .iter()
+        .map(|identity| file_identity(&identity.path))
+        .collect::<std::io::Result<Vec<_>>>();
+    let headers_valid = current_artifacts.as_ref().is_ok_and(|current| {
+        current == &value.artifacts
+            && value.projections.iter().all(|projection| {
+                let path = value.cache_dir.join(format!(
+                    "{}.{}.safetensors",
+                    projection.source_hex, projection.dtype_name
+                ));
+                validate_sidecar_header(&path, projection.payload_bytes)
+            })
+    });
+    check_cancel(cancel)?;
+    if headers_valid {
+        Ok(Some(value))
+    } else {
+        validation_memo()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+        Ok(None)
+    }
+}
+
+fn remember_validation(key: &ValidationMemoKey, cache: &PackedWeightSidecars) -> Result<()> {
+    let mut artifacts = cache
+        .entries
+        .values()
+        .map(|entry| file_identity(&entry.path))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    artifacts.sort_by(|a, b| a.path.cmp(&b.path));
+    validation_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            key.clone(),
+            ValidationMemoValue {
+                projections: cache.prepared.clone(),
+                cache_dir: cache.cache_dir.clone(),
+                artifacts,
+            },
+        );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -981,6 +1198,33 @@ fn validate_sidecar(
     payload_bytes: usize,
     cancel: Option<&CancelFlag>,
 ) -> Result<bool> {
+    let mut payload_bytes_hashed = 0;
+    validate_sidecar_counted(path, payload_bytes, cancel, &mut payload_bytes_hashed)
+}
+
+fn validate_sidecar_header(path: &Path, payload_bytes: usize) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    // SAFETY: header-only validation maps an immutable, atomically published cache artifact.
+    let Ok(mapped) = (unsafe { MmapedSafetensors::new(path) }) else {
+        return false;
+    };
+    matches!(
+        mapped.get(PAYLOAD_KEY),
+        Ok(view) if view.dtype() == SafeDtype::U8 && view.data().len() == payload_bytes
+    ) && matches!(
+        mapped.get(PAYLOAD_HASH_KEY),
+        Ok(view) if view.dtype() == SafeDtype::U8 && view.data().len() == 32
+    )
+}
+
+fn validate_sidecar_counted(
+    path: &Path,
+    payload_bytes: usize,
+    cancel: Option<&CancelFlag>,
+    payload_bytes_hashed: &mut u64,
+) -> Result<bool> {
     check_cancel(cancel)?;
     if !path.is_file() {
         return Ok(false);
@@ -998,6 +1242,7 @@ fn validate_sidecar(
         Ok(view) if view.dtype() == SafeDtype::U8 && view.data().len() == 32 => view,
         _ => return Ok(false),
     };
+    *payload_bytes_hashed = payload_bytes_hashed.saturating_add(payload.data().len() as u64);
     let actual_hash = validation_payload_digest(payload.data(), cancel)?;
     check_cancel(cancel)?;
     Ok(stored_hash.data() == actual_hash)
@@ -1234,6 +1479,10 @@ mod tests {
             );
 
             let cancel = CancelFlag::new();
+            validation_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             // Deterministic mutation hook: cancel after hashing the first payload chunk. This proves
             // the error originates inside artifact validation, not before source hashing or between
             // the two entries, without relying on scheduler timing.
@@ -1327,6 +1576,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unchanged_external_cache_warm_reopen_hashes_zero_bytes() -> Result<()> {
+        let component = TestDir::new("external-warm-component");
+        let external = TestDir::new("external-warm-root");
+        let source_path = write_source(&component.0, 4, 0.0)?;
+        let source = open(&source_path)?;
+        fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let first = PackedWeightSidecars::prepare_with_external_cache_root(
+            &source,
+            &component.0,
+            packed,
+            &Device::Cpu,
+            &external.0,
+        )?;
+        assert!(first.cache_dir().starts_with(&external.0));
+        let warm = PackedWeightSidecars::prepare_with_external_cache_root(
+            &source,
+            &component.0,
+            packed,
+            &Device::Cpu,
+            &external.0,
+        )?;
+        assert_eq!(warm.source_bytes_hashed(), 0);
+        assert_eq!(warm.payload_bytes_hashed(), 0);
+        assert_eq!(warm.reused_count(), 1);
+        Ok(())
+    }
+
     fn write_rank3_source(dir: &Path, bits: usize) -> Result<PathBuf> {
         let mut weights = Vec::new();
         let mut scales = Vec::new();
@@ -1372,6 +1653,8 @@ mod tests {
         let cache = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
         assert_eq!(cache.created_count(), 1);
         assert_eq!(cache.reused_count(), 0);
+        assert!(cache.source_bytes_hashed() > 0);
+        assert!(cache.payload_bytes_hashed() > 0);
         assert!(cache.contains("layers.0.proj"));
         let sidecar_path = cache.path_for("layers.0.proj").unwrap();
         assert!(sidecar_path.is_file());
@@ -1397,6 +1680,8 @@ mod tests {
         let reused = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
         assert_eq!(reused.created_count(), 0);
         assert_eq!(reused.reused_count(), 1);
+        assert_eq!(reused.source_bytes_hashed(), 0);
+        assert_eq!(reused.payload_bytes_hashed(), 0);
         for _ in 0..3 {
             assert_eq!(
                 reused.load("layers.0.proj", &Device::Cpu)?.data()?.as_ref(),
@@ -1511,6 +1796,52 @@ mod tests {
             b_cache.path_for("layers.0.proj").unwrap().file_name(),
             "invalidation must follow source bytes, not a timestamp"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn same_source_path_metadata_change_invalidates_the_process_memo() -> Result<()> {
+        let dir = TestDir::new("same-path-source-change");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let first_path = {
+            let source = open(&source_path)?;
+            PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?
+                .path_for("layers.0.proj")
+                .unwrap()
+                .to_path_buf()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_source(&dir.0, 4, 0.25)?;
+        let source = open(&source_path)?;
+        let changed = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        assert!(changed.source_bytes_hashed() > 0);
+        assert_ne!(changed.path_for("layers.0.proj").unwrap(), first_path);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_metadata_change_forces_full_validation_before_reuse() -> Result<()> {
+        let dir = TestDir::new("artifact-metadata-change");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source = open(&source_path)?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let first = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
+        let bytes = fs::read(&artifact)?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&artifact, bytes)?;
+        let reopened = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        assert_eq!(reopened.created_count(), 0);
+        assert_eq!(reopened.reused_count(), 1);
+        assert!(reopened.source_bytes_hashed() > 0);
+        assert!(reopened.payload_bytes_hashed() > 0);
         Ok(())
     }
 
