@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import json
 import types
 import unittest
 from pathlib import Path
@@ -227,6 +228,26 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
                 mutated[key] = value
                 with self.assertRaises(self.module.InvalidOracle):
                     self.module._validate_manifest_file_record(mutated, path)
+
+    def test_bundle_verify_reuses_the_file_records_already_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            records = [
+                {"name": name, "bytes": index + 1, "sha256": f"hash-{index}"}
+                for index, name in enumerate(self.module.EXPECTED_FILES)
+            ]
+            (output / self.module.MANIFEST).write_text(
+                json.dumps({"files": records}), encoding="utf-8"
+            )
+            with (
+                mock.patch.object(self.module, "_revision", return_value="a" * 40),
+                mock.patch.object(self.module, "_validate_manifest_header"),
+                mock.patch.object(self.module, "_validate_files", return_value=records),
+                mock.patch.object(self.module, "_sha256") as digest,
+                mock.patch("builtins.print"),
+            ):
+                self.module.verify(output, output, output)
+            digest.assert_not_called()
 
     def test_every_float_tensor_must_be_finite(self) -> None:
         class Tensor:

@@ -440,10 +440,26 @@ def load_manifest(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _validate_take_filename(filename: object) -> str:
+    """Accept only a non-special basename, never a path supplied by the manifest."""
+    if not isinstance(filename, str) or not filename or filename in {".", ".."}:
+        raise ValueError(f"invalid listening take filename: {filename!r}")
+    path = Path(filename)
+    if (
+        path.is_absolute()
+        or path.name != filename
+        or "/" in filename
+        or "\\" in filename
+    ):
+        raise ValueError(f"listening take file must be a basename: {filename!r}")
+    return filename
+
+
 def index_takes(manifest: dict) -> dict:
     """Group manifest takes by `(stimulus, seed)` -> `{variant: entry}`."""
     grouped: dict[tuple[str, int], dict[str, dict]] = {}
     for take in manifest["takes"]:
+        _validate_take_filename(take.get("file"))
         grouped.setdefault((take["stimulus"], take["seed"]), {})[take["variant"]] = take
     return grouped
 
@@ -599,6 +615,26 @@ def materialize(playlists: dict, key: dict, source_dir: Path, out_dir: Path) -> 
     Copies rather than symlinks: a symlink's target is the variant-bearing filename, and an
     operator inspecting the presentation directory would be unblinded by `ls -l`.
     """
+    # Resolve every source before creating the first destination directory. This makes a malformed
+    # filename, missing take, or source symlink escape an all-or-nothing preflight failure.
+    source_root = source_dir.resolve(strict=True)
+    filenames = set()
+    for design in key["listeners"].values():
+        for trial in design["abx"]:
+            filenames.update((trial["a"], trial["b"]))
+        for screen in design["ratings"]:
+            filenames.update(slot["file"] for slot in screen["slots"])
+    sources: dict[str, Path] = {}
+    for raw_name in filenames:
+        filename = _validate_take_filename(raw_name)
+        try:
+            resolved = (source_root / filename).resolve(strict=True)
+        except OSError as error:
+            raise ValueError(f"listening take is unavailable: {filename!r}") from error
+        if not resolved.is_relative_to(source_root) or not resolved.is_file():
+            raise ValueError(f"listening take escapes source directory: {filename!r}")
+        sources[filename] = resolved
+
     written = 0
     for listener, playlist in playlists.items():
         listener_dir = out_dir / listener
@@ -607,11 +643,11 @@ def materialize(playlists: dict, key: dict, source_dir: Path, out_dir: Path) -> 
         for blind, trial in zip(playlist["abx"], design["abx"]):
             source = {"a": trial["a"], "b": trial["b"], "x": trial[trial["x_is"]]}
             for slot in ("a", "b", "x"):
-                shutil.copyfile(source_dir / source[slot], listener_dir / blind[slot])
+                shutil.copyfile(sources[source[slot]], listener_dir / blind[slot])
                 written += 1
         for blind, screen in zip(playlist["ratings"], design["ratings"]):
             for name, slot in zip(blind["slots"], screen["slots"]):
-                shutil.copyfile(source_dir / slot["file"], listener_dir / name)
+                shutil.copyfile(sources[slot["file"]], listener_dir / name)
                 written += 1
     return written
 

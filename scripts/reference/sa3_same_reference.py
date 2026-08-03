@@ -22,6 +22,11 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+try:
+    from sa3_reference import sha256_file, tensor_records, validate_upstream_checkout
+except ModuleNotFoundError:
+    from .sa3_reference import sha256_file, tensor_records, validate_upstream_checkout
+
 
 UPSTREAM_COMMIT = "124e8a799f57a1f665495ecb72e547d0a62867f1"
 UPSTREAM_REPOSITORY = "https://github.com/Stability-AI/stable-audio-3.git"
@@ -167,14 +172,6 @@ class InvalidReference(RuntimeError):
     pass
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def load_json(path: Path):
     def reject_duplicates(pairs):
         value = {}
@@ -266,26 +263,13 @@ def require_revision(path: Path, revision: str, label: str) -> None:
 
 
 def validate_upstream(path: Path) -> None:
-    revision = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
-    if revision != UPSTREAM_COMMIT:
-        raise InvalidReference(
-            f"upstream revision mismatch: {revision}, expected {UPSTREAM_COMMIT}"
-        )
-    status = subprocess.run(
-        ["git", "-C", str(path), "status", "--porcelain=v1", "--untracked-files=all"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.splitlines()
-    if any(not line.endswith(" .venv/") for line in status):
-        raise InvalidReference(f"upstream checkout is not clean: {status}")
+    validate_upstream_checkout(
+        path,
+        UPSTREAM_COMMIT,
+        error_type=InvalidReference,
+        allow_venv=True,
+        include_ignored=False,
+    )
 
 
 def runtime(upstream: Path):
@@ -438,24 +422,6 @@ def run_decode_with_saved_noise(torch, autoencoder, latents, override_stride=Non
     batch = latents.shape[0]
     mask = noises[1].reshape(batch, -1, noises[1].shape[-1]) * 0.01
     return decoded, noises[0], mask
-
-
-def tensor_records(torch, tensors):
-    from safetensors.torch import save
-
-    records = {}
-    for name, value in tensors.items():
-        value = value.detach().cpu().contiguous()
-        payload_bytes = value.numel() * value.element_size()
-        serialized = save({"x": value})
-        records[name] = {
-            "dtype": str(value.dtype).removeprefix("torch."),
-            "shape": list(value.shape),
-            "sha256": hashlib.sha256(
-                serialized[-payload_bytes:] if payload_bytes else b""
-            ).hexdigest(),
-        }
-    return records
 
 
 def save_artifact(torch, save_file, path: Path, tensors):

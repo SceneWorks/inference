@@ -280,11 +280,19 @@ def _validate_manifest_header(
         raise InvalidOracle("Mage oracle manifest header/population is incomplete or stale")
 
 
-def _validate_manifest_file_record(record: dict, path: Path) -> None:
+def _validate_manifest_file_record(
+    record: dict, path: Path, actual: dict[str, object] | None = None
+) -> None:
+    if actual is None:
+        actual = {
+            "name": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
     if (
         type(record.get("bytes")) is not int
-        or record.get("sha256") != _sha256(path)
-        or record["bytes"] != path.stat().st_size
+        or record.get("sha256") != actual["sha256"]
+        or record["bytes"] != actual["bytes"]
     ):
         raise InvalidOracle(f"{path.name} hash/size differs from the manifest")
 
@@ -500,7 +508,9 @@ def verify(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
         raise InvalidOracle("Mage oracle manifest file population is incomplete or stale")
     for record in records:
         manifest_record = expected[record["name"]]
-        _validate_manifest_file_record(manifest_record, output / record["name"])
+        _validate_manifest_file_record(
+            manifest_record, output / record["name"], actual=record
+        )
     print(f"verified {len(records)} CPU Mage oracles for revision {revision} under {output}")
 
 
