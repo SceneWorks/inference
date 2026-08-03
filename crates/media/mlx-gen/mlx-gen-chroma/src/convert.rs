@@ -9,9 +9,10 @@
 //! * The transformer's own `x_embedder` / `context_embedder` / top-level `proj_out` and the entire
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
-//! * T5 progressively packs every group-quantizable 2-D weight as a primary Q4/Q8 term plus a
-//!   Q4-packed reconstruction residual, including its token embedding and shared relative-position
-//!   bias. RMSNorm scales remain dense because affine quantization does not target vectors.
+//! * T5 progressively packs every group-quantizable 2-D weight as a primary Q8 term plus a packed
+//!   reconstruction residual. Large attention/FFN projections use Q4 residuals; the shared token
+//!   embedding and relative-position bias use small Q8 residuals. RMSNorm scales remain dense
+//!   because affine quantization does not target vectors.
 //! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
@@ -26,7 +27,7 @@ use std::path::Path;
 use mlx_rs::Array;
 
 use mlx_gen::quant::{
-    copy_dir, copy_turnkey_assets, quantize_map, quantize_map_with_residual, save_map,
+    copy_dir, copy_turnkey_assets, quantize_map, quantize_map_with_residual_policy, save_map,
     write_quantized_config,
 };
 use mlx_gen::weights::Weights;
@@ -40,8 +41,28 @@ use crate::quant::GROUP_SIZE;
 /// changes.
 const TRANSFORMER_FILE: &str = "diffusion_pytorch_model.safetensors";
 const AUXILIARY_FILE: &str = "model.safetensors";
+/// Chroma's immutable packed auxiliary width. Q4/Q8 is a transformer tier choice; T5 and VAE use
+/// Q8 in both tiers to preserve the measured image-quality envelope.
+pub const AUXILIARY_BITS: i32 = 8;
+/// Chroma's immutable T5 affine group size, selected by the hosted quality calibration.
+pub const T5_GROUP_SIZE: i32 = 32;
 /// The second-stage packed correction applied to Chroma's Q8 T5 surface.
 pub const T5_RESIDUAL_BITS: i32 = 4;
+/// The higher-fidelity correction used only for T5 tables reused across the full residual stream.
+pub const T5_SENSITIVE_RESIDUAL_BITS: i32 = 8;
+/// Exact packed bases whose small Q8 residuals protect the T5 input and attention-bias boundaries.
+pub const T5_SENSITIVE_RESIDUAL_BASES: &[&str] = &[
+    "shared",
+    "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+];
+
+pub fn t5_residual_bits_for(base: &str) -> i32 {
+    if T5_SENSITIVE_RESIDUAL_BASES.contains(&base) {
+        T5_SENSITIVE_RESIDUAL_BITS
+    } else {
+        T5_RESIDUAL_BITS
+    }
+}
 
 // ============================================================================================
 // Pack predicate (operates on the **base** = the on-disk key minus its `.weight`).
@@ -103,7 +124,7 @@ fn is_t5_target(_base: &str) -> bool {
 
 /// FLUX.1 VAE packed surface: encoder/decoder mid-block attention QKV/out projections. Convolutions
 /// and GroupNorms remain dense; the shared Z-Image VAE loader packed-detects these keys.
-fn is_vae_target(base: &str) -> bool {
+pub(crate) fn is_vae_target(base: &str) -> bool {
     base.ends_with(".to_q")
         || base.ends_with(".to_k")
         || base.ends_with(".to_v")
@@ -156,12 +177,12 @@ fn quantize_t5_component(src: &Path, dst: &Path, bits: i32, group_size: i32) -> 
         )));
     }
     std::fs::create_dir_all(dst)?;
-    let map = quantize_map_with_residual(
+    let map = quantize_map_with_residual_policy(
         load_component_map(src)?,
         bits,
-        T5_RESIDUAL_BITS,
         group_size,
         is_t5_target,
+        t5_residual_bits_for,
     )?;
     save_map(&dst.join(AUXILIARY_FILE), &map)?;
     write_quantized_config(src, dst, bits, group_size)?;
@@ -174,6 +195,10 @@ fn quantize_t5_component(src: &Path, dst: &Path, bits: i32, group_size: i32) -> 
             ))
         })?;
     config["quantization"]["residual_bits"] = serde_json::json!(T5_RESIDUAL_BITS);
+    config["quantization"]["sensitive_residual_bits"] =
+        serde_json::json!(T5_SENSITIVE_RESIDUAL_BITS);
+    config["quantization"]["sensitive_residual_bases"] =
+        serde_json::json!(T5_SENSITIVE_RESIDUAL_BASES);
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).map_err(|error| {
@@ -196,12 +221,12 @@ fn quantize_t5_component(src: &Path, dst: &Path, bits: i32, group_size: i32) -> 
 /// tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion — mirror it; see
 /// the tier builder in `tests/prequantize_real_weights.rs`).
 pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
-    prequantize_turnkey_with_t5_group_size(src_root, dst_root, bits, GROUP_SIZE)
+    prequantize_turnkey_with_t5_group_size(src_root, dst_root, bits, T5_GROUP_SIZE)
 }
 
-/// As [`prequantize_turnkey`], with an explicit T5 group size for real-weight calibration. The DiT
-/// and VAE retain Chroma's established group size; only the independently resident T5 artifact uses
-/// `t5_group_size` and records it in `text_encoder/config.json` for the loader.
+/// Compatibility seam for callers that used the calibration-era API. Shipping policy is immutable,
+/// so any group size other than [`T5_GROUP_SIZE`] is rejected rather than producing an artifact the
+/// Chroma loader should not accept.
 pub fn prequantize_turnkey_with_t5_group_size(
     src_root: &Path,
     dst_root: &Path,
@@ -213,9 +238,9 @@ pub fn prequantize_turnkey_with_t5_group_size(
             "chroma convert: bits must be 4 or 8, got {bits}"
         )));
     }
-    if !matches!(t5_group_size, 32 | 64) {
+    if t5_group_size != T5_GROUP_SIZE {
         return Err(Error::Msg(format!(
-            "chroma convert: T5 group size must be 32 or 64, got {t5_group_size}"
+            "chroma convert: T5 group size must be {T5_GROUP_SIZE}, got {t5_group_size}"
         )));
     }
     if dst_root.exists() {
@@ -284,14 +309,14 @@ fn prequantize_turnkey_into(
     quantize_t5_component(
         &src_root.join("text_encoder"),
         &dst_root.join("text_encoder"),
-        bits,
+        AUXILIARY_BITS,
         t5_group_size,
     )?;
     quantize_component(
         &src_root.join("vae"),
         &dst_root.join("vae"),
         AUXILIARY_FILE,
-        bits,
+        AUXILIARY_BITS,
         GROUP_SIZE,
         is_vae_target,
     )?;
@@ -324,11 +349,11 @@ mod tests {
             missing,
             Path::new("unused-chroma-output"),
             8,
-            128,
+            64,
         )
         .unwrap_err()
         .to_string();
-        assert!(invalid_group.contains("T5 group size must be 32 or 64"));
+        assert!(invalid_group.contains("T5 group size must be 32"));
 
         let destination = std::env::temp_dir().join(format!(
             "mlx-gen-chroma-existing-destination-{}",
@@ -467,45 +492,60 @@ mod tests {
     }
 
     #[test]
-    fn t5_progressive_pack_matches_two_stage_affine_quantization() {
-        let base = "encoder.block.0.layer.1.DenseReluDense.wi_0";
+    fn t5_progressive_pack_matches_selective_two_stage_affine_quantization() {
         let weight = Array::from_slice(
             &(0..64 * 128)
                 .map(|i| ((i as f32) * 0.017).cos())
                 .collect::<Vec<_>>(),
             &[64, 128],
         );
-        let wbf16 = weight.as_dtype(Dtype::Bfloat16).unwrap();
-        let (primary_weight, primary_scales, primary_biases) =
-            quantize(&wbf16, GROUP_SIZE, 8).unwrap();
-        let restored = dequantize(
-            &primary_weight,
-            &primary_scales,
-            &primary_biases,
-            GROUP_SIZE,
+        let mut map = HashMap::new();
+        for base in ["encoder.block.0.layer.1.DenseReluDense.wi_0", "shared"] {
+            map.insert(format!("{base}.weight"), weight.clone());
+        }
+        let out = quantize_map_with_residual_policy(
+            map,
             8,
+            GROUP_SIZE,
+            is_t5_target,
+            t5_residual_bits_for,
         )
         .unwrap();
-        let residual = subtract(&wbf16, &restored).unwrap();
-        let (residual_weight, residual_scales, residual_biases) =
-            quantize(&residual, GROUP_SIZE, T5_RESIDUAL_BITS).unwrap();
-        let mut map = HashMap::new();
-        map.insert(format!("{base}.weight"), weight);
-        let out =
-            quantize_map_with_residual(map, 8, T5_RESIDUAL_BITS, GROUP_SIZE, is_t5_target).unwrap();
-        for (suffix, expected) in [
-            ("weight", &primary_weight),
-            ("scales", &primary_scales),
-            ("biases", &primary_biases),
-            ("residual.weight", &residual_weight),
-            ("residual.scales", &residual_scales),
-            ("residual.biases", &residual_biases),
-        ] {
-            assert!(
-                byte_equal(out.get(&format!("{base}.{suffix}")).unwrap(), expected),
-                "progressive tensor mismatch: {suffix}"
-            );
+        for base in ["encoder.block.0.layer.1.DenseReluDense.wi_0", "shared"] {
+            let wbf16 = weight.as_dtype(Dtype::Bfloat16).unwrap();
+            let (primary_weight, primary_scales, primary_biases) =
+                quantize(&wbf16, GROUP_SIZE, 8).unwrap();
+            let restored = dequantize(
+                &primary_weight,
+                &primary_scales,
+                &primary_biases,
+                GROUP_SIZE,
+                8,
+            )
+            .unwrap();
+            let residual = subtract(&wbf16, &restored).unwrap();
+            let residual_bits = t5_residual_bits_for(base);
+            let (residual_weight, residual_scales, residual_biases) =
+                quantize(&residual, GROUP_SIZE, residual_bits).unwrap();
+            for (suffix, expected) in [
+                ("weight", &primary_weight),
+                ("scales", &primary_scales),
+                ("biases", &primary_biases),
+                ("residual.weight", &residual_weight),
+                ("residual.scales", &residual_scales),
+                ("residual.biases", &residual_biases),
+            ] {
+                assert!(
+                    byte_equal(out.get(&format!("{base}.{suffix}")).unwrap(), expected),
+                    "progressive tensor mismatch for {base}: {suffix}"
+                );
+            }
         }
+        assert_eq!(t5_residual_bits_for("shared"), 8);
+        assert_eq!(
+            t5_residual_bits_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
+            4
+        );
     }
 
     /// The packed triple a block Linear becomes is byte-identical to the op the load-time `.quantize`

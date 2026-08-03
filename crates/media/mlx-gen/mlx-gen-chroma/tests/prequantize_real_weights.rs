@@ -8,8 +8,10 @@
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
 //! converter packs the **DiT `transformer/` block Linears**, every group-quantizable T5-XXL 2-D
 //! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer
-//! and uses q8 T5 primaries plus q4-packed T5 residuals because hosted image calibration rejects
-//! single-term q4 and q8 quality; both routes load without a full dense auxiliary transient. A
+//! and uses q8 T5 primaries plus q4-packed T5 residuals for the large projection surface and
+//! q8-packed residuals for the shared embedding/relative bias because hosted image calibration
+//! rejects uniform single- and two-term policies; both routes load without a full dense auxiliary
+//! transient. A
 //! packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
 //! tier is the mirrored source, loaded directly.
@@ -20,9 +22,9 @@
 //!
 //! Env knobs: SC8777_SRC (source snapshot dir; default the cached Chroma1-Base snapshot),
 //! SC8777_OUT (tier output dir), SC8777_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8777_MODEL
-//! (registry id: `chroma1_base` default / `chroma1_hd` / `chroma1_flash`), SC8777_KEEP (retain the
-//! tier), SC16462_AUX_BITS (optional T5/VAE bit width for mixed-precision shipping evidence), and
-//! SC16462_T5_GROUP_SIZE (optional T5 affine group size; 64 by default).
+//! (registry id: `chroma1_base` default / `chroma1_hd` / `chroma1_flash`), and SC8777_KEEP (retain
+//! the tier). The provider fixes T5/VAE at Q8 and the T5 affine group size at 32; those shipping
+//! choices are intentionally not environment-selectable.
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
@@ -73,18 +75,12 @@ fn bits_env() -> i32 {
         .unwrap_or(4)
 }
 
-fn auxiliary_bits_env(route_bits: i32) -> i32 {
-    std::env::var("SC16462_AUX_BITS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(route_bits)
+fn auxiliary_bits() -> i32 {
+    mlx_gen_chroma::convert::AUXILIARY_BITS
 }
 
-fn t5_group_size_env() -> i32 {
-    std::env::var("SC16462_T5_GROUP_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(mlx_gen::quant::DEFAULT_GROUP_SIZE)
+fn t5_group_size() -> i32 {
+    mlx_gen_chroma::convert::T5_GROUP_SIZE
 }
 
 fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
@@ -99,13 +95,8 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
             "refusing to reuse incomplete packed destination {}",
             out.display()
         );
-        mlx_gen_chroma::convert::prequantize_turnkey_with_t5_group_size(
-            src,
-            out,
-            bits,
-            t5_group_size_env(),
-        )
-        .expect("prequantize_turnkey succeeds");
+        mlx_gen_chroma::convert::prequantize_turnkey(src, out, bits)
+            .expect("prequantize_turnkey succeeds");
     }
     for component in ["transformer", "text_encoder", "vae"] {
         let config: serde_json::Value = serde_json::from_str(
@@ -116,14 +107,14 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
         let expected_bits = if component == "transformer" {
             bits
         } else {
-            auxiliary_bits_env(bits)
+            auxiliary_bits()
         };
         assert_eq!(
             config["quantization"]["bits"], expected_bits,
             "{component} packed bit-width provenance"
         );
         let expected_group_size = if component == "text_encoder" {
-            t5_group_size_env()
+            t5_group_size()
         } else {
             mlx_gen::quant::DEFAULT_GROUP_SIZE
         };
@@ -136,6 +127,16 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
                 config["quantization"]["residual_bits"],
                 mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
                 "T5 progressive residual bit-width provenance"
+            );
+            assert_eq!(
+                config["quantization"]["sensitive_residual_bits"],
+                mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BITS,
+                "T5 sensitive residual bit-width provenance"
+            );
+            assert_eq!(
+                config["quantization"]["sensitive_residual_bases"],
+                serde_json::json!(mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BASES),
+                "T5 sensitive residual surface provenance"
             );
         }
         let safetensors = std::fs::read_dir(out.join(component))
@@ -179,6 +180,7 @@ enum T5ProbePolicy {
     Dense,
     Q8Q4Progressive,
     Q8Q4ProgressiveGroup32,
+    Q8Q4ProgressiveSensitiveQ8Group32,
     Q8Q8Progressive,
     Q8Linears,
     Q8Except { block: usize, sublayer: T5Sublayer },
@@ -200,15 +202,14 @@ fn t5_probe_outputs(
     match policy {
         T5ProbePolicy::Dense => {}
         T5ProbePolicy::Q8Q4Progressive => t5
-            .quantize_progressive(
-                8,
-                mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
-                t5_group_size_env(),
-            )
+            .quantize_progressive(8, mlx_gen_chroma::convert::T5_RESIDUAL_BITS, 64)
             .expect("load-time progressive T5 quantization"),
         T5ProbePolicy::Q8Q4ProgressiveGroup32 => t5
             .quantize_progressive(8, 4, 32)
             .expect("load-time group-32 progressive T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveSensitiveQ8Group32 => t5
+            .quantize_progressive_with_sensitive_residuals(8, 4, 8, 32)
+            .expect("load-time group-32 selective-residual T5 quantization"),
         T5ProbePolicy::Q8Q8Progressive => t5
             .quantize_progressive(8, 8, 64)
             .expect("load-time Q8+Q8 progressive T5 quantization"),
@@ -282,7 +283,8 @@ fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>
     let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     if let Some(bits) = quantize_at_load {
-        mlx_gen_chroma::loader::quantize_t5_for_dense_source(&mut t5, bits, t5_group_size_env())
+        assert_eq!(bits, auxiliary_bits(), "dense T5 seam is provider-owned Q8");
+        mlx_gen_chroma::loader::quantize_t5_for_dense_source(&mut t5)
             .expect("load-time complete progressive T5 quantization");
     }
     let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
@@ -331,7 +333,13 @@ fn vae_output(
     reset_peak_memory();
     let mut vae = mlx_gen_chroma::loader::load_vae(root).expect("VAE weights");
     if let Some(bits) = quantize_at_load {
-        vae.quantize(bits).expect("load-time VAE quantization");
+        assert_eq!(
+            bits,
+            auxiliary_bits(),
+            "dense VAE seam is provider-owned Q8"
+        );
+        mlx_gen_chroma::loader::quantize_vae_for_dense_source(&mut vae)
+            .expect("load-time VAE quantization");
     }
     let latent_values = (0..16 * 8 * 8)
         .map(|i| ((i as f32 * 0.013).sin() * 0.5).clamp(-1.0, 1.0))
@@ -519,6 +527,11 @@ fn t5_precision_sensitivity_sweep() {
             None,
         ),
         (
+            "q8-plus-q4-packed-residual-sensitive-q8-group32",
+            T5ProbePolicy::Q8Q4ProgressiveSensitiveQ8Group32,
+            None,
+        ),
+        (
             "q8-plus-q8-packed-residual-group64",
             T5ProbePolicy::Q8Q8Progressive,
             None,
@@ -624,11 +637,7 @@ fn packed_auxiliaries_match_load_time_quantization() {
     };
     let bits = bits_env();
     assert!(matches!(bits, 4 | 8), "SC8777_BITS must be 4 or 8");
-    let auxiliary_bits = auxiliary_bits_env(bits);
-    assert!(
-        matches!(auxiliary_bits, 4 | 8),
-        "SC16462_AUX_BITS must be 4 or 8"
-    );
+    let auxiliary_bits = auxiliary_bits();
     let out = std::env::var("SC8777_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join(format!("chroma-tier-q{bits}")));
@@ -718,13 +727,14 @@ fn packed_auxiliaries_match_load_time_quantization() {
         "Q{auxiliary_bits} VAE cosine fell below {vae_floor:.5} (decode={vae_decode_cosine:.7}, encode={vae_encode_cosine:.7})"
     );
     println!(
-        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
         bits,
         auxiliary_bits,
         auxiliary_bits,
         mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
-        t5_group_size_env(),
+        mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BITS,
+        t5_group_size(),
         t5_all_positions_cosine,
         t5_active_span_cosine,
         vae_decode_cosine,
@@ -756,7 +766,7 @@ fn component_residency_probe() {
         .expect("SC16462_RESIDENCY_REPETITION is required")
         .parse::<usize>()
         .expect("SC16462_RESIDENCY_REPETITION must be an integer");
-    let auxiliary_bits = auxiliary_bits_env(bits_env());
+    let auxiliary_bits = auxiliary_bits();
     let (root, quantize_at_load) = match mode.as_str() {
         "dense" => (src.as_path(), None),
         "load-time" => (src.as_path(), Some(auxiliary_bits)),
@@ -774,7 +784,7 @@ fn component_residency_probe() {
             "model": model_id(),
             "tier": format!("q{}", bits_env()),
             "auxiliaryBits": auxiliary_bits,
-            "groupSize": t5_group_size_env(),
+            "groupSize": t5_group_size(),
             "component": component,
             "mode": mode,
             "repetition": repetition,
@@ -805,7 +815,7 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         std::env::var("SC8777_OUT").expect("SC8777_OUT must point to the candidate packed tier"),
     );
     let bits = bits_env();
-    let auxiliary_bits = auxiliary_bits_env(bits);
+    let auxiliary_bits = auxiliary_bits();
     let id = model_id();
     let transformer = "transformer/diffusion_pytorch_model.safetensors";
     assert!(
@@ -840,13 +850,14 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         gib(baseline_peak)
     );
     println!(
-        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
         id,
         bits,
         auxiliary_bits,
         auxiliary_bits,
         mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
-        t5_group_size_env(),
+        mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BITS,
+        t5_group_size(),
         minimum_cosine,
         maximum_mae,
         baseline_peak,

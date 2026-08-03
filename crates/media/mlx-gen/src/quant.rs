@@ -407,6 +407,29 @@ pub fn quantize_map_with_residual(
             "progressive quant: group size must be 32, 64, or 128, got {group_size}"
         )));
     }
+    quantize_map_with_residual_policy(map, bits, group_size, is_target, |_| residual_bits)
+}
+
+/// As [`quantize_map_with_residual`], with a provider-owned residual-width policy per packed base.
+/// This keeps the primary surface uniform while allowing a small, explicitly named sensitive
+/// boundary to use Q8 residuals without paying Q8 residency for every large projection.
+pub fn quantize_map_with_residual_policy(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+    is_target: impl Fn(&str) -> bool,
+    residual_bits_for: impl Fn(&str) -> i32,
+) -> Result<HashMap<String, Array>> {
+    if !matches!(bits, 4 | 8) {
+        return Err(crate::Error::Msg(format!(
+            "progressive quant: primary bits must be 4 or 8, got {bits}"
+        )));
+    }
+    if !matches!(group_size, 32 | 64 | 128) {
+        return Err(crate::Error::Msg(format!(
+            "progressive quant: group size must be 32, 64, or 128, got {group_size}"
+        )));
+    }
     let mut out = HashMap::with_capacity(map.len() * 2);
     for (k, v) in map {
         let base = k.strip_suffix(".weight").filter(|b| is_target(b));
@@ -419,6 +442,12 @@ pub fn quantize_map_with_residual(
             let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
             let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
             let residual = subtract(&wbf16, &restored)?;
+            let residual_bits = residual_bits_for(base);
+            if !matches!(residual_bits, 4 | 8) {
+                return Err(crate::Error::Msg(format!(
+                    "progressive quant: residual bits for {base} must be 4 or 8, got {residual_bits}"
+                )));
+            }
             let (residual_wq, residual_scales, residual_biases) =
                 quantize(&residual, group_size, residual_bits)?;
             out.insert(format!("{base}.weight"), wq);
@@ -545,6 +574,16 @@ mod tests {
         assert!(
             quantize_map_with_residual(HashMap::new(), 8, 4, 0, |_| true).is_err(),
             "group size zero must not reach modulo arithmetic"
+        );
+
+        let mut map = HashMap::new();
+        map.insert(
+            "sensitive.weight".into(),
+            Array::zeros::<f32>(&[2, 64]).unwrap(),
+        );
+        assert!(
+            quantize_map_with_residual_policy(map, 8, 64, |_| true, |_| 3).is_err(),
+            "per-base residual width must be Q4 or Q8"
         );
     }
 

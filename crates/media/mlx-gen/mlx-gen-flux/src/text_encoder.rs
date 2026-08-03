@@ -533,11 +533,38 @@ impl T5TextEncoder {
         residual_bits: i32,
         group_size: i32,
     ) -> Result<()> {
+        self.quantize_progressive_with_sensitive_residuals(
+            bits,
+            residual_bits,
+            residual_bits,
+            group_size,
+        )
+    }
+
+    /// Progressively quantize the complete packable T5 surface while giving the shared token
+    /// embedding and relative-position bias an independently selected residual width. Those two
+    /// boundary tables are reused across the full residual stream, so providers can spend a small
+    /// Q8 correction there while retaining Q4 residuals for the large attention/FFN projections.
+    pub fn quantize_progressive_with_sensitive_residuals(
+        &mut self,
+        bits: i32,
+        residual_bits: i32,
+        sensitive_residual_bits: i32,
+        group_size: i32,
+    ) -> Result<()> {
         validate_t5_group_size(group_size)?;
+        if !matches!(bits, 4 | 8)
+            || !matches!(residual_bits, 4 | 8)
+            || !matches!(sensitive_residual_bits, 4 | 8)
+        {
+            return Err(Error::Msg(format!(
+                "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} residuals"
+            )));
+        }
         self.shared
-            .quantize_progressive(bits, residual_bits, group_size)?;
+            .quantize_progressive(bits, sensitive_residual_bits, group_size)?;
         for block in &mut self.blocks {
-            block.quantize_progressive(bits, residual_bits, group_size)?;
+            block.quantize_progressive(bits, residual_bits, sensitive_residual_bits, group_size)?;
         }
         Ok(())
     }
@@ -630,10 +657,11 @@ impl T5Block {
         &mut self,
         bits: i32,
         residual_bits: i32,
+        sensitive_residual_bits: i32,
         group_size: i32,
     ) -> Result<()> {
         self.attn
-            .quantize_progressive(bits, residual_bits, group_size)?;
+            .quantize_progressive(bits, residual_bits, sensitive_residual_bits, group_size)?;
         self.ff
             .quantize_progressive(bits, residual_bits, group_size)
     }
@@ -737,6 +765,7 @@ impl T5Attention {
         &mut self,
         bits: i32,
         residual_bits: i32,
+        relative_bias_residual_bits: i32,
         group_size: i32,
     ) -> Result<()> {
         self.q
@@ -748,7 +777,7 @@ impl T5Attention {
         self.o
             .quantize_progressive(bits, residual_bits, group_size)?;
         self.rel_bias
-            .quantize_progressive(bits, residual_bits, group_size)
+            .quantize_progressive(bits, relative_bias_residual_bits, group_size)
     }
 
     fn quantize_linears(&mut self, bits: i32) -> Result<()> {

@@ -32,12 +32,6 @@ on:
         type: string
         required: false
         default: ""
-      chroma_t5_group_size:
-        description: T5 primary/residual affine group size for Chroma auxiliary validation
-        type: choice
-        required: false
-        default: "64"
-        options: ["32", "64"]
       chroma_model:
         description: Chroma model to validate; publication always requires all
         type: choice
@@ -81,7 +75,7 @@ jobs:
       CHROMA_MODEL: ${{ matrix.model }}
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
-      SC16462_T5_GROUP_SIZE: ${{ inputs.chroma_t5_group_size }}
+      SC16462_T5_GROUP_SIZE: "32"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -93,6 +87,7 @@ jobs:
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
+          test "$SC16462_T5_GROUP_SIZE" = "32"
       - name: Materialize the exact shipped bf16 source
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
@@ -136,11 +131,10 @@ jobs:
           : > "$CHROMA_RESIDENCY_SUMMARY"
           for bits in 4 8; do
             export SC8777_BITS="$bits"
-            export SC16462_AUX_BITS=8
             export SC8777_OUT="$CHROMA_PACKED_ROOT/q$bits"
             export SC16462_BUILT="$CHROMA_PACKED_ROOT/.built-q$bits"
             export SC16462_BASELINE="$SC8777_SRC/../q$bits"
-            SC8777_BITS="$SC16462_AUX_BITS" SC8777_OUT="$SC16462_BUILT" \
+            SC8777_BITS="$bits" SC8777_OUT="$SC16462_BUILT" \
               cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
               build_tier_only -- --ignored --exact --nocapture --test-threads=1
             # Compose from the exact shipped tier and replace only the two auxiliary directories.
@@ -239,6 +233,29 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["CHROMA_PACKED_ROOT"])
+          t5_quantization = json.loads(
+              (root / "q4/text_encoder/config.json").read_text(encoding="utf-8")
+          )["quantization"]
+          q8_t5_quantization = json.loads(
+              (root / "q8/text_encoder/config.json").read_text(encoding="utf-8")
+          )["quantization"]
+          if q8_t5_quantization != t5_quantization:
+              raise SystemExit("q4/q8 T5 quantization policies differ")
+          expected_t5_policy = {
+              "bits": 8,
+              "group_size": 32,
+              "residual_bits": 4,
+              "sensitive_residual_bits": 8,
+              "sensitive_residual_bases": [
+                  "shared",
+                  "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+              ],
+          }
+          for key, value in expected_t5_policy.items():
+              if t5_quantization.get(key) != value:
+                  raise SystemExit(
+                      f"unsupported T5 quantization {key}: {t5_quantization.get(key)!r} != {value!r}"
+                  )
           files = {}
           for tier in ("q4", "q8"):
               tier_root = root / tier
@@ -258,6 +275,7 @@ jobs:
               "inferenceRevision": os.environ["GITHUB_SHA"],
               "sourceRevision": os.environ["CHROMA_SOURCE_REVISION"],
               "t5GroupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
+              "t5Quantization": t5_quantization,
               "files": files,
           }
           Path(os.environ["CHROMA_PAYLOAD_MANIFEST"]).write_text(
@@ -357,7 +375,7 @@ jobs:
       CHROMA_MODEL: ${{ matrix.model }}
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
-      SC16462_T5_GROUP_SIZE: ${{ inputs.chroma_t5_group_size }}
+      SC16462_T5_GROUP_SIZE: "32"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate publication authorization
@@ -366,6 +384,7 @@ jobs:
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
+          test "$SC16462_T5_GROUP_SIZE" = "32"
       - name: Download the validated payload manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -397,7 +416,7 @@ jobs:
           for bits in 4 8; do
             SC8777_SRC="$CHROMA_SNAPSHOT/bf16" \
             SC8777_MODEL="$CHROMA_MODEL" \
-            SC8777_BITS=8 \
+            SC8777_BITS="$bits" \
             SC8777_OUT="$CHROMA_BUILT/q$bits" \
               cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
                 build_tier_only -- --ignored --exact --nocapture --test-threads=1
@@ -415,11 +434,35 @@ jobs:
 
           root = Path(os.environ["CHROMA_PACKED"])
           expected = json.loads(Path(os.environ["CHROMA_VALIDATED_MANIFEST"]).read_text())
+          t5_quantization = json.loads(
+              (root / "q4/text_encoder/config.json").read_text(encoding="utf-8")
+          )["quantization"]
+          q8_t5_quantization = json.loads(
+              (root / "q8/text_encoder/config.json").read_text(encoding="utf-8")
+          )["quantization"]
+          if q8_t5_quantization != t5_quantization:
+              raise SystemExit("rebuilt q4/q8 T5 quantization policies differ")
+          expected_t5_policy = {
+              "bits": 8,
+              "group_size": 32,
+              "residual_bits": 4,
+              "sensitive_residual_bits": 8,
+              "sensitive_residual_bases": [
+                  "shared",
+                  "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+              ],
+          }
+          for key, value in expected_t5_policy.items():
+              if t5_quantization.get(key) != value:
+                  raise SystemExit(
+                      f"unsupported rebuilt T5 quantization {key}: {t5_quantization.get(key)!r} != {value!r}"
+                  )
           identity = {
               "model": os.environ["CHROMA_MODEL"],
               "inferenceRevision": os.environ["GITHUB_SHA"],
               "sourceRevision": os.environ["CHROMA_SOURCE_REVISION"],
               "t5GroupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
+              "t5Quantization": t5_quantization,
           }
           for key, value in identity.items():
               if expected.get(key) != value:
