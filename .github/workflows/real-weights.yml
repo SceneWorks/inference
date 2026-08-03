@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: inference-real-weights-${{ github.ref }}
+  group: inference-real-weights-${{ github.ref }}-${{ inputs.profile || 'schedule' }}
   cancel-in-progress: false
 
 jobs:
@@ -1473,7 +1473,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable SAME-L snapshot path
-        run: echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+        run: python3 scripts/release/export_model_snapshot_paths.py --model same-l
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1506,8 +1506,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable SAME snapshot paths
         run: |
-          echo "SA3_SAME_S_SNAPSHOT=$RUNNER_TEMP/sa3-same-s/fbeb3dcf53a326e5682f38e22e7f740202d44232" >> "$GITHUB_ENV"
-          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+          python3 scripts/release/export_model_snapshot_paths.py \
+            --model same-s --model same-l
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1554,7 +1554,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable small-music snapshot path
-        run: echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+        run: python3 scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1624,8 +1624,8 @@ jobs:
         run: |
           # sc-14544's identity and divergence gates compare the two checkpoints against each other,
           # so both snapshots are required on this runner.
-          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+          python3 scripts/release/export_model_snapshot_paths.py \
+            --model stable-audio-3-small-sfx --model stable-audio-3-small-music
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1702,11 +1702,10 @@ jobs:
           # The cross-variant mutation gates compare medium against both smalls and against its own
           # base sibling, and the two-domain comparison renders medium beside each specialist, so
           # every snapshot they read has to be on this runner.
-          echo "SA3_MEDIUM_SNAPSHOT=$RUNNER_TEMP/sa3-medium/27b5a21b791b1b033d193a9e1e3ce78493f102f9" >> "$GITHUB_ENV"
-          echo "SA3_MEDIUM_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-medium-base/b32993f73c3bdc3864043a72d8032606bba737c8" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
-          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+          python3 scripts/release/export_model_snapshot_paths.py \
+            --model stable-audio-3-medium --model stable-audio-3-medium-base \
+            --model stable-audio-3-small-music --model stable-audio-3-small-sfx \
+            --model same-l
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1836,13 +1835,11 @@ jobs:
           # its `-base` sibling in both directions, plus the two small bases against each other and
           # against medium-base. Every one of those needs both sides materialized, so this job owns
           # the full set and the per-variant jobs no longer run the target.
-          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
-          echo "SA3_MEDIUM_SNAPSHOT=$RUNNER_TEMP/sa3-medium/27b5a21b791b1b033d193a9e1e3ce78493f102f9" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_MUSIC_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-music-base/eab5ceee5ad9c1ed38800aff30a8e49d1161c539" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_SFX_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx-base/cc5ddb990e30daa68336ac61c140c37c7033ab7c" >> "$GITHUB_ENV"
-          echo "SA3_MEDIUM_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-medium-base/b32993f73c3bdc3864043a72d8032606bba737c8" >> "$GITHUB_ENV"
-          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+          python3 scripts/release/export_model_snapshot_paths.py \
+            --model stable-audio-3-small-music --model stable-audio-3-small-sfx \
+            --model stable-audio-3-medium --model stable-audio-3-small-music-base \
+            --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base \
+            --model same-l
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -2011,8 +2008,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure both immutable small-base snapshot paths
         run: |
-          echo "SA3_SMALL_MUSIC_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-music-base/eab5ceee5ad9c1ed38800aff30a8e49d1161c539" >> "$GITHUB_ENV"
-          echo "SA3_SMALL_SFX_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx-base/cc5ddb990e30daa68336ac61c140c37c7033ab7c" >> "$GITHUB_ENV"
+          python3 scripts/release/export_model_snapshot_paths.py \
+            --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -2078,7 +2075,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable SAME-L snapshot path
         shell: cmd
-        run: echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+        run: python scripts/release/export_model_snapshot_paths.py --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -2205,7 +2202,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable small-music snapshot path
         shell: cmd
-        run: echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+        run: python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -2273,8 +2270,7 @@ jobs:
       - name: Configure immutable small-sfx and small-music snapshot paths
         shell: cmd
         run: |
-          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
-          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-sfx --model stable-audio-3-small-music
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -2360,11 +2356,7 @@ jobs:
       - name: Configure immutable medium and small snapshot paths
         shell: cmd
         run: |
-          echo SA3_MEDIUM_SNAPSHOT=%RUNNER_TEMP%\sa3-medium\27b5a21b791b1b033d193a9e1e3ce78493f102f9>>"%GITHUB_ENV%"
-          echo SA3_MEDIUM_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-medium-base\b32993f73c3bdc3864043a72d8032606bba737c8>>"%GITHUB_ENV%"
-          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
-          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
-          echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-medium --model stable-audio-3-medium-base --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -2593,13 +2585,7 @@ jobs:
       - name: Configure all six immutable Stable Audio 3 snapshot paths
         shell: cmd
         run: |
-          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
-          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
-          echo SA3_MEDIUM_SNAPSHOT=%RUNNER_TEMP%\sa3-medium\27b5a21b791b1b033d193a9e1e3ce78493f102f9>>"%GITHUB_ENV%"
-          echo SA3_SMALL_MUSIC_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music-base\eab5ceee5ad9c1ed38800aff30a8e49d1161c539>>"%GITHUB_ENV%"
-          echo SA3_SMALL_SFX_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx-base\cc5ddb990e30daa68336ac61c140c37c7033ab7c>>"%GITHUB_ENV%"
-          echo SA3_MEDIUM_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-medium-base\b32993f73c3bdc3864043a72d8032606bba737c8>>"%GITHUB_ENV%"
-          echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -2710,8 +2696,7 @@ jobs:
       - name: Configure both immutable small-base snapshot paths
         shell: cmd
         run: |
-          echo SA3_SMALL_MUSIC_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music-base\eab5ceee5ad9c1ed38800aff30a8e49d1161c539>>"%GITHUB_ENV%"
-          echo SA3_SMALL_SFX_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx-base\cc5ddb990e30daa68336ac61c140c37c7033ab7c>>"%GITHUB_ENV%"
+          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
       - name: Select Git Bash
         shell: cmd
         run: |
