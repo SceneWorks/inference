@@ -114,6 +114,50 @@ pub fn fit_to_length(samples: &[f32], target: usize) -> Vec<f32> {
     }
 }
 
+/// Produce only the global 48 kHz window CLAP will consume. Long inputs are centered with the
+/// exact same integer rounding as [`fit_to_length`]'s historical center crop; short inputs retain
+/// their complete resampled waveform for repeat-padding. Downmixing happens lazily inside the FIR,
+/// so neither path allocates a whole-clip mono or resampled buffer.
+fn resample_clap_window(samples: &[f32], sample_rate: u32, channels: u16) -> Result<Vec<f32>> {
+    if channels == 0 {
+        // Delegate to the shared validation/error wording without dividing by zero here.
+        return candle_audio::dsp::resample_mono_range(
+            samples,
+            sample_rate,
+            config::SAMPLE_RATE,
+            channels,
+            0..0,
+        );
+    }
+    let channels_usize = channels as usize;
+    if !samples.len().is_multiple_of(channels_usize) {
+        // The shared function owns layout validation. The dummy range is never evaluated.
+        return candle_audio::dsp::resample_mono_range(
+            samples,
+            sample_rate,
+            config::SAMPLE_RATE,
+            channels,
+            0..0,
+        );
+    }
+    let input_frames = samples.len() / channels_usize;
+    let output_frames =
+        candle_audio::dsp::resample_output_frames(input_frames, sample_rate, config::SAMPLE_RATE)?;
+    let start = output_frames.saturating_sub(config::TARGET_SAMPLES) / 2;
+    let end = if output_frames > config::TARGET_SAMPLES {
+        start + config::TARGET_SAMPLES
+    } else {
+        output_frames
+    };
+    candle_audio::dsp::resample_mono_range(
+        samples,
+        sample_rate,
+        config::SAMPLE_RATE,
+        channels,
+        start..end,
+    )
+}
+
 /// Full front-end: an [`AudioTrack`](candle_audio::gen_core::media::AudioTrack)'s raw PCM
 /// (interleaved `samples`, `sample_rate`, `channels`) → a flat `[TARGET_FRAMES][n_mels]`
 /// (`out[frame * n_mels + mel]`) log-mel spectrogram ready to reshape into the Swin input tensor.
@@ -123,8 +167,7 @@ pub fn log_mel(
     channels: u16,
     filterbank: &[f32],
 ) -> Result<Vec<f32>> {
-    let mono = to_mono(samples, channels);
-    let resampled = candle_audio::dsp::resample(&mono, sample_rate, config::SAMPLE_RATE, 1)?;
+    let resampled = resample_clap_window(samples, sample_rate, channels)?;
     let fitted = fit_to_length(&resampled, config::TARGET_SAMPLES);
 
     let window = hann_window(config::N_FFT);
@@ -205,5 +248,40 @@ mod tests {
         assert_eq!(fit_to_length(&[1.0, 2.0], 5), vec![1.0, 2.0, 1.0, 2.0, 1.0]);
         assert_eq!(fit_to_length(&[1.0, 2.0, 3.0, 4.0], 2), vec![2.0, 3.0]);
         assert_eq!(fit_to_length(&[], 3), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn clap_center_window_bounds_resampling_and_downmix_work() {
+        let input_frames = config::TARGET_SAMPLES + 48_000;
+        let mut stereo = Vec::with_capacity(input_frames * 2);
+        for frame in 0..input_frames {
+            stereo.push(frame as f32 * 0.000_001);
+            stereo.push(-(frame as f32) * 0.000_000_25);
+        }
+        let start = (input_frames - config::TARGET_SAMPLES) / 2;
+        let legacy_mono = to_mono(&stereo, 2);
+        let expected = &legacy_mono[start..start + config::TARGET_SAMPLES];
+
+        candle_audio::dsp::resample_test_support::reset();
+        let bounded = resample_clap_window(&stereo, config::SAMPLE_RATE, 2).unwrap();
+        assert_eq!(bounded.len(), config::TARGET_SAMPLES);
+        assert!(bounded
+            .iter()
+            .zip(expected)
+            .all(|(&a, &b)| a.to_bits() == b.to_bits()));
+        assert_eq!(
+            candle_audio::dsp::resample_test_support::work(),
+            (config::TARGET_SAMPLES, config::TARGET_SAMPLES),
+            "only the centered target window may be downmixed/evaluated"
+        );
+        assert!(config::TARGET_SAMPLES < input_frames);
+    }
+
+    #[test]
+    fn clap_short_window_keeps_full_global_result_for_repeat_padding() {
+        let stereo = [1.0, 3.0, 2.0, 4.0];
+        let bounded = resample_clap_window(&stereo, config::SAMPLE_RATE, 2).unwrap();
+        assert_eq!(bounded, [2.0, 3.0]);
+        assert_eq!(fit_to_length(&bounded, 5), [2.0, 3.0, 2.0, 3.0, 2.0]);
     }
 }

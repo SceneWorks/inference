@@ -38,6 +38,8 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 
 [dev-dependencies]
+# Exposes resampler work counters only in tests; production keeps the counter-free default build.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The real-weight conformance test generates its reference clips with Kokoro (the sanctioned
 # Kokoro-generated reference-audio path) and measures voice similarity with the chatterbox_ve
 # embedder (already a runtime dependency above).
