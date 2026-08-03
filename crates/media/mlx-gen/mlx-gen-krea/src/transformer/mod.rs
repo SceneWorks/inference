@@ -137,6 +137,19 @@ impl Krea2Transformer {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_block_stream(
+        mut self,
+        materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            self.cfg.clone(),
+            self.blocks.clone(),
+            materializations,
+        ));
+        self
+    }
+
     pub(crate) fn block_window<'a>(
         &self,
         window_size: Option<usize>,
@@ -392,6 +405,31 @@ impl Krea2Transformer {
         self.finalize(&combined, &j.t, &j)
     }
 
+    /// Run conditional and unconditional prepared states through one block traversal. Under bounded
+    /// residency each block is reconstructed once, then applied to both independent carries before
+    /// both are evaluated and the window is released.
+    pub(crate) fn forward_prepared_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        let positive = self.joint_inputs(latent, timestep, positive)?;
+        let negative = self.joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive.combined.clone(), negative.combined.clone()),
+            (&positive.tvec, &positive.rcos, &positive.rsin),
+            (&negative.tvec, &negative.rcos, &negative.rsin),
+            window,
+        )?;
+        Ok((
+            self.finalize(&positive_combined, &positive.t, &positive)?,
+            self.finalize(&negative_combined, &negative.t, &negative)?,
+        ))
+    }
+
     /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
     pub(crate) fn forward_prepared_edit_windowed(
         &self,
@@ -407,6 +445,86 @@ impl Krea2Transformer {
         let head = prep.cap_len + prep.n_refs * img_len;
         let img_out = split_axis1(&out, head)?.swap_remove(1);
         unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+    }
+
+    /// Paired conditional/unconditional edit forward with one block-window traversal.
+    pub(crate) fn forward_prepared_edit_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        let (positive_combined, positive_t, positive_tvec) =
+            self.edit_joint_inputs(latent, timestep, positive)?;
+        let (negative_combined, negative_t, negative_tvec) =
+            self.edit_joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive_combined, negative_combined),
+            (&positive_tvec, &positive.rcos, &positive.rsin),
+            (&negative_tvec, &negative.rcos, &negative.rsin),
+            window,
+        )?;
+        let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
+            let out = self.final_layer(combined, t)?;
+            let img_len = prep.ht * prep.wt;
+            let head = prep.cap_len + prep.n_refs * img_len;
+            let img_out = split_axis1(&out, head)?.swap_remove(1);
+            unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        };
+        Ok((
+            finish(&positive_combined, &positive_t, positive)?,
+            finish(&negative_combined, &negative_t, negative)?,
+        ))
+    }
+
+    fn run_blocks_paired(
+        &self,
+        mut states: (Array, Array),
+        positive: (&Array, &Array, &Array),
+        negative: (&Array, &Array, &Array),
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        let Some(window) = window else {
+            for block in &self.blocks {
+                states.0 = block.forward(&states.0, positive.0, positive.1, positive.2)?;
+                states.1 = block.forward(&states.1, negative.0, negative.1, negative.2)?;
+            }
+            return Ok(states);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            states,
+            || stream.open(),
+            |states, view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| stream.materialize(view, index),
+                    |block, state| block.forward(&state, positive.0, positive.1, positive.2),
+                    |block, state| block.forward(&state, negative.0, negative.1, negative.2),
+                )
+            },
+            |(positive, negative): &(Array, Array)| {
+                Ok(mlx_rs::transforms::eval([positive, negative])?)
+            },
+        )
     }
 
     fn run_blocks(
@@ -730,6 +848,116 @@ impl Krea2Transformer {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn executable_test_fixture(
+    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Krea2Transformer> {
+    let mut cfg = Krea2Config::turbo();
+    cfg.hidden_size = 8;
+    cfg.num_attention_heads = 1;
+    cfg.num_kv_heads = 1;
+    cfg.attention_head_dim = 8;
+    cfg.num_layers = 2;
+    cfg.intermediate_size = 16;
+    cfg.axes_dims_rope = [2, 2, 4];
+    cfg.timestep_embed_dim = 8;
+    cfg.num_text_layers = 1;
+    cfg.num_layerwise_text_blocks = 0;
+    cfg.num_refiner_text_blocks = 0;
+    cfg.text_hidden_dim = 8;
+    cfg.text_intermediate_size = 16;
+    cfg.text_num_attention_heads = 1;
+    cfg.text_num_kv_heads = 1;
+
+    let mut weights = Weights::empty();
+    let values = |len: usize, seed: usize| -> Vec<f32> {
+        (0..len)
+            .map(|index| (((index + seed) % 19) as f32 - 9.0) * 0.0075)
+            .collect()
+    };
+    {
+        let mut linear = |base: &str, out: i32, input: i32, bias: bool, seed: usize| {
+            weights.insert(
+                format!("{base}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed), &[out, input]),
+            );
+            if bias {
+                weights.insert(
+                    format!("{base}.bias"),
+                    Array::from_slice(&values(out as usize, seed + 3), &[out]),
+                );
+            }
+        };
+        linear("img_in", 8, 64, true, 1);
+        linear("time_embed.linear_1", 8, 8, true, 2);
+        linear("time_embed.linear_2", 8, 8, true, 3);
+        linear("time_mod_proj", 48, 8, true, 4);
+        linear("txt_in.linear_1", 8, 8, true, 5);
+        linear("txt_in.linear_2", 8, 8, true, 6);
+        linear("final_layer.linear", 64, 8, true, 7);
+        linear("text_fusion.projector", 1, 1, false, 8);
+    }
+    for key in ["txt_in.norm.weight", "final_layer.norm.weight"] {
+        weights.insert(key, Array::from_slice(&[0.0_f32; 8], &[8]));
+    }
+    weights.insert(
+        "final_layer.scale_shift_table",
+        Array::from_slice(&values(16, 9), &[2, 8]),
+    );
+
+    for block in 0..cfg.num_layers {
+        let prefix = format!("transformer_blocks.{block}");
+        weights.insert(
+            format!("{prefix}.scale_shift_table"),
+            Array::from_slice(&values(48, 10 + block), &[6, 8]),
+        );
+        for key in ["norm1.weight", "norm2.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                Array::from_slice(&[0.0_f32; 8], &[8]),
+            );
+        }
+        for key in ["attn.norm_q.weight", "attn.norm_k.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                Array::from_slice(&[0.0_f32; 8], &[8]),
+            );
+        }
+        for (name, out, input, seed) in [
+            ("attn.to_q", 8, 8, 20),
+            ("attn.to_k", 8, 8, 21),
+            ("attn.to_v", 8, 8, 22),
+            ("attn.to_gate", 8, 8, 23),
+            ("attn.to_out.0", 8, 8, 24),
+            ("ff.gate", 16, 8, 25),
+            ("ff.up", 16, 8, 26),
+            ("ff.down", 8, 16, 27),
+        ] {
+            weights.insert(
+                format!("{prefix}.{name}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed + block), &[out, input]),
+            );
+        }
+    }
+
+    Ok(Krea2Transformer::from_weights(&weights, &cfg)?.with_test_block_stream(materializations))
+}
+
+fn run_paired_range<S, B>(
+    mut states: (S, S),
+    range: std::ops::Range<usize>,
+    mut materialize: impl FnMut(usize) -> Result<B>,
+    mut apply_positive: impl FnMut(&B, S) -> Result<S>,
+    mut apply_negative: impl FnMut(&B, S) -> Result<S>,
+) -> Result<(S, S)> {
+    for index in range {
+        let block = materialize(index)?;
+        states.0 = apply_positive(&block, states.0)?;
+        states.1 = apply_negative(&block, states.1)?;
+    }
+    Ok(states)
+}
+
 /// The embed/fuse preamble outputs shared by the dense and checkpointed forwards: the joint hidden
 /// state, the timestep embedding `t`, the shared modulation `tvec`, the joint RoPE tables, and the
 /// patchify/slice geometry the final layer needs.
@@ -903,6 +1131,222 @@ fn unpatchify(tokens: &Array, ht: i32, wt: i32, p: i32, c: i32) -> Result<Array>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn assert_exact(left: &Array, right: &Array) {
+        mlx_rs::transforms::eval([left, right]).unwrap();
+        assert_eq!(left.as_slice::<f32>(), right.as_slice::<f32>());
+    }
+
+    #[test]
+    fn actual_prepared_entrypoints_preserve_cfg_order_parity_and_materialization_counts() {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let transformer = executable_test_fixture(Arc::clone(&materializations)).unwrap();
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let positive_context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let negative_context = Array::from_slice(
+            &(0..8)
+                .map(|index| 0.4 - index as f32 * 0.03)
+                .collect::<Vec<_>>(),
+            &[1, 1, 1, 8],
+        );
+        let positive = transformer
+            .prepare(&positive_context, None, &latent)
+            .unwrap();
+        let negative = transformer
+            .prepare(&negative_context, None, &latent)
+            .unwrap();
+        let expected_positive = transformer
+            .forward_prepared_windowed(&latent, &timestep, &positive, None)
+            .unwrap();
+        let expected_negative = transformer
+            .forward_prepared_windowed(&latent, &timestep, &negative, None)
+            .unwrap();
+        mlx_rs::transforms::eval([&expected_positive, &expected_negative]).unwrap();
+        assert_ne!(
+            expected_positive.as_slice::<f32>(),
+            expected_negative.as_slice::<f32>(),
+            "the fixture must distinguish positive and negative routing"
+        );
+
+        let (resident_positive, resident_negative) = transformer
+            .forward_prepared_pair_windowed(&latent, &timestep, &positive, &negative, None)
+            .unwrap();
+        assert_exact(&resident_positive, &expected_positive);
+        assert_exact(&resident_negative, &expected_negative);
+        assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        materializations.store(0, Ordering::Relaxed);
+        let cancel = mlx_gen::CancelFlag::new();
+        let window = transformer.block_window(Some(1), &cancel).unwrap();
+        let (windowed_positive, windowed_negative) = transformer
+            .forward_prepared_pair_windowed(&latent, &timestep, &positive, &negative, window)
+            .unwrap();
+        assert_exact(&windowed_positive, &expected_positive);
+        assert_exact(&windowed_negative, &expected_negative);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks(),
+            "paired CFG must materialize each block once"
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let single = transformer
+            .forward_prepared_windowed(&latent, &timestep, &positive, window)
+            .unwrap();
+        assert_exact(&single, &expected_positive);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks(),
+            "the non-CFG path must retain one traversal"
+        );
+
+        let reference = Array::from_slice(
+            &(0..64)
+                .map(|index| 0.15 - index as f32 * 0.004)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let edit_positive = transformer
+            .prepare_edit(
+                &positive_context,
+                None,
+                &latent,
+                std::slice::from_ref(&reference),
+            )
+            .unwrap();
+        let edit_negative = transformer
+            .prepare_edit(&negative_context, None, &latent, &[reference])
+            .unwrap();
+        let expected_edit_positive = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_positive, None)
+            .unwrap();
+        let expected_edit_negative = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_negative, None)
+            .unwrap();
+        let (resident_edit_positive, resident_edit_negative) = transformer
+            .forward_prepared_edit_pair_windowed(
+                &latent,
+                &timestep,
+                &edit_positive,
+                &edit_negative,
+                None,
+            )
+            .unwrap();
+        assert_exact(&resident_edit_positive, &expected_edit_positive);
+        assert_exact(&resident_edit_negative, &expected_edit_negative);
+
+        materializations.store(0, Ordering::Relaxed);
+        let (windowed_edit_positive, windowed_edit_negative) = transformer
+            .forward_prepared_edit_pair_windowed(
+                &latent,
+                &timestep,
+                &edit_positive,
+                &edit_negative,
+                window,
+            )
+            .unwrap();
+        assert_exact(&windowed_edit_positive, &expected_edit_positive);
+        assert_exact(&windowed_edit_negative, &expected_edit_negative);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks()
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let single_edit = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_positive, window)
+            .unwrap();
+        assert_exact(&single_edit, &expected_edit_positive);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks()
+        );
+    }
+
+    #[test]
+    fn paired_range_matches_two_legacy_states_and_materializes_each_block_once() {
+        let blocks = [2_i32, 3, 5];
+        let legacy_materializations = Cell::new(0usize);
+        let legacy = |mut state: i32| {
+            for block in blocks {
+                legacy_materializations.set(legacy_materializations.get() + 1);
+                state = state * block + 1;
+            }
+            state
+        };
+        let expected = (legacy(1), legacy(7));
+
+        let paired_materializations = Cell::new(0usize);
+        let actual = run_paired_range(
+            (1_i32, 7_i32),
+            0..blocks.len(),
+            |index| {
+                paired_materializations.set(paired_materializations.get() + 1);
+                Ok(blocks[index])
+            },
+            |block, state| Ok(state * block + 1),
+            |block, state| Ok(state * block + 1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "paired traversal must preserve both outputs"
+        );
+        assert_eq!(legacy_materializations.get(), blocks.len() * 2);
+        assert_eq!(paired_materializations.get(), blocks.len());
+    }
+
+    #[test]
+    fn paired_carry_preserves_typed_cancellation_at_window_boundaries() {
+        let cancel = mlx_gen::CancelFlag::new();
+        let opened = Cell::new(0usize);
+        let materialized_blocks = Cell::new(0usize);
+        let error = mlx_gen::block_residency::run_windowed(
+            &mlx_gen::block_residency::BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            (0usize, 10usize),
+            || {
+                opened.set(opened.get() + 1);
+                Ok(Weights::empty())
+            },
+            |states, _view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| {
+                        materialized_blocks.set(materialized_blocks.get() + 1);
+                        Ok(index)
+                    },
+                    |block, state| Ok(state + block + 1),
+                    |block, state| Ok(state + block + 1),
+                )
+            },
+            |_| {
+                cancel.cancel();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, mlx_gen::Error::Canceled));
+        assert_eq!(opened.get(), 1, "cancellation must prevent the next window");
+        assert_eq!(materialized_blocks.get(), 2);
+    }
 
     /// A dense `[out, in]` weight (+ its `[out]` bias) at `base` — values are irrelevant (these tests
     /// route by shape, never forward), so each global projection gets a distinct `out` we can match on.
