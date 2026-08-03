@@ -512,6 +512,53 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
             self.write_safetensors(fixture, metadata)
             with self.assertRaisesRegex(VERIFY.InvalidManifest, "model revision mismatch"):
                 VERIFY.verify_generated_metadata(manifest, name, record, fixture)
+            metadata["reference_model_revision"] = source["model_revision"]
+            metadata["reference_model_path"] = str(
+                pathlib.PurePosixPath(source["model_path"]).parent / ("0" * 40)
+            )
+            self.write_safetensors(fixture, metadata)
+            with self.assertRaisesRegex(VERIFY.InvalidManifest, "model path mismatch"):
+                VERIFY.verify_generated_metadata(manifest, name, record, fixture)
+
+    def test_generated_model_path_is_compared_without_resolving_it_locally(self):
+        # Parity goldens are dumped on one host and the manifest records that host's
+        # absolute path (see crates/media/mlx-gen/tools/golden/README.md). Verification
+        # asks whether a golden was dumped against the model directory the manifest
+        # names, never whether that path exists here — so it must not re-root the
+        # recorded path onto the verifying host. Exercise both a POSIX-shaped and a
+        # Windows-shaped recording so the comparison stays an identity on either OS.
+        for recorded in (
+            "/Users/reference/.cache/huggingface/hub/models--example--model/snapshots/"
+            + "a" * 40,
+            "E:\\goldens\\hub\\models--example--model\\snapshots\\" + "a" * 40,
+        ):
+            with self.subTest(recorded=recorded):
+                manifest = self.valid_manifest()
+                name = "z_image_lora_adapter"
+                record = manifest["artifacts"][name]
+                source = record["source"]
+                source["model_path"] = recorded
+                metadata = {
+                    "artifact_role": "adapter",
+                    "adapter_kind": "lora",
+                    "reference_mflux_repository": manifest["reference"]["repository"],
+                    "reference_mflux_revision": manifest["reference"]["revision"],
+                    "reference_script_sha256": manifest["scripts"][source["script"]],
+                    "reference_provenance_sha256": manifest["scripts"][
+                        "_adapter_parity_provenance.py"
+                    ],
+                    "reference_model_repository": source["model_repository"],
+                    "reference_model_revision": source["model_revision"],
+                    "reference_model_ref": source["model_reference"],
+                    "reference_model_subdirectory": source["model_subdirectory"],
+                    "reference_model_path": recorded,
+                    "reference_model_inventory_sha256": source["model_inventory_sha256"],
+                    "reference_runtime": json.dumps(manifest["reference"]["runtime"]),
+                }
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = pathlib.Path(directory) / "fixture.safetensors"
+                    self.write_safetensors(fixture, metadata)
+                    VERIFY.verify_generated_metadata(manifest, name, record, fixture)
 
     def test_transcript_measurements_are_bound_to_artifact_hashes(self):
         manifest = self.valid_manifest()
