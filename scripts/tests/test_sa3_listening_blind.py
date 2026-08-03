@@ -714,6 +714,20 @@ class SheetAndUnblindTests(unittest.TestCase):
                 {"listener": "L01", "screen": screen, "slot": "1", "rating": "101"},
             ])
 
+    def test_unblinding_rejects_duplicate_normalized_rating_keys(self) -> None:
+        screen = self.key["listeners"]["L01"]["ratings"][0]["screen"]
+        rows = [
+            {"listener": "L01", "screen": screen, "slot": "1", "rating": "50"},
+            {
+                "listener": " l01 ",
+                "screen": f" {screen.upper()} ",
+                "slot": "01",
+                "rating": "60",
+            },
+        ]
+        with self.assertRaisesRegex(ValueError, "duplicate rating response"):
+            blind.unblind(self.key, [], rows)
+
 
 class AnalysisTests(unittest.TestCase):
     """The pre-registered analysis, and above all the order it enforces."""
@@ -778,6 +792,32 @@ class AnalysisTests(unittest.TestCase):
         report = blind.analyze(simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0))
         self.assertIsNone(report["deviation"])
         self.assertNotIn("DEVIATION", report["conclusion"])
+
+    def test_missing_or_extra_rating_rows_are_non_overridable_deviations(self) -> None:
+        unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0)
+        mutations = (
+            unblinded["ratings"][:-1],
+            [*unblinded["ratings"], dict(unblinded["ratings"][0])],
+        )
+        expected = (
+            blind.PANEL_SIZE
+            * blind.RATING_SCREENS_PER_LISTENER
+            * blind.RATING_SLOTS_PER_SCREEN
+        )
+        self.assertEqual(len(unblinded["ratings"]), expected)
+        for ratings in mutations:
+            with self.subTest(observed=len(ratings)):
+                mutated = {**unblinded, "ratings": ratings}
+                report = blind.analyze(mutated)
+                self.assertIsNotNone(report["deviation"])
+                self.assertTrue(
+                    report["conclusion"].startswith("DEVIATION FROM PRE-REGISTRATION")
+                )
+                self.assertIn(
+                    f"pooled MOS rating rows: {len(ratings)} observed, {expected} pre-registered",
+                    report["deviation"],
+                )
+                self.assertIn("PREFERENCE FOR MEDIUM", report["conclusion"])
 
     def test_a_trimmed_panel_is_flagged_as_a_deviation_from_the_preregistration(self) -> None:
         """The garden-of-forking-paths hole the pre-registration exists to close.

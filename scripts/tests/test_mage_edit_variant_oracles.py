@@ -105,8 +105,46 @@ class MageEditVariantOracleTests(unittest.TestCase):
             "reference": "microsoft/Mage frozen vendored reference",
             "device": "cpu",
             "generationSnapshotRevision": self.gen_revision,
+            "referenceEnvironment": dict(self.module.REFERENCE_PACKAGES),
             "files": records,
         }
+
+    def test_shared_reference_environment_is_exact_and_rejects_package_drift(self) -> None:
+        self.assertEqual(self.module.REFERENCE_PYTHON, (3, 12, 10))
+        self.assertEqual(
+            self.module.REFERENCE_PACKAGES,
+            {
+                "accelerate": "1.13.0",
+                "diffusers": "0.38.0",
+                "einops": "0.8.2",
+                "loguru": "0.7.3",
+                "numpy": "2.4.3",
+                "pillow": "12.3.0",
+                "pydantic": "2.12.5",
+                "safetensors": "0.8.0",
+                "torch": "2.13.0",
+                "torchvision": "0.28.0",
+                "transformers": "5.5.0",
+                "typing_extensions": "4.15.0",
+            },
+        )
+        validator_globals = self.module.validate_reference_environment.__globals__
+        metadata = validator_globals["importlib"].metadata
+        runtime = validator_globals["sys"]
+        with (
+            mock.patch.object(runtime, "version_info", self.module.REFERENCE_PYTHON),
+            mock.patch.object(
+                metadata,
+                "version",
+                side_effect=lambda package: (
+                    "0.0.0"
+                    if package == "transformers"
+                    else self.module.REFERENCE_PACKAGES[package]
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "transformers==0.0.0"),
+        ):
+            self.module.validate_reference_environment()
 
     def record(self, steps: int = 30, cfg: float = 5.0) -> dict:
         sigmas, timesteps = self.module.expected_schedule(steps)
@@ -159,6 +197,11 @@ class MageEditVariantOracleTests(unittest.TestCase):
         )
         with (
             mock.patch.object(sys, "argv", self.args()),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=AssertionError("verify-only must be runtime-portable"),
+            ),
             mock.patch.object(self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"),
             mock.patch.object(self.module, "validate") as validate,
             mock.patch.object(
@@ -181,6 +224,34 @@ class MageEditVariantOracleTests(unittest.TestCase):
                 for label, filename, steps, cfg in self.module.CASES
             ],
         )
+
+    def test_production_environment_failure_precedes_every_side_effect(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", self.args(verify_only=False)),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=RuntimeError("bad reference environment"),
+            ),
+            mock.patch.object(
+                Path, "mkdir", side_effect=AssertionError("must not mutate output")
+            ),
+            mock.patch.object(
+                Path, "write_text", side_effect=AssertionError("must not write manifest")
+            ),
+            mock.patch.object(
+                self.module.shutil,
+                "copy2",
+                side_effect=AssertionError("must not copy"),
+            ),
+            mock.patch.object(
+                self.module.subprocess,
+                "run",
+                side_effect=AssertionError("must not launch producer"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "bad reference environment"),
+        ):
+            self.module.main()
 
     def test_producer_environment_rejects_hostile_ambient_mage_inputs(self) -> None:
         hostile = {
@@ -214,6 +285,29 @@ class MageEditVariantOracleTests(unittest.TestCase):
         with (
             mock.patch.object(sys, "argv", self.args()),
             mock.patch.object(self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"),
+            mock.patch.object(self.module, "validate"),
+            self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
+        ):
+            self.module.main()
+
+    def test_verify_only_rejects_reference_environment_drift(self) -> None:
+        manifest = self.manifest()
+        manifest["referenceEnvironment"]["torch"] = "2.12.0"
+        (self.output / "mage_edit_variants_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.object(sys, "argv", self.args()),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=AssertionError("verify-only must not inspect its runtime"),
+            ),
+            mock.patch.object(
+                self.module,
+                "sha256",
+                side_effect=lambda path: f"hash:{path.name}",
+            ),
             mock.patch.object(self.module, "validate"),
             self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
         ):

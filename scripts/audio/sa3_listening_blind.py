@@ -685,13 +685,26 @@ def unblind(key: dict, abx_rows: list[dict], rating_rows: list[dict]) -> dict:
             "correct": response == trial["x_is"],
         })
 
+    listener_ids = {
+        listener.strip().casefold(): listener for listener in key["listeners"]
+    }
     ratings: list[dict] = []
+    rating_keys: set[tuple[str, str, int]] = set()
     for row in rating_rows:
-        listener = row["listener"].strip()
-        design = key["listeners"].get(listener)
-        if design is None:
-            raise ValueError(f"rating for unknown listener {listener!r}")
-        screen = next((s for s in design["ratings"] if s["screen"] == row["screen"].strip()), None)
+        listener_input = row["listener"].strip()
+        listener = listener_ids.get(listener_input.casefold())
+        if listener is None:
+            raise ValueError(f"rating for unknown listener {listener_input!r}")
+        design = key["listeners"][listener]
+        screen_input = row["screen"].strip()
+        screen = next(
+            (
+                candidate
+                for candidate in design["ratings"]
+                if candidate["screen"].strip().casefold() == screen_input.casefold()
+            ),
+            None,
+        )
         if screen is None:
             raise ValueError(f"{listener}: unknown rating screen {row['screen']!r}")
         slot_index = int(row["slot"]) - 1
@@ -700,6 +713,16 @@ def unblind(key: dict, abx_rows: list[dict], rating_rows: list[dict]) -> dict:
         value = float(row["rating"])
         if not RATING_SCALE[0] <= value <= RATING_SCALE[1]:
             raise ValueError(f"{listener}/{screen['screen']}: rating {value} outside {RATING_SCALE}")
+        rating_key = (
+            listener.casefold(),
+            screen["screen"].strip().casefold(),
+            slot_index + 1,
+        )
+        if rating_key in rating_keys:
+            raise ValueError(
+                f"duplicate rating response for {listener}/{screen['screen']}/slot {slot_index + 1}"
+            )
+        rating_keys.add(rating_key)
         slot = screen["slots"][slot_index]
         ratings.append({
             "listener": listener,
@@ -745,11 +768,18 @@ def preregistration_deviations(unblinded: dict) -> list[str]:
     observed_contrast = sum(1 for row in unblinded["abx"] if row["kind"] == "contrast")
     observed_null = sum(1 for row in unblinded["abx"] if row["kind"] == "null")
     observed_listeners = len({row["listener"] for row in unblinded["abx"]})
+    observed_ratings = len(unblinded["ratings"])
+    expected_ratings = (
+        pre["panel_size"]
+        * pre["mos"]["screens_per_listener"]
+        * pre["mos"]["slots_per_screen"]
+    )
 
     deviations = []
     for label, observed, expected in (
         ("pooled contrast ABX trials", observed_contrast, pre["abx"]["pooled_trials"]),
         ("pooled null-control ABX trials", observed_null, pre["null_control"]["pooled_trials"]),
+        ("pooled MOS rating rows", observed_ratings, expected_ratings),
         ("listeners", observed_listeners, pre["panel_size"]),
     ):
         if observed != expected:
