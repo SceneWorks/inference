@@ -86,12 +86,12 @@ struct SynthesisGeometry {
 }
 
 fn synthesis_geometry(
-    max_inference_seconds: u32,
+    denoise_seconds: u32,
     sample_rate: u32,
     requested_seconds: f32,
 ) -> SynthesisGeometry {
     SynthesisGeometry {
-        denoise_seconds: configured_full_window_seconds(max_inference_seconds),
+        denoise_seconds,
         requested_samples: ((sample_rate as f64) * requested_seconds as f64).round() as usize,
     }
 }
@@ -237,6 +237,18 @@ impl MossSfxPipeline {
         )?)
     }
 
+    /// The configured full denoise window in whole seconds. Requested output duration does not
+    /// enter this seam; it controls only the post-decode crop.
+    pub fn full_window_seconds(&self) -> u32 {
+        configured_full_window_seconds(self.config.index.max_inference_seconds)
+    }
+
+    /// Compatibility wrapper for the original public API. The argument was always deliberately
+    /// ignored: MOSS-SFX denoises the configured full window and crops only after decoding.
+    pub fn window_seconds(&self, _requested_seconds: f32) -> u32 {
+        self.full_window_seconds()
+    }
+
     /// Synthesize one clip. `on_progress` receives [`PipelineProgress::Step`] after each
     /// completed solver step (`k = 1..=steps`) and [`PipelineProgress::Decoding`] once before
     /// the VAE decode; `cancel` is polled before every solver step, between DiT blocks, and
@@ -255,11 +267,7 @@ impl MossSfxPipeline {
                 "moss-sfx: seconds must be > 0 after 0.1 s rounding (got {seconds})"
             )));
         }
-        let geometry = synthesis_geometry(
-            self.config.index.max_inference_seconds,
-            sample_rate,
-            seconds,
-        );
+        let geometry = synthesis_geometry(self.full_window_seconds(), sample_rate, seconds);
         let latent_len = geometry.denoise_seconds as usize * sample_rate as usize / HOP_LENGTH;
 
         if cancel() {
@@ -323,7 +331,9 @@ impl MossSfxPipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::{crop_decoded_audio, synthesis_geometry, SynthesisGeometry};
+    use super::{
+        configured_full_window_seconds, crop_decoded_audio, synthesis_geometry, SynthesisGeometry,
+    };
 
     #[test]
     fn denoise_window_is_configured_full_window_not_requested_crop() {
@@ -334,7 +344,7 @@ mod tests {
                 requested_samples: 4 * 48_000,
             }
         );
-        assert_eq!(synthesis_geometry(0, 48_000, 0.1).denoise_seconds, 1);
+        assert_eq!(configured_full_window_seconds(0), 1);
 
         let decoded = vec![0.0_f32; 30 * 48_000];
         let allocation = decoded.as_ptr();

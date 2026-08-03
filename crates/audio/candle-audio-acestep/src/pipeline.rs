@@ -211,7 +211,7 @@ impl AceStepPipeline {
             root.join("condition_encoder/model.safetensors")
         };
         let timbre_frames = (30.0 * config.vae.latents_per_second()).ceil() as usize;
-        let condition = ConditionEncoder::new(
+        let condition = ConditionEncoder::new_with_fixed_timbre_frames(
             &config.condition,
             timbre_frames,
             mmap_vb(&[ce_path], device)?,
@@ -329,7 +329,7 @@ impl AceStepPipeline {
         // Text-to-music timbre: the reference's `timbre_fix_frame` — a fixed 30 s slice of the
         // encoded silence latent, independent of the requested duration.
         self.condition
-            .encode(&text_hidden, lyric_embeds.as_ref())
+            .encode_cached(&text_hidden, lyric_embeds.as_ref())
             .map_err(AudioError::from)
     }
 

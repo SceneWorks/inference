@@ -282,8 +282,10 @@ fn mono_samples(track: &AudioTrack) -> Vec<f32> {
 
 fn contextual_audio_error(context: String, error: candle_audio::AudioError) -> gen_core::Error {
     match error {
-        candle_audio::AudioError::Canceled => gen_core::Error::Canceled,
-        other => gen_core::Error::Msg(format!("{context}: {other}")),
+        candle_audio::AudioError::Msg(message) => {
+            gen_core::Error::Msg(format!("{context}: {message}"))
+        }
+        typed => typed.into(),
     }
 }
 
@@ -923,10 +925,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codec_context_preserves_typed_cancellation() {
-        let error =
+    fn codec_context_preserves_typed_backend_and_cancellation() {
+        let canceled =
             contextual_audio_error("codec encode".into(), candle_audio::AudioError::Canceled);
-        assert!(matches!(error, gen_core::Error::Canceled));
+        assert!(matches!(canceled, gen_core::Error::Canceled));
+
+        let backend = contextual_audio_error(
+            "codec encode".into(),
+            candle_audio::AudioError::Candle(candle_audio::candle_core::Error::Msg(
+                "device failed".into(),
+            )),
+        );
+        assert!(matches!(backend, gen_core::Error::Backend(_)));
+
+        let message = contextual_audio_error(
+            "encode reference".into(),
+            candle_audio::AudioError::Msg("bad rate".into()),
+        );
+        assert!(matches!(message, gen_core::Error::Msg(_)));
+        assert_eq!(message.to_string(), "encode reference: bad rate");
     }
     use candle_audio::gen_core::{AudioParams, CancelFlag, SpeechSegment};
 
