@@ -219,8 +219,9 @@ Split deliberately across two points:
   reading the checkpoint cannot change, and the caller should hear about it immediately.
 * `resolve_adapter_plan` runs after snapshot identity, still at `load_variant` — so a malformed,
   pickle-format, or key-mismatched adapter fails at **load** rather than at first generate, minutes
-  later, behind a cold start. Its result is discarded; the plan the pipeline folds is rebuilt on the
-  compute device by the identical function, so the two paths cannot drift. That second bullet is
+  later, behind a cold start. As corrected by sc-16601, its CPU result is retained on the generator
+  and its tensors are copied to the compute device during cold start; adapter files are not parsed
+  and matched twice. That second bullet is
   gated by the real-weight `a_key_mismatched_adapter_is_refused_at_load_variant_not_at_first_generate`
   case; deleting the call was green in every lane before it existed.
 

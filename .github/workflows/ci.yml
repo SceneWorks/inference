@@ -233,11 +233,11 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named eleven and what they execute on a PR (measured, by running this step's exact
-        # command on the merged tree): `adapters` 36, `audio_edit` 20, `sampler_oracle` 17,
+        # The named twelve and what they execute on a PR (measured, by running this step's exact
+        # command on the merged tree): `adapters` 37, `audio_edit` 20, `sampler_oracle` 17,
         # `reference_audio` 7, `provider` 3, `listening_stimuli` 3, `dtype_policy` 2,
-        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 92
-        # weight-free cases.
+        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 93
+        # weight-free cases, plus `reference_window` 1 — 94 total.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
@@ -276,8 +276,8 @@ jobs:
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
         #
-        # sc-14550 adds `adapters`, the load-time adapter target, with 36 weight-free cases (four
-        # further cases are `#[ignore]`d and run on `sa3-base-identity-{metal,cuda}`). This target
+        # sc-14550 adds `adapters`, the load-time adapter target, now with 37 weight-free cases (five
+        # further cases are `#[ignore]`d; the real-weight cases run on the platform lanes). This target
         # carries the whole eight-type family — `lora`, `dora-rows`, `dora-cols`, `bora` and their
         # four `-xs` siblings, plus the legacy `dora` alias — because **no Stable Audio 3 adapter
         # artifact exists on this machine or in any cache** (sc-15347), so every adapter it uses is
@@ -408,7 +408,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
-          --test listening_stimuli --test reference_audio --test audio_edit
+          --test listening_stimuli --test reference_audio --test reference_window --test audio_edit
           --test adapters
           -- --nocapture
       - name: Test LLM-only CPU bundle

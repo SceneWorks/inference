@@ -1147,16 +1147,16 @@ fn the_plan_preserves_request_order_at_both_ends() {
     assert_eq!(ops[1].adapter_index, 1);
 }
 
-/// `adapter_index` is the position in the caller's **original** request, across the zero-scale
-/// filter.
+/// `adapter_index` is the position in the caller's **original** request, across zero-scale op
+/// suppression.
 ///
-/// `plan_for` validates the whole stack, then rebuilds the plan from the zero-scale-**filtered**
-/// slice. Numbering the ops positionally while rebuilding would renumber the survivors: for
+/// `plan_for` validates the whole stack once and suppresses op insertion for zero-scale members.
+/// Numbering the ops by their position among inserted ops would renumber the survivors: for
 /// `[zero, live]` the live op would report index 0 and an error message would blame the wrong
 /// adapter — the inert one the caller explicitly turned off. Every other case in this file stacks
-/// only live adapters, so the filter is invisible to them and the bug is unobservable there.
+/// only live adapters, so the suppression is invisible to them and the bug is unobservable there.
 #[test]
-fn adapter_index_survives_the_zero_scale_filter() {
+fn adapter_index_survives_zero_scale_op_suppression() {
     let dir = scratch("index-filter");
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let targets = small_targets(TARGET, out_features, in_features);
@@ -2710,6 +2710,53 @@ fn an_empty_plan_is_empty_and_folds_nothing() {
     assert!(resolved.is_empty());
 }
 
+#[test]
+fn a_resolved_plan_moves_factor_tensors_without_reloading_or_replanning() {
+    let dir = scratch("plan-device-transfer");
+    let path = dir.join("adapter.safetensors");
+    recipe_for(AdapterType::Lora, TARGET, 4, 4, 2, 4.0, 3.0).write_native(&path);
+    let plan = plan_for(
+        &[spec(&path, 0.75)],
+        &small_targets(TARGET, 4, 4),
+        &Device::Cpu,
+    )
+    .expect("load-time CPU plan");
+
+    // If `to_device` accidentally delegated to `plan_for`, removing the only adapter file before
+    // this call would make the transfer fail. The retained tensor values and plan metadata remain.
+    std::fs::remove_file(&path).expect("remove adapter after its one load");
+    let moved = plan
+        .to_device(&Device::Cpu)
+        .expect("transfer retained plan");
+    assert_eq!(moved.op_count(), plan.op_count());
+    let original = &plan.ops_for(TARGET).unwrap()[0];
+    let transferred = &moved.ops_for(TARGET).unwrap()[0];
+    assert_eq!(transferred.kind, original.kind);
+    assert_eq!(transferred.rank, original.rank);
+    assert_eq!(transferred.effective_scale, original.effective_scale);
+    assert_eq!(transferred.adapter_index, original.adapter_index);
+    assert_eq!(
+        transferred
+            .module
+            .a
+            .as_ref()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        original
+            .module
+            .a
+            .as_ref()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // 10. Real weights
 //
@@ -2833,6 +2880,30 @@ fn render(generator: &dyn candle_audio::gen_core::Generator, prompt: &str, seed:
         candle_audio::gen_core::GenerationOutput::Audio(track) => track.samples,
         other => panic!("expected audio, got {other:?}"),
     }
+}
+
+/// The production load -> lazy-pipeline route consumes the retained plan, not the adapter path.
+///
+/// The file is removed after `load_variant` returns but before first `generate`. The render can
+/// succeed only if load parsed/matched the adapter once and cold start transferred that plan; the
+/// former duplicate `resolve_adapter_plan` call failed here when it tried to reopen the path.
+#[test]
+#[ignore = "requires the pinned small-music snapshot; set SA3_SMALL_MUSIC_SNAPSHOT"]
+fn first_generate_does_not_reload_or_replan_an_adapter() {
+    let root = snapshot_root("SA3_SMALL_MUSIC_SNAPSHOT");
+    let dir = scratch("single-adapter-load");
+    let path = dir.join("one-load.safetensors");
+    write_real_adapter(&path, AdapterType::Lora, &real_targets(&root, 1), 17.0);
+    let mut load_spec =
+        candle_audio::gen_core::LoadSpec::new(candle_audio::gen_core::WeightsSource::Dir(root));
+    load_spec.adapters = vec![spec(&path, 1.0)];
+    let generator = model::load_variant(model::Variant::SmallMusic, &load_spec)
+        .expect("load and retain one CPU plan");
+    std::fs::remove_file(&path).expect("remove adapter before first generate");
+
+    let samples = render(&generator, "bright plucked strings", 29);
+    assert!(!samples.is_empty());
+    assert!(samples.iter().all(|sample| sample.is_finite()));
 }
 
 /// The two exactly-signed real-weight gates, on all six pinned checkpoints.
