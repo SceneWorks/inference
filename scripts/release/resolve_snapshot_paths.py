@@ -31,13 +31,19 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
+from pathlib import PurePosixPath
 
 
 def resolve(value: str, home: str) -> str:
-    """Return `value` with a leading `~/` replaced by `home`, else unchanged."""
+    """Return `value` with a leading `~/` replaced by `home`, else unchanged.
+
+    PurePosixPath, not Path: a `~/`-relative value is by construction a POSIX runner home -- the
+    convention exists for the two macOS boxes -- but `Path` takes the flavour of whatever host runs
+    this. On the Windows CUDA dev box that turned `~/a/b` into `\\a\\b`, so the repository's own
+    `scripts/tests` suite failed there while staying green on the ubuntu runner CI executes it on.
+    """
     if value == "~" or value.startswith("~/"):
-        return str(Path(home) / value[2:]) if value.startswith("~/") else home
+        return str(PurePosixPath(home) / value[2:]) if value.startswith("~/") else home
     return value
 
 
