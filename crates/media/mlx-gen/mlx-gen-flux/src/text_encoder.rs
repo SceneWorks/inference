@@ -497,14 +497,26 @@ impl T5Linear {
 
     fn forward(&self, hidden: &Array) -> Result<Array> {
         let primary = self.primary.forward(hidden)?;
-        let with_residual = match &self.residual {
-            Some(residual) => add(&primary, &residual.forward(hidden)?)?,
-            None => primary,
+        let Some(residual) = &self.residual else {
+            return Ok(primary);
         };
-        match &self.residual2 {
-            Some(residual2) => Ok(add(&with_residual, &residual2.forward(hidden)?)?),
-            None => Ok(with_residual),
+
+        // Packed progressive terms approximate one dense projection. Accumulating their qmm
+        // outputs directly in bf16 rounds after every term and compounds error across T5's 24
+        // blocks. Widen only these activation-sized outputs for the sum, then restore the primary
+        // output dtype. The packed weights never materialize densely.
+        let output_dtype = primary.dtype();
+        let mut accumulated = add(
+            &primary.as_dtype(Dtype::Float32)?,
+            &residual.forward(hidden)?.as_dtype(Dtype::Float32)?,
+        )?;
+        if let Some(residual2) = &self.residual2 {
+            accumulated = add(
+                &accumulated,
+                &residual2.forward(hidden)?.as_dtype(Dtype::Float32)?,
+            )?;
         }
+        Ok(accumulated.as_dtype(output_dtype)?)
     }
 
     fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {

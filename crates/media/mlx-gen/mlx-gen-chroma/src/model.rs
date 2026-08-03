@@ -977,21 +977,16 @@ mod tests {
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
         sensitive_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
-        secondary_bits: i32,
-        secondary_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_progressive_with_secondary_residuals(
+        t5.quantize_progressive_with_sensitive_sublayers_residuals(
             crate::convert::AUXILIARY_BITS,
             crate::convert::T5_RESIDUAL_BITS,
             crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
-            secondary_bits,
             crate::convert::T5_GROUP_SIZE,
             sensitive_sublayers,
-            false,
-            secondary_sublayers,
         )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
@@ -1113,24 +1108,24 @@ mod tests {
             (22, Attention),
             (13, Attention),
         ];
-        // Projection decomposition exactly reproduced the whole block-13 near-pass but did not
-        // cross the MAE gate. The earlier secondary-residual sweep always corrected the boundaries
-        // too, which regressed quality. Isolate a second packed correction to block-13 FFN alone.
-        let mut sensitive_sublayers = ranked[..10].to_vec();
-        sensitive_sublayers.push((13, FeedForward));
-        let secondary_sublayers = [(13, FeedForward)];
-        let candidates = [("block13-secondary-q4", 4), ("block13-secondary-q8", 8)];
+        // Additional packed terms regressed strict render quality. Compare the existing surfaces
+        // with activation-side f32 accumulation of the primary+residual qmm outputs, starting from
+        // the smallest production policy and retaining the established near-pass as a control.
+        let current = vec![(4, Attention), (1, FeedForward), (2, FeedForward)];
+        let top10 = ranked[..10].to_vec();
+        let mut top10_block13 = top10.clone();
+        top10_block13.push((13, FeedForward));
+        let candidates = [
+            ("f32-accumulation-current", current),
+            ("f32-accumulation-top10", top10),
+            ("f32-accumulation-top10-block13", top10_block13),
+        ];
 
-        for (policy, secondary_bits) in candidates {
+        for (policy, sensitive_sublayers) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(
-                &baseline_spec,
-                &sensitive_sublayers,
-                secondary_bits,
-                &secondary_sublayers,
-            )
-            .expect("load render sensitivity candidate");
+            let model = load_render_calibration_candidate(&baseline_spec, &sensitive_sublayers)
+                .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
             drop(model);
@@ -1161,18 +1156,7 @@ mod tests {
                             },
                         }))
                         .collect::<Vec<_>>(),
-                    "secondaryBits": secondary_bits,
-                    "secondaryBoundaries": false,
-                    "secondarySublayers": secondary_sublayers
-                        .iter()
-                        .map(|(block, sublayer)| serde_json::json!({
-                            "block": block,
-                            "sublayer": match sublayer {
-                                mlx_gen_flux::T5Sublayer::Attention => "attention",
-                                mlx_gen_flux::T5Sublayer::FeedForward => "ffn",
-                            },
-                        }))
-                        .collect::<Vec<_>>(),
+                    "packedTermAccumulation": "f32",
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
                     "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
