@@ -653,6 +653,52 @@ class AssignmentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             blind.assign(manifest)
 
+    def test_manifest_take_files_must_be_plain_non_special_basenames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            absolute = str((Path(temporary) / "take.wav").resolve())
+            for filename in ("", ".", "..", absolute, "nested/take.wav", r"nested\take.wav"):
+                with self.subTest(filename=filename):
+                    manifest = fake_manifest()
+                    manifest["takes"][0]["file"] = filename
+                    with self.assertRaisesRegex(ValueError, "take file|take filename"):
+                        blind.assign(manifest)
+
+    def test_materialize_preflights_all_sources_before_copying_anything(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "stimuli"
+            source.mkdir()
+            for take in self.manifest["takes"]:
+                (source / take["file"]).write_text("wav", encoding="utf-8")
+            playlists, key = blind.assign(self.manifest, panel=1)
+            missing = key["listeners"]["L01"]["ratings"][-1]["slots"][-1]["file"]
+            (source / missing).unlink()
+            panel = root / "panel"
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                blind.materialize(playlists, key, source, panel)
+            self.assertFalse(panel.exists())
+
+    def test_materialize_rejects_a_source_symlink_escape_before_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "stimuli"
+            source.mkdir()
+            for take in self.manifest["takes"]:
+                (source / take["file"]).write_text("wav", encoding="utf-8")
+            escaped_name = self.manifest["takes"][0]["file"]
+            escaped = root / "outside.wav"
+            escaped.write_text("secret", encoding="utf-8")
+            (source / escaped_name).unlink()
+            try:
+                (source / escaped_name).symlink_to(escaped)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            playlists, key = blind.assign(self.manifest, panel=1)
+            panel = root / "panel"
+            with self.assertRaisesRegex(ValueError, "escapes"):
+                blind.materialize(playlists, key, source, panel)
+            self.assertFalse(panel.exists())
+
     def test_materialize_copies_to_opaque_names(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

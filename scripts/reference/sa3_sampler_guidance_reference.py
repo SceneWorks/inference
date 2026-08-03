@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -196,14 +197,7 @@ def generate(upstream: Path, snapshots: dict[str, Path], output: Path) -> None:
         "upstreamCommit": UPSTREAM_COMMIT,
         "sourceSha256": SOURCE_SHA256,
         "runtime": versions,
-        "inputs": {
-            "timestep": 0.5,
-            "schedule": [0.5, 0.0],
-            "paddingValid": 12,
-            "paddingLength": 16,
-            "negativeConditioning": "zero-cross-context",
-            "variants": VARIANTS,
-        },
+        "inputs": EXPECTED_INPUTS,
         "snapshots": provenance,
         "artifact": ARTIFACT,
         "artifactSha256": sha256_file(artifact),
@@ -279,7 +273,7 @@ def verify(output: Path) -> None:
         raise InvalidReference("guidance tensor inventory/payload mismatch")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream", type=Path)
     parser.add_argument("--small-music", type=Path)
@@ -287,17 +281,22 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--generate", action="store_true")
     args = parser.parse_args()
-    if args.generate:
-        if not args.upstream or not args.small_music or not args.small_music_base:
-            parser.error("--generate requires --upstream and both snapshot paths")
-        generate(
-            args.upstream,
-            {"small-music": args.small_music, "small-music-base": args.small_music_base},
-            args.output,
-        )
-    verify(args.output)
-    print("Stable Audio 3 sampler guidance reference verified")
+    try:
+        if args.generate:
+            if not args.upstream or not args.small_music or not args.small_music_base:
+                parser.error("--generate requires --upstream and both snapshot paths")
+            generate(
+                args.upstream,
+                {"small-music": args.small_music, "small-music-base": args.small_music_base},
+                args.output,
+            )
+        verify(args.output)
+        print("Stable Audio 3 sampler guidance reference verified")
+    except (InvalidReference, OSError, ValueError, KeyError) as error:
+        print(f"SA3 sampler guidance reference error: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
