@@ -255,16 +255,30 @@ def privileged_real_weight_jobs(workflow: str) -> list[str]:
 def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     """Reject pip installs that can escape the reviewed wheel/hash inputs."""
     errors: list[str] = []
-    install_lines = [
+    pip_token = re.compile(r"\bpip(?:\d+(?:\.\d+)*)?\b", re.IGNORECASE)
+    canonical_install = re.compile(
+        r"\bpip(?:\d+(?:\.\d+)*)?\s+install\b", re.IGNORECASE
+    )
+    pip_lines = [
         (line_number, line.strip())
         for line_number, line in enumerate(workflow.splitlines(), start=1)
-        if re.search(r"\bpip(?:\d+(?:\.\d+)*)?\s+install\b", line)
+        if pip_token.search(line)
     ]
-    if not install_lines:
-        return ["real-weight workflow has no pip installs"]
+    if not pip_lines:
+        return ["real-weight workflow has no pip commands"]
+
+    install_lines: list[tuple[int, str, re.Match[str]]] = []
+    for line_number, command in pip_lines:
+        match = canonical_install.search(command)
+        if match is None:
+            errors.append(
+                f"line {line_number}: pip command is not a canonical single-line install"
+            )
+            continue
+        install_lines.append((line_number, command, match))
 
     locks_seen: list[str] = []
-    for line_number, command in install_lines:
+    for line_number, command, install_match in install_lines:
         prefix = f"line {line_number}"
         for required_flag in ("--only-binary=:all:", "--require-hashes"):
             if required_flag not in command:
@@ -295,7 +309,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
                 f"{prefix}: install target expects {expected_lock}, got {lock}"
             )
 
-        install_arguments = command.split("pip install", 1)[1]
+        install_arguments = command[install_match.end() :]
         before_lock, after_lock = re.split(
             r"(?:^|\s)(?:-r|--requirement)\s+\S+", install_arguments, maxsplit=1
         )
@@ -399,6 +413,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "new inline install": workflow
             + '\n          python3 -m pip install "requests==2.32.5"\n',
             "direct pip bypass": workflow + "\n          pip install requests\n",
+            "direct pip3 bypass": workflow + "\n          pip3 install requests\n",
+            "posix continuation bypass": workflow
+            + "\n          python3 -m pip \\\n"
+            + "            install requests\n",
+            "cmd continuation bypass": workflow
+            + "\n          python -m pip ^\n"
+            + "            install requests\n",
+            "option before install bypass": workflow
+            + "\n          python3 -m pip --disable-pip-version-check install requests\n",
             "new superficially compliant install": workflow
             + f"\n          python3 -m pip install --disable-pip-version-check "
             f"--only-binary=:all: --require-hashes -r {MACOS_HUB_LOCK}\n",
