@@ -1108,14 +1108,18 @@ mod tests {
             (22, Attention),
             (13, Attention),
         ];
+        // The preceding run found rank 13 (block-13 FFN) was the only single addition within
+        // 0.04 MAE of the strict gate. Pair it with every other rank 11..20 candidate so the next
+        // search remains bounded while accounting for the observed non-monotonic interactions.
         let mut candidates = Vec::new();
-        for (rank, candidate) in ranked[10..15].iter().copied().enumerate() {
+        for rank in 11..=20 {
+            if rank == 13 {
+                continue;
+            }
             let mut surface = ranked[..10].to_vec();
-            surface.push(candidate);
-            candidates.push((format!("top10-plus-rank{}", rank + 11), surface));
-        }
-        for prefix in [12, 15, 20] {
-            candidates.push((format!("top{prefix}"), ranked[..prefix].to_vec()));
+            surface.push(ranked[12]);
+            surface.push(ranked[rank - 1]);
+            candidates.push((format!("top10-rank13-plus-rank{rank}"), surface));
         }
 
         for (policy, sensitive_sublayers) in candidates {
