@@ -23,9 +23,10 @@
 use mlx_rs::ops::{add, divide, matmul, minimum, multiply, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Progress, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Quant, Result};
 
 use crate::config::NeoChatConfig;
 use crate::fm::{
@@ -161,6 +162,16 @@ pub struct T2iOptions {
     pub seed: u64,
     pub think_mode: bool,
     pub max_think_tokens: usize,
+    /// Maximum score-domain elements per shared bounded-attention call. `None` preserves the
+    /// historical single-call path. This is consumed only by the generation path during denoise;
+    /// understanding, VQA, and think-token attention remain unbounded.
+    pub attention_score_budget: Option<u32>,
+    /// Generation-path Qwen block window selected by rung 4. `None` is the resident/default
+    /// execution shape (or one all-covering window on a deferred load).
+    pub transformer_window_size: Option<u32>,
+    /// Calibration-only deterministic failure after the first streamed Gen block materializes.
+    #[doc(hidden)]
+    pub calibration_stream_fault: bool,
 }
 
 impl Default for T2iOptions {
@@ -177,7 +188,24 @@ impl Default for T2iOptions {
             seed: 0,
             think_mode: false,
             max_think_tokens: 1024,
+            attention_score_budget: None,
+            transformer_window_size: None,
+            calibration_stream_fault: false,
         }
+    }
+}
+
+fn attention_plan<'a>(opts: &T2iOptions, cancel: Option<&'a CancelFlag>) -> AttentionPlan<'a> {
+    let Some(score_elements) = opts.attention_score_budget else {
+        return AttentionPlan::UNBOUNDED;
+    };
+    let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        u64::from(score_elements),
+        true,
+    ));
+    match cancel {
+        Some(cancel) => plan.with_cancel(cancel),
+        None => plan,
     }
 }
 
@@ -246,6 +274,24 @@ pub struct T2iModel {
 impl T2iModel {
     /// Build from a loaded checkpoint (`language_model.*` + `fm_modules.*`).
     pub fn from_weights(w: &Weights, cfg: &NeoChatConfig) -> Result<Self> {
+        Self::validate_config(cfg)?;
+        let backbone = Qwen3Backbone::from_weights(w, cfg, "language_model")?;
+        Self::from_weights_with_backbone(w, cfg, backbone)
+    }
+
+    pub fn from_weights_deferred(
+        w: &Weights,
+        cfg: &NeoChatConfig,
+        artifact: crate::memory_strategy::PinnedArtifact,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        Self::validate_config(cfg)?;
+        let backbone =
+            Qwen3Backbone::from_weights_deferred(w, cfg, "language_model", artifact, quant)?;
+        Self::from_weights_with_backbone(w, cfg, backbone)
+    }
+
+    fn validate_config(cfg: &NeoChatConfig) -> Result<()> {
         // `noise_scale_embed` divides each denoise step's conditioning by `noise_scale_max_value`
         // (`scale.min(max)` then `/max`); a zero/negative value from a misconfigured config.json
         // would inject NaN/Inf conditioning silently. Reject it at load (F-012).
@@ -255,6 +301,14 @@ impl T2iModel {
                 cfg.noise_scale_max_value
             )));
         }
+        Ok(())
+    }
+
+    fn from_weights_with_backbone(
+        w: &Weights,
+        cfg: &NeoChatConfig,
+        backbone: Qwen3Backbone,
+    ) -> Result<Self> {
         let noise_scale_embedder = if cfg.add_noise_scale_embedding {
             Some(TimestepEmbedder::from_weights(
                 w,
@@ -278,7 +332,7 @@ impl T2iModel {
             None
         };
         Ok(Self {
-            backbone: Qwen3Backbone::from_weights(w, cfg, "language_model")?,
+            backbone,
             gen_vision: NeoVisionEmbedder::from_weights(
                 w,
                 cfg,
@@ -372,6 +426,7 @@ impl T2iModel {
     /// per-cache [`RopeMask`] from [`Self::prepare_gen`], `fm_head` → `x_pred`, then the
     /// flow-matching velocity. `image_embeds` is the vision+timestep conditioned image block
     /// `[1, L, hidden]`.
+    #[allow(clippy::too_many_arguments)]
     fn predict_v(
         &self,
         image_embeds: &Array,
@@ -380,10 +435,20 @@ impl T2iModel {
         z: &Array,
         t: f32,
         t_eps: f32,
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+        calibration_stream_fault: bool,
     ) -> Result<Array> {
-        let hidden = self
-            .backbone
-            .forward_prepared(image_embeds, rm, Path::Gen, cache, false)?;
+        let hidden = self.backbone.forward_prepared_memory(
+            image_embeds,
+            rm,
+            Path::Gen,
+            cache,
+            false,
+            attention,
+            transformer_window,
+            calibration_stream_fault,
+        )?;
         let x_pred = self.fm_head.forward(&hidden)?;
         velocity(&x_pred, z, t, t_eps)
     }
@@ -592,7 +657,17 @@ impl T2iModel {
 
             let (z, cond) = self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
 
-            let v_cond = self.predict_v(&cond, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
+            let v_cond = self.predict_v(
+                &cond,
+                &rm_cond,
+                cache_cond,
+                &z,
+                t,
+                opts.t_eps,
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                opts.transformer_window_size.map(|window| window as usize),
+                opts.calibration_stream_fault,
+            )?;
 
             // CFG-interval gate for the T2I path: **inclusive** both ends, a faithful port of the
             // reference `modeling_neo_chat.py:1799`
@@ -608,7 +683,17 @@ impl T2iModel {
                 let rm_u = rm_uncond.as_ref().ok_or_else(|| {
                     Error::Msg("sensenova: CFG enabled but uncond running-mean is absent".into())
                 })?;
-                let v_uncond = self.predict_v(&cond, rm_u, cache_u, &z, t, opts.t_eps)?;
+                let v_uncond = self.predict_v(
+                    &cond,
+                    rm_u,
+                    cache_u,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                    opts.transformer_window_size.map(|window| window as usize),
+                    opts.calibration_stream_fault,
+                )?;
                 cfg_blend(&v_cond, &v_uncond, opts.cfg_scale, opts.cfg_norm, i)?
             } else {
                 v_cond
@@ -1459,14 +1544,34 @@ impl T2iModel {
 
             let (z, cond_emb) =
                 self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let out_cond = self.predict_v(&cond_emb, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
+            let out_cond = self.predict_v(
+                &cond_emb,
+                &rm_cond,
+                cache_cond,
+                &z,
+                t,
+                opts.t_eps,
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                opts.transformer_window_size.map(|window| window as usize),
+                opts.calibration_stream_fault,
+            )?;
 
             let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
                 out_cond.clone()
             } else if img_cfg == 1.0 {
                 let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
                 let (c, _) = img.as_mut().ok_or_else(img_cache_err)?;
-                let oi = self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?;
+                let oi = self.predict_v(
+                    &cond_emb,
+                    rm_i,
+                    c,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                    opts.transformer_window_size.map(|window| window as usize),
+                    opts.calibration_stream_fault,
+                )?;
                 add(
                     &oi,
                     &multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?,
@@ -1474,7 +1579,17 @@ impl T2iModel {
             } else if cfg == img_cfg {
                 let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
                 let (c, _) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
-                let ou = self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?;
+                let ou = self.predict_v(
+                    &cond_emb,
+                    rm_u,
+                    c,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                    opts.transformer_window_size.map(|window| window as usize),
+                    opts.calibration_stream_fault,
+                )?;
                 add(
                     &ou,
                     &multiply(&subtract(&out_cond, &ou)?, Array::from_f32(cfg))?,
@@ -1483,12 +1598,32 @@ impl T2iModel {
                 let oi = {
                     let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
                     let (c, _) = img.as_mut().ok_or_else(img_cache_err)?;
-                    self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?
+                    self.predict_v(
+                        &cond_emb,
+                        rm_i,
+                        c,
+                        &z,
+                        t,
+                        opts.t_eps,
+                        attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                        opts.transformer_window_size.map(|window| window as usize),
+                        opts.calibration_stream_fault,
+                    )?
                 };
                 let ou = {
                     let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
                     let (c, _) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
-                    self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?
+                    self.predict_v(
+                        &cond_emb,
+                        rm_u,
+                        c,
+                        &z,
+                        t,
+                        opts.t_eps,
+                        attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                        opts.transformer_window_size.map(|window| window as usize),
+                        opts.calibration_stream_fault,
+                    )?
                 };
                 let a = multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?;
                 let b = multiply(&subtract(&oi, &ou)?, Array::from_f32(img_cfg))?;
