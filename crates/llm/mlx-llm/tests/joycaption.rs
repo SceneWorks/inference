@@ -33,8 +33,19 @@ const GOLDEN: &[i32] = &[
 const GOLDEN_TEXT: &str =
     "Photograph of a solid, flat, gray background with no visible objects, textures";
 
-fn snapshot() -> Option<String> {
-    std::env::var("MLX_LLM_JOYCAPTION_SNAPSHOT").ok()
+/// The pinned JoyCaption source snapshot dir, from the required `MLX_LLM_JOYCAPTION_SNAPSHOT`.
+///
+/// REQUIRED, not optional (sc-17250). These tests previously read this through an `Option` and
+/// `return`ed early when it was unset, which libtest reports as `test result: ok. 1 passed` in
+/// 0.00 s — indistinguishable from a real pass. Now that `real-weights.yml` runs them on a schedule,
+/// that shape would make the whole lane vacuously green the moment the repo variable went missing,
+/// and a run-count assertion in the workflow cannot catch it because the count is still 1. Failing
+/// here instead matches `prepared_q4_snapshot_runs_full_vlm` in this same file, which always
+/// `expect`ed the variable.
+fn snapshot() -> String {
+    std::env::var("MLX_LLM_JOYCAPTION_SNAPSHOT").expect(
+        "MLX_LLM_JOYCAPTION_SNAPSHOT must name the verified pinned JoyCaption source snapshot",
+    )
 }
 
 fn gray_image() -> (Vec<u8>, u32, u32) {
@@ -70,9 +81,7 @@ impl Drop for PreparedSnapshot {
 #[test]
 #[ignore = "needs pinned MLX_LLM_JOYCAPTION_SNAPSHOT and several GiB of temporary disk"]
 fn prepared_q4_snapshot_runs_full_vlm() {
-    let source = std::env::var("MLX_LLM_JOYCAPTION_SNAPSHOT").expect(
-        "MLX_LLM_JOYCAPTION_SNAPSHOT must name the verified pinned JoyCaption source snapshot",
-    );
+    let source = snapshot();
     let source = std::path::Path::new(&source);
     assert!(
         source.is_dir(),
@@ -203,10 +212,7 @@ fn prepared_q4_snapshot_runs_full_vlm() {
 #[test]
 #[ignore = "needs MLX_LLM_JOYCAPTION_SNAPSHOT"]
 fn joycaption_model_matches_golden_tokens() {
-    let Some(snap) = snapshot() else {
-        eprintln!("skip: set MLX_LLM_JOYCAPTION_SNAPSHOT");
-        return;
-    };
+    let snap = snapshot();
     let model = JoyCaptionModel::from_dir(&snap).unwrap();
     let tok = Tokenizer::from_file(format!("{snap}/tokenizer.json")).unwrap();
 
@@ -270,10 +276,7 @@ fn joycaption_resize_path_matches_golden() {
     const GRAD_TEXT: &str =
         "Digital abstract pattern featuring diagonal, colorful, gradient triangles in vivid";
 
-    let Some(snap) = snapshot() else {
-        eprintln!("skip: set MLX_LLM_JOYCAPTION_SNAPSHOT");
-        return;
-    };
+    let snap = snapshot();
     let model = JoyCaptionModel::from_dir(&snap).unwrap();
     let tok = Tokenizer::from_file(format!("{snap}/tokenizer.json")).unwrap();
 
@@ -326,10 +329,7 @@ fn joycaption_resize_path_matches_golden() {
 #[test]
 #[ignore = "needs MLX_LLM_JOYCAPTION_SNAPSHOT"]
 fn joycaption_provider_streams_caption_through_contract() {
-    let Some(snap) = snapshot() else {
-        eprintln!("skip: set MLX_LLM_JOYCAPTION_SNAPSHOT");
-        return;
-    };
+    let snap = snapshot();
     let provider = JoyCaptionProvider::load(&LoadSpec::dense(snap)).unwrap();
     assert!(provider.descriptor().capabilities.supports_vision);
 

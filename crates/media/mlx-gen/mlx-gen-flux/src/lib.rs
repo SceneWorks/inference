@@ -6,12 +6,15 @@
 //! the base txt2img generation path.
 
 pub mod adapters;
+pub(crate) mod artifact_inventory;
+pub(crate) mod block_stream;
 pub mod config;
 pub mod control_transformer;
 pub mod convert;
 pub mod image_encoder;
 pub mod ip_adapter;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod pipeline;
@@ -58,9 +61,33 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::SCHNELL_REGISTRATION)
+        .register_memory_strategy(model::SCHNELL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX1_SCHNELL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(FLUX1_SCHNELL_ID, spec)
+            },
+        })
+        .register_memory_behavior(model::SCHNELL_MEMORY_BEHAVIOR)
         .register_generator(model::DEV_REGISTRATION)
+        .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX1_DEV_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_ID, spec)
+            },
+        })
+        .register_memory_behavior(model::DEV_MEMORY_BEHAVIOR)
         .register_activation_memory(DEV_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX1_DEV_CONTROL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)
+            },
+        })
+        .register_memory_behavior(model_control::DEV_CONTROL_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX FLUX.1 provider catalog.
