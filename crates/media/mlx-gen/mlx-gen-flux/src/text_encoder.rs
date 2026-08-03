@@ -804,6 +804,38 @@ impl T5TextEncoder {
             sensitive_sublayers,
             &[],
             Dtype::Float32,
+            Dtype::Float32,
+            &[],
+        )
+    }
+
+    /// In-memory calibration seam for f32 affine parameters on selected T5 boundaries and
+    /// sublayers. Unselected surfaces retain the production bf16 affine representation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_progressive_with_selected_f32_parameters(
+        &mut self,
+        bits: i32,
+        residual_bits: i32,
+        sensitive_residual_bits: i32,
+        group_size: i32,
+        sensitive_sublayers: &[(usize, T5Sublayer)],
+        f32_boundaries: bool,
+        f32_sublayers: &[(usize, T5Sublayer)],
+    ) -> Result<()> {
+        self.quantize_progressive_with_sensitive_surfaces_residuals_in_dtype(
+            bits,
+            residual_bits,
+            sensitive_residual_bits,
+            group_size,
+            sensitive_sublayers,
+            &[],
+            if f32_boundaries {
+                Dtype::Float32
+            } else {
+                Dtype::Bfloat16
+            },
+            Dtype::Bfloat16,
+            f32_sublayers,
         )
     }
 
@@ -828,6 +860,8 @@ impl T5TextEncoder {
             sensitive_sublayers,
             sensitive_ffn_projections,
             Dtype::Bfloat16,
+            Dtype::Bfloat16,
+            &[],
         )
     }
 
@@ -840,7 +874,9 @@ impl T5TextEncoder {
         group_size: i32,
         sensitive_sublayers: &[(usize, T5Sublayer)],
         sensitive_ffn_projections: &[(usize, T5FeedForwardProjection)],
-        source_dtype: Dtype,
+        boundary_dtype: Dtype,
+        default_sublayer_dtype: Dtype,
+        f32_sublayers: &[(usize, T5Sublayer)],
     ) -> Result<()> {
         validate_t5_group_size(group_size)?;
         if !matches!(bits, 4 | 8)
@@ -855,6 +891,7 @@ impl T5TextEncoder {
             .iter()
             .map(|(block, _)| *block)
             .chain(sensitive_ffn_projections.iter().map(|(block, _)| *block))
+            .chain(f32_sublayers.iter().map(|(block, _)| *block))
         {
             if block >= self.blocks.len() {
                 return Err(Error::Msg(format!(
@@ -867,7 +904,7 @@ impl T5TextEncoder {
             bits,
             sensitive_residual_bits,
             group_size,
-            source_dtype,
+            boundary_dtype,
         )?;
         for (index, block) in self.blocks.iter_mut().enumerate() {
             let attention_is_sensitive =
@@ -877,6 +914,13 @@ impl T5TextEncoder {
             let sensitive_ffn_projection = |projection| {
                 feed_forward_is_sensitive
                     || sensitive_ffn_projections.contains(&(index, projection))
+            };
+            let source_dtype = |sublayer| {
+                if f32_sublayers.contains(&(index, sublayer)) {
+                    Dtype::Float32
+                } else {
+                    default_sublayer_dtype
+                }
             };
             block.quantize_progressive_in_dtype(
                 bits,
@@ -889,7 +933,9 @@ impl T5TextEncoder {
                     sensitive_ffn_projection(T5FeedForwardProjection::Wi1),
                     sensitive_ffn_projection(T5FeedForwardProjection::Wo),
                 ],
-                source_dtype,
+                source_dtype(T5Sublayer::Attention),
+                source_dtype(T5Sublayer::FeedForward),
+                boundary_dtype,
             )?;
         }
         Ok(())
@@ -1046,7 +1092,9 @@ impl T5Block {
         group_size: i32,
         attention_is_sensitive: bool,
         sensitive_ffn_projections: [bool; 3],
-        source_dtype: Dtype,
+        attention_dtype: Dtype,
+        feed_forward_dtype: Dtype,
+        boundary_dtype: Dtype,
     ) -> Result<()> {
         let attention_residual_bits = if attention_is_sensitive {
             sensitive_residual_bits
@@ -1058,7 +1106,8 @@ impl T5Block {
             attention_residual_bits,
             sensitive_residual_bits,
             group_size,
-            source_dtype,
+            attention_dtype,
+            boundary_dtype,
         )?;
         self.ff
             .quantize_progressive_with_sensitive_projections_in_dtype(
@@ -1067,7 +1116,7 @@ impl T5Block {
                 sensitive_residual_bits,
                 group_size,
                 sensitive_ffn_projections,
-                source_dtype,
+                feed_forward_dtype,
             )
     }
 
@@ -1214,6 +1263,7 @@ impl T5Attention {
         relative_bias_residual_bits: i32,
         group_size: i32,
         source_dtype: Dtype,
+        boundary_dtype: Dtype,
     ) -> Result<()> {
         self.q
             .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
@@ -1227,7 +1277,7 @@ impl T5Attention {
             bits,
             relative_bias_residual_bits,
             group_size,
-            source_dtype,
+            boundary_dtype,
         )
     }
 

@@ -977,16 +977,20 @@ mod tests {
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
         sensitive_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
+        f32_boundaries: bool,
+        f32_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_progressive_with_sensitive_sublayers_f32_parameters(
+        t5.quantize_progressive_with_selected_f32_parameters(
             crate::convert::AUXILIARY_BITS,
             crate::convert::T5_RESIDUAL_BITS,
             crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
             crate::convert::T5_GROUP_SIZE,
             sensitive_sublayers,
+            f32_boundaries,
+            f32_sublayers,
         )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
@@ -1082,35 +1086,30 @@ mod tests {
 
         use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
 
-        // Additional full-width packed terms failed quality and residency together. Instead, retain
-        // the same Q8+Q4/Q8 bit widths and measure f32 affine quantization/metadata, which adds no
-        // qmm term but can select different codes at rounding boundaries. Compare the shipped
-        // three-sublayer policy with the established top10+block13 near-pass so the smallest strict
-        // candidate remains selectable.
+        // Full-surface f32 affine parameters pass quality but miss the dense calibration peak by
+        // 224 MB. Isolate the smallest f32 surface that retains the pass: boundaries, the current
+        // three sensitive sublayers, and their union. All other affine parameters remain bf16.
         let current = vec![(4, Attention), (1, FeedForward), (2, FeedForward)];
-        let near_pass = vec![
-            (4, Attention),
-            (1, FeedForward),
-            (2, FeedForward),
-            (18, FeedForward),
-            (15, Attention),
-            (1, Attention),
-            (16, Attention),
-            (14, Attention),
-            (18, Attention),
-            (19, Attention),
-            (13, FeedForward),
-        ];
         let candidates = [
-            ("f32-affine-current", current),
-            ("f32-affine-top10-block13", near_pass),
+            ("f32-affine-boundaries", true, Vec::new()),
+            ("f32-affine-current-sensitive", false, current.clone()),
+            (
+                "f32-affine-boundaries-current-sensitive",
+                true,
+                current.clone(),
+            ),
         ];
 
-        for (policy, sensitive_sublayers) in candidates {
+        for (policy, f32_boundaries, f32_sublayers) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(&baseline_spec, &sensitive_sublayers)
-                .expect("load render sensitivity candidate");
+            let model = load_render_calibration_candidate(
+                &baseline_spec,
+                &current,
+                f32_boundaries,
+                &f32_sublayers,
+            )
+            .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
             drop(model);
@@ -1133,7 +1132,7 @@ mod tests {
                     "primaryBits": crate::convert::AUXILIARY_BITS,
                     "residualBits": crate::convert::T5_RESIDUAL_BITS,
                     "sensitiveResidualBits": crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
-                    "sensitiveSublayers": sensitive_sublayers
+                    "sensitiveSublayers": current
                         .iter()
                         .map(|(block, sublayer)| serde_json::json!({
                             "block": block,
@@ -1143,7 +1142,17 @@ mod tests {
                             },
                         }))
                         .collect::<Vec<_>>(),
-                    "affineParameterDtype": "f32",
+                    "f32AffineBoundaries": f32_boundaries,
+                    "f32AffineSublayers": f32_sublayers
+                        .iter()
+                        .map(|(block, sublayer)| serde_json::json!({
+                            "block": block,
+                            "sublayer": match sublayer {
+                                Attention => "attention",
+                                FeedForward => "ffn",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
                     "groupSize": crate::convert::T5_GROUP_SIZE,
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
