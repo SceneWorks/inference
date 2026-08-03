@@ -892,7 +892,16 @@ impl Pipeline {
                 .to_device(&self.device)?;
 
             let latents = if let Some((policy, cond)) = &lightning_ctx {
-                self.denoise_lightning(&init, policy, cond, unet, &req.cancel, on_progress, total)?
+                self.denoise_lightning(
+                    &init,
+                    policy,
+                    cond,
+                    unet,
+                    &req.cancel,
+                    on_progress,
+                    total,
+                    &req.preview,
+                )?
             } else if let Some(name) = curated {
                 // The default path (sc-10826): `curated` is `Some` for every non-lightning render, so
                 // the omitted-sampler default (→ the curated `ddim`) and every explicit curated name
@@ -949,9 +958,15 @@ impl Pipeline {
         cancel: &gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         total: u32,
+        preview: &gen_core::PreviewSink,
     ) -> Result<Tensor> {
         // σ-space prior: unit noise · the largest σ (init_noise_sigma for trailing spacing).
         let mut latents = init.affine(policy.init_noise_scale() as f64, 0.0)?;
+        // Per-step latent preview (epic 16948, sc-16954). This lane owns its loop rather than driving
+        // a shared sampler, so it numbers frames itself — on the STEP INDEX, since it walks
+        // `LightningPolicy` coefficients rather than a σ array. One frame per iteration, so there is
+        // no multi-eval repeat to dedup; the counter still bounds and dedups on principle.
+        let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
         for i in 0..policy.num_steps() {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -959,6 +974,13 @@ impl Pipeline {
             let c = policy.coeffs(i);
             // Model-input scaling x/√(σ²+1), cast to the UNet compute dtype (f16). CFG-off ⇒ batch 1.
             let x_in = latents.affine(c.c_in as f64, 0.0)?.to_dtype(self.dtype)?;
+            // Preview the RENORMALIZED latent — `x·c_in`, the very coefficient this step feeds the
+            // UNet, which is also the domain the reused fit was measured in. Binding it to `c.c_in`
+            // rather than recomputing `1/√(σ²+1)` is what keeps the preview and the denoise from
+            // coming to disagree about the scaling. Failures are swallowed by `emit_preview_at`.
+            candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
+                crate::preview::project_spatial_latents(&latents.affine(c.c_in as f64, 0.0)?)
+            });
             let eps = unet
                 .forward(&x_in, c.timestep as f64, cond)?
                 .to_dtype(DType::F32)?;
@@ -1003,6 +1025,12 @@ impl Pipeline {
         let sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
         // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler (cast to f16 per eval).
         let latents = (init * sigmas[0] as f64)?;
+        // Per-step latent preview (epic 16948, sc-16954). Opting in is the sc-16949 projector hook, so
+        // the loop is not restructured and the driver owns frame numbering + the multi-eval dedup.
+        // `ve_hook` because the running latent here is raw k-diffusion VE σ-space — see
+        // `crate::preview` for why that needs the `1/√(σ²+1)` renormalization the fit was measured in.
+        // Built per image: the driver starts a fresh counter per call.
+        let preview = crate::preview::ve_hook(&req.preview);
         let out = candle_gen::run_curated_sampler(
             Some(sampler),
             &ms,
@@ -1011,7 +1039,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x_in, t| -> Result<Tensor> {
                 // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
                 // index the UNet embeds. CFG batches/combines exactly like the native DDIM path.

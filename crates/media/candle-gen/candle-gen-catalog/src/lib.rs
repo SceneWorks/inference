@@ -214,6 +214,20 @@ mod preview_advertising {
     ///   `anima_turbo` are three registered descriptors over one architecture, differing only in the
     ///   DiT weights file, and they share a single `pipeline::AnimaPipeline::generate` body — so one
     ///   hooked sampler site wires all three at once, and the inventory below pins exactly one.
+    ///
+    /// The SDXL family (sc-16954) adds a third failure of correspondence, in a direction neither Qwen
+    /// entry shows: **one id can cover lanes that are not all sampler sites**. `sdxl` and `kolors` are
+    /// one descriptor each, but each registered route has *two* denoise lanes — a curated
+    /// `run_curated_sampler` lane and a bespoke loop (SDXL Lightning; the Kolors native leading Euler)
+    /// — and each crate additionally ships name-driven providers (SDXL edit / IP-Adapter, Kolors
+    /// pose-control / IP-Adapter) that carry a `preview` field rather than a descriptor. The
+    /// inventories below therefore mix `hooked` and `direct` counts in the same crate, which no
+    /// earlier family needed.
+    ///
+    /// `instantid` is deliberately absent and cannot be added: it registers no descriptor at all
+    /// (`BESPOKE_UTILITY_CRATES`, and `bespoke_composition_apis_have_no_invented_registration` forbids
+    /// one), so it has no id to advertise. It reaches `candle-gen-sdxl`'s `denoise_curated` /
+    /// `denoise_ip_multi_control` and passes `None` at both, exactly as MLX left it.
     const PREVIEW_ROUTE_IDS: &[&str] = &[
         "krea_2_turbo",
         "krea_2_raw",
@@ -222,6 +236,8 @@ mod preview_advertising {
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
+        "sdxl",
+        "kolors",
     ];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
@@ -380,7 +396,34 @@ mod preview_advertising {
             dir: "candle-gen-kolors",
             register: candle_gen_kolors::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16954's inventory. Kolors has one hooked driver call — the registered route's curated
+            // lane in `pipeline.rs` — and three bespoke leading-Euler loops, one per entry point, each
+            // emitting directly: the registered route's native lane (`pipeline.rs`), the pose-control
+            // provider (`control.rs`) and the IP-Adapter provider (`ip_provider.rs`). The two
+            // providers' CURATED lanes are invisible here by construction: they reach
+            // `candle_gen_sdxl::denoise_curated` rather than a driver of their own, so the hook they
+            // build is counted in `candle-gen-sdxl`'s `denoise.rs` row. No dark site — this crate has
+            // no trainer.
+            routes: &[
+                FileRoutes {
+                    file: "control.rs",
+                    hooked: 0,
+                    direct: 1,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "ip_provider.rs",
+                    hooked: 0,
+                    direct: 1,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "pipeline.rs",
+                    hooked: 1,
+                    direct: 1,
+                    dark: &[],
+                },
+            ],
         },
         ProviderCrate {
             dir: "candle-gen-krea",
@@ -494,7 +537,47 @@ mod preview_advertising {
             dir: "candle-gen-sdxl",
             register: candle_gen_sdxl::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16954's inventory, and the first to mix both wiring layers in one crate. SDXL ships
+            // FOUR emitting lanes across three files plus one deliberately dark trainer site:
+            //   * `pipeline.rs` — the registered route's two lanes: the curated driver call (hooked)
+            //     and the bespoke Lightning Euler loop (direct).
+            //   * `denoise.rs` — the shared helpers the name-driven providers, Kolors and InstantID
+            //     all reach: `denoise_curated` (hooked, forwarding its caller's hook) and the bespoke
+            //     `denoise_ip_multi_control` ancestral loop (direct).
+            //   * `edit_provider.rs` — the bespoke img2img/inpaint ancestral loop (direct).
+            //   * `training.rs` — the trainer's periodic sample render, dark on purpose.
+            // `ip_provider.rs` gets no row: it drives `denoise::denoise_curated` and the ancestral
+            // loop rather than a driver of its own, so its wiring is counted where those live.
+            routes: &[
+                FileRoutes {
+                    file: "denoise.rs",
+                    hooked: 1,
+                    direct: 1,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "edit_provider.rs",
+                    hooked: 0,
+                    direct: 1,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "pipeline.rs",
+                    hooked: 1,
+                    direct: 1,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "training.rs",
+                    hooked: 0,
+                    direct: 0,
+                    dark: &[DarkSite {
+                        driver: "run_curated_sampler",
+                        index: 0,
+                        reason: "the trainer's periodic sample render drives the sampler from a                                  synthetic request that carries no PreviewSink — its result is                                  delivered as a finished TrainingProgress::Sample image, not as a                                  live denoise stream — so it passes `None` on purpose (the same                                  decision sc-16950 recorded for Krea's trainer)",
+                    }],
+                },
+            ],
         },
         ProviderCrate {
             dir: "candle-gen-seedvr2",

@@ -31,7 +31,12 @@ use crate::{CandleError, Result};
 
 /// The projection a family hands the sampler drivers: unpack the running latent into the
 /// `[1, C, h, w]` contract and project it with the family's committed fit.
-type Projector<'a> = Box<dyn Fn(&Tensor) -> Result<Image> + 'a>;
+///
+/// The second argument is the **schedule σ this frame is being emitted at**, `None` on a driver that
+/// has no σ array ([`crate::sampler::run_scm_sampler`]). Families built through [`PreviewHook::new`]
+/// never see it; it exists for the ε/DDPM cohort, which needs it to reach the space its fit was
+/// measured in — see [`PreviewHook::with_sigma`].
+type Projector<'a> = Box<dyn Fn(&Tensor, Option<f32>) -> Result<Image> + 'a>;
 
 /// Numbers preview frames by schedule position.
 ///
@@ -187,9 +192,44 @@ pub struct PreviewHook<'a> {
 impl<'a> PreviewHook<'a> {
     /// Build a hook from a request's sink and the family's projection closure. Frame numbering is
     /// owned by whichever driver receives this hook.
+    ///
+    /// The projector sees only the latent. That is the right shape for the flow-match cohort, whose
+    /// [`gen_core::sampling::FlowModelSampling`] has an `input_scale` of exactly `1.0` at every σ, so
+    /// the running latent already *is* the tensor their fit was measured against. A family whose
+    /// `ModelSampling` scales its input needs [`with_sigma`](Self::with_sigma) instead.
     pub fn new<F>(sink: &'a PreviewSink, project: F) -> Self
     where
         F: Fn(&Tensor) -> Result<Image> + 'a,
+    {
+        Self {
+            sink,
+            project: Box::new(move |latents, _| project(latents)),
+            schedule: None,
+        }
+    }
+
+    /// Build a hook whose projector also receives the **schedule σ** this frame is emitted at
+    /// (`None` on the σ-less SCM driver).
+    ///
+    /// ## Why the ε/DDPM cohort needs this (sc-16954)
+    ///
+    /// The drivers hand the hook the *running* latent `x`, never the `c_in`-scaled model input
+    /// `x_in` — [`crate::sampler::run_curated_sampler`] documents that as the property that makes the
+    /// hook see "the tensor a family's linear RGB fit was measured against". That holds for the flow
+    /// cohort, where `input_scale ≡ 1.0`, and it is **false** for the discrete ε-prediction cohort:
+    /// SDXL and Kolors denoise in k-diffusion VE σ-space, where `x ≈ σ·ε` and σ runs up to ≈ 14.6,
+    /// while their fit was measured on the `1/√(σ²+1)`-normalized latent (12-step ancestral Euler,
+    /// whose sampler folds that renormalization into its own step). Projecting the raw VE latent
+    /// would clamp the early frames to a saturated binary field rather than the noise-to-image
+    /// progression the fit describes.
+    ///
+    /// A family opting in here applies its own `ModelSampling`'s `input_scale` before projecting, so
+    /// the correction is the same function the denoise already uses rather than a second opinion
+    /// about it. This is the σ-keyed sibling of the `1/σ_data` correction
+    /// [`crate::sampler::run_scm_sampler`] documents for SANA-Sprint.
+    pub fn with_sigma<F>(sink: &'a PreviewSink, project: F) -> Self
+    where
+        F: Fn(&Tensor, Option<f32>) -> Result<Image> + 'a,
     {
         Self {
             sink,
@@ -216,7 +256,7 @@ impl<'a> PreviewHook<'a> {
     {
         Self {
             sink,
-            project: Box::new(project),
+            project: Box::new(move |latents, _| project(latents)),
             schedule: Some((counter, sigmas)),
         }
     }
@@ -232,14 +272,15 @@ impl<'a> PreviewHook<'a> {
     pub fn emit(&self, counter: &PreviewCounter, sigmas: &[f32], sigma: f32, latents: &Tensor) {
         let (counter, sigmas) = self.schedule.unwrap_or((counter, sigmas));
         emit_preview(self.sink, counter, sigmas, sigma, || {
-            (self.project)(latents)
+            (self.project)(latents, Some(sigma))
         });
     }
 
-    /// Step-index-keyed emission — the SCM driver, which has no σ schedule.
+    /// Step-index-keyed emission — the SCM driver, which has no σ schedule, so a
+    /// [`with_sigma`](Self::with_sigma) projector receives `None` here.
     pub fn emit_step(&self, counter: &PreviewCounter, step: usize, latents: &Tensor) {
         let counter = self.schedule.map_or(counter, |(counter, _)| counter);
-        emit_preview_at(self.sink, counter, step, || (self.project)(latents));
+        emit_preview_at(self.sink, counter, step, || (self.project)(latents, None));
     }
 }
 
@@ -510,6 +551,83 @@ mod tests {
             (1..=8).map(|n| (n, 8)).collect::<Vec<_>>(),
             "the global schedule must number 1..=8 across both slices, with the global total"
         );
+    }
+
+    /// sc-16954: a `with_sigma` projector receives the σ each frame is emitted at, so the ε/DDPM
+    /// cohort can apply its `input_scale` before projecting. The σ-less `new` constructor is
+    /// unaffected — that is what keeps the flow families byte-identical.
+    #[test]
+    fn with_sigma_hook_forwards_the_emission_sigma() {
+        let (sink, frames) = collecting_sink();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let hook = PreviewHook::with_sigma(&sink, move |x: &Tensor, sigma: Option<f32>| {
+            crate::lock_recover(&recorded).push(sigma);
+            project_latents(x, &[[0.0; 3]; 4], [0.0; 3])
+        });
+
+        let counter = PreviewCounter::new(&SIGMAS);
+        let latents = zeros((1, 4, 2, 3));
+        for &sigma in &SIGMAS[..3] {
+            hook.emit(&counter, &SIGMAS, sigma, &latents);
+        }
+        // A repeat is deduped before the projector runs, so no fourth sigma is recorded.
+        hook.emit(&counter, &SIGMAS, SIGMAS[2], &latents);
+
+        assert_eq!(
+            *crate::lock_recover(&seen),
+            vec![Some(SIGMAS[0]), Some(SIGMAS[1]), Some(SIGMAS[2])]
+        );
+        assert_eq!(crate::lock_recover(&frames).len(), 3);
+    }
+
+    /// The σ-less SCM driver has no schedule to report, so a `with_sigma` projector must be handed
+    /// `None` rather than a fabricated value it could silently scale by.
+    #[test]
+    fn with_sigma_hook_receives_none_on_the_step_keyed_driver() {
+        let (sink, _frames) = collecting_sink();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let hook = PreviewHook::with_sigma(&sink, move |x: &Tensor, sigma: Option<f32>| {
+            crate::lock_recover(&recorded).push(sigma);
+            project_latents(x, &[[0.0; 3]; 4], [0.0; 3])
+        });
+
+        let counter = PreviewCounter::with_steps(2);
+        let latents = zeros((1, 4, 2, 3));
+        hook.emit_step(&counter, 0, &latents);
+        hook.emit_step(&counter, 1, &latents);
+
+        assert_eq!(*crate::lock_recover(&seen), vec![None, None]);
+    }
+
+    /// The σ-less `new` constructor must stay exactly what it was: the flow families pass a
+    /// one-argument closure and the internal two-argument projector is invisible to them.
+    #[test]
+    fn sigma_less_hook_projects_identically_to_a_sigma_aware_one_that_ignores_sigma() {
+        let latents =
+            Tensor::from_vec(vec![0.5f32, 0.25, 0.25, 0.5], (1, 2, 1, 2), &Device::Cpu).unwrap();
+        let factors = [[1.0f32, 0.0, 0.5], [0.0, 1.0, 0.5]];
+        let sigmas = [1.0f32, 0.0];
+
+        let (plain_sink, plain) = collecting_sink();
+        let plain_hook = PreviewHook::new(&plain_sink, |x: &Tensor| {
+            project_latents(x, &factors, [0.0; 3])
+        });
+        plain_hook.emit(&PreviewCounter::new(&sigmas), &sigmas, sigmas[0], &latents);
+
+        let (sigma_sink, sigma_frames) = collecting_sink();
+        let sigma_hook = PreviewHook::with_sigma(&sigma_sink, |x: &Tensor, _| {
+            project_latents(x, &factors, [0.0; 3])
+        });
+        sigma_hook.emit(&PreviewCounter::new(&sigmas), &sigmas, sigmas[0], &latents);
+
+        let (plain, sigma_frames) = (
+            crate::lock_recover(&plain),
+            crate::lock_recover(&sigma_frames),
+        );
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].image.pixels, sigma_frames[0].image.pixels);
     }
 
     /// The default hook keeps the driver's numbering — the invariant `over_schedule` relaxes.

@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress, WeightsSource};
+use candle_gen::gen_core::{Image, PreviewSink, Progress, WeightsSource};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -113,6 +113,12 @@ pub struct SdxlEditRequest {
     pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// The caller's live per-step latent preview sink (epic 16948, sc-16954). A name-driven provider,
+    /// so the sink travels on the request rather than on a `GenerationRequest`. The default (inert)
+    /// sink leaves the render byte-identical. Frames show the **whole** canvas as it denoises,
+    /// including the mask-pinned region, because the inpaint blend lands in latent space before the
+    /// next emission — see [`crate::preview`].
+    pub preview: PreviewSink,
 }
 
 impl Default for SdxlEditRequest {
@@ -128,6 +134,8 @@ impl Default for SdxlEditRequest {
             seed: 0,
             use_pid: false,
             cancel: CancelFlag::default(),
+            // Inert by default: a caller that never sets a sink gets exactly today's render.
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -289,6 +297,7 @@ impl SdxlEdit {
             &mut step_rng,
             &req.cancel,
             on_progress,
+            &req.preview,
         )?;
         on_progress(Progress::Decoding);
         // Decode the final (mask-blended) latent: native SDXL VAE by default, or the `sdxl` PiD student
@@ -343,6 +352,7 @@ impl SdxlEdit {
         rng: &mut StdRng,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Tensor> {
         // An empty schedule (img2img at strength ≤ 1/steps) is a no-op: the lightly-noised source. For
         // inpaint that leaves the source untouched (no repaint), the honest result of a zero-step edit.
@@ -352,11 +362,19 @@ impl SdxlEdit {
         let cfg_on = cfg > 1.0;
         let total = steps.len() as u32;
         let (_, lat_c, lat_h, lat_w) = latents.dims4()?;
+        // Per-step latent preview (epic 16948, sc-16954). A bespoke ancestral loop, so it numbers its
+        // own frames on the step index — the schedule here is a `(t, t_prev)` timestep pair list, not
+        // a σ array. No renormalization: euler-ancestral folds the input scaling into its own step, so
+        // `latents` is already in the domain the reused fit was measured in.
+        let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
         for (i, &(t, t_prev)) in steps.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
+                crate::preview::project_spatial_latents(&latents)
+            });
             let x_unet = if cfg_on {
                 Tensor::cat(&[&latents, &latents], 0)?
             } else {

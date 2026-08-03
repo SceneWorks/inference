@@ -86,6 +86,11 @@ pub mod weights;
 pub mod sampler;
 pub use sampler::EulerAncestralSampler;
 
+// The 4-channel SDXL/Kolors per-step latent preview seam (epic 16948, sc-16954) — the reused epic
+// 16624 RGB fit plus the VE→fit-domain renormalization the ε/DDPM cohort needs. `candle-gen-kolors`
+// projects through this module rather than restating the coefficients.
+pub mod preview;
+
 // InstantID denoise loop + the SDXL conditioning/prior/control/decode helpers (sc-5491) — the candle
 // twin of `mlx-gen-sdxl::pipeline`'s `denoise_ip_control` family, composing the IP-Adapter UNet, the
 // IdentityNet ControlNet, and the euler-ancestral sampler. Driven by the `candle-gen-instantid` glue.
@@ -463,7 +468,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16954): every shipped SDXL render lane
+            // emits -- the curated driver lane and the bespoke Lightning loop on this registered
+            // route, plus the name-driven edit / IP-Adapter providers. `crate::preview` reuses the
+            // epic-16624 four-channel fit; the trainer's sample render stays deliberately dark.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
