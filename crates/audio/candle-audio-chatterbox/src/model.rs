@@ -746,7 +746,8 @@ mod tests {
 
     #[test]
     fn t3_first_six_seconds_bound_resampling_and_mono_derivation() {
-        let input_frames = 10 * S3_SR as usize;
+        const SOURCE_RATE: u32 = 24_000;
+        let input_frames = 7 * SOURCE_RATE as usize;
         let mut stereo = Vec::with_capacity(input_frames * 2);
         for frame in 0..input_frames {
             stereo.push(frame as f32 * 0.000_001);
@@ -754,24 +755,40 @@ mod tests {
         }
         let audio = AudioTrack {
             samples: stereo,
-            sample_rate: S3_SR,
+            sample_rate: SOURCE_RATE,
             channels: 2,
             stems: Vec::new(),
         };
 
+        let legacy_mono: Vec<f32> = audio
+            .samples
+            .chunks_exact(2)
+            .map(|frame| frame.iter().copied().sum::<f32>() / 2.0)
+            .collect();
+        candle_audio::dsp::resample_test_support::reset();
+        let full = candle_audio::dsp::resample(&legacy_mono, SOURCE_RATE, S3_SR, 1).unwrap();
+        let full_work = candle_audio::dsp::resample_test_support::work();
+
         candle_audio::dsp::resample_test_support::reset();
         let bounded = prepare_reference_speech_audio(&audio).unwrap();
+        let bounded_work = candle_audio::dsp::resample_test_support::work();
         assert_eq!(bounded.len(), ENC_COND_LEN);
-        for (frame, &sample) in bounded.iter().enumerate() {
-            let expected = (audio.samples[frame * 2] + audio.samples[frame * 2 + 1]) / 2.0;
-            assert_eq!(sample.to_bits(), expected.to_bits(), "frame {frame}");
-        }
+        assert!(bounded
+            .iter()
+            .zip(&full[..ENC_COND_LEN])
+            .all(|(&actual, &expected)| actual.to_bits() == expected.to_bits()));
         assert_eq!(
-            candle_audio::dsp::resample_test_support::work(),
-            (ENC_COND_LEN, ENC_COND_LEN),
-            "only the first six seconds may be downmixed/evaluated"
+            bounded_work.0, ENC_COND_LEN,
+            "only the first six seconds may be evaluated"
         );
-        assert!(ENC_COND_LEN < input_frames);
+        assert_eq!(full_work.0, full.len());
+        assert!(
+            bounded_work.1 < full_work.1,
+            "bounded source work {} must be below full-clip {}",
+            bounded_work.1,
+            full_work.1
+        );
+        assert!(ENC_COND_LEN < full.len());
     }
 
     #[test]
@@ -833,6 +850,24 @@ mod tests {
                 COMPONENT_VOICE_EMBEDDING,
                 WeightsSource::File(std::path::PathBuf::from("unused-ve.safetensors")),
             )
+    }
+
+    #[test]
+    fn production_path_rejects_short_stereo_by_frame_count_before_weights() {
+        let dir = std::env::temp_dir().join("chatterbox-short-stereo-no-weights");
+        let generator = load(&spec_with_stub_components(dir)).unwrap();
+        let request = req_with(vec![Conditioning::ReferenceAudio {
+            audio: AudioTrack {
+                samples: vec![0.0; 300 * 2],
+                sample_rate: 16_000,
+                channels: 2,
+                stems: Vec::new(),
+            },
+            strength: None,
+        }]);
+        let error = generator.generate(&request, &mut |_| {}).unwrap_err();
+        assert!(error.to_string().contains("300 frames"), "{error}");
+        assert!(error.to_string().contains("too short"), "{error}");
     }
 
     /// `Box<dyn Generator>` is not `Debug`, so `Result::unwrap_err` is unavailable — take the error

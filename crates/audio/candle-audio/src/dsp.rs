@@ -679,6 +679,63 @@ pub fn istft(
 mod tests {
     use super::*;
 
+    const OLD_BASE_TAPS_PER_PHASE: usize = 197;
+    const OLD_KAISER_BETA: f64 = 8.6;
+    const OLD_CUTOFF_GUARD: f64 = 0.94;
+
+    fn old_bessel_i0_oracle(x: f64) -> f64 {
+        let y = x * x / 4.0;
+        let mut sum = 1.0;
+        let mut term = 1.0;
+        for k in 1.. {
+            term *= y / (k * k) as f64;
+            sum += term;
+            if term <= sum * f64::EPSILON {
+                break;
+            }
+        }
+        sum
+    }
+
+    fn old_normalized_sinc_oracle(x: f64) -> f64 {
+        if x.abs() < 1e-12 {
+            1.0
+        } else {
+            let px = std::f64::consts::PI * x;
+            px.sin() / px
+        }
+    }
+
+    /// Independent copy of the legacy coefficient construction. Do not call production
+    /// `fill_phase_kernel` here: a coefficient/order regression must not mutate its own oracle.
+    fn old_phase_kernel_oracle(
+        phase: usize,
+        phase_count: usize,
+        taps_per_phase: usize,
+        cutoff: f64,
+        kaiser_denominator: f64,
+    ) -> Vec<f64> {
+        let fraction = phase as f64 / phase_count as f64;
+        let half_taps = (taps_per_phase / 2) as isize;
+        let radius = taps_per_phase as f64 / 2.0;
+        let mut kernel = vec![0.0; taps_per_phase];
+        let mut sum = 0.0;
+        for (tap, weight) in kernel.iter_mut().enumerate() {
+            let offset = tap as isize - half_taps;
+            let distance = offset as f64 - fraction;
+            let window_position = (distance / radius).clamp(-1.0, 1.0);
+            let window = old_bessel_i0_oracle(
+                OLD_KAISER_BETA * (1.0 - window_position * window_position).sqrt(),
+            ) / kaiser_denominator;
+            *weight = cutoff * old_normalized_sinc_oracle(cutoff * distance) * window;
+            sum += *weight;
+        }
+        for weight in &mut kernel {
+            *weight /= sum;
+        }
+        kernel
+    }
+
     /// Test-only copy of the pre-sc-16602 resampling loop. Keep its per-phase allocations,
     /// per-output checked tap walk, and per-channel normalization intact: this is the numerical
     /// compatibility oracle for the flattened/interior-specialized implementation above.
@@ -697,16 +754,20 @@ mod tests {
         let divisor = gcd(src_rate, dst_rate);
         let phase_count = (dst_rate / divisor) as usize;
         let phase_step = (src_rate / divisor) as usize;
-        let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0) * RESAMPLE_CUTOFF_GUARD;
-        let required_taps = RESAMPLE_BASE_TAPS_PER_PHASE as f64 * RESAMPLE_CUTOFF_GUARD / cutoff;
+        let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0) * OLD_CUTOFF_GUARD;
+        let required_taps = OLD_BASE_TAPS_PER_PHASE as f64 * OLD_CUTOFF_GUARD / cutoff;
         let taps_per_phase = (required_taps.ceil() as usize) | 1;
         let half_taps = (taps_per_phase / 2) as isize;
-        let kaiser_denominator = bessel_i0(RESAMPLE_KAISER_BETA);
+        let kaiser_denominator = old_bessel_i0_oracle(OLD_KAISER_BETA);
         let phase_kernels = (0..phase_count)
             .map(|phase| {
-                let mut kernel = vec![0.0; taps_per_phase];
-                fill_phase_kernel(&mut kernel, phase, phase_count, cutoff, kaiser_denominator);
-                kernel
+                old_phase_kernel_oracle(
+                    phase,
+                    phase_count,
+                    taps_per_phase,
+                    cutoff,
+                    kaiser_denominator,
+                )
             })
             .collect::<Vec<_>>();
 

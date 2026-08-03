@@ -252,29 +252,44 @@ mod tests {
 
     #[test]
     fn clap_center_window_bounds_resampling_and_downmix_work() {
-        let input_frames = config::TARGET_SAMPLES + 48_000;
+        const SOURCE_RATE: u32 = 48_100;
+        let desired_output_frames = config::TARGET_SAMPLES + config::SAMPLE_RATE as usize;
+        let input_frames =
+            desired_output_frames * SOURCE_RATE as usize / config::SAMPLE_RATE as usize;
         let mut stereo = Vec::with_capacity(input_frames * 2);
         for frame in 0..input_frames {
             stereo.push(frame as f32 * 0.000_001);
             stereo.push(-(frame as f32) * 0.000_000_25);
         }
-        let start = (input_frames - config::TARGET_SAMPLES) / 2;
         let legacy_mono = to_mono(&stereo, 2);
-        let expected = &legacy_mono[start..start + config::TARGET_SAMPLES];
+        candle_audio::dsp::resample_test_support::reset();
+        let full =
+            candle_audio::dsp::resample(&legacy_mono, SOURCE_RATE, config::SAMPLE_RATE, 1).unwrap();
+        let full_work = candle_audio::dsp::resample_test_support::work();
+        let start = (full.len() - config::TARGET_SAMPLES) / 2;
+        let expected = &full[start..start + config::TARGET_SAMPLES];
 
         candle_audio::dsp::resample_test_support::reset();
-        let bounded = resample_clap_window(&stereo, config::SAMPLE_RATE, 2).unwrap();
+        let bounded = resample_clap_window(&stereo, SOURCE_RATE, 2).unwrap();
+        let bounded_work = candle_audio::dsp::resample_test_support::work();
         assert_eq!(bounded.len(), config::TARGET_SAMPLES);
         assert!(bounded
             .iter()
             .zip(expected)
             .all(|(&a, &b)| a.to_bits() == b.to_bits()));
         assert_eq!(
-            candle_audio::dsp::resample_test_support::work(),
-            (config::TARGET_SAMPLES, config::TARGET_SAMPLES),
-            "only the centered target window may be downmixed/evaluated"
+            bounded_work.0,
+            config::TARGET_SAMPLES,
+            "only the centered target window may be evaluated"
         );
-        assert!(config::TARGET_SAMPLES < input_frames);
+        assert_eq!(full_work.0, full.len());
+        assert!(
+            bounded_work.1 < full_work.1,
+            "bounded source work {} must be below full-clip {}",
+            bounded_work.1,
+            full_work.1
+        );
+        assert!(config::TARGET_SAMPLES < full.len());
     }
 
     #[test]
