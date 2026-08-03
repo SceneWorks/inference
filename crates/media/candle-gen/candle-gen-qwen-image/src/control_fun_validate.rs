@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::Progress;
+use candle_gen::gen_core::{PreviewSink, Progress};
 use candle_gen::testkit::{env_path, mean_abs_diff, read_ppm, write_ppm};
 
 use crate::control_fun::{QwenFunControl, QwenFunControlPaths, QwenFunControlRequest};
@@ -63,6 +63,7 @@ fn real_weight_fun_control() {
         control_scale: 1.0,
         seed: 12345,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
 
     let mut noop = |_p: Progress| {};

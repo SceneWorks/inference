@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, OffloadPolicy, Progress};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress};
 use candle_gen::testkit::{env_path, mean_abs_diff, read_ppm, write_ppm};
 
 use crate::edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
@@ -72,6 +72,7 @@ fn real_weight_edit() {
         stage_residency: false,
         memory: None,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
 
     let mut noop = |_p: Progress| {};
@@ -193,6 +194,7 @@ fn high_res_edit_avoids_i32_overflow() {
         stage_residency: false,
         memory: None,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
     let mut noop = |_p: Progress| {};
 
@@ -254,6 +256,7 @@ fn lightning_edit_4steps() {
         stage_residency: false,
         memory: None,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
     let mut noop = |_p: Progress| {};
 

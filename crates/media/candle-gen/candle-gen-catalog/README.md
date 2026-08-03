@@ -63,6 +63,13 @@ is what keeps a wired family honest afterwards — without exact per-file counts
 an already-inventoried file changes nothing any assertion can see. Weights-free, like the rest of the
 contract.
 
+Route ids and wired lanes are **not** one-to-one, and step 1 is about ids. `candle-gen-qwen-image`
+(sc-16952) wires three render lanes — base txt2img, reference edit, and 2512-Fun ControlNet — but
+registers one generator descriptor, because the latter two are bespoke providers the worker drives by
+name and so carry a `preview` sink on their own request types instead of a descriptor. One id in
+`PREVIEW_ROUTE_IDS`, three hooked sites in the route inventory; step 3 is what holds the two bespoke
+lanes to account.
+
 Consumers reach this catalog through the [`runtime-cuda`](../../../bundles/runtime-cuda/README.md)
 and [`runtime-cpu`](../../../bundles/runtime-cpu/README.md) bundles, which validate it against
 the Candle backend and pair it with the Candle LLM and snapshot-preparer catalogs.

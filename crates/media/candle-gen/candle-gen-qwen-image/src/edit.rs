@@ -27,7 +27,9 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, OffloadPolicy, Progress};
+use candle_gen::gen_core::{
+    AdapterSpec, GenerationMemory, Image, OffloadPolicy, PreviewSink, Progress,
+};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -84,6 +86,16 @@ pub struct QwenEditRequest {
     /// Shared memory-ladder selection configured by the worker's request scope.
     pub memory: Option<GenerationMemory>,
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16952) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// carried as a field because the edit lane is a bespoke provider the worker drives by name
+    /// rather than through the registry. The [`Default`] is inert, and an inert sink is
+    /// seeded-byte-identical to a render with no preview at all.
+    ///
+    /// The frames are of the **target** image only. The reference latents are concatenated onto the
+    /// DiT sequence inside the predict closure and narrowed straight back off, so the sampler's
+    /// running latent — the only thing the hook is ever handed — never carries a reference token.
+    pub preview: PreviewSink,
 }
 
 impl Default for QwenEditRequest {
@@ -100,6 +112,7 @@ impl Default for QwenEditRequest {
             stage_residency: false,
             memory: None,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -549,6 +562,13 @@ impl QwenEdit {
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::TRANSFORMER_BLOCKS as usize);
 
+        // Per-step latent preview (epic 16948, sc-16952). The sampler's running latent is the packed
+        // NOISE prefix `[1, (H/16)·(W/16), 64]` alone — the reference concatenation and the true-CFG
+        // pos/neg blend both happen inside the predict closure below, and the closure narrows its
+        // result back to `noise_seq` — so the projector is handed target tokens only and unpacks them
+        // to `[1, 16, H/8, W/8]` before applying the QwenVae fit.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
+
         let latents = candle_gen::run_flow_sampler(
             None,
             candle_gen::gen_core::sampling::TimestepConvention::Sigma,
@@ -557,7 +577,7 @@ impl QwenEdit {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 // Concatenate the (updating) noise with the (static) reference latents over the sequence.
                 let joint = Tensor::cat(&[latents, static_latents], 1)?;

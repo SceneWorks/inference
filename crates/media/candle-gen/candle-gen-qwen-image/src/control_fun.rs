@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, PreviewSink, Progress};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -76,6 +76,12 @@ pub struct QwenFunControlRequest {
     pub control_scale: f32,
     pub seed: u64,
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16952) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// carried as a field because this lane is a bespoke provider the worker drives by name rather
+    /// than through the registry. The [`Default`] is inert, and an inert sink is
+    /// seeded-byte-identical to a render with no preview at all.
+    pub preview: PreviewSink,
 }
 
 impl Default for QwenFunControlRequest {
@@ -90,6 +96,7 @@ impl Default for QwenFunControlRequest {
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 0,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -228,6 +235,13 @@ impl QwenFunControl {
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 
+        // Per-step latent preview (epic 16948, sc-16952). The sampler's running latent is the packed
+        // `[1, (H/16)·(W/16), 64]` target; the packed 132-channel VACE control context is a closure
+        // capture, constant across steps and never part of it, and the true-CFG pos/neg blend also
+        // lives inside the closure. The projector unpacks to `[1, 16, H/8, W/8]` before applying the
+        // QwenVae fit.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
+
         let latents = candle_gen::run_flow_sampler(
             None,
             candle_gen::gen_core::sampling::TimestepConvention::Sigma,
@@ -236,7 +250,7 @@ impl QwenFunControl {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let pos_v = self.transformer.forward_fun_control(
                     latents,
