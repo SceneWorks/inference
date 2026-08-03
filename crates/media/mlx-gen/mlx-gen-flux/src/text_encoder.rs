@@ -39,7 +39,6 @@ enum TokenEmbedding {
         group_size: i32,
         bits: i32,
         residual: Option<PackedTerm>,
-        residual2: Option<PackedTerm>,
     },
 }
 
@@ -93,10 +92,6 @@ impl TokenEmbedding {
                 group_size,
                 bits,
                 residual: load_packed_term(w, &format!("{base}.residual"), group_size)?,
-                // The second term is currently an in-memory calibration seam only. Chroma's
-                // fail-closed packed-surface validator must learn its exact provenance before any
-                // `.residual2.*` artifact is accepted on disk.
-                residual2: None,
             });
         }
         Ok(Self::Dense(w.require(&format!("{base}.weight"))?.clone()))
@@ -112,13 +107,12 @@ impl TokenEmbedding {
                 group_size,
                 bits,
                 residual,
-                residual2,
             } => {
                 let pw = wq.take_axis(ids, 0)?;
                 let sc = scales.take_axis(ids, 0)?;
                 let bi = biases.take_axis(ids, 0)?;
                 let primary = dequantize(&pw, &sc, &bi, *group_size, *bits)?;
-                let with_residual = match residual {
+                match residual {
                     Some(residual) => {
                         let rw = residual.wq.take_axis(ids, 0)?;
                         let rs = residual.scales.take_axis(ids, 0)?;
@@ -129,18 +123,6 @@ impl TokenEmbedding {
                         )?
                     }
                     None => primary,
-                };
-                match residual2 {
-                    Some(residual2) => {
-                        let rw = residual2.wq.take_axis(ids, 0)?;
-                        let rs = residual2.scales.take_axis(ids, 0)?;
-                        let rb = residual2.biases.take_axis(ids, 0)?;
-                        add(
-                            &with_residual,
-                            &dequantize(&rw, &rs, &rb, residual2.group_size, residual2.bits)?,
-                        )?
-                    }
-                    None => with_residual,
                 }
             }
         };
@@ -168,7 +150,6 @@ impl TokenEmbedding {
                 group_size,
                 bits,
                 residual: None,
-                residual2: None,
             };
         }
         Ok(())
@@ -203,60 +184,6 @@ impl TokenEmbedding {
                     group_size,
                     bits: residual_bits,
                 }),
-                residual2: None,
-            };
-        }
-        Ok(())
-    }
-
-    fn quantize_progressive_with_secondary(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        secondary_bits: Option<i32>,
-        group_size: i32,
-    ) -> Result<()> {
-        if let Self::Dense(w) = self {
-            let wbf16 = w.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-            let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
-            let residual = subtract(&wbf16, &restored)?;
-            let (residual_wq, residual_scales, residual_biases) =
-                quantize(&residual, group_size, residual_bits)?;
-            let residual2 = if let Some(secondary_bits) = secondary_bits {
-                let restored_residual = dequantize(
-                    &residual_wq,
-                    &residual_scales,
-                    &residual_biases,
-                    group_size,
-                    residual_bits,
-                )?;
-                let secondary = subtract(&residual, &restored_residual)?;
-                let (wq, scales, biases) = quantize(&secondary, group_size, secondary_bits)?;
-                Some(PackedTerm {
-                    wq,
-                    scales,
-                    biases,
-                    group_size,
-                    bits: secondary_bits,
-                })
-            } else {
-                None
-            };
-            *self = Self::Quantized {
-                wq,
-                scales,
-                biases,
-                group_size,
-                bits,
-                residual: Some(PackedTerm {
-                    wq: residual_wq,
-                    scales: residual_scales,
-                    biases: residual_biases,
-                    group_size,
-                    bits: residual_bits,
-                }),
-                residual2,
             };
         }
         Ok(())
@@ -484,7 +411,6 @@ impl ClipMlp {
 struct T5Linear {
     primary: AdaptableLinear,
     residual: Option<AdaptableLinear>,
-    residual2: Option<AdaptableLinear>,
 }
 
 impl T5Linear {
@@ -500,24 +426,14 @@ impl T5Linear {
                 term.bits,
             )
         });
-        Ok(Self {
-            primary,
-            residual,
-            // In-memory calibration only until the provider's exact-set artifact validator and
-            // provenance schema support a second packed residual term.
-            residual2: None,
-        })
+        Ok(Self { primary, residual })
     }
 
     fn forward(&self, hidden: &Array) -> Result<Array> {
         let primary = self.primary.forward(hidden)?;
-        let with_residual = match &self.residual {
-            Some(residual) => add(&primary, &residual.forward(hidden)?)?,
-            None => primary,
-        };
-        match &self.residual2 {
-            Some(residual2) => Ok(add(&with_residual, &residual2.forward(hidden)?)?),
-            None => Ok(with_residual),
+        match &self.residual {
+            Some(residual) => Ok(add(&primary, &residual.forward(hidden)?)?),
+            None => Ok(primary),
         }
     }
 
@@ -565,66 +481,6 @@ impl T5Linear {
         ));
         Ok(())
     }
-
-    fn quantize_progressive_with_secondary(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        secondary_bits: Option<i32>,
-        group_size: i32,
-    ) -> Result<()> {
-        if self.residual.is_some() || self.residual2.is_some() {
-            return Ok(());
-        }
-        let Some((weight, bias)) = self.primary.dense_weight() else {
-            return Err(Error::Msg(
-                "T5 progressive quantization requires a dense source weight".into(),
-            ));
-        };
-        if bias.is_some() {
-            return Err(Error::Msg(
-                "T5 progressive quantization does not support biased linears".into(),
-            ));
-        }
-        let wbf16 = weight.as_dtype(Dtype::Bfloat16)?;
-        let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-        let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
-        let residual = subtract(&wbf16, &restored)?;
-        let (residual_wq, residual_scales, residual_biases) =
-            quantize(&residual, group_size, residual_bits)?;
-        self.residual2 = if let Some(secondary_bits) = secondary_bits {
-            let restored_residual = dequantize(
-                &residual_wq,
-                &residual_scales,
-                &residual_biases,
-                group_size,
-                residual_bits,
-            )?;
-            let secondary = subtract(&residual, &restored_residual)?;
-            let (wq, scales, biases) = quantize(&secondary, group_size, secondary_bits)?;
-            Some(AdaptableLinear::from_quantized_parts(
-                wq,
-                scales,
-                biases,
-                None,
-                group_size,
-                secondary_bits,
-            ))
-        } else {
-            None
-        };
-        self.primary =
-            AdaptableLinear::from_quantized_parts(wq, scales, biases, None, group_size, bits);
-        self.residual = Some(AdaptableLinear::from_quantized_parts(
-            residual_wq,
-            residual_scales,
-            residual_biases,
-            None,
-            group_size,
-            residual_bits,
-        ));
-        Ok(())
-    }
 }
 
 pub struct T5TextEncoder {
@@ -639,16 +495,6 @@ pub struct T5TextEncoder {
 pub enum T5Sublayer {
     Attention,
     FeedForward,
-}
-
-/// One projection within a T5 gated feed-forward sublayer. This is a finer calibration surface
-/// than [`T5Sublayer::FeedForward`]; selecting a projection changes only that packed residual's
-/// width and never retains its dense source weight.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum T5FeedForwardProjection {
-    Wi0,
-    Wi1,
-    Wo,
 }
 
 impl T5TextEncoder {
@@ -773,44 +619,21 @@ impl T5TextEncoder {
         group_size: i32,
         sensitive_sublayers: &[(usize, T5Sublayer)],
     ) -> Result<()> {
-        self.quantize_progressive_with_sensitive_surfaces_residuals(
+        self.quantize_progressive_with_selected_parameter_dtypes(
             bits,
             residual_bits,
             sensitive_residual_bits,
             group_size,
             sensitive_sublayers,
+            Dtype::Bfloat16,
+            Dtype::Bfloat16,
             &[],
         )
     }
 
-    /// In-memory calibration seam for progressive T5 packs whose affine scales and biases are
-    /// derived and retained in f32. Packed bit widths and residual term count are unchanged, while
-    /// f32 affine arithmetic may select different codes at rounding boundaries. This isolates an
-    /// f32 affine representation without another projection-sized residual term. Provider
-    /// provenance must be extended separately if calibration selects it.
-    pub fn quantize_progressive_with_sensitive_sublayers_f32_parameters(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        group_size: i32,
-        sensitive_sublayers: &[(usize, T5Sublayer)],
-    ) -> Result<()> {
-        self.quantize_progressive_with_sensitive_surfaces_residuals_in_dtype(
-            bits,
-            residual_bits,
-            sensitive_residual_bits,
-            group_size,
-            sensitive_sublayers,
-            &[],
-            Dtype::Float32,
-            Dtype::Float32,
-            &[],
-        )
-    }
-
-    /// In-memory calibration seam for f32 affine parameters on selected T5 boundaries and
-    /// sublayers. Unselected surfaces retain the production bf16 affine representation.
+    /// Progressively quantize T5 with f32-derived affine scales/biases on selected boundaries and
+    /// whole attention/FFN sublayers. Unselected linears retain bf16 affine metadata and every
+    /// source weight remains represented only by its packed primary and residual terms.
     #[allow(clippy::too_many_arguments)]
     pub fn quantize_progressive_with_selected_f32_parameters(
         &mut self,
@@ -822,13 +645,12 @@ impl T5TextEncoder {
         f32_boundaries: bool,
         f32_sublayers: &[(usize, T5Sublayer)],
     ) -> Result<()> {
-        self.quantize_progressive_with_sensitive_surfaces_residuals_in_dtype(
+        self.quantize_progressive_with_selected_parameter_dtypes(
             bits,
             residual_bits,
             sensitive_residual_bits,
             group_size,
             sensitive_sublayers,
-            &[],
             if f32_boundaries {
                 Dtype::Float32
             } else {
@@ -839,43 +661,16 @@ impl T5TextEncoder {
         )
     }
 
-    /// Progressively quantize T5 with both whole-sublayer and individual feed-forward projection
-    /// residual-width selections. Whole-FFN selection takes precedence and makes all three of its
-    /// projections sensitive; otherwise only explicitly selected projections use the wider packed
-    /// residual.
-    pub fn quantize_progressive_with_sensitive_surfaces_residuals(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        group_size: i32,
-        sensitive_sublayers: &[(usize, T5Sublayer)],
-        sensitive_ffn_projections: &[(usize, T5FeedForwardProjection)],
-    ) -> Result<()> {
-        self.quantize_progressive_with_sensitive_surfaces_residuals_in_dtype(
-            bits,
-            residual_bits,
-            sensitive_residual_bits,
-            group_size,
-            sensitive_sublayers,
-            sensitive_ffn_projections,
-            Dtype::Bfloat16,
-            Dtype::Bfloat16,
-            &[],
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn quantize_progressive_with_sensitive_surfaces_residuals_in_dtype(
+    fn quantize_progressive_with_selected_parameter_dtypes(
         &mut self,
         bits: i32,
         residual_bits: i32,
         sensitive_residual_bits: i32,
         group_size: i32,
         sensitive_sublayers: &[(usize, T5Sublayer)],
-        sensitive_ffn_projections: &[(usize, T5FeedForwardProjection)],
         boundary_dtype: Dtype,
-        default_sublayer_dtype: Dtype,
+        default_linear_dtype: Dtype,
         f32_sublayers: &[(usize, T5Sublayer)],
     ) -> Result<()> {
         validate_t5_group_size(group_size)?;
@@ -887,12 +682,7 @@ impl T5TextEncoder {
                 "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} residuals"
             )));
         }
-        for block in sensitive_sublayers
-            .iter()
-            .map(|(block, _)| *block)
-            .chain(sensitive_ffn_projections.iter().map(|(block, _)| *block))
-            .chain(f32_sublayers.iter().map(|(block, _)| *block))
-        {
+        for &(block, _) in sensitive_sublayers.iter().chain(f32_sublayers) {
             if block >= self.blocks.len() {
                 return Err(Error::Msg(format!(
                     "T5 sensitive-residual block {block} is outside 0..{}",
@@ -911,16 +701,15 @@ impl T5TextEncoder {
                 sensitive_sublayers.contains(&(index, T5Sublayer::Attention));
             let feed_forward_is_sensitive =
                 sensitive_sublayers.contains(&(index, T5Sublayer::FeedForward));
-            let sensitive_ffn_projection = |projection| {
-                feed_forward_is_sensitive
-                    || sensitive_ffn_projections.contains(&(index, projection))
+            let attention_dtype = if f32_sublayers.contains(&(index, T5Sublayer::Attention)) {
+                Dtype::Float32
+            } else {
+                default_linear_dtype
             };
-            let source_dtype = |sublayer| {
-                if f32_sublayers.contains(&(index, sublayer)) {
-                    Dtype::Float32
-                } else {
-                    default_sublayer_dtype
-                }
+            let feed_forward_dtype = if f32_sublayers.contains(&(index, T5Sublayer::FeedForward)) {
+                Dtype::Float32
+            } else {
+                default_linear_dtype
             };
             block.quantize_progressive_in_dtype(
                 bits,
@@ -928,72 +717,10 @@ impl T5TextEncoder {
                 sensitive_residual_bits,
                 group_size,
                 attention_is_sensitive,
-                [
-                    sensitive_ffn_projection(T5FeedForwardProjection::Wi0),
-                    sensitive_ffn_projection(T5FeedForwardProjection::Wi1),
-                    sensitive_ffn_projection(T5FeedForwardProjection::Wo),
-                ],
-                source_dtype(T5Sublayer::Attention),
-                source_dtype(T5Sublayer::FeedForward),
+                feed_forward_is_sensitive,
                 boundary_dtype,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// In-memory calibration seam for a third packed affine term on a narrowly selected T5 surface.
-    /// The primary and first residual retain the normal progressive policy; selected boundaries and
-    /// sublayers receive another Q4/Q8 correction. Every runtime term remains packed. This method
-    /// deliberately does not define an on-disk format; provider provenance validation must be
-    /// extended separately after hosted calibration selects an exact surface.
-    #[allow(clippy::too_many_arguments)]
-    pub fn quantize_progressive_with_secondary_residuals(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        secondary_bits: i32,
-        group_size: i32,
-        sensitive_sublayers: &[(usize, T5Sublayer)],
-        secondary_boundaries: bool,
-        secondary_sublayers: &[(usize, T5Sublayer)],
-    ) -> Result<()> {
-        validate_t5_group_size(group_size)?;
-        if !matches!(bits, 4 | 8)
-            || !matches!(residual_bits, 4 | 8)
-            || !matches!(sensitive_residual_bits, 4 | 8)
-            || !matches!(secondary_bits, 4 | 8)
-        {
-            return Err(Error::Msg(format!(
-                "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} + Q{secondary_bits}"
-            )));
-        }
-        for &(block, _) in sensitive_sublayers.iter().chain(secondary_sublayers) {
-            if block >= self.blocks.len() {
-                return Err(Error::Msg(format!(
-                    "T5 sensitive-residual block {block} is outside 0..{}",
-                    self.blocks.len()
-                )));
-            }
-        }
-        self.shared.quantize_progressive_with_secondary(
-            bits,
-            sensitive_residual_bits,
-            secondary_boundaries.then_some(secondary_bits),
-            group_size,
-        )?;
-        for (index, block) in self.blocks.iter_mut().enumerate() {
-            block.quantize_progressive_with_secondary(
-                bits,
-                residual_bits,
-                sensitive_residual_bits,
-                secondary_bits,
-                group_size,
-                sensitive_sublayers.contains(&(index, T5Sublayer::Attention)),
-                sensitive_sublayers.contains(&(index, T5Sublayer::FeedForward)),
-                secondary_boundaries,
-                secondary_sublayers.contains(&(index, T5Sublayer::Attention)),
-                secondary_sublayers.contains(&(index, T5Sublayer::FeedForward)),
+                attention_dtype,
+                feed_forward_dtype,
             )?;
         }
         Ok(())
@@ -1091,12 +818,17 @@ impl T5Block {
         sensitive_residual_bits: i32,
         group_size: i32,
         attention_is_sensitive: bool,
-        sensitive_ffn_projections: [bool; 3],
+        feed_forward_is_sensitive: bool,
+        boundary_dtype: Dtype,
         attention_dtype: Dtype,
         feed_forward_dtype: Dtype,
-        boundary_dtype: Dtype,
     ) -> Result<()> {
         let attention_residual_bits = if attention_is_sensitive {
+            sensitive_residual_bits
+        } else {
+            residual_bits
+        };
+        let feed_forward_residual_bits = if feed_forward_is_sensitive {
             sensitive_residual_bits
         } else {
             residual_bits
@@ -1109,55 +841,11 @@ impl T5Block {
             attention_dtype,
             boundary_dtype,
         )?;
-        self.ff
-            .quantize_progressive_with_sensitive_projections_in_dtype(
-                bits,
-                residual_bits,
-                sensitive_residual_bits,
-                group_size,
-                sensitive_ffn_projections,
-                feed_forward_dtype,
-            )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn quantize_progressive_with_secondary(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        secondary_bits: i32,
-        group_size: i32,
-        attention_is_sensitive: bool,
-        feed_forward_is_sensitive: bool,
-        secondary_boundaries: bool,
-        secondary_attention: bool,
-        secondary_feed_forward: bool,
-    ) -> Result<()> {
-        let attention_residual_bits = if attention_is_sensitive {
-            sensitive_residual_bits
-        } else {
-            residual_bits
-        };
-        let feed_forward_residual_bits = if feed_forward_is_sensitive {
-            sensitive_residual_bits
-        } else {
-            residual_bits
-        };
-        self.attn.quantize_progressive_with_secondary(
-            bits,
-            attention_residual_bits,
-            sensitive_residual_bits,
-            secondary_bits,
-            group_size,
-            secondary_boundaries,
-            secondary_attention,
-        )?;
-        self.ff.quantize_progressive_with_secondary(
+        self.ff.quantize_progressive_in_dtype(
             bits,
             feed_forward_residual_bits,
-            secondary_feed_forward.then_some(secondary_bits),
             group_size,
+            feed_forward_dtype,
         )
     }
 
@@ -1262,66 +950,22 @@ impl T5Attention {
         residual_bits: i32,
         relative_bias_residual_bits: i32,
         group_size: i32,
-        source_dtype: Dtype,
-        boundary_dtype: Dtype,
+        linear_dtype: Dtype,
+        relative_bias_dtype: Dtype,
     ) -> Result<()> {
         self.q
-            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, linear_dtype)?;
         self.k
-            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, linear_dtype)?;
         self.v
-            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, linear_dtype)?;
         self.o
-            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, linear_dtype)?;
         self.rel_bias.quantize_progressive_in_dtype(
             bits,
             relative_bias_residual_bits,
             group_size,
-            boundary_dtype,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn quantize_progressive_with_secondary(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        relative_bias_residual_bits: i32,
-        secondary_bits: i32,
-        group_size: i32,
-        secondary_boundary: bool,
-        secondary_attention: bool,
-    ) -> Result<()> {
-        let linear_secondary = secondary_attention.then_some(secondary_bits);
-        self.q.quantize_progressive_with_secondary(
-            bits,
-            residual_bits,
-            linear_secondary,
-            group_size,
-        )?;
-        self.k.quantize_progressive_with_secondary(
-            bits,
-            residual_bits,
-            linear_secondary,
-            group_size,
-        )?;
-        self.v.quantize_progressive_with_secondary(
-            bits,
-            residual_bits,
-            linear_secondary,
-            group_size,
-        )?;
-        self.o.quantize_progressive_with_secondary(
-            bits,
-            residual_bits,
-            linear_secondary,
-            group_size,
-        )?;
-        self.rel_bias.quantize_progressive_with_secondary(
-            bits,
-            relative_bias_residual_bits,
-            secondary_boundary.then_some(secondary_bits),
-            group_size,
+            relative_bias_dtype,
         )
     }
 
@@ -1381,63 +1025,19 @@ impl T5FeedForward {
         Ok(())
     }
 
-    fn quantize_progressive_with_sensitive_projections_in_dtype(
+    fn quantize_progressive_in_dtype(
         &mut self,
         bits: i32,
         residual_bits: i32,
-        sensitive_residual_bits: i32,
         group_size: i32,
-        sensitive: [bool; 3],
         source_dtype: Dtype,
     ) -> Result<()> {
-        let selected_bits = |selected| {
-            if selected {
-                sensitive_residual_bits
-            } else {
-                residual_bits
-            }
-        };
-        self.wi0.quantize_progressive_in_dtype(
-            bits,
-            selected_bits(sensitive[0]),
-            group_size,
-            source_dtype,
-        )?;
-        self.wi1.quantize_progressive_in_dtype(
-            bits,
-            selected_bits(sensitive[1]),
-            group_size,
-            source_dtype,
-        )?;
-        self.wo.quantize_progressive_in_dtype(
-            bits,
-            selected_bits(sensitive[2]),
-            group_size,
-            source_dtype,
-        )
-    }
-
-    fn quantize_progressive_with_secondary(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        secondary_bits: Option<i32>,
-        group_size: i32,
-    ) -> Result<()> {
-        self.wi0.quantize_progressive_with_secondary(
-            bits,
-            residual_bits,
-            secondary_bits,
-            group_size,
-        )?;
-        self.wi1.quantize_progressive_with_secondary(
-            bits,
-            residual_bits,
-            secondary_bits,
-            group_size,
-        )?;
+        self.wi0
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
+        self.wi1
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)?;
         self.wo
-            .quantize_progressive_with_secondary(bits, residual_bits, secondary_bits, group_size)
+            .quantize_progressive_in_dtype(bits, residual_bits, group_size, source_dtype)
     }
 }
 

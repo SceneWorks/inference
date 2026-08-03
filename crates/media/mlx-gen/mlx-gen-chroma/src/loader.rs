@@ -59,25 +59,35 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
 /// source. Keeping this provider-owned seam shared by production and the real-weight identity test
 /// prevents the test from validating a hand-written quantization recipe that production never uses.
 pub fn quantize_t5_for_dense_source(t5: &mut T5TextEncoder) -> Result<()> {
-    t5.quantize_progressive_with_sensitive_sublayers_residuals(
+    let sensitive_sublayers = [
+        (
+            crate::convert::T5_SENSITIVE_RESIDUAL_BLOCK,
+            T5Sublayer::Attention,
+        ),
+        (
+            crate::convert::T5_SENSITIVE_RESIDUAL_FFN_BLOCKS[0],
+            T5Sublayer::FeedForward,
+        ),
+        (
+            crate::convert::T5_SENSITIVE_RESIDUAL_FFN_BLOCKS[1],
+            T5Sublayer::FeedForward,
+        ),
+    ];
+    let mut f32_sublayers = (0..crate::convert::T5_BLOCK_COUNT)
+        .map(|block| (block, T5Sublayer::FeedForward))
+        .collect::<Vec<_>>();
+    f32_sublayers.push((
+        crate::convert::T5_SENSITIVE_RESIDUAL_BLOCK,
+        T5Sublayer::Attention,
+    ));
+    t5.quantize_progressive_with_selected_f32_parameters(
         crate::convert::AUXILIARY_BITS,
         crate::convert::T5_RESIDUAL_BITS,
         crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
         crate::convert::T5_GROUP_SIZE,
-        &[
-            (
-                crate::convert::T5_SENSITIVE_RESIDUAL_BLOCK,
-                T5Sublayer::Attention,
-            ),
-            (
-                crate::convert::T5_SENSITIVE_RESIDUAL_FFN_BLOCKS[0],
-                T5Sublayer::FeedForward,
-            ),
-            (
-                crate::convert::T5_SENSITIVE_RESIDUAL_FFN_BLOCKS[1],
-                T5Sublayer::FeedForward,
-            ),
-        ],
+        &sensitive_sublayers,
+        true,
+        &f32_sublayers,
     )
 }
 
@@ -92,6 +102,7 @@ struct T5ResidualPolicy {
     default_bits: i32,
     sensitive_bits: i32,
     sensitive_bases: BTreeSet<String>,
+    f32_affine_bases: BTreeSet<String>,
 }
 
 impl T5ResidualPolicy {
@@ -100,6 +111,14 @@ impl T5ResidualPolicy {
             self.sensitive_bits
         } else {
             self.default_bits
+        }
+    }
+
+    fn affine_parameter_dtype_for(&self, base: &str) -> Dtype {
+        if self.f32_affine_bases.contains(base) {
+            Dtype::Float32
+        } else {
+            Dtype::Bfloat16
         }
     }
 }
@@ -126,6 +145,8 @@ fn t5_residual_policy(component: &Path) -> Result<Option<T5ResidualPolicy>> {
     let Some(value) = quantization.get("residual_bits") else {
         if quantization.contains_key("sensitive_residual_bits")
             || quantization.contains_key("sensitive_residual_bases")
+            || quantization.contains_key("affine_parameter_dtype")
+            || quantization.contains_key("f32_affine_bases")
         {
             return Err(Error::Msg(format!(
                 "chroma T5: {} sensitive residual policy requires quantization.residual_bits",
@@ -203,10 +224,55 @@ fn t5_residual_policy(component: &Path) -> Result<Option<T5ResidualPolicy>> {
             config_path.display()
         )));
     }
+    let affine_parameter_dtype = quantization
+        .get("affine_parameter_dtype")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "chroma T5: {} quantization.affine_parameter_dtype must be a string",
+                config_path.display()
+            ))
+        })?;
+    if affine_parameter_dtype != crate::convert::T5_AFFINE_PARAMETER_DTYPE {
+        return Err(Error::Msg(format!(
+            "chroma T5: unsupported default affine parameter dtype {affine_parameter_dtype:?}; expected {:?}",
+            crate::convert::T5_AFFINE_PARAMETER_DTYPE
+        )));
+    }
+    let f32_bases = quantization
+        .get("f32_affine_bases")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "chroma T5: {} quantization.f32_affine_bases must be an array",
+                config_path.display()
+            ))
+        })?;
+    let f32_affine_bases = f32_bases
+        .iter()
+        .map(|base| {
+            base.as_str().map(str::to_string).ok_or_else(|| {
+                Error::Msg(format!(
+                    "chroma T5: {} quantization.f32_affine_bases must contain strings",
+                    config_path.display()
+                ))
+            })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let expected_f32 = crate::convert::t5_f32_affine_bases()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if f32_affine_bases != expected_f32 || f32_affine_bases.len() != f32_bases.len() {
+        return Err(Error::Msg(format!(
+            "chroma T5: {} declares an unsupported f32 affine parameter surface",
+            config_path.display()
+        )));
+    }
     Ok(Some(T5ResidualPolicy {
         default_bits,
         sensitive_bits,
         sensitive_bases,
+        f32_affine_bases,
     }))
 }
 
@@ -281,6 +347,9 @@ fn validate_t5_progressive_surface(
             let scales = w.require(&format!("{base}.scales"))?;
             let biases = w.require(&format!("{base}.biases"))?;
             validate_packed_companions(base, scales, biases)?;
+            if let Some(policy) = residual_policy {
+                validate_t5_affine_parameter_dtype(base, scales, biases, policy)?;
+            }
             let actual_bits = mlx_gen::quant::packed_bits(weight, scales, group_size)?;
             if actual_bits != primary_bits {
                 return Err(Error::Msg(format!(
@@ -359,6 +428,12 @@ fn validate_t5_progressive_surface(
             residual_scales,
             residual_biases,
         )?;
+        validate_t5_affine_parameter_dtype(
+            &format!("{base}.residual"),
+            residual_scales,
+            residual_biases,
+            residual_policy,
+        )?;
         let actual_bits =
             mlx_gen::quant::packed_bits(residual_weight, residual_scales, group_size)?;
         let expected_bits = residual_policy.bits_for(base);
@@ -367,6 +442,24 @@ fn validate_t5_progressive_surface(
                 "chroma T5: {base} residual is Q{actual_bits}, but policy requires Q{expected_bits}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_t5_affine_parameter_dtype(
+    base: &str,
+    scales: &mlx_rs::Array,
+    biases: &mlx_rs::Array,
+    policy: &T5ResidualPolicy,
+) -> Result<()> {
+    let policy_base = base.strip_suffix(".residual").unwrap_or(base);
+    let expected = policy.affine_parameter_dtype_for(policy_base);
+    if scales.dtype() != expected || biases.dtype() != expected {
+        return Err(Error::Msg(format!(
+            "chroma T5: {base} affine parameter dtype is scales={:?}, biases={:?}; policy requires {expected:?}",
+            scales.dtype(),
+            biases.dtype()
+        )));
     }
     Ok(())
 }
@@ -503,9 +596,18 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         assert_eq!(t5_residual_policy(&root).unwrap(), None);
+        let valid_config = serde_json::json!({"quantization": {
+            "bits": 8,
+            "group_size": 32,
+            "residual_bits": 4,
+            "sensitive_residual_bits": 8,
+            "sensitive_residual_bases": crate::convert::T5_SENSITIVE_RESIDUAL_BASES,
+            "affine_parameter_dtype": crate::convert::T5_AFFINE_PARAMETER_DTYPE,
+            "f32_affine_bases": crate::convert::t5_f32_affine_bases(),
+        }});
         std::fs::write(
             root.join("config.json"),
-            r#"{"quantization":{"bits":8,"group_size":32,"residual_bits":4,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o","encoder.block.1.layer.1.DenseReluDense.wi_0","encoder.block.1.layer.1.DenseReluDense.wi_1","encoder.block.1.layer.1.DenseReluDense.wo","encoder.block.2.layer.1.DenseReluDense.wi_0","encoder.block.2.layer.1.DenseReluDense.wi_1","encoder.block.2.layer.1.DenseReluDense.wo"]}}"#,
+            serde_json::to_vec(&valid_config).unwrap(),
         )
         .unwrap();
         let policy = t5_residual_policy(&root).unwrap().unwrap();
@@ -527,6 +629,26 @@ mod tests {
             policy.bits_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
             4
         );
+        assert_eq!(policy.affine_parameter_dtype_for("shared"), Dtype::Float32);
+        assert_eq!(
+            policy.affine_parameter_dtype_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
+            Dtype::Float32
+        );
+        assert_eq!(
+            policy.affine_parameter_dtype_for("encoder.block.0.layer.0.SelfAttention.q"),
+            Dtype::Bfloat16
+        );
+        let mut incomplete_f32 = valid_config.clone();
+        incomplete_f32["quantization"]["f32_affine_bases"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_vec(&incomplete_f32).unwrap(),
+        )
+        .unwrap();
+        assert!(t5_residual_policy(&root).is_err());
         std::fs::write(
             root.join("config.json"),
             r#"{"quantization":{"bits":8,"group_size":64,"residual_bits":8,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o","encoder.block.1.layer.1.DenseReluDense.wi_0","encoder.block.1.layer.1.DenseReluDense.wi_1","encoder.block.1.layer.1.DenseReluDense.wo","encoder.block.2.layer.1.DenseReluDense.wi_0","encoder.block.2.layer.1.DenseReluDense.wi_1","encoder.block.2.layer.1.DenseReluDense.wo"]}}"#,
@@ -551,6 +673,7 @@ mod tests {
                 .iter()
                 .map(|base| (*base).to_string())
                 .collect(),
+            f32_affine_bases: crate::convert::t5_f32_affine_bases().into_iter().collect(),
         };
         validate_t5_packed_policy(
             Some(crate::convert::AUXILIARY_BITS),
@@ -605,6 +728,9 @@ mod tests {
             default_bits: bits,
             sensitive_bits: bits,
             sensitive_bases: BTreeSet::new(),
+            f32_affine_bases: ["encoder.block.0.layer.0.SelfAttention.q".to_string()]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -682,6 +808,12 @@ mod tests {
                 .iter()
                 .map(|base| (*base).to_string())
                 .collect(),
+            f32_affine_bases: [
+                "shared".to_string(),
+                "encoder.block.0.layer.0.SelfAttention.q".to_string(),
+            ]
+            .into_iter()
+            .collect(),
         };
         let shared = "shared";
         validate_t5_progressive_surface(
@@ -727,6 +859,20 @@ mod tests {
         let q4 = uniform_residual_policy(4);
         validate_t5_progressive_surface(&progressive_fixture(16, false, 2), Some(8), Some(&q4), 64)
             .unwrap();
+        let mut wrong_dtype_policy = q4.clone();
+        wrong_dtype_policy.f32_affine_bases.clear();
+        assert!(
+            validate_t5_progressive_surface(
+                &progressive_fixture(16, false, 2),
+                Some(8),
+                Some(&wrong_dtype_policy),
+                64,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("policy requires Bfloat16"),
+            "f32 affine tensors must not pass a bf16 provenance surface"
+        );
         assert!(
             validate_t5_progressive_surface(
                 &progressive_fixture(32, false, 2),

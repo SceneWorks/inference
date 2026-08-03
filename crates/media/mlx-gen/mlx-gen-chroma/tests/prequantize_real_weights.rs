@@ -139,6 +139,16 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
                 serde_json::json!(mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BASES),
                 "T5 sensitive residual surface provenance"
             );
+            assert_eq!(
+                config["quantization"]["affine_parameter_dtype"],
+                mlx_gen_chroma::convert::T5_AFFINE_PARAMETER_DTYPE,
+                "T5 default affine parameter dtype provenance"
+            );
+            assert_eq!(
+                config["quantization"]["f32_affine_bases"],
+                serde_json::json!(mlx_gen_chroma::convert::t5_f32_affine_bases()),
+                "T5 f32 affine parameter surface provenance"
+            );
         }
         let safetensors = std::fs::read_dir(out.join(component))
             .expect("packed component dir")

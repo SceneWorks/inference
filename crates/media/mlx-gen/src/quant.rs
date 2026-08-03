@@ -420,6 +420,28 @@ pub fn quantize_map_with_residual_policy(
     is_target: impl Fn(&str) -> bool,
     residual_bits_for: impl Fn(&str) -> i32,
 ) -> Result<HashMap<String, Array>> {
+    quantize_map_with_residual_policy_and_parameter_dtype(
+        map,
+        bits,
+        group_size,
+        is_target,
+        residual_bits_for,
+        |_| Dtype::Bfloat16,
+    )
+}
+
+/// As [`quantize_map_with_residual_policy`], with a provider-owned source/affine-parameter dtype
+/// per packed base. MLX derives affine scales and biases in the source dtype, so providers that
+/// have calibrated a mixed precision metadata surface must select it before quantization rather
+/// than casting the resulting parameters after codes have already been chosen.
+pub fn quantize_map_with_residual_policy_and_parameter_dtype(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+    is_target: impl Fn(&str) -> bool,
+    residual_bits_for: impl Fn(&str) -> i32,
+    parameter_dtype_for: impl Fn(&str) -> Dtype,
+) -> Result<HashMap<String, Array>> {
     if !matches!(bits, 4 | 8) {
         return Err(crate::Error::Msg(format!(
             "progressive quant: primary bits must be 4 or 8, got {bits}"
@@ -438,10 +460,16 @@ pub fn quantize_map_with_residual_policy(
             && v.shape()[1] % group_size == 0
             && v.shape()[1] >= group_size;
         if let (Some(base), true) = (base, packable) {
-            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
+            let parameter_dtype = parameter_dtype_for(base);
+            if !matches!(parameter_dtype, Dtype::Bfloat16 | Dtype::Float32) {
+                return Err(crate::Error::Msg(format!(
+                    "progressive quant: affine parameter dtype for {base} must be Bfloat16 or Float32, got {parameter_dtype:?}"
+                )));
+            }
+            let source = v.as_dtype(parameter_dtype)?;
+            let (wq, scales, biases) = quantize(&source, group_size, bits)?;
             let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
-            let residual = subtract(&wbf16, &restored)?;
+            let residual = subtract(&source, &restored)?;
             let residual_bits = residual_bits_for(base);
             if !matches!(residual_bits, 4 | 8) {
                 return Err(crate::Error::Msg(format!(
@@ -450,6 +478,15 @@ pub fn quantize_map_with_residual_policy(
             }
             let (residual_wq, residual_scales, residual_biases) =
                 quantize(&residual, group_size, residual_bits)?;
+            if scales.dtype() != parameter_dtype
+                || biases.dtype() != parameter_dtype
+                || residual_scales.dtype() != parameter_dtype
+                || residual_biases.dtype() != parameter_dtype
+            {
+                return Err(crate::Error::Msg(format!(
+                    "progressive quant: affine parameter dtype drift for {base}; expected {parameter_dtype:?}"
+                )));
+            }
             out.insert(format!("{base}.weight"), wq);
             out.insert(format!("{base}.scales"), scales);
             out.insert(format!("{base}.biases"), biases);

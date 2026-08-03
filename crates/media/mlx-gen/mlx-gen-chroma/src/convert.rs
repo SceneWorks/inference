@@ -25,11 +25,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::quant::{
-    copy_dir, copy_turnkey_assets, quantize_map, quantize_map_with_residual_policy, save_map,
-    write_quantized_config,
+    copy_dir, copy_turnkey_assets, quantize_map,
+    quantize_map_with_residual_policy_and_parameter_dtype, save_map, write_quantized_config,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -55,6 +55,11 @@ pub const T5_SENSITIVE_RESIDUAL_BITS: i32 = 8;
 pub const T5_SENSITIVE_RESIDUAL_BLOCK: usize = 4;
 /// Feed-forward blocks selected in sensitivity rank order as the next packed corrections.
 pub const T5_SENSITIVE_RESIDUAL_FFN_BLOCKS: &[usize] = &[1, 2];
+/// T5-v1.1-XXL encoder depth. The exact f32 affine metadata surface is generated from this fixed
+/// architecture and written into artifact provenance so loaders can reject incomplete rebuilds.
+pub const T5_BLOCK_COUNT: usize = 24;
+pub const T5_AFFINE_PARAMETER_DTYPE: &str = "bfloat16";
+pub const T5_F32_AFFINE_PARAMETER_DTYPE: &str = "float32";
 /// Exact packed bases whose small Q8 residuals protect the T5 boundaries and calibrated sublayers
 /// while keeping every source weight packed.
 pub const T5_SENSITIVE_RESIDUAL_BASES: &[&str] = &[
@@ -77,6 +82,41 @@ pub fn t5_residual_bits_for(base: &str) -> i32 {
         T5_SENSITIVE_RESIDUAL_BITS
     } else {
         T5_RESIDUAL_BITS
+    }
+}
+
+/// Exact bases whose primary and residual affine scales/biases are derived and stored in f32.
+/// This is the smallest structured surface that passed both unchanged strict Base render gates
+/// and the same-run dense residency comparison: both boundaries, every FFN projection, and the
+/// calibrated block-4 attention projections.
+pub fn t5_f32_affine_bases() -> Vec<String> {
+    let mut bases = vec![
+        "shared".to_string(),
+        "encoder.block.0.layer.0.SelfAttention.relative_attention_bias".to_string(),
+    ];
+    for block in 0..T5_BLOCK_COUNT {
+        for projection in ["wi_0", "wi_1", "wo"] {
+            bases.push(format!(
+                "encoder.block.{block}.layer.1.DenseReluDense.{projection}"
+            ));
+        }
+    }
+    for projection in ["q", "k", "v", "o"] {
+        bases.push(format!(
+            "encoder.block.{T5_SENSITIVE_RESIDUAL_BLOCK}.layer.0.SelfAttention.{projection}"
+        ));
+    }
+    bases
+}
+
+pub fn t5_affine_parameter_dtype_for(base: &str) -> Dtype {
+    if t5_f32_affine_bases()
+        .iter()
+        .any(|candidate| candidate == base)
+    {
+        Dtype::Float32
+    } else {
+        Dtype::Bfloat16
     }
 }
 
@@ -193,12 +233,13 @@ fn quantize_t5_component(src: &Path, dst: &Path, bits: i32, group_size: i32) -> 
         )));
     }
     std::fs::create_dir_all(dst)?;
-    let map = quantize_map_with_residual_policy(
+    let map = quantize_map_with_residual_policy_and_parameter_dtype(
         load_component_map(src)?,
         bits,
         group_size,
         is_t5_target,
         t5_residual_bits_for,
+        t5_affine_parameter_dtype_for,
     )?;
     save_map(&dst.join(AUXILIARY_FILE), &map)?;
     write_quantized_config(src, dst, bits, group_size)?;
@@ -215,6 +256,8 @@ fn quantize_t5_component(src: &Path, dst: &Path, bits: i32, group_size: i32) -> 
         serde_json::json!(T5_SENSITIVE_RESIDUAL_BITS);
     config["quantization"]["sensitive_residual_bases"] =
         serde_json::json!(T5_SENSITIVE_RESIDUAL_BASES);
+    config["quantization"]["affine_parameter_dtype"] = serde_json::json!(T5_AFFINE_PARAMETER_DTYPE);
+    config["quantization"]["f32_affine_bases"] = serde_json::json!(t5_f32_affine_bases());
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).map_err(|error| {
@@ -509,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn t5_progressive_pack_matches_selective_two_stage_affine_quantization() {
+    fn t5_progressive_pack_matches_mixed_dtype_two_stage_affine_quantization() {
         let weight = Array::from_slice(
             &(0..64 * 128)
                 .map(|i| ((i as f32) * 0.017).cos())
@@ -526,12 +569,13 @@ mod tests {
         ] {
             map.insert(format!("{base}.weight"), weight.clone());
         }
-        let out = quantize_map_with_residual_policy(
+        let out = quantize_map_with_residual_policy_and_parameter_dtype(
             map,
             8,
             GROUP_SIZE,
             is_t5_target,
             t5_residual_bits_for,
+            t5_affine_parameter_dtype_for,
         )
         .unwrap();
         for base in [
@@ -541,9 +585,11 @@ mod tests {
             "encoder.block.1.layer.1.DenseReluDense.wi_0",
             "encoder.block.2.layer.1.DenseReluDense.wi_0",
         ] {
-            let wbf16 = weight.as_dtype(Dtype::Bfloat16).unwrap();
+            let source = weight
+                .as_dtype(t5_affine_parameter_dtype_for(base))
+                .unwrap();
             let (primary_weight, primary_scales, primary_biases) =
-                quantize(&wbf16, GROUP_SIZE, 8).unwrap();
+                quantize(&source, GROUP_SIZE, 8).unwrap();
             let restored = dequantize(
                 &primary_weight,
                 &primary_scales,
@@ -552,7 +598,7 @@ mod tests {
                 8,
             )
             .unwrap();
-            let residual = subtract(&wbf16, &restored).unwrap();
+            let residual = subtract(&source, &restored).unwrap();
             let residual_bits = t5_residual_bits_for(base);
             let (residual_weight, residual_scales, residual_biases) =
                 quantize(&residual, GROUP_SIZE, residual_bits).unwrap();
@@ -569,6 +615,16 @@ mod tests {
                     "progressive tensor mismatch for {base}: {suffix}"
                 );
             }
+            assert_eq!(
+                primary_scales.dtype(),
+                t5_affine_parameter_dtype_for(base),
+                "primary affine dtype for {base}"
+            );
+            assert_eq!(
+                residual_scales.dtype(),
+                t5_affine_parameter_dtype_for(base),
+                "residual affine dtype for {base}"
+            );
         }
         assert_eq!(t5_residual_bits_for("shared"), 8);
         for projection in ["q", "k", "v", "o"] {
