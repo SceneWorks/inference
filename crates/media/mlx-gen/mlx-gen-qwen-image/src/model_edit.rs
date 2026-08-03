@@ -251,7 +251,7 @@ fn load_vl_encoder_only(root: &Path) -> Result<QwenVisionLanguageEncoder> {
 fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHeavyOwned> {
     // Edit-2511 transformer (zero_cond_t on): clean-timestep modulation for the conditioning tokens.
     let mut transformer = loader::load_transformer_edit(root)?;
-    if crate::memory_strategy::is_streamable_spec(spec) {
+    if crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec) {
         transformer =
             transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
     }
@@ -408,7 +408,7 @@ impl QwenImageEdit {
             block_window,
             attention_budget,
             decode_tiling,
-        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
+        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117): `req.sampler == "lightning"` selects
         // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
@@ -424,20 +424,20 @@ impl QwenImageEdit {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |vl: &QwenVisionLanguageEncoder| self.encode_phase_a(vl, req, params.is_lightning),
-            // Materialize pos (+neg) while the VL encoder is still alive (Sequential only) — this forces
-            // the vision-tower AND LM forwards, else the outputs keep the encoder referenced and the
-            // drop would free nothing.
-            |encoded| {
-                let Some((pos, neg)) = encoded else {
-                    return Ok(());
-                };
-                match neg {
-                    Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
-                    None => mlx_rs::transforms::eval([pos])?,
-                }
-                Ok(())
+            |vl: &QwenVisionLanguageEncoder| {
+                let encoded = self.encode_phase_a(vl, req, params.is_lightning)?;
+                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                    match &encoded.1 {
+                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                        None => mlx_rs::transforms::eval([&encoded.0])?,
+                    }
+                    Ok(())
+                })?;
+                Ok(encoded)
             },
+            // The shared boundary already forced the vision tower and LM while the VL encoder was
+            // alive, including Resident requests; Sequential has nothing left before its text drop.
+            |_| Ok(()),
             // ── Establish the heavy render components (edit DiT + VAE + PiD) and run the dual-latent
             // VAE-encode + denoise/decode body once against the `heavy` borrow — identical for both.
             |heavy_owned, enc, on_progress| {
