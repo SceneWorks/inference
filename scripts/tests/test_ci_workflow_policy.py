@@ -350,11 +350,17 @@ def parse_binary_hashed_lock(lock: str) -> dict[str, tuple[str, str]]:
     lines = lock.splitlines()
     if "--only-binary=:all:" not in lines:
         raise AssertionError("lock must require binary distributions")
+    if lines.count("--index-url https://pypi.org/simple") != 1:
+        raise AssertionError("lock must use the canonical PyPI simple index")
     requirements: dict[str, tuple[str, str]] = {}
     cursor = 0
     while cursor < len(lines):
         line = lines[cursor]
-        if not line or line.startswith("#") or line == "--only-binary=:all:":
+        if (
+            not line
+            or line.startswith("#")
+            or line in ("--only-binary=:all:", "--index-url https://pypi.org/simple")
+        ):
             cursor += 1
             continue
         match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s\\]+) \\", line)
@@ -501,6 +507,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         mutations = {
             "missing binary policy": lock.replace("--only-binary=:all:\n", "", 1),
+            "missing canonical index": lock.replace(
+                "--index-url https://pypi.org/simple\n", "", 1
+            ),
+            "untrusted index": lock.replace(
+                "https://pypi.org/simple", "https://example.invalid/simple", 1
+            ),
             "unhashed requirement": lock.replace(
                 "    --hash=sha256:", "    --hash=sha512:", 1
             ),

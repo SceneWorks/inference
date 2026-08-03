@@ -3,6 +3,7 @@
 # python -m pip download --only-binary=:all: --platform win_amd64 \
 #   --python-version 3.12 --implementation cp --abi cp312 huggingface_hub==1.20.1
 --only-binary=:all:
+--index-url https://pypi.org/simple
 
 annotated-doc==0.0.5 \
     --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101
