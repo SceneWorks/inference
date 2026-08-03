@@ -25,7 +25,8 @@ use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewSink, Progress, Quant,
+    WeightsSource,
 };
 use candle_gen_flux2::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
@@ -225,6 +226,9 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         seed: c.seed,
         // Native VAE: this example exercises the edit pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
+        // an inert sink is byte-identical to a render with no preview at all.
+        preview: PreviewSink::default(),
         cancel: CancelFlag::new(),
     };
 
@@ -335,6 +339,9 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         seed: c.seed,
         // Native VAE: this example exercises the edit pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
+        // an inert sink is byte-identical to a render with no preview at all.
+        preview: PreviewSink::default(),
         cancel: CancelFlag::new(),
     };
     let mut prog = step_progress("edit");

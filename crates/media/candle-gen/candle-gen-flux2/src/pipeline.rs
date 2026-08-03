@@ -54,6 +54,17 @@ pub fn pack_nchw(x: &Tensor) -> Result<Tensor> {
 /// Unpack packed latents `[1, seq, C]` back to `[1, C, lat_h, lat_w]` (NCHW) for the VAE.
 pub fn unpack_latents(packed: &Tensor, width: u32, height: u32) -> Result<Tensor> {
     let (lat_h, lat_w) = latent_dims(width, height);
+    unpack_latents_at(packed, lat_h, lat_w)
+}
+
+/// [`unpack_latents`] against an **explicit** token grid rather than an image size.
+///
+/// The image-size form derives `(lat_h, lat_w)` through [`latent_dims`], which is right for every
+/// FLUX.2 route. Lens shares this latent space and this fold but resolves its grid through its own
+/// aspect-bucket table (`candle_gen_lens::resolution`) rather than from `width/16`, and
+/// `crate::preview` has to unpack for **both** — so the grid-keyed form is the one primitive both
+/// callers share, and [`unpack_latents`] becomes a thin wrapper rather than a second implementation.
+pub fn unpack_latents_at(packed: &Tensor, lat_h: usize, lat_w: usize) -> Result<Tensor> {
     let (b, _seq, c) = packed.dims3()?;
     packed
         .reshape((b, lat_h, lat_w, c))?

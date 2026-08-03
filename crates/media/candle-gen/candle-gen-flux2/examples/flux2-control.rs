@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress, Quant};
+use candle_gen::gen_core::{Image, PreviewSink, Progress, Quant};
 use candle_gen_flux2::{Flux2Control, Flux2ControlPaths, Flux2ControlRequest};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -244,6 +244,9 @@ fn main() -> Result<()> {
         seed,
         // Native VAE: this example exercises the control pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
+        // an inert sink is byte-identical to a render with no preview at all.
+        preview: PreviewSink::default(),
         cancel: CancelFlag::new(),
     };
     let mut on_progress = |p: Progress| {

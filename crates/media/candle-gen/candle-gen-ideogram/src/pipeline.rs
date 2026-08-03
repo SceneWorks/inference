@@ -492,10 +492,39 @@ fn denoise(
     };
     let text_z_padding = Tensor::zeros((1, num_text, ch), DType::F32, device)?;
 
+    // Per-step latent preview (epic 16948, sc-16955). Ideogram owns a bespoke flow-match loop with no
+    // shared-driver call anywhere, so it emits through `candle_gen::preview::emit_preview_at` directly
+    // rather than by handing a hook to a sampler — the `Denoise::Bespoke` shape `candle-gen-catalog`'s
+    // route inventory declares for this crate.
+    //
+    // Keyed on the **step index** rather than on a sigma: this loop walks a `LogitNormalSchedule` whose
+    // σ is inverted (larger = cleaner) and is evaluated per step rather than indexed out of a descending
+    // array, so `PreviewCounter::new(sigmas)` has nothing to key against. `with_steps` is the same
+    // counter shape the σ-less SCM driver uses, and it gives the same guarantees: monotone, bounded by
+    // `num_run`, and one frame per position even if a position were revisited.
+    //
+    // The counter is local to this call, and `render` calls this function once per seed, so a batched
+    // request starts each image's trajectory at frame 1.
+    //
+    // `num_run` — not `steps` — is the total: an edit skips the noisiest leading steps, so a
+    // strength-0.5 img2img genuinely runs (and previews) half as many.
+    let preview_counter = candle_gen::preview::PreviewCounter::with_steps(num_run);
+
     for i in (0..num_run).rev() {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        // Emitted BEFORE the step, matching the shared drivers' contract: the frame shows the latent
+        // this step is about to advance, so the fully denoised state is never previewed (the finished
+        // image lands instead). The loop counts down, so iteration `i` is 0-based position
+        // `num_run - 1 - i`. Projection failures are swallowed inside — a lost decorative frame never
+        // fails a render — and an inert sink never even runs the projection.
+        candle_gen::preview::emit_preview_at(
+            &req.preview,
+            &preview_counter,
+            num_run - 1 - i,
+            || crate::preview::project_packed_tokens(comps, &z, grid_h, grid_w),
+        );
         let t_val = schedule.eval(si[i + 1]) as f32;
         let s_val = schedule.eval(si[i]) as f32;
         let t = Tensor::from_vec(vec![t_val], 1, device)?;
@@ -560,19 +589,7 @@ fn decode(
     let grid_h = (height / PATCH_AE) as usize;
     let grid_w = (width / PATCH_AE) as usize;
 
-    // bn de-normalize in the packed [1, L, 128] space (Ideogram's (ph,pw,c) channel order).
-    let (bn_std, bn_mean) = comps.vae.bn_stats();
-    let bn_std = bn_std.reshape((1, 1, 128))?;
-    let bn_mean = bn_mean.reshape((1, 1, 128))?;
-    let denorm = z.broadcast_mul(&bn_std)?.broadcast_add(&bn_mean)?; // [1, L, 128]
-
-    // Unpatchify (ph,pw,c) → NCHW [1, 32, gh·2, gw·2]: split 128 = (ph=2, pw=2, c=32),
-    // bring c to the channel axis and interleave (gh,ph)/(gw,pw).
-    let latent = denorm
-        .reshape((1, grid_h, grid_w, 2, 2, 32))?
-        .permute((0, 5, 1, 3, 2, 4))? // [1, c, gh, ph, gw, pw]
-        .contiguous()?
-        .reshape((1, 32, grid_h * 2, grid_w * 2))?;
+    let latent = raw_latent(comps, z, grid_h, grid_w)?;
 
     let decoded = match pid {
         Some(d) => {
@@ -586,6 +603,48 @@ fn decode(
         None => comps.vae.decode_latent(&latent)?, // unchanged native path: [1, 3, H, W] f32 ~[-1,1]
     };
     to_image(&decoded)
+}
+
+/// Recover the **raw 32-channel VAE latent** `[1, 32, gh·2, gw·2]` (NCHW) from Ideogram's packed
+/// running latent `z` `[1, gh·gw, 128]`: bn de-normalize in the packed space, then unpatchify in
+/// Ideogram's own **`(ph, pw, c)`** channel order.
+///
+/// ## Why this cannot call the FLUX.2 helper
+///
+/// Ideogram loads the FLUX.2 VAE — the learned tensors are byte-identical to
+/// `black-forest-labs/FLUX.2-klein-9B`'s (sc-16955) — but its DiT packs the 128 channels as
+/// `(ph=2, pw=2, c=32)` while FLUX.2 packs them as `(c=32, ph=2, pw=2)`. So
+/// [`candle_gen_flux2::vae::raw_latent_from_packed`] would de-normalize against a **permuted** stat
+/// vector and unpatchify along the wrong axes, producing a plausible-looking but wrong latent rather
+/// than an error. [`Flux2Vae::bn_stats`] / [`Flux2Vae::decode_latent`] exist precisely so a provider in
+/// a non-FLUX channel order can do these two steps itself, which is what this does.
+///
+/// Factored out of [`decode`] because [`crate::preview`] needs exactly this tensor and nothing after
+/// it: the epic-16624 32-channel fit is defined over the raw latent, and having the preview and the
+/// decode share one function is what keeps a per-step frame from being a differently-unpatchified
+/// picture of the same trajectory.
+pub(crate) fn raw_latent(
+    comps: &Components,
+    z: &Tensor,
+    grid_h: usize,
+    grid_w: usize,
+) -> CResult<Tensor> {
+    // bn de-normalize in the packed [1, L, 128] space (Ideogram's (ph,pw,c) channel order).
+    let (bn_std, bn_mean) = comps.vae.bn_stats();
+    let bn_std = bn_std.reshape((1, 1, 128))?;
+    let bn_mean = bn_mean.reshape((1, 1, 128))?;
+    let denorm = z
+        .to_dtype(DType::F32)?
+        .broadcast_mul(&bn_std)?
+        .broadcast_add(&bn_mean)?; // [1, L, 128]
+
+    // Unpatchify (ph,pw,c) → NCHW [1, 32, gh·2, gw·2]: split 128 = (ph=2, pw=2, c=32),
+    // bring c to the channel axis and interleave (gh,ph)/(gw,pw).
+    Ok(denorm
+        .reshape((1, grid_h, grid_w, 2, 2, 32))?
+        .permute((0, 5, 1, 3, 2, 4))? // [1, c, gh, ph, gw, pw]
+        .contiguous()?
+        .reshape((1, 32, grid_h * 2, grid_w * 2))?)
 }
 
 /// `[1, 3, H, W]` f32 ~[-1,1] → RGB8 [`Image`].
