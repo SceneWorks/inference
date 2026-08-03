@@ -38,14 +38,16 @@
 //! roughly `σ·ε` against `~0.17` slopes, clamping them to a saturated binary field instead of the
 //! noise-to-image progression the fit describes.
 //!
-//! [`project_ve_latents`] therefore applies the family's own `input_scale` before projecting, and the
-//! lanes that already hold a renormalized latent ([`project_spatial_latents`]) apply nothing. Which
-//! lane is which is not a judgement call — it is read off what the lane feeds its UNet:
+//! [`project_ve_latents`] therefore applies the family's own `input_scale` before projecting, and a
+//! lane that already holds the renormalized tensor — because it was handed one, or because it just
+//! computed one to feed the UNet — projects that tensor directly with [`project_spatial_latents`].
+//! Which lane is which is not a judgement call: the projector is always shown the tensor the lane
+//! feeds its UNet, so it is read off the lane's own model input:
 //!
 //! | lane | running latent | projector |
 //! | --- | --- | --- |
 //! | `Pipeline::denoise_curated`, `denoise::denoise_curated`, Kolors `Pipeline::denoise_curated` | VE σ-space (driver applies `c_in`) | [`project_ve_latents`] |
-//! | `Pipeline::denoise_lightning`, Kolors native leading-Euler | VE-like (lane applies its own `c_in` / `scale_in`) | [`project_ve_latents`] |
+//! | `Pipeline::denoise_lightning`, Kolors native leading-Euler | VE-like, but the lane computes its own `c_in` / `1÷scale_in` and previews the product | [`project_spatial_latents`] on `x·c_in` |
 //! | `denoise::denoise_ip_multi_control`, `SdxlEdit::denoise_edit` | already renormalized — ancestral folds it into the step, "the UNet input is the raw latents" | [`project_spatial_latents`] |
 //!
 //! At the final emission σ is small, so `c_in → 1` and the two agree; the correction only ever
@@ -207,20 +209,14 @@ fn check_layout(latents: &Tensor) -> Result<()> {
 ///
 /// Built per image: the driver starts a fresh counter per call, and building the hook alongside the
 /// call keeps the two impossible to separate.
-pub(crate) fn ve_hook(sink: &PreviewSink) -> PreviewHook<'_> {
+///
+/// Public because `candle-gen-kolors`' curated lanes reach [`crate::denoise::denoise_curated`] in
+/// this crate rather than owning a driver call of their own, so they need the same seam. There is no
+/// companion constructor for the already-renormalized lanes: those hold a bespoke loop and call
+/// `candle_gen::preview::emit_preview_at` with [`project_spatial_latents`] directly, so a hook would
+/// have no caller.
+pub fn ve_hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::with_sigma(sink, project_ve_latents)
-}
-
-/// The preview hook for a lane whose running latent is **already renormalized** — the ancestral and
-/// edit loops. Public so `candle-gen-kolors`' bespoke providers can build the same seam.
-pub fn spatial_hook(sink: &PreviewSink) -> PreviewHook<'_> {
-    PreviewHook::new(sink, project_spatial_latents)
-}
-
-/// The VE-space hook, for `candle-gen-kolors`' bespoke providers, which reach
-/// [`crate::denoise::denoise_curated`] in this crate rather than owning a driver call of their own.
-pub fn ve_hook_for(sink: &PreviewSink) -> PreviewHook<'_> {
-    ve_hook(sink)
 }
 
 #[cfg(test)]

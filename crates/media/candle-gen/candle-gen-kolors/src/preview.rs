@@ -36,7 +36,7 @@
 //! rather than by assumption:
 //!
 //! * the **curated** lanes hand the driver a raw k-diffusion VE σ-space latent, so they project
-//!   through [`candle_gen_sdxl::preview::ve_hook_for`], which applies `1/√(σ²+1)` first;
+//!   through [`candle_gen_sdxl::preview::ve_hook`], which applies `1/√(σ²+1)` first;
 //! * the **native leading-Euler** lanes hold a latent they divide by
 //!   `KolorsEulerSampler::scale_in` to build their model input, so they emit that
 //!   same quotient — bound to the lane's own coefficient, not to a second opinion about it.
@@ -65,7 +65,7 @@ pub fn project_spatial_latents(latents: &Tensor) -> Result<Image> {
 /// Build it per image: the driver starts a fresh counter per call, so a batched route that reused one
 /// hook across seeds would find every position already emitted from the second image on.
 pub(crate) fn ve_hook(sink: &PreviewSink) -> PreviewHook<'_> {
-    candle_gen_sdxl::preview::ve_hook_for(sink)
+    candle_gen_sdxl::preview::ve_hook(sink)
 }
 
 #[cfg(test)]

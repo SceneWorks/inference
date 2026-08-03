@@ -12,7 +12,7 @@ predecessors did not.
 | family | decision | why |
 | --- | --- | --- |
 | **kolors** | **wired**, `supports_preview: true` | One registered descriptor (`kolors`). Both its lanes emit, as do both name-driven providers. Reuses the SDXL fit through `candle_gen_sdxl::preview` — one byte-identical VAE file. |
-| **instantid** | **not wired**, stays unadvertised | Registers **no descriptor at all**. It is a `BESPOKE_UTILITY_CRATES` member and `candle-gen-catalog`'s `bespoke_composition_apis_have_no_invented_registration` actively forbids it acquiring one, so there is no `supports_preview` to flip and no `PROVIDER_CRATES` row to inventory. `InstantIdRequest` carries no sink either. MLX left it unadvertised for the same reason. |
+| **instantid** | **not wired**, stays unadvertised | Registers **no descriptor at all**. It is a `BESPOKE_UTILITY_CRATES` member, so there is no `supports_preview` to flip and no `PROVIDER_CRATES` row to inventory. Two shipped `candle-gen-catalog` tests forbid it acquiring one: the second half of `temporal_and_super_resolution_routes_stay_outside_preview_advertising` asserts by exact id that no registered descriptor is ever named `instantid`, `pulid` or `pulid_flux`, and `every_shipped_generator_is_covered_by_the_wiring_table` requires `PROVIDER_CRATES` to cover exactly the registered surface. The `BESPOKE_UTILITY_CRATES.len() == 6` assertions in `runtime-cpu` / `runtime-cuda` pin the membership itself. `InstantIdRequest` carries no sink either. MLX left it unadvertised for the same reason. |
 | **svd** | **stays preview-inert** | `svd_xt` is already in `PREVIEW_INERT_ROUTE_IDS`, carried over from epic 16624's rejected temporal fits. Its fit was **not** re-run and must not be: the .88 holdout bar is a property of the latent space, not of the backend. Its `run_curated_sampler` site keeps passing `None` and its crate keeps `routes: &[]`. |
 
 InstantID is the interesting one, and the answer is **it does not inherit previews for free**. It
@@ -121,10 +121,10 @@ raw would push the early frames to roughly `σ·ε` against ~0.17 slopes.
 
 Measured (`the_ve_correction_is_what_makes_the_early_frames_readable`, weights-free, at σ = 14.6):
 
-| projection | fraction of pixels clipped to 0 or 255 |
-| --- | --- |
-| raw VE latent | **> 0.50** |
-| `x · 1/√(σ²+1)` | **< 0.05** |
+| projection | fraction of pixels clipped to 0 or 255 | asserted bound |
+| --- | --- | --- |
+| raw VE latent | **0.894** | `> 0.50` |
+| `x · 1/√(σ²+1)` | **0.060** | `< 0.10` |
 
 Uncorrected, the first frames are a saturated binary field rather than the noise-to-image progression
 the fit describes. At the last emission σ is small, `c_in → 1`, and the two agree — so the correction
@@ -176,10 +176,18 @@ once with an inert sink, once live — and the two outputs were required to be *
 | --- | --- | --- | --- | --- | --- | --- |
 | curated (**the default lane**) | `ddim` (omitted → curated default) | 12 | 1024² | 12, numbered 1..=12 @128² | 71.99 → **18.30** | +0.215 → **+0.885** |
 | Lightning | `lightning` | 8 | 1024² | 8, numbered 1..=8 @128² | 65.06 → **32.31** | +0.243 → **+0.600** |
-| multi-eval | `heun` | 8 | 768² | 8, numbered 1..=8 @96² | 79.53 → **20.57** | +0.203 → **+0.887** |
+| multi-eval | `heun` | 8 | 768² | 8, numbered 1..=8 @96² | 67.78 → **20.57** | +0.203 → **+0.887** |
 
 Distance to the finished image fell at **every** step and resemblance rose at **every** step on all
-three. `test result: ok. 5 passed; 0 failed`.
+three. `--ignored` run: `test result: ok. 5 passed; 0 failed` — five of the six rows in
+`candle-gen-sdxl/tests/preview_real_weights.rs` carry `#[ignore]`. The sixth,
+`the_ve_correction_is_what_makes_the_early_frames_readable`, is weights-free and therefore **not**
+ignored, so it must also be run *without* `--ignored`: `test result: ok. 1 passed; 0 failed; 5 ignored`.
+
+Every number in both tables above is re-derivable from the committed strips: decode
+`<lane>-strip.png` into its per-step frames and compare each against `<lane>-final.png` put through
+the harness's own `downsample_raw`, then `mean_abs_delta` / `correlation`
+(`preview_real_weights.rs:182-224`).
 
 ### Kolors — `Kwai-Kolors/Kolors-diffusers`, its own render
 
@@ -194,7 +202,7 @@ The reuse is a claim about weights, so Kolors gets its own run rather than being
 All three lanes fell and rose at every step, and Kolors' `heun` likewise produced **15 `Progress::Step`
 events for 8 outer steps** and exactly 8 frames. `test result: ok. 4 passed; 0 failed`.
 
-The Lightning lane is held to a lower `r_last` floor (0.55 rather than 0.85) and the reason is
+The Lightning lane is held to a lower `r_last` floor (0.55 rather than 0.83) and the reason is
 structural, not a lowered bar. The hook emits **before** each solver step, so the last frame is the
 latent one advancement short of the render — the fully denoised state is never previewed, the finished
 image lands instead. On a 12-step schedule that final step is a small share of the trajectory; on the
@@ -248,17 +256,25 @@ reduction in that distance, **strictly** rising resemblance, `r_last − r_first
 
 ### The `r_last` backstop is derived from the fit, not tuned to the runs
 
-A projection cannot correlate with the decode better than the fit itself does. The 16-channel QwenVae
-families wired earlier in this epic carry a **holdout R² of 0.9586** — a correlation ceiling of ~0.979
-— and were held to `r_last > 0.85`, i.e. **86.8% of their ceiling**. The four-channel SDXL fit is
-demonstrably weaker: **holdout R² 0.86065**, a ceiling of ~0.928. The same *relative* strictness is
-`0.928 × 0.85 / 0.979 = 0.805`, so **0.80** is the matched floor, and re-using 0.85 here would have
-imposed a strictly harsher gate on a strictly weaker fit for no stated reason.
+A projection cannot correlate with the decode better than the fit itself does — and the two fits have
+to be compared on the **same statistic**, which is the part that is easy to get wrong.
 
-This matters because the measured values straddle the ported number: Kolors' curated lane lands at
-**+0.848** and its native lane at **+0.852**. Moving the floor to 0.845 to clear the first would have
-been fitting the threshold to the observation; deriving it from the committed fit statistics is not,
-and it lands well clear of both. The floor is the "the strip never got close" backstop — the
+The 16-channel QwenVae families wired earlier in this epic were held to `r_last > 0.85` against a
+recorded **R² of 0.9586** — a correlation ceiling of ~0.979, so **86.8% of their ceiling**. That
+0.9586 is an **in-sample fit** R² over the whole 32,768-sample corpus
+(`mlx-gen-qwen-image/src/preview.rs:22`; `fit_preview_rgb.rs:83` treats it as one). There is **no
+QwenVae holdout split** — the word does not appear anywhere in that crate.
+
+So the like-for-like number on this side is the SDXL **fit** R², **0.91849**, a ceiling of ~0.9584 —
+not its holdout 0.86065. The holdout is a genuine out-of-sample measurement, and matching it against
+an unsplit in-sample one biases the floor low. The same 86.8% of 0.9584 is
+`0.9584 × 0.85 / 0.979 = 0.832`, so **0.83** is the matched floor.
+
+The corrected derivation is *stricter* than the 0.80 that the mismatched comparison produced, and
+every lane still clears it: Kolors' curated lane lands at **+0.848** and its native lane at
+**+0.852**, the two closest values, and both SDXL 12-step lanes sit at +0.885 / +0.887. Moving the
+floor to 0.845 to clear the first would have been fitting the threshold to the observation; deriving
+it from matched fit statistics is not. The floor is the "the strip never got close" backstop — the
 load-bearing assertions are the strictly monotone rise and fall around it.
 
 The Lightning lane keeps a further per-lane floor of 0.55 for the schedule reason given above, and

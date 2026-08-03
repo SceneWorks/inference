@@ -225,8 +225,12 @@ mod preview_advertising {
     /// earlier family needed.
     ///
     /// `instantid` is deliberately absent and cannot be added: it registers no descriptor at all
-    /// (`BESPOKE_UTILITY_CRATES`, and `bespoke_composition_apis_have_no_invented_registration` forbids
-    /// one), so it has no id to advertise. It reaches `candle-gen-sdxl`'s `denoise_curated` /
+    /// (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Two shipped tests hold that in
+    /// place — the second half of `temporal_and_super_resolution_routes_stay_outside_preview_advertising`
+    /// asserts by exact id that no registered descriptor is ever named `instantid`, `pulid` or
+    /// `pulid_flux`, and `every_shipped_generator_is_covered_by_the_wiring_table` requires the table
+    /// below to cover exactly the registered surface, so a new registration could not slip in
+    /// uninventoried either. It reaches `candle-gen-sdxl`'s `denoise_curated` /
     /// `denoise_ip_multi_control` and passes `None` at both, exactly as MLX left it.
     const PREVIEW_ROUTE_IDS: &[&str] = &[
         "krea_2_turbo",
@@ -574,7 +578,11 @@ mod preview_advertising {
                     dark: &[DarkSite {
                         driver: "run_curated_sampler",
                         index: 0,
-                        reason: "the trainer's periodic sample render drives the sampler from a                                  synthetic request that carries no PreviewSink — its result is                                  delivered as a finished TrainingProgress::Sample image, not as a                                  live denoise stream — so it passes `None` on purpose (the same                                  decision sc-16950 recorded for Krea's trainer)",
+                        reason: "the trainer's periodic sample render drives the sampler from a \
+                                 synthetic request that carries no PreviewSink — its result is \
+                                 delivered as a finished TrainingProgress::Sample image, not as a \
+                                 live denoise stream — so it passes `None` on purpose (the same \
+                                 decision sc-16950 recorded for Krea's trainer)",
                     }],
                 },
             ],

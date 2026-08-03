@@ -300,14 +300,18 @@ fn assert_the_strip_converges(
         );
     }
     let (r_first, r_last) = (correlations[0], correlations[correlations.len() - 1]);
-    // The floor is derived from the FIT's own explanatory power, not tuned to an observation.
+    // The floor is derived from the FIT's own explanatory power, not tuned to an observation -- and
+    // the two fits are compared on the SAME statistic, which is the part that is easy to get wrong.
     //
     // A projection cannot correlate with the decode better than the fit does. The 16-channel QwenVae
-    // families wired earlier in this epic carry a holdout R^2 of 0.9586 -- a correlation ceiling of
-    // ~0.979 -- and were held to 0.85, i.e. 86.8% of their ceiling. The four-channel SDXL fit is a
-    // demonstrably weaker one: holdout R^2 0.86065, a ceiling of ~0.928. The SAME relative strictness
-    // is 0.928 * 0.85 / 0.979 = 0.805, so 0.80 is the matched floor, and re-using 0.85 here would have
-    // been a strictly harsher gate on a strictly weaker fit for no stated reason.
+    // families wired earlier in this epic were held to 0.85 against a recorded R^2 of 0.9586, a
+    // correlation ceiling of ~0.979 -- so 86.8% of their ceiling. That 0.9586 is an **in-sample** fit
+    // R^2 over the whole 32,768-sample corpus (`mlx-gen-qwen-image/src/preview.rs:22`, and
+    // `fit_preview_rgb.rs:83` treats it as one); no QwenVae holdout split exists to compare against.
+    // The like-for-like number on this side is therefore the SDXL fit R^2, 0.91849, a ceiling of
+    // ~0.9584 -- NOT its holdout 0.86065, which is a genuine out-of-sample measurement and would bias
+    // the floor low by being matched against an unsplit one. The same 86.8% of 0.9584 is
+    // 0.9584 * 0.85 / 0.979 = 0.832, so 0.83 is the matched floor.
     //
     // The hook also emits BEFORE each solver step (sc-16949), so the last frame is one advancement
     // short of the render -- the fully denoised state is never previewed, the finished image lands
@@ -318,7 +322,7 @@ fn assert_the_strip_converges(
     // Both Kolors lanes run a full 12-step schedule, so neither needs the per-lane floor the SDXL
     // harness carries for its few-step Lightning lane.
     assert!(
-        r_last > 0.80,
+        r_last > 0.83,
         "{label}: the last preview frame must resemble the finished render (r {r_last:+.3})"
     );
     assert!(
