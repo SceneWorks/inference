@@ -3,7 +3,6 @@
 # python -m pip download --only-binary=:all: --platform win_amd64 \
 #   --python-version 3.12 --implementation cp --abi cp312 numpy==2.4.3 safetensors==0.8.0
 --only-binary=:all:
---index-url https://pypi.org/simple
 
 numpy==2.4.3 \
     --hash=sha256:65f3c2455188f09678355f5cae1f959a06b778bc66d535da07bf2ef20cd319d5
