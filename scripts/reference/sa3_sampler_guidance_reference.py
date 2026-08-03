@@ -213,6 +213,8 @@ def verify(output: Path) -> None:
     manifest = json.loads(
         (output / "guidance-manifest.json").read_text(encoding="utf-8")
     )
+    if not isinstance(manifest, dict):
+        raise InvalidReference("guidance manifest must be a JSON object")
     if manifest.get("story") != STORY or manifest.get("upstreamCommit") != UPSTREAM_COMMIT:
         raise InvalidReference("guidance identity mismatch")
     if manifest.get("sourceSha256") != SOURCE_SHA256:
@@ -222,8 +224,10 @@ def verify(output: Path) -> None:
     if manifest.get("inputs") != EXPECTED_INPUTS:
         raise InvalidReference("guidance input/control contract mismatch")
     snapshots = manifest.get("snapshots", {})
-    if set(snapshots) != set(CASES):
+    if not isinstance(snapshots, dict) or set(snapshots) != set(CASES):
         raise InvalidReference("guidance snapshot coverage mismatch")
+    if any(not isinstance(record, dict) for record in snapshots.values()):
+        raise InvalidReference("guidance snapshot records must be JSON objects")
     p0_manifest_path = ROOT / "docs/migration/sa3-reference/manifest.json"
     if sha256_file(p0_manifest_path) != P0_MANIFEST_SHA256:
         raise InvalidReference("P0 manifest payload mismatch")
@@ -292,7 +296,7 @@ def main() -> int:
             )
         verify(args.output)
         print("Stable Audio 3 sampler guidance reference verified")
-    except (InvalidReference, OSError, ValueError, KeyError) as error:
+    except (InvalidReference, OSError, json.JSONDecodeError) as error:
         print(f"SA3 sampler guidance reference error: {error}", file=sys.stderr)
         return 1
     return 0

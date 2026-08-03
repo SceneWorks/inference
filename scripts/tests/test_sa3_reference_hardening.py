@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import subprocess
 import sys
 import tempfile
@@ -104,6 +105,47 @@ class Sa3ReferenceHardeningTests(unittest.TestCase):
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertTrue(result.stderr.strip())
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    def test_non_object_manifests_are_domain_errors_not_tracebacks(self) -> None:
+        commands = (
+            (
+                "sa3_sampler_reference.py",
+                "manifest.json",
+                lambda output: ["--output", str(output)],
+            ),
+            (
+                "sa3_sampler_guidance_reference.py",
+                "guidance-manifest.json",
+                lambda output: ["--output", str(output)],
+            ),
+            (
+                "sa3_text_reference.py",
+                "manifest.json",
+                lambda output: ["verify", "--output-dir", str(output)],
+            ),
+        )
+        for document in ([], None):
+            for script_name, manifest_name, arguments in commands:
+                with self.subTest(script=script_name, document=document):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        output = Path(temporary)
+                        (output / manifest_name).write_text(
+                            json.dumps(document), encoding="utf-8"
+                        )
+                        result = subprocess.run(
+                            [
+                                sys.executable,
+                                REFERENCE / script_name,
+                                *arguments(output),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                        )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("must be a JSON object", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertEqual(result.stdout, "")
 

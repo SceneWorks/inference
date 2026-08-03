@@ -289,6 +289,8 @@ def generate(upstream: Path, output: Path) -> None:
 
 def verify(output: Path) -> None:
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise InvalidReference("sampler manifest must be a JSON object")
     if manifest.get("story") != STORY or manifest.get("upstreamCommit") != UPSTREAM_COMMIT:
         raise InvalidReference("manifest identity mismatch")
     if manifest.get("sourceSha256") != SOURCES:
@@ -303,6 +305,8 @@ def verify(output: Path) -> None:
     ):
         raise InvalidReference("artifact payload mismatch")
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise InvalidReference("sampler artifact must be a JSON object")
     if (
         payload.get("story") != STORY
         or payload.get("upstreamCommit") != UPSTREAM_COMMIT
@@ -345,7 +349,7 @@ def main() -> int:
             generate(args.upstream, args.output)
         verify(args.output)
         print("Stable Audio 3 sampler reference verified")
-    except (InvalidReference, OSError, ValueError, KeyError) as error:
+    except (InvalidReference, OSError, json.JSONDecodeError) as error:
         print(f"SA3 sampler reference error: {error}", file=sys.stderr)
         return 1
     return 0

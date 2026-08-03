@@ -395,6 +395,8 @@ def generate(upstream: Path, snapshot: Path, output_dir: Path) -> None:
 def verify(output_dir: Path) -> None:
     manifest_path = output_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise InvalidReference("text manifest must be a JSON object")
     if manifest.get("schemaVersion") != 1 or manifest.get("story") != "sc-14537":
         raise InvalidReference("manifest identity mismatch")
     if manifest.get("runtime") != EXPECTED_RUNTIME:
@@ -530,7 +532,7 @@ def main() -> int:
             generate(args.upstream, args.snapshot, args.output_dir)
         else:
             verify(args.output_dir)
-    except (InvalidReference, OSError, ValueError, KeyError) as error:
+    except (InvalidReference, OSError, json.JSONDecodeError) as error:
         print(f"SA3 text reference error: {error}", file=sys.stderr)
         return 1
     return 0
