@@ -54,15 +54,43 @@ class WorkflowWiringTests(unittest.TestCase):
         self.raw = WORKFLOW.read_text(encoding="utf-8")
 
     def macos_jobs_reading_variables(self) -> dict[str, set[str]]:
+        """Map each macOS job to the ENV VAR NAMES it defines from a `vars.` reference.
+
+        Keying on the env var name rather than the repository variable name is the whole
+        correctness of this check. `mlx-request-memory-scope` defines
+        `MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}` — the names differ. The
+        resolver rewrites ENVIRONMENT variables, so handing it `MAGE_SNAPSHOT` there resolves
+        nothing at all and the job receives a literal `~/...` path. An earlier version of this
+        test compared variable names against variable names and passed while that exact bug
+        was live, which is why it now derives the expected set from `env` keys.
+        """
         found: dict[str, set[str]] = {}
         for name, job in self.workflow["jobs"].items():
             runs_on = job.get("runs-on") or []
             if "macOS" not in runs_on:
                 continue
-            names = set(re.findall(r"vars\.([A-Z0-9_]+)", yaml.dump(job)))
+            names = {
+                key
+                for key, value in (job.get("env") or {}).items()
+                if re.search(r"vars\.[A-Z0-9_]+", str(value))
+            }
             if names:
                 found[name] = names
         return found
+
+    def test_no_step_reads_a_variable_directly(self) -> None:
+        """A `${{ vars.X }}` inside a step is expanded by Actions, not read from the
+        environment, so the resolve step cannot reach it — it would keep the literal `~/`."""
+        for name, job in self.workflow["jobs"].items():
+            if "macOS" not in (job.get("runs-on") or []):
+                continue
+            for index, step in enumerate(job.get("steps", [])):
+                with self.subTest(job=name, step=index):
+                    self.assertNotRegex(
+                        yaml.dump(step),
+                        r"vars\.[A-Z0-9_]+",
+                        f"{name} step {index} reads a variable directly, bypassing the resolver",
+                    )
 
     def test_every_macos_job_reading_variables_resolves_them(self) -> None:
         for name, variables in self.macos_jobs_reading_variables().items():
