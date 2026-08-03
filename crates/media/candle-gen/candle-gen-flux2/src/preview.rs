@@ -12,8 +12,7 @@
 //! FLUX.2 does not denoise the tensor its fit is defined over. The transformer works in a
 //! **BatchNorm-normalized, 2×2-patchified, 128-channel** space, and the raw 32-channel VAE latent
 //! only exists on the far side of two VAE-owned transforms. So the running latent goes through three
-//! shapes before it is projectable, and every one of them would silently produce a picture rather
-//! than an error if projected in the wrong place:
+//! shapes before it is projectable:
 //!
 //! | stage | shape | projectable? |
 //! | --- | --- | --- |
@@ -21,13 +20,25 @@
 //! | after [`crate::pipeline::unpack_latents_at`] | `[1, 128, H/16, W/16]` | **no — 128 "channels" at half resolution, and still bn-normalized** |
 //! | after [`crate::vae::Flux2Vae::raw_latent_from_packed`] | `[1, 32, H/8, W/8]` | yes — the fitted space |
 //!
-//! The middle row is the trap `mlx-gen-flux2/src/preview.rs` names: it is rank 4 with a plausible
-//! channel count, so [`candle_gen::preview::project_latents`] would accept it if handed a 128-row
-//! factor table, and a 32-row table simply rejects it. [`project_raw_latents`] therefore pins the
-//! channel count explicitly, and the packed seam runs the *VAE's own* de-normalize + unpatchify —
-//! [`crate::vae::Flux2Vae::raw_latent_from_packed`], the exact function
-//! [`crate::vae::Flux2Vae::decode_packed`] calls — rather than a second copy of those transforms. The
-//! preview's geometry and the decode's geometry are one function, not two agreeing implementations.
+//! Neither wrong row can be projected *quietly*: against the committed 32-row factor table the rank-3
+//! sequence and the 128-channel grid are both rejected outright, which
+//! `the_packed_grid_is_rejected_by_the_raw_projector` pins. The middle row is still the trap
+//! `mlx-gen-flux2/src/preview.rs` names, because it is rank 4 with a plausible channel count —
+//! [`candle_gen::preview::project_latents`] *would* accept it if it were ever handed a 128-row table,
+//! and the result would be a half-resolution picture rather than an error. [`project_raw_latents`]
+//! therefore pins the channel count explicitly rather than inheriting whatever the table's length
+//! happens to be.
+//!
+//! The failure that is genuinely **silent** is a different one, and no shape check can see it: running
+//! the unpatchify while skipping the bn de-normalize. That yields a perfectly valid
+//! `[1, 32, H/8, W/8]`, passes every check here, and projects to a plausible-but-wrong picture. It is
+//! closed structurally rather than by a guard — the packed seam runs the *VAE's own* de-normalize +
+//! unpatchify, [`crate::vae::Flux2Vae::raw_latent_from_packed`], the exact function
+//! [`crate::vae::Flux2Vae::decode_packed`] calls, rather than a second copy of those transforms. The
+//! preview's geometry and the decode's geometry are one function, not two agreeing implementations,
+//! and `packed_projection_equals_the_raw_projection_of_the_recovered_latent` pins that dropping the
+//! de-normalize changes the projected frame, so a refactor that lost it would be red rather than
+//! merely wrong-coloured.
 //!
 //! Ideogram is the exception that proves the seam is VAE-owned rather than pipeline-owned: its DiT
 //! packs the same 128 channels in a **`(ph, pw, c)`** patch-major order instead of FLUX.2's
@@ -86,8 +97,9 @@
 //!
 //! `candle-gen-boogu` is deliberately **not** wired here: it loads a plain 244-tensor 16-channel
 //! `AutoencoderKL` (the FLUX.1 / Z-Image lineage, `z_image::vae::AutoEncoderKL`) with no `bn.*` stats
-//! at all, so this 32-channel fit does not describe its latent space. See the adjudication in the
-//! evidence document.
+//! at all, so this 32-channel fit does not describe its latent space. Split out as **sc-17218**,
+//! which reuses whichever 16-channel fit sc-16956 (FLUX.1) or sc-16957 (Z-Image) lands rather than
+//! borrowing this one. See the adjudication in the evidence document.
 //!
 //! A stale or absent fit degrades preview colour only; the denoise path never reads these constants.
 

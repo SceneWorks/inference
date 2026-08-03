@@ -52,7 +52,10 @@ sweep for bespoke `for`-loop denoise bodies and for direct `emit_preview*` / `.e
 (`the_geometry_modules_drive_no_sampler`). The edit and control providers are **name-driven**: they
 register no descriptor, so like Qwen-Image's and SDXL's they carry a `preview: PreviewSink` field on
 their own request types. `crates/sceneworks-worker/src/image_jobs/flux2_edit_candle.rs:358` already
-threads a `_preview` argument its closure currently ignores — that is the consumer this field unblocks.
+threads a `_preview` argument its closure currently ignores, and `flux2_control_candle.rs:338` the same
+as a `generate_one` parameter — those are the consumers these fields unblock. Adding the fields
+**breaks the SceneWorks build** at four exhaustive struct literals; the full list, and the guard that
+rejects the lazy fix, are in §8.
 
 ### `candle-gen-lens` — `Denoise::Shared`, 2 sites, 1 wired + 1 dark
 
@@ -108,7 +111,9 @@ Ideogram publishes two further containers of the same tensors:
 
 * `SceneWorks/ideogram-4` @ `2e8fb610` `bf16/vae/model.safetensors` — `00089549…409b`, 168,120,846
   bytes. Exactly **32 bytes** smaller than the donor: the donor's safetensors header carries a
-  `__metadata__` block and this one does not. Tensor data identical.
+  `__metadata__` block and this one does not. The **250 learned tensors are byte-identical**; only
+  `bn.num_batches_tracked` differs, in value (its I64 dtype matches the donor's, unlike the packed
+  re-host below).
 * `SceneWorks/ideogram-4-mlx` @ `a3095855` `q4|q8/vae/model.safetensors` — `bb9ba30d…3bc9`,
   168,120,870 bytes. 250/250 learned tensors byte-identical; only `bn.num_batches_tracked` differs, in
   integer dtype (I32 vs I64) and value. Read by nothing — `Flux2Vae::build` loads
@@ -139,10 +144,22 @@ projectable:
 | after `pipeline::unpack_latents_at` | `[1, 128, H/16, W/16]` | **no** — 128 "channels" at half resolution, still bn-normalized |
 | after `Flux2Vae::raw_latent_from_packed` | `[1, 32, H/8, W/8]` | yes |
 
-The middle row is the patch-major trap `mlx-gen-flux2/src/preview.rs:4` names: it is rank 4 with a
-plausible channel count, so it would be *accepted* by a 128-row factor table and produce a
-half-resolution picture rather than an error. `project_raw_latents` therefore pins the channel count
-explicitly (`the_packed_grid_is_rejected_by_the_raw_projector`).
+Neither wrong row can be projected *quietly*. Against the committed 32-row factor table the rank-3
+sequence and the 128-channel grid are both rejected outright — `project_raw_latents` pins the channel
+count explicitly rather than inheriting the table's length, and
+`the_packed_grid_is_rejected_by_the_raw_projector` proves it for both. The middle row is still the
+patch-major trap `mlx-gen-flux2/src/preview.rs:4` names, because it is rank 4 with a plausible channel
+count: a 128-row factor table *would* accept it and produce a half-resolution picture rather than an
+error.
+
+The failure that is genuinely **silent** is a different one, and no shape check can see it: running
+the unpatchify while skipping the bn de-normalize. That yields a perfectly valid `[1, 32, H/8, W/8]`,
+passes every check, and projects to a plausible-but-wrong picture. It is closed structurally rather
+than by a guard — `decode_packed` and the preview seam call the *same*
+`vae::raw_latent_from_packed`, so there is no second copy to drift — and
+`packed_projection_equals_the_raw_projection_of_the_recovered_latent` pins that dropping the
+de-normalize changes the projected frame, so a refactor that lost it would be red rather than merely
+wrong-coloured.
 
 The story noted that `unpack_latents` exists in `candle-gen-flux2` and asked whether to project after
 it. The answer is **after it and after two more VAE-owned transforms**: `unpack_latents` only performs
@@ -150,8 +167,13 @@ the token→grid fold, and the bn de-normalize + 2×2 unpatchify live inside `Fl
 That head is now factored into `vae::raw_latent_from_packed`, which `decode_packed` calls — so the
 preview's geometry and the decode's geometry are **one function**, not two agreeing implementations.
 `pipeline::unpack_latents` likewise became a wrapper over a new grid-keyed
-`pipeline::unpack_latents_at`, because Lens resolves its token grid through its own aspect-bucket table
-rather than from `width/16`.
+`pipeline::unpack_latents_at`. The grid is the primitive because the preview hook is parameterised by
+one: each route builds its hook from the same `(lat_h, lat_w)` pair it hands its decode tail, which is
+what keeps the two geometries from diverging, so the seam has to unpack against that pair directly —
+and `candle-gen-lens` drives it from the grid it has already resolved for its own decode. Lens's grid
+is *numerically* identical to `latent_dims`' (`VAE_SCALE_FACTOR` is the same 16; the aspect-bucket
+table fixes the image dimensions upstream, not this formula) — the grid-keyed form exists for the
+shared-pair discipline, not for a divergent one.
 
 **Ideogram is the exception that proves the seam is VAE-owned.** Its DiT packs the same 128 channels as
 `(ph, pw, c)` rather than FLUX.2's `(c, ph, pw)`, so a FLUX.2-shaped recovery would de-normalize
@@ -285,13 +307,33 @@ nothing`, rather than reporting green.
 
 ## 8. Follow-ups
 
-* **Boogu previews** need the FLUX.1 / Z-Image **16-channel** fit, not this one. Its three
-  `run_flow_sampler` sites are already enumerated in §2; the work is one VAE-identity proof against
-  whichever 16-channel fit sc-16956 (FLUX.1) or sc-16957 (Z-Image) lands, plus the wiring. Filed
-  separately rather than absorbed here, because shipping a 32-channel fit on a 16-channel latent space
-  is precisely what this story's acceptance criteria forbid.
-* **SceneWorks consumer wiring for the FLUX.2 edit lane.** `Flux2EditRequest` and
-  `Flux2ControlRequest` now carry a `preview` field;
-  `crates/sceneworks-worker/src/image_jobs/flux2_edit_candle.rs:358` still ignores the `_preview`
-  argument its shared per-image driver already hands it. Setting it is a SceneWorks-side change and
-  lands with the pin bump (sc-16962).
+* **Boogu previews — sc-17218.** They need the FLUX.1 / Z-Image **16-channel** fit, not this one. Its
+  three `run_flow_sampler` sites are already enumerated in §2; the work is one VAE-identity proof
+  against whichever 16-channel fit sc-16956 (FLUX.1) or sc-16957 (Z-Image) lands, plus the wiring.
+  Filed separately rather than absorbed here, because shipping a 32-channel fit on a 16-channel latent
+  space is precisely what this story's acceptance criteria forbid.
+* **SceneWorks consumer wiring — a HARD COMPILE BREAK, not an optional enhancement.**
+  `Flux2EditRequest` and `Flux2ControlRequest` now carry a `preview` field, and neither is
+  `#[non_exhaustive]`. SceneWorks constructs both with **exhaustive struct literals at four sites**,
+  none using `..Default::default()`:
+
+  | site | request |
+  | --- | --- |
+  | `crates/sceneworks-worker/src/image_jobs/flux2_edit_candle.rs:362` | `Flux2EditRequest` |
+  | `crates/sceneworks-worker/src/image_jobs/flux2_control_candle.rs:341` | `Flux2ControlRequest` |
+  | `crates/sceneworks-worker/src/flux2_dev_gpu_smoke.rs:237` | `Flux2EditRequest` |
+  | `crates/sceneworks-worker/src/flux2_dev_gpu_smoke.rs:322` | `Flux2ControlRequest` |
+
+  (Line numbers against SceneWorks `origin/main` at the time of writing.) **The pin bump does not
+  compile until every one of the four is updated.** Both worker lanes already receive the live sink —
+  `flux2_edit_candle.rs` takes it as the `_preview` parameter of its `drive_gen_items` closure and
+  `flux2_control_candle.rs` as the `_preview` parameter of `generate_one`, each with a standing comment
+  saying the field does not exist upstream yet — so the fix is to feed those, not to invent a sink.
+
+  A `..Default::default()` or `preview: Default::default()` edit would make it compile and ship lanes
+  that emit nothing. SceneWorks guards against exactly that: `no_candle_image_lane_defaults_its_preview_sink`
+  and `no_bespoke_candle_request_hides_its_preview_behind_a_rest_init`
+  (`crates/sceneworks-worker/src/candle_preview_wiring_tests.rs`) sweep `src/image_jobs/` and reject
+  both spellings, so the two worker sites must thread the real sink. The two `flux2_dev_gpu_smoke.rs`
+  sites sit **outside** that sweep's directory and are on the fixer to catch from the compile error
+  alone. Lands with the pin bump (sc-16962).
