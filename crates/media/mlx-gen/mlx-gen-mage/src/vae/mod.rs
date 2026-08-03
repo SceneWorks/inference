@@ -113,6 +113,15 @@ pub struct MageVae {
     shape: MageVaeShape,
 }
 
+fn tiling_geometry(shape: MageVaeShape) -> mlx_gen::tiling::VaeTiling {
+    mlx_gen::tiling::VaeTiling {
+        spatial_scale: shape.patch,
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: shape.hidden_x,
+    }
+}
+
 impl MageVae {
     /// Quantize every live VAE Linear; convolutions and normalization remain dense like `nn.quantize`.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -204,6 +213,41 @@ impl MageVae {
     /// The dtype the codec runs in.
     pub fn dtype(&self) -> Dtype {
         self.dtype
+    }
+
+    /// Spatially tiled decode for the shared bounded-decode rung. Mage's codec maps one latent
+    /// pixel to 16 output pixels; the shared tiler owns partitioning, blending, cancellation, and
+    /// per-tile materialization while this closure executes the unchanged codec forward.
+    pub fn decode_tiled(
+        &self,
+        latents: &Array,
+        cfg: &mlx_gen::tiling::TilingConfig,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "mage-vae tiled decode expects NCHW latents, got {shape:?}"
+            )));
+        }
+        // `SimpleMlpAdaLn` is the widest materialized output-resolution stage: its documented
+        // shape is `[B*latent_pixels, patch^2, hidden_x]`, i.e. `hidden_x` values per output pixel.
+        // The 384-wide CoD path is latent-resolution and therefore must not drive this cap.
+        let vae = tiling_geometry(self.shape);
+        if !cfg.needs_tiling(vae, 1, shape[2], shape[3]) {
+            return self.decode(latents);
+        }
+        let lifted = latents.reshape(&[shape[0], shape[1], 1, shape[2], shape[3]])?;
+        let plan = cfg.plan(vae, 1, shape[2], shape[3]);
+        let decoded =
+            mlx_gen::vae_tiling::tiled_decode(&lifted, &plan, [2, 3, 4], cancel, |tile| {
+                let ts = tile.shape();
+                let out = self.decode(&tile.reshape(&[ts[0], ts[1], ts[3], ts[4]])?)?;
+                let os = out.shape();
+                Ok(out.reshape(&[os[0], os[1], 1, os[2], os[3]])?)
+            })?;
+        let out = decoded.shape();
+        Ok(decoded.reshape(&[out[0], out[1], out[3], out[4]])?)
     }
 
     /// Encode an image to its deterministic posterior mean and clamped log-variance.
@@ -353,4 +397,24 @@ pub fn load(dir: impl AsRef<std::path::Path>, part: VaePart, dtype: Dtype) -> Re
         )));
     }
     Ok(model)
+}
+
+#[cfg(test)]
+mod tiling_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_decode_geometry_tracks_the_architectural_pixel_stage() {
+        let geometry = tiling_geometry(MageVaeShape::PUBLISHED);
+        assert_eq!(geometry.spatial_scale, MageVaeShape::PUBLISHED.patch);
+        assert_eq!(geometry.full_res_channels, MageVaeShape::PUBLISHED.hidden_x);
+        assert_eq!(geometry.full_res_channels, 32);
+
+        let mut mutated = MageVaeShape::PUBLISHED;
+        mutated.hidden_x = 48;
+        mutated.patch = 8;
+        let geometry = tiling_geometry(mutated);
+        assert_eq!(geometry.full_res_channels, 48);
+        assert_eq!(geometry.spatial_scale, 8);
+    }
 }

@@ -31,12 +31,11 @@ use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryMode, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, Result as CoreResult,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    Result as CoreResult,
 };
 #[cfg(test)]
-use mlx_gen::gen_core::{
-    GenerationMemory, MemoryGeometry, MemoryRunOutcome, MemorySelection, MemoryStrategy,
-};
+use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome, MemorySelection};
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
@@ -48,15 +47,34 @@ use std::path::Path;
 
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
 use crate::pipeline::MageComponentDirs;
-use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
+use crate::{resolve_gs_key, GenerationSample};
+use mlx_gen::residency::{Residency, StagedHeavy};
 
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
+/// Exact SC-15509 Apple/Metal calibration identity. At 768²/one step, the full cumulative rung-4
+/// request reduced q4 Edit from 7.714 to 1.794 GiB and bf16 text-to-image from 16.594 to 1.306 GiB.
+/// Staging was byte-identical; bounded decode at the single measured 512/256 geometry retained luma
+/// correlation 0.996013 (q4 Edit) and 0.991627 (bf16 t2i), and attention/block streaming introduced
+/// no additional pixel drift. Clean-warm cancellation and decode-fault recovery retained 0 bytes
+/// after cache clear and remained within 2% of the clean rung-4 peak.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-mlx-shared-ladder-2026-08-03-v1";
+/// Only the physically exercised 768→512 output-pixel tiling cell is publishable. Wider candidates
+/// are intentionally absent until Mage-specific real-weight measurement exists for them.
+pub const DECODE_TILE_EDGES: &[u32] = &[512];
+pub const DECODE_OVERLAP: u32 = 256;
+pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
+pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 
-/// Mage's first shared-contract adoption is intentionally resident-only. The exact measured
-/// request estimator and fail-closed wired-memory boundary are exposed now; SC-15509 owns adding
-/// verified optimized rungs and their provider implementation.
+/// Build the eager Mage shared-memory contract. Every executable eager rung is declared here;
+/// snapshot-backed language-model and DiT block windows additionally require the deferred load
+/// shape exposed by [`memory_strategy_contract_for_spec`].
 pub fn memory_strategy_contract(provider_id: &str, _tier: Option<Quant>) -> MemoryProviderContract {
-    memory_strategy_contract_with_adapters(provider_id, &[], Default::default())
+    memory_strategy_contract_with_adapters(
+        provider_id,
+        &[],
+        Default::default(),
+        mlx_gen::LoadShape::EagerMaterialization,
+        false,
+    )
 }
 
 /// Declaration-equivalent contract used only by weights-free registry conformance.
@@ -64,7 +82,40 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    Ok(memory_strategy_contract(provider_id, spec.quantize))
+    let streamable = streamable_spec(spec)?;
+    Ok(memory_strategy_contract_with_adapters(
+        provider_id,
+        &spec.adapters,
+        Default::default(),
+        spec.load_shape,
+        streamable,
+    ))
+}
+
+fn adapters_have_diff_patch(specs: &[mlx_gen::AdapterSpec]) -> bool {
+    specs.iter().any(|spec| {
+        mlx_gen::gen_core::weightsmeta::CheckpointMeta::from_file(&spec.path)
+            .map(|meta| mlx_gen::adapters::loader::has_diff_patch_key_names(meta.keys()))
+            .unwrap_or(false)
+    })
+}
+
+fn streamable_spec(spec: &LoadSpec) -> CoreResult<bool> {
+    if spec.load_shape != mlx_gen::LoadShape::DeferredMaterialization
+        || adapters_have_diff_patch(&spec.adapters)
+    {
+        return Ok(false);
+    }
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(false);
+    };
+    let dirs = resolve_component_dirs(root, spec)?;
+    let bits = spec.quantize.map(Quant::bits);
+    Ok(
+        crate::pipeline::load_time_quant_bits(&dirs.text_encoder, bits, "mage_flow")?.is_none()
+            && crate::pipeline::load_time_quant_bits(&dirs.transformer, bits, "mage_flow")?
+                .is_none(),
+    )
 }
 
 /// Build the load-exact Mage contract. Mage installs every adapter as a forward-time residual after
@@ -108,10 +159,13 @@ pub fn memory_strategy_contract_for_spec(
         dit: project(&dirs.transformer, &crate::convert::is_dit_target, true)?,
         vae: project(&dirs.vae, &|_| false, false)?,
     };
+    let streamable = streamable_spec(spec)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
         &spec.adapters,
         components,
+        spec.load_shape,
+        streamable,
     ))
 }
 
@@ -119,6 +173,8 @@ fn memory_strategy_contract_with_adapters(
     provider_id: &str,
     adapters: &[mlx_gen::AdapterSpec],
     components: mlx_gen::PerComponentBytes,
+    load_shape: mlx_gen::LoadShape,
+    streamable: bool,
 ) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
@@ -137,6 +193,10 @@ fn memory_strategy_contract_with_adapters(
     let mut variables = vec![
         MemoryFormulaVariable::PixelCount,
         MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+        MemoryFormulaVariable::TransformerWindowSize,
     ];
     let adapter_bytes = adapter_stack_resident_bytes(adapters, AdapterResidencyMode::Additive);
     contract.formula = if let Some(adapter_bytes) = adapter_bytes.filter(|bytes| *bytes > 0) {
@@ -155,9 +215,10 @@ fn memory_strategy_contract_with_adapters(
     } else {
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
+    contract.load_shape = load_shape;
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
-        mlx_gen::LoadShape::EagerMaterialization,
+        load_shape,
     ));
     // Mage's loaded resident generator uses sequential defaults internally. An explicit shared
     // Resident selection must therefore carry an all-disabled memory block to override them.
@@ -169,6 +230,61 @@ fn memory_strategy_contract_with_adapters(
         .text_encoder
         .saturating_add(components.dit)
         .saturating_add(components.vae);
+    for capability in &mut contract.strategies {
+        capability.support = match capability.strategy {
+            MemoryStrategy::Resident
+            | MemoryStrategy::StagedResidency
+            | MemoryStrategy::BoundedDecode
+            | MemoryStrategy::BoundedAttention => {
+                mlx_gen::gen_core::MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedTransformerResidency if streamable => {
+                mlx_gen::gen_core::MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedTransformerResidency => {
+                mlx_gen::gen_core::MemoryStrategySupport::Missing
+            }
+        };
+        capability.parameters = match capability.strategy {
+            MemoryStrategy::BoundedDecode => mlx_gen::gen_core::MemoryParameterRanges {
+                decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
+                decode_overlaps: vec![DECODE_OVERLAP],
+                ..Default::default()
+            },
+            MemoryStrategy::BoundedAttention => mlx_gen::gen_core::MemoryParameterRanges {
+                attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
+                ..Default::default()
+            },
+            MemoryStrategy::BoundedTransformerResidency if streamable => {
+                mlx_gen::gen_core::MemoryParameterRanges {
+                    transformer_window_sizes: TRANSFORMER_WINDOW_SIZES.to_vec(),
+                    transformer_window_components: vec![
+                        mlx_gen::gen_core::TransformerComponent::Both,
+                    ],
+                    ..Default::default()
+                }
+            }
+            _ => Default::default(),
+        };
+    }
+    contract.lifecycle = mlx_gen::gen_core::MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: true,
+        attention_chunking: true,
+        transformer_window_materialization: streamable,
+    };
+    contract.additional_prerequisites.push((
+        MemoryStrategy::BoundedTransformerResidency,
+        mlx_gen::gen_core::MemoryStrategyPrerequisite::Rung {
+            rung: MemoryStrategy::StagedResidency,
+            scope: mlx_gen::gen_core::MemoryPrerequisiteScope::EngagedInSameRequest,
+        },
+    ));
     contract
 }
 
@@ -527,19 +643,35 @@ fn assemble(
     } else {
         crate::vae::VaePart::Decode
     };
-    let mut pipeline =
-        MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
-    // Install LoRA/LoKr adapters AFTER the per-component tier quantization (sc-15328), matching the
-    // Chroma/FLUX composition: the adapter is a forward-time residual over the quantized base, so a
-    // Q4/Q8 tier and a bf16 tier take the same path. No-op when `spec.adapters` is empty; any
-    // unmatched target errors loudly rather than being silently dropped (`apply_adapters_strict`).
-    crate::adapters::apply_mage_adapters(&mut pipeline.transformer, &spec.adapters)?;
+    let text_dirs = dirs.clone();
+    let heavy_dirs = dirs;
+    let quant_bits = spec.quantize.map(Quant::bits);
+    let adapters = spec.adapters.clone();
+    let multimodal = variant.is_edit();
+    let residency = Residency::request_scoped(
+        move |streamable| {
+            crate::pipeline::load_text_component(&text_dirs, quant_bits, multimodal, streamable)
+        },
+        move |_use_pid, streamable| {
+            let loaded = crate::pipeline::load_heavy_components(
+                &heavy_dirs,
+                quant_bits,
+                part,
+                streamable,
+                &adapters,
+            )?;
+            Ok(MageHeavyOwned {
+                transformer: loaded.transformer,
+                vae: loaded.vae,
+            })
+        },
+    );
     Ok(Box::new(MageFlow {
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
         memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec)?,
-        pipeline,
+        residency,
     }))
 }
 
@@ -676,7 +808,37 @@ pub struct MageFlow {
     descriptor: ModelDescriptor,
     tier: Option<Quant>,
     memory_strategy_contract: MemoryProviderContract,
-    pipeline: MageFlowPipeline,
+    residency: Residency<crate::MageTextEncoder, MageHeavyOwned>,
+}
+
+pub(crate) struct MageHeavyOwned {
+    transformer: crate::MageTransformer,
+    vae: crate::MageVae,
+}
+
+pub(crate) struct MageLightOwned {
+    vae: crate::MageVae,
+}
+
+pub(crate) struct MageDecodeView<'a> {
+    vae: &'a crate::MageVae,
+}
+
+impl StagedHeavy for MageHeavyOwned {
+    type Light = MageLightOwned;
+    type DecodeView<'a> = MageDecodeView<'a>;
+
+    fn shed_dit(self) -> Self::Light {
+        MageLightOwned { vae: self.vae }
+    }
+
+    fn decode_view(&self) -> Self::DecodeView<'_> {
+        MageDecodeView { vae: &self.vae }
+    }
+
+    fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
+        MageDecodeView { vae: &light.vae }
+    }
 }
 
 fn resident_request_scope(
@@ -691,12 +853,22 @@ fn resident_request_scope(
         contract.generation_memory(&context.selection),
         context.use_pid,
         crate::config::MageFlowConfig::mage_flow().depth,
-        |_use_pid, _edge, _overlap| {
-            Err(CoreError::Unsupported(
-                "mage_flow: bounded decode is reserved for SC-15509".into(),
-            ))
+        |_use_pid, edge, overlap| {
+            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+                Ok(())
+            } else {
+                Err(CoreError::Unsupported(format!(
+                    "mage_flow: unsupported decode geometry {edge}/{overlap}"
+                )))
+            }
         },
     )?;
+    let mut config = config;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = (context.selection.strategy
+        == MemoryStrategy::BoundedTransformerResidency)
+        .then_some(())
+        .and(context.selection.parameters.transformer_window_size);
     Ok(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
         config, cleanup,
     ))
@@ -777,6 +949,9 @@ fn memory_strategy_safety_check_for(
     if let Some(reason) = request_context_error(provider_id, variant, tier, contract, context) {
         return MemorySafetyDecision::Reject { reason };
     }
+    if context.selection.strategy != MemoryStrategy::Resident {
+        return MemorySafetyDecision::Accept;
+    }
     let safe_gb = match crate::memory::production_safe_budget_gb() {
         Ok(safe_gb) => safe_gb,
         Err(error) => {
@@ -844,13 +1019,15 @@ impl Generator for MageFlow {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        crate::memory::ensure_generation_fits(
-            self.tier,
-            req.width,
-            req.height,
-            req.count,
-            crate::memory::production_safe_budget_gb()?,
-        )?;
+        if req.memory.is_none() {
+            crate::memory::ensure_generation_fits(
+                self.tier,
+                req.width,
+                req.height,
+                req.count,
+                crate::memory::production_safe_budget_gb()?,
+            )?;
+        }
         if req.cancel.is_cancelled() {
             return Err(mlx_gen::gen_core::Error::Canceled);
         }
@@ -859,22 +1036,63 @@ impl Generator for MageFlow {
         let seed = req.seed.unwrap_or(0) as i64;
         let key = resolve_gs_key(None)?;
         let negative_prompt = req.negative_prompt.as_deref().unwrap_or(" ");
+        let memory = req.memory.unwrap_or_default();
+        let stage_residency = memory.stage_residency;
+        let streamable = memory.stream_transformer_blocks;
         if self.variant.is_edit() {
             let references = edit_references(req)?;
             let mut images = Vec::with_capacity(req.count as usize);
             for index in 0..req.count {
-                let trace = self.pipeline.edit_trace(
-                    &req.prompt,
-                    negative_prompt,
-                    &references,
-                    req.height,
-                    req.width,
-                    steps as usize,
-                    cfg,
-                    seed.wrapping_add(index as i64),
-                    &key,
+                let run_seed = seed.wrapping_add(index as i64);
+                let trace = self.residency.run_staged_request_scoped(
+                    stage_residency,
+                    streamable,
+                    &req.cancel,
                     false,
                     on_progress,
+                    |text| {
+                        calibration_fault(req, MemoryPhase::Conditioning)?;
+                        crate::pipeline::encode_edit_phase(
+                            text,
+                            &req.prompt,
+                            negative_prompt,
+                            &references,
+                            cfg,
+                            &req.cancel,
+                        )
+                    },
+                    |encoded| match encoded {
+                        Some(encoded) => crate::pipeline::materialize_edit_encoded(encoded),
+                        None => Ok(()),
+                    },
+                    |heavy, encoded, progress| {
+                        calibration_fault(req, MemoryPhase::Denoise)?;
+                        crate::pipeline::denoise_edit_phase(
+                            &heavy.transformer,
+                            &heavy.vae,
+                            encoded,
+                            &references,
+                            req.height,
+                            req.width,
+                            steps as usize,
+                            cfg,
+                            run_seed,
+                            &key,
+                            req.memory,
+                            &req.cancel,
+                            progress,
+                        )
+                    },
+                    crate::pipeline::materialize_edit_denoised,
+                    |view, denoised, _| {
+                        calibration_fault(req, MemoryPhase::Decode)?;
+                        crate::pipeline::decode_edit_phase(
+                            view.vae,
+                            denoised,
+                            req.memory,
+                            &req.cancel,
+                        )
+                    },
                 )?;
                 if req.cancel.is_cancelled() {
                     return Err(CoreError::Canceled);
@@ -906,8 +1124,46 @@ impl Generator for MageFlow {
             })
             .collect::<Vec<_>>();
         let traces = self
-            .pipeline
-            .generate_batch_trace(&samples, steps as usize, cfg, &key, false, on_progress)?
+            .residency
+            .run_staged_request_scoped(
+                stage_residency,
+                streamable,
+                &req.cancel,
+                false,
+                on_progress,
+                |text| {
+                    calibration_fault(req, MemoryPhase::Conditioning)?;
+                    crate::pipeline::encode_generation_phase(text, &samples, cfg, &req.cancel)
+                },
+                |encoded| match encoded {
+                    Some(encoded) => crate::pipeline::materialize_generation_encoded(encoded),
+                    None => Ok(()),
+                },
+                |heavy, encoded, progress| {
+                    calibration_fault(req, MemoryPhase::Denoise)?;
+                    crate::pipeline::denoise_generation_phase(
+                        &heavy.transformer,
+                        &samples,
+                        encoded,
+                        steps as usize,
+                        cfg,
+                        &key,
+                        req.memory,
+                        &req.cancel,
+                        progress,
+                    )
+                },
+                crate::pipeline::materialize_generation_denoised,
+                |view, denoised, _| {
+                    calibration_fault(req, MemoryPhase::Decode)?;
+                    crate::pipeline::decode_generation_phase(
+                        view.vae,
+                        denoised,
+                        req.memory,
+                        &req.cancel,
+                    )
+                },
+            )?
             .samples;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -930,6 +1186,17 @@ impl Generator for MageFlow {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+fn calibration_fault(req: &GenerationRequest, phase: MemoryPhase) -> Result<()> {
+    if req.memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    }) {
+        return Err(Error::Msg(format!(
+            "mage_flow: authorized calibration fault at {phase:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn edit_references(req: &GenerationRequest) -> Result<Vec<image::RgbImage>> {
@@ -1046,7 +1313,7 @@ mage_registrations! {
 }
 
 macro_rules! mage_memory_registration {
-    ($name:ident, $variant:ident, $id:literal) => {
+    ($name:ident, $behavior:ident, $variant:ident, $id:literal) => {
         pub const $name: mlx_gen::gen_core::MemoryRegistration =
             mlx_gen::gen_core::MemoryRegistration {
                 provider_id: $id,
@@ -1061,20 +1328,119 @@ macro_rules! mage_memory_registration {
                     )
                 },
             };
+        pub const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $id,
+                valid_fixtures: |spec, contract, strategy| {
+                    registered_valid_fixture(MageVariant::$variant, spec, contract, strategy)
+                },
+                begin_request: |spec, contract, context| {
+                    registered_begin_request($id, MageVariant::$variant, spec, contract, context)
+                },
+            };
     };
 }
 
-mage_memory_registration!(MEMORY_REGISTRATION, Rl, "mage_flow");
-mage_memory_registration!(MEMORY_REGISTRATION_BASE, Base, "mage_flow_base");
-mage_memory_registration!(MEMORY_REGISTRATION_TURBO, Turbo, "mage_flow_turbo");
-mage_memory_registration!(MEMORY_REGISTRATION_EDIT, Edit, "mage_flow_edit");
+fn registered_valid_fixture(
+    variant: MageVariant,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        mlx_gen::gen_core::MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+        },
+        mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: if variant.is_edit() {
+                MemoryMode::Edit
+            } else {
+                MemoryMode::TextToImage
+            },
+            reference_count: u32::from(variant.is_edit()),
+            use_pid: false,
+            has_phases: contract.engages(strategy, MemoryStrategy::StagedResidency),
+            overlay: None,
+        },
+    )?;
+    let predicted_peak_bytes = ((crate::memory::generation_peak_gb(
+        spec.quantize,
+        context.geometry.width,
+        context.geometry.height,
+        context.geometry.batch,
+    ) * 1_000_000_000.0)
+        .round() as u64)
+        .saturating_add(contract.auxiliary_resident_bytes());
+    context.predicted_peak_bytes = predicted_peak_bytes;
+    context.budget = mlx_gen::gen_core::MemoryBudget {
+        total_bytes: predicted_peak_bytes,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+fn registered_begin_request(
+    provider_id: &'static str,
+    variant: MageVariant,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    if let MemorySafetyDecision::Reject { reason } =
+        memory_strategy_safety_check_for(provider_id, variant, spec.quantize, contract, context)
+    {
+        return Err(CoreError::Unsupported(reason));
+    }
+    Ok(Some(Box::new(resident_request_scope(
+        provider_id,
+        contract,
+        context,
+        mlx_gen::request_scope::MlxScopeCleanup::None,
+    )?)))
+}
+
+mage_memory_registration!(
+    MEMORY_REGISTRATION,
+    MEMORY_BEHAVIOR_REGISTRATION,
+    Rl,
+    "mage_flow"
+);
+mage_memory_registration!(
+    MEMORY_REGISTRATION_BASE,
+    MEMORY_BEHAVIOR_REGISTRATION_BASE,
+    Base,
+    "mage_flow_base"
+);
+mage_memory_registration!(
+    MEMORY_REGISTRATION_TURBO,
+    MEMORY_BEHAVIOR_REGISTRATION_TURBO,
+    Turbo,
+    "mage_flow_turbo"
+);
+mage_memory_registration!(
+    MEMORY_REGISTRATION_EDIT,
+    MEMORY_BEHAVIOR_REGISTRATION_EDIT,
+    Edit,
+    "mage_flow_edit"
+);
 mage_memory_registration!(
     MEMORY_REGISTRATION_EDIT_BASE,
+    MEMORY_BEHAVIOR_REGISTRATION_EDIT_BASE,
     EditBase,
     "mage_flow_edit_base"
 );
 mage_memory_registration!(
     MEMORY_REGISTRATION_EDIT_TURBO,
+    MEMORY_BEHAVIOR_REGISTRATION_EDIT_TURBO,
     EditTurbo,
     "mage_flow_edit_turbo"
 );
@@ -1119,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_strategy_contract_is_truthful_resident_only_mlx_adoption() {
+    fn memory_strategy_contract_declares_the_executable_eager_ladder() {
         use mlx_gen::gen_core::{MemoryStrategySupport, MEMORY_CALIBRATION_ABI};
 
         let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
@@ -1138,17 +1504,33 @@ mod tests {
                 .map(|capability| &capability.support),
             Some(MemoryStrategySupport::Implemented)
         ));
-        for strategy in MemoryStrategy::ALL
-            .into_iter()
-            .filter(|strategy| *strategy != MemoryStrategy::Resident)
-        {
+        for strategy in [
+            MemoryStrategy::Resident,
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+        ] {
             assert!(matches!(
                 contract
                     .capability(strategy)
                     .map(|capability| &capability.support),
-                Some(MemoryStrategySupport::Missing)
+                Some(MemoryStrategySupport::Implemented)
             ));
         }
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Missing)
+        ));
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            DECODE_TILE_EDGES
+        );
         assert!(matches!(
             contract.backend,
             MemoryBackendRealization::MlxMetal {
@@ -1158,6 +1540,165 @@ mod tests {
                 cache_eviction: true,
             }
         ));
+    }
+
+    #[test]
+    fn deferred_contract_adds_snapshot_backed_text_and_dit_windows() {
+        use mlx_gen::gen_core::{MemoryStrategySupport, TransformerComponent};
+        let root =
+            std::env::temp_dir().join(format!("mage-deferred-contract-{}", std::process::id()));
+        write_memory_snapshot(&root);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        let contract = memory_strategy_contract_for_spec("mage_flow", &spec).unwrap();
+        let rung4 = contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .unwrap();
+        assert!(matches!(rung4.support, MemoryStrategySupport::Implemented));
+        assert_eq!(rung4.parameters.transformer_window_sizes, [1]);
+        assert_eq!(
+            rung4.parameters.transformer_window_components,
+            [TransformerComponent::Both]
+        );
+        assert_eq!(
+            contract.load_shape,
+            mlx_gen::LoadShape::DeferredMaterialization
+        );
+        assert!(contract.conformance_errors().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ladder_parameters_and_load_shape_fail_closed_under_mutation() {
+        use mlx_gen::gen_core::{MemoryNumericTier, TransformerComponent};
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+        };
+        let eager = memory_strategy_contract("mage_flow", Some(Quant::Q4));
+        assert!(eager
+            .representative_selection(MemoryStrategy::BoundedTransformerResidency, tier, false)
+            .is_err());
+
+        let mut deferred = eager.clone();
+        deferred.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
+        let rung4 = deferred
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .unwrap();
+        assert!(matches!(
+            rung4.support,
+            mlx_gen::gen_core::MemoryStrategySupport::Missing
+        ));
+
+        let mut deferred = memory_strategy_contract_with_adapters(
+            "mage_flow",
+            &[],
+            Default::default(),
+            mlx_gen::LoadShape::DeferredMaterialization,
+            true,
+        );
+        let mut selected = deferred
+            .representative_selection(MemoryStrategy::BoundedTransformerResidency, tier, false)
+            .unwrap();
+        assert_eq!(
+            deferred.engaged_composition(MemoryStrategy::BoundedTransformerResidency),
+            [
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ]
+        );
+        assert!(deferred.validate_selection(&selected).is_ok());
+        selected.parameters.decode_tile_edge = Some(511);
+        assert!(deferred.validate_selection(&selected).is_err());
+        selected.parameters.decode_tile_edge = Some(DECODE_TILE_EDGES[0]);
+        selected.parameters.attention_chunk_size = Some(1);
+        assert!(deferred.validate_selection(&selected).is_err());
+        selected.parameters.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        selected.parameters.transformer_window_size = Some(2);
+        assert!(deferred.validate_selection(&selected).is_err());
+        selected.parameters.transformer_window_size = Some(1);
+        selected.parameters.transformer_window_component = Some(TransformerComponent::Dit);
+        assert!(deferred.validate_selection(&selected).is_err());
+
+        deferred.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        assert!(deferred.validate_selection(&selected).is_err());
+    }
+
+    #[test]
+    fn deferred_rung_four_fails_closed_for_load_time_quant_and_diff_patch_adapters() {
+        use mlx_gen::gen_core::{MemoryStrategySupport, TransformerComponent};
+
+        let root =
+            std::env::temp_dir().join(format!("mage-deferred-loadability-{}", std::process::id()));
+        write_memory_snapshot(&root);
+        for component in ["text_encoder", "transformer", "vae"] {
+            std::fs::write(root.join(component).join("config.json"), "{}").unwrap();
+        }
+        let dense_q4 = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_quant(Quant::Q4)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        let dense_contract = memory_strategy_contract_for_spec("mage_flow", &dense_q4).unwrap();
+        assert_eq!(
+            dense_contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        assert!(!dense_contract.lifecycle.transformer_window_materialization);
+
+        let packed = r#"{"quantization":{"bits":4,"group_size":64}}"#;
+        for component in ["text_encoder", "transformer"] {
+            std::fs::write(root.join(component).join("config.json"), packed).unwrap();
+        }
+        let packed_contract = memory_strategy_contract_for_spec("mage_flow", &dense_q4).unwrap();
+        let rung4 = packed_contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .unwrap();
+        assert_eq!(rung4.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            rung4.parameters.transformer_window_components,
+            [TransformerComponent::Both]
+        );
+
+        let adapter = root.join("diff-patch.safetensors");
+        write_memory_safetensors(
+            &adapter,
+            &[("transformer_blocks.0.attn.to_q.diff", "BF16", &[1], 2)],
+        );
+        let diff_patch = dense_q4
+            .clone()
+            .with_adapters(vec![mlx_gen::AdapterSpec::new(
+                adapter,
+                1.0,
+                mlx_gen::AdapterKind::Lora,
+            )]);
+        let diff_contract = memory_strategy_contract_for_spec("mage_flow", &diff_patch).unwrap();
+        assert_eq!(
+            diff_contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deferred_ownership_guards_evict_resident_stacks_and_keep_architectural_depth() {
+        let transformer = include_str!("transformer.rs");
+        assert!(transformer.contains("self.blocks.clear();"));
+        assert!(transformer.contains("if !self.blocks.is_empty()"));
+        assert!(transformer.contains("BlockPlan::new(self.cfg.depth, size)"));
+
+        let text = include_str!("text_encoder/encoder.rs");
+        assert!(text.contains("self.layers.clear();"));
+        assert!(text.contains("if !self.layers.is_empty()"));
+        assert!(text.contains("BlockPlan::new(stream.cfg.num_layers, 1)"));
     }
 
     #[test]

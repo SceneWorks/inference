@@ -91,6 +91,41 @@ pub struct Qwen3VlTextEncoder {
     head_dim: i32,
     rope_theta: f64,
     mrope_section: [i32; 3],
+    block_stream: Option<TextBlockStream>,
+}
+
+#[derive(Clone)]
+struct TextBlockStream {
+    source: mlx_gen::WeightsSource,
+    prefix: String,
+    cfg: QwenVlTextConfig,
+    eps: f32,
+    layer_quant_bits: Option<i32>,
+}
+
+impl TextBlockStream {
+    fn open(&self) -> Result<Weights> {
+        match &self.source {
+            mlx_gen::WeightsSource::Dir(dir) => Weights::from_dir(dir),
+            mlx_gen::WeightsSource::File(file) => Weights::from_file(file),
+        }
+    }
+
+    fn materialize(&self, view: &mut Weights, index: usize) -> Result<Qwen3VlDecoderLayer> {
+        let mut layer = Qwen3VlDecoderLayer::from_weights(
+            view,
+            &join(&self.prefix, &format!("layers.{index}")),
+            self.cfg.num_attention_heads,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim,
+            self.eps,
+        )?;
+        view.remove_accessed();
+        if let Some(bits) = self.layer_quant_bits {
+            layer.quantize(bits)?;
+        }
+        Ok(layer)
+    }
 }
 
 impl Qwen3VlTextEncoder {
@@ -159,6 +194,7 @@ impl Qwen3VlTextEncoder {
             head_dim: cfg.head_dim,
             rope_theta,
             mrope_section: cfg.mrope_section,
+            block_stream: None,
         })
     }
 
@@ -199,7 +235,42 @@ impl Qwen3VlTextEncoder {
             head_dim: cfg.head_dim,
             rope_theta,
             mrope_section: cfg.mrope_section,
+            block_stream: None,
         })
+    }
+
+    pub(crate) fn arm_block_stream(
+        &mut self,
+        source: mlx_gen::WeightsSource,
+        prefix: &str,
+        cfg: QwenVlTextConfig,
+        layer_quant_bits: Option<i32>,
+    ) -> Result<()> {
+        if self.layers.len() != cfg.num_layers {
+            return Err(Error::Msg(format!(
+                "mage_flow text encoder: cannot arm the {}-layer stream from {} resident layers",
+                cfg.num_layers,
+                self.layers.len()
+            )));
+        }
+        self.block_stream = Some(TextBlockStream {
+            source,
+            prefix: prefix.to_owned(),
+            cfg,
+            eps: self.eps,
+            layer_quant_bits,
+        });
+        self.layers.clear();
+        if !self.layers.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow text encoder: deferred stream retained resident layers".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resident_layer_count(&self) -> usize {
+        self.layers.len()
     }
 
     /// The 36 decoder blocks, in order. Public for the deepstack-injecting edit path (sc-14048).
@@ -223,6 +294,15 @@ impl Qwen3VlTextEncoder {
     /// Attention is causal over the whole `s`, so this is **one** packed segment — callers with
     /// several prompts go through [`Qwen3VlTextEncoder::forward_packed`](Self::forward_packed).
     pub fn forward_embeds(&self, hidden: &Array, pos: &MRopePositions) -> Result<Array> {
+        self.forward_embeds_with_cancel(hidden, pos, None)
+    }
+
+    pub(crate) fn forward_embeds_with_cancel(
+        &self,
+        hidden: &Array,
+        pos: &MRopePositions,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
         let sh = hidden.shape();
         let (b, s) = (sh[0], sh[1]);
         if b != 1 {
@@ -248,11 +328,47 @@ impl Qwen3VlTextEncoder {
         let ones = Array::from_slice(&vec![1i32; s as usize], &[1, s]);
         let mask = build_mask(&ones, 1, s)?;
 
-        let mut h = hidden.clone();
-        for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, &mask)?;
-        }
+        let h = self.run_layers(hidden.clone(), &cos, &sin, &mask, cancel, &mut |h, _| Ok(h))?;
         self.final_norm(&h)
+    }
+
+    fn run_layers(
+        &self,
+        mut hidden: Array,
+        cos: &Array,
+        sin: &Array,
+        mask: &Array,
+        cancel: Option<&mlx_gen::CancelFlag>,
+        after: &mut dyn FnMut(Array, usize) -> Result<Array>,
+    ) -> Result<Array> {
+        let Some(stream) = &self.block_stream else {
+            for (index, layer) in self.layers.iter().enumerate() {
+                hidden = after(layer.forward(&hidden, cos, sin, mask)?, index)?;
+            }
+            return Ok(hidden);
+        };
+        if !self.layers.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow text encoder: deferred stream still owns resident layers".into(),
+            ));
+        }
+        let fallback = mlx_gen::CancelFlag::default();
+        let cancel = cancel.unwrap_or(&fallback);
+        let plan = mlx_gen::block_residency::BlockPlan::new(stream.cfg.num_layers, 1)?;
+        mlx_gen::block_residency::run_windowed(
+            &plan,
+            cancel,
+            hidden,
+            || stream.open(),
+            |mut state, view, range| {
+                for index in range {
+                    let layer = stream.materialize(view, index)?;
+                    state = after(layer.forward(&state, cos, sin, mask)?, index)?;
+                }
+                Ok(state)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
     }
 
     /// Run the Qwen3-VL language stack with merged vision features spliced at each image-token run.
@@ -279,6 +395,25 @@ impl Qwen3VlTextEncoder {
         image_embeds: &[Array],
         deepstack: &[Vec<Array>],
         grids: &[[i32; 3]],
+    ) -> Result<(Array, Vec<Array>)> {
+        self.forward_grounded_trace_with_cancel(
+            ids,
+            image_token_id,
+            image_embeds,
+            deepstack,
+            grids,
+            None,
+        )
+    }
+
+    pub(crate) fn forward_grounded_trace_with_cancel(
+        &self,
+        ids: &[i32],
+        image_token_id: i32,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+        cancel: Option<&mlx_gen::CancelFlag>,
     ) -> Result<(Array, Vec<Array>)> {
         if image_embeds.is_empty()
             || image_embeds.len() != deepstack.len()
@@ -334,22 +469,29 @@ impl Qwen3VlTextEncoder {
         )?;
         let mask = build_mask(&Array::from_slice(&vec![1i32; ids.len()], &[1, s]), 1, s)?;
         let mut early = Vec::with_capacity(3);
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-            if layer_index < 3 {
-                early.push(hidden.clone());
-            }
-            for (&(start, end), features) in runs.iter().zip(deepstack) {
+        let hidden = self.run_layers(
+            hidden,
+            &cos,
+            &sin,
+            &mask,
+            cancel,
+            &mut |mut hidden, layer_index| {
                 if layer_index < 3 {
-                    let visual = slice_seq(&hidden, start, end)?;
-                    let injected = add(
-                        &visual,
-                        &features[layer_index].expand_dims(0)?.as_dtype(dtype)?,
-                    )?;
-                    hidden = replace_seq(&hidden, &injected, start, end)?;
+                    early.push(hidden.clone());
                 }
-            }
-        }
+                for (&(start, end), features) in runs.iter().zip(deepstack) {
+                    if layer_index < 3 {
+                        let visual = slice_seq(&hidden, start, end)?;
+                        let injected = add(
+                            &visual,
+                            &features[layer_index].expand_dims(0)?.as_dtype(dtype)?,
+                        )?;
+                        hidden = replace_seq(&hidden, &injected, start, end)?;
+                    }
+                }
+                Ok(hidden)
+            },
+        )?;
         Ok((self.final_norm(&hidden)?, early))
     }
 
@@ -374,11 +516,25 @@ impl Qwen3VlTextEncoder {
     ///
     /// See the module docs for why this is a per-segment loop rather than a block-diagonal mask.
     pub fn forward_packed(&self, ids: &[i32], cu_seqlens: &[i32]) -> Result<Array> {
+        self.forward_packed_with_cancel(ids, cu_seqlens, None)
+    }
+
+    pub(crate) fn forward_packed_with_cancel(
+        &self,
+        ids: &[i32],
+        cu_seqlens: &[i32],
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
         let lens = seq_lens_from_cu(cu_seqlens, ids.len())?;
         let mut parts = Vec::with_capacity(lens.len());
         let mut start = 0usize;
         for len in lens {
-            parts.push(self.forward_segment(&ids[start..start + len])?);
+            let segment = &ids[start..start + len];
+            let ids_arr = Array::from_slice(segment, &[1, len as i32]);
+            let hidden = self.embed(&ids_arr)?;
+            let out =
+                self.forward_embeds_with_cancel(&hidden, &MRopePositions::text(len), cancel)?;
+            parts.push(out.reshape(&[len as i32, -1])?);
             start += len;
         }
         if parts.len() == 1 {
