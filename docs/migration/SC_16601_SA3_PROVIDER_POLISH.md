@@ -55,8 +55,8 @@ The six-file `stable_audio_3_medium` artifact pin set is exactly **10,443,755,93
 
 The pin-set test asserts that exact sum. Earlier `10.4 GB` prose is descriptive rounding only.
 Likewise, the 10–16 minute CPU timing for a 380-second medium render is an **estimate inferred**
-from small measured CPU runs and measured Metal throughput; it is not a measured 380-second CPU
-render.
+from short-duration medium-model CPU runs and measured Metal throughput; it is not a measured
+380-second CPU render.
 
 Finally, T5Gemma's text-side dtype policy is independent of reference preparation. Text compute and
 conditioned embeddings remain F32 on every backend. The raw encoder output remains F32 on CPU, while
