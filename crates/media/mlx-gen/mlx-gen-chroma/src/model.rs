@@ -1086,18 +1086,31 @@ mod tests {
 
         use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
 
-        // Full-surface f32 affine parameters pass quality but miss the dense calibration peak by
-        // 224 MB. Isolate the smallest f32 surface that retains the pass: boundaries, the current
-        // three sensitive sublayers, and their union. All other affine parameters remain bf16.
+        // Narrow boundary/current3 surfaces retain the memory margin but fail quality. Expand f32
+        // affine precision by one coherent projection family at a time, retaining the current
+        // sensitive members of the other family. Also test all linears without f32 boundaries.
         let current = vec![(4, Attention), (1, FeedForward), (2, FeedForward)];
+        let mut attention_plus_current_ffn =
+            (0..24).map(|block| (block, Attention)).collect::<Vec<_>>();
+        attention_plus_current_ffn.extend([(1, FeedForward), (2, FeedForward)]);
+        let mut ffn_plus_current_attention = (0..24)
+            .map(|block| (block, FeedForward))
+            .collect::<Vec<_>>();
+        ffn_plus_current_attention.push((4, Attention));
+        let mut all_linears = (0..24).map(|block| (block, Attention)).collect::<Vec<_>>();
+        all_linears.extend((0..24).map(|block| (block, FeedForward)));
         let candidates = [
-            ("f32-affine-boundaries", true, Vec::new()),
-            ("f32-affine-current-sensitive", false, current.clone()),
             (
-                "f32-affine-boundaries-current-sensitive",
+                "f32-affine-boundaries-attention-current-ffn",
                 true,
-                current.clone(),
+                attention_plus_current_ffn,
             ),
+            (
+                "f32-affine-boundaries-ffn-current-attention",
+                true,
+                ffn_plus_current_attention,
+            ),
+            ("f32-affine-all-linears", false, all_linears),
         ];
 
         for (policy, f32_boundaries, f32_sublayers) in candidates {
