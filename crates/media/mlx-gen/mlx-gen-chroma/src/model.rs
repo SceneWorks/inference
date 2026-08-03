@@ -865,8 +865,6 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
-    use mlx_gen::Quant;
-    use mlx_gen_flux::T5Sublayer;
     use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
     use std::path::PathBuf;
 
@@ -978,23 +976,29 @@ mod tests {
 
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
-        sensitive_sublayers: &[(usize, T5Sublayer)],
+        quantize_t5: bool,
+        quantize_vae: bool,
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_progressive_with_sensitive_sublayers_residuals(
-            crate::convert::AUXILIARY_BITS,
-            crate::convert::T5_RESIDUAL_BITS,
-            crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
-            crate::convert::T5_GROUP_SIZE,
-            sensitive_sublayers,
-        )?;
+        if quantize_t5 {
+            loader::quantize_t5_for_dense_source(&mut t5)?;
+        }
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
             t5,
         };
-        let heavy = load_heavy(variant, spec, false)?;
+        let transformer = loader::load_transformer(root, ChromaTransformerConfig::default())?;
+        let mut vae = loader::load_vae(root)?;
+        if quantize_vae {
+            loader::quantize_vae_for_dense_source(&mut vae)?;
+        }
+        let heavy = ChromaHeavyOwned {
+            transformer,
+            vae,
+            pid: None,
+        };
         Ok(Chroma {
             descriptor: variant.descriptor(),
             variant,
@@ -1059,7 +1063,7 @@ mod tests {
     /// and pixel gates without rebuilding or copying a complete turnkey for every candidate.
     #[test]
     #[ignore = "needs the shipped Chroma Base Q4 tier and Apple Silicon MLX"]
-    fn packed_t5_render_sensitivity_sweep() {
+    fn packed_auxiliary_render_isolation_sweep() {
         let baseline = PathBuf::from(
             std::env::var("SC16462_BASELINE")
                 .expect("SC16462_BASELINE must point to the immutable shipped Base Q4 tier"),
@@ -1075,45 +1079,18 @@ mod tests {
         drop(reference_model);
         clear_cache();
 
-        let all_attention = (0..24)
-            .map(|block| (block, T5Sublayer::Attention))
-            .collect::<Vec<_>>();
-        let all_ffn = (0..24)
-            .map(|block| (block, T5Sublayer::FeedForward))
-            .collect::<Vec<_>>();
         let candidates = [
-            (
-                "all-attention-plus-current-ffn",
-                all_attention
-                    .iter()
-                    .copied()
-                    .chain([(1, T5Sublayer::FeedForward), (2, T5Sublayer::FeedForward)])
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "all-ffn-plus-block4-attention",
-                all_ffn
-                    .iter()
-                    .copied()
-                    .chain([(4, T5Sublayer::Attention)])
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "complete-attention-and-ffn",
-                all_attention
-                    .iter()
-                    .chain(&all_ffn)
-                    .copied()
-                    .collect::<Vec<_>>(),
-            ),
+            ("dense-t5-packed-vae", false, true),
+            ("packed-t5-dense-vae", true, false),
+            ("packed-t5-packed-vae", true, true),
         ];
-        let quantized_spec = baseline_spec.with_quant(Quant::Q4);
 
-        for (policy, sensitive_sublayers) in candidates {
+        for (policy, quantize_t5, quantize_vae) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(&quantized_spec, &sensitive_sublayers)
-                .expect("load render sensitivity candidate");
+            let model =
+                load_render_calibration_candidate(&baseline_spec, quantize_t5, quantize_vae)
+                    .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
             drop(model);
@@ -1133,22 +1110,14 @@ mod tests {
                 "SC16462_RENDER_SENSITIVITY {}",
                 serde_json::json!({
                     "policy": policy,
-                    "sensitiveSublayers": sensitive_sublayers
-                        .iter()
-                        .map(|(block, sublayer)| serde_json::json!({
-                            "block": block,
-                            "sublayer": match sublayer {
-                                T5Sublayer::Attention => "attention",
-                                T5Sublayer::FeedForward => "ffn",
-                            },
-                        }))
-                        .collect::<Vec<_>>(),
+                    "packedT5": quantize_t5,
+                    "packedVae": quantize_vae,
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
                     "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
                     "peakBytes": {
                         "shippedDenseAuxiliary": reference_peak,
-                        "loadTimePackedAuxiliary": peak,
+                        "loadTimeCandidate": peak,
                     },
                 })
             );

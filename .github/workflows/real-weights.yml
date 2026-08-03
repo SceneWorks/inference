@@ -358,9 +358,9 @@ jobs:
           if-no-files-found: error
           path: ${{ runner.temp }}/chroma-sc16462-t5-sensitivity.log
 
-  # SC-16462 diagnostic lane: run structured packed T5 residual surfaces through the exact strict
-  # Base render prompts. The immutable shipped Q4 transformer is reused for every row; only dense
-  # T5/VAE are packed at load time, avoiding repeated full-turnkey builds. This lane is
+  # SC-16462 diagnostic lane: isolate packed T5 and VAE render error against the exact strict Base
+  # prompts. The immutable shipped Q4 transformer is reused for every row; only dense T5/VAE are
+  # packed at load time, avoiding repeated full-turnkey builds. This lane is
   # calibration-only and cannot publish.
   mlx-chroma-render-sensitivity:
     name: Chroma packed T5 render sensitivity
@@ -396,13 +396,13 @@ jobs:
           test -d "$CHROMA_SNAPSHOT/q4/text_encoder"
           test -d "$CHROMA_SNAPSHOT/q4/vae"
           echo "SC16462_BASELINE=$CHROMA_SNAPSHOT/q4" >> "$GITHUB_ENV"
-      - name: Compare structured packed T5 policies by strict render metrics
+      - name: Isolate packed T5 and VAE strict render error
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-render-sensitivity
         run: |
           set -o pipefail
           cargo test --locked --release -p mlx-gen-chroma \
-            model::tests::packed_t5_render_sensitivity_sweep -- --ignored --exact --nocapture \
+            model::tests::packed_auxiliary_render_isolation_sweep -- --ignored --exact --nocapture \
             --test-threads=1 | tee "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log"
           test "$(grep -c 'SC16462_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log")" = 3
       - name: Upload render sensitivity evidence
