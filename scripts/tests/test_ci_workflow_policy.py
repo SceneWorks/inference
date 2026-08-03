@@ -13,6 +13,49 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+REAL_WEIGHT_REQUIREMENTS = WORKFLOW.parent.parent / "requirements"
+MACOS_HUB_LOCK = (
+    ".github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt"
+)
+WINDOWS_HUB_LOCK = (
+    ".github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt"
+)
+WINDOWS_MAGE_LOCK = (
+    ".github/requirements/real-weights-mage-verify-windows-x64-py312.txt"
+)
+MACOS_MAGE_LOCK = (
+    "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
+)
+APPROVED_REAL_WEIGHT_LOCKS = {
+    MACOS_HUB_LOCK,
+    WINDOWS_HUB_LOCK,
+    WINDOWS_MAGE_LOCK,
+    MACOS_MAGE_LOCK,
+}
+HUB_LOCK_PACKAGES = {
+    "annotated-doc",
+    "anyio",
+    "certifi",
+    "click",
+    "filelock",
+    "fsspec",
+    "h11",
+    "hf-xet",
+    "httpcore",
+    "httpx",
+    "huggingface-hub",
+    "idna",
+    "markdown-it-py",
+    "mdurl",
+    "packaging",
+    "pygments",
+    "pyyaml",
+    "rich",
+    "shellingham",
+    "tqdm",
+    "typer",
+    "typing-extensions",
+}
 RESIDENCY_SCRIPT = WORKFLOW.parents[2] / "scripts" / "release" / "run-residency-ab.ps1"
 QWEN_MEMORY_STRATEGY = (
     WORKFLOW.parents[2]
@@ -209,6 +252,123 @@ def privileged_real_weight_jobs(workflow: str) -> list[str]:
     return privileged
 
 
+def real_weight_pip_policy_errors(workflow: str) -> list[str]:
+    """Reject pip installs that can escape the reviewed wheel/hash inputs."""
+    errors: list[str] = []
+    install_lines = [
+        (line_number, line.strip())
+        for line_number, line in enumerate(workflow.splitlines(), start=1)
+        if re.search(r"\bpip(?:\d+(?:\.\d+)*)?\s+install\b", line)
+    ]
+    if not install_lines:
+        return ["real-weight workflow has no pip installs"]
+
+    locks_seen: list[str] = []
+    for line_number, command in install_lines:
+        prefix = f"line {line_number}"
+        for required_flag in ("--only-binary=:all:", "--require-hashes"):
+            if required_flag not in command:
+                errors.append(f"{prefix}: missing {required_flag}")
+        if command.endswith(("\\", "^")):
+            errors.append(f"{prefix}: pip install must be a single physical line")
+
+        requirement = re.findall(r"(?:^|\s)(?:-r|--requirement)\s+(\S+)", command)
+        if len(requirement) != 1:
+            errors.append(f"{prefix}: expected exactly one requirement lock")
+            continue
+        lock = requirement[0].strip("'\"")
+        locks_seen.append(lock)
+        if lock not in APPROVED_REAL_WEIGHT_LOCKS:
+            errors.append(f"{prefix}: unapproved requirement lock {lock}")
+
+        expected_lock = None
+        if "mage-reference/bin/python" in command:
+            expected_lock = MACOS_MAGE_LOCK
+        elif "mage-oracle-verify" in command:
+            expected_lock = WINDOWS_MAGE_LOCK
+        elif "python3 -m pip" in command:
+            expected_lock = MACOS_HUB_LOCK
+        elif "python -m pip" in command:
+            expected_lock = WINDOWS_HUB_LOCK
+        if expected_lock != lock:
+            errors.append(
+                f"{prefix}: install target expects {expected_lock}, got {lock}"
+            )
+
+        install_arguments = command.split("pip install", 1)[1]
+        before_lock, after_lock = re.split(
+            r"(?:^|\s)(?:-r|--requirement)\s+\S+", install_arguments, maxsplit=1
+        )
+        before_lock = re.sub(
+            r"(?:^|\s)--target\s+(?:\"[^\"]+\"|'[^']+'|\S+)", "", before_lock
+        )
+        for allowed_flag in (
+            "--disable-pip-version-check",
+            "--only-binary=:all:",
+            "--require-hashes",
+        ):
+            before_lock = before_lock.replace(allowed_flag, "")
+        if before_lock.strip():
+            errors.append(f"{prefix}: unexpected argument before requirement lock")
+        if after_lock.strip() not in ("", "|| exit /b 1"):
+            errors.append(f"{prefix}: unexpected argument after requirement lock")
+
+    expected_lock_counts = {
+        MACOS_HUB_LOCK: 22,
+        WINDOWS_HUB_LOCK: 10,
+        WINDOWS_MAGE_LOCK: 1,
+        MACOS_MAGE_LOCK: 1,
+    }
+    actual_lock_counts = {lock: locks_seen.count(lock) for lock in set(locks_seen)}
+    if actual_lock_counts != expected_lock_counts:
+        errors.append(
+            f"pip install lock counts differ: expected {expected_lock_counts}, "
+            f"got {actual_lock_counts}"
+        )
+    return errors
+
+
+def parse_binary_hashed_lock(lock: str) -> dict[str, tuple[str, str]]:
+    """Parse the deliberately narrow one-wheel-per-package real-weight lock format."""
+    lines = lock.splitlines()
+    if "--only-binary=:all:" not in lines:
+        raise AssertionError("lock must require binary distributions")
+    requirements: dict[str, tuple[str, str]] = {}
+    cursor = 0
+    while cursor < len(lines):
+        line = lines[cursor]
+        if not line or line.startswith("#") or line == "--only-binary=:all:":
+            cursor += 1
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s\\]+) \\", line)
+        if match is None:
+            raise AssertionError(f"unrecognized lock line: {line!r}")
+        if cursor + 1 >= len(lines):
+            raise AssertionError(f"missing hash for {match.group(1)}")
+        hash_match = re.fullmatch(
+            r"    --hash=sha256:([0-9a-f]{64})", lines[cursor + 1]
+        )
+        if hash_match is None:
+            raise AssertionError(f"missing SHA-256 wheel hash for {match.group(1)}")
+        name = match.group(1).lower().replace("_", "-")
+        if name in requirements:
+            raise AssertionError(f"duplicate locked package: {name}")
+        requirements[name] = (match.group(2), hash_match.group(1))
+        cursor += 2
+    return requirements
+
+
+def validate_binary_hashed_lock(
+    lock: str, expected_packages: set[str]
+) -> dict[str, tuple[str, str]]:
+    requirements = parse_binary_hashed_lock(lock)
+    if set(requirements) != expected_packages:
+        missing = sorted(expected_packages - set(requirements))
+        extra = sorted(set(requirements) - expected_packages)
+        raise AssertionError(f"lock package set differs: missing={missing}, extra={extra}")
+    return requirements
+
+
 class CiWorkflowPolicyTests(unittest.TestCase):
     def require_posix_shell(self) -> str:
         shell = posix_shell()
@@ -219,6 +379,96 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "parsed a trivial script. Install Git for Windows, or a bash, to run this gate."
             )
         return shell
+
+    def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_pip_policy_errors(workflow), [])
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 22)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
+        self.assertNotRegex(
+            workflow,
+            r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
+        )
+
+    def test_real_weight_pip_policy_discriminates_bypass_mutations(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "missing hashes": workflow.replace(" --require-hashes", "", 1),
+            "missing binary only": workflow.replace(" --only-binary=:all:", "", 1),
+            "new inline install": workflow
+            + '\n          python3 -m pip install "requests==2.32.5"\n',
+            "direct pip bypass": workflow + "\n          pip install requests\n",
+            "new superficially compliant install": workflow
+            + f"\n          python3 -m pip install --disable-pip-version-check "
+            f"--only-binary=:all: --require-hashes -r {MACOS_HUB_LOCK}\n",
+            "inline package after lock": workflow.replace(
+                f"-r {MACOS_HUB_LOCK}",
+                f"requests -r {MACOS_HUB_LOCK}",
+                1,
+            ),
+            "binary override": workflow.replace(
+                f"-r {MACOS_HUB_LOCK}",
+                f"--no-binary=:all: -r {MACOS_HUB_LOCK}",
+                1,
+            ),
+            "wrong platform lock": workflow.replace(
+                MACOS_HUB_LOCK, WINDOWS_HUB_LOCK, 1
+            ),
+            "unreviewed lock": workflow.replace(
+                MACOS_HUB_LOCK, ".github/requirements/unreviewed.txt", 1
+            ),
+        }
+        for mutation, mutated_workflow in mutations.items():
+            with self.subTest(mutation=mutation):
+                self.assertTrue(real_weight_pip_policy_errors(mutated_workflow))
+
+    def test_real_weight_wheel_locks_are_complete_and_hash_shaped(self) -> None:
+        macos = validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(MACOS_HUB_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            HUB_LOCK_PACKAGES,
+        )
+        windows = validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_HUB_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            HUB_LOCK_PACKAGES | {"colorama"},
+        )
+        mage = validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_MAGE_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            {"numpy", "safetensors"},
+        )
+        self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
+        self.assertNotEqual(macos["hf-xet"][1], windows["hf-xet"][1])
+        self.assertNotEqual(macos["pyyaml"][1], windows["pyyaml"][1])
+
+    def test_real_weight_lock_policy_discriminates_mutations(self) -> None:
+        lock = (REAL_WEIGHT_REQUIREMENTS / Path(MACOS_HUB_LOCK).name).read_text(
+            encoding="utf-8"
+        )
+        typing_extensions = (
+            "typing-extensions==4.16.0 \\\n"
+            "    --hash=sha256:"
+            "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8\n"
+        )
+        mutations = {
+            "missing binary policy": lock.replace("--only-binary=:all:\n", "", 1),
+            "unhashed requirement": lock.replace(
+                "    --hash=sha256:", "    --hash=sha512:", 1
+            ),
+            "unpinned requirement": lock.replace("annotated-doc==", "annotated-doc>=", 1),
+            "incomplete closure": lock.replace(typing_extensions, "", 1),
+            "duplicate package": lock + typing_extensions,
+        }
+        for mutation, mutated_lock in mutations.items():
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(AssertionError):
+                    validate_binary_hashed_lock(mutated_lock, HUB_LOCK_PACKAGES)
 
     def test_chroma_packed_build_script_is_valid_bash(self) -> None:
         script = chroma_packed_build_script()
@@ -515,7 +765,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "--test real_parity"
         )
         self.assertLess(transferred_verify, candle_rust_acceptance)
-        self.assertIn('"numpy==2.4.3" "safetensors==0.8.0"', workflow)
+        self.assertIn(WINDOWS_MAGE_LOCK, workflow)
+        self.assertNotIn('"numpy==2.4.3" "safetensors==0.8.0"', workflow)
         self.assertIn("--verify-edit-artifact", workflow[transferred_verify:])
         self.assertIn(
             "provision_mage_edit_variants.py", workflow[transferred_verify:]
