@@ -273,7 +273,10 @@ impl MageJointAttention {
 
         let repack = |parts: Vec<Array>, tokens: i32| -> Result<Array> {
             let flat = if parts.len() == 1 {
-                parts.into_iter().next().unwrap_or_else(|| unreachable!())
+                parts
+                    .into_iter()
+                    .next()
+                    .expect("one segment must produce one attention part")
             } else {
                 let refs: Vec<&Array> = parts.iter().collect();
                 concatenate_axis(&refs, 0)?

@@ -73,19 +73,32 @@ pub(crate) struct RequestRungs {
     pub(crate) decode_tiling: Option<TilingConfig>,
 }
 
-/// Resolve the family memory preamble once so no Qwen variant can omit a rung or its calibration
-/// phase boundary. Preview cadence/state remains a separate request concern.
+/// Resolve the family memory preamble once so no Qwen variant can omit a rung. The post-encode
+/// calibration boundary is shared separately by [`finish_conditioning`]; preview cadence/state
+/// remains a separate request concern.
 pub(crate) fn resolve_request_rungs(
     req: &GenerationRequest,
     contract: &mlx_gen::gen_core::MemoryProviderContract,
-    model_id: &str,
 ) -> Result<RequestRungs> {
-    calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning, model_id)?;
     Ok(RequestRungs {
         block_window: crate::memory_strategy::resolve_window_size(req, contract)?,
         attention_budget: attention_budget(req),
         decode_tiling: decode_tiling(req),
     })
+}
+
+/// Complete Qwen's shared conditioning boundary by forcing a provider's prompt/reference graph and
+/// only then checking the calibration fault. MLX arrays are lazy, so merely constructing the graph
+/// is not evidence that base/control text conditioning or Edit's vision+LM conditioning ran.
+/// [`mlx_gen::Residency`] still owns error cleanup and the next warm request.
+pub(crate) fn finish_conditioning(
+    req: &GenerationRequest,
+    model_id: &str,
+    materialize: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    materialize()?;
+    calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning, model_id)?;
+    Ok(())
 }
 
 /// Per-run scalars shared by all three Qwen generators: the Lightning flag, resolved step count and
@@ -856,7 +869,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_variant_uses_the_canonical_request_rung_preamble() {
+    fn every_variant_uses_the_canonical_preamble_and_conditioning_boundary() {
         for (name, source) in [
             ("t2i", include_str!("model.rs")),
             ("control", include_str!("model_control.rs")),
@@ -872,6 +885,17 @@ mod tests {
             assert!(
                 !source.contains("crate::memory_strategy::resolve_window_size(req"),
                 "{name} bypassed the canonical preamble"
+            );
+            assert_eq!(
+                source
+                    .matches("crate::pipeline::finish_conditioning(req")
+                    .count(),
+                1,
+                "{name} must finish its real encode before the shared conditioning fault"
+            );
+            assert!(
+                !source.contains("MemoryPhase::Conditioning"),
+                "{name} bypassed the shared post-encode conditioning boundary"
             );
         }
     }
@@ -1113,6 +1137,158 @@ mod tests {
         .to_string();
         assert!(error.contains("qwen_image"));
         assert!(error.contains("Denoise"));
+    }
+
+    #[test]
+    fn conditioning_fault_runs_each_route_then_allows_cleanup_and_warm_follow_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct DropWitness(Arc<AtomicUsize>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let fault = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Conditioning),
+                calibration_fault_harness_authorized: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain = GenerationRequest::default();
+
+        let failed_materializations = AtomicUsize::new(0);
+        let materialize_error = finish_conditioning(&fault, "qwen_image", || {
+            failed_materializations.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Msg("injected materialization failure".into()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(failed_materializations.load(Ordering::SeqCst), 1);
+        assert_eq!(materialize_error, "injected materialization failure");
+        assert!(
+            !materialize_error.contains("Conditioning"),
+            "the calibration fault must not replace a real conditioning evaluation failure"
+        );
+
+        // Base and Control build prompt conditioning; Edit additionally consumes reference
+        // conditioning. Mutating both counters inside `finish_conditioning`'s materialization
+        // callback is the weight-free witness that the injected error is post-conditioning for
+        // every provider route.
+        for (model_id, references_per_encode) in [
+            ("qwen_image", 0),
+            ("qwen_image_edit", 2),
+            ("qwen_image_control", 0),
+        ] {
+            let prompts = AtomicUsize::new(0);
+            let references = AtomicUsize::new(0);
+            let text_drops = Arc::new(AtomicUsize::new(0));
+            let heavy_drops = Arc::new(AtomicUsize::new(0));
+            let text_drop_loader = Arc::clone(&text_drops);
+            let heavy_drop_loader = Arc::clone(&heavy_drops);
+            let residency: mlx_gen::Residency<DropWitness, DropWitness> =
+                mlx_gen::Residency::sequential(
+                    move || Ok(DropWitness(Arc::clone(&text_drop_loader))),
+                    move |_| Ok(DropWitness(Arc::clone(&heavy_drop_loader))),
+                );
+
+            let injected: Result<()> = residency.run(
+                &fault.cancel,
+                false,
+                &mut |_| {},
+                |_| {
+                    finish_conditioning(&fault, model_id, || {
+                        prompts.fetch_add(1, Ordering::SeqCst);
+                        references.fetch_add(references_per_encode, Ordering::SeqCst);
+                        Ok(())
+                    })
+                },
+                |_| Ok(()),
+                |_, _, _| panic!("conditioning fault must stop before heavy rendering"),
+            );
+            assert!(injected.unwrap_err().to_string().contains("Conditioning"));
+            assert_eq!(prompts.load(Ordering::SeqCst), 1);
+            assert_eq!(references.load(Ordering::SeqCst), references_per_encode);
+            assert_eq!(text_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(heavy_drops.load(Ordering::SeqCst), 0);
+
+            residency
+                .run(
+                    &plain.cancel,
+                    false,
+                    &mut |_| {},
+                    |_| {
+                        finish_conditioning(&plain, model_id, || {
+                            prompts.fetch_add(1, Ordering::SeqCst);
+                            references.fetch_add(references_per_encode, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    },
+                    |_| Ok(()),
+                    |_, _, _| Ok(()),
+                )
+                .expect("a clean follow-up must succeed after the injected conditioning error");
+            assert_eq!(prompts.load(Ordering::SeqCst), 2);
+            assert_eq!(references.load(Ordering::SeqCst), references_per_encode * 2);
+            assert_eq!(text_drops.load(Ordering::SeqCst), 2);
+            assert_eq!(heavy_drops.load(Ordering::SeqCst), 1);
+        }
+
+        // Resident providers keep one warm pair. The same injected fault must leave that pair usable
+        // by the next request instead of poisoning or rebuilding it.
+        let text_loads = Arc::new(AtomicUsize::new(0));
+        let heavy_loads = Arc::new(AtomicUsize::new(0));
+        let materializations = AtomicUsize::new(0);
+        let text_loader = Arc::clone(&text_loads);
+        let heavy_loader = Arc::clone(&heavy_loads);
+        let warm: mlx_gen::Residency<u8, u8> = mlx_gen::Residency::request_scoped(
+            move |_| {
+                text_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+            move |_, _| {
+                heavy_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(2)
+            },
+        );
+        let injected: Result<()> = warm.run(
+            &fault.cancel,
+            false,
+            &mut |_| {},
+            |_| {
+                finish_conditioning(&fault, "qwen_image", || {
+                    materializations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+            |_| Ok(()),
+            |_, _, _| panic!("conditioning fault must stop before rendering"),
+        );
+        assert!(injected.is_err());
+        warm.run(
+            &plain.cancel,
+            false,
+            &mut |_| {},
+            |_| {
+                finish_conditioning(&plain, "qwen_image", || {
+                    materializations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+            |_| Ok(()),
+            |heavy, _, _| {
+                assert_eq!(*heavy, 2);
+                Ok(())
+            },
+        )
+        .expect("the already-warm pair must serve the follow-up request");
+        assert_eq!(text_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(materializations.load(Ordering::SeqCst), 2);
     }
 
     #[test]

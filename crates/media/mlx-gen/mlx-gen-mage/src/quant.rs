@@ -151,13 +151,7 @@ pub(crate) fn floor_bits(base: &str, requested: i32) -> i32 {
         None
     };
     component.map_or(requested, |component| {
-        let documented_minimum = match component {
-            PrecisionFloorComponent::TextEncoder => LM_LAYER_MIN_BITS,
-            PrecisionFloorComponent::TransformerHead => FINAL_MOD_MIN_BITS,
-        };
-        effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
-            .bits()
-            .max(documented_minimum)
+        effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected).bits()
     })
 }
 
@@ -186,5 +180,29 @@ mod descriptor_floor_tests {
         }
         assert_eq!(floor_bits(FINAL_MOD_BASE, 4), 8);
         assert_eq!(floor_bits(LM_LAYER_PREFIX, 4), 8);
+        assert_eq!(floor_bits(FINAL_MOD_BASE, 8), 8);
+        assert_eq!(floor_bits(LM_LAYER_PREFIX, 8), 8);
+        assert_eq!(floor_bits("proj_out", 4), 4);
+        assert_eq!(floor_bits("model.language_model.embed_tokens", 4), 4);
+        assert_eq!(FINAL_MOD_MIN_BITS, Quant::Q8.bits());
+        assert_eq!(LM_LAYER_MIN_BITS, Quant::Q8.bits());
+        for (base, component) in [
+            (FINAL_MOD_BASE, PrecisionFloorComponent::TransformerHead),
+            (LM_LAYER_PREFIX, PrecisionFloorComponent::TextEncoder),
+        ] {
+            for selected in [Quant::Q4, Quant::Q8] {
+                let from_table =
+                    effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
+                        .bits();
+                assert_eq!(floor_bits(base, selected.bits()), from_table);
+                assert_eq!(
+                    crate::convert::quant_floor_bits(base, selected.bits()),
+                    from_table
+                );
+            }
+        }
+        assert!(COMPONENT_PRECISION_FLOORS
+            .iter()
+            .all(|floor| { floor.selected_tier == Quant::Q4 && floor.resident_tier == Quant::Q8 }));
     }
 }
