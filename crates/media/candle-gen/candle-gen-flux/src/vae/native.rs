@@ -449,6 +449,12 @@ impl AutoEncoder {
         let z = xs.apply(&self.encoder)?.apply(&self.reg)?;
         (z - self.shift_factor)? * self.scale_factor
     }
+    /// Deterministic posterior-mean encode for structural control hints.
+    pub fn encode_mean(&self, xs: &Tensor) -> Result<Tensor> {
+        let moments = xs.apply(&self.encoder)?;
+        let mean = moments.apply(&DiagonalGaussian::new(false, 1)?)?;
+        (mean - self.shift_factor)? * self.scale_factor
+    }
     pub fn decode(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = ((xs / self.scale_factor)? + self.shift_factor)?;
         xs.apply(&self.decoder)

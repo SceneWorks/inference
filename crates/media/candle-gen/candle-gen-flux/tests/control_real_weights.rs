@@ -83,6 +83,7 @@ fn real_weight_control() {
         control_scale: Some(0.7),
         control_kind: kind.clone(),
         seed: 12345,
+        memory: candle_gen::gen_core::GenerationMemory::default(),
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};

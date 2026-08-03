@@ -123,6 +123,48 @@ impl FluxIpAdapter {
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_hidden(
+        num_blocks: usize,
+        cross_attn_dim: usize,
+        hidden: usize,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        // The projection model is intentionally tiny because packed-DiT tests bind already-projected
+        // tokens directly; only the per-block K/V linears participate in that test.
+        let proj_model = FluxImageProjModel {
+            proj: Linear::new(Tensor::ones((1, 1), candle_core::DType::F32, device)?, None),
+            norm: LayerNorm::new(
+                Tensor::ones(1, candle_core::DType::F32, device)?,
+                Tensor::zeros(1, candle_core::DType::F32, device)?,
+                PROJ_LN_EPS,
+            ),
+            num_tokens: 1,
+            cross_attn_dim: 1,
+        };
+        let make_linear = |phase: f32| -> Result<Linear> {
+            let weight = (0..hidden * cross_attn_dim)
+                .map(|index| ((index as f32 * 0.013 + phase).sin()) * 0.01)
+                .collect::<Vec<_>>();
+            let bias = (0..hidden)
+                .map(|index| ((index as f32 * 0.17 + phase).cos()) * 0.02)
+                .collect::<Vec<_>>();
+            Ok(Linear::new(
+                Tensor::from_vec(weight, (hidden, cross_attn_dim), device)?,
+                Some(Tensor::from_vec(bias, hidden, device)?),
+            ))
+        };
+        let blocks = (0..num_blocks)
+            .map(|index| {
+                Ok((
+                    make_linear(index as f32 + 0.25)?,
+                    make_linear(index as f32 + 0.75)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { proj_model, blocks })
+    }
 }
 
 /// A bound IP injector for one render: the adapter + the precomputed image tokens `[B, 4, 4096]` + the
@@ -156,6 +198,15 @@ impl<'a> FluxIpInjector<'a> {
             scale,
             block_kv,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_block_count(&self) -> usize {
+        self.block_kv
+            .borrow()
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
     }
 
     /// The decoupled-cross-attention residual for double block `block_idx`, given that block's
