@@ -695,7 +695,16 @@ impl Qwen3Backbone {
                         }
                         Ok(hidden)
                     },
-                    |hidden: &Array| Ok(mlx_rs::transforms::eval([hidden])?),
+                    |hidden: &Array| {
+                        mlx_rs::transforms::eval([hidden])?;
+                        // MLX weights are lazy: the source must remain the verified file until all
+                        // tensors in this window have actually materialized, immediately before the
+                        // shared runner releases the window and clears its allocator cache.
+                        stream
+                            .artifact
+                            .ensure_unchanged()
+                            .map_err(|error| Error::Msg(error.to_string()))
+                    },
                 )?;
                 return Ok(rms_norm(&hidden, &self.norm_gen, self.eps)?);
             }

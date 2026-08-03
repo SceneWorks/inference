@@ -212,6 +212,7 @@ pub(crate) fn verified_artifact(spec: &LoadSpec) -> Option<PinnedArtifact> {
     let mut safetensors = std::fs::read_dir(root)
         .ok()?
         .filter_map(Result::ok)
+        .filter(|entry| !mlx_gen::gen_core::weightsmeta::is_hidden_file(&entry.path()))
         .filter(|entry| {
             entry
                 .path()
@@ -660,6 +661,22 @@ mod tests {
             MemoryStrategySupport::Missing
         );
         assert!(contract.calibration.is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hidden_safetensors_sidecars_do_not_change_the_single_file_inventory() {
+        let (root, spec) = fixture_spec();
+        std::fs::write(root.join("._model.safetensors"), [1_u8; 8]).unwrap();
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(verified_artifact(&spec).is_some());
         std::fs::remove_dir_all(root).ok();
     }
 

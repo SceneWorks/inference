@@ -145,6 +145,27 @@ pub struct SenseNova {
     fast: bool,
     memory_strategy: gen_core::MemoryProviderContract,
     loaded_quant: Option<Quant>,
+    pinned_artifact: Option<crate::memory_strategy::PinnedArtifact>,
+}
+
+fn guard_pinned_artifact<T>(
+    artifact: Option<&crate::memory_strategy::PinnedArtifact>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(artifact) = artifact {
+        artifact
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    let result = operation();
+    if let Some(artifact) = artifact {
+        // Always run the post-check, including after a generation error. A mutation error takes
+        // precedence so no output (or misleading earlier failure) can escape a changed artifact.
+        artifact
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    result
 }
 
 impl SenseNova {
@@ -293,6 +314,7 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
             pinned_artifact.as_ref(),
         )?,
         loaded_quant: spec.quantize,
+        pinned_artifact,
     }))
 }
 
@@ -364,7 +386,10 @@ impl Generator for SenseNova {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
+            self.generate_impl(req, on_progress)
+        })
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -571,6 +596,29 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_guard_reports_post_materialization_mutation_even_after_operation_error() {
+        let root =
+            std::env::temp_dir().join(format!("sensenova-request-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.safetensors");
+        std::fs::write(&path, [0_u8; 8]).unwrap();
+        let artifact = crate::memory_strategy::PinnedArtifact::verify_file(&path).unwrap();
+        let result: Result<()> = guard_pinned_artifact(Some(&artifact), || {
+            let replacement = root.join("replacement.safetensors");
+            std::fs::write(&replacement, [1_u8; 8]).unwrap();
+            std::fs::rename(replacement, &path).unwrap();
+            Err(Error::Msg("earlier generation failure".to_owned()))
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("replaced or mutated"), "got: {error}");
+        assert!(
+            !error.contains("earlier generation failure"),
+            "got: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn descriptor_is_sensenova() {
