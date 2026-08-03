@@ -26,6 +26,22 @@ name: Real-weight validation
 #
 # A LABEL NO RUNNER CARRIES DOES NOT FAIL — IT QUEUES, SILENTLY, UNTIL THE RUN IS CANCELLED.
 # Retiring a box means moving its labels first.
+#
+# EVERY macOS STEP NAMES `python3.12`, NEVER BARE `python3`.
+#
+# The macOS wheel lock is a reviewed CPython 3.12 set (its header resolves with `--abi cp312`) and
+# every pin in it floors at 3.10. Bare `python3` is not that interpreter — it is whatever the
+# runner's launchd `.path` resolves first, and on a box where /usr/bin precedes Homebrew that is
+# Apple's system Python 3.9. pip on 3.9 does not report the mismatch as a version problem: it
+# filters the whole reviewed set out of the candidate list and calls the pin nonexistent
+# ("No matching distribution found for anyio==4.14.2", or click==8.4.2 against an older lock).
+# That took out every rw-* job on nax-macos-2 on 2026-08-03, hours after the split above first
+# routed twelve jobs onto a box whose `python3` is 3.9.6.
+#
+# The `PYTHONPATH=… python3.12 scripts/release/…` lines are load-bearing for the same reason one
+# stage later: they import the tree the pip step installed, so they must be the same interpreter
+# that installed it. scripts/tests/test_ci_workflow_policy.py enforces both halves; a bare
+# `python3` anywhere in a macOS job fails that gate.
 
 on:
   schedule:
@@ -124,8 +140,8 @@ jobs:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
           CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          python3 - <<'PY'
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
           import os
           from huggingface_hub import snapshot_download
 
@@ -195,7 +211,7 @@ jobs:
             done
             sed -n 's/^.*SC16462_RESIDENCY //p' "$RUNNER_TEMP/chroma-q$bits-residency.log" \
               >> "$CHROMA_RESIDENCY_RAW"
-            python3 - <<'PY'
+            python3.12 - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -256,7 +272,7 @@ jobs:
           test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-component.jsonl" | tr -d ' ')" = 2
           test "$(wc -l < "$CHROMA_RESIDENCY_RAW" | tr -d ' ')" = 36
           test "$(wc -l < "$CHROMA_RESIDENCY_SUMMARY" | tr -d ' ')" = 2
-          python3 - <<'PY'
+          python3.12 - <<'PY'
           import hashlib
           import json
           import os
@@ -353,8 +369,8 @@ jobs:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
           CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-t5-sensitivity-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          python3 - <<'PY'
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
           import os
           from huggingface_hub import snapshot_download
 
@@ -436,8 +452,8 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-publish
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          python3 - <<'PY'
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
           import os
           from huggingface_hub import snapshot_download
 
@@ -463,7 +479,7 @@ jobs:
             cp -R "$CHROMA_BUILT/q$bits/vae" "$CHROMA_PACKED/q$bits/vae"
             diff -qr -x text_encoder -x vae "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
           done
-          python3 - <<'PY'
+          python3.12 - <<'PY'
           import hashlib
           import json
           import os
@@ -546,7 +562,7 @@ jobs:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
           CHROMA_REPORT: ${{ runner.temp }}/chroma-sc16462-artifact-${{ matrix.model }}.json
         run: |
-          python3 - <<'PY'
+          python3.12 - <<'PY'
           import hashlib
           import json
           import os
@@ -712,7 +728,7 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           MAGE_REQUEST_SCOPE_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
@@ -722,8 +738,8 @@ jobs:
             echo "MAGE_SNAPSHOT must be an operator-provided absolute path" >&2
             exit 1
           fi
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py \
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
             --model mage-flow \
             --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT"
       - name: Run Mage request-memory lifecycle
@@ -749,7 +765,7 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           ZIMAGE_SNAPSHOT
       - name: Verify exact clean inference provenance
         run: |
@@ -773,7 +789,7 @@ jobs:
           test -z "$(git -C "$SCENEWORKS_PROVENANCE_ROOT" status --porcelain --untracked-files=normal)"
           echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"
       - name: Toolchain versions
-        run: rustc --version && cargo --version && python3 --version
+        run: rustc --version && cargo --version && python3.12 --version
       - name: Materialize and verify immutable Z-Image snapshot
         env:
           MEMORY_MODEL_INVENTORY: ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory.json
@@ -782,16 +798,16 @@ jobs:
             echo "ZIMAGE_SNAPSHOT must be an operator-provided absolute path" >&2
             exit 1
           fi
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py \
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
             --model z-image-turbo \
             --snapshot "$ZIMAGE_SNAPSHOT"
-          python3 scripts/release/verify_model_snapshot.py \
+          python3.12 scripts/release/verify_model_snapshot.py \
             --model z-image-turbo \
             --snapshot "$ZIMAGE_SNAPSHOT" \
             --inventory-output "$MEMORY_MODEL_INVENTORY"
-          inventory_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["inventory_sha256"])' "$MEMORY_MODEL_INVENTORY")"
-          model_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["revision"])' "$MEMORY_MODEL_INVENTORY")"
+          inventory_sha="$(python3.12 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["inventory_sha256"])' "$MEMORY_MODEL_INVENTORY")"
+          model_revision="$(python3.12 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["revision"])' "$MEMORY_MODEL_INVENTORY")"
           if [[ ! "$inventory_sha" =~ ^[0-9a-f]{64}$ ]]; then
             echo "model inventory did not produce an exact SHA-256" >&2
             exit 1
@@ -819,7 +835,7 @@ jobs:
             --test sequential_residency_real_weights \
             sequential_bounds_peak_and_is_byte_identical -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee "$MEMORY_EVIDENCE_LOG"
-          python3 scripts/release/verify_model_snapshot.py \
+          python3.12 scripts/release/verify_model_snapshot.py \
             --model z-image-turbo \
             --snapshot "$ZIMAGE_SNAPSHOT" \
             --inventory-output "$MEMORY_MODEL_INVENTORY_AFTER"
@@ -827,7 +843,7 @@ jobs:
             echo "Z-Image snapshot content changed during the evidence run" >&2
             exit 1
           fi
-          python3 scripts/release/verify_residency_ab.py \
+          python3.12 scripts/release/verify_residency_ab.py \
             --model z_image_turbo \
             --resident "$MEMORY_EVIDENCE_LOG" \
             --sequential "$MEMORY_EVIDENCE_LOG" \
@@ -868,15 +884,15 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           MLX_LLM_TEST_MODEL MLX_LLM_QWEN3_MODEL
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model smollm2-135m-instruct --snapshot "$MLX_LLM_TEST_MODEL"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "$MLX_LLM_QWEN3_MODEL"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model smollm2-135m-instruct --snapshot "$MLX_LLM_TEST_MODEL"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "$MLX_LLM_QWEN3_MODEL"
       - name: Run representative conformance
         run: |
           cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored --nocapture
@@ -909,7 +925,7 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
           MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT
       # actions/setup-python's Darwin package hard-codes /Users/runner during installation, which is
@@ -931,12 +947,12 @@ jobs:
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshot
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT"
       - name: Derive immutable Mage oracle cache key
         id: mage-oracle-key
         run: |
@@ -1157,7 +1173,7 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           KREA_REALTIME_SNAPSHOT KREA_STYLE_LORA_SNAPSHOT KREA_DISTILL_LORA_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
@@ -1177,10 +1193,10 @@ jobs:
           done
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
       # Coherence floor + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v
       # single-frame anchor, the v2v strength=0 paths, and the sc-15325 decode-tiling characterization.
       #
@@ -1287,14 +1303,14 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           KOKORO_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked --release -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
@@ -1342,14 +1358,14 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           MOSS_SFX_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked --release -p candle-audio-moss-sfx --test conformance moss_sfx_conformance -- --ignored --nocapture
@@ -1370,14 +1386,14 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           ACESTEP_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model acestep-v15-turbo --snapshot "$ACESTEP_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model acestep-v15-turbo --snapshot "$ACESTEP_SNAPSHOT"
       - name: Run provider conformance
         run: |
           # ACE-Step 1.5 music/song (sc-12842): the flow-matching DiT + Oobleck VAE producing a
@@ -1403,17 +1419,17 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           KOKORO_SNAPSHOT CHATTERBOX_VE_SNAPSHOT OPENVOICE_V2_SNAPSHOT WHISPER_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
       - name: Run provider conformance
         run: |
           # Chatterbox voice embedder (sc-12844): the sc-12838 release gate. Uses the Kokoro
@@ -1446,17 +1462,17 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           KOKORO_SNAPSHOT CHATTERBOX_SNAPSHOT CHATTERBOX_PERTH_SNAPSHOT CHATTERBOX_VE_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-perth --snapshot "$CHATTERBOX_PERTH_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model chatterbox-perth --snapshot "$CHATTERBOX_PERTH_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
       - name: Run provider conformance
         run: |
           # Chatterbox clone-TTS (sc-13222): the T3 speech-token LM stage on real t3_cfg.safetensors
@@ -1520,16 +1536,16 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           KOKORO_SNAPSHOT WHISPER_SNAPSHOT CLAP_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
       - name: Run provider conformance
         run: |
           # Whisper ASR (sc-12850): the first real Transcriber (audio→text, the Captioner-analog).
@@ -1561,16 +1577,16 @@ jobs:
       # pass through untouched, so variables can be flipped one at a time.
       - name: Resolve runner-local snapshot paths
         run: >-
-          python3 scripts/release/resolve_snapshot_paths.py
+          python3.12 scripts/release/resolve_snapshot_paths.py
           CHATTERBOX_VE_SNAPSHOT MOSS_TTSD_SNAPSHOT MOSS_XY_TOKENIZER_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-ttsd-v05 --snapshot "$MOSS_TTSD_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model xy-tokenizer-ttsd --snapshot "$MOSS_XY_TOKENIZER_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model moss-ttsd-v05 --snapshot "$MOSS_TTSD_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model xy-tokenizer-ttsd --snapshot "$MOSS_XY_TOKENIZER_SNAPSHOT"
       - name: Run provider conformance
         run: |
           # MOSS-TTSD-v0.5 multi-speaker dialogue TTS (sc-13360 AR brain + sc-13518 XY_Tokenizer
@@ -1596,7 +1612,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable SAME-L snapshot path
-        run: python3 scripts/release/export_model_snapshot_paths.py --model same-l
+        run: python3.12 scripts/release/export_model_snapshot_paths.py --model same-l
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1606,8 +1622,8 @@ jobs:
           cargo --version
       - name: Materialize and verify immutable SAME-L snapshot
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
       - name: Verify SAME-L short and long band boundaries on Metal
         run: |
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture
@@ -1629,7 +1645,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable SAME snapshot paths
         run: |
-          python3 scripts/release/export_model_snapshot_paths.py \
+          python3.12 scripts/release/export_model_snapshot_paths.py \
             --model same-s --model same-l
       - name: Toolchain and hardware versions
         run: |
@@ -1640,9 +1656,9 @@ jobs:
           cargo --version
       - name: Materialize and verify immutable SAME snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-s --snapshot "$SA3_SAME_S_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model same-s --snapshot "$SA3_SAME_S_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
       - name: Verify frozen SAME-S and SAME-L chunk ownership on Metal
         run: |
           SA3_CHUNKED_CASE=same_s cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture
@@ -1664,7 +1680,7 @@ jobs:
               done
             done
           done
-          python3 scripts/reference/verify_sa3_chunked_resource_log.py \
+          python3.12 scripts/reference/verify_sa3_chunked_resource_log.py \
             "$resource_log" --json | tee "$RUNNER_TEMP/sa3-chunked-resource.json"
 
   sa3-small-music-metal:
@@ -1677,7 +1693,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable small-music snapshot path
-        run: python3 scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
+        run: python3.12 scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
       - name: Toolchain and hardware versions
         run: |
           sw_vers
@@ -1687,8 +1703,8 @@ jobs:
           cargo --version
       - name: Materialize and verify immutable small-music snapshot
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
       - name: Run registered provider conformance and concurrent RNG isolation on Metal
         run: |
           # Named tests: the shared `conformance` binary also carries the sc-14544 small-sfx cases,
@@ -1747,7 +1763,7 @@ jobs:
         run: |
           # sc-14544's identity and divergence gates compare the two checkpoints against each other,
           # so both snapshots are required on this runner.
-          python3 scripts/release/export_model_snapshot_paths.py \
+          python3.12 scripts/release/export_model_snapshot_paths.py \
             --model stable-audio-3-small-sfx --model stable-audio-3-small-music
       - name: Toolchain and hardware versions
         run: |
@@ -1758,9 +1774,9 @@ jobs:
           cargo --version
       - name: Materialize and verify both immutable small snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
       # sc-14546 moved `--test variant_binding` to the `sa3-base-identity-metal` job. Every gate in
       # that target now needs all six pinned snapshots — `every_post_trained_base_pair_...` and
       # `sibling_root_weights_under_the_other_config_...` compare each post-trained checkpoint
@@ -1825,7 +1841,7 @@ jobs:
           # The cross-variant mutation gates compare medium against both smalls and against its own
           # base sibling, and the two-domain comparison renders medium beside each specialist, so
           # every snapshot they read has to be on this runner.
-          python3 scripts/release/export_model_snapshot_paths.py \
+          python3.12 scripts/release/export_model_snapshot_paths.py \
             --model stable-audio-3-medium --model stable-audio-3-medium-base \
             --model stable-audio-3-small-music --model stable-audio-3-small-sfx \
             --model same-l
@@ -1844,12 +1860,12 @@ jobs:
         run: cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --lib
       - name: Materialize and verify the immutable snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "$SA3_MEDIUM_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "$SA3_MEDIUM_BASE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "$SA3_MEDIUM_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "$SA3_MEDIUM_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
       - name: Verify the embedded SAME-L band boundaries on Metal
         run: |
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
@@ -1919,7 +1935,7 @@ jobs:
           binary="$(
             cargo test --locked --release --no-run --message-format=json \
               -p candle-audio-stable-audio-3 --features metal --test provider |
-              python3 -c "import json, sys; print([m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'provider'][-1])"
+              python3.12 -c "import json, sys; print([m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'provider'][-1])"
           )"
           test -x "$binary" || { echo "could not resolve the provider test binary"; exit 1; }
           echo "timing $binary"
@@ -1958,7 +1974,7 @@ jobs:
           # its `-base` sibling in both directions, plus the two small bases against each other and
           # against medium-base. Every one of those needs both sides materialized, so this job owns
           # the full set and the per-variant jobs no longer run the target.
-          python3 scripts/release/export_model_snapshot_paths.py \
+          python3.12 scripts/release/export_model_snapshot_paths.py \
             --model stable-audio-3-small-music --model stable-audio-3-small-sfx \
             --model stable-audio-3-medium --model stable-audio-3-small-music-base \
             --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base \
@@ -1973,7 +1989,7 @@ jobs:
           # The three `-base` entries carry `download_files` allow-lists, so `svd_bases.pt` — 1.27 GB
           # per small base and 3.84 GB for medium-base, 6.4 GB in total, and unreachable from
           # `SnapshotLayout::from_dir` — is not fetched.
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           for model in stable-audio-3-small-music stable-audio-3-small-sfx stable-audio-3-medium \
                        stable-audio-3-small-music-base stable-audio-3-small-sfx-base \
                        stable-audio-3-medium-base same-l; do
@@ -1986,7 +2002,7 @@ jobs:
               stable-audio-3-medium-base) path="$SA3_MEDIUM_BASE_SNAPSHOT" ;;
               same-l) path="$SA3_SAME_L_SNAPSHOT" ;;
             esac
-            PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model "$model" --snapshot "$path"
+            PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model "$model" --snapshot "$path"
           done
       - name: Reject every cross-variant weight path (full mutation matrix)
         run: |
@@ -2131,7 +2147,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure both immutable small-base snapshot paths
         run: |
-          python3 scripts/release/export_model_snapshot_paths.py \
+          python3.12 scripts/release/export_model_snapshot_paths.py \
             --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
       - name: Toolchain and hardware versions
         run: |
@@ -2142,9 +2158,9 @@ jobs:
           cargo --version
       - name: Materialize and verify both immutable small-base snapshots
         run: |
-          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "$SA3_SMALL_MUSIC_BASE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "$SA3_SMALL_SFX_BASE_SNAPSHOT"
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "$SA3_SMALL_MUSIC_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "$SA3_SMALL_SFX_BASE_SNAPSHOT"
       - name: Run registered base provider conformance and concurrent RNG isolation on Metal
         run: |
           for test in registered_music_base_provider_passes_full_audio_conformance \

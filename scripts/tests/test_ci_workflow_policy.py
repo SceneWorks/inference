@@ -26,6 +26,7 @@ WINDOWS_MAGE_LOCK = (
 MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
+MACOS_INTERPRETER = "python3.12"
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
@@ -252,6 +253,50 @@ def privileged_real_weight_jobs(workflow: str) -> list[str]:
     return privileged
 
 
+def real_weight_macos_interpreter_errors(workflow: str) -> list[str]:
+    """Reject a macOS real-weight step that runs Python without naming the reviewed CPython.
+
+    The pip policy below sees only `pip install` lines, which is half the chain. The macOS hub lock
+    is a reviewed CPython 3.12 set whose every pin floors at 3.10, so a bare `python3` resolves to
+    whatever the runner's launchd `.path` puts first — Apple's 3.9 on a box where /usr/bin precedes
+    Homebrew — and pip then filters the entire reviewed set out of the candidate list and reports
+    the pin as nonexistent rather than as a version conflict. The `PYTHONPATH=… python3 script.py`
+    lines fail the same way one stage later: they import the tree the pip step installed, so a
+    fixed installer with an unfixed consumer is still broken. Hence every Python invocation in a
+    macOS job, not just the installs.
+    """
+    errors: list[str] = []
+    # An interpreter TOKEN: `python`/`python3`/`python3.12` standing alone as a command word. The
+    # lookbehind drops `actions/setup-python`, `${{ runner.temp }}/python-bin` and `"$python_path"`
+    # (paths and variables, not command words); the lookahead drops `python_path=`.
+    interpreter = re.compile(r"(?<![\w./$\"'-])(python[0-9.]*)(?![\w-])")
+    # Two mentions in the Mage oracle job are legitimately not `python3.12`, and both are pinned by
+    # construction rather than by PATH luck:
+    #   * `uv python install 3.12.10` — a uv SUBCOMMAND, not an interpreter.
+    #   * the `$RUNNER_TEMP/mage-reference` venv, created by and running the interpreter that step
+    #     installed and prepended to $GITHUB_PATH.
+    exempt = re.compile(r"\buv python\b|mage-reference")
+    for job, lines in workflow_job_bodies(workflow).items():
+        runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
+        if "macOS" not in runs_on:
+            continue
+        for line in lines:
+            # Comments must not fail the gate — this workflow's own header explains the rule in
+            # prose that names bare `python3`. Cutting at `#` can truncate a quoted string, which
+            # costs a false negative, the right way round for a gate that blocks a merge.
+            command = line.split("#", 1)[0]
+            if exempt.search(command):
+                continue
+            for found in interpreter.finditer(command):
+                name = found.group(1)
+                if name != MACOS_INTERPRETER:
+                    errors.append(
+                        f"{job}: macOS steps must name {MACOS_INTERPRETER}, found "
+                        f"{name!r} in {command.strip()!r}"
+                    )
+    return errors
+
+
 def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     """Reject pip installs that can escape the reviewed wheel/hash inputs."""
     errors: list[str] = []
@@ -259,10 +304,13 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     canonical_install = re.compile(
         r"\bpip(?:\d+(?:\.\d+)*)?\s+install\b", re.IGNORECASE
     )
+    # A FULL-LINE comment is prose, not a command: the workflow header explains this very policy
+    # and names `pip` while doing it, which used to fail the gate it documents. Text after code on
+    # a line is still scanned, so the trailing-comment decoy mutations below stay caught.
     pip_lines = [
         (line_number, line.strip())
         for line_number, line in enumerate(workflow.splitlines(), start=1)
-        if pip_token.search(line)
+        if pip_token.search(line) and not line.lstrip().startswith("#")
     ]
     if not pip_lines:
         return ["real-weight workflow has no pip commands"]
@@ -303,7 +351,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = MACOS_MAGE_LOCK
         elif "mage-oracle-verify" in command:
             expected_lock = WINDOWS_MAGE_LOCK
-        elif "python3 -m pip" in command:
+        elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
         elif "python -m pip" in command:
             expected_lock = WINDOWS_HUB_LOCK
@@ -408,10 +456,71 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
         )
 
+    def test_real_weight_macos_steps_name_the_reviewed_cpython(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_macos_interpreter_errors(workflow), [])
+        # The gate is worthless if it inspected nothing, and `count` alone would pass on a file
+        # whose installs are all Windows. Pin both: the reviewed interpreter appears on every
+        # macOS hub-lock install, and no bare `python3` survives anywhere in the file.
+        self.assertEqual(
+            workflow.count(f"{MACOS_INTERPRETER} -m pip install"),
+            workflow.count(MACOS_HUB_LOCK),
+        )
+        # Over CODE only. The header documents the rule in prose that necessarily writes the very
+        # token being banned, so a file-wide regex would fail on its own documentation.
+        code = "\n".join(
+            line for line in workflow.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotRegex(code, r"(?<![\w.])python3(?!\.12)(?![\w-])")
+
+    def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "bare python3 installer": workflow.replace(
+                f"{MACOS_INTERPRETER} -m pip install", "python3 -m pip install", 1
+            ),
+            "bare python3 consumer": workflow.replace(
+                f"{MACOS_INTERPRETER} scripts/release/ensure_model_snapshot.py",
+                "python3 scripts/release/ensure_model_snapshot.py",
+                1,
+            ),
+            "bare python3 heredoc": workflow.replace(
+                f"{MACOS_INTERPRETER} - <<'PY'", "python3 - <<'PY'", 1
+            ),
+            "windows interpreter on a macOS step": workflow.replace(
+                f"{MACOS_INTERPRETER} scripts/release/resolve_snapshot_paths.py",
+                "python scripts/release/resolve_snapshot_paths.py",
+                1,
+            ),
+            "unreviewed minor": workflow.replace(
+                f"{MACOS_INTERPRETER} -m pip install", "python3.9 -m pip install", 1
+            ),
+        }
+        for mutation, mutated_workflow in mutations.items():
+            with self.subTest(mutation=mutation):
+                self.assertTrue(real_weight_macos_interpreter_errors(mutated_workflow))
+        # The `uv python` / `mage-reference` exemptions are line-scoped, not job-scoped: the Mage
+        # oracle job carries both, and a bare `python3` on one of its OTHER lines must still fail.
+        # Without this, widening an exemption to the job would silently unguard eight steps.
+        mage_regression = workflow.replace(
+            f"PYTHONPATH=\"$RUNNER_TEMP/huggingface-hub\" {MACOS_INTERPRETER} "
+            "scripts/release/ensure_model_snapshot.py --model z-image-turbo",
+            'PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 '
+            "scripts/release/ensure_model_snapshot.py --model z-image-turbo",
+            1,
+        )
+        self.assertNotEqual(mage_regression, workflow)
+        self.assertTrue(
+            any(
+                error.startswith("mlx-media:")
+                for error in real_weight_macos_interpreter_errors(mage_regression)
+            )
+        )
+
     def test_real_weight_pip_policy_discriminates_bypass_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         canonical_macos_install = (
-            "python3 -m pip install --disable-pip-version-check "
+            f"{MACOS_INTERPRETER} -m pip install --disable-pip-version-check "
             "--only-binary=:all: --require-hashes --target \"$PYTHONPATH\" "
             f"-r {MACOS_HUB_LOCK}"
         )
