@@ -27,7 +27,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, PidWeights, Progress, Quant};
+use candle_gen::gen_core::{Image, PidWeights, PreviewSink, Progress, Quant};
 // `LatentDecoder` brings the `PidDecoder::decode` trait method into scope (sc-8044).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -63,6 +63,15 @@ pub struct Flux2EditRequest {
     /// loaded with [`with_pid`](Flux2Edit::with_pid), the final latent is decoded by the `flux2` PiD
     /// student (4× SR → 2K/4K) instead of the native FLUX.2 VAE. `false` (default) keeps the VAE decode.
     pub use_pid: bool,
+    /// Per-step latent-preview sink (epic 16948, sc-16955) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot carry because it is worker-invoked by name rather than through a
+    /// registered descriptor. Default is inert, and an inert sink makes a seeded render
+    /// byte-identical to one with no preview at all.
+    ///
+    /// The frames project the **target** token stream only: the reference tokens are concatenated
+    /// inside the predict closure and sliced back off, so they are never part of the running latent.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -78,6 +87,7 @@ impl Default for Flux2EditRequest {
             guidance: DEFAULT_GUIDANCE,
             seed: 0,
             use_pid: false,
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -235,6 +245,11 @@ impl Flux2Edit {
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
+        // Per-step latent preview (epic 16948, sc-16955), bound to the same `(lat_h, lat_w)` the decode
+        // tail below unpacks against. The sampler's running latent is the TARGET token grid alone —
+        // `ref_tokens` is concatenated and sliced back off inside the predict closure — so the hook
+        // structurally cannot project a reference image.
+        let preview = crate::preview::hook(&req.preview, &self.vae, lat_h, lat_w);
         // The driver does cancel + progress + the integrator step. The joint `[target, refs]` concat,
         // the transformer forward, the target-slice, and the guidance>1 CFG blend all live inside the
         // predict closure so a multi-eval solver re-runs them. FLUX.2 uses the Sigma convention but the
@@ -247,7 +262,7 @@ impl Flux2Edit {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
                 // Joint image stream [target, refs] — references re-concatenated with the current target.

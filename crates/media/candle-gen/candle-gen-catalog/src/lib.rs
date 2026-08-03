@@ -281,6 +281,26 @@ mod preview_advertising {
     /// inventories below therefore mix `hooked` and `direct` counts in the same crate, which no
     /// earlier family needed.
     ///
+    /// The FLUX.2 family (sc-16955) is the widest single unlock and adds a fourth failure of
+    /// correspondence: **one latent space, three crates, two packing orders**. `flux2_klein_9b` /
+    /// `flux2_dev` are one crate's two descriptors over three render lanes (txt2img plus the
+    /// name-driven edit and strict-pose control providers, which carry a `preview` field rather than a
+    /// descriptor); `lens` / `lens_turbo` reach the same 32-channel fit through `candle-gen-lens`,
+    /// which owns no projector at all and re-exports `candle-gen-flux2`'s; and `ideogram_4` /
+    /// `ideogram_4_turbo` share that fit while packing the 128 transformer channels in a different
+    /// order, so they own the de-normalize/unpatchify half and reuse only the projection.
+    ///
+    /// Ideogram is also this table's first genuine `Denoise::Bespoke` **wired** crate: it drives no
+    /// shared sampler anywhere, so it becomes visible below through a direct emission call rather than
+    /// through a hooked call site. That is the case `DIRECT_EMISSION_CALLS` was hardened for.
+    ///
+    /// `candle-gen-boogu` is deliberately absent, and its absence is a measurement rather than an
+    /// omission: the epic groups it with FLUX.2, but it loads a plain 244-tensor **16-channel**
+    /// `AutoencoderKL` (the FLUX.1 / Z-Image lineage, `z_image::vae::AutoEncoderKL`, SHA-256
+    /// `8c717328…4c94`) with no `bn.*` stats at all, so the 32-channel fit does not describe its latent
+    /// space and sc-16955's own acceptance criterion is that it emits only if its VAE is proven to be
+    /// FLUX.2's. It is not. See `docs/migration/evidence/sc-16955-flux2-candle-preview.md`.
+    ///
     /// `instantid` is deliberately absent and cannot be added: it registers no descriptor at all
     /// (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Two shipped tests hold that in
     /// place — the second half of `temporal_and_super_resolution_routes_stay_outside_preview_advertising`
@@ -299,6 +319,12 @@ mod preview_advertising {
         "anima_turbo",
         "sdxl",
         "kolors",
+        "flux2_klein_9b",
+        "flux2_dev",
+        "lens",
+        "lens_turbo",
+        "ideogram_4",
+        "ideogram_4_turbo",
     ];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
@@ -443,7 +469,34 @@ mod preview_advertising {
             dir: "candle-gen-flux2",
             register: candle_gen_flux2::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16955's inventory: one hooked `run_flow_sampler` site per shipped render lane — the
+            // registered txt2img route (`lib.rs`), the name-driven reference-edit provider
+            // (`edit_provider.rs`), and the name-driven strict-pose control provider
+            // (`control_provider.rs`). No dark site: this crate has no trainer and no second denoise.
+            // All three project AFTER `pipeline::unpack_latents_at` and the VAE's own bn de-normalize +
+            // 2×2 unpatchify, which is why `pipeline.rs`, `vae.rs` and `preview.rs` hold no sampler site
+            // and no direct emission — `preview.rs` carries only the reused 32-channel fit and the
+            // projector it is applied through.
+            routes: &[
+                FileRoutes {
+                    file: "control_provider.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "edit_provider.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "lib.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+            ],
         },
         ProviderCrate {
             dir: "candle-gen-ideogram",
@@ -451,7 +504,19 @@ mod preview_advertising {
             // sc-16955 wires it through a direct emission call, not a hook argument.
             register: candle_gen_ideogram::register_providers,
             denoise: Denoise::Bespoke,
-            routes: &[],
+            // sc-16955's inventory, and the first time a **wired** crate's whole contribution is a
+            // direct emission: one `emit_preview_at` call inside `pipeline::denoise`, the single lane
+            // both registered ids (`ideogram_4`, `ideogram_4_turbo`) and both conditioning modes
+            // (txt2img and the reference/mask edit) reach. `hooked: 0` is the point rather than a gap —
+            // there is no sampler call site in this crate to hook, which is what `Denoise::Bespoke`
+            // declares and `the_wiring_table_pins_how_each_crate_denoises` verifies. `preview.rs` holds
+            // the `(ph,pw,c)`-order projector but emits nothing itself.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 0,
+                direct: 1,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-kolors",
@@ -526,7 +591,37 @@ mod preview_advertising {
             dir: "candle-gen-lens",
             register: candle_gen_lens::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16955's inventory. Lens has ONE sampler site — `Pipeline::denoise` in `lib.rs`, which
+            // forwards its caller's hook — plus the deliberately dark trainer site. The site count is
+            // deliberately not the lane count: three callers reach that one site (the resident
+            // `render`, the sequential `render_sequential`, and the `denoise_for_parity` seam), and
+            // only the first two have a `PreviewSink`. That distinction is invisible at this
+            // granularity, so `candle-gen-lens/src/preview.rs` pins the per-caller classification
+            // against the crate's own sources. No direct emission: Lens owns no projector at all and
+            // re-exports `candle-gen-flux2`'s, so `preview.rs` is a `pub use` shim.
+            routes: &[
+                FileRoutes {
+                    file: "lib.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "training.rs",
+                    hooked: 0,
+                    direct: 0,
+                    dark: &[DarkSite {
+                        driver: "run_flow_sampler",
+                        index: 0,
+                        reason: "the trainer's periodic sample render drives the sampler from a \
+                                 synthetic request that carries no PreviewSink — its result is \
+                                 delivered as a finished TrainingProgress::Sample image, not as a \
+                                 live denoise stream — so it passes `None` on purpose (the same \
+                                 decision sc-16950 recorded for Krea's trainer and sc-16954 for \
+                                 SDXL's)",
+                    }],
+                },
+            ],
         },
         ProviderCrate {
             dir: "candle-gen-ltx",

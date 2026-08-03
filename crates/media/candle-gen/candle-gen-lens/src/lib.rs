@@ -23,6 +23,7 @@
 
 pub mod adapters;
 pub mod dit_train;
+pub mod preview;
 pub mod quant;
 pub mod reasoner;
 pub mod resolution;
@@ -475,6 +476,17 @@ impl Pipeline {
     /// `x + v·(σ_{i+1} − σ_i)` within the framework's `to_d` round-trip tolerance. Lens feeds the raw
     /// (shifted) sigma as the model timestep (`Sigma` convention) and is standard-guidance, so the CFG
     /// (`cfg_rescale`) lives inside the `predict` closure — a multi-eval solver re-runs the whole closure.
+    ///
+    /// `preview` is the optional per-step latent preview hook (epic 16948, sc-16955). Lens shares the
+    /// FLUX.2 32-channel latent space and packed token layout, so it reuses
+    /// [`candle_gen_flux2::preview::hook`] rather than owning a projector — see the module docs there
+    /// for why the projection runs after the VAE-owned de-normalize + unpatchify. `None` is
+    /// byte-identical to a run without it; the render lanes build a hook per image and the
+    /// `denoise_for_parity` seam passes `None` (it has no request, and therefore no sink).
+    ///
+    /// The hook sees the sampler's running latent, which is the single **conditional** token stream:
+    /// the joint `[cond, uncond]` batch is fused inside the predict closure and `cfg_rescale` blends
+    /// it back to one velocity before returning, so no unconditional half ever becomes the latent.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
@@ -491,6 +503,7 @@ impl Pipeline {
         scheduler: Option<&str>,
         seed: u64,
         cancel: &gen_core::CancelFlag,
+        preview: Option<&candle_gen::preview::PreviewHook<'_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
         let mu = lens_mu(num_steps, latent_h, latent_w);
@@ -505,7 +518,7 @@ impl Pipeline {
             seed,
             cancel,
             on_progress,
-            None,
+            preview,
             |latents, sigma| -> CResult<Tensor> {
                 if !guided {
                     // Guidance disabled: cfg_rescale(cond, ·, 1.0) == cond, so run a single
@@ -580,6 +593,10 @@ impl Pipeline {
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let init = create_noise(seed, latent_h, latent_w, &self.device)?;
+            // Per-step latent preview (epic 16948, sc-16955), bound to the same `(latent_h, latent_w)`
+            // the decode tail below builds its packed grid from. Built per image so each seed's
+            // trajectory starts at frame 1.
+            let preview = preview::hook(&req.preview, &comps.heavy.vae, latent_h, latent_w);
             let latents = self.denoise(
                 &comps.heavy,
                 &features,
@@ -594,6 +611,7 @@ impl Pipeline {
                 req.scheduler.as_deref(),
                 seed,
                 &req.cancel,
+                Some(&preview),
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
@@ -685,6 +703,9 @@ impl Pipeline {
             candle_gen_pid::resolve_pid_decoder(heavy.pid.as_deref(), req, base_seed, defaults.id)?;
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let init = create_noise(seed, latent_h, latent_w, &self.device)?;
+            // Per-step latent preview (epic 16948, sc-16955) — the sequential-residency twin of the
+            // resident lane's hook, bound to the same grid this lane decodes against.
+            let preview = preview::hook(&req.preview, &heavy.vae, latent_h, latent_w);
             let latents = self.denoise(
                 &heavy,
                 &features,
@@ -699,6 +720,7 @@ impl Pipeline {
                 req.scheduler.as_deref(),
                 seed,
                 &req.cancel,
+                Some(&preview),
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
@@ -1148,7 +1170,9 @@ impl LensGenerator {
             None,
             &cancel,
         )?;
-        // Parity hook drives the default (euler over the native flow_match schedule), no cancel.
+        // Parity hook drives the default (euler over the native flow_match schedule), no cancel, and
+        // no preview: this seam takes injected latents rather than a `GenerationRequest`, so there is
+        // no `PreviewSink` to emit into and a frame here would have no consumer.
         let latents = self.pipeline.denoise(
             &comps.heavy,
             &features,
@@ -1163,6 +1187,7 @@ impl LensGenerator {
             None,
             0,
             &cancel,
+            None,
             &mut |_| {},
         )?;
         let decoded = vae::decode(&comps.heavy.vae, &latents, latent_h, latent_w)?;
@@ -1306,7 +1331,11 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
             supports_sequential_offload: true,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16955). Lens denoises the FLUX.2 32-channel
+            // latent space in the same packed token layout, and loads a VAE whose 250 learned tensors
+            // round exactly onto the fit donor's — so both render lanes hand the shared sampler a
+            // `candle_gen_flux2::preview` hook and no fit of its own is introduced.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
