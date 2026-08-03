@@ -662,7 +662,7 @@ jobs:
             fi
             printf '%s' "$revision"
           }
-          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
+          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
           if [[ ! "$producer" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Oracle producer fingerprint is missing or malformed: $producer" >&2
             exit 1

@@ -12,6 +12,9 @@ QWEN_MEMORY_STRATEGY = (
     WORKFLOW.parents[2]
     / "crates/media/candle-gen/candle-gen-qwen-image/src/memory_strategy.rs"
 )
+JOB_ENV_RUNNER_TEMP_EXPRESSION = re.compile(
+    r"(?m)^      [A-Z][A-Z0-9_]+: \$\{\{ runner\.temp \}\}"
+)
 
 
 def job_if_expression(workflow: str, job: str) -> str:
@@ -113,6 +116,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "crates/media/mlx-gen/tools/_paths.py",
             "crates/media/mlx-gen/tools/dump_mage_flow_golden.py",
             "crates/media/mlx-gen/tools/dump_mage_vae_sizes.py",
+            "scripts/release/mage_reference_environment.py",
             "scripts/release/provision_mage_oracles.py",
             "scripts/release/provision_mage_edit_variants.py",
             "scripts/release/verify_mage_candle_oracles.py",
@@ -226,10 +230,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "verify_mage_candle_transfer.py", workflow[transferred_verify:]
         )
         self.assertNotIn("MAGE_1024_GOLDEN_SHA256", workflow)
-        self.assertNotRegex(
-            workflow,
-            r"(?m)^      [A-Z][A-Z0-9_]+: \\$\\{\\{ runner\\.temp \\}\\}",
+        self.assertIsNotNone(
+            JOB_ENV_RUNNER_TEMP_EXPRESSION.search(
+                "    env:\n      UNSAFE_PATH: ${{ runner.temp }}/shared-cache\n"
+            ),
+            "the policy expression must detect a synthetic job-environment mutation",
         )
+        self.assertNotRegex(workflow, JOB_ENV_RUNNER_TEMP_EXPRESSION)
         for assignment in (
             r"EDIT_SRC=%RUNNER_TEMP%\sdxl-edit-src.ppm",
             r"EDIT_OUT=%RUNNER_TEMP%\sdxl-edit-out",

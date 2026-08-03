@@ -326,6 +326,39 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
             },
         )
 
+    def test_production_environment_failure_precedes_every_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot = root / ("a" * 40)
+            edit_snapshot = root / ("b" * 40)
+            snapshot.mkdir()
+            edit_snapshot.mkdir()
+            output = root / "oracles"
+            with (
+                mock.patch.object(
+                    self.module,
+                    "_validate_reference_environment",
+                    side_effect=self.module.InvalidOracle("bad reference environment"),
+                ),
+                mock.patch.object(
+                    Path, "mkdir", side_effect=AssertionError("must not mutate output")
+                ),
+                mock.patch.object(
+                    Path, "unlink", side_effect=AssertionError("must not delete")
+                ),
+                mock.patch.object(
+                    Path, "write_text", side_effect=AssertionError("must not write manifest")
+                ),
+                mock.patch.object(
+                    self.module.subprocess,
+                    "run",
+                    side_effect=AssertionError("must not launch producer"),
+                ),
+                self.assertRaisesRegex(self.module.InvalidOracle, "bad reference environment"),
+            ):
+                self.module.provision(output, snapshot, edit_snapshot)
+            self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

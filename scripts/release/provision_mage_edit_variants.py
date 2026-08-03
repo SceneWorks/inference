@@ -18,6 +18,19 @@ from pathlib import Path
 import numpy as np
 from safetensors import safe_open
 
+try:
+    from scripts.release.mage_reference_environment import (
+        REFERENCE_PACKAGES,
+        REFERENCE_PYTHON,
+        validate_reference_environment,
+    )
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from mage_reference_environment import (
+        REFERENCE_PACKAGES,
+        REFERENCE_PYTHON,
+        validate_reference_environment,
+    )
+
 ROOT = Path(__file__).resolve().parents[2]
 MLX = ROOT / "crates/media/mlx-gen"
 CANONICAL_EDIT_REF = MLX / "_vendor/mage_flow/assets/dog.jpg"
@@ -333,7 +346,10 @@ def main() -> int:
         "edit-turbo": args.edit_turbo,
     }
     gen_pinned = revision(args.gen)
-    args.output.mkdir(parents=True, exist_ok=True)
+    reference_environment = dict(REFERENCE_PACKAGES)
+    if not args.verify_only:
+        reference_environment = validate_reference_environment()
+        args.output.mkdir(parents=True, exist_ok=True)
     records = []
     for label, filename, steps, cfg in CASES:
         snapshot = snapshots[label]
@@ -380,6 +396,7 @@ def main() -> int:
         "reference": "microsoft/Mage frozen vendored reference",
         "device": "cpu",
         "generationSnapshotRevision": gen_pinned,
+        "referenceEnvironment": reference_environment,
         "files": records,
     }
     manifest_path = args.output / "mage_edit_variants_manifest.json"
