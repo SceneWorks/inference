@@ -106,41 +106,31 @@ impl TokenEmbedding {
                 let pw = wq.take_axis(ids, 0)?;
                 let sc = scales.take_axis(ids, 0)?;
                 let bi = biases.take_axis(ids, 0)?;
-                if residual.is_none() && residual2.is_none() {
-                    return Ok(dequantize(&pw, &sc, &bi, *group_size, *bits)?);
+                let primary = dequantize(&pw, &sc, &bi, *group_size, *bits)?;
+                let with_residual = match residual {
+                    Some(residual) => {
+                        let rw = residual.wq.take_axis(ids, 0)?;
+                        let rs = residual.scales.take_axis(ids, 0)?;
+                        let rb = residual.biases.take_axis(ids, 0)?;
+                        add(
+                            &primary,
+                            &dequantize(&rw, &rs, &rb, residual.group_size, residual.bits)?,
+                        )?
+                    }
+                    None => primary,
+                };
+                match residual2 {
+                    Some(residual2) => {
+                        let rw = residual2.wq.take_axis(ids, 0)?;
+                        let rs = residual2.scales.take_axis(ids, 0)?;
+                        let rb = residual2.biases.take_axis(ids, 0)?;
+                        add(
+                            &with_residual,
+                            &dequantize(&rw, &rs, &rb, residual2.group_size, residual2.bits)?,
+                        )?
+                    }
+                    None => with_residual,
                 }
-
-                // Unlike qmm, embedding lookup dequantizes before T5 promotes activations to f32.
-                // Reconstruct progressive terms using f32 scales/biases, accumulate them there,
-                // then restore the native packed-parameter dtype. No weight is materialized densely.
-                let output_dtype = sc.dtype();
-                let primary = dequantize(
-                    &pw,
-                    &sc.as_dtype(Dtype::Float32)?,
-                    &bi.as_dtype(Dtype::Float32)?,
-                    *group_size,
-                    *bits,
-                )?;
-                let mut accumulated = primary;
-                for term in [residual.as_ref(), residual2.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    let rw = term.wq.take_axis(ids, 0)?;
-                    let rs = term.scales.take_axis(ids, 0)?;
-                    let rb = term.biases.take_axis(ids, 0)?;
-                    accumulated = add(
-                        &accumulated,
-                        &dequantize(
-                            &rw,
-                            &rs.as_dtype(Dtype::Float32)?,
-                            &rb.as_dtype(Dtype::Float32)?,
-                            term.group_size,
-                            term.bits,
-                        )?,
-                    )?;
-                }
-                accumulated.as_dtype(output_dtype)?
             }
         };
         // Return the native (bf16) embedding to match the mflux reference (sc-2787). CLIP genuinely

@@ -404,7 +404,7 @@ jobs:
           cargo test --locked --release -p mlx-gen-chroma \
             model::tests::packed_t5_render_combination_sweep -- --ignored --exact --nocapture \
             --test-threads=1 | tee "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log"
-          test "$(grep -c 'SC16462_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log")" = 3
+          test "$(grep -c 'SC16462_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log")" = 2
       - name: Upload render sensitivity evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

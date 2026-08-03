@@ -974,20 +974,11 @@ mod tests {
         );
     }
 
-    fn load_render_calibration_candidate(
-        spec: &LoadSpec,
-        sensitive_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
-    ) -> Result<Chroma> {
+    fn load_render_calibration_candidate(spec: &LoadSpec, group_size: i32) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_progressive_with_sensitive_sublayers_residuals(
-            crate::convert::AUXILIARY_BITS,
-            crate::convert::T5_RESIDUAL_BITS,
-            crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
-            crate::convert::T5_GROUP_SIZE,
-            sensitive_sublayers,
-        )?;
+        t5.quantize_with_group_size(crate::convert::AUXILIARY_BITS, group_size)?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
             t5,
@@ -1080,52 +1071,15 @@ mod tests {
         drop(reference_model);
         clear_cache();
 
-        use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
+        // Progressive residuals and boundary reconstruction variants all failed the unchanged
+        // strict render gate. Measure the remaining packed affine architecture: one Q8 term per
+        // complete T5 weight, with no residual qmm accumulation, at both valid group sizes.
+        let candidates = [("single-q8-group32", 32), ("single-q8-group64", 64)];
 
-        // The first ten entries are the best strict-render prefix from the preceding exact sweep.
-        // The remaining entries preserve the individual-sensitivity ordering so this bounded
-        // search can test both single additions and cumulative expansion without exploring the
-        // full combinatorial surface.
-        let ranked = [
-            (4, Attention),
-            (1, FeedForward),
-            (2, FeedForward),
-            (18, FeedForward),
-            (15, Attention),
-            (1, Attention),
-            (16, Attention),
-            (14, Attention),
-            (18, Attention),
-            (19, Attention),
-            (14, FeedForward),
-            (20, FeedForward),
-            (13, FeedForward),
-            (16, FeedForward),
-            (22, FeedForward),
-            (23, Attention),
-            (21, Attention),
-            (23, FeedForward),
-            (22, Attention),
-            (13, Attention),
-        ];
-        // Additional packed terms regressed strict render quality. The token embedding is the only
-        // packed progressive reconstruction performed before T5 promotes activations to f32.
-        // Compare f32 dequantization and accumulation there across the smallest production policy
-        // and established near-pass surfaces.
-        let current = vec![(4, Attention), (1, FeedForward), (2, FeedForward)];
-        let top10 = ranked[..10].to_vec();
-        let mut top10_block13 = top10.clone();
-        top10_block13.push((13, FeedForward));
-        let candidates = [
-            ("embedding-f32-dequant-current", current),
-            ("embedding-f32-dequant-top10", top10),
-            ("embedding-f32-dequant-top10-block13", top10_block13),
-        ];
-
-        for (policy, sensitive_sublayers) in candidates {
+        for (policy, group_size) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(&baseline_spec, &sensitive_sublayers)
+            let model = load_render_calibration_candidate(&baseline_spec, group_size)
                 .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
@@ -1146,18 +1100,9 @@ mod tests {
                 "SC16462_RENDER_SENSITIVITY {}",
                 serde_json::json!({
                     "policy": policy,
-                    "sensitiveResidualBits": crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
-                    "sensitiveSublayers": sensitive_sublayers
-                        .iter()
-                        .map(|(block, sublayer)| serde_json::json!({
-                            "block": block,
-                            "sublayer": match sublayer {
-                                mlx_gen_flux::T5Sublayer::Attention => "attention",
-                                mlx_gen_flux::T5Sublayer::FeedForward => "ffn",
-                            },
-                        }))
-                        .collect::<Vec<_>>(),
-                    "embeddingPackedDequantization": "f32",
+                    "primaryBits": crate::convert::AUXILIARY_BITS,
+                    "residualBits": serde_json::Value::Null,
+                    "groupSize": group_size,
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
                     "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
