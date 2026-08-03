@@ -178,6 +178,8 @@ fn exact_f32(a: &[f32], b: &[f32]) -> bool {
 enum T5ProbePolicy {
     Dense,
     Q8Q4Progressive,
+    Q8Q4ProgressiveGroup32,
+    Q8Q8Progressive,
     Q8Linears,
     Q8Except { block: usize, sublayer: T5Sublayer },
 }
@@ -204,6 +206,12 @@ fn t5_probe_outputs(
                 t5_group_size_env(),
             )
             .expect("load-time progressive T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveGroup32 => t5
+            .quantize_progressive(8, 4, 32)
+            .expect("load-time group-32 progressive T5 quantization"),
+        T5ProbePolicy::Q8Q8Progressive => t5
+            .quantize_progressive(8, 8, 64)
+            .expect("load-time Q8+Q8 progressive T5 quantization"),
         T5ProbePolicy::Q8Linears => t5
             .quantize_linears(8)
             .expect("load-time T5 Linear quantization"),
@@ -505,6 +513,16 @@ fn t5_precision_sensitivity_sweep() {
             T5ProbePolicy::Q8Q4Progressive,
             None,
         ),
+        (
+            "q8-plus-q4-packed-residual-group32",
+            T5ProbePolicy::Q8Q4ProgressiveGroup32,
+            None,
+        ),
+        (
+            "q8-plus-q8-packed-residual-group64",
+            T5ProbePolicy::Q8Q8Progressive,
+            None,
+        ),
         ("q8-linears", T5ProbePolicy::Q8Linears, None),
         (
             "q8-except-block0-attention",
@@ -596,8 +614,8 @@ fn t5_precision_sensitivity_sweep() {
 /// the same tensors as the established dense-load-then-quantize seam, and stay inside the measured
 /// direct semantic-span diagnostic versus bf16. Because Chroma uses the reference's literal 0/1
 /// additive attention mask, the separate full-pipeline image gate is authoritative for runtime
-/// quality. T5 is also the residency discriminator: a packed load must avoid the dense-plus-packed
-/// high-water mark that load-time quantization necessarily incurs.
+/// quality. Peak figures emitted here are diagnostic only because all three modes share one process;
+/// [`component_residency_probe`] provides the authoritative fresh-process measurements.
 #[test]
 #[ignore = "needs real Chroma weights and Apple Silicon MLX"]
 fn packed_auxiliaries_match_load_time_quantization() {
@@ -678,13 +696,6 @@ fn packed_auxiliaries_match_load_time_quantization() {
         t5_all_positions_cosine.is_finite() && t5_active_span_cosine.is_finite(),
         "Q{auxiliary_bits} T5 diagnostic cosines must be finite"
     );
-    assert!(
-        packed_t5_peak < load_time_t5_peak,
-        "packed T5 peak {:.2} GiB must stay below load-time quantization peak {:.2} GiB",
-        gib(packed_t5_peak),
-        gib(load_time_t5_peak)
-    );
-
     let (dense_vae_decode, dense_vae_encode, dense_vae_peak) = vae_output(&src, None);
     let (load_time_vae_decode, load_time_vae_encode, load_time_vae_peak) =
         vae_output(&src, Some(auxiliary_bits));
@@ -706,13 +717,6 @@ fn packed_auxiliaries_match_load_time_quantization() {
         vae_decode_cosine >= vae_floor && vae_encode_cosine >= vae_floor,
         "Q{auxiliary_bits} VAE cosine fell below {vae_floor:.5} (decode={vae_decode_cosine:.7}, encode={vae_encode_cosine:.7})"
     );
-    assert!(
-        packed_vae_peak < load_time_vae_peak,
-        "packed VAE peak {:.2} GiB must stay below load-time quantization peak {:.2} GiB",
-        gib(packed_vae_peak),
-        gib(load_time_vae_peak)
-    );
-
     println!(
         "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
@@ -731,6 +735,51 @@ fn packed_auxiliaries_match_load_time_quantization() {
         dense_vae_peak,
         load_time_vae_peak,
         packed_vae_peak,
+    );
+}
+
+/// Emit one component/mode peak from a fresh test process. The hosted workflow invokes this probe
+/// three times for every component/mode and compares medians, avoiding allocator/order bias from
+/// measuring dense, load-time quantized, and packed residency in one Metal process.
+#[test]
+#[ignore = "needs real Chroma weights and Apple Silicon MLX"]
+fn component_residency_probe() {
+    let src = chroma_snapshot().expect("SC8777_SRC or cached Chroma snapshot required");
+    let packed = PathBuf::from(
+        std::env::var("SC8777_OUT").expect("SC8777_OUT must point to the candidate packed tier"),
+    );
+    let component = std::env::var("SC16462_RESIDENCY_COMPONENT")
+        .expect("SC16462_RESIDENCY_COMPONENT must be t5 or vae");
+    let mode = std::env::var("SC16462_RESIDENCY_MODE")
+        .expect("SC16462_RESIDENCY_MODE must be dense, load-time, or packed");
+    let repetition = std::env::var("SC16462_RESIDENCY_REPETITION")
+        .expect("SC16462_RESIDENCY_REPETITION is required")
+        .parse::<usize>()
+        .expect("SC16462_RESIDENCY_REPETITION must be an integer");
+    let auxiliary_bits = auxiliary_bits_env(bits_env());
+    let (root, quantize_at_load) = match mode.as_str() {
+        "dense" => (src.as_path(), None),
+        "load-time" => (src.as_path(), Some(auxiliary_bits)),
+        "packed" => (packed.as_path(), None),
+        other => panic!("unsupported SC16462_RESIDENCY_MODE {other}"),
+    };
+    let peak = match component.as_str() {
+        "t5" => t5_output(root, quantize_at_load).2,
+        "vae" => vae_output(root, quantize_at_load).2,
+        other => panic!("unsupported SC16462_RESIDENCY_COMPONENT {other}"),
+    };
+    println!(
+        "SC16462_RESIDENCY {}",
+        serde_json::json!({
+            "model": model_id(),
+            "tier": format!("q{}", bits_env()),
+            "auxiliaryBits": auxiliary_bits,
+            "groupSize": t5_group_size_env(),
+            "component": component,
+            "mode": mode,
+            "repetition": repetition,
+            "peakBytes": peak,
+        })
     );
 }
 

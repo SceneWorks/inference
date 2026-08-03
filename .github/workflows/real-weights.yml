@@ -38,6 +38,12 @@ on:
         required: false
         default: "64"
         options: ["32", "64"]
+      chroma_model:
+        description: Chroma model to validate; publication always requires all
+        type: choice
+        required: false
+        default: all
+        options: [all, chroma1_base, chroma1_hd, chroma1_flash]
 
 permissions:
   contents: read
@@ -81,13 +87,14 @@ jobs:
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Validate publication authorization
-        if: inputs.publish_chroma_artifacts
+        if: inputs.publish_chroma_artifacts && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
         run: |
           if [[ "${{ inputs.chroma_publish_confirmation }}" != "sc-16462" ]]; then
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
       - name: Materialize the exact shipped bf16 source
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
           CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
@@ -111,17 +118,22 @@ jobs:
           test -d "$CHROMA_SNAPSHOT/q4/transformer"
           test -d "$CHROMA_SNAPSHOT/q8/transformer"
       - name: Build and validate packed q4/q8 tiers
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
           SC8777_SRC: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}/bf16
           SC8777_MODEL: ${{ matrix.model }}
           SC8777_KEEP: "1"
           CHROMA_PACKED_ROOT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PAYLOAD_MANIFEST: ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
+          CHROMA_RESIDENCY_RAW: ${{ runner.temp }}/chroma-sc16462-residency.jsonl
+          CHROMA_RESIDENCY_SUMMARY: ${{ runner.temp }}/chroma-sc16462-residency-summary.jsonl
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462
         run: |
           set -o pipefail
           : > "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl"
           : > "$RUNNER_TEMP/chroma-sc16462-component.jsonl"
+          : > "$CHROMA_RESIDENCY_RAW"
+          : > "$CHROMA_RESIDENCY_SUMMARY"
           for bits in 4 8; do
             export SC8777_BITS="$bits"
             export SC16462_AUX_BITS=8
@@ -143,6 +155,70 @@ jobs:
               --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits.log"
             sed -n 's/^.*SC16462_COMPONENT //p' "$RUNNER_TEMP/chroma-q$bits.log" \
               >> "$RUNNER_TEMP/chroma-sc16462-component.jsonl"
+            : > "$RUNNER_TEMP/chroma-q$bits-residency.log"
+            for component in t5 vae; do
+              for mode in dense load-time packed; do
+                for repetition in 1 2 3; do
+                  SC16462_RESIDENCY_COMPONENT="$component" \
+                  SC16462_RESIDENCY_MODE="$mode" \
+                  SC16462_RESIDENCY_REPETITION="$repetition" \
+                    cargo test --locked --release -p mlx-gen-chroma \
+                      --test prequantize_real_weights component_residency_probe -- --ignored \
+                      --exact --nocapture --test-threads=1 \
+                      | tee -a "$RUNNER_TEMP/chroma-q$bits-residency.log"
+                done
+              done
+            done
+            sed -n 's/^.*SC16462_RESIDENCY //p' "$RUNNER_TEMP/chroma-q$bits-residency.log" \
+              >> "$CHROMA_RESIDENCY_RAW"
+            python3 - <<'PY'
+            import json
+            import os
+            from pathlib import Path
+            from statistics import median
+
+            tier = f"q{os.environ['SC8777_BITS']}"
+            rows = [
+                json.loads(line)
+                for line in Path(os.environ["CHROMA_RESIDENCY_RAW"]).read_text().splitlines()
+            ]
+            rows = [row for row in rows if row["tier"] == tier]
+            if len(rows) != 18:
+                raise SystemExit(f"{tier}: expected 18 fresh-process residency rows, got {len(rows)}")
+            peaks = {}
+            for component in ("t5", "vae"):
+                peaks[component] = {}
+                for mode in ("dense", "load-time", "packed"):
+                    values = [
+                        row["peakBytes"]
+                        for row in rows
+                        if row["component"] == component and row["mode"] == mode
+                    ]
+                    if len(values) != 3:
+                        raise SystemExit(
+                            f"{tier}/{component}/{mode}: expected 3 measurements, got {len(values)}"
+                        )
+                    peaks[component][mode] = {
+                        "median": int(median(values)),
+                        "samples": values,
+                    }
+                packed = peaks[component]["packed"]["median"]
+                load_time = peaks[component]["load-time"]["median"]
+                if packed >= load_time:
+                    raise SystemExit(
+                        f"{tier}/{component}: packed median {packed} must be below load-time {load_time}"
+                    )
+            summary = {
+                "model": os.environ["CHROMA_MODEL"],
+                "tier": tier,
+                "auxiliaryBits": 8,
+                "groupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
+                "freshProcessMedianPeakBytes": peaks,
+            }
+            with Path(os.environ["CHROMA_RESIDENCY_SUMMARY"]).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(summary, sort_keys=True) + "\n")
+            print("SC16462_RESIDENCY_SUMMARY " + json.dumps(summary, sort_keys=True))
+            PY
             cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
               packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak -- --ignored \
               --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-calibration.log"
@@ -154,6 +230,8 @@ jobs:
           done
           test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl" | tr -d ' ')" = 2
           test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-component.jsonl" | tr -d ' ')" = 2
+          test "$(wc -l < "$CHROMA_RESIDENCY_RAW" | tr -d ' ')" = 36
+          test "$(wc -l < "$CHROMA_RESIDENCY_SUMMARY" | tr -d ' ')" = 2
           python3 - <<'PY'
           import hashlib
           import json
@@ -187,7 +265,7 @@ jobs:
           )
           PY
       - name: Upload Chroma calibration evidence
-        if: always()
+        if: always() && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: chroma-sc16462-${{ matrix.model }}
@@ -196,10 +274,12 @@ jobs:
             ${{ runner.temp }}/chroma-sc16462-calibration.jsonl
             ${{ runner.temp }}/chroma-sc16462-component.jsonl
             ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
+            ${{ runner.temp }}/chroma-sc16462-residency.jsonl
+            ${{ runner.temp }}/chroma-sc16462-residency-summary.jsonl
 
-  # SC-16462 diagnostic lane: rank four single-sublayer T5 carve-outs at Chroma's production
-  # sequence length before spending another full Base/HD/Flash render matrix. This lane never
-  # publishes and deliberately materializes only Base's immutable bf16 text encoder.
+  # SC-16462 diagnostic lane: rank fully packed progressive precision policies at Chroma's
+  # production sequence length before spending another Base or Base/HD/Flash render matrix. This
+  # lane never publishes and deliberately materializes only Base's immutable bf16 text encoder.
   mlx-chroma-t5-sensitivity:
     name: Chroma T5 precision sensitivity
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-t5-sensitivity'
@@ -233,7 +313,7 @@ jobs:
           PY
           test -d "$CHROMA_SNAPSHOT/bf16/text_encoder"
           echo "SC8777_SRC=$CHROMA_SNAPSHOT/bf16" >> "$GITHUB_ENV"
-      - name: Rank single-sublayer T5 carve-outs
+      - name: Rank fully packed T5 precision policies
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-t5-sensitivity
         run: |
@@ -255,7 +335,7 @@ jobs:
   # repo byte-for-byte and treats it as success, making a cross-repository partial run resumable.
   mlx-chroma-publish:
     name: Publish Chroma packed auxiliaries (${{ matrix.model }})
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary' && inputs.publish_chroma_artifacts
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary' && inputs.publish_chroma_artifacts && inputs.chroma_model == 'all'
     needs: mlx-chroma-auxiliary
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     timeout-minutes: 360
