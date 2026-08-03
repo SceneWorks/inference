@@ -68,7 +68,7 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// Validate a reference track's interleaved layout and expose the one mono waveform every
 /// Chatterbox conditioning network expects. Keeping this at the provider boundary prevents a
 /// stereo clip from becoming an alternating L/R "mono" waveform in T3 or S3Gen.
-fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, AudioTrack>> {
+fn validate_reference_audio(audio: &AudioTrack) -> gen_core::Result<usize> {
     if audio.channels == 0 {
         return Err(gen_core::Error::Msg(format!(
             "{MODEL_ID}: reference audio channels must be non-zero"
@@ -82,6 +82,11 @@ fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, Audio
             audio.channels
         )));
     }
+    Ok(channels)
+}
+
+fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, AudioTrack>> {
+    let channels = validate_reference_audio(audio)?;
     if channels == 1 {
         return Ok(Cow::Borrowed(audio));
     }
@@ -97,6 +102,24 @@ fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, Audio
         channels: 1,
         stems: Vec::new(),
     }))
+}
+
+/// Derive only T3's first-six-second 16 kHz conditioning window. The range stays on the full
+/// resampled output timeline, while mono samples are derived lazily from interleaved source frames.
+fn prepare_reference_speech_audio(audio: &AudioTrack) -> gen_core::Result<Vec<f32>> {
+    let channels = validate_reference_audio(audio)?;
+    let input_frames = audio.samples.len() / channels;
+    let output_frames =
+        candle_audio::dsp::resample_output_frames(input_frames, audio.sample_rate, S3_SR)
+            .map_err(gen_core::Error::from)?;
+    candle_audio::dsp::resample_mono_range(
+        &audio.samples,
+        audio.sample_rate,
+        S3_SR,
+        audio.channels,
+        0..output_frames.min(ENC_COND_LEN),
+    )
+    .map_err(gen_core::Error::from)
 }
 
 /// Stable component key for the pinned Chatterbox checkpoint — what `PROVIDER_COMPONENTS`
@@ -328,12 +351,8 @@ impl ChatterboxGenerator {
     /// Perceiver resampler consumes. It was empty in sc-13222 (weakening the voice conditioning);
     /// with the s3tokenizer ported it is filled from the reference clip.
     pub fn reference_speech_tokens(&self, audio: &AudioTrack) -> gen_core::Result<Vec<u32>> {
-        let prepared = prepare_reference_audio(audio)?;
-        self.reference_speech_tokens_mono(&prepared)
-    }
-
-    fn reference_speech_tokens_mono(&self, audio: &AudioTrack) -> gen_core::Result<Vec<u32>> {
-        debug_assert_eq!(audio.channels, 1);
+        // Resolve/refuse and evaluate the bounded host window before staging tokenizer weights.
+        let wav16k = prepare_reference_speech_audio(audio)?;
         let mut guard = lock_recover(&self.s3tokenizer);
         if guard.is_none() {
             let tok = S3Tokenizer::from_snapshot(&self.root)
@@ -342,14 +361,10 @@ impl ChatterboxGenerator {
         }
         // Resample to 16 kHz first, THEN cap at ENC_COND_LEN — the cap is defined in 16 kHz
         // samples (6 s), so it must be applied post-resample, as the reference does.
-        let wav16k =
-            candle_audio::dsp::resample(&audio.samples, audio.sample_rate, S3_SR, audio.channels)
-                .map_err(gen_core::Error::from)?;
-        let n = ENC_COND_LEN.min(wav16k.len());
         let codes = guard
             .as_ref()
             .unwrap()
-            .encode(&wav16k[..n], S3_SR)
+            .encode(&wav16k, S3_SR)
             .map_err(gen_core::Error::from)?;
         Ok(codes
             .into_iter()
@@ -452,25 +467,29 @@ impl ChatterboxGenerator {
             Conditioning::ReferenceAudio { audio, .. } => Some(audio),
             _ => None,
         });
-        let prepared_reference = reference.map(prepare_reference_audio).transpose()?;
-        self.speech_tokens_with_reference(req, prepared_reference.as_deref(), on_progress)
+        self.speech_tokens_with_reference(req, reference, on_progress)
     }
 
     fn speech_tokens_with_reference(
         &self,
         req: &GenerationRequest,
-        prepared_reference: Option<&AudioTrack>,
+        reference: Option<&AudioTrack>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<(Vec<u32>, Vec<u32>)> {
         let defaults = GenerationDefaults::default();
+
+        // Reject malformed interleaving before a voice embedder or tokenizer can stage weights.
+        if let Some(audio) = reference {
+            validate_reference_audio(audio)?;
+        }
 
         // 1. Conditioning → the T3 speaker vector, plus the s3tokenizer prompt tokens when a
         //    reference clip is present (sc-13235). A VoiceEmbedding-only request has no clip to
         //    tokenize, so the prompt stays empty — the reference's `cond_prompt_speech_emb is None`
         //    branch (a bare voice vector drives T3 without the Perceiver prompt).
-        let speaker_emb = self.speaker_embedding(req, prepared_reference)?;
-        let cond_prompt_speech_tokens = match prepared_reference {
-            Some(audio) => self.reference_speech_tokens_mono(audio)?,
+        let speaker_emb = self.speaker_embedding(req, reference)?;
+        let cond_prompt_speech_tokens = match reference {
+            Some(audio) => self.reference_speech_tokens(audio)?,
             None => Vec::new(),
         };
         let cond = T3Cond {
@@ -549,14 +568,18 @@ impl Generator for ChatterboxGenerator {
             Conditioning::ReferenceAudio { audio, .. } => Some(audio),
             _ => None,
         });
-        let prepared_reference = reference.map(prepare_reference_audio).transpose()?;
 
         // T3 stage (real weights) → speech tokens.
         let (raw_tokens, real_tokens) =
-            self.speech_tokens_with_reference(req, prepared_reference.as_deref(), on_progress)?;
+            self.speech_tokens_with_reference(req, reference, on_progress)?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
+
+        // S3Gen's other conditioning networks consume a mono clip. Defer complete preparation
+        // until after T3's bounded speech window, so the T3-only path never allocates whole-clip
+        // mono and resampled buffers.
+        let prepared_reference = reference.map(prepare_reference_audio).transpose()?;
 
         // S3Gen needs the reference CLIP: VoiceEmbedding alone conditions the T3 LM but cannot
         // supply S3Gen's reference mel / prompt tokens / speaker x-vector, so a full clone WAV
@@ -722,6 +745,53 @@ mod tests {
     }
 
     #[test]
+    fn t3_first_six_seconds_bound_resampling_and_mono_derivation() {
+        const SOURCE_RATE: u32 = 24_000;
+        let input_frames = 7 * SOURCE_RATE as usize;
+        let mut stereo = Vec::with_capacity(input_frames * 2);
+        for frame in 0..input_frames {
+            stereo.push(frame as f32 * 0.000_001);
+            stereo.push(1.0 - frame as f32 * 0.000_000_5);
+        }
+        let audio = AudioTrack {
+            samples: stereo,
+            sample_rate: SOURCE_RATE,
+            channels: 2,
+            stems: Vec::new(),
+        };
+
+        let legacy_mono: Vec<f32> = audio
+            .samples
+            .chunks_exact(2)
+            .map(|frame| frame.iter().copied().sum::<f32>() / 2.0)
+            .collect();
+        candle_audio::dsp::resample_test_support::reset();
+        let full = candle_audio::dsp::resample(&legacy_mono, SOURCE_RATE, S3_SR, 1).unwrap();
+        let full_work = candle_audio::dsp::resample_test_support::work();
+
+        candle_audio::dsp::resample_test_support::reset();
+        let bounded = prepare_reference_speech_audio(&audio).unwrap();
+        let bounded_work = candle_audio::dsp::resample_test_support::work();
+        assert_eq!(bounded.len(), ENC_COND_LEN);
+        assert!(bounded
+            .iter()
+            .zip(&full[..ENC_COND_LEN])
+            .all(|(&actual, &expected)| actual.to_bits() == expected.to_bits()));
+        assert_eq!(
+            bounded_work.0, ENC_COND_LEN,
+            "only the first six seconds may be evaluated"
+        );
+        assert_eq!(full_work.0, full.len());
+        assert!(
+            bounded_work.1 < full_work.1,
+            "bounded source work {} must be below full-clip {}",
+            bounded_work.1,
+            full_work.1
+        );
+        assert!(ENC_COND_LEN < full.len());
+    }
+
+    #[test]
     fn descriptor_advertises_the_clone_surface() {
         let d = descriptor();
         assert_eq!(d.id, "chatterbox_tts");
@@ -780,6 +850,24 @@ mod tests {
                 COMPONENT_VOICE_EMBEDDING,
                 WeightsSource::File(std::path::PathBuf::from("unused-ve.safetensors")),
             )
+    }
+
+    #[test]
+    fn production_path_rejects_short_stereo_by_frame_count_before_weights() {
+        let dir = std::env::temp_dir().join("chatterbox-short-stereo-no-weights");
+        let generator = load(&spec_with_stub_components(dir)).unwrap();
+        let request = req_with(vec![Conditioning::ReferenceAudio {
+            audio: AudioTrack {
+                samples: vec![0.0; 300 * 2],
+                sample_rate: 16_000,
+                channels: 2,
+                stems: Vec::new(),
+            },
+            strength: None,
+        }]);
+        let error = generator.generate(&request, &mut |_| {}).unwrap_err();
+        assert!(error.to_string().contains("300 frames"), "{error}");
+        assert!(error.to_string().contains("too short"), "{error}");
     }
 
     /// `Box<dyn Generator>` is not `Debug`, so `Result::unwrap_err` is unavailable — take the error

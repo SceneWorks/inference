@@ -43,9 +43,9 @@ pub const HUB_REVISION: &str = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18";
 /// The voice-encoder checkpoint (a single safetensors file inside the pinned repo).
 pub const WEIGHTS_FILE: &str = "ve.safetensors";
 
-/// Minimum reference-clip length (samples, at the source rate) `embed` will accept — one FFT
+/// Minimum reference-clip length (mono frames, at the source rate) `embed` will accept — one FFT
 /// frame is meaningless as an identity cue, so a shorter clip is a typed error, not a silent
-/// degenerate vector.
+/// degenerate vector. Multichannel interleaving does not multiply the effective duration.
 pub const MIN_REFERENCE_SAMPLES: usize = config::N_FFT;
 
 /// Chatterbox voice-encoder identity + advertised shape — constructible without weights
@@ -115,11 +115,24 @@ impl VoiceEmbedder for ChatterboxVoiceEmbedder {
     }
 
     fn embed(&self, audio: &AudioTrack) -> gen_core::Result<VoiceEmbedding> {
-        if audio.samples.len() < MIN_REFERENCE_SAMPLES {
+        if audio.channels == 0 {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: reference clip has {} samples (< {MIN_REFERENCE_SAMPLES}); too short \
-                 to extract a speaker identity",
-                audio.samples.len()
+                "{MODEL_ID}: reference audio channels must be non-zero"
+            )));
+        }
+        let channels = audio.channels as usize;
+        if !audio.samples.len().is_multiple_of(channels) {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: reference audio has {} samples, not a whole number of {}-channel frames",
+                audio.samples.len(),
+                audio.channels
+            )));
+        }
+        let input_frames = audio.samples.len() / channels;
+        if input_frames < MIN_REFERENCE_SAMPLES {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: reference clip has {input_frames} frames (< {MIN_REFERENCE_SAMPLES}); \
+                 too short to extract a speaker identity"
             )));
         }
         // Down-mix to mono if the caller handed an interleaved multi-channel clip.
@@ -227,6 +240,25 @@ mod tests {
         };
         // Fails on the length gate before any weight I/O (weights need not exist).
         assert!(e.embed(&clip).is_err());
+    }
+
+    #[test]
+    fn embed_rejects_short_stereo_by_frame_count_before_weight_io() {
+        let e = load(&LoadSpec::new(WeightsSource::File(
+            std::env::temp_dir().join("missing-ve.safetensors"),
+        )))
+        .unwrap();
+        let clip = AudioTrack {
+            // 300 stereo frames are 600 interleaved samples: raw sample count exceeds the old
+            // 400-sample gate, but effective mono duration remains too short.
+            samples: vec![0.0; 300 * 2],
+            sample_rate: 16_000,
+            channels: 2,
+            ..Default::default()
+        };
+        let error = e.embed(&clip).unwrap_err();
+        assert!(error.to_string().contains("300 frames"), "{error}");
+        assert!(error.to_string().contains("too short"), "{error}");
     }
 
     #[test]

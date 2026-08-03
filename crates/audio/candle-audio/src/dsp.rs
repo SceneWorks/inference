@@ -13,6 +13,10 @@
 //! inverse normalizes by the summed squared window and trims the centering pad.
 
 use crate::{AudioError, Result};
+use std::ops::Range;
+
+#[cfg(any(test, feature = "testkit"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A periodic Hann window of length `len` — `0.5 * (1 - cos(2π n / N))`, the analysis and
 /// synthesis window the reference STFT stacks (torch.hann_window / librosa) default to.
@@ -32,6 +36,29 @@ const RESAMPLE_MAX_TAPS_PER_PHASE: usize = 16_385;
 const RESAMPLE_KAISER_BETA: f64 = 8.6;
 const RESAMPLE_CUTOFF_GUARD: f64 = 0.94;
 const RESAMPLE_MAX_PRECOMPUTED_COEFFICIENTS: usize = 4_194_304;
+
+#[cfg(any(test, feature = "testkit"))]
+static RESAMPLE_OUTPUT_WORK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "testkit"))]
+static RESAMPLE_SOURCE_FRAME_WORK: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only observability for proving that bounded callers do not process a complete clip.
+#[cfg(any(test, feature = "testkit"))]
+pub mod resample_test_support {
+    use super::{Ordering, RESAMPLE_OUTPUT_WORK, RESAMPLE_SOURCE_FRAME_WORK};
+
+    pub fn reset() {
+        RESAMPLE_OUTPUT_WORK.store(0, Ordering::Relaxed);
+        RESAMPLE_SOURCE_FRAME_WORK.store(0, Ordering::Relaxed);
+    }
+
+    pub fn work() -> (usize, usize) {
+        (
+            RESAMPLE_OUTPUT_WORK.load(Ordering::Relaxed),
+            RESAMPLE_SOURCE_FRAME_WORK.load(Ordering::Relaxed),
+        )
+    }
+}
 
 fn gcd(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
@@ -63,17 +90,17 @@ fn normalized_sinc(x: f64) -> f64 {
     }
 }
 
-fn phase_kernel(
+fn fill_phase_kernel(
+    kernel: &mut [f64],
     phase: usize,
     phase_count: usize,
-    taps_per_phase: usize,
     cutoff: f64,
     kaiser_denominator: f64,
-) -> Vec<f64> {
+) -> f64 {
+    let taps_per_phase = kernel.len();
     let fraction = phase as f64 / phase_count as f64;
     let half_taps = (taps_per_phase / 2) as isize;
     let radius = taps_per_phase as f64 / 2.0;
-    let mut kernel = vec![0.0; taps_per_phase];
     let mut sum = 0.0;
     for (tap, weight) in kernel.iter_mut().enumerate() {
         let offset = tap as isize - half_taps;
@@ -87,10 +114,110 @@ fn phase_kernel(
     }
     // Phase normalization gives unity DC gain. Each output frame is normalized again
     // after boundary taps are omitted, preserving constants at clip edges as well.
-    for weight in &mut kernel {
+    for weight in kernel.iter_mut() {
         *weight /= sum;
     }
-    kernel
+    // This is the divisor the old output loop obtained by adding every normalized
+    // coefficient in tap order for an interior frame. Retaining it per phase removes
+    // repeated normalization work without changing a single f64 addition.
+    let mut normalized_sum = 0.0;
+    for &weight in kernel.iter() {
+        normalized_sum += weight;
+    }
+    normalized_sum
+}
+
+#[derive(Debug)]
+struct ResamplePlan {
+    phase_count: usize,
+    phase_step: usize,
+    taps_per_phase: usize,
+    half_taps: usize,
+    /// All phases in one allocation: `phase * taps_per_phase .. (phase + 1) * taps_per_phase`.
+    coefficients: Vec<f64>,
+    /// Sum of each normalized phase, accumulated in original tap order.
+    phase_sums: Vec<f64>,
+}
+
+impl ResamplePlan {
+    fn new(src_rate: u32, dst_rate: u32) -> Result<Self> {
+        let divisor = gcd(src_rate, dst_rate);
+        let phase_count = (dst_rate / divisor) as usize;
+        let phase_step = (src_rate / divisor) as usize;
+        let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0) * RESAMPLE_CUTOFF_GUARD;
+        let required_taps = RESAMPLE_BASE_TAPS_PER_PHASE as f64 * RESAMPLE_CUTOFF_GUARD / cutoff;
+        if required_taps > RESAMPLE_MAX_TAPS_PER_PHASE as f64 {
+            return Err(AudioError::Msg(format!(
+                "resample ratio {src_rate} -> {dst_rate} needs more than \
+                 {RESAMPLE_MAX_TAPS_PER_PHASE} taps per phase"
+            )));
+        }
+        let taps_per_phase = (required_taps.ceil() as usize) | 1;
+        let coefficient_count = phase_count.checked_mul(taps_per_phase).ok_or_else(|| {
+            AudioError::Msg(format!(
+                "resample coefficient table size overflows usize for {src_rate} -> {dst_rate}"
+            ))
+        })?;
+        if coefficient_count > RESAMPLE_MAX_PRECOMPUTED_COEFFICIENTS {
+            return Err(AudioError::Msg(format!(
+                "resample ratio {src_rate} -> {dst_rate} needs {coefficient_count} precomputed \
+                 coefficients, above the limit of {RESAMPLE_MAX_PRECOMPUTED_COEFFICIENTS}"
+            )));
+        }
+
+        let kaiser_denominator = bessel_i0(RESAMPLE_KAISER_BETA);
+        let mut coefficients = Vec::with_capacity(coefficient_count);
+        let mut phase_sums = Vec::with_capacity(phase_count);
+        for phase in 0..phase_count {
+            let start = coefficients.len();
+            coefficients.resize(start + taps_per_phase, 0.0);
+            let sum = fill_phase_kernel(
+                &mut coefficients[start..],
+                phase,
+                phase_count,
+                cutoff,
+                kaiser_denominator,
+            );
+            phase_sums.push(sum);
+        }
+        Ok(Self {
+            phase_count,
+            phase_step,
+            taps_per_phase,
+            half_taps: taps_per_phase / 2,
+            coefficients,
+            phase_sums,
+        })
+    }
+
+    fn kernel(&self, phase: usize) -> &[f64] {
+        let start = phase * self.taps_per_phase;
+        &self.coefficients[start..start + self.taps_per_phase]
+    }
+}
+
+/// Number of output frames produced by the shared rational resampler.
+///
+/// Non-empty clips round `input_frames * dst_rate / src_rate` to nearest (ties upward) and are
+/// clamped to one frame. Empty clips remain empty. This is the same rule [`resample`] has always
+/// used and is exposed so bounded callers can select a range on the global output timeline.
+pub fn resample_output_frames(input_frames: usize, src_rate: u32, dst_rate: u32) -> Result<usize> {
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(AudioError::Msg(format!(
+            "resample rates must be non-zero, got {src_rate} -> {dst_rate}"
+        )));
+    }
+    if input_frames == 0 {
+        return Ok(0);
+    }
+    let output_frames_u128 =
+        ((input_frames as u128) * (dst_rate as u128) + (src_rate as u128 / 2)) / src_rate as u128;
+    usize::try_from(output_frames_u128.max(1)).map_err(|_| {
+        AudioError::Msg(format!(
+            "resample output length does not fit usize for {input_frames} frames at \
+             {src_rate} -> {dst_rate}"
+        ))
+    })
 }
 
 /// Resample one complete interleaved PCM buffer with a rational polyphase
@@ -101,18 +228,57 @@ fn phase_kernel(
 /// The returned frame count is `round(input_frames * dst_rate / src_rate)`, clamped to one
 /// frame for every non-empty input. An equal-rate conversion is byte-identical.
 ///
-/// This is deliberately a **whole-buffer** API. The centered FIR reads samples on both sides
-/// of each output position, intrinsically compensating group delay. Calling it separately on
-/// streaming chunks would discard that cross-boundary history and create seams; a future
-/// streaming caller must use a separate stateful contract.
-///
 /// The implementation is in-house rather than dependency-backed: the fixed-rate audio lane
 /// needs only rational conversion, and this small kernel keeps the coefficient design and
 /// channel/boundary behavior directly auditable. Filter support scales with the downsample
-/// ratio so large reductions retain the same stopband quality. Common ratios precompute all
-/// polyphase coefficients; unusually large coefficient tables calculate identical phases on
-/// demand to keep memory bounded.
+/// ratio so large reductions retain the same stopband quality. All phase coefficients are
+/// precomputed in one contiguous table; ratios whose table would exceed the audited bound are
+/// rejected before any output work begins.
 pub fn resample(samples: &[f32], src_rate: u32, dst_rate: u32, channels: u16) -> Result<Vec<f32>> {
+    let channels_usize = validate_resample_input(samples, src_rate, dst_rate, channels)?;
+    let input_frames = samples.len() / channels_usize;
+    let output_frames = resample_output_frames(input_frames, src_rate, dst_rate)?;
+    resample_range(samples, src_rate, dst_rate, channels, 0..output_frames)
+}
+
+/// Resample a range of frames on the complete clip's global output timeline.
+///
+/// This is not chunked/streaming resampling: `samples` is still the full source clip, so output
+/// phase and FIR boundary behavior are exactly those of [`resample`]. `output_range` is half-open
+/// and must lie within `0..resample_output_frames(input_frames, src_rate, dst_rate)`. Consequently,
+/// slicing the whole-buffer result and calling this function with the same range are bit-identical.
+/// Empty input admits only `0..0`; equal-rate ranges are byte-identical source-frame slices.
+pub fn resample_range(
+    samples: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    channels: u16,
+    output_range: Range<usize>,
+) -> Result<Vec<f32>> {
+    resample_range_impl(samples, src_rate, dst_rate, channels, output_range, false)
+}
+
+/// Downmix interleaved input to mono while resampling a bounded global output range.
+///
+/// Each source frame is averaged in the same `f32`, channel-order accumulation used by provider
+/// mono preparation, but no whole-clip mono buffer is allocated. Range, rounding, empty, and
+/// equal-rate semantics are identical to [`resample_range`].
+pub fn resample_mono_range(
+    samples: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    channels: u16,
+    output_range: Range<usize>,
+) -> Result<Vec<f32>> {
+    resample_range_impl(samples, src_rate, dst_rate, channels, output_range, true)
+}
+
+fn validate_resample_input(
+    samples: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    channels: u16,
+) -> Result<usize> {
     if src_rate == 0 || dst_rate == 0 {
         return Err(AudioError::Msg(format!(
             "resample rates must be non-zero, got {src_rate} -> {dst_rate}"
@@ -128,93 +294,157 @@ pub fn resample(samples: &[f32], src_rate: u32, dst_rate: u32, channels: u16) ->
             samples.len()
         )));
     }
-    if samples.is_empty() || src_rate == dst_rate {
-        return Ok(samples.to_vec());
-    }
+    Ok(channels)
+}
 
-    let input_frames = samples.len() / channels;
-    let output_frames_u128 =
-        ((input_frames as u128) * (dst_rate as u128) + (src_rate as u128 / 2)) / src_rate as u128;
-    let output_frames = usize::try_from(output_frames_u128.max(1)).map_err(|_| {
-        AudioError::Msg(format!(
-            "resample output length does not fit usize for {input_frames} frames at \
-             {src_rate} -> {dst_rate}"
-        ))
-    })?;
-    let output_samples = output_frames.checked_mul(channels).ok_or_else(|| {
-        AudioError::Msg(format!(
-            "resample output sample count overflows usize ({output_frames} frames, \
-             {channels} channels)"
-        ))
-    })?;
-
-    let divisor = gcd(src_rate, dst_rate);
-    let phase_count = (dst_rate / divisor) as usize;
-    let phase_step = (src_rate / divisor) as usize;
-    let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0) * RESAMPLE_CUTOFF_GUARD;
-    let required_taps = RESAMPLE_BASE_TAPS_PER_PHASE as f64 * RESAMPLE_CUTOFF_GUARD / cutoff;
-    if required_taps > RESAMPLE_MAX_TAPS_PER_PHASE as f64 {
+fn validate_output_range(range: &Range<usize>, output_frames: usize) -> Result<()> {
+    if range.start > range.end || range.end > output_frames {
         return Err(AudioError::Msg(format!(
-            "resample ratio {src_rate} -> {dst_rate} needs more than \
-             {RESAMPLE_MAX_TAPS_PER_PHASE} taps per phase"
+            "resample output range {}..{} lies outside 0..{output_frames}",
+            range.start, range.end
         )));
     }
-    let taps_per_phase = (required_taps.ceil() as usize) | 1;
-    let half_taps = (taps_per_phase / 2) as isize;
-    let kaiser_denominator = bessel_i0(RESAMPLE_KAISER_BETA);
-    let precompute = phase_count
-        .checked_mul(taps_per_phase)
-        .is_some_and(|count| count <= RESAMPLE_MAX_PRECOMPUTED_COEFFICIENTS);
-    let phase_kernels = precompute.then(|| {
-        (0..phase_count)
-            .map(|phase| {
-                phase_kernel(
-                    phase,
-                    phase_count,
-                    taps_per_phase,
-                    cutoff,
-                    kaiser_denominator,
-                )
-            })
-            .collect::<Vec<_>>()
-    });
+    Ok(())
+}
 
+fn mono_frame(samples: &[f32], frame: usize, channels: usize) -> f32 {
+    let start = frame * channels;
+    samples[start..start + channels]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / channels as f32
+}
+
+fn resample_range_impl(
+    samples: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    channels: u16,
+    output_range: Range<usize>,
+    mono: bool,
+) -> Result<Vec<f32>> {
+    let channels = validate_resample_input(samples, src_rate, dst_rate, channels)?;
+    let input_frames = samples.len() / channels;
+    let output_frames = resample_output_frames(input_frames, src_rate, dst_rate)?;
+    validate_output_range(&output_range, output_frames)?;
+    let output_channels = if mono { 1 } else { channels };
+    let requested_frames = output_range.end - output_range.start;
+    let output_samples = requested_frames
+        .checked_mul(output_channels)
+        .ok_or_else(|| {
+            AudioError::Msg(format!(
+                "resample output sample count overflows usize ({requested_frames} frames, \
+             {output_channels} channels)"
+            ))
+        })?;
+
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    if src_rate == dst_rate {
+        if mono {
+            return Ok((output_range.start..output_range.end)
+                .map(|frame| {
+                    #[cfg(any(test, feature = "testkit"))]
+                    {
+                        RESAMPLE_OUTPUT_WORK.fetch_add(1, Ordering::Relaxed);
+                        RESAMPLE_SOURCE_FRAME_WORK.fetch_add(1, Ordering::Relaxed);
+                    }
+                    mono_frame(samples, frame, channels)
+                })
+                .collect());
+        }
+        #[cfg(any(test, feature = "testkit"))]
+        {
+            RESAMPLE_OUTPUT_WORK.fetch_add(requested_frames, Ordering::Relaxed);
+            RESAMPLE_SOURCE_FRAME_WORK.fetch_add(requested_frames, Ordering::Relaxed);
+        }
+        return Ok(samples[output_range.start * channels..output_range.end * channels].to_vec());
+    }
+
+    // Construct and validate the complete coefficient table before allocating or evaluating any
+    // output. In particular, pathological relatively-prime rates never fall back to per-output
+    // phase construction.
+    let plan = ResamplePlan::new(src_rate, dst_rate)?;
     let mut output = vec![0.0f32; output_samples];
-    for output_frame in 0..output_frames {
-        let source_numerator = (output_frame as u128) * (phase_step as u128);
-        let source_frame = (source_numerator / phase_count as u128) as isize;
-        let phase = (source_numerator % phase_count as u128) as usize;
-        let computed_kernel;
-        let kernel = if let Some(kernels) = &phase_kernels {
-            &kernels[phase]
-        } else {
-            computed_kernel = phase_kernel(
-                phase,
-                phase_count,
-                taps_per_phase,
-                cutoff,
-                kaiser_denominator,
-            );
-            &computed_kernel
-        };
-        let first_input_frame = source_frame - half_taps;
+    for (local_output_frame, output_frame) in output_range.enumerate() {
+        #[cfg(any(test, feature = "testkit"))]
+        RESAMPLE_OUTPUT_WORK.fetch_add(1, Ordering::Relaxed);
 
-        for channel in 0..channels {
+        let source_numerator = (output_frame as u128) * (plan.phase_step as u128);
+        let source_frame =
+            usize::try_from(source_numerator / plan.phase_count as u128).map_err(|_| {
+                AudioError::Msg("resample source-frame index does not fit usize".into())
+            })?;
+        let phase = (source_numerator % plan.phase_count as u128) as usize;
+        let kernel = plan.kernel(phase);
+        let interior_start = source_frame.checked_sub(plan.half_taps);
+        let interior = interior_start
+            .and_then(|start| {
+                start
+                    .checked_add(plan.taps_per_phase)
+                    .map(|end| (start, end))
+            })
+            .filter(|&(_, end)| end <= input_frames);
+
+        for output_channel in 0..output_channels {
             let mut value = 0.0f64;
-            let mut included_weight = 0.0f64;
-            for (tap, &weight) in kernel.iter().enumerate() {
-                let input_frame = first_input_frame + tap as isize;
-                if (0..input_frames as isize).contains(&input_frame) {
-                    value += samples[input_frame as usize * channels + channel] as f64 * weight;
-                    included_weight += weight;
+            let included_weight;
+            if let Some((first_input_frame, end_input_frame)) = interior {
+                // The source window is checked once. This dot product has no per-tap boundary
+                // predicate, while preserving the old tap-order f64 accumulation exactly.
+                if mono {
+                    for (&weight, input_frame) in
+                        kernel.iter().zip(first_input_frame..end_input_frame)
+                    {
+                        value += mono_frame(samples, input_frame, channels) as f64 * weight;
+                    }
+                } else {
+                    let start = first_input_frame * channels + output_channel;
+                    let end = end_input_frame * channels;
+                    for (&weight, &sample) in kernel
+                        .iter()
+                        .zip(samples[start..end].iter().step_by(channels))
+                    {
+                        value += sample as f64 * weight;
+                    }
                 }
-            }
-            output[output_frame * channels + channel] = if included_weight.abs() > 1e-12 {
-                (value / included_weight) as f32
+                #[cfg(any(test, feature = "testkit"))]
+                RESAMPLE_SOURCE_FRAME_WORK.fetch_add(plan.taps_per_phase, Ordering::Relaxed);
+                included_weight = plan.phase_sums[phase];
             } else {
-                samples
-                    [source_frame.clamp(0, input_frames as isize - 1) as usize * channels + channel]
-            };
+                // Only leading/trailing frames pay checked full-clip boundary evaluation.
+                let mut weight_sum = 0.0f64;
+                for (tap, &weight) in kernel.iter().enumerate() {
+                    let input_frame = source_frame
+                        .checked_add(tap)
+                        .and_then(|shifted| shifted.checked_sub(plan.half_taps));
+                    if let Some(input_frame) = input_frame.filter(|&frame| frame < input_frames) {
+                        let sample = if mono {
+                            mono_frame(samples, input_frame, channels)
+                        } else {
+                            samples[input_frame * channels + output_channel]
+                        };
+                        value += sample as f64 * weight;
+                        weight_sum += weight;
+                        #[cfg(any(test, feature = "testkit"))]
+                        RESAMPLE_SOURCE_FRAME_WORK.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                included_weight = weight_sum;
+            }
+            output[local_output_frame * output_channels + output_channel] =
+                if included_weight.abs() > 1e-12 {
+                    (value / included_weight) as f32
+                } else {
+                    let fallback = source_frame.min(input_frames - 1);
+                    if mono {
+                        mono_frame(samples, fallback, channels)
+                    } else {
+                        samples[fallback * channels + output_channel]
+                    }
+                };
         }
     }
     Ok(output)
@@ -448,6 +678,271 @@ pub fn istft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OLD_BASE_TAPS_PER_PHASE: usize = 197;
+    const OLD_KAISER_BETA: f64 = 8.6;
+    const OLD_CUTOFF_GUARD: f64 = 0.94;
+
+    fn old_bessel_i0_oracle(x: f64) -> f64 {
+        let y = x * x / 4.0;
+        let mut sum = 1.0;
+        let mut term = 1.0;
+        for k in 1.. {
+            term *= y / (k * k) as f64;
+            sum += term;
+            if term <= sum * f64::EPSILON {
+                break;
+            }
+        }
+        sum
+    }
+
+    fn old_normalized_sinc_oracle(x: f64) -> f64 {
+        if x.abs() < 1e-12 {
+            1.0
+        } else {
+            let px = std::f64::consts::PI * x;
+            px.sin() / px
+        }
+    }
+
+    /// Independent copy of the legacy coefficient construction. Do not call production
+    /// `fill_phase_kernel` here: a coefficient/order regression must not mutate its own oracle.
+    fn old_phase_kernel_oracle(
+        phase: usize,
+        phase_count: usize,
+        taps_per_phase: usize,
+        cutoff: f64,
+        kaiser_denominator: f64,
+    ) -> Vec<f64> {
+        let fraction = phase as f64 / phase_count as f64;
+        let half_taps = (taps_per_phase / 2) as isize;
+        let radius = taps_per_phase as f64 / 2.0;
+        let mut kernel = vec![0.0; taps_per_phase];
+        let mut sum = 0.0;
+        for (tap, weight) in kernel.iter_mut().enumerate() {
+            let offset = tap as isize - half_taps;
+            let distance = offset as f64 - fraction;
+            let window_position = (distance / radius).clamp(-1.0, 1.0);
+            let window = old_bessel_i0_oracle(
+                OLD_KAISER_BETA * (1.0 - window_position * window_position).sqrt(),
+            ) / kaiser_denominator;
+            *weight = cutoff * old_normalized_sinc_oracle(cutoff * distance) * window;
+            sum += *weight;
+        }
+        for weight in &mut kernel {
+            *weight /= sum;
+        }
+        kernel
+    }
+
+    /// Test-only copy of the pre-sc-16602 resampling loop. Keep its per-phase allocations,
+    /// per-output checked tap walk, and per-channel normalization intact: this is the numerical
+    /// compatibility oracle for the flattened/interior-specialized implementation above.
+    fn old_resample_oracle(
+        samples: &[f32],
+        src_rate: u32,
+        dst_rate: u32,
+        channels: u16,
+    ) -> Result<Vec<f32>> {
+        let channels = validate_resample_input(samples, src_rate, dst_rate, channels)?;
+        if samples.is_empty() || src_rate == dst_rate {
+            return Ok(samples.to_vec());
+        }
+        let input_frames = samples.len() / channels;
+        let output_frames = resample_output_frames(input_frames, src_rate, dst_rate)?;
+        let divisor = gcd(src_rate, dst_rate);
+        let phase_count = (dst_rate / divisor) as usize;
+        let phase_step = (src_rate / divisor) as usize;
+        let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0) * OLD_CUTOFF_GUARD;
+        let required_taps = OLD_BASE_TAPS_PER_PHASE as f64 * OLD_CUTOFF_GUARD / cutoff;
+        let taps_per_phase = (required_taps.ceil() as usize) | 1;
+        let half_taps = (taps_per_phase / 2) as isize;
+        let kaiser_denominator = old_bessel_i0_oracle(OLD_KAISER_BETA);
+        let phase_kernels = (0..phase_count)
+            .map(|phase| {
+                old_phase_kernel_oracle(
+                    phase,
+                    phase_count,
+                    taps_per_phase,
+                    cutoff,
+                    kaiser_denominator,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut output = vec![0.0f32; output_frames * channels];
+        for output_frame in 0..output_frames {
+            let source_numerator = (output_frame as u128) * (phase_step as u128);
+            let source_frame = (source_numerator / phase_count as u128) as isize;
+            let phase = (source_numerator % phase_count as u128) as usize;
+            let kernel = &phase_kernels[phase];
+            let first_input_frame = source_frame - half_taps;
+            for channel in 0..channels {
+                let mut value = 0.0f64;
+                let mut included_weight = 0.0f64;
+                for (tap, &weight) in kernel.iter().enumerate() {
+                    let input_frame = first_input_frame + tap as isize;
+                    if (0..input_frames as isize).contains(&input_frame) {
+                        value += samples[input_frame as usize * channels + channel] as f64 * weight;
+                        included_weight += weight;
+                    }
+                }
+                output[output_frame * channels + channel] = if included_weight.abs() > 1e-12 {
+                    (value / included_weight) as f32
+                } else {
+                    samples[source_frame.clamp(0, input_frames as isize - 1) as usize * channels
+                        + channel]
+                };
+            }
+        }
+        Ok(output)
+    }
+
+    fn assert_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context}: length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{context}: sample {index}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    fn deterministic_signal(frames: usize, channels: usize) -> Vec<f32> {
+        let mut state = 0x5eed_cafe_u64;
+        (0..frames * channels)
+            .map(|index| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let random = ((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32;
+                random * 0.7 + (index as f32 * 0.013).sin() * 0.3
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flattened_resampler_is_bit_identical_to_old_loop_oracle() {
+        for &(src_rate, dst_rate) in &[
+            (48_000, 16_000),
+            (16_000, 48_000),
+            (48_000, 44_100),
+            (22_050, 32_000),
+            (44_100, 32_000),
+        ] {
+            for channels in [1usize, 2, 3] {
+                for frames in [1usize, 17, 257, 1_024] {
+                    let random = deterministic_signal(frames, channels);
+                    let constant = vec![0.375; frames * channels];
+                    let mut impulse = vec![0.0; frames * channels];
+                    impulse[(frames / 2) * channels] = 1.0;
+                    for (kind, samples) in [
+                        ("random", random),
+                        ("constant", constant),
+                        ("impulse", impulse),
+                    ] {
+                        let old =
+                            old_resample_oracle(&samples, src_rate, dst_rate, channels as u16)
+                                .unwrap();
+                        let new = resample(&samples, src_rate, dst_rate, channels as u16).unwrap();
+                        assert_bits_eq(
+                            &new,
+                            &old,
+                            &format!(
+                                "{kind}, {frames} frames, {channels}ch, {src_rate}->{dst_rate}"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_ranges_equal_slices_of_full_resample_bit_for_bit() {
+        let channels = 2usize;
+        let samples = deterministic_signal(4_097, channels);
+        let full = resample(&samples, 44_100, 48_000, channels as u16).unwrap();
+        let output_frames = full.len() / channels;
+        let ranges = [
+            0..37,
+            41..313,
+            output_frames / 2 - 100..output_frames / 2 + 101,
+            output_frames - 41..output_frames,
+            123..123,
+        ];
+        for range in ranges {
+            let bounded =
+                resample_range(&samples, 44_100, 48_000, channels as u16, range.clone()).unwrap();
+            assert_bits_eq(
+                &bounded,
+                &full[range.start * channels..range.end * channels],
+                &format!("range {range:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_mono_matches_downmix_then_full_resample() {
+        let channels = 4usize;
+        let samples = deterministic_signal(8_000, channels);
+        let mono: Vec<f32> = samples
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
+            .collect();
+        let full = resample(&mono, 32_000, 48_000, 1).unwrap();
+        let range = 777..2_345;
+        let bounded =
+            resample_mono_range(&samples, 32_000, 48_000, channels as u16, range.clone()).unwrap();
+        assert_bits_eq(&bounded, &full[range], "bounded mono");
+    }
+
+    #[test]
+    fn bounded_range_defines_empty_equal_rate_and_invalid_semantics() {
+        assert!(resample_range(&[], 44_100, 48_000, 2, 0..0)
+            .unwrap()
+            .is_empty());
+        assert!(resample_range(&[], 44_100, 48_000, 2, 0..1).is_err());
+
+        let stereo = [1.0, -1.0, 0.5, -0.5, 0.25, -0.25];
+        assert_eq!(
+            resample_range(&stereo, 48_000, 48_000, 2, 1..3).unwrap(),
+            stereo[2..6]
+        );
+        assert_eq!(
+            resample_mono_range(&stereo, 48_000, 48_000, 2, 1..3).unwrap(),
+            [0.0, 0.0]
+        );
+        let reversed_start = 2;
+        let reversed_end = 1;
+        assert!(resample_range(&stereo, 48_000, 48_000, 2, reversed_start..reversed_end).is_err());
+        assert!(resample_range(&stereo, 48_000, 48_000, 2, 0..4).is_err());
+    }
+
+    #[test]
+    fn pathological_phase_table_is_rejected_before_output_work() {
+        // Relatively-prime rates make 48,000 phases; even the minimum 197-tap support would need
+        // 9,456,000 coefficients. The old implementation fell back to phase construction inside
+        // the output loop. The bounded contract refuses it up front.
+        resample_test_support::reset();
+        let error = resample(&[0.25; 100], 47_999, 48_000, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("precomputed coefficients"),
+            "{error}"
+        );
+        assert_eq!(resample_test_support::work(), (0, 0));
+    }
+
+    #[test]
+    fn filter_support_keeps_the_197_tap_floor_and_scales_for_downsampling() {
+        let equal = ResamplePlan::new(48_000, 48_000).unwrap();
+        let down = ResamplePlan::new(48_000, 16_000).unwrap();
+        assert_eq!(equal.taps_per_phase, RESAMPLE_BASE_TAPS_PER_PHASE);
+        assert!(down.taps_per_phase > RESAMPLE_BASE_TAPS_PER_PHASE);
+        assert!(equal.taps_per_phase % 2 == 1 && down.taps_per_phase % 2 == 1);
+    }
 
     #[test]
     fn hann_window_shape_and_symmetry() {
