@@ -865,6 +865,10 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
+    use mlx_gen::Quant;
+    use mlx_gen_flux::T5Sublayer;
+    use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+    use std::path::PathBuf;
 
     /// A Chroma with no loadable components — enough to exercise the request-boundary paths
     /// (`validate`, pre-run cancellation) that run before any tensor is touched. The residency is
@@ -970,5 +974,165 @@ mod tests {
             !msg.contains("single .safetensors file") && !msg.contains("precision override"),
             "expected an eager-load failure, not the up-front guard: {msg}"
         );
+    }
+
+    fn load_render_calibration_candidate(
+        spec: &LoadSpec,
+        sensitive_sublayers: &[(usize, T5Sublayer)],
+    ) -> Result<Chroma> {
+        let variant = ChromaVariant::Base;
+        let root = resolve_root(variant, spec)?;
+        let mut t5 = loader::load_t5_encoder(root)?;
+        t5.quantize_progressive_with_sensitive_sublayers_residuals(
+            crate::convert::AUXILIARY_BITS,
+            crate::convert::T5_RESIDUAL_BITS,
+            crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+            crate::convert::T5_GROUP_SIZE,
+            sensitive_sublayers,
+        )?;
+        let text = ChromaTextOwned {
+            tokenizer: loader::load_tokenizer()?,
+            t5,
+        };
+        let heavy = load_heavy(variant, spec, false)?;
+        Ok(Chroma {
+            descriptor: variant.descriptor(),
+            variant,
+            residency: Residency::resident(text, heavy),
+        })
+    }
+
+    fn render_calibration_samples(model: &Chroma) -> Vec<Image> {
+        [
+            "a studio photograph of a red fox on fresh snow, detailed fur",
+            "a watercolor lighthouse above a stormy ocean at sunset",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let request = GenerationRequest {
+                prompt: (*prompt).into(),
+                width: 256,
+                height: 256,
+                count: 1,
+                seed: Some(16462 + index as u64),
+                steps: Some(8),
+                ..Default::default()
+            };
+            match model
+                .generate(&request, &mut |_| {})
+                .expect("Chroma render sensitivity candidate")
+            {
+                GenerationOutput::Images(mut images) => {
+                    assert_eq!(images.len(), 1);
+                    images.pop().unwrap()
+                }
+                other => panic!("expected Images, got {other:?}"),
+            }
+        })
+        .collect()
+    }
+
+    fn render_metrics(reference: &Image, candidate: &Image) -> (f64, f64) {
+        assert_eq!(reference.pixels.len(), candidate.pixels.len());
+        let mut dot = 0.0f64;
+        let mut aa = 0.0f64;
+        let mut bb = 0.0f64;
+        let mut absolute_error = 0.0f64;
+        for (&left, &right) in reference.pixels.iter().zip(&candidate.pixels) {
+            let left = f64::from(left);
+            let right = f64::from(right);
+            dot += left * right;
+            aa += left * left;
+            bb += right * right;
+            absolute_error += (left - right).abs();
+        }
+        (
+            dot / (aa.sqrt() * bb.sqrt()).max(f64::EPSILON),
+            absolute_error / reference.pixels.len() as f64,
+        )
+    }
+
+    /// Full-render calibration for sc-16462. This runs over the immutable shipped Base Q4 tier,
+    /// whose transformer is already packed while T5/VAE are still dense, then applies candidate
+    /// packed auxiliary policies at load time. It therefore exercises the exact two strict prompts
+    /// and pixel gates without rebuilding or copying a complete turnkey for every candidate.
+    #[test]
+    #[ignore = "needs the shipped Chroma Base Q4 tier and Apple Silicon MLX"]
+    fn packed_t5_render_sensitivity_sweep() {
+        let baseline = PathBuf::from(
+            std::env::var("SC16462_BASELINE")
+                .expect("SC16462_BASELINE must point to the immutable shipped Base Q4 tier"),
+        );
+        let baseline_spec = LoadSpec::new(WeightsSource::Dir(baseline.clone()));
+
+        clear_cache();
+        reset_peak_memory();
+        let reference_model = load_chroma(ChromaVariant::Base, &baseline_spec)
+            .expect("load shipped Base Q4 reference");
+        let reference = render_calibration_samples(&reference_model);
+        let reference_peak = get_peak_memory();
+        drop(reference_model);
+        clear_cache();
+
+        let ranked = [
+            (4, T5Sublayer::Attention),
+            (1, T5Sublayer::FeedForward),
+            (2, T5Sublayer::FeedForward),
+            (18, T5Sublayer::FeedForward),
+            (15, T5Sublayer::Attention),
+            (1, T5Sublayer::Attention),
+            (16, T5Sublayer::Attention),
+            (14, T5Sublayer::Attention),
+            (18, T5Sublayer::Attention),
+            (19, T5Sublayer::Attention),
+        ];
+        let candidate_lengths = [3usize, 4, 6, 8, 10];
+        let quantized_spec = baseline_spec.with_quant(Quant::Q4);
+
+        for length in candidate_lengths {
+            clear_cache();
+            reset_peak_memory();
+            let model = load_render_calibration_candidate(&quantized_spec, &ranked[..length])
+                .expect("load render sensitivity candidate");
+            let images = render_calibration_samples(&model);
+            let peak = get_peak_memory();
+            drop(model);
+            clear_cache();
+
+            let metrics = reference
+                .iter()
+                .zip(&images)
+                .map(|(reference, candidate)| render_metrics(reference, candidate))
+                .collect::<Vec<_>>();
+            let minimum_cosine = metrics
+                .iter()
+                .map(|(cosine, _)| *cosine)
+                .fold(f64::INFINITY, f64::min);
+            let maximum_mae = metrics.iter().map(|(_, mae)| *mae).fold(0.0f64, f64::max);
+            println!(
+                "SC16462_RENDER_SENSITIVITY {}",
+                serde_json::json!({
+                    "rankedSublayers": length,
+                    "sensitiveSublayers": ranked[..length]
+                        .iter()
+                        .map(|(block, sublayer)| serde_json::json!({
+                            "block": block,
+                            "sublayer": match sublayer {
+                                T5Sublayer::Attention => "attention",
+                                T5Sublayer::FeedForward => "ffn",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                    "minimumImageCosine": minimum_cosine,
+                    "maximumMeanAbsolutePixelError": maximum_mae,
+                    "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
+                    "peakBytes": {
+                        "shippedDenseAuxiliary": reference_peak,
+                        "loadTimePackedAuxiliary": peak,
+                    },
+                })
+            );
+        }
     }
 }
