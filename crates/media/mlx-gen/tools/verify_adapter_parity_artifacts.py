@@ -8,7 +8,7 @@ import json
 import os
 import re
 import struct
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from _adapter_parity_provenance import (
     MFLUX_REPOSITORY,
@@ -96,6 +96,22 @@ def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict:
 
 def _expanded_path(value: str, tools: Path) -> Path:
     return Path(os.path.expandvars(value.replace("${TOOLS}", str(tools)))).expanduser()
+
+
+def _recorded_reference_path(value: str) -> PurePosixPath:
+    """Normalize a recorded *reference-host* path for shape-independent comparison.
+
+    Golden provenance embeds the absolute model path of the single host that dumped
+    it (see `tools/golden/README.md` — parity goldens are single-host, deliberately).
+    The check this feeds asks whether a golden was dumped against the model directory
+    the manifest names; it must never ask whether that path exists on the *verifying*
+    host. Resolving either side (`Path(...).absolute()` / `.resolve()` / `expanduser()`)
+    does exactly that: on Windows it re-roots the recorded POSIX path onto the current
+    drive and flips the separators, turning an identity compare into a permanent false
+    failure that hides real provenance drift. Compare the recorded strings as opaque
+    values, normalized only for cosmetic separator noise.
+    """
+    return PurePosixPath(value)
 
 
 def _safetensors_metadata(path: Path) -> dict[str, str]:
@@ -399,8 +415,8 @@ def verify_generated_metadata(manifest: dict, name: str, record: dict, path: Pat
             f"{name}: golden model {key} mismatch",
         )
     _require(
-        metadata.get("reference_model_path")
-        == str(Path(source["model_path"]).expanduser().absolute()),
+        _recorded_reference_path(metadata.get("reference_model_path", ""))
+        == _recorded_reference_path(source["model_path"]),
         f"{name}: golden model path mismatch",
     )
     _require(

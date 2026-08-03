@@ -211,6 +211,20 @@ projection of that transcript. A deliberate reference refresh must update the ma
 receipt, and `CHECKSUMS.txt` in the same review as any changed acceptance number; silently
 accepting a new golden is not permitted.
 
+**Known stale binding (sc-17070): the transcript pins the verifier's own bytes.** `source_state()`
+hashes every path in the manifest's `scripts` map, and `verify_adapter_parity_artifacts.py` is one of
+them — so the frozen transcript's `source.files` records the *verifier's* SHA-256 beside the dump
+scripts that actually produced the goldens. Any byte edit to the verifier therefore makes a full
+(non-`--manifest-only`) run report `result transcript source files mismatch`. That is **not** drift in
+the parity evidence: the measurements, artifact hashes, model inventories, and receipt projection are
+all still bound and still check. It cannot be repaired in place — the frozen `files` dict already
+holds the old hash and `source_sha256` digests it — so the entry re-syncs on the next legitimate
+re-record, which is when sc-17070 should also narrow the hashed set to exclude the verifier. Do not
+re-record solely to clear it. As of the 2026-08-02 Windows path-comparison fix (compare the recorded
+reference-host model path as `PurePosixPath` rather than `str(Path(p).expanduser().absolute())`, which
+re-rooted the recorded `/Users/...` path onto the verifying host's drive and made the check
+permanently red off-host), the verifier's entry is stale in exactly this way.
+
 ## Manifest
 
 ### Z-Image (`mlx-gen-z-image`)
