@@ -865,6 +865,8 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
+    use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+    use std::path::PathBuf;
 
     /// A Chroma with no loadable components — enough to exercise the request-boundary paths
     /// (`validate`, pre-run cancellation) that run before any tensor is touched. The residency is
@@ -970,5 +972,231 @@ mod tests {
             !msg.contains("single .safetensors file") && !msg.contains("precision override"),
             "expected an eager-load failure, not the up-front guard: {msg}"
         );
+    }
+
+    fn load_q8_render_calibration_candidate(
+        spec: &LoadSpec,
+        f32_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
+    ) -> Result<Chroma> {
+        use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
+
+        let variant = ChromaVariant::Base;
+        let root = resolve_root(variant, spec)?;
+        let mut t5 = loader::load_t5_encoder(root)?;
+        t5.quantize_progressive_with_selected_f32_parameters(
+            crate::convert::AUXILIARY_BITS,
+            crate::convert::T5_RESIDUAL_BITS,
+            crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+            crate::convert::T5_GROUP_SIZE,
+            &[(4, Attention), (1, FeedForward), (2, FeedForward)],
+            true,
+            f32_sublayers,
+        )?;
+        let text = ChromaTextOwned {
+            tokenizer: loader::load_tokenizer()?,
+            t5,
+        };
+        let transformer = loader::load_transformer(root, ChromaTransformerConfig::default())?;
+        let mut vae = loader::load_vae(root)?;
+        loader::quantize_vae_for_dense_source(&mut vae)?;
+        let heavy = ChromaHeavyOwned {
+            transformer,
+            vae,
+            pid: None,
+        };
+        Ok(Chroma {
+            descriptor: variant.descriptor(),
+            variant,
+            residency: Residency::resident(text, heavy),
+        })
+    }
+
+    fn render_q8_calibration_samples(model: &Chroma) -> Vec<Image> {
+        [
+            "a studio photograph of a red fox on fresh snow, detailed fur",
+            "a watercolor lighthouse above a stormy ocean at sunset",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let request = GenerationRequest {
+                prompt: (*prompt).into(),
+                width: 256,
+                height: 256,
+                count: 1,
+                seed: Some(16462 + index as u64),
+                steps: Some(8),
+                ..Default::default()
+            };
+            match model
+                .generate(&request, &mut |_| {})
+                .expect("Chroma Q8 render sensitivity candidate")
+            {
+                GenerationOutput::Images(mut images) => {
+                    assert_eq!(images.len(), 1);
+                    images.pop().unwrap()
+                }
+                other => panic!("expected Images, got {other:?}"),
+            }
+        })
+        .collect()
+    }
+
+    fn q8_render_metrics(reference: &Image, candidate: &Image) -> (f64, f64) {
+        assert_eq!(reference.pixels.len(), candidate.pixels.len());
+        let mut dot = 0.0f64;
+        let mut aa = 0.0f64;
+        let mut bb = 0.0f64;
+        let mut absolute_error = 0.0f64;
+        for (&left, &right) in reference.pixels.iter().zip(&candidate.pixels) {
+            let left = f64::from(left);
+            let right = f64::from(right);
+            dot += left * right;
+            aa += left * left;
+            bb += right * right;
+            absolute_error += (left - right).abs();
+        }
+        (
+            dot / (aa.sqrt() * bb.sqrt()).max(f64::EPSILON),
+            absolute_error / reference.pixels.len() as f64,
+        )
+    }
+
+    fn measure_q8_affine_candidate(
+        spec: &LoadSpec,
+        reference: &[Image],
+        reference_peak: usize,
+        policy: &str,
+        f32_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
+    ) -> (f64, f64, usize) {
+        use mlx_gen_flux::T5Sublayer::Attention;
+
+        clear_cache();
+        reset_peak_memory();
+        let model = load_q8_render_calibration_candidate(spec, f32_sublayers)
+            .expect("load Q8 render sensitivity candidate");
+        let images = render_q8_calibration_samples(&model);
+        let peak = get_peak_memory();
+        drop(model);
+        clear_cache();
+
+        let metrics = reference
+            .iter()
+            .zip(&images)
+            .map(|(reference, candidate)| q8_render_metrics(reference, candidate))
+            .collect::<Vec<_>>();
+        let minimum_cosine = metrics
+            .iter()
+            .map(|(cosine, _)| *cosine)
+            .fold(f64::INFINITY, f64::min);
+        let maximum_mae = metrics.iter().map(|(_, mae)| *mae).fold(0.0f64, f64::max);
+        let f32_attention_blocks = f32_sublayers
+            .iter()
+            .filter_map(|(block, sublayer)| (*sublayer == Attention).then_some(*block))
+            .collect::<Vec<_>>();
+        println!(
+            "SC16462_Q8_RENDER_SENSITIVITY {}",
+            serde_json::json!({
+                "policy": policy,
+                "primaryBits": crate::convert::AUXILIARY_BITS,
+                "residualBits": crate::convert::T5_RESIDUAL_BITS,
+                "sensitiveResidualBits": crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+                "f32AffineBoundaries": true,
+                "f32AffineAllFeedForward": true,
+                "f32AffineAttentionBlocks": f32_attention_blocks,
+                "groupSize": crate::convert::T5_GROUP_SIZE,
+                "minimumImageCosine": minimum_cosine,
+                "maximumMeanAbsolutePixelError": maximum_mae,
+                "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
+                "peakBytes": {
+                    "shippedDenseAuxiliary": reference_peak,
+                    "loadTimeCandidate": peak,
+                },
+                "beatsDensePeak": peak < reference_peak,
+                "viable": minimum_cosine >= 0.9999
+                    && maximum_mae <= 1.0
+                    && peak < reference_peak,
+            })
+        );
+        (minimum_cosine, maximum_mae, peak)
+    }
+
+    /// One bounded q8-transformer calibration for sc-16462. The production policy already passes
+    /// the strict q4 render and all component/residency gates, but its identical auxiliary payload
+    /// misses q8 MAE by 0.1967. Rank every remaining attention block individually, then add that
+    /// ranking cumulatively in this same process until the smallest viable expansion is observed.
+    #[test]
+    #[ignore = "needs the shipped Chroma Base Q8 tier and Apple Silicon MLX"]
+    fn packed_t5_q8_attention_affine_sweep() {
+        use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
+
+        let baseline = PathBuf::from(
+            std::env::var("SC16462_BASELINE")
+                .expect("SC16462_BASELINE must point to the immutable shipped Base Q8 tier"),
+        );
+        let baseline_spec = LoadSpec::new(WeightsSource::Dir(baseline));
+
+        clear_cache();
+        reset_peak_memory();
+        let reference_model = load_chroma(ChromaVariant::Base, &baseline_spec)
+            .expect("load shipped Base Q8 reference");
+        let reference = render_q8_calibration_samples(&reference_model);
+        let reference_peak = get_peak_memory();
+        drop(reference_model);
+        clear_cache();
+
+        let mut current_f32 = (0..24)
+            .map(|block| (block, FeedForward))
+            .collect::<Vec<_>>();
+        current_f32.push((4, Attention));
+        measure_q8_affine_candidate(
+            &baseline_spec,
+            &reference,
+            reference_peak,
+            "current-production",
+            &current_f32,
+        );
+
+        let mut individuals = Vec::with_capacity(23);
+        for block in (0..24).filter(|block| *block != 4) {
+            let mut candidate = current_f32.clone();
+            candidate.push((block, Attention));
+            let policy = format!("current-plus-attention-{block}");
+            let (cosine, mae, peak) = measure_q8_affine_candidate(
+                &baseline_spec,
+                &reference,
+                reference_peak,
+                &policy,
+                &candidate,
+            );
+            individuals.push((block, cosine, mae, peak));
+        }
+
+        individuals.sort_by(|left, right| {
+            left.2
+                .total_cmp(&right.2)
+                .then_with(|| right.1.total_cmp(&left.1))
+        });
+        if individuals.iter().any(|(_, cosine, mae, peak)| {
+            *cosine >= 0.9999 && *mae <= 1.0 && *peak < reference_peak
+        }) {
+            return;
+        }
+
+        let mut cumulative = current_f32;
+        for (rank, (block, _, _, _)) in individuals.iter().enumerate() {
+            cumulative.push((*block, Attention));
+            let policy = format!("ranked-cumulative-{}", rank + 1);
+            let (cosine, mae, peak) = measure_q8_affine_candidate(
+                &baseline_spec,
+                &reference,
+                reference_peak,
+                &policy,
+                &cumulative,
+            );
+            if cosine >= 0.9999 && mae <= 1.0 && peak < reference_peak {
+                break;
+            }
+        }
     }
 }
