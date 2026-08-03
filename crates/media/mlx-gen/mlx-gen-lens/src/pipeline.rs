@@ -26,6 +26,7 @@
 use mlx_rs::ops::{concatenate_axis, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::gen_core;
 use mlx_gen::scheduler::compute_mu;
 use mlx_gen::weights::Weights;
@@ -371,6 +372,31 @@ impl LensHeavy {
         })
     }
 
+    /// Deferred DiT loader used only by request-scoped rung 4. The VAE remains resident within the
+    /// heavy phase; the transformer retains only its front/back projections and a reopenable block
+    /// source.
+    pub fn load_streamable(
+        root: &std::path::Path,
+        dtype: Dtype,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        let cfg = LensDitConfig::lens();
+        let transformer_dir = root.join("transformer");
+        let weights = Weights::from_dir(&transformer_dir)?;
+        let transformer = LensTransformer::from_streamable_source(
+            weights,
+            mlx_gen::WeightsSource::Dir(transformer_dir),
+            &cfg,
+            dtype,
+            quant,
+        )?;
+        Ok(Self {
+            transformer,
+            vae: load_vae(root)?,
+            dtype,
+        })
+    }
+
     /// The denoising loop over pre-encoded conditioning + an initial latent, on the engine **default**
     /// sampler/scheduler (`euler` over the native empirical-μ flow-match schedule). Exposed for the e2e
     /// parity gate (which injects the reference's initial latents to factor out cross-RNG noise). A thin
@@ -572,6 +598,47 @@ impl LensHeavy {
         on_step: &mut dyn FnMut(usize, usize),
         preview: &PreviewSink,
     ) -> Result<Array> {
+        self.denoise_with_sampler_keep_with_preview_memory(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler_name,
+            scheduler_name,
+            seed,
+            keep,
+            cancel,
+            on_step,
+            preview,
+            AttentionPlan::UNBOUNDED,
+            None,
+        )
+    }
+
+    /// Request-scoped denoise body with the shared attention plan and optional 48-block DiT window.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_with_sampler_keep_with_preview_memory(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        seed: u64,
+        keep: Option<usize>,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+        preview: &PreviewSink,
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+    ) -> Result<Array> {
         // The native Lens schedule is the byte-exact N1 default: empirical-μ flow-match sigmas (length
         // num_steps + 1, trailing 0). A curated `scheduler_name` re-shapes σ over the SAME empirical μ
         // (`compute_mu(seq_len, steps)`), so `karras` / `exponential` / … stay consistent with Lens's
@@ -610,7 +677,7 @@ impl LensHeavy {
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
                 let hidden = concatenate_axis(&[latents, latents], 0)?; // [2, seq, 128]
                 let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
-                let noise = transformer.forward(
+                let noise = transformer.forward_with_memory(
                     &hidden,
                     encoder_features,
                     Some(encoder_mask),
@@ -618,13 +685,16 @@ impl LensHeavy {
                     1,
                     latent_h,
                     latent_w,
+                    attention,
+                    transformer_window,
+                    cancel,
                 )?;
                 // chunk(2) → cond (positive, batch 0), uncond (negative, batch 1).
                 let parts = split(&noise, 2, 0)?;
                 cfg_rescale(&parts[0], &parts[1], guidance_scale)
             } else {
                 let timestep = Array::from_slice(&[sigma], &[1]).as_dtype(dtype)?;
-                let cond = transformer.forward(
+                let cond = transformer.forward_with_memory(
                     latents,
                     &cond_features,
                     Some(&cond_mask),
@@ -632,6 +702,9 @@ impl LensHeavy {
                     1,
                     latent_h,
                     latent_w,
+                    attention,
+                    transformer_window,
+                    cancel,
                 )?;
                 cfg_rescale(&cond, &cond, guidance_scale)
             }
@@ -926,6 +999,10 @@ impl LensHeavy {
         &self.vae
     }
 
+    pub(crate) fn into_vae(self) -> Flux2Vae {
+        self.vae
+    }
+
     /// Apply LoRA/LoKr adapters to the DiT (sc-3174) — stacked, mixed, strict (errors on an unmatched
     /// target). A LoRA trained on base `microsoft/Lens` applies to `Lens-Turbo` (same architecture).
     pub fn apply_adapters(&mut self, specs: &[mlx_gen::AdapterSpec]) -> Result<()> {
@@ -1051,7 +1128,7 @@ fn pad_mask(mask: &Array, cur: i32, target: i32) -> Result<Array> {
 
 /// Convert a decoded image `[1, H, W, 3]` (NHWC) in `[-1, 1]` to an RGB8 [`Image`]
 /// (`((x·0.5+0.5).clamp(0,1)·255).round()`), matching the reference `_to_pil` quantization.
-fn decoded_to_image(decoded: &Array) -> Result<Image> {
+pub(crate) fn decoded_to_image(decoded: &Array) -> Result<Image> {
     let x = decoded.as_dtype(Dtype::Float32)?;
     let half = Array::from_f32(0.5);
     let x = mlx_rs::ops::add(&mlx_rs::ops::multiply(&x, &half)?, &half)?;

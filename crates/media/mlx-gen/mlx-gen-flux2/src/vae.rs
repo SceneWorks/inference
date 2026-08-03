@@ -25,6 +25,32 @@ const BN_EPS: f32 = 1e-4;
 const LATENT_CHANNELS: i32 = 32;
 const BLOCK_OUT: [i32; 4] = [128, 256, 512, 512];
 const LAYERS_PER_BLOCK: i32 = 2;
+const FLUX2_TILING: mlx_gen::tiling::VaeTiling = mlx_gen::tiling::VaeTiling {
+    spatial_scale: 8,
+    temporal_scale: 1,
+    causal_temporal: false,
+    full_res_channels: 128,
+};
+
+#[cfg(test)]
+mod tiling_tests {
+    use super::*;
+
+    #[test]
+    fn lens_decode_candidate_physically_splits_the_1024_tail_and_edge_is_load_bearing() {
+        // Lens packs 2x2, so a 1024 image enters the Flux2 decoder as a 128x128 raw latent.
+        let bounded =
+            mlx_gen::tiling::TilingConfig::spatial_only(512, 128).plan(FLUX2_TILING, 1, 128, 128);
+        assert!(bounded.h.len() > 1 && bounded.w.len() > 1);
+        assert_eq!((bounded.out_h, bounded.out_w), (1024, 1024));
+
+        // Mutation control: doubling the edge collapses the same geometry to one tile. This proves
+        // the production parameter reaches the physical plan instead of being metadata-only.
+        let mutated =
+            mlx_gen::tiling::TilingConfig::spatial_only(1024, 128).plan(FLUX2_TILING, 1, 128, 128);
+        assert_eq!((mutated.h.len(), mutated.w.len()), (1, 1));
+    }
+}
 
 /// `[O, I, H, W]` (PyTorch) → `[O, H, W, I]` (mlx conv2d), cast to f32.
 fn conv_w(w: &Weights, key: &str) -> Result<Array> {
@@ -303,10 +329,20 @@ impl Decoder {
     }
 
     fn forward(&self, z: &Array) -> Result<Array> {
+        self.forward_upsample_tail(&self.forward_pre_upsample(z)?)
+    }
+
+    /// Global-attention head, run once before a bounded decode splits the local upsample tail.
+    fn forward_pre_upsample(&self, z: &Array) -> Result<Array> {
         let mut x = conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
         x = self.mid_resnet0.forward(&x)?;
         x = self.mid_attn.forward(&x)?;
-        x = self.mid_resnet1.forward(&x)?;
+        self.mid_resnet1.forward(&x)
+    }
+
+    /// Spatially local, memory-spiking upsample tail.
+    fn forward_upsample_tail(&self, head: &Array) -> Result<Array> {
+        let mut x = head.clone();
         for ub in &self.up_blocks {
             x = ub.forward(&x)?;
         }
@@ -372,6 +408,41 @@ impl Flux2Vae {
     pub fn decode_packed_latents(&self, packed: &Array) -> Result<Array> {
         let latents = self.unpack_flux_packed_latents(packed)?;
         self.decode(&latents)
+    }
+
+    /// Bounded packed-latent decode. BatchNorm de-normalization, unpatchify, post-quant projection,
+    /// and the decoder's global-attention head run once on the full latent; only the spatially-local
+    /// ×8 upsample tail is tiled and blended through the shared MLX tiling driver.
+    pub fn decode_packed_latents_tiled(
+        &self,
+        packed: &Array,
+        cfg: &mlx_gen::tiling::TilingConfig,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        let latents = self
+            .unpack_flux_packed_latents(packed)?
+            .as_dtype(Dtype::Float32)?;
+        let shape = latents.shape();
+        let (h, w) = (shape[1], shape[2]);
+        if !cfg.needs_tiling(FLUX2_TILING, 1, h, w) {
+            return self.decode(&latents);
+        }
+        let z = linear(&latents, &self.post_quant.0, &self.post_quant.1)?;
+        let head = self.decoder.forward_pre_upsample(&z)?;
+        // NHWC -> NTHWC with singleton time; tiled axes are T/H/W and channels remain last.
+        let hs = head.shape();
+        let head5 = head.reshape(&[hs[0], 1, hs[1], hs[2], hs[3]])?;
+        let plan = cfg.plan(FLUX2_TILING, 1, h, w);
+        let decoded5 =
+            mlx_gen::vae_tiling::tiled_decode(&head5, &plan, [1, 2, 3], cancel, |tile5| {
+                let ts = tile5.shape();
+                let tile = tile5.reshape(&[ts[0], ts[2], ts[3], ts[4]])?;
+                let out = self.decoder.forward_upsample_tail(&tile)?;
+                let os = out.shape();
+                Ok(out.reshape(&[os[0], 1, os[1], os[2], os[3]])?)
+            })?;
+        let ds = decoded5.shape();
+        Ok(decoded5.reshape(&[ds[0], ds[2], ds[3], ds[4]])?)
     }
 
     /// De-normalize and unpatchify FLUX/Lens packed-grid latents into the VAE's true raw 32-channel
