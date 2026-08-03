@@ -79,10 +79,11 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
 pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
     // Precision + snapshot-dir guard up front for BOTH policies (fail fast).
     resolve_root(variant, spec)?;
+    let stream_inventory = crate::artifact_inventory::verified_stream_inventory(variant.id(), spec);
     // F-181: a `Sequential` + `spec.quantize` load over a *dense* snapshot re-quantizes the whole
     // model on every generate; `Resident` quantizes once. Warn for that combination only.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) && stream_inventory.is_none() {
             mlx_gen::residency::warn_sequential_requantize(variant.id(), q.bits());
         }
     }
@@ -100,7 +101,6 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         None => None,
     };
 
-    let stream_inventory = crate::artifact_inventory::verified_stream_inventory(variant.id(), spec);
     let memory_strategy = crate::memory_strategy::memory_strategy_contract_with_inventory(
         variant.id(),
         spec,

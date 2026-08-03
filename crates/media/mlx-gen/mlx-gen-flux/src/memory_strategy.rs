@@ -19,6 +19,9 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadSpec, OffloadPolicy};
 
 const STATIC_CALIBRATION: &str = "flux-one-static-registry-behavior-v1";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "flux1-dev-q4-mlx-shared-ladder-2026-08-03-v1";
+pub const CALIBRATED_Q4_COMPOSITE_SHA256: &str =
+    "9dbbfeec18eb1fb137d264fe74777fe01f2f15cb0a1402f1e47c76c795463fbe";
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 /// Native FLUX.1/Z-Image VAE tile geometry in output pixels. These are the production candidates
 /// supported by the shared head-once/tail-tiled decoder; PiD owns a separate, disjoint domain.
@@ -201,8 +204,57 @@ pub fn verified_runner_artifact(provider_id: &str, spec: &LoadSpec) -> CoreResul
                 "{provider_id}: runner artifact failed exact pinned inventory/content verification"
             ))
         })?;
+    let contract = memory_strategy_contract_with_inventory(provider_id, spec, Some(&inventory))?;
+    validate_runner_gate(provider_id, inventory.composite_sha256(), &contract)?;
     inventory.ensure_unchanged()?;
     Ok(inventory.composite_sha256().to_owned())
+}
+
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+    inventory: Option<&crate::artifact_inventory::PackedArtifactInventory>,
+) -> Option<MemoryCalibrationIdentity> {
+    let inventory = inventory?;
+    production_calibration_fingerprint(provider_id, spec, inventory.composite_sha256())
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
+fn production_calibration_fingerprint(
+    provider_id: &str,
+    spec: &LoadSpec,
+    composite_sha256: &str,
+) -> Option<&'static str> {
+    (provider_id == crate::FLUX1_DEV_ID
+        && composite_sha256 == CALIBRATED_Q4_COMPOSITE_SHA256
+        && spec.precision == mlx_gen::Precision::Bf16
+        && spec.quantize == Some(mlx_gen::Quant::Q4)
+        && spec.offload_policy == OffloadPolicy::Sequential
+        && spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
+        && route_overlay(provider_id, spec).is_none())
+    .then_some(MEMORY_CALIBRATION_FINGERPRINT)
+}
+
+/// Fail closed unless the real-weight runner is bound to the exact measured production key.
+pub fn validate_runner_gate(
+    provider_id: &str,
+    artifact_sha256: &str,
+    contract: &MemoryProviderContract,
+) -> CoreResult<()> {
+    let valid = provider_id == crate::FLUX1_DEV_ID
+        && artifact_sha256 == CALIBRATED_Q4_COMPOSITE_SHA256
+        && contract.provider_id == provider_id
+        && contract.calibration.as_ref().is_some_and(|identity| {
+            identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT
+                && identity.load_shape == mlx_gen::LoadShape::DeferredMaterialization
+                && identity.load_shape == contract.load_shape
+        });
+    if !valid {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: runner artifact/contract does not match the calibrated FLUX.1-dev Q4 key"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn memory_strategy_contract_with_inventory(
@@ -224,12 +276,13 @@ pub(crate) fn memory_strategy_contract_with_inventory(
             ));
         }
     }
+    let calibration = production_calibration_identity(provider_id, spec, inventory);
     build_contract(
         provider_id,
         spec,
         crate::model::component_footprint(spec)?,
         inventory.is_some(),
-        None,
+        calibration,
     )
 }
 
@@ -276,6 +329,24 @@ pub(crate) fn safety_check(
         if context.use_pid && spec.pid.is_none() {
             return Err(CoreError::Unsupported(format!(
                 "{}: PiD route requested without a loaded PiD overlay",
+                contract.provider_id
+            )));
+        }
+        if contract
+            .calibration
+            .as_ref()
+            .is_some_and(|identity| identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
+            && (context.mode != MemoryMode::TextToImage
+                || context.geometry.reference_count != 0
+                || context.geometry.width != 1024
+                || context.geometry.height != 1024
+                || context.geometry.batch != 1
+                || context.geometry.frames != 1
+                || context.use_pid
+                || context.overlay.is_some())
+        {
+            return Err(CoreError::Unsupported(format!(
+                "{}: calibrated memory geometry is exactly clean text-to-image 1024x1024, batch 1, one frame, and zero references",
                 contract.provider_id
             )));
         }
@@ -609,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn production_rung4_needs_verified_exact_inventory_and_stays_uncalibrated() {
+    fn production_rung4_needs_verified_exact_inventory_and_unknown_fixture_stays_uncalibrated() {
         let root = std::env::temp_dir().join(format!("flux-rung4-contract-{}", std::process::id()));
         write_exact_snapshot(&root, Some(mlx_gen::Quant::Q4));
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
@@ -617,9 +688,14 @@ mod tests {
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(mlx_gen::Quant::Q4);
         let contract = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
-        let artifact = verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).unwrap();
+        let artifact =
+            crate::artifact_inventory::verified_stream_inventory(crate::FLUX1_DEV_ID, &spec)
+                .unwrap()
+                .composite_sha256()
+                .to_owned();
         assert_eq!(artifact.len(), 64);
         assert!(contract.calibration.is_none());
+        assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).is_err());
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -646,6 +722,104 @@ mod tests {
         let resident = spec.clone().with_offload_policy(OffloadPolicy::Resident);
         assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &resident).is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn production_calibration_key_is_exact_and_all_other_axes_fail_closed() {
+        let exact = LoadSpec::new(WeightsSource::Dir("/exact-q4".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        assert_eq!(
+            production_calibration_fingerprint(
+                crate::FLUX1_DEV_ID,
+                &exact,
+                CALIBRATED_Q4_COMPOSITE_SHA256,
+            ),
+            Some(MEMORY_CALIBRATION_FINGERPRINT)
+        );
+        assert!(production_calibration_fingerprint(
+            crate::FLUX1_SCHNELL_ID,
+            &exact,
+            CALIBRATED_Q4_COMPOSITE_SHA256,
+        )
+        .is_none());
+        assert!(production_calibration_fingerprint(crate::FLUX1_DEV_ID, &exact, "stale").is_none());
+        for changed in [
+            exact.clone().with_quant(mlx_gen::Quant::Q8),
+            exact.clone().with_offload_policy(OffloadPolicy::Resident),
+            exact
+                .clone()
+                .with_load_shape(mlx_gen::LoadShape::EagerMaterialization),
+        ] {
+            assert!(production_calibration_fingerprint(
+                crate::FLUX1_DEV_ID,
+                &changed,
+                CALIBRATED_Q4_COMPOSITE_SHA256,
+            )
+            .is_none());
+        }
+        let mut overlay = exact;
+        overlay.adapters.push(mlx_gen::AdapterSpec::new(
+            "/adapter.safetensors".into(),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        assert!(production_calibration_fingerprint(
+            crate::FLUX1_DEV_ID,
+            &overlay,
+            CALIBRATED_Q4_COMPOSITE_SHA256,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn calibrated_contract_admits_only_the_measured_geometry_and_runner_key() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/exact-q4".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        let mut contract =
+            weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        ));
+        validate_runner_gate(
+            crate::FLUX1_DEV_ID,
+            CALIBRATED_Q4_COMPOSITE_SHA256,
+            &contract,
+        )
+        .unwrap();
+        assert!(validate_runner_gate(crate::FLUX1_DEV_ID, "stale", &contract).is_err());
+
+        let context = registered_valid_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0)
+        .context;
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        for mutation in 0..6 {
+            let mut changed = context.clone();
+            match mutation {
+                0 => changed.geometry.width = 768,
+                1 => changed.geometry.height = 768,
+                2 => changed.geometry.batch = 2,
+                3 => changed.geometry.frames = 2,
+                4 => changed.geometry.reference_count = 1,
+                _ => changed.mode = MemoryMode::Edit,
+            }
+            assert!(matches!(
+                registered_safety_check(&spec, &contract, &changed),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
     }
 
     #[test]

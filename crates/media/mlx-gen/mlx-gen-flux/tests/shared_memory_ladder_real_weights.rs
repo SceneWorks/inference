@@ -188,9 +188,13 @@ fn validate_exact_inventory(root: &Path) -> String {
         &validation,
     )
     .expect("exact pinned inventory/content validation");
-    assert!(
-        contract.calibration.is_none(),
-        "SC-15514 must not publish calibration before real evidence is reviewed"
+    assert_eq!(
+        contract
+            .calibration
+            .as_ref()
+            .expect("reviewed exact-key production calibration")
+            .fingerprint,
+        mlx_gen_flux::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
     );
     assert_eq!(
         contract
@@ -619,7 +623,12 @@ fn exact_q4_shared_memory_ladder_arm() {
         &arm_spec,
     )
     .expect("arm contract");
-    assert!(contract.calibration.is_none());
+    mlx_gen_flux::memory_strategy::validate_runner_gate(
+        mlx_gen_flux::FLUX1_DEV_ID,
+        &artifact_sha256,
+        &contract,
+    )
+    .expect("arm remains bound to the exact calibrated key");
     let (generator, load) = load_measured(&arm_spec);
 
     if arm.is_terminal() {
@@ -653,7 +662,7 @@ fn exact_q4_shared_memory_ladder_arm() {
     drop(generator);
     clear_cache();
     println!(
-        "RESULT status=pass provider={} revision={} artifact_sha256={} tier=q4 arm={} size={} batch=1 seed={} steps={} final_active_bytes={} final_cache_bytes={} calibration_published=false",
+        "RESULT status=pass provider={} revision={} artifact_sha256={} tier=q4 arm={} size={} batch=1 seed={} steps={} final_active_bytes={} final_cache_bytes={} calibration_published=true calibration_fingerprint={}",
         mlx_gen_flux::FLUX1_DEV_ID,
         REVISION,
         artifact_sha256,
@@ -663,5 +672,6 @@ fn exact_q4_shared_memory_ladder_arm() {
         STEPS,
         get_active_memory(),
         get_cache_memory(),
+        mlx_gen_flux::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
     );
 }
