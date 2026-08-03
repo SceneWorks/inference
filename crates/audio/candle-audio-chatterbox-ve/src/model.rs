@@ -17,6 +17,7 @@
 //! for cosine similarity; a cloned-voice TTS generator (a future sc-12844 slice) feeds it raw
 //! through [`Conditioning::VoiceEmbedding`](gen_core::generator::Conditioning::VoiceEmbedding).
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::DType;
@@ -137,7 +138,8 @@ impl VoiceEmbedder for ChatterboxVoiceEmbedder {
         }
         // Down-mix to mono if the caller handed an interleaved multi-channel clip.
         let mono = to_mono(&audio.samples, audio.channels);
-        let mel = wav_to_mel_frames(&mono, audio.sample_rate).map_err(gen_core::Error::from)?;
+        let mel =
+            wav_to_mel_frames(mono.as_ref(), audio.sample_rate).map_err(gen_core::Error::from)?;
         if mel.is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{MODEL_ID}: reference clip produced no analysis frames"
@@ -151,16 +153,18 @@ impl VoiceEmbedder for ChatterboxVoiceEmbedder {
     }
 }
 
-/// Interleaved `channels`-channel PCM → mono by averaging channels (a no-op for mono).
-fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+/// Interleaved `channels`-channel PCM → mono by averaging channels (a borrow for mono).
+fn to_mono(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
     if channels <= 1 {
-        return samples.to_vec();
+        return Cow::Borrowed(samples);
     }
     let ch = channels as usize;
-    samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
+    Cow::Owned(
+        samples
+            .chunks(ch)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+            .collect(),
+    )
 }
 
 /// Construct the (lazy) Chatterbox voice embedder from a [`LoadSpec`]. `spec.weights` must be the
@@ -265,8 +269,12 @@ mod tests {
     fn to_mono_averages_channels() {
         // Stereo [L,R,L,R] → mono average.
         let m = to_mono(&[1.0, 3.0, 2.0, 4.0], 2);
-        assert_eq!(m, vec![2.0, 3.0]);
-        // Mono passthrough.
-        assert_eq!(to_mono(&[1.0, 2.0], 1), vec![1.0, 2.0]);
+        assert_eq!(m.as_ref(), [2.0, 3.0]);
+        assert!(matches!(m, Cow::Owned(_)));
+
+        let mono = [1.0, 2.0];
+        let passthrough = to_mono(&mono, 1);
+        assert!(matches!(passthrough, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(passthrough.as_ptr(), mono.as_ptr()));
     }
 }
