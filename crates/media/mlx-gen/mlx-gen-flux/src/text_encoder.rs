@@ -106,11 +106,21 @@ impl TokenEmbedding {
                 let pw = wq.take_axis(ids, 0)?;
                 let sc = scales.take_axis(ids, 0)?;
                 let bi = biases.take_axis(ids, 0)?;
-                let primary = dequantize(&pw, &sc, &bi, *group_size, *bits)?;
-                // Unlike T5Linear, the embedding sum happens before RMS norm promotes activations
-                // to f32. Accumulate the dequantized packed terms once in f32, then restore the
-                // native embedding dtype; no packed weight is materialized densely.
-                let output_dtype = primary.dtype();
+                if residual.is_none() && residual2.is_none() {
+                    return Ok(dequantize(&pw, &sc, &bi, *group_size, *bits)?);
+                }
+
+                // Unlike qmm, embedding lookup dequantizes before T5 promotes activations to f32.
+                // Reconstruct progressive terms using f32 scales/biases, accumulate them there,
+                // then restore the native packed-parameter dtype. No weight is materialized densely.
+                let output_dtype = sc.dtype();
+                let primary = dequantize(
+                    &pw,
+                    &sc.as_dtype(Dtype::Float32)?,
+                    &bi.as_dtype(Dtype::Float32)?,
+                    *group_size,
+                    *bits,
+                )?;
                 let mut accumulated = primary;
                 for term in [residual.as_ref(), residual2.as_ref()]
                     .into_iter()
@@ -120,9 +130,14 @@ impl TokenEmbedding {
                     let rs = term.scales.take_axis(ids, 0)?;
                     let rb = term.biases.take_axis(ids, 0)?;
                     accumulated = add(
-                        &accumulated.as_dtype(Dtype::Float32)?,
-                        &dequantize(&rw, &rs, &rb, term.group_size, term.bits)?
-                            .as_dtype(Dtype::Float32)?,
+                        &accumulated,
+                        &dequantize(
+                            &rw,
+                            &rs.as_dtype(Dtype::Float32)?,
+                            &rb.as_dtype(Dtype::Float32)?,
+                            term.group_size,
+                            term.bits,
+                        )?,
                     )?;
                 }
                 accumulated.as_dtype(output_dtype)?

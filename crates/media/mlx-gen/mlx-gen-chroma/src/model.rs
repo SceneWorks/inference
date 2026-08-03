@@ -1109,17 +1109,17 @@ mod tests {
             (13, Attention),
         ];
         // Additional packed terms regressed strict render quality. The token embedding is the only
-        // packed progressive sum performed before T5 promotes activations to f32. Compare f32
-        // accumulation at that boundary across the smallest production policy and established
-        // near-pass surfaces.
+        // packed progressive reconstruction performed before T5 promotes activations to f32.
+        // Compare f32 dequantization and accumulation there across the smallest production policy
+        // and established near-pass surfaces.
         let current = vec![(4, Attention), (1, FeedForward), (2, FeedForward)];
         let top10 = ranked[..10].to_vec();
         let mut top10_block13 = top10.clone();
         top10_block13.push((13, FeedForward));
         let candidates = [
-            ("embedding-f32-accumulation-current", current),
-            ("embedding-f32-accumulation-top10", top10),
-            ("embedding-f32-accumulation-top10-block13", top10_block13),
+            ("embedding-f32-dequant-current", current),
+            ("embedding-f32-dequant-top10", top10),
+            ("embedding-f32-dequant-top10-block13", top10_block13),
         ];
 
         for (policy, sensitive_sublayers) in candidates {
@@ -1157,7 +1157,7 @@ mod tests {
                             },
                         }))
                         .collect::<Vec<_>>(),
-                    "embeddingPackedTermAccumulation": "f32",
+                    "embeddingPackedDequantization": "f32",
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
                     "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
