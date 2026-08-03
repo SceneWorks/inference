@@ -11,8 +11,9 @@ use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, Result as CoreResult,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadSpec, OffloadPolicy};
@@ -24,6 +25,7 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512];
 pub const DECODE_OVERLAP: u32 = 64;
+pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
     mlx_gen_pid::DecodeRoutes::new_core(
@@ -82,6 +84,7 @@ fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
     footprint: mlx_gen::PerComponentBytes,
+    streamable: bool,
     calibration: Option<MemoryCalibrationIdentity>,
 ) -> CoreResult<MemoryProviderContract> {
     if !is_known_provider(provider_id) {
@@ -117,6 +120,7 @@ fn build_contract(
             MemoryFormulaVariable::ConditioningTokenCount,
             MemoryFormulaVariable::OverlayBytes,
             MemoryFormulaVariable::DecodeTileArea,
+            MemoryFormulaVariable::TransformerWindowSize,
         ],
     };
     contract.asset_facts.base_bytes = footprint
@@ -135,7 +139,7 @@ fn build_contract(
         synchronized_phase_release: staged,
         decode_tiling: clean_base,
         attention_chunking: clean_base,
-        transformer_window_materialization: false,
+        transformer_window_materialization: streamable,
     };
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
@@ -150,22 +154,59 @@ fn build_contract(
                 capability.parameters.attention_chunk_sizes = vec![ATTENTION_CHUNK_SIZE];
                 MemoryStrategySupport::Implemented
             }
+            MemoryStrategy::BoundedTransformerResidency if streamable => {
+                capability.parameters.transformer_window_sizes = vec![TRANSFORMER_WINDOW_SIZE];
+                capability.parameters.transformer_window_components =
+                    vec![TransformerComponent::Dit];
+                MemoryStrategySupport::Implemented
+            }
             _ => MemoryStrategySupport::Missing,
         };
     }
+    contract.additional_prerequisites.push((
+        MemoryStrategy::BoundedTransformerResidency,
+        MemoryStrategyPrerequisite::Rung {
+            rung: MemoryStrategy::StagedResidency,
+            scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+        },
+    ));
     Ok(contract)
 }
 
-/// Production contract. Filesystem-backed asset facts are real, but no optimized route is admitted
-/// until an exact route/tier/overlay/artifact calibration exists.
+/// Production contract. Filesystem-backed asset facts are real; rung 4 is declared loadable only
+/// for an exact pinned packed inventory, while calibration remains absent until real measurement.
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let inventory = crate::artifact_inventory::verified_stream_inventory(provider_id, spec);
+    memory_strategy_contract_with_inventory(provider_id, spec, inventory.as_ref())
+}
+
+pub(crate) fn memory_strategy_contract_with_inventory(
+    provider_id: &str,
+    spec: &LoadSpec,
+    inventory: Option<&crate::artifact_inventory::PackedArtifactInventory>,
+) -> CoreResult<MemoryProviderContract> {
+    if let Some(inventory) = inventory {
+        inventory.ensure_unchanged()?;
+        if inventory.composite_sha256().len() != 64
+            || !inventory
+                .transformer_source()
+                .canonical_path()
+                .is_absolute()
+        {
+            return Err(CoreError::Unsupported(
+                "flux1: verified packed inventory has an invalid composite or transformer pin"
+                    .to_owned(),
+            ));
+        }
+    }
     build_contract(
         provider_id,
         spec,
         crate::model::component_footprint(spec)?,
+        inventory.is_some(),
         None,
     )
 }
@@ -185,6 +226,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
         provider_id,
         spec,
         mlx_gen::PerComponentBytes::default(),
+        crate::artifact_inventory::structurally_streamable(provider_id, spec),
         Some(MemoryCalibrationIdentity::new(
             format!("{STATIC_CALIBRATION}-{route}"),
             spec.load_shape,
@@ -224,6 +266,16 @@ pub(crate) fn safety_check(
                     context.selection.parameters.decode_overlap,
                 )
                 .map_err(CoreError::Unsupported)?;
+        }
+        if contract.engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        ) && (!contract.lifecycle.transformer_window_materialization || !context.has_phases)
+        {
+            return Err(CoreError::Unsupported(format!(
+                "{}: transformer streaming requires the verified Sequential + DeferredMaterialization route",
+                contract.provider_id
+            )));
         }
         Ok(())
     };
@@ -329,6 +381,13 @@ fn begin_request_with_cleanup(
         },
     )?;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten();
     Ok(Some(Box::new(
         mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
     )))
@@ -390,6 +449,28 @@ mod tests {
     fn sequential_spec() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
             .with_offload_policy(OffloadPolicy::Sequential)
+    }
+
+    fn write_exact_snapshot(root: &std::path::Path, quant: Option<mlx_gen::Quant>) {
+        for (index, component) in crate::artifact_inventory::COMPONENTS.iter().enumerate() {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.safetensors"), vec![index as u8; 64]).unwrap();
+            let config = match quant {
+                Some(quant) => format!(
+                    r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
+                    quant.bits()
+                ),
+                None => "{}".to_owned(),
+            };
+            std::fs::write(dir.join("config.json"), config).unwrap();
+        }
+        std::fs::create_dir_all(root.join("tokenizer_2")).unwrap();
+        std::fs::write(
+            root.join("tokenizer_2/tokenizer.json"),
+            br#"{"version":"1.0","model":{"type":"Unigram"}}"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -459,6 +540,103 @@ mod tests {
                 MemorySafetyDecision::Accept
             );
         }
+    }
+
+    #[test]
+    fn static_rung4_fixture_is_zero_filesystem_and_requires_structural_eligibility() {
+        let eligible = sequential_spec()
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        for provider in [crate::FLUX1_SCHNELL_ID, crate::FLUX1_DEV_ID] {
+            let contract = weights_free_memory_strategy_contract(provider, &eligible).unwrap();
+            assert_eq!(contract.asset_facts, Default::default());
+            assert!(contract.lifecycle.transformer_window_materialization);
+            let capability = contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert_eq!(capability.support, MemoryStrategySupport::Implemented);
+            assert_eq!(
+                capability.parameters.transformer_window_sizes,
+                [TRANSFORMER_WINDOW_SIZE]
+            );
+            assert_eq!(
+                capability.parameters.transformer_window_components,
+                [TransformerComponent::Dit]
+            );
+            let mut fixture = registered_valid_fixture(
+                &eligible,
+                &contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap()
+            .remove(0);
+            let mut scope =
+                registered_begin_request(provider, &eligible, &contract, &fixture.context)
+                    .unwrap()
+                    .unwrap();
+            scope.configure_request(&mut fixture.request).unwrap();
+            let memory = fixture.request.memory.expect("rung4 request memory");
+            assert!(memory.stage_residency);
+            assert!(memory.stream_transformer_blocks);
+            assert_eq!(
+                memory.transformer_window_size,
+                Some(TRANSFORMER_WINDOW_SIZE)
+            );
+            assert_eq!(
+                memory.transformer_window_component,
+                Some(TransformerComponent::Dit)
+            );
+            scope
+                .materialize_transformer_window(0, TRANSFORMER_WINDOW_SIZE)
+                .unwrap();
+        }
+
+        let resident = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        assert_eq!(
+            weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, &resident)
+                .unwrap()
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+    }
+
+    #[test]
+    fn production_rung4_needs_verified_exact_inventory_and_stays_uncalibrated() {
+        let root = std::env::temp_dir().join(format!("flux-rung4-contract-{}", std::process::id()));
+        write_exact_snapshot(&root, Some(mlx_gen::Quant::Q4));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        let contract = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        assert!(contract.calibration.is_none());
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+
+        std::fs::write(
+            root.join("transformer/model-00002-of-00002.safetensors"),
+            [5_u8; 8],
+        )
+        .unwrap();
+        let sharded = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        assert!(sharded.calibration.is_none());
+        assert_eq!(
+            sharded
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -705,6 +883,13 @@ mod tests {
             );
             assert!(!contract.lifecycle.decode_tiling);
             assert!(!contract.lifecycle.attention_chunking);
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            );
         }
     }
 

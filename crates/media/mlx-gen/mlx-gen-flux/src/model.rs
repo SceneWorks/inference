@@ -100,7 +100,12 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         None => None,
     };
 
-    let memory_strategy = crate::memory_strategy::memory_strategy_contract(variant.id(), spec)?;
+    let stream_inventory = crate::artifact_inventory::verified_stream_inventory(variant.id(), spec);
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract_with_inventory(
+        variant.id(),
+        spec,
+        stream_inventory.as_ref(),
+    )?;
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
@@ -108,6 +113,7 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         ip_adapter,
         memory_strategy,
         loaded_spec: spec.clone(),
+        stream_inventory,
     })
 }
 
@@ -261,6 +267,10 @@ pub struct Flux1 {
     /// Exact load axes used to build [`Self::memory_strategy`]. Overlay-bearing specs deliberately
     /// keep bounded attention unavailable until those extra attention paths have their own proof.
     loaded_spec: LoadSpec,
+    /// Exact packed component + T5-tokenizer inventory retained for the future runtime streaming
+    /// slice. The DiT source is the pinned `transformer/model.safetensors`, never a rediscovered
+    /// shard/glob.
+    stream_inventory: Option<crate::artifact_inventory::PackedArtifactInventory>,
 }
 
 impl Flux1 {
@@ -293,6 +303,7 @@ impl Flux1 {
             ip_adapter: None,
             memory_strategy,
             loaded_spec,
+            stream_inventory: None,
         }
     }
 }
@@ -380,6 +391,20 @@ impl Generator for Flux1 {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        if self.memory_strategy.engages(
+            context.selection.strategy,
+            gen_core::MemoryStrategy::BoundedTransformerResidency,
+        ) {
+            let inventory = self.stream_inventory.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{}: transformer streaming has no verified packed inventory",
+                    self.descriptor.id
+                ))
+            })?;
+            inventory.ensure_unchanged()?;
+            // The eventual block loader must open this exact pin, not rediscover a file by glob.
+            inventory.transformer_source().ensure_unchanged()?;
+        }
         crate::memory_strategy::begin_request(
             self.variant.id(),
             &self.loaded_spec,
