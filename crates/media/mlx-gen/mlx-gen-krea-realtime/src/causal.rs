@@ -58,8 +58,12 @@ fn mask_materialization_count() -> usize {
 pub type LayerKv = (Array, Array);
 
 /// End of the frame-block containing global token index `q` (exclusive): `(q / block + 1) * block`.
+/// The widened result represents the final boundary past `i64::MAX` exactly instead of overflowing;
+/// i128 division keeps Rust's existing truncation-toward-zero behavior for negative test positions.
 #[inline]
-fn end_of_block(q: i64, block_size: i64) -> i64 {
+fn end_of_block(q: i64, block_size: i64) -> i128 {
+    let q = i128::from(q);
+    let block_size = i128::from(block_size);
     (q / block_size + 1) * block_size
 }
 
@@ -76,7 +80,7 @@ fn checked_block_size(block_size: usize) -> Result<i64> {
 
 #[inline]
 fn is_masked(q: i64, kv: i64, block_size: i64) -> bool {
-    !(kv < end_of_block(q, block_size) || q == kv)
+    !(i128::from(kv) < end_of_block(q, block_size) || q == kv)
 }
 
 /// Decide whether the scalar block-causal rule masks any `(query, key)` pair without building the
@@ -887,6 +891,34 @@ mod tests {
         assert_eq!(end_of_block(15, 8), 16);
     }
 
+    #[test]
+    fn end_of_block_is_exact_at_i64_extremes() {
+        assert_eq!(
+            end_of_block(i64::MAX, 2),
+            i128::from(i64::MAX) + 1,
+            "the final representable two-token block ends one past i64::MAX"
+        );
+        assert_eq!(
+            end_of_block(i64::MIN, 2),
+            i128::from(i64::MIN) + 2,
+            "negative division must retain the previous truncation-toward-zero rule"
+        );
+        assert!(
+            !is_masked(i64::MAX - 1, i64::MAX, 2),
+            "both final representable positions occupy the same block"
+        );
+        let final_block = [i64::MAX - 1, i64::MAX];
+        let (data, any_masked) = mask_data(&final_block, &final_block, 2).unwrap();
+        assert!(!any_masked);
+        assert_eq!(data, vec![0.0; 4]);
+        assert_eq!(
+            build_block_causal_mask(&final_block, &final_block, 2)
+                .unwrap()
+                .shape(),
+            &[2, 2]
+        );
+    }
+
     /// (C) The explicit mask rule: 2 blocks × 2 tokens (block_size 2) → the hand-derived [4,4] additive
     /// matrix. Block 0 (q0,q1) sees only block 0; block 1 (q2,q3) sees blocks 0 and 1.
     #[test]
@@ -977,7 +1009,7 @@ mod tests {
             vec![0],
             vec![8, 3, 8],
             vec![-9, -1, 0, 7],
-            vec![i64::MIN / 2, 1, i64::MAX / 2],
+            vec![i64::MIN, i64::MIN + 1, 1, i64::MAX - 1, i64::MAX],
         ];
         for block_size in 1..=9 {
             for q_pos in &unusual {
