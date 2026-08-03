@@ -7,6 +7,8 @@
 pub use candle_gen as media;
 pub use candle_gen::gen_core::{ProviderRegistry, ProviderRegistryBuilder};
 
+pub mod licenses;
+
 /// Complete backend package surface owned by the Candle runtimes.
 ///
 /// Some modules are ordinary registry providers; `depth`, `face`, `instantid`, `pid`, `pulid`, and
@@ -83,6 +85,61 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
 /// Build the complete explicit Candle media provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
+}
+
+// -------------------------------------------------------------------------------------------------
+// Model-weight licence surface (sc-16667) — the Candle media half.
+//
+// DISCLOSURE ONLY. Nothing in this section blocks, gates, degrades or withholds anything, and
+// nothing added here ever should. It exists so a consumer can SHOW a user which upstream artifacts a
+// render touched and what those texts name; whether a given use is permitted is the consumer's
+// evaluation of those facts against its own situation, which this crate knows nothing about.
+//
+// Three layers (see `gen_core::license`): the reviewed licence FAMILIES, one COMPONENT row per
+// upstream checkpoint — shared with the MLX catalog, because a licence is a property of the
+// checkpoint and both engines load the same ones — and the per-backend provider→component mapping in
+// [`licenses`], whose term union is DERIVED and never hand-authored.
+// -------------------------------------------------------------------------------------------------
+
+/// The licence families every component row this catalog reaches resolves against — the reviewed
+/// unit, shared with the audio and MLX catalogs.
+pub fn license_families() -> &'static [media::gen_core::LicenseFamily] {
+    media::gen_core::LICENSE_FAMILIES
+}
+
+/// The **shared** media checkpoint table: one row per upstream artifact whose licence has been read.
+///
+/// Deliberately not per-backend and deliberately not filtered to what this catalog reaches. It is
+/// the same slice `mlx-gen-catalog` reads, so the two catalogs cannot drift into two different
+/// answers about one upstream artifact; rows no registered Candle id loads are simply unreferenced
+/// by [`provider_components`].
+pub fn component_licenses() -> &'static [media::gen_core::ComponentLicense] {
+    media::gen_core::MEDIA_COMPONENT_LICENSES
+}
+
+/// Which components each registered Candle provider id loads — the mapping
+/// [`media::gen_core::provider_terms`] derives a provider's effective terms from.
+///
+/// Nine registered ids have no row because every component they load is a pinned hole in the shared
+/// table; `licenses::tests` names which nine and why, deliberately as `#[cfg(test)]` data so no gate
+/// can read it. Those ids still ship and still render — a missing disclosure never withholds a
+/// provider, and registration is never conditioned on this mapping.
+pub fn provider_components() -> &'static [media::gen_core::ProviderComponents] {
+    licenses::PROVIDER_COMPONENTS
+}
+
+/// The model-licences manifest JSON at `schema_version` 3 for **this** catalog, in the same shape
+/// the audio catalog emits and the release tooling ships beside the SPDX SBOM.
+///
+/// Not a committed artifact on its own: `release/model-weight-licenses.json` carries the audio lane
+/// today, and merging the three catalogs' manifests into one file is sc-16664's job. Output is
+/// deterministic, so a merge can compare byte-for-byte.
+pub fn component_licenses_manifest_json() -> String {
+    media::gen_core::component_licenses_manifest_json(
+        license_families(),
+        component_licenses(),
+        provider_components(),
+    )
 }
 
 /// The **advanced** quant tiers this Candle catalog surfaces beyond the universal group-wise affine
@@ -2187,6 +2244,63 @@ mod tests {
         );
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
+
+        // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
+        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
+        // generator ids, which is why 51 + 7 + 1 + 2 registrations are 56 distinct ids.
+        //
+        // Registration is never conditioned on the mapping: 47 < 56 because nine ids load nothing
+        // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
+        // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
+        // `#[cfg(test)]` data, so no gate can read it and suppress them.
+        let distinct: std::collections::BTreeSet<&String> = generators
+            .iter()
+            .chain(&trainers)
+            .chain(&captioners)
+            .chain(&image_embedders)
+            .chain(&text_embedders)
+            .collect();
+        assert_eq!(distinct.len(), 56);
+        assert_eq!(super::provider_components().len(), 47);
+    }
+
+    /// The manifest emitter runs on **this** catalog's three slices, and its output is
+    /// deterministic.
+    ///
+    /// Deliberately cheap. Byte-stability of the shared emitter was settled in sc-16663 (#406,
+    /// #411) and the audio lane gates its bytes against a committed file; there is no committed
+    /// Candle media manifest to compare against, because merging the three catalogs into one
+    /// release artifact is sc-16664's job. So this pins only what is this crate's to pin: the
+    /// function is reachable, emits the schema-3 shape with all three layers present, and returns
+    /// the same bytes call to call.
+    #[test]
+    fn component_licenses_manifest_json_is_well_formed_and_stable() {
+        let generated = super::component_licenses_manifest_json();
+        assert!(!generated.is_empty());
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&generated).expect("manifest is valid JSON");
+        assert_eq!(parsed["schema_version"], 3);
+        assert_eq!(parsed["kind"], "model-weight-licenses");
+        // A consumer reads one document and finds all three layers in it.
+        for section in ["families", "components", "providers"] {
+            assert!(
+                parsed[section]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty()),
+                "manifest section {section:?} is missing or empty"
+            );
+        }
+        assert_eq!(
+            parsed["providers"].as_array().expect("providers").len(),
+            super::provider_components().len()
+        );
+
+        assert_eq!(
+            super::component_licenses_manifest_json(),
+            generated,
+            "the emitter must be deterministic — a merged release artifact compares bytes"
+        );
     }
 
     #[test]
