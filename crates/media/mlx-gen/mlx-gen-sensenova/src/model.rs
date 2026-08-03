@@ -143,6 +143,29 @@ pub struct SenseNova {
     model: T2iModel,
     /// The 8-step distilled variant — selects the distilled generation defaults (8 NFE, CFG 1.0).
     fast: bool,
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_quant: Option<Quant>,
+    pinned_artifact: Option<crate::memory_strategy::PinnedArtifact>,
+}
+
+fn guard_pinned_artifact<T>(
+    artifact: Option<&crate::memory_strategy::PinnedArtifact>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(artifact) = artifact {
+        artifact
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    let result = operation();
+    if let Some(artifact) = artifact {
+        // Always run the post-check, including after a generation error. A mutation error takes
+        // precedence so no output (or misleading earlier failure) can escape a changed artifact.
+        artifact
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    result
 }
 
 impl SenseNova {
@@ -222,13 +245,36 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         None
     };
     let cfg = NeoChatConfig::from_dir(root)?;
-    let weights = load_raw(root)?;
+    // A single-file artifact is verified once and then becomes the source of truth for the initial
+    // load, calibration identity, and every deferred Gen window. Sharded/multi-file layouts
+    // retain the historical eager directory loader but truthfully do not advertise rung 4.
+    let pinned_artifact = crate::memory_strategy::verified_artifact(spec);
+    let weights = if let Some(artifact) = pinned_artifact.as_ref() {
+        artifact.open_weights()?
+    } else {
+        load_raw(root)?
+    };
     // F-137: diff the checkpoint against the canonical key set before building modules (the loader
     // module doc promised this validation). Missing keys still fail via `require` with the exact
     // name during `from_weights`; this additionally rejects extra/renamed tensors that would
     // otherwise load silently with whatever subset matches.
     check_coverage(weights.keys(), &cfg).require_no_unexpected(id)?;
-    let mut model = T2iModel::from_weights(&weights, &cfg)?;
+    let deferred_gen = distill_lora_path.is_none()
+        && crate::memory_strategy::can_stream_gen_with_artifact(id, spec, pinned_artifact.as_ref());
+    let mut model = if deferred_gen {
+        T2iModel::from_weights_deferred(
+            &weights,
+            &cfg,
+            pinned_artifact
+                .clone()
+                .expect("streamable artifact is pinned"),
+            spec.quantize,
+        )?
+    } else {
+        // A fast dense-base load needs a runtime LoRA merge into all generation blocks. Keep that
+        // exact path eager; the contract refuses rung 4 until the artifact is a pre-merged turnkey.
+        T2iModel::from_weights(&weights, &cfg)?
+    };
     // The fast variant merges the 8-step distill LoRA into the dense generation path — UNLESS the
     // tier is a **pre-merged** turnkey (sc-8775: the packed/dense fast tiers bake the merge in at
     // convert time and drop `DISTILL_MERGED_MARKER`). A pre-merged tier must NOT re-merge: for a
@@ -262,6 +308,13 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         tokenizer,
         model,
         fast,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract_with_artifact(
+            id,
+            spec,
+            pinned_artifact.as_ref(),
+        )?,
+        loaded_quant: spec.quantize,
+        pinned_artifact,
     }))
 }
 
@@ -298,6 +351,18 @@ impl SenseNova {
             num_steps: req.steps.unwrap_or(def_steps) as usize,
             timestep_shift: req.scheduler_shift.unwrap_or(DEFAULT_TIMESTEP_SHIFT),
             seed,
+            attention_score_budget: req
+                .memory
+                .filter(|memory| memory.chunk_attention)
+                .and_then(|memory| memory.attention_chunk_size),
+            transformer_window_size: req
+                .memory
+                .filter(|memory| memory.stream_transformer_blocks)
+                .and_then(|memory| memory.transformer_window_size),
+            calibration_stream_fault: req.memory.is_some_and(|memory| {
+                memory.calibration_fault_harness_authorized
+                    && memory.calibration_error_phase == Some(gen_core::MemoryPhase::Denoise)
+            }),
             ..Default::default()
         }
     }
@@ -321,7 +386,34 @@ impl Generator for SenseNova {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
+            self.generate_impl(req, on_progress)
+        })
+        .map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_quant, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.loaded_quant,
+            context,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        )
     }
 }
 
@@ -464,6 +556,38 @@ mlx_gen::register_generators! {
     pub(crate) const QUALITY_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+pub const QUALITY_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const FAST_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID_FAST,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_FAST, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const QUALITY_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
+pub const FAST_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_FAST,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID_FAST, spec, contract, context)
+        },
+    };
 mlx_gen::register_generators! {
     pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast;
     footprint = component_footprint
@@ -472,6 +596,29 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_guard_reports_post_materialization_mutation_even_after_operation_error() {
+        let root =
+            std::env::temp_dir().join(format!("sensenova-request-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.safetensors");
+        std::fs::write(&path, [0_u8; 8]).unwrap();
+        let artifact = crate::memory_strategy::PinnedArtifact::verify_file(&path).unwrap();
+        let result: Result<()> = guard_pinned_artifact(Some(&artifact), || {
+            let replacement = root.join("replacement.safetensors");
+            std::fs::write(&replacement, [1_u8; 8]).unwrap();
+            std::fs::rename(replacement, &path).unwrap();
+            Err(Error::Msg("earlier generation failure".to_owned()))
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("replaced or mutated"), "got: {error}");
+        assert!(
+            !error.contains("earlier generation failure"),
+            "got: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn descriptor_is_sensenova() {
