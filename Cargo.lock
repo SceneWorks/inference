@@ -2225,6 +2225,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "safetensors 0.4.5",
  "serde_json",
  "sha2",
 ]

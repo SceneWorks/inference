@@ -1,15 +1,18 @@
 //! Exact file-identity and content pins for FLUX.1 deferred-materialization eligibility.
 //!
 //! A streamable snapshot has one visible `model.safetensors` in each required component directory.
-//! Each file is canonicalized, pinned by mutation-sensitive Unix identity, and SHA-256 hashed with a
-//! process-local coalescing cache. The composite digest covers those four model files plus the T5
-//! `tokenizer_2/tokenizer.json` consumed by prompt conditioning; it is evidence input only and never
-//! grants production calibration by itself.
+//! Each file is canonicalized, pinned by mutation-sensitive Unix identity, SHA-256 hashed with a
+//! process-local coalescing cache, and header-validated against the selected dense/Q4/Q8 tier. The
+//! composite digest covers the four model/config pairs plus the T5 `tokenizer_2/tokenizer.json`
+//! consumed by prompt conditioning; it is evidence input only and never grants production
+//! calibration by itself.
 
+use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use mlx_gen::gen_core::{Error as CoreError, Result as CoreResult};
 use mlx_gen::{LoadSpec, OffloadPolicy, Precision, Quant, WeightsSource};
+use safetensors::Dtype;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -418,37 +421,223 @@ fn single_component_artifact(
     })
 }
 
-fn component_quant_matches(component: &ComponentInventory, quant: Option<Quant>) -> bool {
+fn pinned_quant_marker(component: &ComponentInventory) -> CoreResult<Option<i32>> {
+    component.config.ensure_unchanged()?;
+    let bytes = std::fs::read(component.config.canonical_path()).map_err(|error| {
+        CoreError::Msg(format!(
+            "flux1: read pinned {} config: {error}",
+            component.name
+        ))
+    })?;
+    component.config.ensure_unchanged()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CoreError::Msg(format!(
+            "flux1: parse pinned {} config: {error}",
+            component.name
+        ))
+    })?;
+    let Some(marker) = json.get("quantization") else {
+        return Ok(None);
+    };
+    let bits = marker.get("bits").and_then(serde_json::Value::as_i64);
+    let group_size = marker.get("group_size").and_then(serde_json::Value::as_i64);
+    match (bits, group_size) {
+        (Some(bits @ (4 | 8)), Some(64)) => Ok(Some(bits as i32)),
+        _ => Err(CoreError::Unsupported(format!(
+            "flux1: {} has an invalid packed quantization marker",
+            component.name
+        ))),
+    }
+}
+
+fn validate_tensor_extent(component: &str, tensor: &SafetensorsTensorHeader) -> CoreResult<()> {
+    let elements = tensor.shape.iter().try_fold(1_u64, |product, &dimension| {
+        product.checked_mul(dimension as u64)
+    });
+    let expected = elements.and_then(|elements| elements.checked_mul(tensor.dtype.size() as u64));
+    if expected != Some(tensor.data_bytes) {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {component} tensor {} has shape/dtype bytes inconsistent with its data range",
+            tensor.name
+        )));
+    }
+    Ok(())
+}
+
+fn is_float(dtype: Dtype) -> bool {
+    matches!(dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32)
+}
+
+fn is_dense_quant_candidate(tensor: &SafetensorsTensorHeader) -> bool {
+    tensor.shape.len() == 2 && tensor.shape[1] >= 64 && tensor.shape[1].is_multiple_of(64)
+}
+
+fn is_vae_quant_target(base: &str) -> bool {
+    [".to_q", ".to_k", ".to_v", ".to_out.0"]
+        .iter()
+        .any(|suffix| base.ends_with(suffix))
+}
+
+fn validate_packed_triple(
+    component: &str,
+    base: &str,
+    weight: &SafetensorsTensorHeader,
+    scales: &SafetensorsTensorHeader,
+    biases: &SafetensorsTensorHeader,
+    expected_bits: i32,
+) -> CoreResult<()> {
+    if weight.dtype != Dtype::U32 || weight.shape.len() != 2 {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {component} packed {base}.weight must be rank-2 U32 codes"
+        )));
+    }
+    if !is_float(scales.dtype)
+        || !is_float(biases.dtype)
+        || scales.shape.len() != 2
+        || biases.shape.len() != 2
+        || scales.dtype != biases.dtype
+        || scales.shape != biases.shape
+        || scales.shape[0] != weight.shape[0]
+    {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {component} packed {base} scales/biases must be matching rank-2 floating grids with the code-row count"
+        )));
+    }
+    let input = scales.shape[1].checked_mul(64).ok_or_else(|| {
+        CoreError::Unsupported(format!("flux1: {component} packed {base} input overflow"))
+    })?;
+    if input < 64 || input % 64 != 0 {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {component} packed {base} has an invalid group-64 logical input"
+        )));
+    }
+    let packed_width = weight.shape[1].checked_mul(32).ok_or_else(|| {
+        CoreError::Unsupported(format!("flux1: {component} packed {base} width overflow"))
+    })?;
+    if packed_width % input != 0 || packed_width / input != expected_bits as usize {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {component} packed {base} content does not encode Q{expected_bits} at group 64"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_component_content(
+    component: &ComponentInventory,
+    quant: Option<Quant>,
+) -> CoreResult<()> {
+    component.model.ensure_unchanged()?;
+    let headers =
+        safetensors_path_tensor_headers(component.model.canonical_path()).map_err(|error| {
+            CoreError::Unsupported(format!(
+                "flux1: {} model.safetensors is not a valid header-readable artifact: {error}",
+                component.name
+            ))
+        })?;
+    component.model.ensure_unchanged()?;
+    if headers.is_empty() {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {} model.safetensors contains no tensors",
+            component.name
+        )));
+    }
+    let mut tensors = BTreeMap::new();
+    for tensor in headers {
+        validate_tensor_extent(component.name, &tensor)?;
+        tensors.insert(tensor.name.clone(), tensor);
+    }
+
+    let marker = pinned_quant_marker(component)?;
     let expected = quant.map(Quant::bits);
-    let actual = (|| -> CoreResult<Option<i32>> {
-        component.config.ensure_unchanged()?;
-        let bytes = std::fs::read(component.config.canonical_path()).map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: read pinned {} config: {error}",
+    if marker != expected {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {} pinned quantization marker does not match the selected tier",
+            component.name
+        )));
+    }
+
+    if expected.is_none() {
+        if tensors.values().any(|tensor| {
+            tensor.name.ends_with(".scales")
+                || tensor.name.ends_with(".biases")
+                || (tensor.name.ends_with(".weight") && tensor.dtype == Dtype::U32)
+        }) {
+            return Err(CoreError::Unsupported(format!(
+                "flux1: dense {} contains packed quantization leaves",
                 component.name
-            ))
-        })?;
-        component.config.ensure_unchanged()?;
-        let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: parse pinned {} config: {error}",
-                component.name
-            ))
-        })?;
-        let Some(marker) = json.get("quantization") else {
-            return Ok(None);
-        };
-        let bits = marker.get("bits").and_then(serde_json::Value::as_i64);
-        let group_size = marker.get("group_size").and_then(serde_json::Value::as_i64);
-        match (bits, group_size) {
-            (Some(bits @ (4 | 8)), Some(64)) => Ok(Some(bits as i32)),
-            _ => Err(CoreError::Unsupported(format!(
-                "flux1: {} has an invalid packed quantization marker",
-                component.name
-            ))),
+            )));
         }
-    })();
-    matches!(actual, Ok(actual) if actual == expected)
+        return Ok(());
+    }
+
+    for tensor in tensors.values() {
+        for suffix in [".scales", ".biases"] {
+            if let Some(base) = tensor.name.strip_suffix(suffix) {
+                if !tensors.contains_key(&format!("{base}.weight")) {
+                    return Err(CoreError::Unsupported(format!(
+                        "flux1: {} has orphan packed leaf {}",
+                        component.name, tensor.name
+                    )));
+                }
+            }
+        }
+    }
+
+    let expected_bits = expected.expect("quantized branch checked above");
+    let vae = component.name == "vae";
+    let mut packed_count = 0_usize;
+    for weight in tensors
+        .values()
+        .filter(|tensor| tensor.name.ends_with(".weight"))
+    {
+        let base = weight
+            .name
+            .strip_suffix(".weight")
+            .expect("filtered suffix");
+        let scales = tensors.get(&format!("{base}.scales"));
+        let biases = tensors.get(&format!("{base}.biases"));
+        match (scales, biases) {
+            (Some(scales), Some(biases)) => {
+                if vae && !is_vae_quant_target(base) {
+                    return Err(CoreError::Unsupported(format!(
+                        "flux1: VAE has unexpected packed non-attention target {base}"
+                    )));
+                }
+                validate_packed_triple(
+                    component.name,
+                    base,
+                    weight,
+                    scales,
+                    biases,
+                    expected_bits,
+                )?;
+                packed_count += 1;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(CoreError::Unsupported(format!(
+                    "flux1: {} has a partial packed triple for {base}",
+                    component.name
+                )));
+            }
+            (None, None) => {
+                let required =
+                    is_dense_quant_candidate(weight) && (!vae || is_vae_quant_target(base));
+                if weight.dtype == Dtype::U32 || required {
+                    return Err(CoreError::Unsupported(format!(
+                        "flux1: {} quantized tier has an unpacked or incomplete eligible weight {base}",
+                        component.name
+                    )));
+                }
+            }
+        }
+    }
+    if packed_count == 0 {
+        return Err(CoreError::Unsupported(format!(
+            "flux1: {} quantization marker has no packed content",
+            component.name
+        )));
+    }
+    Ok(())
 }
 
 fn composite_digest(components: &[ComponentInventory; 4], t5_tokenizer: &PinnedArtifact) -> String {
@@ -480,13 +669,8 @@ fn discover_inventory(spec: &LoadSpec) -> CoreResult<PackedArtifactInventory> {
         single_component_artifact(root, COMPONENTS[2])?,
         single_component_artifact(root, COMPONENTS[3])?,
     ];
-    if !components
-        .iter()
-        .all(|component| component_quant_matches(component, spec.quantize))
-    {
-        return Err(CoreError::Unsupported(
-            "flux1: every pinned component quant marker must match the selected tier".to_owned(),
-        ));
+    for component in &components {
+        validate_component_content(component, spec.quantize)?;
     }
     let inventory = PackedArtifactInventory {
         components,
@@ -512,6 +696,103 @@ pub(crate) fn verified_stream_inventory(
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct TestTensor {
+    name: String,
+    dtype: &'static str,
+    shape: Vec<usize>,
+}
+
+#[cfg(test)]
+fn write_test_safetensors(path: &Path, tensors: &[TestTensor]) {
+    let mut header = serde_json::Map::new();
+    let mut offset = 0_usize;
+    for tensor in tensors {
+        let element_size = match tensor.dtype {
+            "BF16" | "F16" => 2,
+            "F32" | "U32" => 4,
+            other => panic!("unsupported test dtype {other}"),
+        };
+        let bytes = tensor.shape.iter().product::<usize>() * element_size;
+        header.insert(
+            tensor.name.clone(),
+            serde_json::json!({
+                "dtype": tensor.dtype,
+                "shape": tensor.shape,
+                "data_offsets": [offset, offset + bytes],
+            }),
+        );
+        offset += bytes;
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut file = Vec::with_capacity(8 + header.len() + offset);
+    file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    file.extend_from_slice(&header);
+    file.resize(8 + header.len() + offset, 0);
+    std::fs::write(path, file).unwrap();
+}
+
+#[cfg(test)]
+fn packed_test_tensors(component: &str, bits: i32) -> Vec<TestTensor> {
+    let base = if component == "vae" {
+        "probe.attn.to_q"
+    } else {
+        "probe"
+    };
+    vec![
+        TestTensor {
+            name: format!("{base}.weight"),
+            dtype: "U32",
+            shape: vec![2, (bits as usize) * 2],
+        },
+        TestTensor {
+            name: format!("{base}.scales"),
+            dtype: "BF16",
+            shape: vec![2, 1],
+        },
+        TestTensor {
+            name: format!("{base}.biases"),
+            dtype: "BF16",
+            shape: vec![2, 1],
+        },
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_snapshot(root: &Path, quant: Option<Quant>) {
+    for component in COMPONENTS {
+        let dir = root.join(component);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tensors = match quant {
+            Some(quant) => packed_test_tensors(component, quant.bits()),
+            None => vec![TestTensor {
+                name: "probe.weight".to_owned(),
+                dtype: "BF16",
+                shape: vec![2, 64],
+            }],
+        };
+        write_test_safetensors(&dir.join("model.safetensors"), &tensors);
+        let config = match quant {
+            Some(quant) => format!(
+                r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
+                quant.bits()
+            ),
+            None => "{}".to_owned(),
+        };
+        std::fs::write(dir.join("config.json"), config).unwrap();
+    }
+    std::fs::create_dir_all(root.join("tokenizer_2")).unwrap();
+    std::fs::write(
+        root.join("tokenizer_2/tokenizer.json"),
+        br#"{"version":"1.0","model":{"type":"Unigram"}}"#,
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
@@ -525,25 +806,7 @@ mod tests {
     }
 
     fn write_snapshot(root: &Path, quant: Option<Quant>) {
-        for (index, component) in COMPONENTS.iter().enumerate() {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("model.safetensors"), vec![index as u8; 64]).unwrap();
-            let config = match quant {
-                Some(quant) => format!(
-                    r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
-                    quant.bits()
-                ),
-                None => "{}".to_owned(),
-            };
-            std::fs::write(dir.join("config.json"), config).unwrap();
-        }
-        std::fs::create_dir_all(root.join("tokenizer_2")).unwrap();
-        std::fs::write(
-            root.join("tokenizer_2/tokenizer.json"),
-            br#"{"version":"1.0","model":{"type":"Unigram"}}"#,
-        )
-        .unwrap();
+        write_test_snapshot(root, quant);
     }
 
     fn eligible_spec(root: &Path, quant: Option<Quant>) -> LoadSpec {
@@ -607,7 +870,10 @@ mod tests {
         let spec = eligible_spec(&root, None);
         let first = verified_stream_inventory(crate::FLUX1_SCHNELL_ID, &spec).unwrap();
         let first_composite = first.composite_sha256().to_owned();
-        std::fs::write(root.join("vae/model.safetensors"), [11_u8; 64]).unwrap();
+        let vae_path = root.join("vae/model.safetensors");
+        let mut vae = std::fs::read(&vae_path).unwrap();
+        *vae.last_mut().unwrap() ^= 1;
+        std::fs::write(&vae_path, vae).unwrap();
         assert!(first.ensure_unchanged().is_err());
         let second = verified_stream_inventory(crate::FLUX1_SCHNELL_ID, &spec).unwrap();
         assert_ne!(first_composite, second.composite_sha256());
@@ -630,6 +896,195 @@ mod tests {
         let spec = eligible_spec(&root, None);
         std::fs::remove_file(root.join("tokenizer_2/tokenizer.json")).unwrap();
         assert!(verified_stream_inventory(crate::FLUX1_DEV_ID, &spec).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn assert_component_content_rejected(
+        label: &str,
+        quant: Option<Quant>,
+        component: &str,
+        tensors: &[TestTensor],
+    ) {
+        let root = unique_root(label);
+        write_snapshot(&root, quant);
+        write_test_safetensors(&root.join(component).join("model.safetensors"), tensors);
+        assert!(
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, quant)).is_none(),
+            "{component} mutation unexpectedly passed admission"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn corrupt_empty_and_arbitrary_model_files_fail_in_every_component() {
+        for component in COMPONENTS {
+            let root = unique_root(&format!("empty-{component}"));
+            write_snapshot(&root, None);
+            std::fs::write(root.join(component).join("model.safetensors"), []).unwrap();
+            assert!(
+                verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, None))
+                    .is_none(),
+                "empty {component} unexpectedly passed"
+            );
+            std::fs::remove_dir_all(&root).ok();
+
+            let root = unique_root(&format!("arbitrary-{component}"));
+            write_snapshot(&root, None);
+            std::fs::write(
+                root.join(component).join("model.safetensors"),
+                [component.len() as u8; 64],
+            )
+            .unwrap();
+            assert!(
+                verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, None))
+                    .is_none(),
+                "arbitrary {component} unexpectedly passed"
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+
+        assert_component_content_rejected("zero-tensor-header", None, "transformer", &[]);
+    }
+
+    #[test]
+    fn dense_tier_rejects_packed_leaves() {
+        assert_component_content_rejected(
+            "dense-with-packed",
+            None,
+            "transformer",
+            &packed_test_tensors("transformer", 4),
+        );
+    }
+
+    #[test]
+    fn quantized_tier_rejects_missing_triple_for_eligible_dense_weight() {
+        assert_component_content_rejected(
+            "quant-with-dense",
+            Some(Quant::Q4),
+            "text_encoder",
+            &[TestTensor {
+                name: "probe.weight".to_owned(),
+                dtype: "BF16",
+                shape: vec![2, 64],
+            }],
+        );
+    }
+
+    #[test]
+    fn q4_marker_rejects_q8_content() {
+        assert_component_content_rejected(
+            "q4-marker-q8-content",
+            Some(Quant::Q4),
+            "transformer",
+            &packed_test_tensors("transformer", 8),
+        );
+    }
+
+    #[test]
+    fn quantized_tier_rejects_partial_and_orphan_triples() {
+        let full = packed_test_tensors("text_encoder_2", 4);
+        assert_component_content_rejected(
+            "partial-triple",
+            Some(Quant::Q4),
+            "text_encoder_2",
+            &full[..2],
+        );
+        assert_component_content_rejected(
+            "orphan-triple",
+            Some(Quant::Q4),
+            "text_encoder_2",
+            &[TestTensor {
+                name: "orphan.scales".to_owned(),
+                dtype: "BF16",
+                shape: vec![2, 1],
+            }],
+        );
+    }
+
+    #[test]
+    fn quantized_tier_rejects_wrong_code_dtype_and_packed_shapes() {
+        let mut wrong_dtype = packed_test_tensors("transformer", 4);
+        wrong_dtype[0].dtype = "BF16";
+        assert_component_content_rejected(
+            "wrong-code-dtype",
+            Some(Quant::Q4),
+            "transformer",
+            &wrong_dtype,
+        );
+
+        let mut wrong_rows = packed_test_tensors("transformer", 4);
+        wrong_rows[2].shape = vec![3, 1];
+        assert_component_content_rejected(
+            "wrong-packed-shape",
+            Some(Quant::Q4),
+            "transformer",
+            &wrong_rows,
+        );
+
+        let mut wrong_scale_dtype = packed_test_tensors("transformer", 4);
+        wrong_scale_dtype[1].dtype = "U32";
+        assert_component_content_rejected(
+            "wrong-scale-dtype",
+            Some(Quant::Q4),
+            "transformer",
+            &wrong_scale_dtype,
+        );
+    }
+
+    #[test]
+    fn quantized_tier_rejects_non_group_64_marker() {
+        let root = unique_root("wrong-group-size");
+        write_snapshot(&root, Some(Quant::Q4));
+        std::fs::write(
+            root.join("vae/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":32}}"#,
+        )
+        .unwrap();
+        assert!(verified_stream_inventory(
+            crate::FLUX1_DEV_ID,
+            &eligible_spec(&root, Some(Quant::Q4)),
+        )
+        .is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vae_rejects_packed_non_attention_target() {
+        assert_component_content_rejected(
+            "vae-packed-non-attention",
+            Some(Quant::Q4),
+            "vae",
+            &packed_test_tensors("transformer", 4),
+        );
+    }
+
+    #[test]
+    fn vae_requires_only_eligible_attention_targets_to_be_packed() {
+        assert_component_content_rejected(
+            "vae-missing-attention-triple",
+            Some(Quant::Q4),
+            "vae",
+            &[TestTensor {
+                name: "probe.attn.to_q.weight".to_owned(),
+                dtype: "BF16",
+                shape: vec![2, 64],
+            }],
+        );
+
+        let root = unique_root("vae-target-only-positive");
+        write_snapshot(&root, Some(Quant::Q4));
+        let mut tensors = packed_test_tensors("vae", 4);
+        tensors.push(TestTensor {
+            name: "probe.conv.weight".to_owned(),
+            dtype: "BF16",
+            shape: vec![2, 64],
+        });
+        write_test_safetensors(&root.join("vae/model.safetensors"), &tensors);
+        assert!(
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, Some(Quant::Q4)),)
+                .is_some(),
+            "eligible dense non-attention VAE weights must remain allowed"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

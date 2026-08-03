@@ -452,25 +452,7 @@ mod tests {
     }
 
     fn write_exact_snapshot(root: &std::path::Path, quant: Option<mlx_gen::Quant>) {
-        for (index, component) in crate::artifact_inventory::COMPONENTS.iter().enumerate() {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("model.safetensors"), vec![index as u8; 64]).unwrap();
-            let config = match quant {
-                Some(quant) => format!(
-                    r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
-                    quant.bits()
-                ),
-                None => "{}".to_owned(),
-            };
-            std::fs::write(dir.join("config.json"), config).unwrap();
-        }
-        std::fs::create_dir_all(root.join("tokenizer_2")).unwrap();
-        std::fs::write(
-            root.join("tokenizer_2/tokenizer.json"),
-            br#"{"version":"1.0","model":{"type":"Unigram"}}"#,
-        )
-        .unwrap();
+        crate::artifact_inventory::write_test_snapshot(root, quant);
     }
 
     #[test]

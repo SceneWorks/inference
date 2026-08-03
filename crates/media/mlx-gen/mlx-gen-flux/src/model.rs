@@ -1432,14 +1432,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        for (index, component) in crate::artifact_inventory::COMPONENTS.iter().enumerate() {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("model.safetensors"), vec![index as u8; 64]).unwrap();
-            std::fs::write(dir.join("config.json"), "{}").unwrap();
-        }
-        std::fs::create_dir_all(root.join("tokenizer_2")).unwrap();
-        std::fs::write(root.join("tokenizer_2/tokenizer.json"), b"tokenizer-v1").unwrap();
+        crate::artifact_inventory::write_test_snapshot(&root, None);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
