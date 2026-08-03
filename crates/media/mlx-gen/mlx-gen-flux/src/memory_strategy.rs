@@ -4,8 +4,8 @@
 //! contract. The clean schnell/dev routes use the shared head-once/tail-tiled native VAE decode and
 //! thread the shared bounded-attention kernel through every double- and single-stream block. Control
 //! and every loaded overlay remain `Missing` until their additional paths have independent coverage.
-//! Production contracts deliberately carry no calibration identity; weights-free registry
-//! conformance receives an isolated synthetic identity.
+//! Production calibration is limited to the exact measured FLUX.1-dev Q4 deferred artifact and
+//! request geometry; weights-free registry conformance receives an isolated synthetic identity.
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
