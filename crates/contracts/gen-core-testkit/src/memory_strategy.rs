@@ -391,6 +391,20 @@ fn check_behavior_fixture(
             registration.provider_id, fixture.request.memory, expected_memory
         ));
     }
+    let expected_attention_chunk = contract
+        .engages(strategy, MemoryStrategy::BoundedAttention)
+        .then_some(fixture.context.selection.parameters.attention_chunk_size)
+        .flatten();
+    let configured_attention_chunk = fixture
+        .request
+        .memory
+        .and_then(|memory| memory.attention_chunk_size);
+    if configured_attention_chunk != expected_attention_chunk {
+        errors.push(format!(
+            "{}: {strategy:?} configured attention chunk {:?}, expected engaged carrier {:?}",
+            registration.provider_id, configured_attention_chunk, expected_attention_chunk
+        ));
+    }
     if let Err(error) = scope.enter_phase(MemoryPhase::Denoise) {
         errors.push(format!(
             "{}: {strategy:?} enter_phase rejected valid scope: {error}",

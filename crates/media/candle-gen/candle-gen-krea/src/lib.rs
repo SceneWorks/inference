@@ -110,8 +110,6 @@ pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 
 use std::path::PathBuf;
-#[cfg(any(feature = "cuda", test))]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Device, Tensor};
@@ -223,6 +221,8 @@ pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
     loaded_quant: Option<Quant>,
+    #[cfg(any(feature = "cuda", test))]
+    memory_contract: Option<gen_core::MemoryProviderContract>,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
@@ -309,7 +309,9 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         _geometry: gen_core::MemoryGeometry,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if tile_edge == 512 && overlap == 128 {
+        if SUPPORTED_DECODE_TILE_EDGES.contains(&tile_edge)
+            && SUPPORTED_DECODE_OVERLAPS.contains(&overlap)
+        {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
@@ -320,7 +322,7 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
 
     fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if chunk_size == pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32 {
+        if SUPPORTED_ATTENTION_CHUNK_SIZES.contains(&chunk_size) {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
@@ -401,6 +403,49 @@ impl Drop for KreaMemoryScope {
 /// NOT cfg-gated, unlike the contract that publishes it: `generate` re-validates the window on every
 /// build, and the streamed trunk itself is not cuda-only (it runs on CPU in the parity tests).
 const SUPPORTED_TRANSFORMER_WINDOWS: &[u32] = &[1];
+const SUPPORTED_DECODE_TILE_EDGES: &[u32] = &[512];
+const SUPPORTED_DECODE_OVERLAPS: &[u32] = &[128];
+const SUPPORTED_ATTENTION_CHUNK_SIZES: &[u32] = &[pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32];
+
+fn validate_memory_parameters(
+    id: &str,
+    memory: gen_core::GenerationMemory,
+) -> gen_core::Result<()> {
+    for (name, value, engaged, allowed) in [
+        (
+            "decode_tile_edge",
+            memory.decode_tile_edge,
+            memory.tile_vae_decode,
+            SUPPORTED_DECODE_TILE_EDGES,
+        ),
+        (
+            "decode_overlap",
+            memory.decode_overlap,
+            memory.tile_vae_decode,
+            SUPPORTED_DECODE_OVERLAPS,
+        ),
+        (
+            "attention_chunk_size",
+            memory.attention_chunk_size,
+            memory.chunk_attention,
+            SUPPORTED_ATTENTION_CHUNK_SIZES,
+        ),
+    ] {
+        if value.is_some() && !engaged {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: {name} is present but its owning memory-strategy rung is not engaged"
+            )));
+        }
+        if let Some(value) = value {
+            if !allowed.contains(&value) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{id}: {name}={value} is outside the published candidates {allowed:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
@@ -410,7 +455,7 @@ impl Generator for KreaGenerator {
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         #[cfg(any(feature = "cuda", test))]
         {
-            (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_memory_strategy_contract)
+            self.memory_contract.as_ref()
         }
         #[cfg(not(any(feature = "cuda", test)))]
         {
@@ -455,7 +500,10 @@ impl Generator for KreaGenerator {
             }
             Ok(Some(Box::new(KreaMemoryScope {
                 device: self.device.clone(),
-                memory: krea_turbo_memory_strategy_contract().generation_memory(&context.selection),
+                memory: self
+                    .memory_contract
+                    .as_ref()
+                    .and_then(|contract| contract.generation_memory(&context.selection)),
                 requires_reference: false,
                 finished: false,
             })))
@@ -502,6 +550,20 @@ impl Generator for KreaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(memory) = req.memory {
+            validate_memory_parameters(self.descriptor.id, memory)?;
+        }
+        if req
+            .memory
+            .is_some_and(|memory| memory.stream_transformer_blocks)
+            && !self.adapters.is_empty()
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: streamed transformer residency does not support load-time LoRA/LoKr or \
+                 diff-patch adapters",
+                self.descriptor.id
+            )));
+        }
         // Loud-reject a multi-phase request on a diff-patch model (sc-13887): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
@@ -1045,6 +1107,9 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
     let convrot_dit = convrot_selector(spec, descriptor.id)?;
     let loaded_quant = actual_quant_tier(spec, descriptor.id)?;
+    #[cfg(any(feature = "cuda", test))]
+    let memory_contract =
+        (descriptor.id == KREA_2_TURBO_ID).then(|| build_krea_turbo_memory_strategy_contract(spec));
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     //
@@ -1085,7 +1150,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // `root/transformer` unconditionally — the wrong DiT for a ConvRot request — which is why ConvRot
     // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
-    let residency = candle_gen::Residency::request_scoped_with_resident(
+    let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
             let components = match resident_convrot.as_ref() {
                 Some(convrot_dit) => pipeline::load_components_convrot(
@@ -1111,26 +1176,33 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                 })),
             ))
         },
-        move |_| {
-            Ok(KreaTextPhase::Sequential(Box::new(pipeline::load_text(
-                &text_root,
-                &text_device,
-            )?)))
+        move |_, cancel| {
+            Ok(KreaTextPhase::Sequential(Box::new(
+                pipeline::load_text_for_request(&text_root, &text_device, cancel)?,
+            )))
         },
-        move |use_pid, _| {
+        move |use_pid, _, cancel| {
             let heavy = match heavy_convrot.as_ref() {
                 // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
                 // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
                 // this loads into that freed pool — the whole point of going sequential here.
                 Some(convrot_dit) => {
-                    pipeline::load_residency_heavy_convrot(&heavy_root, convrot_dit, &heavy_device)?
+                    candle_gen::check_cancel(cancel)?;
+                    let heavy = pipeline::load_residency_heavy_convrot(
+                        &heavy_root,
+                        convrot_dit,
+                        &heavy_device,
+                    )?;
+                    candle_gen::check_cancel(cancel)?;
+                    heavy
                 }
-                None => pipeline::load_residency_heavy(
+                None => pipeline::load_residency_heavy_for_request(
                     &heavy_root,
                     &heavy_device,
                     &heavy_adapters,
                     heavy_pid.as_ref(),
                     use_pid,
+                    cancel,
                 )?,
             };
             Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
@@ -1140,6 +1212,8 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         descriptor,
         device,
         loaded_quant,
+        #[cfg(any(feature = "cuda", test))]
+        memory_contract,
         residency,
         root,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
@@ -1228,6 +1302,8 @@ pub fn load_from_native_dit_file(
         descriptor,
         device,
         loaded_quant: None,
+        #[cfg(any(feature = "cuda", test))]
+        memory_contract: None,
         residency,
         root,
         // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
@@ -1253,7 +1329,7 @@ candle_gen::register_generators! {
 /// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
 /// pins the executable structure that makes those measurements valid.
 #[cfg(any(feature = "cuda", test))]
-fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContract {
+fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
     use gen_core::{
         LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
@@ -1262,6 +1338,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
         MemoryWindowMaterialization,
     };
 
+    let streamable = spec.adapters.is_empty();
     MemoryProviderContract {
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -1277,27 +1354,33 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             .into_iter()
             .map(|strategy| MemoryStrategyCapability {
                 strategy,
-                support: MemoryStrategySupport::Implemented,
+                support: if strategy == MemoryStrategy::BoundedTransformerResidency && !streamable {
+                    MemoryStrategySupport::Missing
+                } else {
+                    MemoryStrategySupport::Implemented
+                },
                 parameters: match strategy {
                     MemoryStrategy::BoundedDecode => MemoryParameterRanges {
-                        decode_tile_edges: vec![512],
-                        decode_overlaps: vec![128],
+                        decode_tile_edges: SUPPORTED_DECODE_TILE_EDGES.to_vec(),
+                        decode_overlaps: SUPPORTED_DECODE_OVERLAPS.to_vec(),
                         ..Default::default()
                     },
                     MemoryStrategy::BoundedAttention => MemoryParameterRanges {
-                        attention_chunk_sizes: vec![
-                            pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32,
-                        ],
+                        attention_chunk_sizes: SUPPORTED_ATTENTION_CHUNK_SIZES.to_vec(),
                         ..Default::default()
                     },
-                    MemoryStrategy::BoundedTransformerResidency => MemoryParameterRanges {
-                        // One source for what this provider publishes, what its request scope
-                        // accepts, and what `generate` re-validates — three sites that were three
-                        // independent literals before SC-15792 and would have drifted silently.
-                        transformer_window_sizes: SUPPORTED_TRANSFORMER_WINDOWS.to_vec(),
-                        ..Default::default()
-                    },
-                    MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+                    MemoryStrategy::BoundedTransformerResidency if streamable => {
+                        MemoryParameterRanges {
+                            // One source for what this provider publishes, what its request scope
+                            // accepts, and what `generate` re-validates — three sites that were three
+                            // independent literals before SC-15792 and would have drifted silently.
+                            transformer_window_sizes: SUPPORTED_TRANSFORMER_WINDOWS.to_vec(),
+                            ..Default::default()
+                        }
+                    }
+                    MemoryStrategy::Resident
+                    | MemoryStrategy::StagedResidency
+                    | MemoryStrategy::BoundedTransformerResidency => {
                         MemoryParameterRanges::default()
                     }
                 },
@@ -1337,7 +1420,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
             synchronized_phase_release: true,
             decode_tiling: true,
             attention_chunking: true,
-            transformer_window_materialization: true,
+            transformer_window_materialization: streamable,
         },
         formula: MemoryFormulaKind::PhaseEnvelope {
             phases: vec![
@@ -1362,17 +1445,22 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
-fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
-    static CONTRACT: OnceLock<gen_core::MemoryProviderContract> = OnceLock::new();
-    CONTRACT.get_or_init(build_krea_turbo_memory_strategy_contract)
-}
-
 #[cfg(feature = "cuda")]
 fn registered_krea_turbo_memory_strategy_contract(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    Ok(krea_turbo_memory_strategy_contract().clone())
+    Ok(build_krea_turbo_memory_strategy_contract(spec))
+}
+
+#[cfg(test)]
+fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
+    static CONTRACT: std::sync::OnceLock<gen_core::MemoryProviderContract> =
+        std::sync::OnceLock::new();
+    CONTRACT.get_or_init(|| {
+        build_krea_turbo_memory_strategy_contract(&LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/krea".into(),
+        )))
+    })
 }
 
 fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
@@ -1474,7 +1562,7 @@ mod weights_free_behavior_tests {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
         for (contract, strategy) in [
             (
-                krea_turbo_memory_strategy_contract().clone(),
+                build_krea_turbo_memory_strategy_contract(&spec),
                 gen_core::MemoryStrategy::BoundedDecode,
             ),
             (
@@ -2071,6 +2159,7 @@ mod tests {
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(128),
                 chunk_attention: true,
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
                 ..Default::default()
             })
         );
@@ -2085,6 +2174,7 @@ mod tests {
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(128),
                 chunk_attention: true,
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
                 stream_transformer_blocks: true,
                 // SC-15792: the SELECTED window travels with the selection. Pinned as a non-default
                 // value on purpose — `None` is `GenerationMemory::default()`, so asserting it would
@@ -2173,6 +2263,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adapter_specs_remove_only_registered_transformer_streaming() {
+        let plain = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let plain_contract = build_krea_turbo_memory_strategy_contract(&plain);
+        assert!(matches!(
+            plain_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        ));
+        for (path, kind) in [
+            ("/nonexistent/lora.safetensors", gen_core::AdapterKind::Lora),
+            ("/nonexistent/lokr.safetensors", gen_core::AdapterKind::Lokr),
+            (
+                "/nonexistent/weights.diff.safetensors",
+                gen_core::AdapterKind::Lora,
+            ),
+        ] {
+            let adapted =
+                plain
+                    .clone()
+                    .with_adapters(vec![AdapterSpec::new(path.into(), 1.0, kind)]);
+            let adapted_contract = build_krea_turbo_memory_strategy_contract(&adapted);
+            let streaming = adapted_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert!(matches!(
+                streaming.support,
+                gen_core::MemoryStrategySupport::Missing
+            ));
+            assert!(streaming.parameters.transformer_window_sizes.is_empty());
+            for rung in [
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategy::BoundedAttention,
+            ] {
+                assert!(matches!(
+                    adapted_contract.capability(rung).unwrap().support,
+                    gen_core::MemoryStrategySupport::Implemented
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn memory_parameter_domains_reject_orphans_and_unknown_values() {
+        let id = KREA_2_TURBO_ID;
+        let valid = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+            ..Default::default()
+        };
+        validate_memory_parameters(id, valid).unwrap();
+        for invalid in [
+            gen_core::GenerationMemory {
+                decode_tile_edge: Some(512),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                decode_overlap: Some(128),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(256),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_memory_parameters(id, invalid),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+        }
+    }
+
     /// SC-15805: the cumulative default is DEFEASIBLE, and this provider now reads it from the
     /// contract rather than from the ladder's numeric order. Pin that with a contract that declares
     /// a cheaper rung unavailable: a deeper selection must leave that rung's lever OFF.
@@ -2184,7 +2363,7 @@ mod tests {
     fn a_rung_the_provider_does_not_implement_is_not_engaged_by_a_deeper_selection() {
         use gen_core::{MemoryStrategy, MemoryStrategySupport};
 
-        let mut contract = build_krea_turbo_memory_strategy_contract();
+        let mut contract = krea_turbo_memory_strategy_contract().clone();
         for capability in &mut contract.strategies {
             if capability.strategy == MemoryStrategy::BoundedDecode {
                 capability.support = MemoryStrategySupport::Missing;
@@ -2226,7 +2405,7 @@ mod tests {
     fn the_shipped_contract_is_conformance_clean_and_declares_its_window_realization() {
         use gen_core::{MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization};
 
-        let contract = build_krea_turbo_memory_strategy_contract();
+        let contract = krea_turbo_memory_strategy_contract().clone();
         assert_eq!(
             contract.conformance_errors(),
             Vec::<String>::new(),
@@ -2866,10 +3045,13 @@ mod tests {
     }
 
     fn sequential_generator(descriptor: ModelDescriptor) -> KreaGenerator {
+        let has_memory_contract = descriptor.id == KREA_2_TURBO_ID;
         KreaGenerator {
             descriptor,
             device: candle_gen::default_device().expect("a default device"),
             loaded_quant: None,
+            memory_contract: has_memory_contract
+                .then(|| krea_turbo_memory_strategy_contract().clone()),
             residency: candle_gen::Residency::request_scoped(
                 |_| {
                     Err(candle_gen::CandleError::Msg(
@@ -2908,6 +3090,39 @@ mod tests {
             generator.generate(&req, &mut |_| {}),
             Err(gen_core::Error::Canceled)
         ));
+    }
+
+    #[test]
+    fn direct_streamed_request_with_adapter_rejects_before_progress_or_load() {
+        let mut generator = sequential_generator(descriptor());
+        generator.adapters.push(AdapterSpec::new(
+            "/nonexistent/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        let request = GenerationRequest {
+            prompt: "a lighthouse".to_owned(),
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                transformer_window_size: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let progress_calls = std::cell::Cell::new(0usize);
+        let error = generator
+            .generate(&request, &mut |_| {
+                progress_calls.set(progress_calls.get() + 1)
+            })
+            .expect_err("adapter-bearing direct streaming must reject");
+        assert!(matches!(error, gen_core::Error::Unsupported(_)));
+        assert_eq!(progress_calls.get(), 0);
     }
 
     /// F-173 (sc-12089): a request cancelled before `generate` returns `Canceled` without loading a
@@ -2966,6 +3181,111 @@ mod tests {
             "{}: expected Canceled, got {err:?} — the text-phase load must follow the cancel check",
             KREA_2_EDIT_ID
         );
+    }
+
+    #[test]
+    fn stage_only_requests_cancel_inside_cold_source_hash_for_every_krea_descriptor() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        use std::collections::HashMap;
+
+        let component = std::env::temp_dir().join(format!(
+            "sceneworks-krea-stage-cancel-{}",
+            std::process::id()
+        ));
+        if component.exists() {
+            std::fs::remove_dir_all(&component).unwrap();
+        }
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        // The packed code tensor alone is exactly one 4 MiB cancellation chunk. Scales and biases
+        // make the fixture a valid group-64 affine triple without ever reaching repack/build.
+        let out_dim = 131_072usize;
+        let tensors = HashMap::from([
+            (
+                "layers.0.proj.weight".to_owned(),
+                Tensor::zeros((out_dim, 8), DType::U32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "layers.0.proj.scales".to_owned(),
+                Tensor::zeros((out_dim, 1), DType::F32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "layers.0.proj.biases".to_owned(),
+                Tensor::zeros((out_dim, 1), DType::F32, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, component.join("model.safetensors"))
+            .unwrap();
+
+        for descriptor in [descriptor(), raw_descriptor(), edit_descriptor()] {
+            let text_component = component.clone();
+            let has_memory_contract = descriptor.id == KREA_2_TURBO_ID;
+            let generator = KreaGenerator {
+                descriptor: descriptor.clone(),
+                device: Device::Cpu,
+                loaded_quant: None,
+                memory_contract: has_memory_contract
+                    .then(|| krea_turbo_memory_strategy_contract().clone()),
+                residency: candle_gen::Residency::request_scoped_with_resident_cancelable(
+                    |_| {
+                        Err(candle_gen::CandleError::Msg(
+                            "warm loader must not run for a stage-only request".into(),
+                        ))
+                    },
+                    move |_, cancel| {
+                        let _ = crate::loader::Weights::from_dir_cancelable(
+                            &text_component,
+                            &Device::Cpu,
+                            DType::BF16,
+                            cancel,
+                        )?;
+                        Err(candle_gen::CandleError::Msg(
+                            "cold source hash unexpectedly completed".into(),
+                        ))
+                    },
+                    |_, _, _| {
+                        Err(candle_gen::CandleError::Msg(
+                            "heavy loader must not run after text cancellation".into(),
+                        ))
+                    },
+                ),
+                root: "/snap".into(),
+                adapters: Vec::new(),
+                has_diff_patch: false,
+            };
+            let cancel = gen_core::CancelFlag::new();
+            let request = GenerationRequest {
+                prompt: "cancel during cold packed hashing".into(),
+                conditioning: (descriptor.id == KREA_2_EDIT_ID)
+                    .then(|| Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                memory: Some(gen_core::GenerationMemory {
+                    stage_residency: true,
+                    ..Default::default()
+                }),
+                cancel: cancel.clone(),
+                ..Default::default()
+            };
+            candle_gen::quant::sidecar::cancel_source_hash_after_chunks(1);
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .expect_err("stage-only cold hashing must observe cancellation");
+            assert!(
+                matches!(error, gen_core::Error::Canceled),
+                "{} returned {error:?}",
+                descriptor.id
+            );
+            assert!(cancel.is_cancelled());
+        }
+        std::fs::remove_dir_all(component).unwrap();
     }
 
     #[test]
@@ -3391,7 +3711,7 @@ mod tests {
                 vec![gen_core::MemoryStrategy::Resident]
             }
         } else {
-            krea_turbo_memory_strategy_contract().engaged_composition(strategy)
+            build_krea_turbo_memory_strategy_contract(&spec).engaged_composition(strategy)
         };
         let observed_calibration = if raw || edit {
             gen_core::MemoryCalibrationIdentity::new(
@@ -3399,7 +3719,7 @@ mod tests {
                 spec.load_shape,
             )
         } else {
-            krea_turbo_memory_strategy_contract()
+            build_krea_turbo_memory_strategy_contract(&spec)
                 .calibration
                 .clone()
                 .expect("Krea Turbo contract must export its calibration identity")

@@ -39,6 +39,11 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+[target.'cfg(windows)'.dependencies]
+# Stable std exposes Windows write time but not the handle's file ID/change time. The sidecar warm
+# memo needs both so same-size corruption cannot hide behind a restored mtime.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [features]
 # Default works on Mac with NO extra features: candle-core defaults to the CPU backend.
 default = []

@@ -20,7 +20,7 @@ pub mod block;
 pub mod rope;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::quant::Nvfp4Context;
 use candle_gen::BlockPlan;
 
@@ -35,14 +35,8 @@ fn request_attention_plan<'a>(
     scores_budget: usize,
     cancel: &'a candle_gen::gen_core::CancelFlag,
 ) -> AttentionPlan<'a> {
-    let max_score_elements = if scores_budget == usize::MAX {
-        u64::MAX
-    } else {
-        scores_budget as u64
-    };
-    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
-        max_score_elements,
-        false,
+    AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(
+        scores_budget,
     ))
     .with_cancel(cancel)
 }

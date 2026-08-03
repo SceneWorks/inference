@@ -512,6 +512,9 @@ pub struct GenerationMemory {
     /// Feather/blend overlap in output pixels paired with [`Self::decode_tile_edge`]. `None` ⇒ the
     /// provider's default overlap.
     pub decode_overlap: Option<u32>,
+    /// Maximum attention-score elements materialized by one bounded attention chunk. `None` uses the
+    /// provider's historical chunk size. Meaningful only when [`Self::chunk_attention`] is enabled.
+    pub attention_chunk_size: Option<u32>,
     /// Number of consecutive transformer trunk blocks held materialized at once when
     /// [`Self::stream_transformer_blocks`] is set. `None` ⇒ the provider's default window.
     pub transformer_window_size: Option<u32>,
@@ -2517,6 +2520,7 @@ mod tests {
                 stream_transformer_blocks: false,
                 decode_tile_edge: None,
                 decode_overlap: None,
+                attention_chunk_size: None,
                 transformer_window_size: None,
                 transformer_window_component: None,
                 calibration_error_phase: None,
@@ -2535,12 +2539,14 @@ mod tests {
         assert!(!memory.stage_residency);
         assert_eq!(memory.decode_tile_edge, None);
         assert_eq!(memory.decode_overlap, None);
+        assert_eq!(memory.attention_chunk_size, None);
         assert_eq!(memory.transformer_window_size, None);
         // Setting a parameter does NOT turn its rung on: the boolean is the switch, the parameter is
         // only the value. A selector that set an edge but not `tile_vae_decode` gets no tiling.
         let parameterized = GenerationMemory {
             decode_tile_edge: Some(384),
             decode_overlap: Some(64),
+            attention_chunk_size: Some(128),
             transformer_window_size: Some(2),
             ..Default::default()
         };

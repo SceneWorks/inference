@@ -22,8 +22,10 @@ pub trait ResidencyRuntime {
 }
 
 type RuntimeResult<R, T> = std::result::Result<T, <R as ResidencyRuntime>::Error>;
-type TextLoader<Text, R> = Box<dyn Fn(bool) -> RuntimeResult<R, Text> + Send + Sync>;
-type HeavyLoader<Heavy, R> = Box<dyn Fn(bool, bool) -> RuntimeResult<R, Heavy> + Send + Sync>;
+type TextLoader<Text, R> =
+    Box<dyn Fn(bool, Option<&CancelFlag>) -> RuntimeResult<R, Text> + Send + Sync>;
+type HeavyLoader<Heavy, R> =
+    Box<dyn Fn(bool, bool, Option<&CancelFlag>) -> RuntimeResult<R, Heavy> + Send + Sync>;
 type WarmLoader<Text, Heavy, R> =
     Box<dyn Fn(bool) -> RuntimeResult<R, (Text, Heavy)> + Send + Sync>;
 
@@ -67,10 +69,10 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
     pub fn resident(text: Text, heavy: Heavy) -> Self {
         Self {
             loaders: Loaders {
-                load_text: Box::new(|_| {
+                load_text: Box::new(|_, _| {
                     Err(Error::Msg("resident-only source cannot reload text".into()).into())
                 }),
-                load_heavy: Box::new(|_, _| {
+                load_heavy: Box::new(|_, _, _| {
                     Err(
                         Error::Msg("resident-only source cannot reload heavy components".into())
                             .into(),
@@ -97,8 +99,8 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
     ) -> Self {
         Self {
             loaders: Loaders {
-                load_text: Box::new(move |_| load_text()),
-                load_heavy: Box::new(move |use_pid, _| load_heavy(use_pid)),
+                load_text: Box::new(move |_, _| load_text()),
+                load_heavy: Box::new(move |use_pid, _, _| load_heavy(use_pid)),
                 load_warm: None,
             },
             warm: Mutex::new(None),
@@ -116,8 +118,8 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
     ) -> Self {
         Self {
             loaders: Loaders {
-                load_text: Box::new(load_text),
-                load_heavy: Box::new(load_heavy),
+                load_text: Box::new(move |streamable, _| load_text(streamable)),
+                load_heavy: Box::new(move |use_pid, streamable, _| load_heavy(use_pid, streamable)),
                 load_warm: None,
             },
             warm: Mutex::new(None),
@@ -136,8 +138,46 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
     ) -> Self {
         Self {
             loaders: Loaders {
-                load_text: Box::new(load_text),
-                load_heavy: Box::new(load_heavy),
+                load_text: Box::new(move |streamable, _| load_text(streamable)),
+                load_heavy: Box::new(move |use_pid, streamable, _| load_heavy(use_pid, streamable)),
+                load_warm: Some(Box::new(load_warm)),
+            },
+            warm: Mutex::new(None),
+            rebuildable: true,
+            default_stage_residency: false,
+            on_staged: None,
+            runtime: PhantomData,
+        }
+    }
+
+    /// Construct request-scoped residency whose staged loaders can observe the active request's
+    /// cancellation flag. The distinct warm aggregate remains request-independent; only loads that
+    /// occur inside [`Self::run_request_scoped`] receive the flag.
+    pub fn request_scoped_with_resident_cancelable(
+        load_warm: impl Fn(bool) -> RuntimeResult<R, (Text, Heavy)> + Send + Sync + 'static,
+        load_text: impl Fn(bool, &CancelFlag) -> RuntimeResult<R, Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool, bool, &CancelFlag) -> RuntimeResult<R, Heavy> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            loaders: Loaders {
+                load_text: Box::new(move |streamable, cancel| {
+                    let Some(cancel) = cancel else {
+                        return Err(Into::<R::Error>::into(Error::Msg(
+                            "cancel-aware text loader used outside a request-scoped staged load"
+                                .into(),
+                        )));
+                    };
+                    load_text(streamable, cancel)
+                }),
+                load_heavy: Box::new(move |use_pid, streamable, cancel| {
+                    let Some(cancel) = cancel else {
+                        return Err(Into::<R::Error>::into(Error::Msg(
+                            "cancel-aware heavy loader used outside a request-scoped staged load"
+                                .into(),
+                        )));
+                    };
+                    load_heavy(use_pid, streamable, cancel)
+                }),
                 load_warm: Some(Box::new(load_warm)),
             },
             warm: Mutex::new(None),
@@ -279,7 +319,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             }
         } else {
             on_progress(Progress::Loading(LoadPhase::TextEncoder));
-            let text = match (self.loaders.load_text)(streamable) {
+            let text = match (self.loaders.load_text)(streamable, None) {
                 Ok(text) => text,
                 Err(error) => {
                     R::after_component_drop();
@@ -289,7 +329,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             on_progress(Progress::Loading(LoadPhase::Renderer));
             // Warm residents deliberately load the reusable PiD superset once. Per-request
             // `use_pid` selects the decode path; it must not narrow the cross-request warm pair.
-            let heavy = match (self.loaders.load_heavy)(true, streamable) {
+            let heavy = match (self.loaders.load_heavy)(true, streamable, None) {
                 Ok(heavy) => heavy,
                 Err(error) => {
                     drop(text);
@@ -374,10 +414,10 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         let result = run_two_phase::<R, _, _, _, _>(
             cancel,
             on_progress,
-            || (self.loaders.load_text)(streamable),
+            || (self.loaders.load_text)(streamable, Some(cancel)),
             encode,
             materialize_before_text_drop,
-            || (self.loaders.load_heavy)(use_pid, streamable),
+            || (self.loaders.load_heavy)(use_pid, streamable, Some(cancel)),
             render,
         );
         drop(warm);
@@ -484,7 +524,7 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         Self::evict_warm_locked(&mut warm);
 
         on_progress(Progress::Loading(LoadPhase::TextEncoder));
-        let text = match (self.loaders.load_text)(streamable) {
+        let text = match (self.loaders.load_text)(streamable, Some(cancel)) {
             Ok(text) => text,
             Err(error) => {
                 R::after_component_drop();
@@ -504,7 +544,7 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         check_cancel::<R>(cancel)?;
 
         on_progress(Progress::Loading(LoadPhase::Renderer));
-        let heavy = match (self.loaders.load_heavy)(use_pid, streamable) {
+        let heavy = match (self.loaders.load_heavy)(use_pid, streamable, Some(cancel)) {
             Ok(heavy) => heavy,
             Err(error) => {
                 R::after_component_drop();

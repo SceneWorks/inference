@@ -108,21 +108,17 @@ fn query_block(rows_per_query: usize, sq: usize, budget: usize) -> usize {
     // `usize::MAX` is this crate's un-chunked sentinel (the trainers and every unbounded call site pass
     // it). Map it to the planner's own `u64::MAX` sentinel explicitly rather than via `as`, which would
     // widen to 2^32-1 — a real budget — on a 32-bit target.
-    let budget = if budget == usize::MAX {
-        u64::MAX
-    } else {
-        budget as u64
-    };
     // The result is bounded above by `sq`, which came from a `usize`, so the narrowing is exact.
-    AttentionBudget::from_score_elements(budget, false)
-        .query_block_rows(rows_per_query as u64, sq as u64) as usize
+    attention_budget_from_usize(budget).query_block_rows(rows_per_query as u64, sq as u64) as usize
 }
 
-fn budget_from_usize(budget: usize) -> AttentionBudget {
+/// Convert a legacy Candle `usize` score budget into the shared planner type without narrowing the
+/// unbounded sentinel on 32-bit targets.
+pub fn attention_budget_from_usize(budget: usize) -> AttentionBudget {
     let budget = if budget == usize::MAX {
         u64::MAX
     } else {
-        budget as u64
+        u64::try_from(budget).unwrap_or(u64::MAX)
     };
     AttentionBudget::from_score_elements(budget, false)
 }
@@ -162,7 +158,7 @@ pub fn sdpa_budgeted_bhsd(
         scale,
         mask,
         softmax,
-        budget_from_usize(budget),
+        attention_budget_from_usize(budget),
         || Ok::<(), candle_core::Error>(()),
     )
 }
@@ -256,9 +252,15 @@ pub fn sdpa_budgeted_flat(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
-    sdpa_flat_impl(q, k, v, scale, softmax, budget_from_usize(budget), || {
-        Ok::<(), candle_core::Error>(())
-    })
+    sdpa_flat_impl(
+        q,
+        k,
+        v,
+        scale,
+        softmax,
+        attention_budget_from_usize(budget),
+        || Ok::<(), candle_core::Error>(()),
+    )
 }
 
 /// Request-scoped variant of [`sdpa_budgeted_flat`], with the same typed between-chunk cancellation
@@ -661,6 +663,20 @@ mod tests {
             chunking_cases > 100,
             "only {chunking_cases} grid cases actually chunked — the agreement is near-vacuous"
         );
+    }
+
+    #[test]
+    fn usize_budget_conversion_preserves_unbounded_sentinel_and_finite_values() {
+        assert_eq!(
+            attention_budget_from_usize(usize::MAX).max_score_elements(),
+            u64::MAX
+        );
+        for finite in [0usize, 1, 4096, ATTN_SCORES_BUDGET] {
+            assert_eq!(
+                attention_budget_from_usize(finite).max_score_elements(),
+                u64::try_from(finite).unwrap()
+            );
+        }
     }
 
     /// The shared table must cover the budget this crate actually ships as its i32-overflow guard,
