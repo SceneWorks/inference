@@ -1,6 +1,10 @@
 """Regression tests for trust boundaries around persistent self-hosted CI runners."""
 
+import functools
+import ntpath
+import os
 import re
+import shutil
 import subprocess
 import textwrap
 import unittest
@@ -17,6 +21,106 @@ QWEN_MEMORY_STRATEGY = (
 JOB_ENV_RUNNER_TEMP_EXPRESSION = re.compile(
     r"(?m)^      [A-Z][A-Z0-9_]+: \$\{\{ runner\.temp \}\}"
 )
+
+# Windows ships `C:\Windows\System32\bash.exe` -- the WSL launcher -- and it precedes Git for
+# Windows on a default PATH, so bare `bash` resolves to it. With no WSL distro installed it exits
+# non-zero before reading a byte of the script, which turns a syntax gate into a host-shape false
+# red: it fails whether or not the workflow script is valid, so genuine drift in the script hides
+# behind it. Resolve a shell that demonstrably parses instead of trusting PATH order, and skip
+# honestly when the host has none -- a missing interpreter is not evidence of a broken script.
+# Same class as the model-weight-licenses CRLF gate (72658873) and the golden model path gate
+# (sc-17077). `ntpath` throughout so the stub is recognisable from Linux CI too, not only Windows.
+WINDOWS_SYSTEM_DIRECTORIES = frozenset(
+    ntpath.normcase(ntpath.join(os.environ.get("SystemRoot", r"C:\Windows"), name))
+    for name in ("System32", "SysWOW64", "Sysnative")
+)
+
+# Git for Windows is the supported POSIX shell here; cover the machine-wide and per-user installs.
+GIT_FOR_WINDOWS_ROOTS = ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)")
+GIT_FOR_WINDOWS_BASH = (
+    ntpath.join("Git", "bin", "bash.exe"),
+    ntpath.join("Git", "usr", "bin", "bash.exe"),
+)
+
+
+def in_windows_system_directory(path: str) -> bool:
+    """True when `path` is the WSL launcher shipped in the Windows system directory."""
+    return ntpath.normcase(ntpath.dirname(str(path))) in WINDOWS_SYSTEM_DIRECTORIES
+
+
+def posix_shell_candidates() -> list[str]:
+    """Every plausible bash, PATH order first, with the Windows WSL stub filtered out."""
+    candidates: list[str] = []
+
+    def offer(candidate: str | None) -> None:
+        if candidate is None or in_windows_system_directory(candidate):
+            return
+        if os.path.isfile(candidate) and candidate not in candidates:
+            candidates.append(candidate)
+
+    # `shutil.which` returns only the first hit, which on Windows is the stub -- walk PATH entry by
+    # entry so a Git bash sitting behind System32 is still found.
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if directory:
+            offer(shutil.which("bash", path=directory))
+
+    roots = [os.environ[name] for name in GIT_FOR_WINDOWS_ROOTS if name in os.environ]
+    if "LOCALAPPDATA" in os.environ:
+        roots.append(ntpath.join(os.environ["LOCALAPPDATA"], "Programs"))
+    for root in roots:
+        for relative in GIT_FOR_WINDOWS_BASH:
+            offer(ntpath.join(root, relative))
+    return candidates
+
+
+@functools.lru_cache(maxsize=1)
+def posix_shell() -> str | None:
+    """The first candidate that actually parses a script, or None when the host has no POSIX shell.
+
+    The probe -- not the directory filter -- is what makes this honest: a shell that cannot parse
+    `:` can never be selected, so a stub in an unanticipated location still cannot produce a red.
+    That is not hypothetical. Windows also installs the WSL launcher as an App Execution Alias at
+    `%LOCALAPPDATA%\\Microsoft\\WindowsApps\\bash.exe`, which is not a system directory and so
+    survives the filter; only the probe rejects it and moves on to Git for Windows.
+    """
+    for candidate in posix_shell_candidates():
+        try:
+            probe = subprocess.run(
+                [candidate, "-n"],
+                input=":\n",
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
+def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [shell, "-n"],
+        input=script,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+
+
+def chroma_packed_build_script() -> str:
+    workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+    step = re.search(
+        r"(?ms)^      - name: Build and validate packed q4/q8 tiers\n"
+        r".*?^        run: \|\n(?P<script>.*?)^      - name:",
+        workflow,
+    )
+    if step is None:
+        raise AssertionError("missing workflow step: Build and validate packed q4/q8 tiers")
+    return textwrap.dedent(step.group("script"))
 
 
 def job_if_expression(workflow: str, job: str) -> str:
@@ -106,24 +210,48 @@ def privileged_real_weight_jobs(workflow: str) -> list[str]:
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def require_posix_shell(self) -> str:
+        shell = posix_shell()
+        if shell is None:
+            self.skipTest(
+                "no usable POSIX shell on this host: searched every PATH entry (excluding the "
+                "Windows System32 WSL stub) and the Git for Windows install locations, and none "
+                "parsed a trivial script. Install Git for Windows, or a bash, to run this gate."
+            )
+        return shell
+
     def test_chroma_packed_build_script_is_valid_bash(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        step = re.search(
-            r"(?ms)^      - name: Build and validate packed q4/q8 tiers\n"
-            r".*?^        run: \|\n(?P<script>.*?)^      - name:",
-            workflow,
-        )
-        self.assertIsNotNone(step)
-        script = textwrap.dedent(step.group("script"))
-        result = subprocess.run(
-            ["bash", "-n"],
-            input=script,
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            check=False,
-        )
+        script = chroma_packed_build_script()
+        # An empty or truncated capture would make `bash -n` pass vacuously, so pin the extraction
+        # to the payload this gate exists to check. Runs even on a host with no bash at all.
+        self.assertIn("for bits in 4 8; do", script)
+        self.assertIn('SC8777_BITS="$bits"', script)
+
+        result = bash_syntax_check(self.require_posix_shell(), script)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
+        # The positive case alone cannot tell "the script parses" from "the checker never fails".
+        # Feed the real script with an unterminated loop appended, through the same shell and the
+        # same code path: genuine drift in the workflow script must still turn this gate red.
+        shell = self.require_posix_shell()
+        result = bash_syntax_check(shell, chroma_packed_build_script() + "\nfor bits in 4 8; do\n")
+        self.assertNotEqual(result.returncode, 0, "bash -n accepted an unterminated loop")
+        self.assertNotEqual(result.stderr.strip(), "", "bash -n rejected the script silently")
+
+    def test_shell_resolution_never_selects_the_windows_wsl_stub(self) -> None:
+        # The sc-17196 regression: bare `bash` resolved to the WSL launcher, which exits non-zero
+        # before parsing anything. Asserted with ntpath so Linux CI covers it too.
+        stub = ntpath.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "bash.exe")
+        self.assertTrue(
+            in_windows_system_directory(stub),
+            "the resolver must recognise the Windows System32 WSL stub",
+        )
+        for candidate in posix_shell_candidates():
+            self.assertFalse(
+                in_windows_system_directory(candidate),
+                f"resolved a Windows system stub as a POSIX shell: {candidate}",
+            )
 
     def test_chroma_shipping_policy_cannot_dispatch_unsupported_t5_geometry(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
