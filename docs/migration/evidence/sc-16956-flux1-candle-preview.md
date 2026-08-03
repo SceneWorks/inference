@@ -51,8 +51,8 @@ for direct `emit_preview*` / `.emit*` calls. **Five sampler sites across the thr
 zero bespoke loops, zero dark sites.**
 
 Sites are cited by **file**, not by line — matching the catalog table below. The scanner re-derives the
-exact call positions from the shipped module tree on every run, so a line number here would carry no
-authority and would drift out of date the first time either file above it changed.
+exact call positions from the shipped module tree on every run, so a line number in this prose would
+carry no authority and would go stale the first time any of these files changed above the call.
 
 ### `candle-gen-flux` — `Denoise::Shared`, 3 sites, 3 lanes, 0 dark
 
