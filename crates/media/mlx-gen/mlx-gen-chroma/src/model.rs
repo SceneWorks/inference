@@ -977,18 +977,21 @@ mod tests {
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
         sensitive_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
-        sensitive_ffn_projections: &[(usize, mlx_gen_flux::T5FeedForwardProjection)],
+        secondary_bits: i32,
+        secondary_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_progressive_with_sensitive_surfaces_residuals(
+        t5.quantize_progressive_with_secondary_residuals(
             crate::convert::AUXILIARY_BITS,
             crate::convert::T5_RESIDUAL_BITS,
             crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+            secondary_bits,
             crate::convert::T5_GROUP_SIZE,
             sensitive_sublayers,
-            sensitive_ffn_projections,
+            false,
+            secondary_sublayers,
         )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
@@ -1110,32 +1113,22 @@ mod tests {
             (22, Attention),
             (13, Attention),
         ];
-        // Whole block-13 FFN produced the best strict-render result, while both additions and
-        // removals around that surface regressed. Calibrate its three packed projections directly
-        // to find the smallest subset that preserves the useful correction.
-        use mlx_gen_flux::T5FeedForwardProjection::{Wi0, Wi1, Wo};
-        let candidates = [
-            ("top10-block13-wi0", vec![Wi0]),
-            ("top10-block13-wi1", vec![Wi1]),
-            ("top10-block13-wo", vec![Wo]),
-            ("top10-block13-wi0-wi1", vec![Wi0, Wi1]),
-            ("top10-block13-wi0-wo", vec![Wi0, Wo]),
-            ("top10-block13-wi1-wo", vec![Wi1, Wo]),
-            ("top10-block13-wi0-wi1-wo", vec![Wi0, Wi1, Wo]),
-        ];
+        // Projection decomposition exactly reproduced the whole block-13 near-pass but did not
+        // cross the MAE gate. The earlier secondary-residual sweep always corrected the boundaries
+        // too, which regressed quality. Isolate a second packed correction to block-13 FFN alone.
+        let mut sensitive_sublayers = ranked[..10].to_vec();
+        sensitive_sublayers.push((13, FeedForward));
+        let secondary_sublayers = [(13, FeedForward)];
+        let candidates = [("block13-secondary-q4", 4), ("block13-secondary-q8", 8)];
 
-        for (policy, sensitive_ffn_projection_kinds) in candidates {
-            let sensitive_sublayers = ranked[..10].to_vec();
-            let sensitive_ffn_projections = sensitive_ffn_projection_kinds
-                .iter()
-                .map(|projection| (13, *projection))
-                .collect::<Vec<_>>();
+        for (policy, secondary_bits) in candidates {
             clear_cache();
             reset_peak_memory();
             let model = load_render_calibration_candidate(
                 &baseline_spec,
                 &sensitive_sublayers,
-                &sensitive_ffn_projections,
+                secondary_bits,
+                &secondary_sublayers,
             )
             .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
@@ -1168,14 +1161,15 @@ mod tests {
                             },
                         }))
                         .collect::<Vec<_>>(),
-                    "sensitiveFfnProjections": sensitive_ffn_projections
+                    "secondaryBits": secondary_bits,
+                    "secondaryBoundaries": false,
+                    "secondarySublayers": secondary_sublayers
                         .iter()
-                        .map(|(block, projection)| serde_json::json!({
+                        .map(|(block, sublayer)| serde_json::json!({
                             "block": block,
-                            "projection": match projection {
-                                mlx_gen_flux::T5FeedForwardProjection::Wi0 => "wi_0",
-                                mlx_gen_flux::T5FeedForwardProjection::Wi1 => "wi_1",
-                                mlx_gen_flux::T5FeedForwardProjection::Wo => "wo",
+                            "sublayer": match sublayer {
+                                mlx_gen_flux::T5Sublayer::Attention => "attention",
+                                mlx_gen_flux::T5Sublayer::FeedForward => "ffn",
                             },
                         }))
                         .collect::<Vec<_>>(),
