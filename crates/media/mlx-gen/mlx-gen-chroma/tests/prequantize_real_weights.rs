@@ -329,6 +329,19 @@ fn vae_output(
     root: &std::path::Path,
     quantize_at_load: Option<i32>,
 ) -> (Vec<f32>, Vec<f32>, usize) {
+    vae_output_at_geometry(root, quantize_at_load, 8, 64)
+}
+
+/// Exercise both VAE attention stacks at caller-selected geometry. Quality uses representative
+/// 8x8/64x64 tensors; the residency probe uses the minimum valid 1x1/8x8 tensors so activation
+/// allocation does not drown out the model-load transient the story is specifically measuring.
+fn vae_output_at_geometry(
+    root: &std::path::Path,
+    quantize_at_load: Option<i32>,
+    latent_edge: i32,
+    image_edge: i32,
+) -> (Vec<f32>, Vec<f32>, usize) {
+    assert!(latent_edge > 0 && image_edge >= 8);
     clear_cache();
     reset_peak_memory();
     let mut vae = mlx_gen_chroma::loader::load_vae(root).expect("VAE weights");
@@ -341,16 +354,16 @@ fn vae_output(
         mlx_gen_chroma::loader::quantize_vae_for_dense_source(&mut vae)
             .expect("load-time VAE quantization");
     }
-    let latent_values = (0..16 * 8 * 8)
+    let latent_values = (0..16 * latent_edge * latent_edge)
         .map(|i| ((i as f32 * 0.013).sin() * 0.5).clamp(-1.0, 1.0))
         .collect::<Vec<_>>();
-    let latents = Array::from_slice(&latent_values, &[1, 16, 1, 8, 8]);
+    let latents = Array::from_slice(&latent_values, &[1, 16, 1, latent_edge, latent_edge]);
     let decoded = vae.decode(&latents).expect("VAE decode");
     let decoded = decoded.as_dtype(Dtype::Float32).expect("VAE decode f32");
-    let image_values = (0..3 * 64 * 64)
+    let image_values = (0..3 * image_edge * image_edge)
         .map(|i| ((i as f32 * 0.007).cos() * 0.5).clamp(-1.0, 1.0))
         .collect::<Vec<_>>();
-    let image = Array::from_slice(&image_values, &[1, 3, 1, 64, 64]);
+    let image = Array::from_slice(&image_values, &[1, 3, 1, image_edge, image_edge]);
     let encoded = vae.encode(&image).expect("VAE encode");
     let encoded = encoded.as_dtype(Dtype::Float32).expect("VAE encode f32");
     eval([&decoded, &encoded]).expect("materialize VAE outputs");
@@ -750,7 +763,9 @@ fn packed_auxiliaries_match_load_time_quantization() {
 
 /// Emit one component/mode peak from a fresh test process. The hosted workflow invokes this probe
 /// three times for every component/mode and compares medians, avoiding allocator/order bias from
-/// measuring dense, load-time quantized, and packed residency in one Metal process.
+/// measuring dense, load-time quantized, and packed residency in one Metal process. VAE uses its
+/// minimum valid decode/encode geometry so the measurement isolates model residency and the
+/// dense-to-packed load transient instead of being dominated by unrelated image activations.
 #[test]
 #[ignore = "needs real Chroma weights and Apple Silicon MLX"]
 fn component_residency_probe() {
@@ -775,7 +790,7 @@ fn component_residency_probe() {
     };
     let peak = match component.as_str() {
         "t5" => t5_output(root, quantize_at_load).2,
-        "vae" => vae_output(root, quantize_at_load).2,
+        "vae" => vae_output_at_geometry(root, quantize_at_load, 1, 8).2,
         other => panic!("unsupported SC16462_RESIDENCY_COMPONENT {other}"),
     };
     println!(
