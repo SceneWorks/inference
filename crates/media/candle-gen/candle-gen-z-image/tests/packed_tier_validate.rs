@@ -20,13 +20,20 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, MemoryBudget,
-    MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryRunContext,
-    MemoryRunOutcome, MemorySelection, MemoryStrategy, MemoryStrategyParameters, Precision,
-    Progress, Quant, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadShape, LoadSpec,
+    MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
+    MemoryRunContext, MemoryRunOutcome, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
+    Precision, Progress, Quant, WeightsSource,
 };
 
 use candle_gen_z_image::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
+use sha2::{Digest, Sha256};
+
+fn deferred_spec(tier: PathBuf) -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(tier));
+    spec.load_shape = LoadShape::DeferredMaterialization;
+    spec
+}
 
 #[cfg(all(windows, feature = "cuda"))]
 mod host_memory {
@@ -188,6 +195,101 @@ fn assert_coherent(img: &Image, tag: &str) {
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Rgb8Delta {
+    maximum: u8,
+    mean: f64,
+    rmse: f64,
+}
+
+fn rgb8_delta(reference: &Image, candidate: &Image) -> Rgb8Delta {
+    assert_eq!(
+        (candidate.width, candidate.height),
+        (reference.width, reference.height)
+    );
+    assert_eq!(candidate.pixels.len(), reference.pixels.len());
+    let mut maximum = 0;
+    let mut total = 0u64;
+    let mut squared = 0u64;
+    for (&expected, &actual) in reference.pixels.iter().zip(&candidate.pixels) {
+        let delta = expected.abs_diff(actual);
+        maximum = maximum.max(delta);
+        total += u64::from(delta);
+        squared += u64::from(delta).pow(2);
+    }
+    let count = reference.pixels.len() as f64;
+    Rgb8Delta {
+        maximum,
+        mean: total as f64 / count,
+        rmse: (squared as f64 / count).sqrt(),
+    }
+}
+
+fn output_sha256(image: &Image) -> String {
+    format!("{:x}", Sha256::digest(&image.pixels))
+}
+
+fn assert_q4_cuda_ladder_parity(
+    reference: &Image,
+    candidate: &Image,
+    strategy: MemoryStrategy,
+    quant: Quant,
+    width: u32,
+    height: u32,
+    seed: u64,
+) {
+    assert_eq!(
+        quant,
+        Quant::Q4,
+        "SC-15815 quality evidence is tier-specific"
+    );
+    assert_eq!(seed, 15815, "SC-15815 quality evidence is seed-specific");
+    assert!(
+        [(256, 256), (1024, 1024)].contains(&(width, height)),
+        "SC-15815 quality evidence covers only the measured geometries"
+    );
+    assert_eq!((reference.width, reference.height), (width, height));
+    assert_eq!((candidate.width, candidate.height), (width, height));
+    let delta = rgb8_delta(reference, candidate);
+    eprintln!(
+        "ZIMAGE_SC15815_PARITY provider=z_image backend=candle_cuda tier=q4 strategy={strategy:?} geometry={width}x{height} seed={seed} max_rgb8={} mean_rgb8={:.9} rmse_rgb8={:.9} reference_sha256={} candidate_sha256={}",
+        delta.maximum,
+        delta.mean,
+        delta.rmse,
+        output_sha256(reference),
+        output_sha256(candidate),
+    );
+    match strategy {
+        MemoryStrategy::StagedResidency => assert_eq!(
+            candidate, reference,
+            "staged residency must preserve exact fixed-seed output"
+        ),
+        MemoryStrategy::BoundedDecode
+        | MemoryStrategy::BoundedAttention
+        | MemoryStrategy::BoundedTransformerResidency => {
+            // SC-15815 remeasured the intentional whole-frame f32 host decoder on the current
+            // artifact/backend pair. The exact 1024x1024 production result was max=10,
+            // mean=0.303418477, RMSE=0.610755335; the 256x256 control was 7/0.268534342/
+            // 0.551588689. These minimally rounded limits cover both measured geometries. This is
+            // not a family-wide tolerance: q8/bf16 and resident/staged remain governed by their own
+            // exact or separately measured contracts.
+            assert!(
+                delta.maximum <= 10,
+                "q4 host decode maximum RGB8 delta exceeded: {delta:?}"
+            );
+            assert!(
+                delta.mean <= 0.304,
+                "q4 host decode mean RGB8 delta exceeded: {delta:?}"
+            );
+            assert!(
+                delta.rmse <= 0.611,
+                "q4 host decode RGB8 RMSE exceeded: {delta:?}"
+            );
+        }
+        MemoryStrategy::Resident => panic!("resident is the parity reference, not a candidate"),
+    }
+}
+
 fn render_tier(env: &str, tag: &str) {
     let Ok(dir) = std::env::var(env) else {
         eprintln!("SKIP {tag}: set {env} to the packed tier subdir");
@@ -255,12 +357,14 @@ fn render_tier(env: &str, tag: &str) {
     }
 }
 
-fn render_base_ladder(
+fn render_base_ladder_at(
     generator: &dyn candle_gen::gen_core::Generator,
     strategy: MemoryStrategy,
     transformer_window_size: Option<u32>,
     quant: Quant,
     step_count: u32,
+    width: u32,
+    height: u32,
 ) -> (Image, Vec<f64>) {
     let contract = generator
         .memory_strategy_contract()
@@ -309,8 +413,8 @@ fn render_base_ladder(
         use_pid: false,
         has_phases: false,
         geometry: MemoryGeometry {
-            width: 256,
-            height: 256,
+            width,
+            height,
             batch: 1,
             frames: 1,
             reference_count: 0,
@@ -341,8 +445,8 @@ fn render_base_ladder(
     }
     let mut request = GenerationRequest {
         prompt: "a photo of a rusty robot holding a lit candle, cinematic lighting".into(),
-        width: 256,
-        height: 256,
+        width,
+        height,
         count: 1,
         seed: Some(15815),
         steps: Some(step_count),
@@ -380,6 +484,24 @@ fn render_base_ladder(
     (image, step_seconds)
 }
 
+fn render_base_ladder(
+    generator: &dyn candle_gen::gen_core::Generator,
+    strategy: MemoryStrategy,
+    transformer_window_size: Option<u32>,
+    quant: Quant,
+    step_count: u32,
+) -> (Image, Vec<f64>) {
+    render_base_ladder_at(
+        generator,
+        strategy,
+        transformer_window_size,
+        quant,
+        step_count,
+        256,
+        256,
+    )
+}
+
 #[test]
 #[ignore = "needs Z_IMAGE_BASE_PACKED_Q4 + CUDA; exercises every implemented production rung"]
 fn packed_base_all_rungs_preserve_fixed_seed_output() {
@@ -387,7 +509,7 @@ fn packed_base_all_rungs_preserve_fixed_seed_output() {
         std::env::var("Z_IMAGE_BASE_PACKED_Q4")
             .expect("set Z_IMAGE_BASE_PACKED_Q4 to the z-image q4 tier directory"),
     );
-    let spec = LoadSpec::new(WeightsSource::Dir(tier));
+    let spec = deferred_spec(tier);
     let generator = candle_gen_z_image::provider_registry()
         .unwrap()
         .load("z_image", &spec)
@@ -407,11 +529,50 @@ fn packed_base_all_rungs_preserve_fixed_seed_output() {
         (MemoryStrategy::BoundedTransformerResidency, Some(1)),
     ] {
         let (adapted, _) = render_base_ladder(generator.as_ref(), strategy, window, Quant::Q4, 1);
-        assert_eq!(
-            adapted, reference,
-            "real packed Z-Image output changed at {strategy:?} / window {window:?}"
-        );
+        assert_q4_cuda_ladder_parity(&reference, &adapted, strategy, Quant::Q4, 256, 256, 15815);
     }
+}
+
+#[test]
+#[ignore = "needs Z_IMAGE_BASE_PACKED_Q4 + CUDA; measures the production 1024 host-decode candidate"]
+fn packed_base_q4_production_host_decode_parity() {
+    let tier = PathBuf::from(
+        std::env::var("Z_IMAGE_BASE_PACKED_Q4")
+            .expect("set Z_IMAGE_BASE_PACKED_Q4 to the z-image q4 tier directory"),
+    );
+    let spec = deferred_spec(tier);
+    let generator = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
+        .expect("load packed Z-Image base");
+    let (reference, _) = render_base_ladder_at(
+        generator.as_ref(),
+        MemoryStrategy::Resident,
+        None,
+        Quant::Q4,
+        1,
+        1024,
+        1024,
+    );
+    assert_coherent(&reference, "base-q4-resident-1024");
+    let (adapted, _) = render_base_ladder_at(
+        generator.as_ref(),
+        MemoryStrategy::BoundedDecode,
+        None,
+        Quant::Q4,
+        1,
+        1024,
+        1024,
+    );
+    assert_q4_cuda_ladder_parity(
+        &reference,
+        &adapted,
+        MemoryStrategy::BoundedDecode,
+        Quant::Q4,
+        1024,
+        1024,
+        15815,
+    );
 }
 
 #[test]
@@ -421,7 +582,7 @@ fn packed_base_q8_rung_four_preserves_fixed_seed_output() {
         std::env::var("Z_IMAGE_BASE_PACKED_Q8")
             .expect("set Z_IMAGE_BASE_PACKED_Q8 to the z-image q8 tier directory"),
     );
-    let spec = LoadSpec::new(WeightsSource::Dir(tier));
+    let spec = deferred_spec(tier);
     let generator = candle_gen_z_image::provider_registry()
         .unwrap()
         .load("z_image", &spec)
@@ -499,7 +660,7 @@ fn profile_sidecar_preparation(tier: &std::path::Path, tag: &str) {
 fn profile_rung_four_steps(tier: &std::path::Path, quant: Quant, tag: &str) {
     use candle_gen::testkit::{used_mib, PeakSampler};
 
-    let spec = LoadSpec::new(WeightsSource::Dir(tier.to_path_buf()));
+    let spec = deferred_spec(tier.to_path_buf());
     let generator = candle_gen_z_image::provider_registry()
         .unwrap()
         .load("z_image", &spec)
