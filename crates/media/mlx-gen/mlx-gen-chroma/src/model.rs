@@ -976,26 +976,17 @@ mod tests {
 
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
-        secondary_bits: i32,
-        secondary_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
+        sensitive_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        let current_sensitive = [
-            (4, mlx_gen_flux::T5Sublayer::Attention),
-            (1, mlx_gen_flux::T5Sublayer::FeedForward),
-            (2, mlx_gen_flux::T5Sublayer::FeedForward),
-        ];
-        t5.quantize_progressive_with_secondary_residuals(
+        t5.quantize_progressive_with_sensitive_sublayers_residuals(
             crate::convert::AUXILIARY_BITS,
             crate::convert::T5_RESIDUAL_BITS,
             crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
-            secondary_bits,
             crate::convert::T5_GROUP_SIZE,
-            &current_sensitive,
-            true,
-            secondary_sublayers,
+            sensitive_sublayers,
         )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
@@ -1073,7 +1064,7 @@ mod tests {
     /// and pixel gates without rebuilding or copying a complete turnkey for every candidate.
     #[test]
     #[ignore = "needs the shipped Chroma Base Q4 tier and Apple Silicon MLX"]
-    fn packed_t5_secondary_residual_sweep() {
+    fn packed_t5_render_combination_sweep() {
         let baseline = PathBuf::from(
             std::env::var("SC16462_BASELINE")
                 .expect("SC16462_BASELINE must point to the immutable shipped Base Q4 tier"),
@@ -1089,40 +1080,49 @@ mod tests {
         drop(reference_model);
         clear_cache();
 
-        let block4_attention = [(4, mlx_gen_flux::T5Sublayer::Attention)];
-        let current_sensitive = [
-            (4, mlx_gen_flux::T5Sublayer::Attention),
-            (1, mlx_gen_flux::T5Sublayer::FeedForward),
-            (2, mlx_gen_flux::T5Sublayer::FeedForward),
-        ];
-        let candidates = [
-            ("secondary-q8-boundaries", 8, &[][..]),
-            (
-                "secondary-q8-boundaries-block4-attention",
-                8,
-                &block4_attention[..],
-            ),
-            (
-                "secondary-q4-boundaries-current-sensitive",
-                4,
-                &current_sensitive[..],
-            ),
-            (
-                "secondary-q8-boundaries-current-sensitive",
-                8,
-                &current_sensitive[..],
-            ),
-        ];
+        use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
 
-        for (policy, secondary_bits, secondary_sublayers) in candidates {
+        // The first ten entries are the best strict-render prefix from the preceding exact sweep.
+        // The remaining entries preserve the individual-sensitivity ordering so this bounded
+        // search can test both single additions and cumulative expansion without exploring the
+        // full combinatorial surface.
+        let ranked = [
+            (4, Attention),
+            (1, FeedForward),
+            (2, FeedForward),
+            (18, FeedForward),
+            (15, Attention),
+            (1, Attention),
+            (16, Attention),
+            (14, Attention),
+            (18, Attention),
+            (19, Attention),
+            (14, FeedForward),
+            (20, FeedForward),
+            (13, FeedForward),
+            (16, FeedForward),
+            (22, FeedForward),
+            (23, Attention),
+            (21, Attention),
+            (23, FeedForward),
+            (22, Attention),
+            (13, Attention),
+        ];
+        let mut candidates = Vec::new();
+        for (rank, candidate) in ranked[10..15].iter().copied().enumerate() {
+            let mut surface = ranked[..10].to_vec();
+            surface.push(candidate);
+            candidates.push((format!("top10-plus-rank{}", rank + 11), surface));
+        }
+        for prefix in [12, 15, 20] {
+            candidates.push((format!("top{prefix}"), ranked[..prefix].to_vec()));
+        }
+
+        for (policy, sensitive_sublayers) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(
-                &baseline_spec,
-                secondary_bits,
-                secondary_sublayers,
-            )
-            .expect("load render sensitivity candidate");
+            let model = load_render_calibration_candidate(&baseline_spec, &sensitive_sublayers)
+                .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
             drop(model);
@@ -1142,9 +1142,8 @@ mod tests {
                 "SC16462_RENDER_SENSITIVITY {}",
                 serde_json::json!({
                     "policy": policy,
-                    "secondaryBits": secondary_bits,
-                    "secondaryBoundaries": true,
-                    "secondarySublayers": secondary_sublayers
+                    "sensitiveResidualBits": crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+                    "sensitiveSublayers": sensitive_sublayers
                         .iter()
                         .map(|(block, sublayer)| serde_json::json!({
                             "block": block,

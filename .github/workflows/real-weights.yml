@@ -396,15 +396,15 @@ jobs:
           test -d "$CHROMA_SNAPSHOT/q4/text_encoder"
           test -d "$CHROMA_SNAPSHOT/q4/vae"
           echo "SC16462_BASELINE=$CHROMA_SNAPSHOT/q4" >> "$GITHUB_ENV"
-      - name: Calibrate the second packed T5 residual
+      - name: Calibrate packed T5 residual combinations
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-render-sensitivity
         run: |
           set -o pipefail
           cargo test --locked --release -p mlx-gen-chroma \
-            model::tests::packed_t5_secondary_residual_sweep -- --ignored --exact --nocapture \
+            model::tests::packed_t5_render_combination_sweep -- --ignored --exact --nocapture \
             --test-threads=1 | tee "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log"
-          test "$(grep -c 'SC16462_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log")" = 4
+          test "$(grep -c 'SC16462_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-render-sensitivity.log")" = 8
       - name: Upload render sensitivity evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
