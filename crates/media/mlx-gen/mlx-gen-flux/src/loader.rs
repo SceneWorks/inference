@@ -46,9 +46,28 @@ pub fn load_t5_tokenizer(root: &Path, variant: FluxVariant) -> Result<TextTokeni
     load_tokenizer(root, FluxTokenizerKind::T5, variant)
 }
 
+/// Load T5 tokenization from an already-admitted exact snapshot file.
+pub(crate) fn load_t5_tokenizer_from_file(
+    path: &Path,
+    variant: FluxVariant,
+) -> Result<TextTokenizer> {
+    let kind = FluxTokenizerKind::T5;
+    let config = TokenizerConfig {
+        max_length: kind.max_length(variant),
+        pad_token_id: kind.pad_token_id(),
+        chat_template: ChatTemplate::None,
+        pad_to_max_length: true,
+    };
+    Ok(TextTokenizer::from_file(path, config)?)
+}
+
 pub fn load_clip_encoder(root: &Path) -> Result<ClipTextEncoder> {
     let w = Weights::from_dir(root.join("text_encoder"))?;
     ClipTextEncoder::from_weights(&w, "")
+}
+
+pub(crate) fn load_clip_encoder_from_file(path: &Path) -> Result<ClipTextEncoder> {
+    ClipTextEncoder::from_weights(&Weights::from_file(path)?, "")
 }
 
 pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
@@ -56,8 +75,22 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
     T5TextEncoder::from_weights(&w, "")
 }
 
+pub(crate) fn load_t5_encoder_from_file(path: &Path) -> Result<T5TextEncoder> {
+    T5TextEncoder::from_weights(&Weights::from_file(path)?, "")
+}
+
 pub fn load_transformer(root: &Path, variant: FluxVariant) -> Result<FluxTransformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
+    FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+}
+
+/// Load the FLUX.1 transformer from an already-admitted exact single-file source. Deferred block
+/// residency must never rediscover its transformer through a directory scan after inventory pinning.
+pub(crate) fn load_transformer_from_file(
+    path: &Path,
+    variant: FluxVariant,
+) -> Result<FluxTransformer> {
+    let w = Weights::from_file(path)?;
     FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
 }
 
@@ -122,6 +155,10 @@ pub fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
 
 pub fn load_vae(root: &Path) -> Result<Vae> {
     load_vae_from_weights(Weights::from_dir(root.join("vae"))?)
+}
+
+pub(crate) fn load_vae_from_file(path: &Path) -> Result<Vae> {
+    load_vae_from_weights(Weights::from_file(path)?)
 }
 
 pub fn load_vae_from_source(source: &WeightsSource) -> Result<Vae> {
