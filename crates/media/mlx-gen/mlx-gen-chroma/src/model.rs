@@ -1108,18 +1108,20 @@ mod tests {
             (22, Attention),
             (13, Attention),
         ];
-        // The preceding run found rank 13 (block-13 FFN) was the only single addition within
-        // 0.04 MAE of the strict gate. Pair it with every other rank 11..20 candidate so the next
-        // search remains bounded while accounting for the observed non-monotonic interactions.
+        // The preceding pair search did not improve on top10 + rank13 (block-13 FFN). Since the
+        // render error is non-monotonic, remove each original top-10 entry once while retaining
+        // rank13. Every candidate is smaller than the near-pass surface and tests whether one of
+        // its interactions is masking the block-13 correction.
         let mut candidates = Vec::new();
-        for rank in 11..=20 {
-            if rank == 13 {
-                continue;
-            }
-            let mut surface = ranked[..10].to_vec();
+        for removed_rank in 1..=10 {
+            let mut surface = ranked[..10]
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != removed_rank - 1)
+                .map(|(_, selected)| *selected)
+                .collect::<Vec<_>>();
             surface.push(ranked[12]);
-            surface.push(ranked[rank - 1]);
-            candidates.push((format!("top10-rank13-plus-rank{rank}"), surface));
+            candidates.push((format!("top10-rank13-minus-rank{removed_rank}"), surface));
         }
 
         for (policy, sensitive_sublayers) in candidates {
