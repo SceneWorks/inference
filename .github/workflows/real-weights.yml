@@ -418,9 +418,9 @@ jobs:
           if-no-files-found: error
           path: ${{ runner.temp }}/chroma-sc16462-t5-sensitivity.log
 
-  # SC-16462 bounded diagnostic: the block-20-anchored Q8 pair sweep found blocks 20+0 closest to
-  # strict quality while retaining a below-dense peak. Add every other non-production attention
-  # block exactly once along that evidence-ranked chain. This calibration-only lane cannot publish.
+  # SC-16462 bounded diagnostic: the evidence-ranked Q8 triple sweep found blocks 20+0+21 closest
+  # by strict MAE while retaining a below-dense peak. Add every other non-production attention
+  # block exactly once along that chain. This calibration-only lane cannot publish.
   mlx-chroma-q8-render-sensitivity:
     name: Chroma Q8 packed T5 render sensitivity
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-q8-render-sensitivity'
@@ -455,15 +455,15 @@ jobs:
           test -d "$CHROMA_SNAPSHOT/q8/text_encoder"
           test -d "$CHROMA_SNAPSHOT/q8/vae"
           echo "SC16462_BASELINE=$CHROMA_SNAPSHOT/q8" >> "$GITHUB_ENV"
-      - name: Evaluate Q8 attention affine triples
+      - name: Evaluate Q8 attention affine quadruples
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-q8-render-sensitivity
         run: |
           set -o pipefail
           cargo test --locked --release -p mlx-gen-chroma \
-            model::tests::packed_t5_q8_attention_affine_triple_sweep -- --ignored --exact --nocapture \
+            model::tests::packed_t5_q8_attention_affine_quadruple_sweep -- --ignored --exact --nocapture \
             --test-threads=1 | tee "$RUNNER_TEMP/chroma-sc16462-q8-render-sensitivity.log"
-          test "$(grep -c 'SC16462_Q8_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-q8-render-sensitivity.log")" = 21
+          test "$(grep -c 'SC16462_Q8_RENDER_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-q8-render-sensitivity.log")" = 20
       - name: Upload Q8 render sensitivity evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
