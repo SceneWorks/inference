@@ -1,21 +1,37 @@
-//! SC-15800: Lens' measured rung-4 production contract.
+//! Lens / Lens-Turbo MLX shared image-memory ladder.
 //!
-//! Dense BF16 is the only advertised tier: on the measured Lens-Turbo request, a one-block text
-//! encoder window reduced peak MLX residency from 80.084 GiB to 10.037 GiB. Q4 reduced the isolated
-//! conditioning peak but did not reduce the full request peak, so it deliberately remains Missing.
+//! SC-15800's dense-bf16 text-encoder-only result remains an independent legacy measurement. The
+//! full ladder uses a new identity and does not relabel that result as DiT, Both, Q4, decode, or
+//! attention evidence.
 
 use mlx_gen::gen_core::{
     Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 #[cfg(test)]
 use mlx_gen::{gen_core::MemoryGeometry, GenerationRequest};
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "lens-text-encoder-window-2026-07-31-v1";
+pub const LEGACY_TEXT_ENCODER_FINGERPRINT: &str = "lens-text-encoder-window-2026-07-31-v1";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "lens-mlx-shared-ladder-2026-08-03-v1";
 pub const TEXT_ENCODER_WINDOW: u32 = 1;
+pub const DECODE_TILE_EDGE: u32 = 512;
+pub const DECODE_OVERLAP: u32 = 128;
+pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
+
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new_core(provider_id, [DECODE_TILE_EDGE], DECODE_OVERLAP)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalibrationRoute {
+    FullQ4Lens,
+    LegacyDenseLensTurboTextEncoder,
+    Unmeasured,
+}
 
 /// The exact load shape for which the measured production rung is executable and beneficial.
 pub(crate) fn is_streamable_spec(spec: &LoadSpec) -> bool {
@@ -28,11 +44,73 @@ pub(crate) fn is_streamable_spec(spec: &LoadSpec) -> bool {
         && spec.pid.is_none()
 }
 
+fn base_streamable(spec: &LoadSpec) -> Option<&std::path::Path> {
+    if spec.load_shape != LoadShape::DeferredMaterialization
+        || spec.precision != Precision::Bf16
+        || spec.pid.is_some()
+    {
+        return None;
+    }
+    match &spec.weights {
+        WeightsSource::Dir(root) => Some(root),
+        WeightsSource::File(_) => None,
+    }
+}
+
+fn calibration_route(
+    provider_id: &str,
+    spec: &LoadSpec,
+    text_streamable: bool,
+    dit_streamable: bool,
+) -> CalibrationRoute {
+    if provider_id == "lens"
+        && spec.quantize == Some(mlx_gen::Quant::Q4)
+        && spec.adapters.is_empty()
+        && text_streamable
+        && dit_streamable
+    {
+        CalibrationRoute::FullQ4Lens
+    } else if provider_id == "lens_turbo" && is_streamable_spec(spec) {
+        CalibrationRoute::LegacyDenseLensTurboTextEncoder
+    } else {
+        CalibrationRoute::Unmeasured
+    }
+}
+
+pub(crate) fn can_stream_text(spec: &LoadSpec) -> CoreResult<bool> {
+    let Some(root) = base_streamable(spec) else {
+        return Ok(false);
+    };
+    Ok(match spec.quantize {
+        Some(quant) => {
+            !mlx_gen::quant::needs_load_time_quant(root, "text_encoder", quant.bits(), "lens")?
+        }
+        None => true,
+    })
+}
+
+pub(crate) fn can_stream_dit(spec: &LoadSpec) -> CoreResult<bool> {
+    let Some(root) = base_streamable(spec) else {
+        return Ok(false);
+    };
+    if !spec.adapters.is_empty() {
+        return Ok(false);
+    }
+    Ok(match spec.quantize {
+        Some(quant) => {
+            !mlx_gen::quant::needs_load_time_quant(root, "transformer", quant.bits(), "lens")?
+        }
+        None => true,
+    })
+}
+
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    let streamable = is_streamable_spec(spec);
+    let text_streamable = can_stream_text(spec)?;
+    let dit_streamable = can_stream_dit(spec)?;
+    let calibration_route = calibration_route(provider_id, spec, text_streamable, dit_streamable);
     let footprint = crate::registry::component_footprint(spec)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
@@ -44,24 +122,38 @@ pub fn memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    let mut formula_variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::TransformerWindowSize,
+    ];
+    if calibration_route != CalibrationRoute::LegacyDenseLensTurboTextEncoder {
+        formula_variables.extend([
+            MemoryFormulaVariable::DecodeTileArea,
+            MemoryFormulaVariable::AttentionChunkSize,
+        ]);
+    }
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
             MemoryPhase::Conditioning,
             MemoryPhase::Denoise,
             MemoryPhase::Decode,
         ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+        variables: formula_variables,
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
-        spec.load_shape,
-    ));
+    contract.calibration = match calibration_route {
+        CalibrationRoute::FullQ4Lens => Some(MemoryCalibrationIdentity::new(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        )),
+        CalibrationRoute::LegacyDenseLensTurboTextEncoder => Some(MemoryCalibrationIdentity::new(
+            LEGACY_TEXT_ENCODER_FINGERPRINT,
+            spec.load_shape,
+        )),
+        CalibrationRoute::Unmeasured => None,
+    };
     contract.asset_facts.base_bytes = footprint
         .text_encoder
         .saturating_add(footprint.dit)
@@ -69,26 +161,79 @@ pub fn memory_strategy_contract(
     contract.asset_facts.conditioning_bytes = footprint.text_encoder;
     contract.asset_facts.transformer_bytes = footprint.dit;
     contract.asset_facts.decoder_bytes = footprint.vae;
-    contract.lifecycle = MemoryLifecycleCapabilities {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        synchronized_phase_release: true,
-        transformer_window_materialization: streamable,
-        ..Default::default()
+    contract.lifecycle = match calibration_route {
+        CalibrationRoute::LegacyDenseLensTurboTextEncoder => MemoryLifecycleCapabilities {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            synchronized_phase_release: true,
+            transformer_window_materialization: true,
+            ..Default::default()
+        },
+        CalibrationRoute::FullQ4Lens | CalibrationRoute::Unmeasured => {
+            MemoryLifecycleCapabilities {
+                phases: vec![
+                    MemoryPhase::Conditioning,
+                    MemoryPhase::Denoise,
+                    MemoryPhase::Decode,
+                ],
+                synchronized_phase_release: true,
+                decode_tiling: true,
+                attention_chunking: true,
+                transformer_window_materialization: text_streamable || dit_streamable,
+            }
+        }
     };
-    if streamable {
-        let capability = contract
-            .strategies
-            .iter_mut()
-            .find(|capability| capability.strategy == MemoryStrategy::BoundedTransformerResidency)
-            .expect("compatibility contract contains every strategy");
-        capability.support = MemoryStrategySupport::Implemented;
-        capability.parameters.transformer_window_sizes = vec![TEXT_ENCODER_WINDOW];
-        capability.parameters.transformer_window_components =
-            vec![TransformerComponent::TextEncoder];
+    for capability in &mut contract.strategies {
+        match capability.strategy {
+            MemoryStrategy::Resident => {
+                capability.support = MemoryStrategySupport::Implemented;
+            }
+            MemoryStrategy::StagedResidency
+                if calibration_route == CalibrationRoute::FullQ4Lens =>
+            {
+                capability.support = MemoryStrategySupport::Implemented;
+            }
+            MemoryStrategy::BoundedDecode if calibration_route == CalibrationRoute::FullQ4Lens => {
+                capability.support = MemoryStrategySupport::Implemented;
+                capability.parameters.decode_tile_edges = vec![DECODE_TILE_EDGE];
+                capability.parameters.decode_overlaps = vec![DECODE_OVERLAP];
+            }
+            MemoryStrategy::BoundedAttention
+                if calibration_route == CalibrationRoute::FullQ4Lens =>
+            {
+                capability.support = MemoryStrategySupport::Implemented;
+                capability.parameters.attention_chunk_sizes = vec![ATTENTION_CHUNK_SIZE];
+            }
+            MemoryStrategy::BoundedTransformerResidency
+                if calibration_route == CalibrationRoute::FullQ4Lens =>
+            {
+                capability.support = MemoryStrategySupport::Implemented;
+                capability.parameters.transformer_window_sizes = vec![TEXT_ENCODER_WINDOW];
+                capability.parameters.transformer_window_components =
+                    vec![TransformerComponent::Both];
+            }
+            MemoryStrategy::BoundedTransformerResidency
+                if calibration_route == CalibrationRoute::LegacyDenseLensTurboTextEncoder =>
+            {
+                capability.support = MemoryStrategySupport::Implemented;
+                capability.parameters.transformer_window_sizes = vec![TEXT_ENCODER_WINDOW];
+                capability.parameters.transformer_window_components =
+                    vec![TransformerComponent::TextEncoder];
+            }
+            _ => {}
+        }
+    }
+    if calibration_route == CalibrationRoute::FullQ4Lens {
+        contract.additional_prerequisites.push((
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        ));
     }
     Ok(contract)
 }
@@ -100,6 +245,28 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
+        if context.use_pid
+            || contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
+        {
+            let routes = decode_routes(&contract.provider_id)?;
+            routes
+                .validate(
+                    context.use_pid,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                )
+                .map_err(|reason| {
+                    let detail = if context.use_pid {
+                        "the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay"
+                    } else {
+                        "Lens decode route validation failed"
+                    };
+                    CoreError::Unsupported(format!(
+                        "{}: {detail}: {reason}",
+                        contract.provider_id
+                    ))
+                })?;
+        }
         if context.use_pid {
             return Err(CoreError::Unsupported(format!(
                 "{}: the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay",
@@ -136,6 +303,10 @@ pub(crate) fn registered_valid_fixture(
     if !strategy.is_optimized() {
         return Ok(Vec::new());
     }
+    let full_ladder = contract
+        .calibration
+        .as_ref()
+        .is_some_and(|identity| identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT);
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
@@ -148,7 +319,7 @@ pub(crate) fn registered_valid_fixture(
             mode: mlx_gen::gen_core::MemoryMode::TextToImage,
             reference_count: 0,
             use_pid: false,
-            has_phases: false,
+            has_phases: full_ladder && contract.engages(strategy, MemoryStrategy::StagedResidency),
             overlay: None,
         },
     )?;
@@ -201,18 +372,31 @@ fn begin_request_with_cleanup(
     {
         return Err(CoreError::Unsupported(reason));
     }
+    let full_ladder = contract
+        .calibration
+        .as_ref()
+        .is_some_and(|identity| identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT);
+    let component = context.selection.parameters.window_component();
+    let routes = decode_routes(provider_id)?;
+    let transformer_blocks = match component {
+        TransformerComponent::TextEncoder => crate::config::GptOssConfig::lens().num_layers,
+        TransformerComponent::Dit | TransformerComponent::Both => {
+            crate::dit::LensDitConfig::lens().num_layers
+        }
+    };
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
-        crate::config::GptOssConfig::lens().num_layers,
-        |_use_pid, _edge, _overlap| {
-            Err(CoreError::Unsupported(
-                "lens: bounded decode is not implemented".into(),
-            ))
+        transformer_blocks,
+        move |use_pid, edge, overlap| {
+            routes
+                .validate(use_pid, Some(edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
         },
     )?;
+    config.attention_chunk_size = full_ladder.then_some(ATTENTION_CHUNK_SIZE);
     config.transformer_window = contract
         .engages(
             context.selection.strategy,
@@ -238,7 +422,7 @@ mod tests {
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn spec() -> (std::path::PathBuf, LoadSpec) {
+    fn fixture(bits: Option<i32>) -> (std::path::PathBuf, LoadSpec) {
         let root = std::env::temp_dir().join(format!(
             "mlx_gen_lens_sc15800_{}_{}",
             std::process::id(),
@@ -249,92 +433,175 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("model.safetensors"), [0_u8; 8]).unwrap();
         }
-        std::fs::write(
-            root.join("text_encoder/config.json"),
-            r#"{"dtype":"bfloat16"}"#,
-        )
-        .unwrap();
+        for component in ["text_encoder", "transformer"] {
+            let config = match bits {
+                Some(bits) => {
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#)
+                }
+                None => r#"{"dtype":"bfloat16"}"#.to_owned(),
+            };
+            std::fs::write(root.join(component).join("config.json"), config).unwrap();
+        }
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
-            .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
         (root, spec)
     }
 
+    fn dense_legacy_spec() -> (std::path::PathBuf, LoadSpec) {
+        let (root, spec) = fixture(None);
+        (root, spec.with_offload_policy(OffloadPolicy::Sequential))
+    }
+
+    fn packed_spec(bits: i32, quant: Quant) -> (std::path::PathBuf, LoadSpec) {
+        let (root, mut spec) = fixture(Some(bits));
+        spec.quantize = Some(quant);
+        (root, spec)
+    }
+
+    fn assert_unmeasured(contract: &MemoryProviderContract) {
+        assert!(contract.calibration.is_none());
+        for strategy in [
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ] {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Missing,
+                "{strategy:?} must not inherit unmeasured evidence"
+            );
+        }
+    }
+
     #[test]
-    fn dense_sequential_deferred_contract_advertises_only_the_measured_scope() {
-        let (root, spec) = spec();
-        let contract = memory_strategy_contract("lens_turbo", &spec).unwrap();
+    fn exact_q4_lens_route_publishes_the_measured_full_ladder() {
+        let (root, spec) = packed_spec(4, Quant::Q4);
+        let contract = memory_strategy_contract("lens", &spec).unwrap();
         assert!(contract.conformance_errors().is_empty());
-        let rung = contract
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
+        assert_eq!(decode.support, MemoryStrategySupport::Implemented);
+        assert_eq!(decode.parameters.decode_tile_edges, vec![DECODE_TILE_EDGE]);
+        assert_eq!(decode.parameters.decode_overlaps, vec![DECODE_OVERLAP]);
+        let attention = contract
+            .capability(MemoryStrategy::BoundedAttention)
+            .unwrap();
+        assert_eq!(attention.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            attention.parameters.attention_chunk_sizes,
+            vec![ATTENTION_CHUNK_SIZE]
+        );
+        let window = contract
             .capability(MemoryStrategy::BoundedTransformerResidency)
             .unwrap();
-        assert_eq!(rung.support, MemoryStrategySupport::Implemented);
+        assert_eq!(window.support, MemoryStrategySupport::Implemented);
         assert_eq!(
-            rung.parameters.transformer_window_sizes,
-            vec![TEXT_ENCODER_WINDOW]
+            window.parameters.transformer_window_components,
+            vec![TransformerComponent::Both]
         );
-        assert_eq!(
-            rung.parameters.transformer_window_components,
-            vec![TransformerComponent::TextEncoder]
-        );
+        let measured = rung_four_context().selection;
+        contract
+            .validate_selection(&measured)
+            .expect("the measured Both scope must remain selectable");
+        for unmeasured in [TransformerComponent::TextEncoder, TransformerComponent::Dit] {
+            let mut selection = measured;
+            selection.parameters.transformer_window_component = Some(unmeasured);
+            let error = contract
+                .validate_selection(&selection)
+                .expect_err("an unmeasured component scope must remain unpublished");
+            assert!(
+                error.to_string().contains("transformer_window_component")
+                    && error.to_string().contains("[Both]"),
+                "the refusal must identify the unadvertised component: {error}"
+            );
+        }
+        assert!(contract.lifecycle.decode_tiling);
+        assert!(contract.lifecycle.attention_chunking);
+        assert!(contract.lifecycle.transformer_window_materialization);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn unmeasured_numeric_or_loader_shapes_do_not_advertise_rung_four() {
-        let (root, base) = spec();
-        let deferred_contract = memory_strategy_contract("lens_turbo", &base).unwrap();
-        let mut specs = Vec::new();
-        let mut quantized = base.clone();
-        quantized.quantize = Some(Quant::Q4);
-        specs.push(quantized);
-        let mut eager = base.clone();
-        eager.load_shape = LoadShape::EagerMaterialization;
-        let eager_contract = memory_strategy_contract("lens_turbo", &eager).unwrap();
+    fn legacy_dense_lens_turbo_te_only_identity_remains_separate() {
+        let (root, spec) = dense_legacy_spec();
+        let contract = memory_strategy_contract("lens_turbo", &spec).unwrap();
+        assert!(contract.conformance_errors().is_empty());
         assert_eq!(
-            deferred_contract.calibration.as_ref().unwrap().fingerprint,
-            eager_contract.calibration.as_ref().unwrap().fingerprint
+            contract.calibration.as_ref().unwrap().fingerprint,
+            LEGACY_TEXT_ENCODER_FINGERPRINT
         );
-        assert_ne!(
-            deferred_contract.calibration.as_ref().unwrap().load_shape,
-            eager_contract.calibration.as_ref().unwrap().load_shape
+        let window = contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .unwrap();
+        assert_eq!(window.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            window.parameters.transformer_window_components,
+            vec![TransformerComponent::TextEncoder]
         );
-        specs.push(eager);
-        let mut resident = base;
-        resident.offload_policy = OffloadPolicy::Resident;
-        specs.push(resident);
-        let mut fp32 = specs[0].clone();
-        fp32.quantize = None;
-        fp32.precision = Precision::Fp32;
-        specs.push(fp32);
-        let mut adapted = specs[0].clone();
-        adapted.quantize = None;
+        assert!(!contract.lifecycle.decode_tiling);
+        assert!(!contract.lifecycle.attention_chunking);
+        let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &contract.formula else {
+            panic!("legacy Lens-Turbo calibration must retain its phase envelope")
+        };
+        assert!(!variables.contains(&MemoryFormulaVariable::DecodeTileArea));
+        assert!(!variables.contains(&MemoryFormulaVariable::AttentionChunkSize));
+        for strategy in [
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+        ] {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Missing
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn provider_tier_and_load_shape_mutations_do_not_fan_out_evidence() {
+        let (q4_root, q4) = packed_spec(4, Quant::Q4);
+        assert_unmeasured(&memory_strategy_contract("lens_turbo", &q4).unwrap());
+
+        let (q8_root, q8) = packed_spec(8, Quant::Q8);
+        assert_unmeasured(&memory_strategy_contract("lens", &q8).unwrap());
+
+        let (dense_root, dense) = dense_legacy_spec();
+        assert_unmeasured(&memory_strategy_contract("lens", &dense).unwrap());
+
+        let mut eager = q4.clone();
+        eager.load_shape = LoadShape::EagerMaterialization;
+        assert_unmeasured(&memory_strategy_contract("lens", &eager).unwrap());
+
+        let mut adapted = q4.clone();
         adapted.adapters.push(AdapterSpec::new(
-            root.join("adapter.safetensors"),
+            q4_root.join("adapter.safetensors"),
             1.0,
             AdapterKind::Lora,
         ));
-        specs.push(adapted);
-        let mut pid = specs[0].clone();
-        pid.quantize = None;
-        pid.pid = Some(PidWeights {
-            checkpoint: WeightsSource::File(root.join("pid.safetensors")),
-            gemma: WeightsSource::Dir(root.join("gemma")),
-        });
-        specs.push(pid);
+        assert_unmeasured(&memory_strategy_contract("lens", &adapted).unwrap());
 
-        for spec in specs {
-            let contract = memory_strategy_contract("lens_turbo", &spec).unwrap();
-            assert!(contract.conformance_errors().is_empty());
-            assert!(matches!(
-                contract
-                    .capability(MemoryStrategy::BoundedTransformerResidency)
-                    .map(|capability| &capability.support),
-                Some(MemoryStrategySupport::Missing)
-            ));
-            assert!(!contract.lifecycle.transformer_window_materialization);
+        let mut pid = q4.clone();
+        pid.pid = Some(PidWeights {
+            checkpoint: WeightsSource::File(q4_root.join("pid.safetensors")),
+            gemma: WeightsSource::Dir(q4_root.join("gemma")),
+        });
+        assert_unmeasured(&memory_strategy_contract("lens", &pid).unwrap());
+
+        for root in [q4_root, q8_root, dense_root] {
+            std::fs::remove_dir_all(root).ok();
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     fn rung_four_context() -> MemoryRunContext {
@@ -342,13 +609,15 @@ mod tests {
             selection: MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    decode_tile_edge: Some(DECODE_TILE_EDGE),
+                    decode_overlap: Some(DECODE_OVERLAP),
+                    attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                     transformer_window_size: Some(TEXT_ENCODER_WINDOW),
-                    transformer_window_component: Some(TransformerComponent::TextEncoder),
-                    ..Default::default()
+                    transformer_window_component: Some(TransformerComponent::Both),
                 },
                 tier: MemoryNumericTier {
                     precision: Precision::Bf16,
-                    quant: None,
+                    quant: Some(Quant::Q4),
                     component_precision_floors: &[],
                 },
             },
@@ -381,10 +650,10 @@ mod tests {
 
     #[test]
     fn selected_contract_scope_reaches_the_generation_request_and_pid_fails_closed() {
-        let (root, spec) = spec();
-        let contract = memory_strategy_contract("lens_turbo", &spec).unwrap();
+        let (root, spec) = packed_spec(4, Quant::Q4);
+        let contract = memory_strategy_contract("lens", &spec).unwrap();
         let context = rung_four_context();
-        let mut scope = begin_request("lens_turbo", &contract, Precision::Bf16, None, &context)
+        let mut scope = registered_begin_request("lens", &spec, &contract, &context)
             .unwrap()
             .unwrap();
         let mut request = GenerationRequest {
@@ -395,20 +664,35 @@ mod tests {
         };
         scope.configure_request(&mut request).unwrap();
         let memory = request.memory.expect("rung 4 configures request memory");
+        assert!(memory.stage_residency);
+        assert!(memory.tile_vae_decode);
+        assert!(memory.chunk_attention);
         assert!(memory.stream_transformer_blocks);
         assert_eq!(memory.transformer_window_size, Some(TEXT_ENCODER_WINDOW));
         assert_eq!(
             memory.transformer_window_component,
-            Some(TransformerComponent::TextEncoder)
+            Some(TransformerComponent::Both)
         );
-        // This is a tensor-free contract test. The scope's production Drop performs a Metal barrier,
-        // which is exercised by the full macOS suite but is intentionally unavailable in headless CI.
-        std::mem::forget(scope);
+        // Registry conformance uses the same tensor-free scope cleanup exercised here; the Device
+        // cleanup path is covered by the real-Metal runner.
+        drop(scope);
+
+        let mut unmeasured_native = context.clone();
+        unmeasured_native.selection.parameters.decode_tile_edge = Some(640);
+        assert!(matches!(
+            safety_check(
+                &contract,
+                Precision::Bf16,
+                Some(Quant::Q4),
+                &unmeasured_native
+            ),
+            MemorySafetyDecision::Reject { .. }
+        ));
 
         let mut pid = context;
         pid.use_pid = true;
         assert!(matches!(
-            safety_check(&contract, Precision::Bf16, None, &pid),
+            safety_check(&contract, Precision::Bf16, Some(Quant::Q4), &pid),
             MemorySafetyDecision::Reject { reason } if reason.contains("native VAE decode only")
         ));
         std::fs::remove_dir_all(root).ok();

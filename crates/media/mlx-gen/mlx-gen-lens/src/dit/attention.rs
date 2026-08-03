@@ -11,6 +11,7 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -108,6 +109,33 @@ impl LensJointAttention {
         txt_sin: &Array,
         mask: Option<&Array>,
     ) -> Result<(Array, Array)> {
+        self.forward_with_attention(
+            img,
+            txt,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// Inference forward with the shared bounded-attention plan. The unbounded plan retains the
+    /// original single-kernel path exactly; training continues to use [`Self::forward`] because an
+    /// eval-per-chunk plan is not valid inside an autograd trace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_attention(
+        &self,
+        img: &Array,
+        txt: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         let (b, img_seq) = (img.shape()[0], img.shape()[1]);
         let txt_seq = txt.shape()[1];
         let (h, hd) = (self.num_heads, self.head_dim);
@@ -165,10 +193,7 @@ impl LensJointAttention {
                 mlx_gen::Error::Msg("lens: checkpoint SDPA produced no output".into())
             })?
         } else {
-            match mask {
-                Some(m) => scaled_dot_product_attention(&q, &k, &v, self.scale, m, None)?,
-                None => scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?,
-            }
+            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, mask, attention)?
         };
         let joint = img_seq + txt_seq;
         let o = o

@@ -33,6 +33,21 @@ pub fn decode(
     latent_w: usize,
     pid: Option<&dyn LatentDecoder>,
 ) -> Result<Array> {
+    decode_with_tiling(vae, dit_out, latent_h, latent_w, pid, None, None)
+}
+
+/// Decode with an optional bounded native-VAE geometry. PiD owns a distinct decoder and is rejected
+/// by the memory strategy before this seam; keeping the fallback explicit prevents a selected native
+/// tiling request from silently becoming an untiled overlay decode.
+pub fn decode_with_tiling(
+    vae: &Flux2Vae,
+    dit_out: &Array,
+    latent_h: usize,
+    latent_w: usize,
+    pid: Option<&dyn LatentDecoder>,
+    tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: Option<&mlx_gen::CancelFlag>,
+) -> Result<Array> {
     let b = dit_out.shape()[0];
     let c = dit_out.shape()[2]; // 128 packed channels
     let packed = dit_out.reshape(&[b, latent_h as i32, latent_w as i32, c])?;
@@ -43,6 +58,9 @@ pub fn decode(
         Some(d) => Ok(d
             .decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
             .transpose_axes(&[0, 2, 3, 1])?), // NCHW [B,3,4H,4W] → NHWC [B,4H,4W,3]
-        None => vae.decode_packed_latents(&packed), // NHWC [B,H,W,3]
+        None => match tiling {
+            Some(cfg) => vae.decode_packed_latents_tiled(&packed, cfg, cancel),
+            None => vae.decode_packed_latents(&packed), // NHWC [B,H,W,3]
+        },
     }
 }
