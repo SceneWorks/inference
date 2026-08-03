@@ -42,6 +42,18 @@ use mlx_rs::{Array, Dtype};
 
 use crate::config::KreaRealtimeConfig;
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread count of full `Sq x Sk` host-mask materializations. A thread-local counter
+    /// keeps assertions deterministic under Rust's parallel test runner.
+    static MASK_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn mask_materialization_count() -> usize {
+    MASK_MATERIALIZATIONS.with(std::cell::Cell::get)
+}
+
 /// One layer's cached self-attention `(post-RoPE keys, raw values)`, each `[B, n, S, head_dim]`.
 pub type LayerKv = (Array, Array);
 
@@ -51,24 +63,72 @@ fn end_of_block(q: i64, block_size: i64) -> i64 {
     (q / block_size + 1) * block_size
 }
 
+fn checked_block_size(block_size: usize) -> Result<i64> {
+    let block_size = i64::try_from(block_size)
+        .map_err(|_| Error::Msg("krea causal mask: block_size exceeds i64::MAX".into()))?;
+    if block_size == 0 {
+        return Err(Error::Msg(
+            "krea causal mask: block_size must be greater than zero".into(),
+        ));
+    }
+    Ok(block_size)
+}
+
+#[inline]
+fn is_masked(q: i64, kv: i64, block_size: i64) -> bool {
+    !(kv < end_of_block(q, block_size) || q == kv)
+}
+
+/// Decide whether the scalar block-causal rule masks any `(query, key)` pair without building the
+/// `Sq x Sk` matrix. For each query only the largest key other than that query can matter: if it is
+/// below the query block's end, every smaller key is allowed; otherwise that largest key is masked.
+/// Tracking the two largest distinct key positions preserves the rule's `q == kv` exception.
+fn mask_is_needed(q_pos: &[i64], kv_pos: &[i64], block_size: usize) -> Result<bool> {
+    let bs = checked_block_size(block_size)?;
+    let (mut largest, mut second_largest) = (None, None);
+    for &kv in kv_pos {
+        match largest {
+            None => largest = Some(kv),
+            Some(max) if kv > max => {
+                second_largest = Some(max);
+                largest = Some(kv);
+            }
+            Some(max) if kv < max && second_largest.is_none_or(|second| kv > second) => {
+                second_largest = Some(kv);
+            }
+            Some(_) => {}
+        }
+    }
+
+    Ok(q_pos.iter().any(|&q| {
+        let largest_other = match largest {
+            Some(max) if max != q => Some(max),
+            Some(_) => second_largest,
+            None => None,
+        };
+        largest_other.is_some_and(|kv| is_masked(q, kv, bs))
+    }))
+}
+
 /// The raw additive block-causal mask data for query global positions `q_pos` against key global
 /// positions `kv_pos` (block size `block_size` tokens), plus whether **any** entry is masked. Entry
 /// `(i, j)` is `0.0` when `kv_pos[j] < end_of_block(q_pos[i]) || q_pos[i] == kv_pos[j]`, else `-inf`.
-fn mask_data(q_pos: &[i64], kv_pos: &[i64], block_size: usize) -> (Vec<f32>, bool) {
-    let bs = block_size as i64;
+fn mask_data(q_pos: &[i64], kv_pos: &[i64], block_size: usize) -> Result<(Vec<f32>, bool)> {
+    let bs = checked_block_size(block_size)?;
+    #[cfg(test)]
+    MASK_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
     let (sq, sk) = (q_pos.len(), kv_pos.len());
     let mut data = vec![0f32; sq * sk];
     let mut any_masked = false;
     for (i, &q) in q_pos.iter().enumerate() {
-        let end = end_of_block(q, bs);
         for (j, &kv) in kv_pos.iter().enumerate() {
-            if !(kv < end || q == kv) {
+            if is_masked(q, kv, bs) {
                 data[i * sk + j] = f32::NEG_INFINITY;
                 any_masked = true;
             }
         }
     }
-    (data, any_masked)
+    Ok((data, any_masked))
 }
 
 /// Build the **additive** block-causal SDPA mask (bf16) for query global token positions `q_pos`
@@ -78,7 +138,7 @@ fn mask_data(q_pos: &[i64], kv_pos: &[i64], block_size: usize) -> (Vec<f32>, boo
 /// `causal_model.py::get_sdpa_mask`/`get_block_mask`. See [`block_causal_mask`] for the forward path's
 /// "all-allowed ⇒ no mask" optimization.
 pub fn build_block_causal_mask(q_pos: &[i64], kv_pos: &[i64], block_size: usize) -> Result<Array> {
-    let (data, _) = mask_data(q_pos, kv_pos, block_size);
+    let (data, _) = mask_data(q_pos, kv_pos, block_size)?;
     let arr = Array::from_slice(&data, &[q_pos.len() as i32, kv_pos.len() as i32]);
     Ok(arr.as_dtype(Dtype::Bfloat16)?)
 }
@@ -92,10 +152,11 @@ pub fn block_causal_mask(
     kv_pos: &[i64],
     block_size: usize,
 ) -> Result<Option<Array>> {
-    let (data, any_masked) = mask_data(q_pos, kv_pos, block_size);
-    if !any_masked {
+    if !mask_is_needed(q_pos, kv_pos, block_size)? {
         return Ok(None);
     }
+    let (data, any_masked) = mask_data(q_pos, kv_pos, block_size)?;
+    debug_assert!(any_masked, "analytic and scalar mask decisions diverged");
     let arr = Array::from_slice(&data, &[q_pos.len() as i32, kv_pos.len() as i32]);
     Ok(Some(arr.as_dtype(Dtype::Bfloat16)?))
 }
@@ -832,7 +893,7 @@ mod tests {
     fn block_causal_mask_rule_is_exact() {
         let q_pos = [0i64, 1, 2, 3];
         let kv_pos = [0i64, 1, 2, 3];
-        let (data, any) = mask_data(&q_pos, &kv_pos, 2);
+        let (data, any) = mask_data(&q_pos, &kv_pos, 2).unwrap();
         assert!(any, "a 2-block case must mask block 0 → block 1");
         let ninf = f32::NEG_INFINITY;
         #[rustfmt::skip]
@@ -852,8 +913,87 @@ mod tests {
     fn single_block_mask_is_all_allowed() {
         // One full block of queries+keys is fully bidirectional ⇒ no mask (None).
         let pos = [0i64, 1, 2, 3];
+        let before = mask_materialization_count();
         let m = block_causal_mask(&pos, &pos, 4).unwrap();
         assert!(m.is_none(), "a single block must need no mask");
+        assert_eq!(
+            mask_materialization_count(),
+            before,
+            "the common all-allowed path must not materialize an Sq x Sk host matrix"
+        );
+
+        let masked = block_causal_mask(&[0], &[0, 4], 4).unwrap();
+        assert!(masked.is_some(), "a future block must materialize a mask");
+        assert_eq!(
+            mask_materialization_count(),
+            before + 1,
+            "a genuinely masked path must materialize exactly one host matrix"
+        );
+    }
+
+    #[test]
+    fn zero_block_size_is_a_typed_error() {
+        let err = block_causal_mask(&[0], &[0], 0)
+            .expect_err("zero block size must return an error instead of dividing by zero");
+        assert!(matches!(err, Error::Msg(_)), "got: {err:?}");
+        let err = build_block_causal_mask(&[0], &[0], 0)
+            .expect_err("the explicit builder must also reject zero block size");
+        assert!(matches!(err, Error::Msg(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn analytic_mask_decision_matches_scalar_rule_across_positions_and_blocks() {
+        for block_size in 1..=9 {
+            for q_start in 0..=12 {
+                for q_len in 0..=6 {
+                    let q_pos = (q_start..q_start + q_len)
+                        .map(i64::from)
+                        .collect::<Vec<_>>();
+                    for kv_start in 0..=12 {
+                        for kv_len in 0..=9 {
+                            let kv_pos = (kv_start..kv_start + kv_len)
+                                .map(i64::from)
+                                .collect::<Vec<_>>();
+                            let scalar = q_pos.iter().any(|&q| {
+                                kv_pos
+                                    .iter()
+                                    .any(|&kv| is_masked(q, kv, i64::from(block_size)))
+                            });
+                            assert_eq!(
+                                mask_is_needed(&q_pos, &kv_pos, block_size as usize).unwrap(),
+                                scalar,
+                                "q={q_pos:?}, kv={kv_pos:?}, block_size={block_size}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Gaps, duplicates, reverse order, and negative positions exercise the equality exception
+        // and prove the decision does not depend on sorted contiguous production positions.
+        let unusual = [
+            vec![],
+            vec![0],
+            vec![8, 3, 8],
+            vec![-9, -1, 0, 7],
+            vec![i64::MIN / 2, 1, i64::MAX / 2],
+        ];
+        for block_size in 1..=9 {
+            for q_pos in &unusual {
+                for kv_pos in &unusual {
+                    let bs = i64::from(block_size);
+                    let scalar = q_pos
+                        .iter()
+                        .any(|&q| kv_pos.iter().any(|&kv| is_masked(q, kv, bs)));
+                    assert_eq!(
+                        mask_is_needed(q_pos, kv_pos, block_size as usize).unwrap(),
+                        scalar,
+                        "q={q_pos:?}, kv={kv_pos:?}, block_size={block_size}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

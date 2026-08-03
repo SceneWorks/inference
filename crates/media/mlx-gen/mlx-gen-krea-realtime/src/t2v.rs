@@ -117,7 +117,7 @@ pub fn mac_ar_config(base: &KreaRealtimeConfig) -> KreaRealtimeConfig {
 
 /// Latent frame count for `num_frames` **output** frames at the z16 VAE's 4× temporal compression
 /// (`(frames − 1)/4 + 1`, the reference latent convention; decode returns `4·T_lat` frames).
-fn latent_frame_count(num_frames: u32) -> Result<usize> {
+pub(crate) fn latent_frame_count(num_frames: u32) -> Result<usize> {
     let f = num_frames as usize;
     let fm1 = f
         .checked_sub(1)
