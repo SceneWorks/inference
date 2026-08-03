@@ -623,12 +623,19 @@ fn exact_q4_shared_memory_ladder_arm() {
         &arm_spec,
     )
     .expect("arm contract");
-    mlx_gen_flux::memory_strategy::validate_runner_gate(
-        mlx_gen_flux::FLUX1_DEV_ID,
-        &artifact_sha256,
-        &contract,
-    )
-    .expect("arm remains bound to the exact calibrated key");
+    if arm == Arm::Resident {
+        assert!(
+            contract.calibration.is_none(),
+            "Resident+Eager is the comparison baseline, not a calibrated optimized route"
+        );
+    } else {
+        mlx_gen_flux::memory_strategy::validate_runner_gate(
+            mlx_gen_flux::FLUX1_DEV_ID,
+            &artifact_sha256,
+            &contract,
+        )
+        .expect("optimized arm remains bound to the exact calibrated key");
+    }
     let (generator, load) = load_measured(&arm_spec);
 
     if arm.is_terminal() {

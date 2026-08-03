@@ -336,6 +336,7 @@ pub(crate) fn safety_check(
             .calibration
             .as_ref()
             .is_some_and(|identity| identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
+            && context.selection.strategy.is_optimized()
             && (context.mode != MemoryMode::TextToImage
                 || context.geometry.reference_count != 0
                 || context.geometry.width != 1024
@@ -820,6 +821,17 @@ mod tests {
                 MemorySafetyDecision::Reject { .. }
             ));
         }
+
+        let mut resident = context;
+        resident.selection.strategy = MemoryStrategy::Resident;
+        resident.selection.parameters = Default::default();
+        resident.geometry.width = 768;
+        resident.geometry.height = 768;
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &resident),
+            MemorySafetyDecision::Accept,
+            "the optimized exact-geometry calibration must not constrain Resident requests"
+        );
     }
 
     #[test]
