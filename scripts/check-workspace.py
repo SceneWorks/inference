@@ -572,8 +572,17 @@ def _cfg_item_end(syntax: str, start: int) -> int | None:
     prefix = re.sub(r"^\s*(?:#\s*\[[^\]]*\]\s*)*", "", prefix)
     prefix = re.sub(r"^pub(?:\s*\([^)]*\))?\s+", "", prefix)
     # These constructs own every brace in their initializer/type/path and end at a semicolon. A
-    # function body, including `const fn`, ends at its top-level brace instead.
-    semicolon_item = re.match(r"(?:const(?!\s+fn\b)|static|type|use|let)\b", prefix) is not None
+    # function body, including a qualified `const fn`, ends at its top-level brace instead. String
+    # literal blanking leaves an extern ABI as whitespace, so the same pattern covers `extern fn`
+    # and `extern "ABI" fn`.
+    const_function = (
+        re.match(r"const\s+(?:async\s+)?(?:unsafe\s+)?(?:extern\s+)?fn\b", prefix)
+        is not None
+    )
+    semicolon_item = (
+        re.match(r"(?:const|static|type|use|let)\b", prefix) is not None
+        and not const_function
+    )
 
     paren_depth = 0
     bracket_depth = 0
@@ -613,7 +622,10 @@ def _cfg_item_end(syntax: str, start: int) -> int | None:
             char == ";"
             and paren_depth == 0
             and bracket_depth == 0
-            and angle_depth == 0
+            # A bare comparison such as `if 1 < 2` is indistinguishable from a generic opener to
+            # this lightweight scanner. Recognized semicolon items still end here; their braced
+            # initializers were skipped above, and nested delimiters remain protected.
+            and (semicolon_item or angle_depth == 0)
         ):
             return cursor + 1
         cursor += 1

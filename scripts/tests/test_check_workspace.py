@@ -303,10 +303,24 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                     loop {}
                 }
             """,
+            "qualified const function": """
+                #[cfg(test)]
+                const unsafe fn qualified_const_test_adoption() {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                }
+            """,
             "const initializer branches": """
                 #[cfg(test)]
                 const FAKE: () = if true {
                 } else {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                };
+            """,
+            "const initializer bare comparison": """
+                #[cfg(test)]
+                const FAKE: () = if 1 < 2 {
                     let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
                     routes.validate(true, Some(2048), Some(256)).unwrap();
                 };
