@@ -301,14 +301,31 @@ mod preview_advertising {
     /// space and sc-16955's own acceptance criterion is that it emits only if its VAE is proven to be
     /// FLUX.2's. It is not. See `docs/migration/evidence/sc-16955-flux2-candle-preview.md`.
     ///
-    /// `instantid` is deliberately absent and cannot be added: it registers no descriptor at all
-    /// (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Two shipped tests hold that in
-    /// place — the second half of `temporal_and_super_resolution_routes_stay_outside_preview_advertising`
-    /// asserts by exact id that no registered descriptor is ever named `instantid`, `pulid` or
-    /// `pulid_flux`, and `every_shipped_generator_is_covered_by_the_wiring_table` requires the table
-    /// below to cover exactly the registered surface, so a new registration could not slip in
-    /// uninventoried either. It reaches `candle-gen-sdxl`'s `denoise_curated` /
-    /// `denoise_ip_multi_control` and passes `None` at both, exactly as MLX left it.
+    /// The FLUX.1 family (sc-16956) is the first to make the descriptor-less half of the platform
+    /// *visible* rather than merely absent. It contributes seven rows — `flux1_schnell` / `flux1_dev`
+    /// (one crate, two descriptors, one shared txt2img lane) and `chroma1_hd` / `chroma1_base` /
+    /// `chroma1_flash` (one crate, three descriptors, one shared lane over a **byte-identical** VAE, so
+    /// `candle-gen-chroma` re-exports `candle-gen-flux`'s projector rather than owning one) — while
+    /// wiring **five** lanes. The two rows that do not appear here are the reason
+    /// `BESPOKE_PROVIDER_CRATES` exists:
+    ///
+    /// * `candle-gen-flux`'s name-driven Fun-ControlNet-Union and XLabs IP-Adapter providers carry a
+    ///   `preview` field on their own request types rather than a descriptor. They are still counted —
+    ///   in this crate's route inventory below, which pins one hooked site per file.
+    /// * `candle-gen-pulid` registers **nothing at all** and is not even composed by
+    ///   `register_providers`, yet it owns a `run_flow_sampler` site of its own. Before sc-16956 no
+    ///   table in this module could see it: `PROVIDER_CRATES` is keyed on a registration function.
+    ///
+    /// `instantid` is deliberately absent from *this* list and cannot be added: it registers no
+    /// descriptor at all (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Three shipped tests
+    /// hold that in place — the second half of
+    /// `temporal_and_super_resolution_routes_stay_outside_preview_advertising` asserts by exact id that
+    /// no registered descriptor is ever named `instantid`, `pulid` or `pulid_flux`;
+    /// `every_shipped_generator_is_covered_by_the_wiring_table` requires the table below to cover
+    /// exactly the registered surface, so a new registration could not slip in uninventoried either;
+    /// and `every_bespoke_utility_crate_is_covered_by_the_bespoke_table` requires each of the six
+    /// descriptor-less crates to be inventoried. InstantID reaches `candle-gen-sdxl`'s
+    /// `denoise_curated` / `denoise_ip_multi_control` and passes `None` at both, exactly as MLX left it.
     const PREVIEW_ROUTE_IDS: &[&str] = &[
         "krea_2_turbo",
         "krea_2_raw",
@@ -325,6 +342,11 @@ mod preview_advertising {
         "lens_turbo",
         "ideogram_4",
         "ideogram_4_turbo",
+        "flux1_schnell",
+        "flux1_dev",
+        "chroma1_hd",
+        "chroma1_base",
+        "chroma1_flash",
     ];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
@@ -457,13 +479,53 @@ mod preview_advertising {
             dir: "candle-gen-chroma",
             register: candle_gen_chroma::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16956's inventory: one hooked `run_flow_sampler` site, in the single txt2img render
+            // lane all three variants share. No dark site — this crate has no trainer and no second
+            // denoise — and no direct emission, because `preview.rs` is a `pub use` shim over
+            // `candle-gen-flux`'s projector: Chroma ships a VAE byte-identical to FLUX.1-dev's, so it
+            // reuses that crate's committed 16-channel fit instead of owning a second copy.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 1,
+                direct: 0,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-flux",
             register: candle_gen_flux::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16956's inventory: one hooked `run_flow_sampler` site per shipped render lane — the
+            // registered txt2img route both `flux1_*` descriptors share (`pipeline.rs`), the name-driven
+            // Fun-ControlNet-Union strict-pose provider (`control_provider.rs`, the lane the worker
+            // already hands a live sink to), and the name-driven XLabs IP-Adapter provider
+            // (`ip_provider.rs`). The latter two carry a `preview` field on their own request types
+            // rather than a descriptor, which is why this crate's two ids cover three lanes.
+            //
+            // No dark site: this crate has no trainer and no second denoise. All three project AFTER
+            // `flux::sampling::unpack` — the same function `decode_latents` calls — which is why
+            // `preview.rs` holds no sampler site and no direct emission: it carries only the reused
+            // 16-channel fit and the projector it is applied through.
+            routes: &[
+                FileRoutes {
+                    file: "control_provider.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "ip_provider.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "pipeline.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+            ],
         },
         ProviderCrate {
             dir: "candle-gen-flux2",
@@ -773,6 +835,100 @@ mod preview_advertising {
         },
     ];
 
+    /// One **descriptor-less** provider crate — a [`super::BESPOKE_UTILITY_CRATES`] member, consumed
+    /// through a provider-specific API rather than through `gen_core`'s registry.
+    ///
+    /// Why this table exists (sc-16956): [`ProviderCrate`] is keyed on a registration function, so a
+    /// crate that registers nothing cannot appear there — and until FLUX.1 landed, none of the six
+    /// owned a denoise loop, so their absence cost nothing. `candle-gen-pulid` breaks that: it drives
+    /// its own `run_flow_sampler` over the FLUX.1-dev backbone it composes, is not even reached by
+    /// `register_providers`, and would therefore have been wired with **no** guard at all — the exact
+    /// "one lane left dark on a shipped route" failure this module exists to prevent.
+    ///
+    /// All six are listed, wired or not, and `every_bespoke_utility_crate_is_covered_by_the_bespoke_table`
+    /// pins that against `BESPOKE_UTILITY_CRATES` itself, so a seventh utility crate — or a sampler
+    /// site appearing in one of the five that have none — cannot join uninventoried. There is no
+    /// advertising half here, by construction: a crate with no descriptor has nothing to advertise, and
+    /// `temporal_and_super_resolution_routes_stay_outside_preview_advertising` is what keeps it that way.
+    struct BespokeCrate {
+        /// Directory name under `crates/media/candle-gen`.
+        dir: &'static str,
+        /// Shared-driver or bespoke — checked against the sources exactly as [`ProviderCrate`]'s is.
+        denoise: Denoise,
+        /// The route inventory, one row per source file that drives a sampler or emits directly.
+        /// **Empty for a crate with no denoise loop**, which is five of the six.
+        routes: &'static [FileRoutes],
+    }
+
+    const BESPOKE_PROVIDER_CRATES: &[BespokeCrate] = &[
+        // Depth estimation (DWPose/MiDaS-lineage hints). No denoise loop at all.
+        BespokeCrate {
+            dir: "candle-gen-depth",
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        // SCRFD + ArcFace + BiSeNet. Detection and embedding only.
+        BespokeCrate {
+            dir: "candle-gen-face",
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        // InstantID composes `candle-gen-sdxl`'s `denoise_curated` / `denoise_ip_multi_control` rather
+        // than driving a sampler of its own, so its wiring is counted in that crate's `denoise.rs` row
+        // and it has no site here. It passes `None` at both, exactly as MLX left it.
+        BespokeCrate {
+            dir: "candle-gen-instantid",
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        // The PiD super-resolving decoder: a decode seam, not a denoise.
+        BespokeCrate {
+            dir: "candle-gen-pid",
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        // sc-16956's inventory, and the only wired member of this table: ONE hooked
+        // `run_flow_sampler` site, in `PulidFlux::generate`'s dev flow denoise. `preview.rs` is a
+        // `pub use` shim over `candle-gen-flux`'s projector — PuLID composes that crate's own
+        // `FluxRefBackbone`, so the latent, the unpack and the VAE are literally the registered
+        // `flux1_dev` route's — so it holds neither a site nor a direct emission. No dark site: this is
+        // the crate's only denoise.
+        BespokeCrate {
+            dir: "candle-gen-pulid",
+            denoise: Denoise::Shared,
+            routes: &[FileRoutes {
+                file: "pulid_flux.rs",
+                hooked: 1,
+                direct: 0,
+                dark: &[],
+            }],
+        },
+        // Segment Anything 3. Masks, no denoise.
+        BespokeCrate {
+            dir: "candle-gen-sam3",
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+    ];
+
+    /// Every crate whose sources this module scans, as `(dir, denoise, routes)` — the registered
+    /// provider crates and the descriptor-less ones together.
+    ///
+    /// The three source-derived assertions (denoise shape, no undeclared dark site, exact route
+    /// inventory) apply to both tables identically; only the id-keyed assertions are `PROVIDER_CRATES`-
+    /// only, because a `BespokeCrate` has no ids.
+    fn scanned_crates() -> Vec<(&'static str, Denoise, &'static [FileRoutes])> {
+        PROVIDER_CRATES
+            .iter()
+            .map(|provider| (provider.dir, provider.denoise, provider.routes))
+            .chain(
+                BESPOKE_PROVIDER_CRATES
+                    .iter()
+                    .map(|provider| (provider.dir, provider.denoise, provider.routes)),
+            )
+            .collect()
+    }
+
     /// One shared sampler driver: the call text scanned for, the **0-based position of its
     /// `preview` parameter**, and its total parameter count. Positions are read from the front, so
     /// a family that passes a named `predict` instead of an inline closure parses the same way, and
@@ -1068,6 +1224,26 @@ mod preview_advertising {
                 continue;
             }
             if skipping.is_none() {
+                // A FILE-LEVEL inner `#![cfg(…)]` applies to the whole module, so a test-only one
+                // means the file ships nothing at all — `candle-gen-instantid` and `candle-gen-pulid`
+                // both open `src/validate.rs` that way (sc-16956 brought them into the scan through
+                // BESPOKE_PROVIDER_CRATES). Recognised only before the first block, which is the only
+                // position where it can mean "the whole file": an inner attribute inside an inline
+                // `mod` applies to that module alone, and treating it as file-scope would UNDER-scan.
+                if let Some((predicate, end)) = inner_cfg_attribute(file, &chars, i) {
+                    if out.chars().all(char::is_whitespace) {
+                        return match classify_cfg(&predicate) {
+                            CfgTest::TestOnly => Stripped {
+                                code: String::new(),
+                                test_only_mods: Vec::new(),
+                            },
+                            _ => {
+                                let rest: String = chars[end..].iter().collect();
+                                code_only(file, &rest)
+                            }
+                        };
+                    }
+                }
                 if let Some((predicate, end)) = cfg_attribute(file, &chars, i) {
                     if classify_cfg(&predicate) == CfgTest::TestOnly {
                         i = end;
@@ -1162,6 +1338,30 @@ mod preview_advertising {
             chars.get(i),
             Some(&']'),
             "{file}: #[cfg({predicate})…] does not close with `]` — teach `code_only` about it"
+        );
+        Some((predicate, i + 1))
+    }
+
+    /// The predicate text and the index just past the closing `]` of an **inner** `#![cfg(…)]`
+    /// attribute starting at `at`, or `None` if one does not start there.
+    ///
+    /// The inner form is what a whole-file gate looks like (`#![cfg(test)]` at the top of
+    /// `src/validate.rs`); [`cfg_attribute`] only recognises the outer `#[cfg(…)]` that precedes an
+    /// item, so before sc-16956 an inner one survived the strip and tripped the sweep below.
+    fn inner_cfg_attribute(file: &str, chars: &[char], at: usize) -> Option<(String, usize)> {
+        const OPEN: &str = "#![cfg(";
+        if !matches_at(chars, at, OPEN) {
+            return None;
+        }
+        let (predicate, past_paren) = balanced_predicate(file, chars, at + OPEN.chars().count());
+        let mut i = past_paren;
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        assert_eq!(
+            chars.get(i),
+            Some(&']'),
+            "{file}: #![cfg({predicate})…] does not close with `]` — teach `code_only` about it"
         );
         Some((predicate, i + 1))
     }
@@ -1548,15 +1748,18 @@ mod preview_advertising {
     }
 
     /// Read one provider crate's preview wiring out of its **shipped** module tree.
-    fn scan(provider: &ProviderCrate) -> CrateWiring {
-        let src = candle_gen_root().join(provider.dir).join("src");
+    ///
+    /// Keyed on the directory rather than on a `ProviderCrate`, so the descriptor-less
+    /// [`BespokeCrate`] rows go through the very same scan.
+    fn scan(dir: &str) -> CrateWiring {
+        let src = candle_gen_root().join(dir).join("src");
         assert!(
             src.is_dir(),
             "{}: no src directory — the wiring table names a crate that does not exist, so its \
              emission fact would silently read as `no`",
             src.display()
         );
-        let tree = module_tree(provider.dir, &src);
+        let tree = module_tree(dir, &src);
         let mut wiring = CrateWiring {
             sites: Vec::new(),
             direct: Vec::new(),
@@ -1634,9 +1837,8 @@ mod preview_advertising {
     }
 
     /// What the wiring table declares, in the same shape.
-    fn declared_tallies(provider: &ProviderCrate) -> Vec<FileTally> {
-        let mut tallies: Vec<FileTally> = provider
-            .routes
+    fn declared_tallies(routes: &[FileRoutes]) -> Vec<FileTally> {
+        let mut tallies: Vec<FileTally> = routes
             .iter()
             .map(|routes| FileTally {
                 file: routes.file.to_string(),
@@ -1732,7 +1934,7 @@ mod preview_advertising {
     fn source_level_wiring_and_advertised_capability_agree_for_every_provider_crate() {
         let advertising = advertising_ids();
         for provider in PROVIDER_CRATES {
-            let wiring = scan(provider);
+            let wiring = scan(provider.dir);
             let ids = ids_of(provider);
             let advertised: Vec<&String> =
                 ids.iter().filter(|id| advertising.contains(*id)).collect();
@@ -1776,22 +1978,20 @@ mod preview_advertising {
     /// emission call instead.
     #[test]
     fn the_wiring_table_pins_how_each_crate_denoises() {
-        for provider in PROVIDER_CRATES {
-            let wiring = scan(provider);
+        for (dir, denoise, _) in scanned_crates() {
+            let wiring = scan(dir);
             let sites = wiring.sites.len();
-            match provider.denoise {
+            match denoise {
                 Denoise::Shared => assert!(
                     sites > 0,
-                    "{} is declared Denoise::Shared but its shipped sources drive no sampler \
+                    "{dir} is declared Denoise::Shared but its shipped sources drive no sampler \
                      driver at all — either it moved to a bespoke loop (say so in the table) or \
-                     the scan is reading the wrong files",
-                    provider.dir
+                     the scan is reading the wrong files"
                 ),
                 Denoise::Bespoke => assert_eq!(
                     sites, 0,
-                    "{} is declared Denoise::Bespoke but its shipped sources drive a shared \
-                     sampler — say Denoise::Shared so its sites are inventoried",
-                    provider.dir
+                    "{dir} is declared Denoise::Bespoke but its shipped sources drive a shared \
+                     sampler — say Denoise::Shared so its sites are inventoried"
                 ),
             }
         }
@@ -1868,10 +2068,9 @@ mod preview_advertising {
     /// dark, and a dark declaration on a crate that is not wired at all, are both stale.
     #[test]
     fn a_wired_crate_leaves_no_undeclared_dark_sampler_site() {
-        for provider in PROVIDER_CRATES {
-            let wiring = scan(provider);
-            let declared: BTreeSet<(&str, &str, usize)> = provider
-                .routes
+        for (dir, _, routes) in scanned_crates() {
+            let wiring = scan(dir);
+            let declared: BTreeSet<(&str, &str, usize)> = routes
                 .iter()
                 .flat_map(|routes| {
                     routes
@@ -1881,12 +2080,11 @@ mod preview_advertising {
                 })
                 .collect();
 
-            for routes in provider.routes {
+            for routes in routes {
                 for site in routes.dark {
                     assert!(
                         !site.reason.trim().is_empty(),
-                        "{}: {} {} #{} is declared dark with no reason",
-                        provider.dir,
+                        "{dir}: {} {} #{} is declared dark with no reason",
                         routes.file,
                         site.driver,
                         site.index
@@ -1897,9 +2095,8 @@ mod preview_advertising {
             if !wiring.emits() {
                 assert!(
                     declared.is_empty(),
-                    "{} declares dark sampler sites {declared:?} but emits no previews at all — a \
-                     dark declaration only means something on a wired crate",
-                    provider.dir
+                    "{dir} declares dark sampler sites {declared:?} but emits no previews at all — a \
+                     dark declaration only means something on a wired crate"
                 );
                 continue;
             }
@@ -1915,10 +2112,9 @@ mod preview_advertising {
                 .collect();
             assert!(
                 undeclared.is_empty(),
-                "{} is wired for previews but these sampler sites still pass `None`: {undeclared:?} \
-                 — pass a hook, or declare that exact site in its file's `dark` list with the \
-                 reason it emits nothing",
-                provider.dir
+                "{dir} is wired for previews but these sampler sites still pass `None`: \
+                 {undeclared:?} — pass a hook, or declare that exact site in its file's `dark` list \
+                 with the reason it emits nothing"
             );
 
             for (file, driver, index) in &declared {
@@ -1929,9 +2125,8 @@ mod preview_advertising {
                             && site.index == *index
                             && !site.hooked
                     }),
-                    "{}: {file} declares {driver} #{index} dark, but that site no longer passes \
-                     `None` — remove the stale declaration",
-                    provider.dir
+                    "{dir}: {file} declares {driver} #{index} dark, but that site no longer passes \
+                     `None` — remove the stale declaration"
                 );
             }
         }
@@ -1954,14 +2149,13 @@ mod preview_advertising {
     fn every_wired_crate_pins_its_exact_route_inventory() {
         let mut wired = 0usize;
         let mut hooked_sites = 0usize;
-        for provider in PROVIDER_CRATES {
-            let wiring = scan(provider);
+        for (dir, _, routes) in scanned_crates() {
+            let wiring = scan(dir);
             if !wiring.emits() {
                 assert!(
-                    provider.routes.is_empty(),
-                    "{} pins a route inventory but emits no previews — an inventory only means \
-                     something on a wired crate",
-                    provider.dir
+                    routes.is_empty(),
+                    "{dir} pins a route inventory but emits no previews — an inventory only means \
+                     something on a wired crate"
                 );
                 continue;
             }
@@ -1969,11 +2163,10 @@ mod preview_advertising {
             hooked_sites += wiring.sites.iter().filter(|site| site.hooked).count();
             assert_eq!(
                 derived_tallies(&wiring),
-                declared_tallies(provider),
-                "{}: the route inventory in PROVIDER_CRATES disagrees with the crate's sources. \
+                declared_tallies(routes),
+                "{dir}: the route inventory in the wiring table disagrees with the crate's sources. \
                  Every file that drives a sampler or emits directly needs a row with exact counts \
-                 — blanking one route of an already-inventoried file must be a diff here too.",
-                provider.dir
+                 — blanking one route of an already-inventoried file must be a diff here too."
             );
         }
         assert!(
@@ -2034,11 +2227,11 @@ mod preview_advertising {
         ];
 
         for (dir, test_only, shipped) in expectations {
-            let provider = PROVIDER_CRATES
-                .iter()
-                .find(|provider| provider.dir == *dir)
-                .unwrap_or_else(|| panic!("{dir} is in the wiring table"));
-            let wiring = scan(provider);
+            assert!(
+                PROVIDER_CRATES.iter().any(|provider| provider.dir == *dir),
+                "{dir} is in the wiring table"
+            );
+            let wiring = scan(dir);
             let src = candle_gen_root().join(dir).join("src");
             for file in *test_only {
                 assert!(
@@ -2074,11 +2267,13 @@ mod preview_advertising {
     /// module's numbers evidence rather than a restatement of its own parse.
     #[test]
     fn the_source_scan_resolves_the_krea_wiring_it_claims_to_verify() {
-        let krea = PROVIDER_CRATES
-            .iter()
-            .find(|provider| provider.dir == "candle-gen-krea")
-            .expect("Krea is in the wiring table");
-        let wiring = scan(krea);
+        assert!(
+            PROVIDER_CRATES
+                .iter()
+                .any(|provider| provider.dir == "candle-gen-krea"),
+            "Krea is in the wiring table"
+        );
+        let wiring = scan("candle-gen-krea");
 
         let tally = |hooked: bool| {
             let mut by_file: Vec<(String, usize)> = Vec::new();
@@ -2133,6 +2328,63 @@ mod preview_advertising {
         assert_eq!(
             covered, shipped,
             "PROVIDER_CRATES must cover exactly the shipped generator surface"
+        );
+    }
+
+    /// Every descriptor-less provider crate is inventoried, and the two tables are disjoint.
+    ///
+    /// [`super::BESPOKE_UTILITY_CRATES`] is the shipped list of crates consumed through a
+    /// provider-specific API rather than through the registry, and it is what
+    /// `runtime-{cpu,cuda}`'s surface tests pin. Deriving this table's membership from it — rather
+    /// than restating six names — is what stops a seventh utility crate from arriving with a denoise
+    /// loop and no guard, which is precisely how `candle-gen-pulid` would have landed before sc-16956.
+    ///
+    /// The disjointness half matters too: a crate that appeared in both tables would be scanned twice
+    /// and could satisfy `every_wired_crate_pins_its_exact_route_inventory` from whichever row happened
+    /// to be right.
+    #[test]
+    fn every_bespoke_utility_crate_is_covered_by_the_bespoke_table() {
+        let expected: BTreeSet<String> = super::BESPOKE_UTILITY_CRATES
+            .iter()
+            .map(|name| format!("candle-gen-{name}"))
+            .collect();
+        let declared: BTreeSet<String> = BESPOKE_PROVIDER_CRATES
+            .iter()
+            .map(|provider| provider.dir.to_string())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            BESPOKE_PROVIDER_CRATES.len(),
+            "the bespoke table must not repeat a crate"
+        );
+        assert_eq!(
+            declared, expected,
+            "BESPOKE_PROVIDER_CRATES must cover exactly the descriptor-less crates \
+             BESPOKE_UTILITY_CRATES names — one of them (candle-gen-pulid) drives a sampler, so an \
+             uncovered member could be wired with no guard at all"
+        );
+
+        let registered: BTreeSet<String> = PROVIDER_CRATES
+            .iter()
+            .map(|provider| provider.dir.to_string())
+            .collect();
+        assert!(
+            registered.is_disjoint(&declared),
+            "a crate may appear in only one wiring table: {:?}",
+            registered.intersection(&declared).collect::<Vec<_>>()
+        );
+
+        // Non-vacuity: exactly one member of this table is wired today, and it is PuLID. A scan that
+        // resolved nothing would read every row as unwired and satisfy every assertion above.
+        let wired: Vec<&str> = BESPOKE_PROVIDER_CRATES
+            .iter()
+            .filter(|provider| scan(provider.dir).emits())
+            .map(|provider| provider.dir)
+            .collect();
+        assert_eq!(
+            wired,
+            ["candle-gen-pulid"],
+            "sc-16956 wired PuLID and nothing else in this table"
         );
     }
 

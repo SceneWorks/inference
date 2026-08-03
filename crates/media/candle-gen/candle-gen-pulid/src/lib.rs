@@ -21,6 +21,10 @@
 pub mod ca;
 pub mod eva_clip;
 pub mod idformer;
+// Per-step latent previews (epic 16948, sc-16956). A re-export of `candle_gen_flux::preview`: PuLID
+// composes that crate's own FLUX.1-dev backbone, so the latent, the unpack and the VAE are literally
+// the registered route's. See the module docs for why there is no id to advertise.
+pub mod preview;
 pub mod pulid_flux;
 
 pub use pulid_flux::{

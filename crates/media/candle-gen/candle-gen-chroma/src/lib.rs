@@ -23,6 +23,10 @@
 mod beta;
 mod config;
 mod pipeline;
+// Per-step latent previews (epic 16948, sc-16956). A re-export of `candle_gen_flux::preview`: Chroma
+// packs, unpacks and decodes the same 16-channel `AutoencoderKL` bytes as FLUX.1, so it shares that
+// crate's committed fit rather than restating it. See the module docs for the tensor-byte provenance.
+pub mod preview;
 mod quant;
 mod rope;
 mod text;

@@ -62,3 +62,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 sceneworks-gen-core-testkit = { workspace = true }
 # Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# Hash the VAE files in the sc-16956 preview-provenance rows: the reuse of epic 16624's 16-channel
+# FLUX.1 RGB fit is grounded in tensor bytes (repo / revision / SHA-256), not in a matching Rust type
+# name. Test-only - nothing in the engine hashes weights.
+sha2 = { workspace = true }

@@ -43,6 +43,9 @@ serde_json = "1"
 # scoped to dev/test builds, so it never reaches downstream consumers or production.
 [dev-dependencies]
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# `tests/preview_real_weights.rs` (sc-16956) writes the frame strip + final render as PNG so a real GPU
+# run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 # Pass the backend selection through to the core crate AND the composed provider crates so a downstream

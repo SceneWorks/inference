@@ -91,10 +91,18 @@ impl Attention {
     }
 
     /// Apply RoPE to `x[:, :, 1:, :]` (patch tokens) only; the CLS token at index 0 is untouched.
+    ///
+    /// The result is forced **contiguous** (sc-16956). `Tensor::cat` on a non-zero axis takes a
+    /// transposing slow path when its inputs are not all contiguous — and `rope.apply` returns a
+    /// strided view — so the joined `[B, heads, N, hd]` tensor comes back with a transposed layout.
+    /// Candle's CPU gemm accepts that; its **CUDA** matmul does not (`matmul is only supported for
+    /// contiguous tensors`), so the whole EVA tower failed at the first attention on the one platform
+    /// this crate exists for, while every CPU unit test passed. Materializing here fixes q and k at
+    /// once and is numerically a no-op.
     fn rope_patch_tokens(&self, x: &Tensor, rope: &VisionRope) -> candle_core::Result<Tensor> {
         let n = x.dim(2)?;
         let cls = x.narrow(2, 0, 1)?;
         let pat = rope.apply(&x.narrow(2, 1, n - 1)?)?;
-        Tensor::cat(&[&cls, &pat], 2)
+        Tensor::cat(&[&cls, &pat], 2)?.contiguous()
     }
 }

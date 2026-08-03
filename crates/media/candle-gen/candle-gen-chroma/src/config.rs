@@ -122,7 +122,12 @@ impl ChromaVariant {
                 // worker needs no sigma-shift loader hint (matches the candle FLUX/Z-Image slices).
                 requires_sigma_shift: false,
                 supports_sequential_offload: false,
-                supports_preview: false,
+                // Per-step latent previews (epic 16948, sc-16956): the one registered render lane all
+                // three variants share hands `crate::preview::hook` — the FLUX.1 seam, reused because
+                // Chroma ships a byte-identical VAE — to the shared flow driver. `candle-gen-catalog`'s
+                // `preview_advertising` guard derives this from the sources and fails if the flag and
+                // the wiring ever disagree.
+                supports_preview: true,
                 supports_streaming: false,
                 supports_multi_speaker: false,
                 supports_conversation_history: false,

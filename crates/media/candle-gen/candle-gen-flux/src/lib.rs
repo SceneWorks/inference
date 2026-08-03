@@ -29,6 +29,12 @@ mod pipeline;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 mod memory_strategy;
 
+// Per-step latent previews (epic 16948, sc-16956) — the 16-channel FLUX.1 fit reused verbatim from
+// epic 16624's `mlx-gen-flux`, plus the packed-token → native-latent recovery every route projects
+// through. `candle-gen-chroma` and `candle-gen-pulid` share this latent space and reach it here rather
+// than restating the constants; see the module docs for the tensor-byte provenance.
+pub mod preview;
+
 // Vendored, i32-overflow-safe FLUX.1 VAEs (sc-11154 / F-081): faithful copies of the BFL/native
 // `flux::autoencoder` and the diffusers `z_image::vae` with the mid-block spatial self-attention routed
 // through the shared budgeted helper (the stock upstream overflows i32 on CUDA at a 2048² decode).
@@ -377,7 +383,12 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16956): the registered txt2img route hands
+            // `crate::preview::hook` to the shared flow driver, projecting the unpacked 16-channel
+            // latent through the reused epic-16624 fit. Both variants share one render lane, so both
+            // advertise. `candle-gen-catalog`'s `preview_advertising` guard derives this from the
+            // sources and fails if the flag and the wiring ever disagree.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
