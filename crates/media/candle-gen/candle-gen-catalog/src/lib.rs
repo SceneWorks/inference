@@ -1224,12 +1224,26 @@ mod preview_advertising {
                 continue;
             }
             if skipping.is_none() {
+                // A file's inner attributes form a PROLOGUE, and a non-`cfg` one may sit ahead of the
+                // file-level gate below — `#![allow(dead_code)]` before `#![cfg(test)]`, the shape
+                // `candle-gen-flux/src/vae/diffusers.rs` already opens with. Emitting it would end the
+                // whitespace-only run the gate keys on, so the gate would miss the `#![cfg(test)]`
+                // behind it and the sweep at the bottom would hard-fail on a file that ships nothing.
+                // Dropping it costs the scan nothing: an attribute is never a sampler or hook site.
+                if out.chars().all(char::is_whitespace) && !matches_at(&chars, i, "#![cfg(") {
+                    if let Some(end) = inner_attribute_end(file, &chars, i) {
+                        i = end;
+                        continue;
+                    }
+                }
                 // A FILE-LEVEL inner `#![cfg(…)]` applies to the whole module, so a test-only one
                 // means the file ships nothing at all — `candle-gen-instantid` and `candle-gen-pulid`
                 // both open `src/validate.rs` that way (sc-16956 brought them into the scan through
-                // BESPOKE_PROVIDER_CRATES). Recognised only before the first block, which is the only
-                // position where it can mean "the whole file": an inner attribute inside an inline
-                // `mod` applies to that module alone, and treating it as file-scope would UNDER-scan.
+                // BESPOKE_PROVIDER_CRATES). Recognised only while nothing shipped has been emitted
+                // yet — comments, whitespace and the non-`cfg` inner attributes skipped just above all
+                // preserve that run — which is the only position where it can mean "the whole file":
+                // an inner attribute inside an inline `mod` applies to that module alone, and treating
+                // it as file-scope would UNDER-scan.
                 if let Some((predicate, end)) = inner_cfg_attribute(file, &chars, i) {
                     if out.chars().all(char::is_whitespace) {
                         return match classify_cfg(&predicate) {
@@ -1364,6 +1378,61 @@ mod preview_advertising {
             "{file}: #![cfg({predicate})…] does not close with `]` — teach `code_only` about it"
         );
         Some((predicate, i + 1))
+    }
+
+    /// The index just past the closing `]` of **any** inner `#![…]` attribute starting at `at`, or
+    /// `None` if one does not start there.
+    ///
+    /// Used to step over the non-`cfg` inner attributes of a file's prologue so they cannot displace
+    /// the file-level `#![cfg(…)]` gate. Brackets nest and string literals (plain and raw) are
+    /// skipped, so a `]` inside `#![doc = "…]…"]` does not close the attribute early.
+    fn inner_attribute_end(file: &str, chars: &[char], at: usize) -> Option<usize> {
+        if !matches_at(chars, at, "#![") {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut i = at + 2; // land on the `[`
+        while i < chars.len() {
+            if let Some(end) = raw_string_end(file, chars, i) {
+                i = end;
+                continue;
+            }
+            let ch = chars[i];
+            if ch == '"' {
+                i += 1;
+                let mut escaped = false;
+                let mut closed = false;
+                while i < chars.len() {
+                    let c = chars[i];
+                    i += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        closed = true;
+                        break;
+                    }
+                }
+                assert!(
+                    closed,
+                    "{file}: unterminated string inside an inner attribute"
+                );
+                continue;
+            }
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{file}: an inner `#![…]` attribute never closes — teach `code_only` about it");
     }
 
     /// Every `cfg(…)` predicate left in stripped code, wherever it sits.
@@ -2057,6 +2126,53 @@ mod preview_advertising {
                 binding.trim().trim_start_matches("mut ").trim().to_string()
             })
             .collect()
+    }
+
+    /// A file-level `#![cfg(test)]` is found even when other inner attributes sit ahead of it.
+    ///
+    /// The gate keys on "nothing shipped has been emitted yet", so before this row any preceding
+    /// inner attribute ended that run and hid the `#![cfg(test)]` behind it — and the post-strip
+    /// sweep then hard-failed on a file that ships nothing at all. `#![allow(dead_code)]` ahead of a
+    /// module gate is a real shape here: `candle-gen-flux/src/vae/diffusers.rs` opens with one.
+    ///
+    /// The last two cases keep the skip honest in the other direction — a file-level `cfg` that
+    /// *does* ship still yields its code, and an inner attribute is only stepped over in the
+    /// prologue, never once shipped code has been seen.
+    #[test]
+    fn a_file_level_cfg_test_is_found_behind_other_inner_attributes() {
+        let stripped = |source: &str| code_only("synthetic.rs", source).code;
+        let body = "fn denoise() { candle_gen::run_flow_sampler(preview); }";
+
+        // The regression this row exists for, plus the bare form it must not disturb.
+        for prologue in [
+            "#![allow(dead_code)]\n",
+            "",
+            "//! docs\n#![allow(dead_code)]\n#![allow(clippy::too_many_arguments)]\n",
+            "#![doc = \"a ] bracket in a string\"]\n",
+        ] {
+            let code = stripped(&format!("{prologue}#![cfg(test)]\n{body}\n"));
+            assert!(
+                code.trim().is_empty(),
+                "a file gated test-only behind {prologue:?} must strip to nothing, got {code:?}"
+            );
+        }
+
+        // A shipping file-level cfg still yields its body, prologue or not.
+        let code = stripped(&format!(
+            "#![allow(dead_code)]\n#![cfg(feature = \"cuda\")]\n{body}\n"
+        ));
+        assert!(
+            code.contains("run_flow_sampler"),
+            "a cuda-gated file ships — its sampler site must survive the strip, got {code:?}"
+        );
+
+        // Non-vacuity for the "prologue only" half: an inner attribute inside an inline `mod` after
+        // shipped code applies to that module alone. Treating it as file-scope would UNDER-scan.
+        let code = stripped(&format!("{body}\nmod inner {{ #![allow(dead_code)] }}\n"));
+        assert!(
+            code.contains("run_flow_sampler"),
+            "an inner attribute below shipped code must not blank the file, got {code:?}"
+        );
     }
 
     /// A wired crate must be wired **everywhere**, not just somewhere: once a crate emits at all,

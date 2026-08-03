@@ -435,8 +435,10 @@ fn pulid_preview_frames_evolve_toward_the_final_image() {
 #[ignore = "needs PULID_PREVIEW_* + a CUDA GPU; run with --features cuda --release --ignored"]
 fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
     let steps = 8u32;
+    // 0.90 against a measured +0.952 on this 8-step 768 lane - 96% of the fit-derived 0.991 ceiling,
+    // and level with the two sibling heun lanes (+0.961 flux, +0.957 chroma, both floored at 0.90).
     let events =
-        assert_pulid_previews_converge("pulid-flux-heun", Some("heun"), steps, 768, 0.70, 1.5);
+        assert_pulid_previews_converge("pulid-flux-heun", Some("heun"), steps, 768, 0.90, 1.5);
     eprintln!("  heun: {events} evaluations for {steps} outer steps");
     assert!(
         events > steps as usize,

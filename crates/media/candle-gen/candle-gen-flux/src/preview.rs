@@ -71,9 +71,9 @@
 //! [128, 256, 512, 512]` in all four `vae/config.json`s):
 //!
 //! * the **fit donor** — `SceneWorks/flux1-dev-mlx` @ `323fd12d…`, `q4/vae/model.safetensors`, SHA-256
-//!   `e510ed25…4823`, 164,654,042 bytes, 260 tensors (diffusers layout; 244 learned bf16 plus the 16
-//!   `scales`/`biases` arrays of the eight q4-packed mid-block attention linears). This is the file the
-//!   MLX fit block names;
+//!   `e510ed25…4823`, 164,654,042 bytes, 260 tensors (diffusers layout; 244 learned — 236 bf16 plus the
+//!   8 `U32`-packed mid-block attention linears — plus those same eight linears' 16 `scales`/`biases`
+//!   arrays). This is the file the MLX fit block names;
 //! * the **diffusers bf16 container** — `black-forest-labs/FLUX.1-dev` and `FLUX.1-schnell`
 //!   `vae/diffusion_pytorch_model.safetensors`, SHA-256 `f5b59a26…40a3`, 167,666,902 bytes, 244
 //!   tensors. **Byte-identical** across those two repos and all three Chroma re-hosts;

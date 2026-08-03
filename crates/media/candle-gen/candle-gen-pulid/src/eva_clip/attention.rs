@@ -106,3 +106,77 @@ impl Attention {
         Tensor::cat(&[&cls, &pat], 2)?.contiguous()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// An `Attention` whose projections are never exercised. `rope_patch_tokens` reads no field of
+    /// `self`, so building one this way keeps the guard below off the weight loader and lets it run
+    /// on CPU in microseconds.
+    fn bare_attention(dev: &Device, num_heads: usize, head_dim: usize) -> Attention {
+        let c = num_heads * head_dim;
+        let weight = Tensor::zeros((c, c), DType::F32, dev).unwrap();
+        let vector = Tensor::zeros(c, DType::F32, dev).unwrap();
+        let linear = || Linear::new(weight.clone(), None);
+        Attention {
+            q_proj: linear(),
+            k_proj: linear(),
+            v_proj: linear(),
+            inner_ln: LayerNorm::new(vector.clone(), vector.clone(), 1e-6),
+            proj: linear(),
+            num_heads,
+            head_dim,
+            scale: (head_dim as f64).powf(-0.5),
+        }
+    }
+
+    /// `rope_patch_tokens` must hand back a **contiguous** `[B, heads, N, hd]` tensor (sc-16956).
+    ///
+    /// This is the CPU-runnable guard on a CUDA-only fix. `forward` feeds the result straight into
+    /// `matmul`, and candle's CUDA matmul rejects a non-contiguous operand outright (`matmul is only
+    /// supported for contiguous tensors`) where its CPU gemm silently accepts one — so without the
+    /// `.contiguous()` the whole EVA tower fails at the first attention on the one platform this crate
+    /// exists for, while every CPU test still passes. The real-weight row that would otherwise catch
+    /// it is `#[ignore]`d behind five env vars, a GPU and `--features cuda --release`.
+    #[test]
+    fn rope_patch_tokens_returns_a_contiguous_tensor() {
+        let dev = Device::Cpu;
+        // grid² patch tokens + the unrotated CLS token at index 0.
+        let (grid, heads, head_dim) = (2usize, 2usize, 4usize);
+        let n = 1 + grid * grid;
+        let rope = VisionRope::build(head_dim, grid, grid, 10_000.0, &dev).unwrap();
+        let attn = bare_attention(&dev, heads, head_dim);
+
+        // Contiguous going in — exactly what `forward`'s `to_heads` produces.
+        let x = Tensor::arange(0f32, (heads * n * head_dim) as f32, &dev)
+            .unwrap()
+            .reshape((1, heads, n, head_dim))
+            .unwrap();
+        assert!(
+            x.is_contiguous(),
+            "the input must start contiguous or this row proves nothing about the join"
+        );
+
+        // Non-vacuity: the join itself really does come back strided, so the `.contiguous()` inside
+        // `rope_patch_tokens` is load-bearing rather than defensive. `narrow` on axis 2 yields a view,
+        // and `Tensor::cat` on a non-zero axis with a non-contiguous input takes a transposing path
+        // (`cat0` then `transpose(0, dim)`). If candle ever makes that path contiguous this assertion
+        // fires — which is the correct failure: the guard below would have gone vacuous.
+        let cls = x.narrow(2, 0, 1).unwrap();
+        let pat = rope.apply(&x.narrow(2, 1, n - 1).unwrap()).unwrap();
+        assert!(
+            !Tensor::cat(&[&cls, &pat], 2).unwrap().is_contiguous(),
+            "the unmaterialized join is expected to be strided; this guard is vacuous if it is not"
+        );
+
+        let out = attn.rope_patch_tokens(&x, &rope).unwrap();
+        assert_eq!(out.dims(), &[1, heads, n, head_dim]);
+        assert!(
+            out.is_contiguous(),
+            "rope_patch_tokens must materialize its join — candle's CUDA matmul rejects a strided \
+             operand, so a view here breaks the EVA tower on GPU while CPU tests stay green"
+        );
+    }
+}

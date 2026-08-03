@@ -50,13 +50,17 @@ sweep for bespoke `for`-loop denoise bodies (`for … in …sigmas`, `for … in
 for direct `emit_preview*` / `.emit*` calls. **Five sampler sites across the three crates, five lanes,
 zero bespoke loops, zero dark sites.**
 
+Sites are cited by **file**, not by line — matching the catalog table below. The scanner re-derives the
+exact call positions from the shipped module tree on every run, so a line number here would carry no
+authority and would drift out of date the first time either file above it changed.
+
 ### `candle-gen-flux` — `Denoise::Shared`, 3 sites, 3 lanes, 0 dark
 
 | file | lane | driver | default for |
 | --- | --- | --- | --- |
-| `pipeline.rs:649` | registered txt2img (`Pipeline::denoise`) | `run_flow_sampler` | **`flux1_schnell` and `flux1_dev` — the default and only registered lane for both** |
-| `control_provider.rs:417` | Fun-ControlNet-Union strict pose/canny/depth | `run_flow_sampler` | the worker's `flux1_dev_control` candle lane |
-| `ip_provider.rs:324` | XLabs IP-Adapter reference stream | `run_flow_sampler` | the worker's FLUX IP-Adapter lane |
+| `pipeline.rs` | registered txt2img (`Pipeline::denoise`) | `run_flow_sampler` | **`flux1_schnell` and `flux1_dev` — the default and only registered lane for both** |
+| `control_provider.rs` | Fun-ControlNet-Union strict pose/canny/depth | `run_flow_sampler` | the worker's `flux1_dev_control` candle lane |
+| `ip_provider.rs` | XLabs IP-Adapter reference stream | `run_flow_sampler` | the worker's FLUX IP-Adapter lane |
 
 `control.rs`, `ip_adapter.rs`, `ip_dit.rs`, `packed_dit.rs`, `packed_te.rs`, `flux1_load.rs`,
 `ref_backbone.rs`, `quant.rs`, `vae/` and `lib.rs` hold weights, geometry or registration and drive no
@@ -74,7 +78,7 @@ source, so a refactor giving `generate` a body of its own has to come back to it
 
 | file | lane | driver | default for |
 | --- | --- | --- | --- |
-| `pipeline.rs:312` | registered txt2img (`Pipeline::denoise`) | `run_flow_sampler` | **`chroma1_hd`, `chroma1_base` and `chroma1_flash` — one lane, three descriptors** |
+| `pipeline.rs` | registered txt2img (`Pipeline::denoise`) | `run_flow_sampler` | **`chroma1_hd`, `chroma1_base` and `chroma1_flash` — one lane, three descriptors** |
 
 Three ids, one render body: the variants differ in the DiT weights and in the σ schedule
 (`Pipeline::sigmas` — HD/Flash static-shift `linspace`, Base beta-spaced), not in the denoise. Chroma
@@ -84,7 +88,7 @@ has no trainer, no second denoise and no name-driven provider.
 
 | file | lane | driver | default for |
 | --- | --- | --- | --- |
-| `pulid_flux.rs:391` | `PulidFlux::generate` identity T2I | `run_flow_sampler` | the worker's `candle_pulid_flux` lane (no descriptor) |
+| `pulid_flux.rs` | `PulidFlux::generate` identity T2I | `run_flow_sampler` | the worker's `candle_pulid_flux` lane (no descriptor) |
 
 The epic's scoping said PuLID uses `run_flow_sampler`; **verified, and it is its own call**, not a
 delegation to `candle-gen-flux`'s. The candle PuLID runs its own flow loop (unlike the MLX PuLID, which
@@ -132,7 +136,7 @@ per snapshot. All four containers declare the same `vae/config.json`: `_class_na
 
 | container | SHA-256 | bytes | tensors | loaded by |
 | --- | --- | --- | --- | --- |
-| **fit donor** `SceneWorks/flux1-dev-mlx` @ `323fd12d…` `q4/vae/model.safetensors` | `e510ed25…4823` | 164,654,042 | 260 (244 learned bf16 + 16 packed arrays) | candle FLUX.1 / PuLID packed tier |
+| **fit donor** `SceneWorks/flux1-dev-mlx` @ `323fd12d…` `q4/vae/model.safetensors` | `e510ed25…4823` | 164,654,042 | 260 = 244 learned (236 bf16 + 8 U32-packed) plus 16 scales/biases arrays | candle FLUX.1 / PuLID packed tier |
 | diffusers bf16 `black-forest-labs/FLUX.1-{dev,schnell}` `vae/diffusion_pytorch_model.safetensors` | `f5b59a26…40a3` | 167,666,902 | 244 | Chroma (all three variants) |
 | BFL f32 `black-forest-labs/FLUX.1-{dev,schnell}` `ae.safetensors` | `afc8e282…9e38` | 335,304,388 | 244 | candle FLUX.1 / PuLID **dense** tier |
 | q8 tier `SceneWorks/flux1-dev-mlx` `q8/vae/model.safetensors` | `7cbe4841…f24d` | 165,702,660 | 260 | candle FLUX.1 / PuLID q8 tier |
@@ -221,8 +225,18 @@ Bringing those five crates into the scan exposed one real hole in the scanner: `
 and `candle-gen-pulid` both open `src/validate.rs` with a **file-level inner** `#![cfg(test)]`, which
 `code_only` did not recognise (it looked only for the outer `#[cfg(…)]` that precedes an item) and which
 its own belt-and-braces sweep then hard-failed on. `inner_cfg_attribute` now handles it, recognised only
-before the first block — the one position where an inner attribute means "the whole file", since one
-inside an inline `mod` applies to that module alone and treating it as file-scope would under-scan.
+while nothing shipped has been emitted yet — the one position where an inner attribute means "the whole
+file", since one inside an inline `mod` applies to that module alone and treating it as file-scope would
+under-scan.
+
+That "nothing emitted yet" test is what the gate actually keys on, and on review it was **not** the same
+thing as "before the first block": any *preceding* inner attribute ended the run and hid the gate behind
+it, sending a file that ships nothing straight to the sweep's hard failure. `#![allow(dead_code)]` ahead
+of `#![cfg(test)]` is a real shape here — `candle-gen-flux/src/vae/diffusers.rs` opens with one — so
+`code_only` now steps over non-`cfg` inner attributes while the prologue is still whitespace-only.
+`a_file_level_cfg_test_is_found_behind_other_inner_attributes` pins all four directions: the regression
+shape, the bare form, a file-level `cfg` that *does* ship, and an inner attribute below shipped code
+(which must stay module-scoped). Removing the skip turns that row red on the sweep's hard failure.
 
 ### Mutation proof
 
@@ -253,7 +267,7 @@ needs no third-party portrait.
 | `chroma1_hd` euler (**default**) | 1024² × 12 | 12, 1..=12 | 3.122 → 8.797 (2.8×), peak 9.496 | 60.71 → 13.42 (**−77.9 %**) | +0.193 → **+0.800** |
 | `chroma1_hd` heun | 768² × 8 | 8, 1..=8 | 4.273 → 15.731 (3.7×), peak 15.731 | 65.32 → 12.64 (**−80.6 %**) | +0.058 → **+0.957** |
 | PuLID euler (**default**) | 1024² × 12 | 12, 1..=12 | 4.805 → 14.507 (3.0×), peak 15.989 | 90.43 → 12.34 (**−86.4 %**) | +0.113 → **+0.962** |
-| PuLID heun | 768² × 8 | 8, 1..=8 | 8.413 → 19.307 (2.3×), peak 19.307 | 84.37 → 12.34 (**−85.4 %**) | +0.018 → **+0.952** |
+| PuLID heun | 768² × 8 | 8, 1..=8 | 8.413 → 19.307 (2.3×), peak 19.307 | 84.37 → 12.34 (**−85.4 %**) | +0.062 → **+0.952** |
 
 Every strip: distance to the finished image falls at **every** step, resemblance rises at **every**
 step, and the total rise clears the +0.30 bar with room (+0.607 on the weakest lane, +0.934 on the
@@ -265,7 +279,11 @@ wiring: Chroma HD walks `linspace(1, 1/N)` under a static shift of 3, which leav
 terminal step (the hook emits *before* each solver step, so the final advancement is never shown). Its
 own 8-step 768 lane, which does not pay that penalty, reaches +0.957 on the same fit. sc-16955 measured
 the same effect on FLUX.2 (+0.556 against a 0.874 ceiling); at 80.7 % of ceiling Chroma is well ahead of
-that already-accepted precedent. Per-lane floors are set just under each measurement.
+that already-accepted precedent. Per-lane floors are set just under each measurement, and each carries
+the measured number in a comment beside it: **0.90** on the five lanes that clear +0.95 (flux euler
++0.970 and heun +0.961, chroma heun +0.957, PuLID euler +0.962 and heun +0.952), **0.75** on Chroma's
+schedule-penalised 1024 euler lane (+0.800). PuLID heun carried 0.70 against +0.952 on first submission,
+which was the one lane a floor would not have caught degrading — it is 0.90 now, level with its siblings.
 
 **Exactly one frame per outer step on a multi-eval solver**, proven non-vacuously: `heun` produced **15
 evaluations for 8 outer steps** on all three families (the driver calls `on_progress` once per
@@ -309,9 +327,20 @@ non-zero axis when its inputs are not all contiguous — and `rope.apply` return
 reached the attention matmul with a transposed layout. Candle's CPU gemm accepts that; its **CUDA**
 matmul does not. The whole EVA02-CLIP tower therefore failed at the first attention on the one platform
 this crate exists for, while every CPU unit test passed — the standing candle lesson that a green CPU
-suite proves a path compiles and runs, not that the CUDA kernels accept its layouts. One `.contiguous()`, numerically a no-op, fixes q and k at once. Without it candle PuLID is
-entirely non-functional at real weights on Windows/CUDA, so this was a blocker for the story's own
-acceptance criterion rather than adjacent cleanup.
+suite proves a path compiles and runs, not that the CUDA kernels accept its layouts. One `.contiguous()`,
+numerically a no-op, fixes q and k at once. Without it candle PuLID is entirely non-functional at real
+weights on Windows/CUDA, so this was a blocker for the story's own acceptance criterion rather than
+adjacent cleanup.
+
+**And it now has a CPU-runnable guard**, which the fix originally shipped without — leaving the
+`#[ignore]`d GPU row (five env vars, a GPU, `--features cuda --release`) as the only thing that would
+notice a regression, in exactly the blind spot the paragraph above describes.
+`rope_patch_tokens_returns_a_contiguous_tensor` in `attention.rs` builds a `[1, 2, 5, 4]` input, asserts
+the un-materialized join really does come back strided (non-vacuity — the guard would be worthless if
+candle's `cat` were already contiguous here), and then asserts `rope_patch_tokens` returns a contiguous
+tensor. It runs on CPU in microseconds, and removing the `.contiguous()` turns it red on that exact
+assertion. Layout is one of the few CUDA-only failure classes a CPU test *can* reach, because
+`is_contiguous` is a property of the layout rather than of the kernel.
 
 ## 8. What this breaks in SceneWorks — and what is left
 
