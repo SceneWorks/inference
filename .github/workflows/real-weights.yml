@@ -942,6 +942,23 @@ jobs:
               exit 1
             fi
           done
+      # sc-17271: the first run of this lane on a box that does not already hold the snapshot pays
+      # a 16 GB Hub transfer into the shared `~/.cache/huggingface` every other rw-* lane on that
+      # runner reads from, and an ENOSPC partway through leaves partial blobs behind. This records
+      # the headroom that box actually had, and whether a transfer is about to happen at all, in
+      # the run log — the only view of a self-hosted runner's disk anyone gets after the fact.
+      # Report-only: a hard floor would have to guess a build-tree size, and would red the lane in
+      # the steady state, when the snapshot is already resident and nothing is transferred.
+      - name: Report runner disk headroom
+        run: |
+          df -h "$HOME" "$RUNNER_TEMP"
+          for v in MLX_LLM_JOYCAPTION_SNAPSHOT; do
+            if [[ -d "${!v}" ]]; then
+              echo "$v: resident, $(du -shL "${!v}" | cut -f1)"
+            else
+              echo "$v: ABSENT — this run materializes it from the Hub"
+            fi
+          done
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1758,6 +1775,19 @@ jobs:
             if [[ "${!v}" != /* ]]; then
               echo "$v must be an absolute path, got: ${!v}" >&2
               exit 1
+            fi
+          done
+      # sc-17271: same as the JoyCaption lane — the MOSS-TTS-Realtime AR stack and the MOSS-Audio
+      # codec are an 11 GB transfer on a box that does not already hold them, into a cache shared
+      # with every other rw-audio lane. Report-only, for the reason given at the JoyCaption copy.
+      - name: Report runner disk headroom
+        run: |
+          df -h "$HOME" "$RUNNER_TEMP"
+          for v in MOSS_TTS_REALTIME_SNAPSHOT MOSS_AUDIO_TOKENIZER_SNAPSHOT WHISPER_SNAPSHOT CHATTERBOX_SNAPSHOT; do
+            if [[ -d "${!v}" ]]; then
+              echo "$v: resident, $(du -shL "${!v}" | cut -f1)"
+            else
+              echo "$v: ABSENT — this run materializes it from the Hub"
             fi
           done
       - name: Materialize and verify immutable snapshots
