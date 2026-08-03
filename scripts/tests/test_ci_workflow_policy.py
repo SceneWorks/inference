@@ -65,6 +65,46 @@ def evaluate_policy(
     return bool(eval(rendered, {"__builtins__": {}}, {}))
 
 
+def workflow_job_bodies(workflow: str) -> dict[str, list[str]]:
+    """Return top-level job bodies without treating nested step keys as jobs."""
+    lines = workflow.splitlines()
+    try:
+        cursor = lines.index("jobs:") + 1
+    except ValueError as error:
+        raise AssertionError("workflow has no jobs mapping") from error
+
+    jobs: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in lines[cursor:]:
+        if line and not line.startswith(" "):
+            break
+        match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if match is not None:
+            current = match.group(1)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(line)
+    return jobs
+
+
+def privileged_real_weight_jobs(workflow: str) -> list[str]:
+    """Find ordinary-CI jobs whose job-level runner declaration names the privileged label."""
+    privileged: list[str] = []
+    for job, lines in workflow_job_bodies(workflow).items():
+        for index, line in enumerate(lines):
+            if not line.startswith("    runs-on:"):
+                continue
+            declaration = [line.partition(":")[2].strip()]
+            for continuation in lines[index + 1 :]:
+                if continuation and len(continuation) - len(continuation.lstrip()) <= 4:
+                    break
+                declaration.append(continuation.strip())
+            if "real-weights" in " ".join(declaration).lower():
+                privileged.append(job)
+            break
+    return privileged
+
+
 class CiWorkflowPolicyTests(unittest.TestCase):
     def test_chroma_packed_build_script_is_valid_bash(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
@@ -97,6 +137,101 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(workflow.count('"bits": 8,'), 2)
         self.assertEqual(workflow.count('"group_size": 32,'), 2)
+
+    def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
+        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 13)
+        expected_models = {
+            "same-l-metal": ("same-l",),
+            "same-chunked-metal": ("same-s", "same-l"),
+            "sa3-small-music-metal": ("stable-audio-3-small-music",),
+            "sa3-small-sfx-metal": (
+                "stable-audio-3-small-sfx",
+                "stable-audio-3-small-music",
+            ),
+            "sa3-medium-metal": (
+                "stable-audio-3-medium",
+                "stable-audio-3-medium-base",
+                "stable-audio-3-small-music",
+                "stable-audio-3-small-sfx",
+                "same-l",
+            ),
+            "sa3-base-identity-metal": (
+                "stable-audio-3-small-music",
+                "stable-audio-3-small-sfx",
+                "stable-audio-3-medium",
+                "stable-audio-3-small-music-base",
+                "stable-audio-3-small-sfx-base",
+                "stable-audio-3-medium-base",
+                "same-l",
+            ),
+            "sa3-small-base-metal": (
+                "stable-audio-3-small-music-base",
+                "stable-audio-3-small-sfx-base",
+            ),
+        }
+        expected_models.update(
+            {
+                job.replace("-metal", "-cuda"): models
+                for job, models in expected_models.items()
+                if job != "same-chunked-metal"
+            }
+        )
+        for job, models in expected_models.items():
+            match = re.search(
+                rf"^  {re.escape(job)}:\n(?P<body>(?:^    .*\n|^\n)*)",
+                workflow,
+                flags=re.MULTILINE,
+            )
+            self.assertIsNotNone(match, job)
+            body = match["body"]
+            helper_start = body.index("export_model_snapshot_paths.py")
+            helper_end = body.find("\n      - name:", helper_start)
+            helper = body[helper_start : helper_end if helper_end >= 0 else None]
+            invocation_models = re.findall(r"--model\s+([^\s]+)", helper)
+            self.assertEqual(invocation_models, list(models), job)
+            self.assertEqual(len(invocation_models), len(set(invocation_models)), job)
+
+    def test_real_weight_selection_is_informational_in_ordinary_ci(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("real_weights: ${{ steps.select.outputs.real_weights }}", workflow)
+        self.assertIn("ordinary CI cannot launch privileged real-weight runners", workflow)
+        self.assertEqual(privileged_real_weight_jobs(workflow), [])
+
+    def test_privileged_runner_guard_rejects_differently_named_jobs(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "scalar": "    runs-on: real-weights",
+            "list": "    runs-on: [self-hosted, macOS, ARM64, real-weights]",
+            "expression": (
+                "    runs-on: ${{ fromJSON('[\"self-hosted\",\"real-weights\"]') }}"
+            ),
+        }
+        for shape, runs_on in mutations.items():
+            with self.subTest(shape=shape):
+                mutated = workflow + f"\n  differently-named-{shape}:\n{runs_on}\n"
+                self.assertEqual(
+                    privileged_real_weight_jobs(mutated),
+                    [f"differently-named-{shape}"],
+                )
+
+    def test_sa3_weight_free_step_keeps_only_the_executable_invariant(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("- name: Test Stable Audio 3 weight-free quality gates")
+        run = workflow.index("\n        run:", start)
+        comments = [line for line in workflow[start:run].splitlines() if "#" in line]
+        self.assertLessEqual(len(comments), 4)
+        self.assertIn("test_sa3_ci_target_coverage.py", workflow[start:run])
+        self.assertIn("SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md", workflow[start:run])
+
+    def test_real_weight_concurrency_is_scoped_by_profile(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "group: inference-real-weights-${{ github.ref }}-"
+            "${{ inputs.profile || 'schedule' }}",
+            workflow,
+        )
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
