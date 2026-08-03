@@ -599,7 +599,7 @@ mod tests {
     fn requested_geometry_drives_feasibility_preprocessing_and_render_options() {
         use std::cell::Cell;
 
-        let req = GenerationRequest {
+        let mut req = GenerationRequest {
             width: 640,
             height: 384,
             sampler: Some("euler".into()),
@@ -644,6 +644,10 @@ mod tests {
         assert_eq!(prepared_dimensions.get(), Some((640, 384)));
         assert_eq!(admitted.dimensions(), (640, 384));
 
+        // Render options must consume the admitted geometry, not re-read substitutable request
+        // fields after the gate. This mutation makes that distinction observable without weights.
+        req.width = 1024;
+        req.height = 768;
         let opts = admitted.turbo_options(&req, 8, 42);
         assert_eq!((opts.width, opts.height), (640, 384));
         assert_eq!(opts.steps, 8);
