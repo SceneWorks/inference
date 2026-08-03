@@ -642,6 +642,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -827,6 +828,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
  "tracing",
 ]

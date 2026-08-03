@@ -23,6 +23,10 @@ mod chatglm3;
 mod common;
 mod config;
 mod pipeline;
+// Per-step latent preview wiring (epic 16948, sc-16954). No coefficients of its own — Kolors shares
+// the SDXL four-channel latent space (one byte-identical VAE file, `scaling_factor` 0.13025) and
+// projects through `candle_gen_sdxl::preview` rather than restating the fit.
+pub mod preview;
 mod sampler;
 mod tokenizer;
 mod unet;

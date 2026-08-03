@@ -31,7 +31,7 @@ use rand::SeedableRng;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::DiscreteModelSampling;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{self, Image, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
 
 use crate::pipeline::VAE_SCALE;
@@ -237,6 +237,7 @@ pub fn denoise_ip_multi_control(
     rng: &mut StdRng,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
     controls: &[ControlContext],
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
@@ -252,11 +253,20 @@ pub fn denoise_ip_multi_control(
         let (_, c, h, w) = latents.dims4()?;
         (c, h, w)
     };
+    // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers frames itself, on
+    // the STEP INDEX — this schedule is a `(t, t_prev)` timestep pair list, not a descending σ array.
+    // No renormalization is applied here and none is wanted: euler-ancestral folds the input scaling
+    // into its own step ("the UNet input is the raw latents", below), so `latents` is ALREADY in the
+    // domain the reused fit was measured in — this is the very lane it was measured on.
+    let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
     for (i, &(t, t_prev)) in steps.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
+            crate::preview::project_spatial_latents(&latents)
+        });
         // Euler-ancestral folds the input renormalization into its step (the sampler's `step` applies
         // `rsqrt(σ_prev²+1)`), so the UNet input is the raw latents — no `scale_model_input`. CFG runs
         // the cond + uncond rows in one batched forward.
@@ -339,6 +349,7 @@ pub fn denoise_ip_control(
     rng: &mut StdRng,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
     control: &ControlContext,
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
@@ -353,6 +364,7 @@ pub fn denoise_ip_control(
         rng,
         cancel,
         on_progress,
+        preview,
         std::slice::from_ref(control),
         controlnet_encoder,
     )
@@ -401,6 +413,7 @@ pub fn denoise_curated(
     seed: u64,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&candle_gen::preview::PreviewHook<'_>>,
     controls: &[ControlContext],
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
@@ -413,7 +426,7 @@ pub fn denoise_curated(
         seed,
         cancel,
         on_progress,
-        None,
+        preview,
         |x_in, timestep| -> Result<Tensor> {
             // `x_in` is the `1/√(σ²+1)`-scaled latent (f32 from the solver); cast to the UNet compute
             // dtype, then CFG-batch the single row to [uncond, cond].
@@ -660,6 +673,7 @@ mod tests {
                 &mut rng,
                 &cancel,
                 &mut prog,
+                &gen_core::PreviewSink::default(),
                 &[],
                 &c.text,
             )
@@ -696,6 +710,7 @@ mod tests {
             &mut rng,
             &cancel,
             &mut prog,
+            &gen_core::PreviewSink::default(),
             &[],
             &c.text,
         );
@@ -758,6 +773,7 @@ mod tests {
                 &mut rng,
                 &cancel,
                 &mut prog,
+                &gen_core::PreviewSink::default(),
                 &cc,
                 &c.text, // the face tokens are the ControlNet cross-attn conditioning
             )
@@ -835,6 +851,7 @@ mod tests {
                 3,
                 &cancel,
                 &mut prog,
+                None,
                 std::slice::from_ref(&cc),
                 &c.text, // the face/control cross-attn conditioning
             )
@@ -891,6 +908,7 @@ mod tests {
             3,
             &cancel,
             &mut prog,
+            None,
             &[],
             &c.text,
         );

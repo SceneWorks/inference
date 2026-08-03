@@ -97,7 +97,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16954): both lanes of this registered route
+            // emit -- the curated driver lane and the native leading-Euler loop -- as do the
+            // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
+            // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

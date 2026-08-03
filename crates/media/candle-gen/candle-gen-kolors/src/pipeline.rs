@@ -375,11 +375,23 @@ impl Pipeline {
                 )?
             } else {
                 let mut latents = (&noise * sampler.init_noise_sigma() as f64)?;
+                // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers its
+                // own frames on the STEP INDEX -- this lane walks a `KolorsEulerSampler` timestep
+                // table, not a descending sigma array. One eval per step, so nothing repeats for the
+                // counter to dedup; it still bounds and dedups on principle.
+                let preview_counter =
+                    candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
                 for i in 0..sampler.num_steps() {
                     if req.cancel.is_cancelled() {
                         return Err(CandleError::Canceled);
                     }
                     let scaled = (&latents / sampler.scale_in(i) as f64)?;
+                    // Preview `scaled` -- the very tensor this step feeds the UNet, and therefore the
+                    // domain the reused fit was measured in. Binding the preview to the lane's own
+                    // `scale_in` is what stops the two coming to disagree about the renormalization.
+                    candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, i, || {
+                        crate::preview::project_spatial_latents(&scaled)
+                    });
                     let model_in = if use_guide {
                         Tensor::cat(&[&scaled, &scaled], 0)?
                     } else {
@@ -444,6 +456,11 @@ impl Pipeline {
         // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
         // identical across the three entry points. `init` is the raw seeded noise (lifted to σ-space).
         let setup = CuratedSetup::new(req.scheduler.as_deref(), steps, init)?;
+        // Per-step latent preview (epic 16948, sc-16954). The sc-16949 projector hook, so the loop is
+        // not restructured and the driver owns frame numbering plus the multi-eval dedup. `ve_hook`
+        // because the running latent here is raw k-diffusion VE sigma-space. Built per image: the
+        // driver starts a fresh counter per call.
+        let preview = crate::preview::ve_hook(&req.preview);
         let out = candle_gen::run_curated_sampler(
             Some(sampler),
             &setup.model_sampling,
@@ -452,7 +469,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |x_in, t| -> Result<Tensor> {
                 // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
                 // index the UNet embeds. CFG batches/combines exactly like the native leading-Euler path.

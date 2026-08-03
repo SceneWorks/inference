@@ -354,6 +354,11 @@ fn preview_latents(
         seed,
         &cancel,
         &mut on_progress,
+        // Deliberately dark (epic 16948, sc-16954): this is the TRAINER's periodic sample render,
+        // driven from a synthetic request that carries no `PreviewSink` at all — its result is
+        // delivered as a finished `TrainingProgress::Sample` image, not as a live denoise stream. The
+        // sc-16951 catalog guard pins this as a `DarkSite` so blanking a *render* route later cannot
+        // hide behind it. Same decision sc-16950 recorded for Krea's trainer.
         None,
         |x_in, timestep| -> Result<Tensor> {
             // `x_in` is already `1/√(σ²+1)`-scaled by the solver; CFG-batch the single row to
