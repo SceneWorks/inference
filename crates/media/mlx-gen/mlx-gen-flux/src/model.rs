@@ -183,7 +183,7 @@ pub(crate) fn load_flux_text(
     }
     let t5_tokenizer = match stream_inventory {
         Some(inventory) => loader::load_t5_tokenizer_from_file(
-            inventory.t5_tokenizer_source().canonical_path(),
+            inventory.t5_tokenizer_source().loader_path(),
             variant,
         )?,
         None => loader::load_t5_tokenizer(root, variant)?,
@@ -192,14 +192,14 @@ pub(crate) fn load_flux_text(
     let mut text_encoders = FluxTextEncoders {
         t5: match stream_inventory {
             Some(inventory) => {
-                loader::load_t5_encoder_from_file(inventory.t5_encoder_source().canonical_path())?
+                loader::load_t5_encoder_from_file(inventory.t5_encoder_source().loader_path())?
             }
             None => loader::load_t5_encoder(root)?,
         },
         clip: match stream_inventory {
-            Some(inventory) => loader::load_clip_encoder_from_file(
-                inventory.clip_encoder_source().canonical_path(),
-            )?,
+            Some(inventory) => {
+                loader::load_clip_encoder_from_file(inventory.clip_encoder_source().loader_path())?
+            }
             None => loader::load_clip_encoder(root)?,
         },
     };
@@ -237,7 +237,7 @@ fn load_flux_heavy(
                 .ensure_unchanged()
                 .map_err(|error| Error::Msg(error.to_string()))?;
             let transformer = loader::load_transformer_from_file(
-                inventory.transformer_source().canonical_path(),
+                inventory.transformer_source().loader_path(),
                 variant,
             )?;
             inventory
@@ -250,7 +250,7 @@ fn load_flux_heavy(
     };
     let mut vae = match stream_inventory {
         Some(inventory) => {
-            let vae = loader::load_vae_from_file(inventory.vae_source().canonical_path())?;
+            let vae = loader::load_vae_from_file(inventory.vae_source().loader_path())?;
             inventory
                 .ensure_unchanged()
                 .map_err(|error| Error::Msg(error.to_string()))?;

@@ -1,10 +1,11 @@
 //! Exact snapshot-backed materialization of FLUX.1's joint and single DiT stacks.
 //!
 //! The non-block trunk stays on [`crate::transformer::FluxTransformer`]. A deferred transformer
-//! owns only this reopenable description: every window opens the already-verified canonical
-//! `transformer/model.safetensors`, reconstructs the requested blocks, drains the tensor handles
-//! read by their constructors, and verifies the complete behavioral inventory around the lazy MLX
-//! materialization boundary.
+//! owns only this reopenable description: every window opens the already-verified pinned snapshot
+//! entry for `transformer/model.safetensors`, reconstructs the requested blocks, drains the tensor
+//! handles read by their constructors, and verifies the complete behavioral inventory around the
+//! lazy MLX materialization boundary. The snapshot entry retains the extension MLX needs for format
+//! dispatch; its exact canonical target remains identity- and content-pinned.
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::weights::Weights;
@@ -75,7 +76,11 @@ impl FluxBlockStream {
     /// resolution is permitted after contract admission.
     pub(crate) fn open(&self) -> Result<Weights> {
         self.verify_inventory()?;
-        let view = Weights::from_file(self.source.canonical_path())?;
+        let view = Weights::from_file(self.source.loader_path()).map_err(|error| {
+            Error::Msg(format!(
+                "flux1 block stream: open pinned transformer safetensors view: {error}"
+            ))
+        })?;
         self.verify_inventory()?;
         Ok(view)
     }
@@ -87,7 +92,12 @@ impl FluxBlockStream {
                 self.joint_blocks
             )));
         }
-        let mut block = JointBlock::from_weights(view, &format!("transformer_blocks.{index}"))?;
+        let mut block = JointBlock::from_weights(view, &format!("transformer_blocks.{index}"))
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "flux1 block stream: materialize joint block {index}: {error}"
+                ))
+            })?;
         // Array handles are refcounted. Drain precisely what this constructor read so dropping the
         // completed window can release its materialized weights instead of retaining a map copy.
         view.remove_accessed();
@@ -96,7 +106,11 @@ impl FluxBlockStream {
             // no-op for those packed leaves. Reject a lying marker rather than quantizing per
             // window, which would violate rung 4's device-format-transfer cost contract.
             ensure_prepacked(&mut block, &format!("joint block {index}"))?;
-            block.quantize(bits)?;
+            block.quantize(bits).map_err(|error| {
+                Error::Msg(format!(
+                    "flux1 block stream: prepare packed joint block {index} at Q{bits}: {error}"
+                ))
+            })?;
         }
         Ok(block)
     }
@@ -113,11 +127,20 @@ impl FluxBlockStream {
             )));
         }
         let mut block =
-            SingleBlock::from_weights(view, &format!("single_transformer_blocks.{index}"))?;
+            SingleBlock::from_weights(view, &format!("single_transformer_blocks.{index}"))
+                .map_err(|error| {
+                    Error::Msg(format!(
+                        "flux1 block stream: materialize single block {index}: {error}"
+                    ))
+                })?;
         view.remove_accessed();
         if let Some(bits) = self.quant_bits {
             ensure_prepacked(&mut block, &format!("single block {index}"))?;
-            block.quantize(bits)?;
+            block.quantize(bits).map_err(|error| {
+                Error::Msg(format!(
+                    "flux1 block stream: prepare packed single block {index} at Q{bits}: {error}"
+                ))
+            })?;
         }
         Ok(block)
     }

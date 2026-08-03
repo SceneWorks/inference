@@ -14,6 +14,7 @@ use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, concatenate_axis, multiply, power, split, tanh};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
+use std::cell::Cell;
 
 use crate::config::FluxVariant;
 
@@ -500,12 +501,15 @@ impl FluxTransformer {
                         "flux1: joint/single block plan depth mismatch".to_owned(),
                     ));
                 }
+                let active_joint_window = Cell::new((0usize, 0usize));
                 let result = mlx_gen::block_residency::run_windowed(
                     &window.joint,
                     window.cancel,
                     (encoder, hidden),
                     || source.open(),
                     |(mut encoder, mut hidden), view, range| {
+                        let (start, end) = (range.start, range.end);
+                        active_joint_window.set((start, end));
                         for i in range {
                             let block = source.materialize_joint(view, i)?;
                             crate::block_stream::calibration_stream_fault(
@@ -519,12 +523,22 @@ impl FluxTransformer {
                                 &rope,
                                 None,
                                 attention,
-                            )?;
+                            )
+                            .map_err(|error| {
+                                mlx_gen::Error::Msg(format!(
+                                    "flux1 block stream: joint window {start}..{end} block {i} forward: {error}"
+                                ))
+                            })?;
                         }
                         Ok((encoder, hidden))
                     },
                     |(encoder, hidden)| {
-                        mlx_rs::transforms::eval([encoder, hidden])?;
+                        let (start, end) = active_joint_window.get();
+                        mlx_rs::transforms::eval([encoder, hidden]).map_err(|error| {
+                            mlx_gen::Error::Msg(format!(
+                                "flux1 block stream: joint window {start}..{end} eval: {error}"
+                            ))
+                        })?;
                         source.verify_materialized_window()
                     },
                 );
@@ -570,20 +584,34 @@ impl FluxTransformer {
                         "flux1: no verified snapshot-backed block stream".to_owned(),
                     )
                 })?;
+                let active_single_window = Cell::new((0usize, 0usize));
                 let result = mlx_gen::block_residency::run_windowed(
                     &window.single,
                     window.cancel,
                     joint,
                     || source.open(),
                     |mut joint, view, range| {
+                        let (start, end) = (range.start, range.end);
+                        active_single_window.set((start, end));
                         for i in range {
                             let block = source.materialize_single(view, i)?;
-                            joint = block.forward(&joint, &text_embeddings, &rope, attention)?;
+                            joint = block
+                                .forward(&joint, &text_embeddings, &rope, attention)
+                                .map_err(|error| {
+                                    mlx_gen::Error::Msg(format!(
+                                        "flux1 block stream: single window {start}..{end} block {i} forward: {error}"
+                                    ))
+                                })?;
                         }
                         Ok(joint)
                     },
                     |joint: &Array| {
-                        mlx_rs::transforms::eval([joint])?;
+                        let (start, end) = active_single_window.get();
+                        mlx_rs::transforms::eval([joint]).map_err(|error| {
+                            mlx_gen::Error::Msg(format!(
+                                "flux1 block stream: single window {start}..{end} eval: {error}"
+                            ))
+                        })?;
                         source.verify_materialized_window()
                     },
                 );

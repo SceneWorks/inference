@@ -64,6 +64,17 @@ impl PinnedArtifact {
         &self.identity.canonical_path
     }
 
+    /// Snapshot entry consumed by format-dispatching runtime loaders.
+    ///
+    /// Hugging Face snapshot entries normally retain the semantic extension while their canonical
+    /// blob targets do not. MLX selects the safetensors loader from that extension, so runtime
+    /// opens must use this already-pinned entry rather than the extensionless canonical blob. The
+    /// entry, its symlink target, and the resolved canonical file are all checked by
+    /// [`ensure_unchanged`](Self::ensure_unchanged) around every load/materialization boundary.
+    pub(crate) fn loader_path(&self) -> &Path {
+        &self.source.absolute_path
+    }
+
     pub(crate) fn digest(&self) -> &str {
         &self.digest
     }
@@ -837,6 +848,45 @@ mod tests {
             inventory.ensure_unchanged().unwrap();
             std::fs::remove_dir_all(root).ok();
         }
+    }
+
+    #[test]
+    fn pinned_loader_path_preserves_safetensors_extension_for_extensionless_hf_blob() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_root("extensionless-hf-blob");
+        write_snapshot(&root, Some(Quant::Q4));
+        let snapshot_path = root.join("transformer/model.safetensors");
+        let blob_path = root.join("blobs/0123456789abcdef");
+        std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        std::fs::rename(&snapshot_path, &blob_path).unwrap();
+        symlink(Path::new("../blobs/0123456789abcdef"), &snapshot_path).unwrap();
+
+        let inventory =
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, Some(Quant::Q4)))
+                .expect("extensionless HF blob remains an exact streamable artifact");
+        let source = inventory.transformer_source();
+
+        assert_eq!(
+            source.loader_path(),
+            std::path::absolute(&snapshot_path).unwrap()
+        );
+        assert_eq!(
+            source
+                .loader_path()
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("safetensors"),
+            "MLX dispatches the file format from the pinned snapshot entry extension"
+        );
+        assert_eq!(
+            source.canonical_path(),
+            std::fs::canonicalize(&blob_path).unwrap()
+        );
+        assert!(source.canonical_path().extension().is_none());
+        source.ensure_unchanged().unwrap();
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
