@@ -180,7 +180,11 @@ impl AdmittedControlGeometry {
             seed,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
-            transformer_window_size: None,
+            transformer_window_size: req
+                .memory
+                .and_then(|memory| memory.transformer_window_size)
+                .map(|window| window as usize),
+            memory: req.memory.unwrap_or_default(),
         }
     }
 }
@@ -296,7 +300,15 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// retracted and sc-16013 owns the re-measure.) `control_scale == 0` stays bit-exact to the base at any
 /// tier.
 fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
-    let mut heavy = KreaHeavy::from_snapshot(root)?;
+    let plan = crate::model::resolve_load_plan(spec, root, KREA_2_TURBO_CONTROL_ID)?;
+    let streamable_transformer = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            mlx_gen::gen_core::LoadShape::DeferredMaterialization
+        )
+        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && plan.load_time_quant_bits.is_none();
+    let mut heavy = KreaHeavy::from_snapshot_with_stream(root, streamable_transformer)?;
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
     }
