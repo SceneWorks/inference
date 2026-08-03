@@ -976,24 +976,34 @@ mod tests {
 
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
-        quantize_t5: bool,
-        quantize_vae: bool,
+        secondary_bits: i32,
+        secondary_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        if quantize_t5 {
-            loader::quantize_t5_for_dense_source(&mut t5)?;
-        }
+        let current_sensitive = [
+            (4, mlx_gen_flux::T5Sublayer::Attention),
+            (1, mlx_gen_flux::T5Sublayer::FeedForward),
+            (2, mlx_gen_flux::T5Sublayer::FeedForward),
+        ];
+        t5.quantize_progressive_with_secondary_residuals(
+            crate::convert::AUXILIARY_BITS,
+            crate::convert::T5_RESIDUAL_BITS,
+            crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+            secondary_bits,
+            crate::convert::T5_GROUP_SIZE,
+            &current_sensitive,
+            true,
+            secondary_sublayers,
+        )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
             t5,
         };
         let transformer = loader::load_transformer(root, ChromaTransformerConfig::default())?;
         let mut vae = loader::load_vae(root)?;
-        if quantize_vae {
-            loader::quantize_vae_for_dense_source(&mut vae)?;
-        }
+        loader::quantize_vae_for_dense_source(&mut vae)?;
         let heavy = ChromaHeavyOwned {
             transformer,
             vae,
@@ -1063,7 +1073,7 @@ mod tests {
     /// and pixel gates without rebuilding or copying a complete turnkey for every candidate.
     #[test]
     #[ignore = "needs the shipped Chroma Base Q4 tier and Apple Silicon MLX"]
-    fn packed_auxiliary_render_isolation_sweep() {
+    fn packed_t5_secondary_residual_sweep() {
         let baseline = PathBuf::from(
             std::env::var("SC16462_BASELINE")
                 .expect("SC16462_BASELINE must point to the immutable shipped Base Q4 tier"),
@@ -1079,18 +1089,40 @@ mod tests {
         drop(reference_model);
         clear_cache();
 
+        let block4_attention = [(4, mlx_gen_flux::T5Sublayer::Attention)];
+        let current_sensitive = [
+            (4, mlx_gen_flux::T5Sublayer::Attention),
+            (1, mlx_gen_flux::T5Sublayer::FeedForward),
+            (2, mlx_gen_flux::T5Sublayer::FeedForward),
+        ];
         let candidates = [
-            ("dense-t5-packed-vae", false, true),
-            ("packed-t5-dense-vae", true, false),
-            ("packed-t5-packed-vae", true, true),
+            ("secondary-q8-boundaries", 8, &[][..]),
+            (
+                "secondary-q8-boundaries-block4-attention",
+                8,
+                &block4_attention[..],
+            ),
+            (
+                "secondary-q4-boundaries-current-sensitive",
+                4,
+                &current_sensitive[..],
+            ),
+            (
+                "secondary-q8-boundaries-current-sensitive",
+                8,
+                &current_sensitive[..],
+            ),
         ];
 
-        for (policy, quantize_t5, quantize_vae) in candidates {
+        for (policy, secondary_bits, secondary_sublayers) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model =
-                load_render_calibration_candidate(&baseline_spec, quantize_t5, quantize_vae)
-                    .expect("load render sensitivity candidate");
+            let model = load_render_calibration_candidate(
+                &baseline_spec,
+                secondary_bits,
+                secondary_sublayers,
+            )
+            .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
             drop(model);
@@ -1110,8 +1142,18 @@ mod tests {
                 "SC16462_RENDER_SENSITIVITY {}",
                 serde_json::json!({
                     "policy": policy,
-                    "packedT5": quantize_t5,
-                    "packedVae": quantize_vae,
+                    "secondaryBits": secondary_bits,
+                    "secondaryBoundaries": true,
+                    "secondarySublayers": secondary_sublayers
+                        .iter()
+                        .map(|(block, sublayer)| serde_json::json!({
+                            "block": block,
+                            "sublayer": match sublayer {
+                                mlx_gen_flux::T5Sublayer::Attention => "attention",
+                                mlx_gen_flux::T5Sublayer::FeedForward => "ffn",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
                     "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
