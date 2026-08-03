@@ -36,6 +36,11 @@ pub mod config;
 pub mod loader;
 pub mod nn;
 pub mod pipeline;
+// Per-step latent previews (epic 16948, sc-16953). Anima carries no fit of its own: it reuses the
+// `candle-gen-qwen-image` QwenVae constants unchanged, because its VAE tensors are bit-identical to
+// the file that fit was measured against. This module owns only the 5-D Cosmos → `[1, C, h, w]`
+// layout adaptation.
+pub mod preview;
 pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
@@ -108,7 +113,11 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // Per-step latent previews: wired by sc-16953 for all three variants at once — they share
+            // one render lane and differ only in the DiT weights file — and advertised behind the
+            // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives
+            // from this crate's shipped sources whether it actually emits.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -285,6 +294,9 @@ impl Generator for Anima {
                 guidance,
                 seed,
                 sampler: req.sampler.clone(),
+                // The caller's live preview sink (epic 16948, sc-16953). Cloning is an `Arc` bump;
+                // an absent sink is inert and the denoise never projects anything.
+                preview: req.preview.clone(),
             };
             pipeline.generate(
                 &req.prompt,
@@ -415,6 +427,22 @@ mod tests {
         assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(b.capabilities.min_size, 512);
         assert_eq!(b.capabilities.max_size, 1536);
+        // Per-step latent previews are wired for ALL THREE variants at once (sc-16953): they share one
+        // `pipeline::AnimaPipeline::generate` render lane and differ only in the DiT weights file, so
+        // there is no configuration in which one emits and another does not. Asserted per id rather
+        // than once, because per id is the claim `candle-gen-catalog`'s bidirectional guard checks
+        // against the sources.
+        for descriptor in [
+            descriptor_base(),
+            descriptor_aesthetic(),
+            descriptor_turbo(),
+        ] {
+            assert!(
+                descriptor.capabilities.supports_preview,
+                "{} must advertise per-step latent previews",
+                descriptor.id
+            );
+        }
         // Turbo is the CFG-free merged student.
         let t = descriptor_turbo();
         assert!(!t.capabilities.supports_guidance);

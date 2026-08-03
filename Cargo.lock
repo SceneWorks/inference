@@ -440,10 +440,12 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-qwen-image",
+ "image",
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
