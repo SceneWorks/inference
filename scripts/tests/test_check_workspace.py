@@ -311,6 +311,13 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                     routes.validate(true, Some(2048), Some(256)).unwrap();
                 };
             """,
+            "const initializer bare comparison": """
+                #[cfg(test)]
+                const FAKE: () = if 1 < 2 {
+                    let routes = DecodeRoutes::new(ID, EDGES, OVERLAP).unwrap();
+                    routes.validate(true, Some(2048), Some(256)).unwrap();
+                };
+            """,
         }
         for label, fixture in fixtures.items():
             with self.subTest(label=label):

@@ -613,7 +613,10 @@ def _cfg_item_end(syntax: str, start: int) -> int | None:
             char == ";"
             and paren_depth == 0
             and bracket_depth == 0
-            and angle_depth == 0
+            # A bare comparison such as `if 1 < 2` is indistinguishable from a generic opener to
+            # this lightweight scanner. Recognized semicolon items still end here; their braced
+            # initializers were skipped above, and nested delimiters remain protected.
+            and (semicolon_item or angle_depth == 0)
         ):
             return cursor + 1
         cursor += 1
