@@ -280,6 +280,13 @@ fn mono_samples(track: &AudioTrack) -> Vec<f32> {
         .collect()
 }
 
+fn contextual_audio_error(context: String, error: candle_audio::AudioError) -> gen_core::Error {
+    match error {
+        candle_audio::AudioError::Canceled => gen_core::Error::Canceled,
+        other => gen_core::Error::Msg(format!("{context}: {other}")),
+    }
+}
+
 /// Prepare one contract [`ConversationTurn`] for the engine (sc-14151): map its role and encode its
 /// PCM audio (if any) to RVQ frames through the codec (a user turn's speech, or a resumed assistant
 /// turn). A synthesis turn (assistant, no audio) prepares with `audio_codes: None`.
@@ -297,9 +304,10 @@ fn prepare_turn(
             let codes = codec
                 .encode(&mono_samples(track), track.sample_rate)
                 .map_err(|e| {
-                    gen_core::Error::Msg(format!(
-                        "{MODEL_ID}: encode conversation turn {index} audio: {e}"
-                    ))
+                    contextual_audio_error(
+                        format!("{MODEL_ID}: encode conversation turn {index} audio"),
+                        e,
+                    )
                 })?;
             if codes.is_empty() {
                 return Err(gen_core::Error::Msg(format!(
@@ -370,7 +378,7 @@ impl MossTtsRealtimeGenerator {
         let codes = codec
             .encode(&mono_samples(track), track.sample_rate)
             .map_err(|e| {
-                gen_core::Error::Msg(format!("{MODEL_ID}: encode reference audio: {e}"))
+                contextual_audio_error(format!("{MODEL_ID}: encode reference audio"), e)
             })?;
         if codes.is_empty() {
             return Err(gen_core::Error::Msg(format!(
@@ -913,6 +921,13 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_context_preserves_typed_cancellation() {
+        let error =
+            contextual_audio_error("codec encode".into(), candle_audio::AudioError::Canceled);
+        assert!(matches!(error, gen_core::Error::Canceled));
+    }
     use candle_audio::gen_core::{AudioParams, CancelFlag, SpeechSegment};
 
     fn audio_req(audio: AudioParams) -> GenerationRequest {

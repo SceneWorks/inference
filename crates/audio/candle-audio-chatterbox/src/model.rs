@@ -292,6 +292,26 @@ fn perth_component_file(src: &WeightsSource) -> std::path::PathBuf {
 }
 
 impl ChatterboxGenerator {
+    /// Shared public-entry preamble: validate the request, honor pre-cancellation, look up its
+    /// reference clip once, and reject malformed interleaving before any model is staged.
+    fn prepare_request_reference<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> gen_core::Result<Option<&'a AudioTrack>> {
+        self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let reference = req.conditioning.iter().find_map(|c| match c {
+            Conditioning::ReferenceAudio { audio, .. } => Some(audio),
+            _ => None,
+        });
+        if let Some(audio) = reference {
+            validate_reference_audio(audio)?;
+        }
+        Ok(reference)
+    }
+
     fn tokenizer_path(&self) -> std::path::PathBuf {
         self.root.join(TOKENIZER_FILE)
     }
@@ -459,14 +479,7 @@ impl ChatterboxGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<(Vec<u32>, Vec<u32>)> {
-        self.validate(req)?;
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        let reference = req.conditioning.iter().find_map(|c| match c {
-            Conditioning::ReferenceAudio { audio, .. } => Some(audio),
-            _ => None,
-        });
+        let reference = self.prepare_request_reference(req)?;
         self.speech_tokens_with_reference(req, reference, on_progress)
     }
 
@@ -477,11 +490,6 @@ impl ChatterboxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<(Vec<u32>, Vec<u32>)> {
         let defaults = GenerationDefaults::default();
-
-        // Reject malformed interleaving before a voice embedder or tokenizer can stage weights.
-        if let Some(audio) = reference {
-            validate_reference_audio(audio)?;
-        }
 
         // 1. Conditioning → the T3 speaker vector, plus the s3tokenizer prompt tokens when a
         //    reference clip is present (sc-13235). A VoiceEmbedding-only request has no clip to
@@ -560,14 +568,7 @@ impl Generator for ChatterboxGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        let reference = req.conditioning.iter().find_map(|c| match c {
-            Conditioning::ReferenceAudio { audio, .. } => Some(audio),
-            _ => None,
-        });
+        let reference = self.prepare_request_reference(req)?;
 
         // T3 stage (real weights) → speech tokens.
         let (raw_tokens, real_tokens) =
@@ -855,7 +856,7 @@ mod tests {
     #[test]
     fn production_path_rejects_short_stereo_by_frame_count_before_weights() {
         let dir = std::env::temp_dir().join("chatterbox-short-stereo-no-weights");
-        let generator = load(&spec_with_stub_components(dir)).unwrap();
+        let generator = load_generator(&spec_with_stub_components(dir)).unwrap();
         let request = req_with(vec![Conditioning::ReferenceAudio {
             audio: AudioTrack {
                 samples: vec![0.0; 300 * 2],
@@ -865,9 +866,13 @@ mod tests {
             },
             strength: None,
         }]);
-        let error = generator.generate(&request, &mut |_| {}).unwrap_err();
-        assert!(error.to_string().contains("300 frames"), "{error}");
-        assert!(error.to_string().contains("too short"), "{error}");
+        for error in [
+            generator.speech_tokens(&request, &mut |_| {}).unwrap_err(),
+            generator.generate(&request, &mut |_| {}).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("300 frames"), "{error}");
+            assert!(error.to_string().contains("too short"), "{error}");
+        }
     }
 
     /// `Box<dyn Generator>` is not `Debug`, so `Result::unwrap_err` is unavailable — take the error
