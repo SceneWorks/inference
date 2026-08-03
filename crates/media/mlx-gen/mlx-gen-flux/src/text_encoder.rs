@@ -573,6 +573,35 @@ impl T5TextEncoder {
         group_size: i32,
         sensitive_sublayer: Option<(usize, T5Sublayer)>,
     ) -> Result<()> {
+        match sensitive_sublayer {
+            Some(selected) => self.quantize_progressive_with_sensitive_sublayers_residuals(
+                bits,
+                residual_bits,
+                sensitive_residual_bits,
+                group_size,
+                &[selected],
+            ),
+            None => self.quantize_progressive_with_sensitive_sublayers_residuals(
+                bits,
+                residual_bits,
+                sensitive_residual_bits,
+                group_size,
+                &[],
+            ),
+        }
+    }
+
+    /// Progressively quantize T5 while giving a calibrated set of attention or feed-forward
+    /// sublayers the sensitive residual width. Selections change only packed residual widths; they
+    /// never retain a dense source projection.
+    pub fn quantize_progressive_with_sensitive_sublayers_residuals(
+        &mut self,
+        bits: i32,
+        residual_bits: i32,
+        sensitive_residual_bits: i32,
+        group_size: i32,
+        sensitive_sublayers: &[(usize, T5Sublayer)],
+    ) -> Result<()> {
         validate_t5_group_size(group_size)?;
         if !matches!(bits, 4 | 8)
             || !matches!(residual_bits, 4 | 8)
@@ -582,7 +611,7 @@ impl T5TextEncoder {
                 "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} residuals"
             )));
         }
-        if let Some((block, _)) = sensitive_sublayer {
+        for &(block, _) in sensitive_sublayers {
             if block >= self.blocks.len() {
                 return Err(Error::Msg(format!(
                     "T5 sensitive-residual block {block} is outside 0..{}",
@@ -593,15 +622,17 @@ impl T5TextEncoder {
         self.shared
             .quantize_progressive(bits, sensitive_residual_bits, group_size)?;
         for (index, block) in self.blocks.iter_mut().enumerate() {
-            let selected = sensitive_sublayer
-                .filter(|(selected, _)| *selected == index)
-                .map(|(_, sublayer)| sublayer);
+            let attention_is_sensitive =
+                sensitive_sublayers.contains(&(index, T5Sublayer::Attention));
+            let feed_forward_is_sensitive =
+                sensitive_sublayers.contains(&(index, T5Sublayer::FeedForward));
             block.quantize_progressive(
                 bits,
                 residual_bits,
                 sensitive_residual_bits,
                 group_size,
-                selected,
+                attention_is_sensitive,
+                feed_forward_is_sensitive,
             )?;
         }
         Ok(())
@@ -697,14 +728,15 @@ impl T5Block {
         residual_bits: i32,
         sensitive_residual_bits: i32,
         group_size: i32,
-        sensitive_sublayer: Option<T5Sublayer>,
+        attention_is_sensitive: bool,
+        feed_forward_is_sensitive: bool,
     ) -> Result<()> {
-        let attention_residual_bits = if sensitive_sublayer == Some(T5Sublayer::Attention) {
+        let attention_residual_bits = if attention_is_sensitive {
             sensitive_residual_bits
         } else {
             residual_bits
         };
-        let feed_forward_residual_bits = if sensitive_sublayer == Some(T5Sublayer::FeedForward) {
+        let feed_forward_residual_bits = if feed_forward_is_sensitive {
             sensitive_residual_bits
         } else {
             residual_bits

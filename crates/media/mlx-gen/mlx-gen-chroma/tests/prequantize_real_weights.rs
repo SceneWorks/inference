@@ -9,8 +9,9 @@
 //! converter packs the **DiT `transformer/` block Linears**, every group-quantizable T5-XXL 2-D
 //! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer
 //! and uses q8 T5 primaries plus q4-packed T5 residuals for most projections and q8-packed residuals
-//! for the shared embedding, relative bias, and calibrated block-4 attention because hosted image
-//! calibration rejects smaller policies; both routes load without a full dense auxiliary
+//! for the shared embedding, relative bias, calibrated block-4 attention, and block-1 feed-forward
+//! projections because hosted image calibration rejects smaller policies; both routes load without
+//! a full dense auxiliary
 //! transient. A
 //! packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
@@ -181,10 +182,20 @@ enum T5ProbePolicy {
     Q8Q4Progressive,
     Q8Q4ProgressiveGroup32,
     Q8Q4ProgressiveSensitiveQ8Group32,
-    Q8Q4ProgressiveSensitiveSublayerQ8Group32 { block: usize, sublayer: T5Sublayer },
+    Q8Q4ProgressiveSensitiveSublayerQ8Group32 {
+        block: usize,
+        sublayer: T5Sublayer,
+    },
+    Q8Q4ProgressiveSensitiveSublayersQ8Group32 {
+        first: (usize, T5Sublayer),
+        second: (usize, T5Sublayer),
+    },
     Q8Q8Progressive,
     Q8Linears,
-    Q8Except { block: usize, sublayer: T5Sublayer },
+    Q8Except {
+        block: usize,
+        sublayer: T5Sublayer,
+    },
 }
 
 type T5ProbeOutputs = Vec<(Vec<f32>, Vec<f32>)>;
@@ -220,6 +231,9 @@ fn t5_probe_outputs(
                 Some((block, sublayer)),
             )
             .expect("load-time group-32 sublayer-selective T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayersQ8Group32 { first, second } => t5
+            .quantize_progressive_with_sensitive_sublayers_residuals(8, 4, 8, 32, &[first, second])
+            .expect("load-time group-32 multi-sublayer-selective T5 quantization"),
         T5ProbePolicy::Q8Q8Progressive => t5
             .quantize_progressive(8, 8, 64)
             .expect("load-time Q8+Q8 progressive T5 quantization"),
@@ -552,6 +566,14 @@ fn t5_precision_sensitivity_sweep() {
         (
             "q8-plus-q4-packed-residual-sensitive-q8-group32",
             T5ProbePolicy::Q8Q4ProgressiveSensitiveQ8Group32,
+            None,
+        ),
+        (
+            "q8-plus-q4-packed-residual-sensitive-q8-group32-block4-attention-block1-ffn",
+            T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayersQ8Group32 {
+                first: (4, T5Sublayer::Attention),
+                second: (1, T5Sublayer::FeedForward),
+            },
             None,
         ),
         (

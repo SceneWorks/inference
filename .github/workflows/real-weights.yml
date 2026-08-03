@@ -253,6 +253,9 @@ jobs:
                   "encoder.block.4.layer.0.SelfAttention.k",
                   "encoder.block.4.layer.0.SelfAttention.v",
                   "encoder.block.4.layer.0.SelfAttention.o",
+                  "encoder.block.1.layer.1.DenseReluDense.wi_0",
+                  "encoder.block.1.layer.1.DenseReluDense.wi_1",
+                  "encoder.block.1.layer.1.DenseReluDense.wo",
               ],
           }
           for key, value in expected_t5_policy.items():
@@ -458,6 +461,9 @@ jobs:
                   "encoder.block.4.layer.0.SelfAttention.k",
                   "encoder.block.4.layer.0.SelfAttention.v",
                   "encoder.block.4.layer.0.SelfAttention.o",
+                  "encoder.block.1.layer.1.DenseReluDense.wi_0",
+                  "encoder.block.1.layer.1.DenseReluDense.wi_1",
+                  "encoder.block.1.layer.1.DenseReluDense.wo",
               ],
           }
           for key, value in expected_t5_policy.items():

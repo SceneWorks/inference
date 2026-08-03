@@ -59,15 +59,21 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
 /// source. Keeping this provider-owned seam shared by production and the real-weight identity test
 /// prevents the test from validating a hand-written quantization recipe that production never uses.
 pub fn quantize_t5_for_dense_source(t5: &mut T5TextEncoder) -> Result<()> {
-    t5.quantize_progressive_with_sensitive_sublayer_residuals(
+    t5.quantize_progressive_with_sensitive_sublayers_residuals(
         crate::convert::AUXILIARY_BITS,
         crate::convert::T5_RESIDUAL_BITS,
         crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
         crate::convert::T5_GROUP_SIZE,
-        Some((
-            crate::convert::T5_SENSITIVE_RESIDUAL_BLOCK,
-            T5Sublayer::Attention,
-        )),
+        &[
+            (
+                crate::convert::T5_SENSITIVE_RESIDUAL_BLOCK,
+                T5Sublayer::Attention,
+            ),
+            (
+                crate::convert::T5_SENSITIVE_RESIDUAL_FFN_BLOCK,
+                T5Sublayer::FeedForward,
+            ),
+        ],
     )
 }
 
@@ -495,7 +501,7 @@ mod tests {
         assert_eq!(t5_residual_policy(&root).unwrap(), None);
         std::fs::write(
             root.join("config.json"),
-            r#"{"quantization":{"bits":8,"group_size":32,"residual_bits":4,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o"]}}"#,
+            r#"{"quantization":{"bits":8,"group_size":32,"residual_bits":4,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o","encoder.block.1.layer.1.DenseReluDense.wi_0","encoder.block.1.layer.1.DenseReluDense.wi_1","encoder.block.1.layer.1.DenseReluDense.wo"]}}"#,
         )
         .unwrap();
         let policy = t5_residual_policy(&root).unwrap().unwrap();
@@ -506,12 +512,16 @@ mod tests {
             8
         );
         assert_eq!(
+            policy.bits_for("encoder.block.1.layer.1.DenseReluDense.wi_0"),
+            8
+        );
+        assert_eq!(
             policy.bits_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
             4
         );
         std::fs::write(
             root.join("config.json"),
-            r#"{"quantization":{"bits":8,"group_size":64,"residual_bits":8,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o"]}}"#,
+            r#"{"quantization":{"bits":8,"group_size":64,"residual_bits":8,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o","encoder.block.1.layer.1.DenseReluDense.wi_0","encoder.block.1.layer.1.DenseReluDense.wi_1","encoder.block.1.layer.1.DenseReluDense.wo"]}}"#,
         )
         .unwrap();
         assert!(t5_residual_policy(&root).is_err());
