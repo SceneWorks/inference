@@ -750,6 +750,49 @@ mlx_gen::register_generators! {
     pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell;
     footprint = component_footprint
 }
+
+pub const SCHNELL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: crate::FLUX1_SCHNELL_ID,
+        contract: |spec| {
+            crate::memory_strategy::memory_strategy_contract(crate::FLUX1_SCHNELL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: crate::FLUX1_DEV_ID,
+    contract: |spec| crate::memory_strategy::memory_strategy_contract(crate::FLUX1_DEV_ID, spec),
+    safety_check: crate::memory_strategy::registered_safety_check,
+};
+
+pub const SCHNELL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::FLUX1_SCHNELL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                crate::FLUX1_SCHNELL_ID,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
+
+pub const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::FLUX1_DEV_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                crate::FLUX1_DEV_ID,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
 mlx_gen::register_generators! {
     pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
     footprint = component_footprint

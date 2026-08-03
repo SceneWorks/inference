@@ -460,6 +460,29 @@ mlx_gen::register_generators! {
     footprint = crate::model::component_footprint
 }
 
+pub const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: FLUX1_DEV_CONTROL_ID,
+        contract: |spec| {
+            crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: FLUX1_DEV_CONTROL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                FLUX1_DEV_CONTROL_ID,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
