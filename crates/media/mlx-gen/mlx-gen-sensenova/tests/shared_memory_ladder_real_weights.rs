@@ -165,10 +165,17 @@ fn drift(a: &mlx_gen::Image, b: &mlx_gen::Image) -> (u8, f64, f64) {
 #[ignore = "needs exact cached SenseNova Q8 weights and exclusive Apple/Metal access"]
 fn serial_resident_attention_and_rung4() {
     clear_cache();
-    let artifact_identity = mlx_gen_sensenova::memory_strategy::verified_artifact_identity(&spec(
-        LoadShape::EagerMaterialization,
-    ))
-    .expect("hash exact checkpoint content");
+    let artifact_identity = mlx_gen_sensenova::memory_strategy::verified_runner_artifact(
+        &provider(),
+        &spec(LoadShape::EagerMaterialization),
+    )
+    .expect("verify exact provider artifact and eager calibrated contract before generation");
+    let deferred_artifact_identity = mlx_gen_sensenova::memory_strategy::verified_runner_artifact(
+        &provider(),
+        &spec(LoadShape::DeferredMaterialization),
+    )
+    .expect("verify exact provider artifact and deferred calibrated contract before generation");
+    assert_eq!(artifact_identity, deferred_artifact_identity);
     let size = request(GenerationMemory::default()).width as i32;
     let mode = std::env::var("SENSENOVA_LADDER_MODE").unwrap_or_else(|_| "t2i".to_owned());
     let image_queries = size / 32;

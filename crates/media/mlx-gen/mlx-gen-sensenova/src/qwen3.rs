@@ -28,7 +28,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Quant, Result, WeightsSource};
+use mlx_gen::{CancelFlag, Error, Quant, Result};
 
 // Shared on-device decode primitives (sc-7159): the growing-concat KV cache, the standard-RoPE
 // table builder, and the half-split rotation. The bespoke dual-path / dual-theta-MRoPE / block-mask
@@ -277,7 +277,7 @@ impl GenLayer {
 
 #[derive(Clone)]
 struct GenBlockStream {
-    source: WeightsSource,
+    artifact: crate::memory_strategy::PinnedArtifact,
     base: String,
     n_blocks: usize,
     quant: Option<Quant>,
@@ -285,10 +285,7 @@ struct GenBlockStream {
 
 impl GenBlockStream {
     fn open(&self) -> Result<Weights> {
-        match &self.source {
-            WeightsSource::Dir(root) => Weights::from_dir(root),
-            WeightsSource::File(file) => Weights::from_file(file),
-        }
+        self.artifact.open_weights()
     }
 
     fn materialize(&self, view: &mut Weights, index: usize) -> Result<GenLayer> {
@@ -417,7 +414,7 @@ impl Qwen3Backbone {
         w: &Weights,
         cfg: &NeoChatConfig,
         prefix: &str,
-        source: WeightsSource,
+        artifact: crate::memory_strategy::PinnedArtifact,
         quant: Option<Quant>,
     ) -> Result<Self> {
         let model = format!("{prefix}.model");
@@ -443,7 +440,7 @@ impl Qwen3Backbone {
             rope_theta: cfg.llm.rope_theta,
             rope_theta_hw: cfg.llm.rope_theta_hw,
             gen_stream: Some(GenBlockStream {
-                source,
+                artifact,
                 base: format!("{model}.layers"),
                 n_blocks: cfg.llm.num_hidden_layers,
                 quant,

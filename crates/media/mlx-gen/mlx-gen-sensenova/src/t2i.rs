@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Progress, Quant, Result, WeightsSource};
+use mlx_gen::{CancelFlag, Error, Progress, Quant, Result};
 
 use crate::config::NeoChatConfig;
 use crate::fm::{
@@ -282,12 +282,12 @@ impl T2iModel {
     pub fn from_weights_deferred(
         w: &Weights,
         cfg: &NeoChatConfig,
-        source: WeightsSource,
+        artifact: crate::memory_strategy::PinnedArtifact,
         quant: Option<Quant>,
     ) -> Result<Self> {
         Self::validate_config(cfg)?;
         let backbone =
-            Qwen3Backbone::from_weights_deferred(w, cfg, "language_model", source, quant)?;
+            Qwen3Backbone::from_weights_deferred(w, cfg, "language_model", artifact, quant)?;
         Self::from_weights_with_backbone(w, cfg, backbone)
     }
 

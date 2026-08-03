@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Exact production parameters exercised by the serial real-Metal runner below.
 pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
@@ -45,6 +45,51 @@ struct ArtifactFileIdentity {
     changed_nanoseconds: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PinnedArtifact {
+    identity: ArtifactFileIdentity,
+    digest: String,
+}
+
+impl PinnedArtifact {
+    /// Verify and pin one explicit safetensors file. Production directory loads additionally enforce
+    /// the single-file inventory rule in [`verified_artifact`].
+    pub fn verify_file(path: impl AsRef<Path>) -> Option<Self> {
+        pinned_artifact(path.as_ref())
+    }
+
+    pub(crate) fn canonical_path(&self) -> &Path {
+        &self.identity.canonical_path
+    }
+
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
+        let current = file_identity(&self.identity.canonical_path).map_err(|error| {
+            CoreError::Msg(format!(
+                "sensenova: verified checkpoint is no longer readable: {error}"
+            ))
+        })?;
+        if current != self.identity {
+            return Err(CoreError::Msg(
+                "sensenova: verified checkpoint was replaced or mutated after load".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn open_weights(&self) -> mlx_gen::Result<mlx_gen::weights::Weights> {
+        self.ensure_unchanged()
+            .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
+        let weights = mlx_gen::weights::Weights::from_file(self.canonical_path())?;
+        self.ensure_unchanged()
+            .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
+        Ok(weights)
+    }
+}
+
 fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
     let canonical_path = std::fs::canonicalize(path)?;
     let metadata = std::fs::metadata(&canonical_path)?;
@@ -60,18 +105,45 @@ fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
     })
 }
 
-fn digest_cache() -> &'static Mutex<HashMap<ArtifactFileIdentity, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<ArtifactFileIdentity, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Debug)]
+enum DigestState {
+    Hashing,
+    Ready(String),
 }
 
-fn content_sha256(path: &Path) -> Option<String> {
-    let before = file_identity(path).ok()?;
-    if let Some(digest) = digest_cache().lock().ok()?.get(&before).cloned() {
-        return Some(digest);
-    }
+struct DigestCache {
+    entries: Mutex<HashMap<ArtifactFileIdentity, DigestState>>,
+    ready: Condvar,
+}
 
-    let file = File::open(&before.canonical_path).ok()?;
+fn digest_cache() -> &'static DigestCache {
+    static CACHE: OnceLock<DigestCache> = OnceLock::new();
+    CACHE.get_or_init(|| DigestCache {
+        entries: Mutex::new(HashMap::new()),
+        ready: Condvar::new(),
+    })
+}
+
+#[cfg(test)]
+fn hash_operation_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hash_exact_file(identity: &ArtifactFileIdentity) -> Option<String> {
+    #[cfg(test)]
+    {
+        *hash_operation_counts()
+            .lock()
+            .ok()?
+            .entry(identity.canonical_path.clone())
+            .or_default() += 1;
+    }
+    let file = File::open(&identity.canonical_path).ok()?;
+    let opened = file.metadata().ok()?;
+    if opened.dev() != identity.device || opened.ino() != identity.inode {
+        return None;
+    }
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 8 * 1024 * 1024];
@@ -82,15 +154,49 @@ fn content_sha256(path: &Path) -> Option<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    let after = file_identity(path).ok()?;
-    if before != after {
-        return None;
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
+    loop {
+        let identity = file_identity(path).ok()?;
+        let cache = digest_cache();
+        let mut entries = cache.entries.lock().ok()?;
+        match entries.get(&identity).cloned() {
+            Some(DigestState::Ready(digest)) => {
+                drop(entries);
+                // A cache hit is useful only if the path still resolves to the exact same object.
+                // This closes the replacement race between the first stat and cache lookup.
+                if file_identity(path).ok()? == identity {
+                    return Some(PinnedArtifact { identity, digest });
+                }
+            }
+            Some(DigestState::Hashing) => {
+                entries = cache.ready.wait(entries).ok()?;
+                drop(entries);
+            }
+            None => {
+                entries.insert(identity.clone(), DigestState::Hashing);
+                drop(entries);
+                let digest = hash_exact_file(&identity);
+                let unchanged = file_identity(path).ok().as_ref() == Some(&identity);
+                let mut entries = cache.entries.lock().ok()?;
+                entries.remove(&identity);
+                let result = if unchanged {
+                    digest.map(|digest| {
+                        entries
+                            .retain(|cached, _| cached.canonical_path != identity.canonical_path);
+                        entries.insert(identity.clone(), DigestState::Ready(digest.clone()));
+                        PinnedArtifact { identity, digest }
+                    })
+                } else {
+                    None
+                };
+                cache.ready.notify_all();
+                return result;
+            }
+        }
     }
-    let digest = format!("{:x}", hasher.finalize());
-    let mut cache = digest_cache().lock().ok()?;
-    cache.retain(|identity, _| identity.canonical_path != before.canonical_path);
-    cache.insert(before, digest.clone());
-    Some(digest)
 }
 
 /// SHA-256 of the exact checkpoint bytes, cached by a mutation-sensitive filesystem identity.
@@ -99,14 +205,35 @@ fn content_sha256(path: &Path) -> Option<String> {
 /// before/after identity comparison prevents caching a digest when the file changes while it is
 /// being read. This keeps repeated selector/contract calls cheap without trusting an HF blob
 /// basename (which is attacker-controlled local path text).
-pub fn verified_artifact_identity(spec: &LoadSpec) -> Option<String> {
+pub(crate) fn verified_artifact(spec: &LoadSpec) -> Option<PinnedArtifact> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return None;
     };
-    content_sha256(&root.join("model.safetensors"))
+    let mut safetensors = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "safetensors")
+        });
+    let only = safetensors.next()?.path();
+    if safetensors.next().is_some() || only.file_name()? != "model.safetensors" {
+        return None;
+    }
+    pinned_artifact(&only)
 }
 
-fn calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'static str> {
+pub fn verified_artifact_identity(spec: &LoadSpec) -> Option<String> {
+    verified_artifact(spec).map(|artifact| artifact.digest)
+}
+
+fn calibration_fingerprint(
+    provider_id: &str,
+    spec: &LoadSpec,
+    artifact: Option<&PinnedArtifact>,
+) -> Option<&'static str> {
     if spec.precision != mlx_gen::Precision::Bf16
         || spec.quantize != Some(Quant::Q8)
         || !spec.adapters.is_empty()
@@ -120,7 +247,7 @@ fn calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'stati
     {
         return None;
     }
-    match (provider_id, verified_artifact_identity(spec)?.as_str()) {
+    match (provider_id, artifact?.digest()) {
         (crate::MODEL_ID, QUALITY_Q8_ARTIFACT) => Some(QUALITY_CALIBRATION_FINGERPRINT),
         (crate::MODEL_ID_FAST, FAST_Q8_ARTIFACT) if matches!(&spec.weights, WeightsSource::Dir(root) if root.join(crate::DISTILL_MERGED_MARKER).is_file()) => {
             Some(FAST_CALIBRATION_FINGERPRINT)
@@ -129,7 +256,11 @@ fn calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'stati
     }
 }
 
-pub(crate) fn can_stream_gen(provider_id: &str, spec: &LoadSpec) -> bool {
+pub(crate) fn can_stream_gen_with_artifact(
+    provider_id: &str,
+    spec: &LoadSpec,
+    artifact: Option<&PinnedArtifact>,
+) -> bool {
     if spec.load_shape != LoadShape::DeferredMaterialization
         || spec.precision != mlx_gen::Precision::Bf16
         || !spec.adapters.is_empty()
@@ -141,6 +272,7 @@ pub(crate) fn can_stream_gen(provider_id: &str, spec: &LoadSpec) -> bool {
         || spec.identity.is_some()
         || spec.text_encoder.is_some()
         || !matches!(spec.weights, WeightsSource::Dir(_))
+        || artifact.is_none()
     {
         return false;
     }
@@ -159,8 +291,17 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let artifact = verified_artifact(spec);
+    memory_strategy_contract_with_artifact(provider_id, spec, artifact.as_ref())
+}
+
+pub(crate) fn memory_strategy_contract_with_artifact(
+    provider_id: &str,
+    spec: &LoadSpec,
+    artifact: Option<&PinnedArtifact>,
+) -> CoreResult<MemoryProviderContract> {
     let footprint = crate::model::component_footprint(spec)?;
-    let streamable = can_stream_gen(provider_id, spec);
+    let streamable = can_stream_gen_with_artifact(provider_id, spec, artifact);
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -171,7 +312,7 @@ pub fn memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.calibration = calibration_fingerprint(provider_id, spec)
+    contract.calibration = calibration_fingerprint(provider_id, spec, artifact)
         .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
@@ -222,6 +363,55 @@ pub fn memory_strategy_contract(
         };
     }
     Ok(contract)
+}
+
+fn expected_runner_identity(provider_id: &str) -> Option<(&'static str, &'static str)> {
+    match provider_id {
+        crate::MODEL_ID => Some((QUALITY_Q8_ARTIFACT, QUALITY_CALIBRATION_FINGERPRINT)),
+        crate::MODEL_ID_FAST => Some((FAST_Q8_ARTIFACT, FAST_CALIBRATION_FINGERPRINT)),
+        _ => None,
+    }
+}
+
+/// Fail-closed gate used by the ignored real-weight runner before it loads or generates anything.
+pub fn validate_runner_gate(
+    provider_id: &str,
+    artifact_sha256: &str,
+    contract: &MemoryProviderContract,
+) -> CoreResult<()> {
+    let (expected_sha256, expected_calibration) = expected_runner_identity(provider_id)
+        .ok_or_else(|| {
+            CoreError::Unsupported(format!("unknown SenseNova provider {provider_id}"))
+        })?;
+    if artifact_sha256 != expected_sha256 {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: runner artifact SHA-256 does not match the calibrated checkpoint"
+        )));
+    }
+    if contract.provider_id != provider_id
+        || contract.calibration.as_ref().is_none_or(|calibration| {
+            calibration.fingerprint != expected_calibration
+                || calibration.load_shape != contract.load_shape
+        })
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: runner contract does not carry the expected calibration identity"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify once, construct the contract from the same pin, and enforce the runner identity gates.
+pub fn verified_runner_artifact(provider_id: &str, spec: &LoadSpec) -> CoreResult<String> {
+    let artifact = verified_artifact(spec).ok_or_else(|| {
+        CoreError::Unsupported(format!(
+            "{provider_id}: runner requires one stable model.safetensors artifact"
+        ))
+    })?;
+    let contract = memory_strategy_contract_with_artifact(provider_id, spec, Some(&artifact))?;
+    validate_runner_gate(provider_id, artifact.digest(), &contract)?;
+    artifact.ensure_unchanged()?;
+    Ok(artifact.digest().to_owned())
 }
 
 pub(crate) fn safety_check(
@@ -458,6 +648,22 @@ mod tests {
     }
 
     #[test]
+    fn sharded_inventory_does_not_advertise_deferred_streaming() {
+        let (root, spec) = fixture_spec();
+        std::fs::write(root.join("model-00001-of-00002.safetensors"), [1_u8; 8]).unwrap();
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        assert!(contract.calibration.is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn expected_digest_basename_with_arbitrary_bytes_does_not_calibrate() {
         let root = unique_root("calibration-contract");
         std::fs::create_dir_all(&root).unwrap();
@@ -482,6 +688,91 @@ mod tests {
             .unwrap()
             .calibration
             .is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pinned_stream_source_fails_closed_after_atomic_replacement() {
+        let root = unique_root("replacement-contract");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.safetensors");
+        std::fs::write(&path, [0_u8; 8]).unwrap();
+        let artifact = PinnedArtifact::verify_file(&path).unwrap();
+        let replacement = root.join("replacement.safetensors");
+        std::fs::write(&replacement, [1_u8; 8]).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let error = match artifact.open_weights() {
+            Ok(_) => panic!("replacement must fail before weights are opened"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("replaced or mutated"),
+            "every deferred stream open must reject a changed source: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn concurrent_verification_coalesces_one_content_hash() {
+        let root = unique_root("coalesced-hash");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.safetensors");
+        std::fs::write(&path, vec![7_u8; 4 * 1024 * 1024]).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let before = hash_operation_counts()
+            .lock()
+            .unwrap()
+            .get(&canonical)
+            .copied()
+            .unwrap_or(0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    PinnedArtifact::verify_file(path)
+                        .unwrap()
+                        .digest()
+                        .to_owned()
+                })
+            })
+            .collect();
+        let digests: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(digests.iter().all(|digest| digest == &digests[0]));
+        assert_eq!(
+            hash_operation_counts()
+                .lock()
+                .unwrap()
+                .get(&canonical)
+                .copied()
+                .unwrap_or(0)
+                - before,
+            1,
+            "one file identity must be read only once even under concurrent first use"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn runner_gate_requires_exact_provider_sha_and_calibration() {
+        let (root, spec) = fixture_spec();
+        let mut contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            QUALITY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        ));
+        assert!(validate_runner_gate(crate::MODEL_ID, QUALITY_Q8_ARTIFACT, &contract).is_ok());
+        assert!(validate_runner_gate(crate::MODEL_ID, FAST_Q8_ARTIFACT, &contract).is_err());
+        assert!(
+            validate_runner_gate(crate::MODEL_ID_FAST, QUALITY_Q8_ARTIFACT, &contract).is_err()
+        );
+        contract.calibration = Some(MemoryCalibrationIdentity::new("stale", spec.load_shape));
+        assert!(validate_runner_gate(crate::MODEL_ID, QUALITY_Q8_ARTIFACT, &contract).is_err());
         std::fs::remove_dir_all(root).ok();
     }
 

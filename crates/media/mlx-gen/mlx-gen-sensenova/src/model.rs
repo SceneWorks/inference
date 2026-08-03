@@ -224,16 +224,31 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         None
     };
     let cfg = NeoChatConfig::from_dir(root)?;
-    let weights = load_raw(root)?;
+    // A single-file artifact is verified once and then becomes the source of truth for the initial
+    // load, calibration identity, and every deferred Gen window. Sharded/multi-file layouts
+    // retain the historical eager directory loader but truthfully do not advertise rung 4.
+    let pinned_artifact = crate::memory_strategy::verified_artifact(spec);
+    let weights = if let Some(artifact) = pinned_artifact.as_ref() {
+        artifact.open_weights()?
+    } else {
+        load_raw(root)?
+    };
     // F-137: diff the checkpoint against the canonical key set before building modules (the loader
     // module doc promised this validation). Missing keys still fail via `require` with the exact
     // name during `from_weights`; this additionally rejects extra/renamed tensors that would
     // otherwise load silently with whatever subset matches.
     check_coverage(weights.keys(), &cfg).require_no_unexpected(id)?;
-    let deferred_gen = spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
-        && distill_lora_path.is_none();
+    let deferred_gen = distill_lora_path.is_none()
+        && crate::memory_strategy::can_stream_gen_with_artifact(id, spec, pinned_artifact.as_ref());
     let mut model = if deferred_gen {
-        T2iModel::from_weights_deferred(&weights, &cfg, spec.weights.clone(), spec.quantize)?
+        T2iModel::from_weights_deferred(
+            &weights,
+            &cfg,
+            pinned_artifact
+                .clone()
+                .expect("streamable artifact is pinned"),
+            spec.quantize,
+        )?
     } else {
         // A fast dense-base load needs a runtime LoRA merge into all generation blocks. Keep that
         // exact path eager; the contract refuses rung 4 until the artifact is a pre-merged turnkey.
@@ -272,7 +287,11 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         tokenizer,
         model,
         fast,
-        memory_strategy: crate::memory_strategy::memory_strategy_contract(id, spec)?,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract_with_artifact(
+            id,
+            spec,
+            pinned_artifact.as_ref(),
+        )?,
         loaded_quant: spec.quantize,
     }))
 }

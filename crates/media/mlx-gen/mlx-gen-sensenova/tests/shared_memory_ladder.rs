@@ -2,8 +2,8 @@
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, WeightsSource};
-use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone};
+use mlx_gen::CancelFlag;
+use mlx_gen_sensenova::{memory_strategy::PinnedArtifact, NeoChatConfig, Path, Qwen3Backbone};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -53,7 +53,7 @@ fn cached_attention_and_one_block_gen_windows_match_resident() {
         &weights,
         &cfg,
         "language_model",
-        WeightsSource::File(FIXTURE.into()),
+        PinnedArtifact::verify_file(FIXTURE).unwrap(),
         None,
     )
     .unwrap();
@@ -111,7 +111,7 @@ fn canceled_windowed_forward_returns_typed_cancellation() {
         &weights,
         &cfg,
         "language_model",
-        WeightsSource::File(FIXTURE.into()),
+        PinnedArtifact::verify_file(FIXTURE).unwrap(),
         None,
     )
     .unwrap();
