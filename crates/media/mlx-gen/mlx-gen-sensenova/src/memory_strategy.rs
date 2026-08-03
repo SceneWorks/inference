@@ -53,7 +53,7 @@ pub struct PinnedArtifact {
 
 impl PinnedArtifact {
     /// Verify and pin one explicit safetensors file. Production directory loads additionally enforce
-    /// the single-file inventory rule in [`verified_artifact`].
+    /// the single-file inventory rule in the internal `verified_artifact` selector.
     pub fn verify_file(path: impl AsRef<Path>) -> Option<Self> {
         pinned_artifact(path.as_ref())
     }
