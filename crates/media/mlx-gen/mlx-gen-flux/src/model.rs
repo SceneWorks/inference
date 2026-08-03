@@ -603,9 +603,13 @@ impl Flux1 {
         let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
         let pid_decoder =
             resolve_pid_decoder_at_sigma(pid, req, base_seed, self.descriptor.id, capture_sigma)?;
-        let decoder: &dyn LatentDecoder = match &pid_decoder {
-            Some(d) => d,
-            None => vae,
+        // Native VAE tiling is a clean-base mechanism. PiD keeps its own checked decode route and
+        // never receives a native VAE tile geometry; overlay-bearing contracts leave rung 2 Missing.
+        let native_tiling = match &pid_decoder {
+            None if self.memory_strategy.lifecycle.decode_tiling => {
+                crate::memory_strategy::decode_tiling(req)?
+            }
+            _ => None,
         };
         let denoise_sigmas = &sigmas[..keep];
         // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
@@ -653,7 +657,25 @@ impl Flux1 {
             )?;
             on_progress(Progress::Decoding);
             let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-            let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+            let decoded = match (&pid_decoder, &native_tiling) {
+                (Some(pid), _) => pid.decode(&unpacked)?,
+                (None, Some(tiling)) => vae.decode_tiled(&unpacked, tiling, Some(&req.cancel))?,
+                (None, None) => vae.decode(&unpacked)?,
+            }
+            .as_dtype(Dtype::Float32)?;
+            // A fault probe must observe the selected lazy decode before returning its synthetic
+            // error. Normal untiled requests retain their historical materialization path.
+            if req.memory.is_some_and(|memory| {
+                memory.calibration_fault_harness_authorized
+                    && memory.calibration_error_phase == Some(gen_core::MemoryPhase::Decode)
+            }) {
+                decoded.eval()?;
+            }
+            crate::memory_strategy::calibration_fault(
+                req,
+                gen_core::MemoryPhase::Decode,
+                self.descriptor.id,
+            )?;
             images.push(decoded_to_image(&decoded)?);
         }
         Ok(GenerationOutput::Images(images))
