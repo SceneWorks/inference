@@ -128,7 +128,13 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertTrue(any("append-only" in error for error in errors), errors)
 
     def test_missing_base_warns_and_validates_the_current_registry(self) -> None:
-        unresolved = subprocess.CompletedProcess(["git", "cat-file"], 128)
+        # --verify --quiet intentionally leaves stderr empty for a missing object.
+        unresolved = subprocess.CompletedProcess(
+            ["git", "rev-parse", "--verify", "--quiet"],
+            1,
+            stdout="",
+            stderr="",
+        )
         with mock.patch.object(self.gate.subprocess, "run", return_value=unresolved) as run:
             result, stdout, stderr = self.run_main("force-pushed-base")
 
@@ -137,11 +143,18 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertIn("warning: unable to resolve base revision 'force-pushed-base'", stderr)
         self.assertIn("validating the current tree", stderr)
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][:3], ["git", "cat-file", "-e"])
+        self.assertEqual(
+            run.call_args.args[0][:4], ["git", "rev-parse", "--verify", "--quiet"]
+        )
 
     def test_missing_base_does_not_suppress_current_registry_errors(self) -> None:
         (self.root / self.gate.LEGACY_ALLOCATIONS[0].document).unlink()
-        unresolved = subprocess.CompletedProcess(["git", "cat-file"], 128)
+        unresolved = subprocess.CompletedProcess(
+            ["git", "rev-parse", "--verify", "--quiet"],
+            1,
+            stdout="",
+            stderr="",
+        )
         with mock.patch.object(self.gate.subprocess, "run", return_value=unresolved):
             result, stdout, stderr = self.run_main("garbage-collected-base")
 
@@ -156,7 +169,7 @@ class ReviewFindingIdTests(unittest.TestCase):
         base_registry = self.register(182, 182, document)
         (self.root / document).unlink()
         self.write_registry(list(self.gate.LEGACY_ALLOCATIONS))
-        resolved = subprocess.CompletedProcess(["git", "cat-file"], 0)
+        resolved = subprocess.CompletedProcess(["git", "rev-parse"], 0)
         shown = subprocess.CompletedProcess(["git", "show"], 0, stdout=base_registry)
         with mock.patch.object(
             self.gate.subprocess, "run", side_effect=[resolved, shown]
@@ -171,7 +184,7 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].args[0][:2], ["git", "show"])
 
     def test_reachable_base_registry_read_failure_does_not_fall_back(self) -> None:
-        resolved = subprocess.CompletedProcess(["git", "cat-file"], 0)
+        resolved = subprocess.CompletedProcess(["git", "rev-parse"], 0)
         show_failure = subprocess.CalledProcessError(128, ["git", "show"])
         with mock.patch.object(
             self.gate.subprocess, "run", side_effect=[resolved, show_failure]
@@ -181,7 +194,25 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(stdout, "")
         self.assertNotIn("warning:", stderr)
-        self.assertIn("error: unable to read registry at base revision", stderr)
+        self.assertIn("error: unable to inspect base revision", stderr)
+
+    def test_base_resolution_usage_failure_does_not_fall_back(self) -> None:
+        usage_failure = subprocess.CompletedProcess(
+            ["git", "rev-parse"],
+            129,
+            stdout="",
+            stderr="usage: git rev-parse [<options>] <args>...",
+        )
+        with mock.patch.object(
+            self.gate.subprocess, "run", return_value=usage_failure
+        ):
+            result, stdout, stderr = self.run_main("requested-base")
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        self.assertNotIn("warning:", stderr)
+        self.assertIn("error: unable to inspect base revision", stderr)
+        self.assertIn("exit status 129", stderr)
 
     def test_base_resolution_subprocess_error_does_not_fall_back(self) -> None:
         with mock.patch.object(
@@ -192,7 +223,7 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(stdout, "")
         self.assertNotIn("warning:", stderr)
-        self.assertIn("error: unable to read registry at base revision", stderr)
+        self.assertIn("error: unable to inspect base revision", stderr)
         self.assertIn("git is unavailable", stderr)
 
 

@@ -94,13 +94,18 @@ def registry_at_revision(revision: str) -> str | None:
     if not revision or set(revision) == {"0"}:
         return None
     resolution = subprocess.run(
-        ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+        ["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
         cwd=ROOT,
         check=False,
         capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
-    if resolution.returncode != 0:
+    # This fixed --verify invocation returns 1 for an unresolved object. Git's
+    # usage and operational failures use other statuses and must remain fatal.
+    if resolution.returncode == 1:
         raise BaseRevisionUnavailable(revision, resolution.returncode)
+    resolution.check_returncode()
     result = subprocess.run(
         ["git", "show", f"{revision}:{REGISTRY.as_posix()}"],
         cwd=ROOT,
@@ -184,14 +189,14 @@ def main() -> int:
     except BaseRevisionUnavailable as error:
         print(
             f"review finding id warning: unable to resolve base revision {error.revision!r} "
-            f"(git cat-file exited {error.returncode}); validating the current tree "
+            f"(git rev-parse exited {error.returncode}); validating the current tree "
             "without an append-only base comparison",
             file=sys.stderr,
         )
         base_registry_text = None
     except (OSError, subprocess.CalledProcessError) as error:
         print(
-            f"review finding id error: unable to read registry at base revision "
+            f"review finding id error: unable to inspect base revision "
             f"{args.base!r}: {error}",
             file=sys.stderr,
         )
