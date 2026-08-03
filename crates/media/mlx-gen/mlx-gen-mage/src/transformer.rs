@@ -47,6 +47,7 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -168,6 +169,7 @@ pub struct MageTransformer {
     txt_in: Linear,
     time_embed: MageTimestepEmbedder,
     blocks: Vec<MageTransformerBlock>,
+    block_stream: Option<crate::block_stream::MageBlockStream>,
     final_layer: MageFinalLayer,
 }
 
@@ -237,6 +239,7 @@ impl MageTransformer {
             txt_in,
             time_embed,
             blocks,
+            block_stream: None,
             final_layer: MageFinalLayer::from_weights(w, "norm_out", "proj_out")?,
             cfg,
         };
@@ -276,6 +279,7 @@ impl MageTransformer {
             txt_in,
             time_embed,
             blocks,
+            block_stream: None,
             final_layer,
         };
         model.check_geometry()?;
@@ -344,6 +348,67 @@ impl MageTransformer {
         &self.blocks
     }
 
+    /// Record the exact snapshot used by the resident stack so a deferred request can re-open and
+    /// materialize it through the shared block-residency driver.
+    pub fn with_block_stream(
+        mut self,
+        source: mlx_gen::WeightsSource,
+        load_time_quant_bits: Option<i32>,
+    ) -> Self {
+        let mut stream = crate::block_stream::MageBlockStream::new(source, self.cfg.clone());
+        if let Some(bits) = load_time_quant_bits {
+            stream.set_quant_bits(bits);
+        }
+        self.block_stream = Some(stream);
+        self
+    }
+
+    /// Capture the forward-time adapters installed on each resident block, then evict the entire
+    /// resident stack. A deferred model must reach request execution with only the non-block
+    /// skeleton plus snapshot metadata owned here; otherwise reopening one block at a time would
+    /// merely duplicate the full stack instead of bounding it.
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = self.block_stream.as_mut() else {
+            return Ok(());
+        };
+        if self.blocks.len() != self.cfg.depth {
+            return Err(Error::Msg(format!(
+                "mage_flow: cannot finalize the {}-block stream from {} resident blocks",
+                self.cfg.depth,
+                self.blocks.len()
+            )));
+        }
+        stream.capture_adapters(&mut self.blocks);
+        self.blocks.clear();
+        if !self.blocks.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow: deferred transformer retained resident blocks".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resident_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(crate) fn block_window<'a>(
+        &self,
+        size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let Some(size) = size else { return Ok(None) };
+        if self.block_stream.is_none() {
+            return Err(Error::Unsupported(
+                "mage_flow: bounded transformer residency needs a re-openable snapshot".into(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.cfg.depth, size)?,
+            cancel,
+        }))
+    }
+
     pub fn timestep_embedder(&self) -> &MageTimestepEmbedder {
         &self.time_embed
     }
@@ -399,12 +464,64 @@ impl MageTransformer {
         sigma: &Array,
         ctx: &PackContext,
     ) -> Result<Array> {
+        self.forward_budgeted(img, txt, sigma, ctx, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn forward_budgeted(
+        &self,
+        img: &Array,
+        txt: &Array,
+        sigma: &Array,
+        ctx: &PackContext,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        self.forward_with_rungs(img, txt, sigma, ctx, plan, None)
+    }
+
+    pub(crate) fn forward_with_rungs(
+        &self,
+        img: &Array,
+        txt: &Array,
+        sigma: &Array,
+        ctx: &PackContext,
+        plan: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
         let (mut stream, temb) = self.embed(img, txt, sigma, ctx)?;
-        for block in &self.blocks {
-            stream = block.forward(&stream, &temb, ctx)?;
-            // Bound the lazy graph: without this MLX holds all 12 blocks' intermediates until the
-            // first read, which is the peak-memory shape a 2048² pack cannot afford.
-            mlx_rs::transforms::eval([&stream.img, &stream.txt])?;
+        match window {
+            None => {
+                for block in &self.blocks {
+                    stream = block.forward_budgeted(&stream, &temb, ctx, plan)?;
+                    mlx_rs::transforms::eval([&stream.img, &stream.txt])?;
+                }
+            }
+            Some(window) => {
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported("mage_flow: no snapshot-backed block stream".into())
+                })?;
+                if !self.blocks.is_empty() {
+                    return Err(Error::Msg(
+                        "mage_flow: deferred transformer still owns resident blocks".into(),
+                    ));
+                }
+                if source.n_blocks() != self.cfg.depth || window.plan.n_blocks() != self.cfg.depth {
+                    return Err(Error::Msg("mage_flow: block-stream depth mismatch".into()));
+                }
+                stream = mlx_gen::block_residency::run_windowed(
+                    &window.plan,
+                    window.cancel,
+                    stream,
+                    || source.open(),
+                    |mut state, view, range| {
+                        for index in range {
+                            let block = source.materialize(view, index)?;
+                            state = block.forward_budgeted(&state, &temb, ctx, plan)?;
+                        }
+                        Ok(state)
+                    },
+                    |state: &DualStream| Ok(mlx_rs::transforms::eval([&state.img, &state.txt])?),
+                )?;
+            }
         }
         // Only the image stream reaches the head; the text stream is dropped (`mage_flow.py:146`).
         self.final_layer.forward(&stream.img, &temb, ctx)

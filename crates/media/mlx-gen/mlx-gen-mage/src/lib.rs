@@ -65,6 +65,7 @@ pub(crate) mod quant;
 
 // --- NR-MMDiT (sc-14040) -------------------------------------------------------------------
 pub mod attention;
+pub(crate) mod block_stream;
 pub mod feed_forward;
 pub mod final_layer;
 pub mod rope_embedder;
@@ -155,26 +156,31 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION_EDIT_BASE)
         .register_generator(model::REGISTRATION_EDIT_TURBO)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: "mage_flow",
             contract: |spec| model::weights_free_memory_strategy_contract("mage_flow", spec),
         })
         .register_memory_strategy(model::MEMORY_REGISTRATION_BASE)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_BASE)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: "mage_flow_base",
             contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_base", spec),
         })
         .register_memory_strategy(model::MEMORY_REGISTRATION_TURBO)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_TURBO)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: "mage_flow_turbo",
             contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_turbo", spec),
         })
         .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: "mage_flow_edit",
             contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_edit", spec),
         })
         .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_BASE)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT_BASE)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: "mage_flow_edit_base",
             contract: |spec| {
@@ -182,6 +188,7 @@ pub fn register_providers(
             },
         })
         .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_TURBO)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT_TURBO)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: "mage_flow_edit_turbo",
             contract: |spec| {
@@ -260,6 +267,19 @@ mod explicit_registry_tests {
                 .is_some());
         }
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn every_optimized_mage_route_registers_a_weights_free_behavior_seam() {
+        let registry = provider_registry().unwrap();
+        let mut ids = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut expected = MODEL_IDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
     }
 
     /// Every id is prefixed with the family id, matching the image-family convention
