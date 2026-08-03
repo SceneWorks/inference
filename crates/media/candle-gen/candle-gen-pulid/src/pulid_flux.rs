@@ -28,10 +28,12 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, PidWeights, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, PidWeights, Progress};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
-use candle_gen_flux::{flow_mu, DitImageInjector, FluxRefBackbone, Variant, BASE_SHIFT, MAX_SHIFT};
+use candle_gen_flux::{
+    flow_mu, DitImageInjector, FluxRefBackbone, FluxRefHeavy, Variant, BASE_SHIFT, MAX_SHIFT,
+};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::ca::PulidCa;
@@ -185,6 +187,13 @@ impl PulidFlux {
     /// Load the FLUX.1-dev backbone + the EVA tower + the IDFormer + the PuLID CA weights + the native
     /// face stack (with the BiSeNet parser) from the [`PulidFluxPaths`].
     pub fn load(paths: &PulidFluxPaths) -> Result<Self> {
+        Self::load_with_memory(paths, GenerationMemory::default())
+    }
+
+    /// Load PuLID with the shared FLUX request memory plan. Identity modules remain resident while the
+    /// base backbone may stage text→DiT/VAE, stream its two block stacks, and CPU-decode through the
+    /// calibrated bounded-host path.
+    pub fn load_with_memory(paths: &PulidFluxPaths, memory: GenerationMemory) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
 
@@ -193,7 +202,13 @@ impl PulidFlux {
         // detect-and-load, so PuLID consumes the SAME q4/q8/bf16 tiers `flux_dev` does. The PuLID CA
         // injection runs through the backbone's post-block `forward_injected` seam (on the BFL `IpFlux`
         // or the diffusers `PackedFluxDit`, whichever tier loaded).
-        let backbone = FluxRefBackbone::load(&paths.flux_base, Variant::Dev, &device, dtype)?;
+        let backbone = FluxRefBackbone::load_with_memory(
+            &paths.flux_base,
+            Variant::Dev,
+            &device,
+            dtype,
+            memory,
+        )?;
 
         // EVA-CLIP tower (f32 conditioning path).
         let eva_w = Weights::from_file(&paths.eva_weights, &device, COND_DTYPE).map_err(|e| {
@@ -299,6 +314,8 @@ impl PulidFlux {
             return Err(CandleError::Canceled);
         }
         reject_below_floor(req)?;
+        self.backbone
+            .validate_native_vae_request(req.use_pid, &req.cancel)?;
 
         // Identity conditioning (computed once; constant across the denoise).
         let id_embedding = self.compute_id_embedding(reference)?;
@@ -313,7 +330,10 @@ impl PulidFlux {
 
         // Text conditioning (T5 seq + CLIP pooled) — tier-agnostic via the backbone (dense or packed
         // encoders, same token ids either way).
-        let (t5_emb, clip_emb) = self.backbone.encode_text(&req.prompt)?;
+        let (t5_emb, clip_emb) = self
+            .backbone
+            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        let heavy = self.backbone.load_heavy(&req.cancel)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
         let lat_h = (req.height as usize).div_ceil(16) * 2;
@@ -336,6 +356,7 @@ impl PulidFlux {
             &timesteps,
             guidance,
             &pulid_ca,
+            heavy.as_ref(),
             req.sampler.as_deref(),
             req.scheduler.as_deref(),
             req.seed,
@@ -347,11 +368,13 @@ impl PulidFlux {
         // this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). PiD is a
         // generative decoder, so face likeness may shift — the user's per-gen call.
         let pid_decoder = self.pid_decoder_for(req)?;
-        self.backbone.decode(
+        self.backbone.decode_with_memory(
+            heavy.as_ref(),
             &latents,
             req.height as usize,
             req.width as usize,
             pid_decoder.as_ref(),
+            &req.cancel,
         )
     }
 
@@ -371,6 +394,7 @@ impl PulidFlux {
         timesteps: &[f64],
         guidance: f64,
         injector: &PulidCa,
+        heavy: Option<&FluxRefHeavy>,
         sampler: Option<&str>,
         scheduler: Option<&str>,
         seed: u64,
@@ -402,7 +426,8 @@ impl PulidFlux {
                 // `PackedFluxDit`) `forward_injected`; the PuLID CA identity injection lives inside this
                 // closure so a multi-eval solver re-runs the whole step.
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                self.backbone.forward_injected(
+                self.backbone.forward_injected_with_memory(
+                    heavy,
                     img,
                     &state.img_ids,
                     &state.txt,
@@ -411,6 +436,7 @@ impl PulidFlux {
                     &state.vec,
                     Some(&guidance_t),
                     Some(injector as &dyn DitImageInjector),
+                    cancel,
                 )
             },
         )

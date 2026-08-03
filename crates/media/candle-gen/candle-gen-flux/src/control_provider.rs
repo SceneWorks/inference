@@ -6,7 +6,7 @@
 //!
 //! **How it conditions:** the pose/canny/depth control image is VAE-encoded + 2×2-packed into the
 //! packed transformer latent `[1, seq, 64]` (the same pack as the noise latents, so it aligns 1:1 with
-//! the base image tokens), constant across the denoise. [`FluxControlTransformer`] runs the
+//! the base image tokens), constant across the denoise. [`crate::FluxControlTransformer`] runs the
 //! parity-proven dev DiT ([`crate::ip_dit::IpFlux`]) plus the control branch
 //! ([`crate::control::FluxControlNet`]): 6 per-block residuals are computed once and added into the base
 //! image stream after base double blocks at `interval = ceil(19/6) = 4`, scaled by `control_scale`
@@ -14,7 +14,7 @@
 //! dev is guidance-distilled — a single embedded-guidance forward,
 //! no true-CFG / negative pass.
 //!
-//! **Compose-readiness:** the denoise routes through [`FluxControlTransformer::forward_composed`], which
+//! **Compose-readiness:** the denoise routes through [`crate::FluxControlTransformer::forward_composed`], which
 //! threads an optional identity injector ([`crate::ip_dit::DitImageInjector`] — PuLID / XLabs
 //! IP-Adapter) into the SAME base double-block stream as the control residuals. This provider wires the
 //! seam (and exposes [`Flux1DevControl::generate_with_injector`]); a follow-on epic stacks identity +
@@ -27,34 +27,27 @@
 //! the VAE posterior MEAN (no sampling, no device RNG — sc-8988), so the control latent is fully
 //! deterministic and launch-portable.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-use crate::vae::native::{AutoEncoder, DiagonalGaussian, Encoder};
+#[cfg(test)]
+use crate::vae::native::{DiagonalGaussian, Encoder};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::clip::text_model::ClipTextTransformer;
 use candle_transformers::models::flux::sampling::{get_schedule, State};
-use candle_transformers::models::t5::T5EncoderModel;
+use std::path::{Path, PathBuf};
 
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, Progress};
 use candle_gen::{CandleError, Result};
 
-use crate::control::{
-    accepts_control_kind, FluxControlNet, FluxControlNetConfig, FluxControlTransformer,
-};
+use crate::control::{accepts_control_kind, FluxControlNet, FluxControlNetConfig};
 use crate::flux1_load;
-use crate::ip_dit::{DitImageInjector, IpFlux};
-use crate::pipeline::{
-    ae_config, decode_latents, encode_text, flow_mu, flux_config, BASE_SHIFT, MAX_SHIFT,
-};
+use crate::ip_dit::{control_residual_interval, DitImageInjector};
+use crate::pipeline::{flow_mu, flux_config, BASE_SHIFT, MAX_SHIFT};
+use crate::ref_backbone::{FluxRefBackbone, FluxRefHeavy};
 use crate::Variant;
 
-/// The provider-specific error label for the shared [`crate::flux1_load`] diagnostics.
-const LABEL: &str = "flux1 control";
 /// FLUX runs at bf16.
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
@@ -99,6 +92,8 @@ pub struct Flux1ControlRequest {
     /// it does NOT branch the forward (Union-Pro-2.0 dropped the discrete mode index).
     pub control_kind: String,
     pub seed: u64,
+    /// Shared FLUX memory ladder selected by worker admission.
+    pub memory: GenerationMemory,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -114,6 +109,7 @@ impl Default for Flux1ControlRequest {
             control_scale: None,
             control_kind: "pose".into(),
             seed: 0,
+            memory: GenerationMemory::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -163,12 +159,14 @@ fn preprocess_control(
 /// best and never launch-portable, violating the sc-3673 determinism contract the rest of this
 /// provider maintains (CPU-seeded `StdRng` everywhere). The mean encode is RNG-free (matching
 /// `Flux2Vae::encode_packed` and the boogu edit precedent) and needs no seed at all.
+#[cfg(test)]
 struct MeanVaeEncoder {
     encoder: Encoder,
     shift_factor: f64,
     scale_factor: f64,
 }
 
+#[cfg(test)]
 impl MeanVaeEncoder {
     /// Encode `nchw` (`[1, 3, H, W]` in `[-1, 1]`) to the posterior-MEAN latent `[1, 16, H/8, W/8]`,
     /// shift/scale-normalized exactly like [`AutoEncoder::encode`] — minus the sampling.
@@ -179,63 +177,30 @@ impl MeanVaeEncoder {
     }
 }
 
-/// A loaded FLUX.1-dev control model: the reused FLUX text encoders + VAE, the dev DiT wrapped in its
-/// control branch ([`FluxControlTransformer`]). `generate` takes `&self` (no per-call mutation), so one
-/// load serves many renders.
+/// A loaded FLUX.1-dev control model: the shared tier-aware backbone plus its resident Shakker branch.
 pub struct Flux1DevControl {
-    /// T5 + CLIP tokenizers, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
-    /// instead of re-parsing per prompt in `encode_text`.
-    toks: crate::pipeline::FluxTokenizers,
     device: Device,
     dtype: DType,
-    clip: ClipTextTransformer,
-    /// Behind a `Mutex` because `T5EncoderModel::forward` takes `&mut self` while `generate` is `&self`;
-    /// locked only for the once-per-request text encode.
-    t5: Mutex<T5EncoderModel>,
-    transformer: FluxControlTransformer,
-    vae: AutoEncoder,
-    /// The deterministic (posterior-MEAN) control-image encoder — sc-8988. A second `Encoder` instance
-    /// over the same `ae.safetensors` (the upstream `AutoEncoder`'s encoder is private and its `encode`
-    /// samples); ~34M params of duplicated encoder weights, negligible next to the dev DiT.
-    control_encoder: MeanVaeEncoder,
+    memory: GenerationMemory,
+    backbone: FluxRefBackbone,
+    branch: FluxControlNet,
 }
 
 impl Flux1DevControl {
-    /// Load the dev base (the forked [`IpFlux`] DiT — the only FLUX DiT with the compose-ready injector
+    /// Load the dev base (the forked [`crate::IpFlux`] DiT — the only FLUX DiT with the compose-ready injector
     /// seam) + the reused text encoders + VAE + the Shakker control overlay, assembling the
-    /// [`FluxControlTransformer`].
+    /// [`crate::FluxControlTransformer`].
     pub fn load(paths: &Flux1ControlPaths) -> Result<Self> {
+        Self::load_with_memory(paths, GenerationMemory::default())
+    }
+
+    pub fn load_with_memory(paths: &Flux1ControlPaths, memory: GenerationMemory) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
         let root = paths.flux_base.clone();
         let variant = Variant::Dev; // the Shakker control is FLUX.1-dev only.
 
-        if !root.join(variant.transformer_file()).is_file() {
-            return Err(CandleError::Msg(format!(
-                "flux1 control: no {} in {} (expected a black-forest-labs FLUX.1-dev snapshot)",
-                variant.transformer_file(),
-                root.display()
-            )));
-        }
-
-        // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load, sc-9003).
-        let (clip, t5) = flux1_load::text_encoders(&root, dtype, &device, LABEL)?;
-
-        // The forked FLUX DiT (the compose-ready injector seam) from the root BFL checkpoint — the genuine
-        // per-provider drift (IpFlux base, not the stock Flux), so the wrapper choice stays here.
-        let dit_vb = flux1_load::dit_vb(&root, variant, dtype, &device, LABEL)?;
-        let base = IpFlux::new(&flux_config(variant), dit_vb)?;
-
-        // FLUX AutoEncoder (`ae.safetensors`) for decode, plus a separate posterior-MEAN encoder over the
-        // same weights for the deterministic control encode (sc-8988). The shared loader hands back the
-        // VAE plus its VarBuilder so the mean-encoder reuses the same mmap (the per-provider drift here).
-        let ae_cfg = ae_config(variant);
-        let (vae, vae_vb) = flux1_load::vae(&root, variant, dtype, &device, LABEL)?;
-        let control_encoder = MeanVaeEncoder {
-            encoder: Encoder::new(&ae_cfg, vae_vb.pp("encoder"))?,
-            shift_factor: ae_cfg.shift_factor,
-            scale_factor: ae_cfg.scale_factor,
-        };
+        let backbone = FluxRefBackbone::load_with_memory(&root, variant, &device, dtype, memory)?;
 
         // The Shakker control overlay (diffusers layout, un-prefixed keys). The branch shares the base
         // FLUX config's dims (hidden / heads / RoPE) so its residuals align with the base image tokens.
@@ -245,29 +210,23 @@ impl Flux1DevControl {
             &FluxControlNetConfig::shakker_union_pro_2_0(),
             control_vb,
         )?;
-        let transformer = FluxControlTransformer::new(base, branch);
-
-        let toks = crate::pipeline::FluxTokenizers::load(&root)?;
         Ok(Self {
-            toks,
             device,
             dtype,
-            clip,
-            t5: Mutex::new(t5),
-            transformer,
-            vae,
-            control_encoder,
+            memory,
+            backbone,
+            branch,
         })
     }
 
     /// The injection interval over the base double blocks (`ceil(19/6) = 4`).
     pub fn residual_interval(&self) -> usize {
-        self.transformer.residual_interval()
+        control_residual_interval(19, self.branch.num_residuals())
     }
 
     /// Number of control residuals (the control double-block count, 6).
     pub fn num_residuals(&self) -> usize {
-        self.transformer.num_residuals()
+        self.branch.num_residuals()
     }
 
     /// Generate one control-conditioned image. `control_image` is the preprocessed pose/canny/depth hint
@@ -321,16 +280,19 @@ impl Flux1DevControl {
         let control_scale = req.control_scale.unwrap_or(DEFAULT_CONTROL_SCALE) as f64;
 
         // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
-        let (t5_emb, clip_emb) = encode_text(
-            Variant::Dev,
-            &self.toks,
-            &self.device,
-            self.dtype,
-            &self.clip,
-            &self.t5,
-            &req.prompt,
+        self.backbone
+            .validate_native_vae_request(false, &req.cancel)?;
+        let (t5_emb, clip_emb) = self
+            .backbone
+            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        let heavy = self.backbone.load_heavy(&req.cancel)?;
+        let control_latent = self.encode_control_latent(
+            heavy.as_ref(),
+            control_image,
+            req.width,
+            req.height,
+            &req.cancel,
         )?;
-        let control_latent = self.encode_control_latent(control_image, req.width, req.height)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request. sc-3673 parity:
         // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
@@ -356,6 +318,7 @@ impl Flux1DevControl {
             guidance,
             control_scale,
             injector,
+            heavy.as_ref(),
             req.seed,
             &req.cancel,
             on_progress,
@@ -363,12 +326,13 @@ impl Flux1DevControl {
         on_progress(Progress::Decoding);
         // Control lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840 /
         // sc-7853); native FLUX VAE decode.
-        decode_latents(
-            &self.vae,
-            None,
+        self.backbone.decode_with_memory(
+            heavy.as_ref(),
             &latents,
             req.height as usize,
             req.width as usize,
+            None,
+            &req.cancel,
         )
     }
 
@@ -377,12 +341,22 @@ impl Flux1DevControl {
     /// the control latent aligns 1:1 with the base image tokens. The encode takes the posterior MEAN
     /// (sc-8988) — no sampling, no device RNG — so the latent is fully deterministic and launch-portable
     /// (the candle determinism contract, sc-3673), identical across steps and across the batch.
-    fn encode_control_latent(&self, image: &Image, width: u32, height: u32) -> Result<Tensor> {
+    fn encode_control_latent(
+        &self,
+        heavy: Option<&FluxRefHeavy>,
+        image: &Image,
+        width: u32,
+        height: u32,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
+        candle_gen::check_cancel(cancel)?;
         let nchw = preprocess_control(image, width, height, &self.device, self.dtype)?;
-        let encoded = self.control_encoder.encode(&nchw)?; // [1, 16, H/8, W/8]
-                                                           // Reuse the candle State patchify to 2×2-pack to [1, seq, 64] — identical geometry to the noise
-                                                           // pack. `State::new` needs a t5/clip embed only to fill txt/vec (unused here), so feed tiny
-                                                           // placeholders and take only `.img` (the packed latent).
+        let encoded = self
+            .backbone
+            .encode_control_with_memory(heavy, &nchw, cancel)?; // [1, 16, H/8, W/8]
+                                                                // Reuse the candle State patchify to 2×2-pack to [1, seq, 64] — identical geometry to the noise
+                                                                // pack. `State::new` needs a t5/clip embed only to fill txt/vec (unused here), so feed tiny
+                                                                // placeholders and take only `.img` (the packed latent).
         let dummy_t5 = Tensor::zeros((1, 1, 4096), self.dtype, &self.device)?;
         let dummy_clip = Tensor::zeros((1, 768), self.dtype, &self.device)?;
         let packed = State::new(&dummy_t5, &dummy_clip, &encoded)?;
@@ -404,6 +378,7 @@ impl Flux1DevControl {
         guidance: f64,
         control_scale: f64,
         injector: Option<&dyn DitImageInjector>,
+        heavy: Option<&FluxRefHeavy>,
         seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -424,8 +399,33 @@ impl Flux1DevControl {
             on_progress,
             None,
             |img, t| -> Result<Tensor> {
+                candle_gen::check_cancel(cancel)?;
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                Ok(self.transformer.forward_composed(
+                let budget = if self.memory.chunk_attention {
+                    self.memory
+                        .attention_chunk_size
+                        .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE)
+                        as u64
+                } else {
+                    candle_gen::ATTN_SCORES_BUDGET as u64
+                };
+                let plan =
+                    AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, false))
+                        .with_cancel(cancel);
+                let residuals = self.branch.forward_with_memory(
+                    img,
+                    control_latent,
+                    &state.txt,
+                    &state.vec,
+                    &state.img_ids,
+                    &state.txt_ids,
+                    &t_vec,
+                    Some(&guidance_t),
+                    plan,
+                    cancel,
+                )?;
+                self.backbone.forward_control_with_memory(
+                    heavy,
                     img,
                     &state.img_ids,
                     &state.txt,
@@ -433,10 +433,10 @@ impl Flux1DevControl {
                     &t_vec,
                     &state.vec,
                     Some(&guidance_t),
-                    control_latent,
-                    control_scale,
                     injector,
-                )?)
+                    Some((&residuals, control_scale)),
+                    cancel,
+                )
             },
         )
     }
