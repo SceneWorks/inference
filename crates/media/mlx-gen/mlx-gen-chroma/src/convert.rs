@@ -59,7 +59,6 @@ pub const T5_SENSITIVE_RESIDUAL_FFN_BLOCKS: &[usize] = &[1, 2];
 /// architecture and written into artifact provenance so loaders can reject incomplete rebuilds.
 pub const T5_BLOCK_COUNT: usize = 24;
 pub const T5_AFFINE_PARAMETER_DTYPE: &str = "bfloat16";
-pub const T5_F32_AFFINE_PARAMETER_DTYPE: &str = "float32";
 /// Exact packed bases whose small Q8 residuals protect the T5 boundaries and calibrated sublayers
 /// while keeping every source weight packed.
 pub const T5_SENSITIVE_RESIDUAL_BASES: &[&str] = &[
@@ -561,6 +560,7 @@ mod tests {
         );
         let mut map = HashMap::new();
         for base in [
+            "encoder.block.0.layer.0.SelfAttention.q",
             "encoder.block.0.layer.1.DenseReluDense.wi_0",
             "shared",
             "encoder.block.4.layer.0.SelfAttention.q",
@@ -579,6 +579,7 @@ mod tests {
         )
         .unwrap();
         for base in [
+            "encoder.block.0.layer.0.SelfAttention.q",
             "encoder.block.0.layer.1.DenseReluDense.wi_0",
             "shared",
             "encoder.block.4.layer.0.SelfAttention.q",

@@ -402,10 +402,6 @@ jobs:
           if-no-files-found: error
           path: ${{ runner.temp }}/chroma-sc16462-t5-sensitivity.log
 
-  # SC-16462 diagnostic lane: calibrate a second packed T5 residual on the exact strict Base prompts.
-  # The immutable shipped Q4 transformer is reused for every row; only dense T5/VAE are packed at
-  # load time, avoiding repeated full-turnkey builds. This lane is
-  # calibration-only and cannot publish.
   # Publication cannot begin until every Base/HD/Flash validation leg above is green. Each repo
   # receives q4+q8 in one parent-guarded commit. A retry explicitly verifies an already-published
   # repo byte-for-byte and treats it as success, making a cross-repository partial run resumable.

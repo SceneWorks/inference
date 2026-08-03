@@ -200,11 +200,6 @@ enum T5ProbePolicy {
         first: (usize, T5Sublayer),
         second: (usize, T5Sublayer),
     },
-    Q8Q4ProgressiveThreeSensitiveSublayersQ8Group32 {
-        first: (usize, T5Sublayer),
-        second: (usize, T5Sublayer),
-        third: (usize, T5Sublayer),
-    },
     Q8Q8Progressive,
     Q8Linears,
     Q8Except {
@@ -249,19 +244,6 @@ fn t5_probe_outputs(
         T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayersQ8Group32 { first, second } => t5
             .quantize_progressive_with_sensitive_sublayers_residuals(8, 4, 8, 32, &[first, second])
             .expect("load-time group-32 multi-sublayer-selective T5 quantization"),
-        T5ProbePolicy::Q8Q4ProgressiveThreeSensitiveSublayersQ8Group32 {
-            first,
-            second,
-            third,
-        } => t5
-            .quantize_progressive_with_sensitive_sublayers_residuals(
-                8,
-                4,
-                8,
-                32,
-                &[first, second, third],
-            )
-            .expect("load-time group-32 three-sublayer-selective T5 quantization"),
         T5ProbePolicy::Q8Q8Progressive => t5
             .quantize_progressive(8, 8, 64)
             .expect("load-time Q8+Q8 progressive T5 quantization"),
@@ -605,15 +587,6 @@ fn t5_precision_sensitivity_sweep() {
             None,
         ),
         (
-            "q8-plus-q4-packed-residual-sensitive-q8-group32-block4-attention-block1-ffn-block2-ffn",
-            T5ProbePolicy::Q8Q4ProgressiveThreeSensitiveSublayersQ8Group32 {
-                first: (4, T5Sublayer::Attention),
-                second: (1, T5Sublayer::FeedForward),
-                third: (2, T5Sublayer::FeedForward),
-            },
-            None,
-        ),
-        (
             "q8-plus-q8-packed-residual-group64",
             T5ProbePolicy::Q8Q8Progressive,
             None,
@@ -773,6 +746,27 @@ fn packed_auxiliaries_match_load_time_quantization() {
             .is_some(),
         "T5 progressive correction must also be stored as packed codes"
     );
+    for (base, expected_dtype) in [
+        (t5_probe, Dtype::Bfloat16),
+        ("shared", Dtype::Float32),
+        (relative_bias, Dtype::Float32),
+        (
+            "encoder.block.0.layer.1.DenseReluDense.wi_0",
+            Dtype::Float32,
+        ),
+        ("encoder.block.4.layer.0.SelfAttention.q", Dtype::Float32),
+    ] {
+        for suffix in ["scales", "biases", "residual.scales", "residual.biases"] {
+            assert_eq!(
+                packed_weights
+                    .require(&format!("{base}.{suffix}"))
+                    .unwrap()
+                    .dtype(),
+                expected_dtype,
+                "T5 affine parameter dtype for {base}.{suffix}"
+            );
+        }
+    }
     let packed_weights =
         mlx_gen::weights::Weights::from_dir(out.join("vae")).expect("packed VAE weights");
     let vae_probe = "decoder.mid_block.attentions.0.to_q";
@@ -826,7 +820,7 @@ fn packed_auxiliaries_match_load_time_quantization() {
         "Q{auxiliary_bits} VAE cosine fell below {vae_floor:.5} (decode={vae_decode_cosine:.7}, encode={vae_encode_cosine:.7})"
     );
     println!(
-        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"t5AffinePolicy\":\"f32-boundaries-all-ffn-block4-attention\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
         bits,
         auxiliary_bits,
@@ -951,7 +945,7 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         gib(baseline_peak)
     );
     println!(
-        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"t5AffinePolicy\":\"f32-boundaries-all-ffn-block4-attention\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
         id,
         bits,
         auxiliary_bits,
