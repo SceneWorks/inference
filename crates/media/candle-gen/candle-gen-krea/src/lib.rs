@@ -803,7 +803,19 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
-            supports_preview: false,
+            // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
+            // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
+            // and the shared Turbo+Raw edit) plus the pose-control provider — to hand
+            // `candle_gen::run_flow_sampler` a `PreviewHook`, so all three descriptors derived from
+            // this one (Turbo here, `raw_descriptor`, `edit_descriptor`) genuinely emit per-step
+            // latent previews. The same lockstep rule as the offload bit above applies, in the same
+            // direction: never advertise ahead of the wiring. What is new is that it is now
+            // enforced rather than merely written down — `candle-gen-catalog`'s
+            // `preview_advertising` guard derives from the Krea sources whether the routes actually
+            // pass a hook and fails the build if this flag and that fact disagree in EITHER
+            // direction. The trainer's periodic sample render is deliberately outside that set: it
+            // renders from a synthetic request that carries no sink.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
