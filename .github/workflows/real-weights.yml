@@ -941,9 +941,9 @@ jobs:
           run_one real_wan_style_lora_loads_and_changes_the_render
           run_one real_wan_step_distill_lora_installs_over_the_widened_globals
 
-  # sc-16981: this was ONE `Candle audio real weights` job running 29 real-weight invocations back
+  # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
-  # the snapshot-path fix, and it consumed GitHub's 360-minute default WITHOUT hanging — 17 of 29
+  # the snapshot-path fix, and it consumed GitHub's 360-minute default WITHOUT hanging — 17 of 30
   # invocations finished, all passing, and it was 21 s into #18 when the cap killed it. For six
   # hours it head-of-line-blocked the single self-hosted Metal runner, and with it every other
   # macOS real-weights job plus the app repo's `nax-worker` PR lane, which shares this machine
@@ -956,10 +956,23 @@ jobs:
   # and each is separately dispatchable. Every job also materializes ONLY the snapshots its own
   # tests read (derived from the `env::var` calls in each crate's tests/).
   #
-  # Measured debug wall times from run 30741567385, per family:
+  # Measured wall times from run 30741567385, per family — DEBUG PROFILE, and therefore SUPERSEDED
+  # as a sizing basis: since sc-17004 every invocation below runs `--release`.
   #   kokoro 3.0m · moss-sfx 233.8m · acestep 79.9m · voice 2.7m · chatterbox ~40m (8 of 11 done)
-  # `asr` and `moss-tts` never got to run before the 360-minute cancel, so their budgets are
-  # provisional. Budgets are ~1.5-2x measured, except moss-sfx — see the note on that job.
+  # `asr` and `moss-tts` never got to run before the 360-minute cancel, so their budgets were
+  # provisional even in debug. Budgets are ~1.5-2x those debug numbers, except moss-sfx.
+  #
+  # The budgets below are deliberately UNCHANGED by sc-17004 and are now loose by an unknown factor
+  # rather than a measured one. Only two families have been measured in release, both on nax-macos
+  # itself: `kokoro` (3 invocations, ~42 s of tests, plus a 2m13s cold optimized build of its crate
+  # tree — versus 2m38s cold for the debug build, so switching profile costs no extra build time
+  # because `[profile.dev.package."*"]` already compiled every registry dependency optimized) and
+  # `asr` (all 4 invocations, ~24 s, including the greedy-argmax `..._within_cer` gate, which is the
+  # one place a numerically-shifted logit could have flipped a discrete decision — it did not).
+  # The other five families have NOT been run in release. Re-sizing all seven from the first weekly
+  # run that executes this lane is sc-17057; a smaller number guessed here is exactly the sc-16981
+  # defect. Note also that `actions/checkout` defaults to `clean: true`, so `target/` does not
+  # survive between jobs — every job pays a full cold build every week, in either profile.
   candle-audio-kokoro:
     name: Candle audio real weights (Kokoro TTS)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-kokoro'
@@ -977,24 +990,36 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
       - name: Run provider conformance
         run: |
-          cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
-          cargo test --locked -p candle-audio-kokoro --test conformance kokoro_wav_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-kokoro --test conformance kokoro_wav_conformance -- --ignored --nocapture
       # Regression fixture (sc-12854): the validation harness's committed metric envelope +
       # PCM repeatability hash; this runner IS the fixture's canonical platform
-      # (macos/aarch64), so the exact-hash check gates here.
+      # (macos/aarch64), so the exact-hash check gates here. Since sc-17004 the fixture commits one
+      # hash per opt-level and the test asserts the one matching its build, so the `--release`
+      # below gates against `pcm_sha256_opt3` — the gate did not go quiet when the profile changed.
+      # `metal` stays off (CPU-first, docs/architecture/audio-backend-strategy.md), which is what
+      # keeps the exact-hash check live at all: on a GPU build it degrades to envelope-only.
       - name: Run regression fixture
-        run: cargo test --locked -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
+        run: cargo test --locked --release -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
 
   # The outlier, and the reason the 2026-08-02 run never finished: these two invocations alone cost
   # 233.8 min of the 360 (moss_sfx_conformance 57.4m, moss_sfx_wav_conformance 176.4m) — despite
   # the conformance profile requesting only 2 solver steps, because the gen-core suite loads the
-  # ~11 GB model and re-generates several times per section. The budget below is deliberately large
-  # enough not to false-fail; it is NOT an endorsement of a 4-hour job. Unlike every sibling audio
-  # job (Stable Audio 3, SAME) this lane runs unoptimized: no `--release`, and `metal` is not a
-  # default feature, so it is a CPU debug build of a 1.3B DiT + a 1.7B Qwen3 text encoder. Cutting
-  # that is tracked separately — it needs a measured debug-vs-release comparison of the committed
-  # `kokoro_82m_regression.json` PCM hash first, since that fixture's exact-hash gate keys on
-  # `cpu_build && macos && aarch64` and does not distinguish build profile.
+  # ~11 GB model and re-generates several times per section.
+  #
+  # sc-17004 unblocked `--release` for this whole lane (every invocation above and below now carries
+  # it). The blocker was that `kokoro_82m_regression.json` pinned ONE PCM hash whose gate keyed on
+  # `cpu_build && macos && aarch64` and ignored build profile; the hash does move with opt-level, so
+  # the fixture now commits one per opt-level instead of the gate silently changing meaning.
+  #
+  # The budget below is UNCHANGED and still deliberately generous. Kokoro measured ~3x on its test
+  # body on this runner, but that multiplier is unlikely to carry here: Kokoro's win is in this
+  # workspace's OWN crates, whereas this lane's cost is ~11 GB of model loading plus candle ops that
+  # were ALREADY opt-level 3 in both profiles via `[profile.dev.package."*"]` (which covers registry
+  # dependencies, not workspace members). This family has never been run in release at all.
+  # Re-tightening every audio budget on the first release-mode weekly run is sc-17057; guessing a
+  # smaller number here is precisely the sc-16981 mistake (a 120-min cap that would have failed a
+  # slow-but-passing job every week).
   candle-audio-moss-sfx:
     name: Candle audio real weights (MOSS SoundEffect)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-sfx'
@@ -1012,8 +1037,8 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
       - name: Run provider conformance
         run: |
-          cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_conformance -- --ignored --nocapture
-          cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_wav_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-moss-sfx --test conformance moss_sfx_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-moss-sfx --test conformance moss_sfx_wav_conformance -- --ignored --nocapture
 
   candle-audio-acestep:
     name: Candle audio real weights (ACE-Step music)
@@ -1034,8 +1059,8 @@ jobs:
         run: |
           # ACE-Step 1.5 music/song (sc-12842): the flow-matching DiT + Oobleck VAE producing a
           # non-degenerate, rhythmic stereo mix (frame-energy variation, broadband spectrum, beat).
-          cargo test --locked -p candle-audio-acestep --test conformance acestep_conformance -- --ignored --nocapture
-          cargo test --locked -p candle-audio-acestep --test conformance acestep_music_wav_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-acestep --test conformance acestep_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-acestep --test conformance acestep_music_wav_conformance -- --ignored --nocapture
 
   candle-audio-voice:
     name: Candle audio real weights (voice embed + conversion)
@@ -1062,15 +1087,15 @@ jobs:
         run: |
           # Chatterbox voice embedder (sc-12844): the sc-12838 release gate. Uses the Kokoro
           # snapshot above for the distinct reference voices it embeds.
-          cargo test --locked -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_discriminates_speakers -- --ignored --nocapture
-          cargo test --locked -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_wav_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_discriminates_speakers -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_wav_conformance -- --ignored --nocapture
           # OpenVoice V2 voice conversion (sc-13223): the sc-12839 release gate. Converts a Kokoro
           # source clip toward a DIFFERENT Kokoro target voice; the timbre shift is measured with
           # chatterbox_ve above. sc-13233 adds a content-preservation gate: whisper_base (snapshot
           # above) transcribes the converted clip and asserts its CER vs the known source script
           # stays small — catching linguistic garbling the duration+timbre gate is blind to.
-          cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_converts_toward_the_target_voice -- --ignored --nocapture
-          cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_is_deterministic -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-openvoice --test conformance openvoice_v2_converts_toward_the_target_voice -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-openvoice --test conformance openvoice_v2_is_deterministic -- --ignored --nocapture
 
   candle-audio-chatterbox:
     name: Candle audio real weights (Chatterbox clone-TTS)
@@ -1098,44 +1123,44 @@ jobs:
           # Chatterbox clone-TTS (sc-13222): the T3 speech-token LM stage on real t3_cfg.safetensors
           # weights — a valid, non-degenerate, voice-responsive token sequence, plus the honest
           # VoiceEmbedding-only boundary (a full clone WAV requires ReferenceAudio; sc-13239).
-          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_t3_produces_valid_speech_tokens -- --ignored --nocapture
-          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_t3_responds_to_the_reference_voice -- --ignored --nocapture
-          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_generate_requires_reference_audio_for_a_full_clone -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance chatterbox_t3_produces_valid_speech_tokens -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance chatterbox_t3_responds_to_the_reference_voice -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance chatterbox_generate_requires_reference_audio_for_a_full_clone -- --ignored --nocapture
           # s3tokenizer (sc-13235) + T3 prompt-token wiring: the Whisper-v2 FSMN encoder + FSQ head
           # tokenizes a reference at ≈25 Hz into valid FSQ codes, deterministically and content-
           # responsively, and fills T3's reference conditioning prompt (previously orphaned — sc-13394).
-          cargo test --locked -p candle-audio-chatterbox --test conformance s3tokenizer_encodes_a_reference_at_25hz -- --ignored --nocapture
-          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_reference_audio_fills_the_t3_prompt_tokens -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance s3tokenizer_encodes_a_reference_at_25hz -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance chatterbox_reference_audio_fills_the_t3_prompt_tokens -- --ignored --nocapture
           # s3tokenizer long-audio (>30s) sliding-window segmentation + merge_tokenized_segments
           # (sc-13380): 30 s windows hopped by 26 s (4 s overlap), each tokenized independently and
           # stitched so the overlap is counted once — a real >30 s clip tokenizes at 25 Hz across the
           # seams and matches single-pass tokens over the non-boundary interior (continuity).
-          cargo test --locked -p candle-audio-chatterbox --test conformance s3tokenizer_windows_audio_longer_than_30s -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance s3tokenizer_windows_audio_longer_than_30s -- --ignored --nocapture
           # CAMPPlus speaker encoder (sc-13236): the D-TDNN x-vector network derives DISCRIMINATIVE
           # 192-d / 80-d flow speaker embeddings on real speaker_encoder.* weights (previously
           # orphaned — sc-13394).
-          cargo test --locked -p candle-audio-chatterbox --test conformance campplus_derives_discriminative_x_vectors -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance campplus_derives_discriminative_x_vectors -- --ignored --nocapture
           # S3Gen flow token->mel decoder (sc-13237): the UpsampleConformerEncoder + CausalConditionalCFM
           # + ConditionalDecoder on real flow.* weights render a sane 80-bin log-mel (shape [80, ~2*n_tokens],
           # finite, non-degenerate range) from real conditioning (s3tokenizer tokens + CAMPPlus 80-d spk +
           # 24 kHz prompt mel) and are deterministic. Needs the full CHATTERBOX_SNAPSHOT (s3gen.safetensors).
-          cargo test --locked -p candle-audio-chatterbox --test conformance flow_synthesizes_a_sane_mel_from_speech_tokens -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance flow_synthesizes_a_sane_mel_from_speech_tokens -- --ignored --nocapture
           # S3Gen HiFTNet vocoder (sc-13238): the NSF/iSTFT mel->waveform generator vocodes a real 24 kHz
           # log-mel into a non-silent, finite, 480-samples/frame waveform, deterministically.
-          cargo test --locked -p candle-audio-chatterbox --test conformance hift_vocodes_a_real_mel_to_nonsilent_waveform -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance hift_vocodes_a_real_mel_to_nonsilent_waveform -- --ignored --nocapture
           # PerTh provenance watermarker (sc-13240): the natively-ported implicit watermarker on real
           # weights (MIT; resolved from the SceneWorks/perth-implicit hub pin — sc-13443) embeds a
           # RECOVERABLE (≈100% detection, clean≈0) and IMPERCEPTIBLE (psychoacoustically masked;
           # SNR ≈16 dB) watermark, at both the model's native 32 kHz rate and Chatterbox's 24 kHz
           # output path. Wired into generate() (sc-13239).
-          cargo test --locked -p candle-audio-chatterbox --test conformance perth_watermark_roundtrips_and_is_imperceptible -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-chatterbox --test conformance perth_watermark_roundtrips_and_is_imperceptible -- --ignored --nocapture
           # THE sc-12838 clone-WAV DoD (sc-13239): the epic-releasing gate. The full registry path
           # (generate()) renders a real 24 kHz cloned-voice WAV from a reference clip + text that is
           # non-silent, finite, token-proportional, speech-shaped, watermarked, AND voice-similar to
           # the reference (cos(ve(out),ve(ref)) > cos(ve(out),ve(control)) by a material margin — it
           # FAILS if the clone ignores the reference). Needs the full CHATTERBOX_SNAPSHOT; PerTh
           # resolves from the SceneWorks/perth-implicit hub pin.
-          CHATTERBOX_WAV_OUT="$RUNNER_TEMP/chatterbox_clone_demo.wav" cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_clones_a_reference_voice_end_to_end -- --ignored --nocapture
+          CHATTERBOX_WAV_OUT="$RUNNER_TEMP/chatterbox_clone_demo.wav" cargo test --locked --release -p candle-audio-chatterbox --test conformance chatterbox_clones_a_reference_voice_end_to_end -- --ignored --nocapture
 
   # Provisional budget: neither of these families reached the runner before the 2026-08-02 cancel,
   # so there is no measured wall time for them yet. Revisit once a full weekly run completes.
@@ -1163,14 +1188,14 @@ jobs:
           # Whisper ASR (sc-12850): the first real Transcriber (audio→text, the Captioner-analog).
           # Kokoro TTS → Whisper ASR round-trip — known text synthesized by kokoro_82m (snapshot
           # above) transcribes back within a small CER, with monotonic segment timestamps.
-          cargo test --locked -p candle-audio-whisper --test conformance whisper_transcribes_kokoro_roundtrip_within_cer -- --ignored --nocapture
-          cargo test --locked -p candle-audio-whisper --test conformance whisper_greedy_transcription_is_deterministic -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-whisper --test conformance whisper_transcribes_kokoro_roundtrip_within_cer -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-whisper --test conformance whisper_greedy_transcription_is_deterministic -- --ignored --nocapture
           # LAION CLAP audio embedder (sc-12851): the first real AudioEmbedder (semantic audio-text
           # joint-space retrieval). Embeds a set of real clips spanning categories (a Kokoro speech
           # clip from the snapshot above, a tone, and white noise) and asserts a TEXT query ranks its
           # matching clip highest by cosine — the cross-modal ranking DoD — plus embedding determinism.
-          cargo test --locked -p candle-audio-clap --test conformance cross_modal_query_ranks_matching_clip_highest -- --ignored --nocapture
-          cargo test --locked -p candle-audio-clap --test conformance embedding_is_deterministic -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-clap --test conformance cross_modal_query_ranks_matching_clip_highest -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-clap --test conformance embedding_is_deterministic -- --ignored --nocapture
 
   candle-audio-moss-tts:
     name: Candle audio real weights (MOSS-TTSD dialogue)
@@ -1200,10 +1225,10 @@ jobs:
           # speakers are acoustically distinct (measured via chatterbox_ve — cross-segment cosine below
           # same-segment self-similarity), with a single-voice control and byte-identical re-synth. The
           # non-English gate (task 12906) checks a Chinese prompt renders distinct real audio.
-          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_emits_valid_delay_pattern_rvq_frames -- --ignored --nocapture
-          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_two_speaker_script_shapes_the_token_stream -- --ignored --nocapture
-          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_renders_multi_speaker_audio -- --ignored --nocapture
-          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_renders_non_english -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-moss-tts --test conformance moss_ttsd_emits_valid_delay_pattern_rvq_frames -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-moss-tts --test conformance moss_ttsd_two_speaker_script_shapes_the_token_stream -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-moss-tts --test conformance moss_ttsd_renders_multi_speaker_audio -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-moss-tts --test conformance moss_ttsd_renders_non_english -- --ignored --nocapture
 
   same-l-metal:
     name: SAME-L real weights (Metal)
