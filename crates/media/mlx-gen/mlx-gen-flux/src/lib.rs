@@ -7,6 +7,7 @@
 
 pub mod adapters;
 pub(crate) mod artifact_inventory;
+pub(crate) mod block_stream;
 pub mod config;
 pub mod control_transformer;
 pub mod convert;

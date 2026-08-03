@@ -106,10 +106,11 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         spec,
         stream_inventory.as_ref(),
     )?;
+    let residency = build_residency(variant, spec, stream_inventory.clone())?;
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
-        residency: build_residency(variant, spec)?,
+        residency,
         ip_adapter,
         memory_strategy,
         loaded_spec: spec.clone(),
@@ -197,12 +198,32 @@ fn load_flux_heavy(
     variant: FluxVariant,
     spec: &LoadSpec,
     load_pid: bool,
+    stream_inventory: Option<&crate::artifact_inventory::PackedArtifactInventory>,
 ) -> Result<FluxHeavyOwned> {
     let root = resolve_root(variant, spec)?;
-    let mut transformer = loader::load_transformer(root, variant)?;
+    let mut transformer = match stream_inventory {
+        Some(inventory) => {
+            inventory
+                .ensure_unchanged()
+                .map_err(|error| Error::Msg(error.to_string()))?;
+            let transformer = loader::load_transformer_from_file(
+                inventory.transformer_source().canonical_path(),
+                variant,
+            )?;
+            inventory
+                .ensure_unchanged()
+                .map_err(|error| Error::Msg(error.to_string()))?;
+            transformer
+                .with_block_stream(inventory.clone(), spec.quantize.map(mlx_gen::Quant::bits))
+        }
+        None => loader::load_transformer(root, variant)?,
+    };
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
+        if stream_inventory.is_some() {
+            crate::block_stream::ensure_prepacked(&mut transformer, "transformer")?;
+        }
         transformer.quantize(bits)?;
         vae.quantize(bits)?;
     }
@@ -210,6 +231,12 @@ fn load_flux_heavy(
     // forward-time residual over the now-quantized base, never a fused merge). No-op when empty; a
     // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
     crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
+    transformer.finalize_block_stream()?;
+    if stream_inventory.is_some() && transformer.resident_block_counts() != (0, 0) {
+        return Err(Error::Msg(
+            "flux1: deferred DiT retained joint or single transformer blocks".to_owned(),
+        ));
+    }
     // Optional PiD decoder overlay (epic 7840, sc-7846): the FLUX.1 16-ch VAE latent space has a PiD
     // student, so the final decode can route through `mlx_gen_pid` when `req.use_pid` is set. Loaded
     // only when the spec carries `pid` AND this generate uses it (`load_pid`, F-177): the Resident path
@@ -238,14 +265,33 @@ fn load_flux_heavy(
 fn build_residency(
     variant: FluxVariant,
     spec: &LoadSpec,
+    stream_inventory: Option<crate::artifact_inventory::PackedArtifactInventory>,
 ) -> Result<Residency<FluxTextOwned, FluxHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
-        move || load_flux_text(variant, &spec_text),
-        move |use_pid| load_flux_heavy(variant, &spec_heavy, use_pid),
-    )
+    match spec.offload_policy {
+        OffloadPolicy::Resident => Residency::from_policy(
+            OffloadPolicy::Resident,
+            move || load_flux_text(variant, &spec_text),
+            move |use_pid| load_flux_heavy(variant, &spec_heavy, use_pid, None),
+        ),
+        OffloadPolicy::Sequential => Ok(Residency::request_scoped(
+            move |_streamable| load_flux_text(variant, &spec_text),
+            move |use_pid, streamable| {
+                let inventory = if streamable {
+                    Some(stream_inventory.as_ref().ok_or_else(|| {
+                        Error::Unsupported(
+                            "flux1: block streaming requested without a verified inventory"
+                                .to_owned(),
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                load_flux_heavy(variant, &spec_heavy, use_pid, inventory)
+            },
+        )),
+    }
 }
 
 pub struct Flux1 {
@@ -267,9 +313,8 @@ pub struct Flux1 {
     /// Exact load axes used to build [`Self::memory_strategy`]. Overlay-bearing specs deliberately
     /// keep bounded attention unavailable until those extra attention paths have their own proof.
     loaded_spec: LoadSpec,
-    /// Exact packed component + T5-tokenizer inventory retained for the future runtime streaming
-    /// slice. The DiT source is the pinned `transformer/model.safetensors`, never a rediscovered
-    /// shard/glob.
+    /// Exact packed component + T5-tokenizer inventory retained by the runtime streaming path. The
+    /// DiT source is the pinned `transformer/model.safetensors`, never a rediscovered shard/glob.
     stream_inventory: Option<crate::artifact_inventory::PackedArtifactInventory>,
 }
 
@@ -305,6 +350,74 @@ impl Flux1 {
             loaded_spec,
             stream_inventory: None,
         }
+    }
+
+    fn requested_transformer_window(
+        &self,
+        req: &GenerationRequest,
+        injector: Option<&dyn crate::transformer::DitImageInjector>,
+    ) -> Result<Option<usize>> {
+        let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+            return Ok(None);
+        };
+        if injector.is_some()
+            || req.use_pid
+            || !memory.stage_residency
+            || !self
+                .memory_strategy
+                .lifecycle
+                .transformer_window_materialization
+            || !crate::artifact_inventory::structurally_streamable(
+                self.variant.id(),
+                &self.loaded_spec,
+            )
+        {
+            return Err(Error::Unsupported(
+                "flux1: transformer streaming requires the clean-base Sequential + DeferredMaterialization route"
+                    .to_owned(),
+            ));
+        }
+        if memory
+            .transformer_window_component
+            .unwrap_or(gen_core::TransformerComponent::Dit)
+            != gen_core::TransformerComponent::Dit
+        {
+            return Err(Error::Unsupported(
+                "flux1: transformer streaming is DiT-only".to_owned(),
+            ));
+        }
+        let size = memory
+            .transformer_window_size
+            .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE);
+        if size != crate::memory_strategy::TRANSFORMER_WINDOW_SIZE {
+            return Err(Error::Unsupported(format!(
+                "flux1: transformer window {size} is outside the published production domain"
+            )));
+        }
+        self.verify_stream_inventory()?;
+        Ok(Some(size as usize))
+    }
+
+    fn verify_stream_inventory(&self) -> Result<()> {
+        self.stream_inventory
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Unsupported(
+                    "flux1: transformer streaming has no verified packed inventory".to_owned(),
+                )
+            })?
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))
+    }
+
+    fn finish_streamed_generation<T>(&self, streamed: bool, result: Result<T>) -> Result<T> {
+        if streamed {
+            // Always run after the residency driver has released the heavy phase, including on a
+            // block fault, cancellation, or forward error. A source mutation outranks the earlier
+            // error because the model's admitted behavioral identity is no longer trustworthy.
+            self.verify_stream_inventory()?;
+        }
+        result
     }
 }
 
@@ -402,7 +515,7 @@ impl Generator for Flux1 {
                 ))
             })?;
             inventory.ensure_unchanged()?;
-            // The eventual block loader must open this exact pin, not rediscover a file by glob.
+            // The block loader opens this exact pin, never rediscovering a file by glob.
             inventory.transformer_source().ensure_unchanged()?;
         }
         crate::memory_strategy::begin_request(
@@ -438,11 +551,16 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let transformer_window = self.requested_transformer_window(req, injector)?;
+        let streamable = transformer_window.is_some();
+        let stage_residency = matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential);
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 + CLIP
         // encoders, encodes the prompt, materializes, then DROPS them + `clear_cache()` before the
         // DiT/VAE load — the peak-bounding win. Under `Resident` it borrows the warm encoders and runs
         // the identical encode/denoise/decode with no eval/clear.
-        self.residency.run(
+        let result = self.residency.run_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -458,6 +576,15 @@ impl Flux1 {
             },
             |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
                 let transformer = &heavy.transformer;
+                let block_window = transformer.block_window(
+                    transformer_window,
+                    &req.cancel,
+                    req.memory.is_some_and(|memory| {
+                        memory.calibration_fault_harness_authorized
+                            && memory.calibration_error_phase
+                                == Some(gen_core::MemoryPhase::Denoise)
+                    }),
+                )?;
                 // Only the clean base route owns complete attention coverage. Any injector adds a
                 // distinct attention stack, so it preserves the historical unbounded forward even
                 // if a caller manually sets request memory outside the admitted contract.
@@ -473,7 +600,7 @@ impl Flux1 {
                     heavy.pid.as_ref(),
                     on_progress,
                     |x_in, _t, timestep, guidance| {
-                        transformer.forward_injected_memory(
+                        transformer.forward_injected_memory_windowed(
                             x_in,
                             &prompt_embeds,
                             &pooled_prompt_embeds,
@@ -483,11 +610,13 @@ impl Flux1 {
                             req.height,
                             injector,
                             attention,
+                            block_window,
                         )
                     },
                 )
             },
-        )
+        );
+        self.finish_streamed_generation(streamable, result)
     }
 
     /// Dual-branch real-CFG denoise — the seam PuLID-FLUX `true_cfg > 1.0` (sc-3075) uses. Each step
@@ -510,7 +639,9 @@ impl Flux1 {
         self.validate(req)?;
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
-        self.residency.run(
+        self.residency.run_request_scoped(
+            matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -1215,12 +1346,10 @@ mod tests {
         let res = build_residency(
             FluxVariant::Dev,
             &missing_snapshot_spec(OffloadPolicy::Sequential),
+            None,
         )
         .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
+        drop(res);
     }
 
     #[test]
@@ -1228,6 +1357,7 @@ mod tests {
         let err = build_residency(
             FluxVariant::Dev,
             &missing_snapshot_spec(OffloadPolicy::Resident),
+            None,
         )
         .err()
         .expect("Resident must eager-load and fail on a missing snapshot dir");
@@ -1236,5 +1366,94 @@ mod tests {
             !msg.contains("single .safetensors file") && !msg.contains("port plan"),
             "expected an eager-load failure, not the up-front guard: {msg}"
         );
+    }
+
+    fn exact_runtime_inventory() -> (
+        std::path::PathBuf,
+        LoadSpec,
+        crate::artifact_inventory::PackedArtifactInventory,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "flux-runtime-stream-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        for (index, component) in crate::artifact_inventory::COMPONENTS.iter().enumerate() {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.safetensors"), vec![index as u8; 64]).unwrap();
+            std::fs::write(dir.join("config.json"), "{}").unwrap();
+        }
+        std::fs::create_dir_all(root.join("tokenizer_2")).unwrap();
+        std::fs::write(root.join("tokenizer_2/tokenizer.json"), b"tokenizer-v1").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        let inventory =
+            crate::artifact_inventory::verified_stream_inventory(crate::FLUX1_DEV_ID, &spec)
+                .unwrap();
+        (root, spec, inventory)
+    }
+
+    #[test]
+    fn runtime_window_gate_is_exact_and_generation_boundary_rechecks_inventory() {
+        let (root, spec, inventory) = exact_runtime_inventory();
+        let mut model = Flux1::new_for_tests(FluxVariant::Dev);
+        model.memory_strategy = crate::memory_strategy::memory_strategy_contract_with_inventory(
+            crate::FLUX1_DEV_ID,
+            &spec,
+            Some(&inventory),
+        )
+        .unwrap();
+        model.loaded_spec = spec;
+        model.stream_inventory = Some(inventory);
+
+        let selected = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE),
+            transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+            ..Default::default()
+        };
+        let request = GenerationRequest {
+            prompt: "stream".into(),
+            memory: Some(selected),
+            ..Default::default()
+        };
+        assert_eq!(
+            model.requested_transformer_window(&request, None).unwrap(),
+            Some(1)
+        );
+
+        let mut wrong_stage = request.clone();
+        wrong_stage.memory.as_mut().unwrap().stage_residency = false;
+        assert!(model
+            .requested_transformer_window(&wrong_stage, None)
+            .is_err());
+        let mut wrong_window = request.clone();
+        wrong_window
+            .memory
+            .as_mut()
+            .unwrap()
+            .transformer_window_size = Some(2);
+        assert!(model
+            .requested_transformer_window(&wrong_window, None)
+            .is_err());
+        let mut wrong_component = request.clone();
+        wrong_component
+            .memory
+            .as_mut()
+            .unwrap()
+            .transformer_window_component = Some(gen_core::TransformerComponent::TextEncoder);
+        assert!(model
+            .requested_transformer_window(&wrong_component, None)
+            .is_err());
+        let mut pid = request.clone();
+        pid.use_pid = true;
+        assert!(model.requested_transformer_window(&pid, None).is_err());
+
+        std::fs::write(root.join("tokenizer_2/tokenizer.json"), b"tokenizer-v2").unwrap();
+        assert!(model.finish_streamed_generation(true, Ok(())).is_err());
+        std::fs::remove_dir_all(root).ok();
     }
 }

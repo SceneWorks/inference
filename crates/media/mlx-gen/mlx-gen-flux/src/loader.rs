@@ -61,6 +61,16 @@ pub fn load_transformer(root: &Path, variant: FluxVariant) -> Result<FluxTransfo
     FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
 }
 
+/// Load the FLUX.1 transformer from an already-admitted exact single-file source. Deferred block
+/// residency must never rediscover its transformer through a directory scan after inventory pinning.
+pub(crate) fn load_transformer_from_file(
+    path: &Path,
+    variant: FluxVariant,
+) -> Result<FluxTransformer> {
+    let w = Weights::from_file(path)?;
+    FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+}
+
 /// Load the FLUX.1-dev base transformer + the Shakker Fun-Controlnet-Union control branch and assemble
 /// the [`FluxControlTransformer`] (sc-8238). `root` is the FLUX.1-dev snapshot dir (the base
 /// `transformer/`); `control` is the Shakker `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint (a single
