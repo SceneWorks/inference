@@ -536,15 +536,11 @@ impl Pipeline {
                 }
                 let packed = transformer_packed_config(&dit_dir);
                 if let Some(packed) = packed {
-                    use candle_gen::candle_core::safetensors::MmapedSafetensors;
                     use candle_gen::quant::PackedWeightSidecars;
 
                     let files = self.component_files("transformer")?;
-                    // SAFETY: read-only mmap over immutable snapshot files. Sidecar preparation hashes
-                    // and converts only the uniform transformer block prefix before generation starts.
-                    let source = unsafe { MmapedSafetensors::multi(&files)? };
-                    let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
-                        &source,
+                    let prepared = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+                        &files,
                         &dit_dir,
                         packed,
                         &self.device,
@@ -554,7 +550,8 @@ impl Pipeline {
                     if cancel.is_cancelled() {
                         return Err(CandleError::Canceled);
                     }
-                    let sidecars = Arc::new(prepared?);
+                    let (source, sidecars) = prepared?;
+                    let sidecars = Arc::new(sidecars);
                     let vb =
                         VarBuilder::from_backend(Box::new(source), DIT_DTYPE, self.device.clone());
                     Ok(QwenTransformer::new_block_streamed_with_sidecars_gs(

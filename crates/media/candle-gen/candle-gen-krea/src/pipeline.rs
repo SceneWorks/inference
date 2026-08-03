@@ -184,16 +184,31 @@ impl ResidencyHeavy {
     }
 }
 
-pub(crate) fn load_residency_heavy(
+pub(crate) fn load_residency_heavy_for_request(
     root: &Path,
     device: &Device,
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
     use_pid: bool,
+    cancel: &gen_core::CancelFlag,
+) -> Result<ResidencyHeavy> {
+    load_residency_heavy_cancelable(root, device, adapters, pid_spec, use_pid, Some(cancel))
+}
+
+fn load_residency_heavy_cancelable(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    use_pid: bool,
+    cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<ResidencyHeavy> {
     Ok(ResidencyHeavy {
-        heavy: load_heavy(root, device, adapters, pid_spec, use_pid)?,
-        vae_encoder: load_vae_encoder(root, device)?,
+        heavy: load_heavy_cancelable(root, device, adapters, pid_spec, use_pid, cancel)?,
+        vae_encoder: {
+            check_optional_cancel(cancel)?;
+            load_vae_encoder(root, device)?
+        },
     })
 }
 
@@ -363,7 +378,7 @@ fn load_te_weights_cancelable(
     let dir = root.join("text_encoder");
     let open = |dtype| match cancel {
         Some(cancel) => Weights::from_dir_cancelable(&dir, device, dtype, cancel),
-        None => Weights::from_dir(&dir, device, dtype),
+        None => Weights::from_dir(&dir, device, dtype).map_err(candle_gen::CandleError::from),
     };
     let w = open(TE_STORE_DTYPE)?;
     if w.get_native("language_model.layers.0.input_layernorm.weight")?
@@ -378,6 +393,21 @@ fn load_te_weights_cancelable(
 
 pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
     load_text_cancelable(root, device, None)
+}
+
+pub(crate) fn load_text_for_request(
+    root: &Path,
+    device: &Device,
+    cancel: &gen_core::CancelFlag,
+) -> Result<KreaText> {
+    load_text_cancelable(root, device, Some(cancel))
+}
+
+fn check_optional_cancel(cancel: Option<&gen_core::CancelFlag>) -> Result<()> {
+    if let Some(cancel) = cancel {
+        candle_gen::check_cancel(cancel)?;
+    }
+    Ok(())
 }
 
 fn load_text_cancelable(
@@ -423,8 +453,21 @@ pub(crate) fn load_heavy(
     pid_spec: Option<&PidWeights>,
     use_pid: bool,
 ) -> Result<KreaHeavy> {
-    let dit = load_dit(root, device, adapters, false)?;
+    load_heavy_cancelable(root, device, adapters, pid_spec, use_pid, None)
+}
+
+fn load_heavy_cancelable(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    use_pid: bool,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> Result<KreaHeavy> {
+    let dit = load_dit_cancelable(root, device, adapters, false, cancel)?;
+    check_optional_cancel(cancel)?;
     let vae = load_vae(root, device)?;
+    check_optional_cancel(cancel)?;
 
     // The optional PiD super-resolving decoder (epic 7840 / sc-7853), loaded when the caller opted in via
     // `LoadSpec::pid` AND this load will actually use it (F-177 — see the `use_pid` doc above; under
@@ -434,23 +477,13 @@ pub(crate) fn load_heavy(
         Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
         None => None,
     };
+    check_optional_cancel(cancel)?;
 
     Ok(KreaHeavy {
         dit,
         vae: Arc::new(vae),
         pid,
     })
-}
-
-/// Load only the ordinary snapshot DiT. `stream_blocks` retains its host-backed safetensors and keeps
-/// just the front-end/head resident on the accelerator, materializing one trunk block per forward.
-fn load_dit(
-    root: &Path,
-    device: &Device,
-    adapters: &[AdapterSpec],
-    stream_blocks: bool,
-) -> Result<Krea2Transformer> {
-    load_dit_cancelable(root, device, adapters, stream_blocks, None)
 }
 
 fn load_dit_cancelable(

@@ -19,21 +19,21 @@
 //! [`QStorage::from_data`] copies it to the device before the mapping is dropped. First creation is
 //! deliberately projection-at-a-time, bounding the q8 dense conversion transient to one projection.
 //! A complete valid cache is opened read-only without creating or acquiring the preparation lock.
-//! After one full validation, a process-local memo keyed by canonical component/cache/config identity
-//! plus source and artifact metadata makes an unchanged reopen metadata/header-only: it hashes zero
-//! source and payload bytes. Any identity or open/header mismatch drops back to the full serialized
-//! validation and recovery path.
+//! After one full validation, path-owning preparation records a process-local memo keyed by canonical
+//! component/cache/config identity plus the exact source file generations it opened. Artifact file
+//! ID and change-time are checked around header validation, so an unchanged reopen hashes zero source
+//! and payload bytes while replacement or in-place mutation drops back to full digest validation and
+//! serialized recovery. Platforms without a mutation-resistant file stamp conservatively skip memoing.
 //! Missing or corrupt entries still take the exclusive-lock path so recovery and publication remain
 //! serialized. The external root can be supplied explicitly or through
 //! `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`; otherwise the platform's per-user cache directory is used.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::safetensors::MmapedSafetensors;
@@ -82,8 +82,29 @@ struct PreparedProjection {
 struct FileIdentity {
     path: PathBuf,
     len: u64,
-    modified_nanos: u128,
+    stamp: PlatformFileStamp,
 }
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PlatformFileStamp {
+    device: u64,
+    inode: u64,
+    change_seconds: i64,
+    change_nanos: i64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PlatformFileStamp {
+    volume: u64,
+    file_id: [u8; 16],
+    change_time: i64,
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PlatformFileStamp;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ValidationMemoKey {
@@ -107,12 +128,28 @@ fn validation_memo() -> &'static Mutex<HashMap<ValidationMemoKey, ValidationMemo
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_SOURCE_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_after_source_open_hook() {
+    AFTER_SOURCE_OPEN_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 /// Prepared device-format sidecars for every MLX-packed projection in one component.
 ///
 /// A cold construction performs all source hashing and any missing conversions; an unchanged
-/// process-local warm reopen uses the validated metadata memo. [`Self::load`] touches only the
-/// sidecar: it does not retain or consult the source `MmapedSafetensors`, which is the property a
-/// block-window loader needs in order to exclude format conversion from the per-window path.
+/// process-local warm reopen opened through a path-bound helper uses the validated file-generation
+/// memo. [`Self::load`] touches only the sidecar: it does not retain or consult the source
+/// `MmapedSafetensors`, which is the property a block-window loader needs in order to exclude format
+/// conversion from the per-window path.
 #[derive(Debug)]
 pub struct PackedWeightSidecars {
     entries: HashMap<String, SidecarEntry>,
@@ -134,7 +171,38 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
     ) -> Result<Self> {
-        Self::prepare_impl(source, component_dir, packed, device, None, None, None)
+        Self::prepare_impl(
+            source,
+            component_dir,
+            packed,
+            device,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Open the exact source paths and prepare their sidecars with mutation-resistant warm memoing.
+    ///
+    /// A bare [`MmapedSafetensors`] does not expose its backing files, so [`Self::prepare`] remains a
+    /// conservative full-validation helper. Callers that own paths should use this entry point: it
+    /// identity-sandwiches the mmap and preparation, and only then records a zero-hash warm memo.
+    pub fn open_and_prepare(
+        source_paths: &[PathBuf],
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+    ) -> Result<(MmapedSafetensors, Self)> {
+        Self::open_and_prepare_impl(
+            source_paths,
+            component_dir,
+            packed,
+            device,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Prepare packed projections with an explicit non-model cache root for read-only components.
@@ -158,6 +226,26 @@ impl PackedWeightSidecars {
             None,
             None,
             Some(external_cache_root),
+            None,
+        )
+    }
+
+    /// Path-bound counterpart of [`Self::prepare_with_external_cache_root`].
+    pub fn open_and_prepare_with_external_cache_root(
+        source_paths: &[PathBuf],
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        external_cache_root: &Path,
+    ) -> Result<(MmapedSafetensors, Self)> {
+        Self::open_and_prepare_impl(
+            source_paths,
+            component_dir,
+            packed,
+            device,
+            None,
+            None,
+            Some(external_cache_root),
         )
     }
 
@@ -172,6 +260,26 @@ impl PackedWeightSidecars {
     ) -> Result<Self> {
         Self::prepare_impl(
             source,
+            component_dir,
+            packed,
+            device,
+            Some(cancel),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Path-bound counterpart of [`Self::prepare_cancelable`].
+    pub fn open_and_prepare_cancelable(
+        source_paths: &[PathBuf],
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<(MmapedSafetensors, Self)> {
+        Self::open_and_prepare_impl(
+            source_paths,
             component_dir,
             packed,
             device,
@@ -207,9 +315,100 @@ impl PackedWeightSidecars {
             Some(cancel),
             Some(base_prefix),
             None,
+            None,
         )
     }
 
+    /// Path-bound counterpart of [`Self::prepare_prefix_cancelable`].
+    pub fn open_and_prepare_prefix_cancelable(
+        source_paths: &[PathBuf],
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: &CancelFlag,
+        base_prefix: &str,
+    ) -> Result<(MmapedSafetensors, Self)> {
+        if base_prefix.is_empty() {
+            return Err(Error::Msg(
+                "device-format sidecar: base prefix must not be empty".to_owned(),
+            ));
+        }
+        Self::open_and_prepare_impl(
+            source_paths,
+            component_dir,
+            packed,
+            device,
+            Some(cancel),
+            Some(base_prefix),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_and_prepare_impl(
+        source_paths: &[PathBuf],
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: Option<&CancelFlag>,
+        base_prefix: Option<&str>,
+        external_cache_root: Option<&Path>,
+    ) -> Result<(MmapedSafetensors, Self)> {
+        if source_paths.is_empty() {
+            return Err(Error::Msg(
+                "device-format sidecar: at least one source path is required".to_owned(),
+            ));
+        }
+        check_cancel(cancel)?;
+        let before = file_identities(source_paths)?;
+        // SAFETY: read-only mappings of the exact caller-supplied source files. The robust identity
+        // checks immediately before and after open detect replacement across this pathname seam.
+        let source = unsafe { MmapedSafetensors::multi(source_paths)? };
+        #[cfg(test)]
+        run_after_source_open_hook();
+        let after_open = file_identities(source_paths)?;
+        if before.is_some() && before != after_open {
+            return Err(Error::Msg(
+                "device-format sidecar: source files changed while opening their mappings"
+                    .to_owned(),
+            ));
+        }
+        let memo_sources = after_open.as_deref();
+        let cache = Self::prepare_impl(
+            &source,
+            component_dir,
+            packed,
+            device,
+            cancel,
+            base_prefix,
+            external_cache_root,
+            memo_sources,
+        )?;
+        let after_prepare = file_identities(source_paths)?;
+        if after_open.is_some() && after_open != after_prepare {
+            if let Some(sources) = memo_sources {
+                if let Ok(key) = validation_memo_key(
+                    component_dir,
+                    external_cache_root,
+                    usize::try_from(packed.bits).unwrap_or_default(),
+                    usize::try_from(packed.group_size).unwrap_or_default(),
+                    base_prefix,
+                    sources,
+                ) {
+                    validation_memo()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&key);
+                }
+            }
+            return Err(Error::Msg(
+                "device-format sidecar: source files changed during preparation".to_owned(),
+            ));
+        }
+        Ok((source, cache))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare_impl(
         source: &MmapedSafetensors,
         component_dir: &Path,
@@ -218,6 +417,7 @@ impl PackedWeightSidecars {
         cancel: Option<&CancelFlag>,
         base_prefix: Option<&str>,
         external_cache_root: Option<&Path>,
+        memo_sources: Option<&[FileIdentity]>,
     ) -> Result<Self> {
         check_cancel(cancel)?;
         let bits = usize::try_from(packed.bits).map_err(|_| {
@@ -239,15 +439,22 @@ impl PackedWeightSidecars {
             )));
         }
 
-        let memo_key = validation_memo_key(
-            component_dir,
-            external_cache_root,
-            bits,
-            group_size,
-            base_prefix,
-        )?;
-        if let Some(value) = validation_memo_hit(&memo_key, cancel)? {
-            return Ok(reused_cache(value.projections, value.cache_dir, 0, 0));
+        let memo_key = memo_sources
+            .map(|sources| {
+                validation_memo_key(
+                    component_dir,
+                    external_cache_root,
+                    bits,
+                    group_size,
+                    base_prefix,
+                    sources,
+                )
+            })
+            .transpose()?;
+        if let Some(key) = memo_key.as_ref() {
+            if let Some(value) = validation_memo_hit(key, cancel)? {
+                return Ok(reused_cache(value.projections, value.cache_dir, 0, 0));
+            }
         }
 
         let projections =
@@ -273,7 +480,9 @@ impl PackedWeightSidecars {
                 source_bytes_hashed,
                 payload_bytes_hashed,
             );
-            remember_validation(&memo_key, &cache)?;
+            if let Some(key) = memo_key.as_ref() {
+                remember_validation(key, &cache)?;
+            }
             return Ok(cache);
         }
 
@@ -290,7 +499,9 @@ impl PackedWeightSidecars {
                 source_bytes_hashed,
                 payload_bytes_hashed,
             );
-            remember_validation(&memo_key, &cache)?;
+            if let Some(key) = memo_key.as_ref() {
+                remember_validation(key, &cache)?;
+            }
             return Ok(cache);
         }
 
@@ -413,7 +624,9 @@ impl PackedWeightSidecars {
             payload_bytes_hashed,
             sidecar_bytes,
         };
-        remember_validation(&memo_key, &cache)?;
+        if let Some(key) = memo_key.as_ref() {
+            remember_validation(key, &cache)?;
+        }
         Ok(cache)
     }
 
@@ -730,18 +943,99 @@ fn default_external_cache_root() -> PathBuf {
     std::env::temp_dir().join("sceneworks-candle-cache")
 }
 
-fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
-    let metadata = fs::metadata(path)?;
-    let modified_nanos = metadata
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    Ok(FileIdentity {
-        path: fs::canonicalize(path)?,
+fn file_identity(path: &Path) -> std::io::Result<Option<FileIdentity>> {
+    let path = fs::canonicalize(path)?;
+    let file = File::open(&path)?;
+    let metadata = file.metadata()?;
+    let Some(stamp) = platform_file_stamp(&file, &metadata)? else {
+        return Ok(None);
+    };
+    Ok(Some(FileIdentity {
+        path,
         len: metadata.len(),
-        modified_nanos,
-    })
+        stamp,
+    }))
+}
+
+fn file_identities(paths: &[PathBuf]) -> Result<Option<Vec<FileIdentity>>> {
+    let mut identities = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(identity) = file_identity(path)? else {
+            return Ok(None);
+        };
+        identities.push(identity);
+    }
+    Ok(Some(identities))
+}
+
+#[cfg(unix)]
+fn platform_file_stamp(
+    _file: &File,
+    metadata: &fs::Metadata,
+) -> std::io::Result<Option<PlatformFileStamp>> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(Some(PlatformFileStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        change_seconds: metadata.ctime(),
+        change_nanos: metadata.ctime_nsec(),
+    }))
+}
+
+#[cfg(windows)]
+fn platform_file_stamp(
+    file: &File,
+    _metadata: &fs::Metadata,
+) -> std::io::Result<Option<PlatformFileStamp>> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
+    };
+
+    let handle = file.as_raw_handle();
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle and both buffers have the exact Win32 structure sizes.
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if basic_ok == 0 {
+        return Ok(None);
+    }
+    let mut id = MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: same handle and exact output-buffer contract as above.
+    let id_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            id.as_mut_ptr().cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if id_ok == 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful calls initialized their complete output structures.
+    let (basic, id) = unsafe { (basic.assume_init(), id.assume_init()) };
+    Ok(Some(PlatformFileStamp {
+        volume: id.VolumeSerialNumber,
+        file_id: id.FileId.Identifier,
+        change_time: basic.ChangeTime,
+    }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_file_stamp(
+    _file: &File,
+    _metadata: &fs::Metadata,
+) -> std::io::Result<Option<PlatformFileStamp>> {
+    Ok(None)
 }
 
 fn validation_memo_key(
@@ -750,6 +1044,7 @@ fn validation_memo_key(
     bits: usize,
     group_size: usize,
     base_prefix: Option<&str>,
+    sources: &[FileIdentity],
 ) -> Result<ValidationMemoKey> {
     let component_dir = fs::canonicalize(component_dir).map_err(|error| {
         Error::Msg(format!(
@@ -757,24 +1052,6 @@ fn validation_memo_key(
             component_dir.display()
         ))
     })?;
-    let mut source_paths = Vec::new();
-    for entry in fs::read_dir(&component_dir)? {
-        let path = entry?.path();
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if !file_name.starts_with("._")
-            && path.extension().and_then(|ext| ext.to_str()) == Some("safetensors")
-        {
-            source_paths.push(path);
-        }
-    }
-    source_paths.sort();
-    let sources = source_paths
-        .iter()
-        .map(|path| file_identity(path))
-        .collect::<std::io::Result<Vec<_>>>()?;
     let cache_identity = external_cache_root
         .map(Path::to_path_buf)
         .unwrap_or_else(default_external_cache_root);
@@ -785,7 +1062,7 @@ fn validation_memo_key(
         bits,
         group_size,
         base_prefix: base_prefix.map(str::to_owned),
-        sources,
+        sources: sources.to_vec(),
     })
 }
 
@@ -806,16 +1083,32 @@ fn validation_memo_hit(
         .artifacts
         .iter()
         .map(|identity| file_identity(&identity.path))
-        .collect::<std::io::Result<Vec<_>>>();
-    let headers_valid = current_artifacts.as_ref().is_ok_and(|current| {
-        current == &value.artifacts
-            && value.projections.iter().all(|projection| {
+        .collect::<std::io::Result<Vec<_>>>()
+        .ok()
+        .and_then(|identities| identities.into_iter().collect::<Option<Vec<_>>>());
+    let headers_valid = current_artifacts.as_ref().is_some_and(|current| {
+        if current != &value.artifacts
+            || !value.projections.iter().all(|projection| {
                 let path = value.cache_dir.join(format!(
                     "{}.{}.safetensors",
                     projection.source_hex, projection.dtype_name
                 ));
                 validate_sidecar_header(&path, projection.payload_bytes)
             })
+        {
+            return false;
+        }
+        // Bind the header opens to the same artifact generations whose identities matched above.
+        // A replacement racing between the first identity read and a pathname-based mmap changes
+        // file-id/change-time and forces the serialized digest/recovery path.
+        value
+            .artifacts
+            .iter()
+            .map(|identity| file_identity(&identity.path))
+            .collect::<std::io::Result<Vec<_>>>()
+            .ok()
+            .and_then(|identities| identities.into_iter().collect::<Option<Vec<_>>>())
+            .is_some_and(|after_headers| after_headers == *current)
     });
     check_cancel(cancel)?;
     if headers_valid {
@@ -830,11 +1123,13 @@ fn validation_memo_hit(
 }
 
 fn remember_validation(key: &ValidationMemoKey, cache: &PackedWeightSidecars) -> Result<()> {
-    let mut artifacts = cache
-        .entries
-        .values()
-        .map(|entry| file_identity(&entry.path))
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut artifacts = Vec::with_capacity(cache.entries.len());
+    for entry in cache.entries.values() {
+        let Some(identity) = file_identity(&entry.path)? else {
+            return Ok(());
+        };
+        artifacts.push(identity);
+    }
     artifacts.sort_by(|a, b| a.path.cmp(&b.path));
     validation_memo()
         .lock()
@@ -1036,8 +1331,45 @@ fn hash_source_bytes(hash: &mut Sha256, bytes: &[u8], cancel: Option<&CancelFlag
     for chunk in bytes.chunks(HASH_CANCEL_CHUNK_BYTES) {
         check_cancel(cancel)?;
         hash.update(chunk);
+        #[cfg(any(test, feature = "testkit"))]
+        source_cancel_test_hook(cancel);
+        check_cancel(cancel)?;
     }
     Ok(())
+}
+
+#[cfg(any(test, feature = "testkit"))]
+std::thread_local! {
+    static CANCEL_SOURCE_AFTER_CHUNKS: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Arm a deterministic same-thread cancellation point in the bounded source-hash loop.
+///
+/// Testkit-only: provider seam tests use this to prove their exact request route passes the live
+/// cancellation flag into sidecar preparation rather than relying on scheduler timing.
+#[cfg(any(test, feature = "testkit"))]
+pub fn cancel_source_hash_after_chunks(chunks: usize) {
+    assert!(
+        chunks > 0,
+        "source-hash cancellation needs a positive chunk count"
+    );
+    CANCEL_SOURCE_AFTER_CHUNKS.with(|remaining| remaining.set(Some(chunks)));
+}
+
+#[cfg(any(test, feature = "testkit"))]
+fn source_cancel_test_hook(cancel: Option<&CancelFlag>) {
+    if let Some(cancel) = cancel {
+        CANCEL_SOURCE_AFTER_CHUNKS.with(|remaining| match remaining.get() {
+            Some(1) => {
+                remaining.set(None);
+                cancel.cancel();
+            }
+            Some(chunks) => remaining.set(Some(chunks - 1)),
+            None => {}
+        });
+    }
 }
 
 fn payload_len(dtype: GgmlDType, out_dim: usize, in_dim: usize) -> Result<usize> {
@@ -1321,6 +1653,7 @@ mod tests {
     use crate::quant::{pack_mlx_affine, repack_packed_weight};
     use candle_core::safetensors;
     use candle_core::{IndexOp, Tensor};
+    use std::io::{Seek, SeekFrom, Write};
 
     struct TestDir(PathBuf);
 
@@ -1378,6 +1711,60 @@ mod tests {
     fn open(path: &Path) -> Result<MmapedSafetensors> {
         // SAFETY: immutable test fixture for the lifetime of the mapping.
         unsafe { MmapedSafetensors::new(path) }
+    }
+
+    fn open_and_prepare_path(
+        path: &Path,
+        component_dir: &Path,
+        packed: PackedConfig,
+    ) -> Result<(MmapedSafetensors, PackedWeightSidecars)> {
+        PackedWeightSidecars::open_and_prepare(
+            &[path.to_path_buf()],
+            component_dir,
+            packed,
+            &Device::Cpu,
+        )
+    }
+
+    fn restore_modified(path: &Path, modified: std::time::SystemTime) -> std::io::Result<()> {
+        File::options()
+            .write(true)
+            .open(path)?
+            .set_times(fs::FileTimes::new().set_modified(modified))
+    }
+
+    #[cfg(unix)]
+    fn replace_file(replacement: &Path, target: &Path) -> std::io::Result<()> {
+        fs::rename(replacement, target)
+    }
+
+    #[cfg(windows)]
+    fn replace_file(replacement: &Path, target: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+        let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        let replacement: Vec<u16> = replacement
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: both paths are valid nul-terminated UTF-16 buffers for the duration of the call.
+        let replaced = unsafe {
+            ReplaceFileW(
+                target.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if replaced == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1468,6 +1855,7 @@ mod tests {
                 None,
                 None,
                 Some(&external.0),
+                None,
             )?;
             assert_eq!(first.created_count(), 2, "fixture must be non-vacuous");
             assert!(first.contains("layers.0.proj"));
@@ -1495,6 +1883,7 @@ mod tests {
                 Some(&cancel),
                 None,
                 Some(&external.0),
+                None,
             )
             .unwrap_err();
             CANCEL_VALIDATION_AFTER_CHUNKS.with(|remaining| remaining.set(None));
@@ -1581,22 +1970,21 @@ mod tests {
         let component = TestDir::new("external-warm-component");
         let external = TestDir::new("external-warm-root");
         let source_path = write_source(&component.0, 4, 0.0)?;
-        let source = open(&source_path)?;
         fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let first = PackedWeightSidecars::prepare_with_external_cache_root(
-            &source,
+        let (_, first) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
+            std::slice::from_ref(&source_path),
             &component.0,
             packed,
             &Device::Cpu,
             &external.0,
         )?;
         assert!(first.cache_dir().starts_with(&external.0));
-        let warm = PackedWeightSidecars::prepare_with_external_cache_root(
-            &source,
+        let (_, warm) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
+            std::slice::from_ref(&source_path),
             &component.0,
             packed,
             &Device::Cpu,
@@ -1644,13 +2032,12 @@ mod tests {
     fn assert_q4_or_q8(bits: usize) -> Result<()> {
         let dir = TestDir::new(if bits == 4 { "q4" } else { "q8" });
         let source_path = write_source(&dir.0, bits, 0.0)?;
-        let source = open(&source_path)?;
         let packed = PackedConfig {
             bits: bits as i32,
             group_size: 64,
         };
 
-        let cache = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let (source, cache) = open_and_prepare_path(&source_path, &dir.0, packed)?;
         assert_eq!(cache.created_count(), 1);
         assert_eq!(cache.reused_count(), 0);
         assert!(cache.source_bytes_hashed() > 0);
@@ -1677,7 +2064,7 @@ mod tests {
 
         // A second preparation reuses the atomically-published artifact. Repeated materializations
         // below accept no source tensors and therefore cannot regress to per-window conversion.
-        let reused = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let (_, reused) = open_and_prepare_path(&source_path, &dir.0, packed)?;
         assert_eq!(reused.created_count(), 0);
         assert_eq!(reused.reused_count(), 1);
         assert_eq!(reused.source_bytes_hashed(), 0);
@@ -1800,44 +2187,151 @@ mod tests {
     }
 
     #[test]
-    fn same_source_path_metadata_change_invalidates_the_process_memo() -> Result<()> {
+    fn legacy_mmap_with_a_different_component_dir_cannot_seed_a_false_memo_hit() -> Result<()> {
+        let a = TestDir::new("mismatched-source-a");
+        let b = TestDir::new("mismatched-source-b");
+        let a_path = write_source(&a.0, 4, 0.0)?;
+        let b_path = write_source(&b.0, 4, 0.5)?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let a_source = open(&a_path)?;
+        let mismatched = PackedWeightSidecars::prepare(&a_source, &b.0, packed, &Device::Cpu)?;
+        let mismatched_path = mismatched.path_for("layers.0.proj").unwrap().to_path_buf();
+
+        let (_, normal_b) = open_and_prepare_path(&b_path, &b.0, packed)?;
+        assert!(normal_b.source_bytes_hashed() > 0);
+        assert_ne!(
+            normal_b.path_for("layers.0.proj").unwrap(),
+            mismatched_path,
+            "a bare mmap must never be memoized under an unrelated component directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_between_source_open_and_identity_check_is_rejected() -> Result<()> {
+        let dir = TestDir::new("replace-during-open");
+        let replacement_dir = TestDir::new("replace-during-open-new");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let replacement_source = write_source(&replacement_dir.0, 4, 0.75)?;
+        let replacement = dir.0.join("replacement.safetensors");
+        fs::copy(replacement_source, &replacement)?;
+        let target = source_path.clone();
+        AFTER_SOURCE_OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                replace_file(&replacement, &target).unwrap();
+            }));
+        });
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let error = match open_and_prepare_path(&source_path, &dir.0, packed) {
+            Ok(_) => panic!("source replacement during mmap open must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("changed while opening"));
+
+        let (_, reopened) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        assert!(reopened.source_bytes_hashed() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn same_size_same_mtime_atomic_artifact_replacement_invalidates_the_memo() -> Result<()> {
+        let dir = TestDir::new("artifact-replacement-identity");
+        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
+        let metadata = fs::metadata(&artifact)?;
+        let modified = metadata.modified()?;
+        let mut bytes = fs::read(&artifact)?;
+        *bytes.last_mut().unwrap() ^= 0x5a;
+        let replacement = artifact.with_extension("replacement");
+        fs::write(&replacement, &bytes)?;
+        restore_modified(&replacement, modified)?;
+        replace_file(&replacement, &artifact)?;
+        let replaced = fs::metadata(&artifact)?;
+        assert_eq!(replaced.len(), metadata.len());
+        assert_eq!(replaced.modified()?, modified);
+
+        let (_, rebuilt) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        assert_eq!(rebuilt.created_count(), 1);
+        assert!(rebuilt.source_bytes_hashed() > 0);
+        assert!(rebuilt.payload_bytes_hashed() > 0);
+        rebuilt.load("layers.0.proj", &Device::Cpu)?;
+        Ok(())
+    }
+
+    #[test]
+    fn same_size_same_mtime_in_place_artifact_corruption_invalidates_the_memo() -> Result<()> {
+        let dir = TestDir::new("artifact-in-place-identity");
+        let source_path = write_source(&dir.0, 8, 0.0)?;
+        let packed = PackedConfig {
+            bits: 8,
+            group_size: 64,
+        };
+        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
+        let metadata = fs::metadata(&artifact)?;
+        let modified = metadata.modified()?;
+        let mut file = File::options().read(true).write(true).open(&artifact)?;
+        file.seek(SeekFrom::End(-1))?;
+        let last = fs::read(&artifact)?.last().copied().unwrap() ^ 0xa5;
+        file.write_all(&[last])?;
+        file.sync_all()?;
+        drop(file);
+        restore_modified(&artifact, modified)?;
+        let corrupted = fs::metadata(&artifact)?;
+        assert_eq!(corrupted.len(), metadata.len());
+        assert_eq!(corrupted.modified()?, modified);
+
+        let (_, rebuilt) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        assert_eq!(rebuilt.created_count(), 1);
+        assert!(rebuilt.source_bytes_hashed() > 0);
+        assert!(rebuilt.payload_bytes_hashed() > 0);
+        rebuilt.load("layers.0.proj", &Device::Cpu)?;
+        Ok(())
+    }
+
+    #[test]
+    fn same_source_path_generation_change_invalidates_the_process_memo() -> Result<()> {
         let dir = TestDir::new("same-path-source-change");
         let source_path = write_source(&dir.0, 4, 0.0)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let first_path = {
-            let source = open(&source_path)?;
-            PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?
-                .path_for("layers.0.proj")
-                .unwrap()
-                .to_path_buf()
-        };
+        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let first_path = first.path_for("layers.0.proj").unwrap().to_path_buf();
         std::thread::sleep(std::time::Duration::from_millis(20));
         write_source(&dir.0, 4, 0.25)?;
-        let source = open(&source_path)?;
-        let changed = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let (_, changed) = open_and_prepare_path(&source_path, &dir.0, packed)?;
         assert!(changed.source_bytes_hashed() > 0);
         assert_ne!(changed.path_for("layers.0.proj").unwrap(), first_path);
         Ok(())
     }
 
     #[test]
-    fn artifact_metadata_change_forces_full_validation_before_reuse() -> Result<()> {
+    fn artifact_generation_change_forces_full_validation_before_reuse() -> Result<()> {
         let dir = TestDir::new("artifact-metadata-change");
         let source_path = write_source(&dir.0, 4, 0.0)?;
-        let source = open(&source_path)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let first = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
         let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
         let bytes = fs::read(&artifact)?;
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&artifact, bytes)?;
-        let reopened = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let (_, reopened) = open_and_prepare_path(&source_path, &dir.0, packed)?;
         assert_eq!(reopened.created_count(), 0);
         assert_eq!(reopened.reused_count(), 1);
         assert!(reopened.source_bytes_hashed() > 0);

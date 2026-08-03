@@ -187,14 +187,10 @@ fn load_transformer(
         if stream_transformer_blocks {
             let files = candle_gen::sorted_safetensors(&dit_dir, "qwen edit")?;
             if let Some(packed) = crate::transformer_packed_config(&dit_dir) {
-                use candle_gen::candle_core::safetensors::MmapedSafetensors;
                 use candle_gen::quant::PackedWeightSidecars;
 
-                // SAFETY: read-only mmap over immutable snapshot files. Sidecar preparation converts
-                // only packed block weights and checks the request cancellation flag throughout.
-                let source = unsafe { MmapedSafetensors::multi(&files)? };
-                let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
-                    &source,
+                let prepared = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+                    &files,
                     &dit_dir,
                     packed,
                     device,
@@ -204,7 +200,8 @@ fn load_transformer(
                 if cancel.is_cancelled() {
                     return Err(CandleError::Canceled);
                 }
-                let sidecars = Arc::new(prepared?);
+                let (source, sidecars) = prepared?;
+                let sidecars = Arc::new(sidecars);
                 let vb = VarBuilder::from_backend(Box::new(source), dtype, device.clone());
                 return Ok(QwenTransformer::new_block_streamed_with_sidecars_gs(
                     &cfg, vb, gs, sidecars,

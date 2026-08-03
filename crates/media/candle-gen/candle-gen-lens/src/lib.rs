@@ -237,11 +237,8 @@ impl Pipeline {
             return Ok(None);
         };
         let files = self.component_files(sub)?;
-        // SAFETY: immutable model shards owned by the process for the duration of preparation. The
-        // sidecar object retains only content-addressed artifact paths, never borrowed source views.
-        let source = unsafe { MmapedSafetensors::multi(&files)? };
-        let prepared = candle_gen::quant::PackedWeightSidecars::prepare_cancelable(
-            &source,
+        let prepared = candle_gen::quant::PackedWeightSidecars::open_and_prepare_cancelable(
+            &files,
             &self.root.join(sub),
             packed,
             &self.device,
@@ -250,7 +247,8 @@ impl Pipeline {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        Ok(Some(Arc::new(prepared?)))
+        let (_, sidecars) = prepared?;
+        Ok(Some(Arc::new(sidecars)))
     }
 
     fn load_components(&self) -> CResult<Components> {

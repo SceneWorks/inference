@@ -1150,7 +1150,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // `root/transformer` unconditionally — the wrong DiT for a ConvRot request — which is why ConvRot
     // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
-    let residency = candle_gen::Residency::request_scoped_with_resident(
+    let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
             let components = match resident_convrot.as_ref() {
                 Some(convrot_dit) => pipeline::load_components_convrot(
@@ -1176,26 +1176,33 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                 })),
             ))
         },
-        move |_| {
-            Ok(KreaTextPhase::Sequential(Box::new(pipeline::load_text(
-                &text_root,
-                &text_device,
-            )?)))
+        move |_, cancel| {
+            Ok(KreaTextPhase::Sequential(Box::new(
+                pipeline::load_text_for_request(&text_root, &text_device, cancel)?,
+            )))
         },
-        move |use_pid, _| {
+        move |use_pid, _, cancel| {
             let heavy = match heavy_convrot.as_ref() {
                 // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
                 // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
                 // this loads into that freed pool — the whole point of going sequential here.
                 Some(convrot_dit) => {
-                    pipeline::load_residency_heavy_convrot(&heavy_root, convrot_dit, &heavy_device)?
+                    candle_gen::check_cancel(cancel)?;
+                    let heavy = pipeline::load_residency_heavy_convrot(
+                        &heavy_root,
+                        convrot_dit,
+                        &heavy_device,
+                    )?;
+                    candle_gen::check_cancel(cancel)?;
+                    heavy
                 }
-                None => pipeline::load_residency_heavy(
+                None => pipeline::load_residency_heavy_for_request(
                     &heavy_root,
                     &heavy_device,
                     &heavy_adapters,
                     heavy_pid.as_ref(),
                     use_pid,
+                    cancel,
                 )?,
             };
             Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
@@ -3174,6 +3181,111 @@ mod tests {
             "{}: expected Canceled, got {err:?} — the text-phase load must follow the cancel check",
             KREA_2_EDIT_ID
         );
+    }
+
+    #[test]
+    fn stage_only_requests_cancel_inside_cold_source_hash_for_every_krea_descriptor() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        use std::collections::HashMap;
+
+        let component = std::env::temp_dir().join(format!(
+            "sceneworks-krea-stage-cancel-{}",
+            std::process::id()
+        ));
+        if component.exists() {
+            std::fs::remove_dir_all(&component).unwrap();
+        }
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        // The packed code tensor alone is exactly one 4 MiB cancellation chunk. Scales and biases
+        // make the fixture a valid group-64 affine triple without ever reaching repack/build.
+        let out_dim = 131_072usize;
+        let tensors = HashMap::from([
+            (
+                "layers.0.proj.weight".to_owned(),
+                Tensor::zeros((out_dim, 8), DType::U32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "layers.0.proj.scales".to_owned(),
+                Tensor::zeros((out_dim, 1), DType::F32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "layers.0.proj.biases".to_owned(),
+                Tensor::zeros((out_dim, 1), DType::F32, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, component.join("model.safetensors"))
+            .unwrap();
+
+        for descriptor in [descriptor(), raw_descriptor(), edit_descriptor()] {
+            let text_component = component.clone();
+            let has_memory_contract = descriptor.id == KREA_2_TURBO_ID;
+            let generator = KreaGenerator {
+                descriptor: descriptor.clone(),
+                device: Device::Cpu,
+                loaded_quant: None,
+                memory_contract: has_memory_contract
+                    .then(|| krea_turbo_memory_strategy_contract().clone()),
+                residency: candle_gen::Residency::request_scoped_with_resident_cancelable(
+                    |_| {
+                        Err(candle_gen::CandleError::Msg(
+                            "warm loader must not run for a stage-only request".into(),
+                        ))
+                    },
+                    move |_, cancel| {
+                        let _ = crate::loader::Weights::from_dir_cancelable(
+                            &text_component,
+                            &Device::Cpu,
+                            DType::BF16,
+                            cancel,
+                        )?;
+                        Err(candle_gen::CandleError::Msg(
+                            "cold source hash unexpectedly completed".into(),
+                        ))
+                    },
+                    |_, _, _| {
+                        Err(candle_gen::CandleError::Msg(
+                            "heavy loader must not run after text cancellation".into(),
+                        ))
+                    },
+                ),
+                root: "/snap".into(),
+                adapters: Vec::new(),
+                has_diff_patch: false,
+            };
+            let cancel = gen_core::CancelFlag::new();
+            let request = GenerationRequest {
+                prompt: "cancel during cold packed hashing".into(),
+                conditioning: (descriptor.id == KREA_2_EDIT_ID)
+                    .then(|| Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                memory: Some(gen_core::GenerationMemory {
+                    stage_residency: true,
+                    ..Default::default()
+                }),
+                cancel: cancel.clone(),
+                ..Default::default()
+            };
+            candle_gen::quant::sidecar::cancel_source_hash_after_chunks(1);
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .expect_err("stage-only cold hashing must observe cancellation");
+            assert!(
+                matches!(error, gen_core::Error::Canceled),
+                "{} returned {error:?}",
+                descriptor.id
+            );
+            assert!(cancel.is_cancelled());
+        }
+        std::fs::remove_dir_all(component).unwrap();
     }
 
     #[test]

@@ -516,15 +516,11 @@ impl Pipeline {
         let packed = self.component_packed_config("transformer")?;
         let (vb, sidecars) = if stream_transformer_blocks {
             if let Some(packed) = packed {
-                use candle_gen::candle_core::safetensors::MmapedSafetensors;
                 use candle_gen::quant::PackedWeightSidecars;
 
                 let files = self.component_files("transformer")?;
-                // SAFETY: read-only mmap of the immutable component files. The same mapping backs
-                // the resident tensors and hashes the packed `layers.N` sources during preparation.
-                let source = unsafe { MmapedSafetensors::multi(&files)? };
-                let prepared = PackedWeightSidecars::prepare_prefix_cancelable(
-                    &source,
+                let prepared = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+                    &files,
                     &self.root.join("transformer"),
                     packed,
                     &self.device,
@@ -537,7 +533,7 @@ impl Pipeline {
                 if cancel.is_cancelled() {
                     return Err(CandleError::Canceled);
                 }
-                let sidecars = prepared?;
+                let (source, sidecars) = prepared?;
                 let vb =
                     VarBuilder::from_backend(Box::new(source), self.dtype, self.device.clone());
                 (vb, Some(Arc::new(sidecars)))
