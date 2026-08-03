@@ -256,6 +256,9 @@ jobs:
                   "encoder.block.1.layer.1.DenseReluDense.wi_0",
                   "encoder.block.1.layer.1.DenseReluDense.wi_1",
                   "encoder.block.1.layer.1.DenseReluDense.wo",
+                  "encoder.block.2.layer.1.DenseReluDense.wi_0",
+                  "encoder.block.2.layer.1.DenseReluDense.wi_1",
+                  "encoder.block.2.layer.1.DenseReluDense.wo",
               ],
           }
           for key, value in expected_t5_policy.items():
@@ -464,6 +467,9 @@ jobs:
                   "encoder.block.1.layer.1.DenseReluDense.wi_0",
                   "encoder.block.1.layer.1.DenseReluDense.wi_1",
                   "encoder.block.1.layer.1.DenseReluDense.wo",
+                  "encoder.block.2.layer.1.DenseReluDense.wi_0",
+                  "encoder.block.2.layer.1.DenseReluDense.wi_1",
+                  "encoder.block.2.layer.1.DenseReluDense.wo",
               ],
           }
           for key, value in expected_t5_policy.items():

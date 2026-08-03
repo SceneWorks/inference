@@ -11,9 +11,9 @@
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
 //! * T5 progressively packs every group-quantizable 2-D weight as a primary Q8 term plus a packed
 //!   reconstruction residual. Most attention/FFN projections use Q4 residuals; the shared token
-//!   embedding, relative-position bias, calibrated block-4 attention, and block-1 feed-forward
-//!   projections use small Q8 residuals. RMSNorm scales remain dense because affine quantization
-//!   does not target vectors.
+//!   embedding, relative-position bias, calibrated block-4 attention, and block-1/block-2
+//!   feed-forward projections use small Q8 residuals. RMSNorm scales remain dense because affine
+//!   quantization does not target vectors.
 //! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
@@ -53,8 +53,8 @@ pub const T5_RESIDUAL_BITS: i32 = 4;
 pub const T5_SENSITIVE_RESIDUAL_BITS: i32 = 8;
 /// The attention block selected by the hosted all-block sensitivity sweep.
 pub const T5_SENSITIVE_RESIDUAL_BLOCK: usize = 4;
-/// The feed-forward block selected as the next smallest packed correction by the same sweep.
-pub const T5_SENSITIVE_RESIDUAL_FFN_BLOCK: usize = 1;
+/// Feed-forward blocks selected in sensitivity rank order as the next packed corrections.
+pub const T5_SENSITIVE_RESIDUAL_FFN_BLOCKS: &[usize] = &[1, 2];
 /// Exact packed bases whose small Q8 residuals protect the T5 boundaries and calibrated sublayers
 /// while keeping every source weight packed.
 pub const T5_SENSITIVE_RESIDUAL_BASES: &[&str] = &[
@@ -67,6 +67,9 @@ pub const T5_SENSITIVE_RESIDUAL_BASES: &[&str] = &[
     "encoder.block.1.layer.1.DenseReluDense.wi_0",
     "encoder.block.1.layer.1.DenseReluDense.wi_1",
     "encoder.block.1.layer.1.DenseReluDense.wo",
+    "encoder.block.2.layer.1.DenseReluDense.wi_0",
+    "encoder.block.2.layer.1.DenseReluDense.wi_1",
+    "encoder.block.2.layer.1.DenseReluDense.wo",
 ];
 
 pub fn t5_residual_bits_for(base: &str) -> i32 {
@@ -519,6 +522,7 @@ mod tests {
             "shared",
             "encoder.block.4.layer.0.SelfAttention.q",
             "encoder.block.1.layer.1.DenseReluDense.wi_0",
+            "encoder.block.2.layer.1.DenseReluDense.wi_0",
         ] {
             map.insert(format!("{base}.weight"), weight.clone());
         }
@@ -535,6 +539,7 @@ mod tests {
             "shared",
             "encoder.block.4.layer.0.SelfAttention.q",
             "encoder.block.1.layer.1.DenseReluDense.wi_0",
+            "encoder.block.2.layer.1.DenseReluDense.wi_0",
         ] {
             let wbf16 = weight.as_dtype(Dtype::Bfloat16).unwrap();
             let (primary_weight, primary_scales, primary_biases) =
@@ -575,14 +580,15 @@ mod tests {
                 T5_SENSITIVE_RESIDUAL_BITS
             );
         }
-        for projection in ["wi_0", "wi_1", "wo"] {
-            assert_eq!(
-                t5_residual_bits_for(&format!(
-                    "encoder.block.{}.layer.1.DenseReluDense.{projection}",
-                    T5_SENSITIVE_RESIDUAL_FFN_BLOCK
-                )),
-                T5_SENSITIVE_RESIDUAL_BITS
-            );
+        for &block in T5_SENSITIVE_RESIDUAL_FFN_BLOCKS {
+            for projection in ["wi_0", "wi_1", "wo"] {
+                assert_eq!(
+                    t5_residual_bits_for(&format!(
+                        "encoder.block.{block}.layer.1.DenseReluDense.{projection}"
+                    )),
+                    T5_SENSITIVE_RESIDUAL_BITS
+                );
+            }
         }
         assert_eq!(
             t5_residual_bits_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
