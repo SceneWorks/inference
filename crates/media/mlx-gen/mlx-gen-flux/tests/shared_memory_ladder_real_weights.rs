@@ -4,15 +4,17 @@
 //! Run the Resident arm first so later arms can compare against its persisted RGB output:
 //!
 //! ```text
+//! FLUX1_LADDER_ROOT=/path/to/snapshots/323fd12d79f78ad444e882e8d8e871914584f2b9/q4 \
 //! FLUX1_LADDER_ARM=resident cargo test -p mlx-gen-flux --release \
 //!   --test shared_memory_ladder_real_weights -- --ignored --nocapture --test-threads=1
+//! FLUX1_LADDER_ROOT=/path/to/snapshots/323fd12d79f78ad444e882e8d8e871914584f2b9/q4 \
 //! FLUX1_LADDER_ARM=rung4 cargo test -p mlx-gen-flux --release \
 //!   --test shared_memory_ladder_real_weights -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Arms: `resident`, `staged`, `tile768`, `tile640`, `tile512`, `attention`, `rung4`,
-//! `cancel`, and `fault`. `FLUX1_LADDER_ROOT` may name either the exact Hugging Face revision root
-//! or its `q4` child; both resolve to and bind `snapshots/<revision>/q4`. Outputs go to
+//! `cancel`, and `fault`. `FLUX1_LADDER_ROOT` is required and may name either the exact revision
+//! root or its `q4` child; both resolve to and bind `snapshots/<revision>/q4`. Outputs go to
 //! `FLUX1_LADDER_OUTPUT_DIR` or a deterministic temporary directory.
 //!
 //! The provider currently has no integration-test-visible runtime window-event counter. The runner
@@ -95,21 +97,6 @@ impl Arm {
     }
 }
 
-fn default_snapshot() -> PathBuf {
-    let huggingface = std::env::var_os("HF_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache/huggingface"))
-        })
-        .expect("set FLUX1_LADDER_ROOT, HF_HOME, or HOME");
-    huggingface
-        .join("hub/models--SceneWorks--flux1-dev-mlx/snapshots")
-        .join(REVISION)
-        .join("q4")
-}
-
 fn bind_q4_snapshot(requested: &Path) -> PathBuf {
     let resolved = std::fs::canonicalize(requested).unwrap_or_else(|error| {
         panic!(
@@ -159,7 +146,7 @@ fn bind_q4_snapshot(requested: &Path) -> PathBuf {
 fn snapshot() -> PathBuf {
     let requested = std::env::var_os("FLUX1_LADDER_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(default_snapshot);
+        .expect("set FLUX1_LADDER_ROOT to the exact revision directory or its q4 child");
     bind_q4_snapshot(&requested)
 }
 
