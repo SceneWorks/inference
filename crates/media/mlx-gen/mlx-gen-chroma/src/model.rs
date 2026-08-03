@@ -1075,25 +1075,44 @@ mod tests {
         drop(reference_model);
         clear_cache();
 
-        let ranked = [
-            (4, T5Sublayer::Attention),
-            (1, T5Sublayer::FeedForward),
-            (2, T5Sublayer::FeedForward),
-            (18, T5Sublayer::FeedForward),
-            (15, T5Sublayer::Attention),
-            (1, T5Sublayer::Attention),
-            (16, T5Sublayer::Attention),
-            (14, T5Sublayer::Attention),
-            (18, T5Sublayer::Attention),
-            (19, T5Sublayer::Attention),
+        let all_attention = (0..24)
+            .map(|block| (block, T5Sublayer::Attention))
+            .collect::<Vec<_>>();
+        let all_ffn = (0..24)
+            .map(|block| (block, T5Sublayer::FeedForward))
+            .collect::<Vec<_>>();
+        let candidates = [
+            (
+                "all-attention-plus-current-ffn",
+                all_attention
+                    .iter()
+                    .copied()
+                    .chain([(1, T5Sublayer::FeedForward), (2, T5Sublayer::FeedForward)])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "all-ffn-plus-block4-attention",
+                all_ffn
+                    .iter()
+                    .copied()
+                    .chain([(4, T5Sublayer::Attention)])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "complete-attention-and-ffn",
+                all_attention
+                    .iter()
+                    .chain(&all_ffn)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
         ];
-        let candidate_lengths = [3usize, 4, 6, 8, 10];
         let quantized_spec = baseline_spec.with_quant(Quant::Q4);
 
-        for length in candidate_lengths {
+        for (policy, sensitive_sublayers) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(&quantized_spec, &ranked[..length])
+            let model = load_render_calibration_candidate(&quantized_spec, &sensitive_sublayers)
                 .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
@@ -1113,8 +1132,8 @@ mod tests {
             println!(
                 "SC16462_RENDER_SENSITIVITY {}",
                 serde_json::json!({
-                    "rankedSublayers": length,
-                    "sensitiveSublayers": ranked[..length]
+                    "policy": policy,
+                    "sensitiveSublayers": sensitive_sublayers
                         .iter()
                         .map(|(block, sublayer)| serde_json::json!({
                             "block": block,
