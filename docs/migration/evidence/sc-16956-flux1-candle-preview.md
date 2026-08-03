@@ -308,8 +308,8 @@ RoPE'd patch tokens with `Tensor::cat` on axis 2. Candle's `cat` takes a **trans
 non-zero axis when its inputs are not all contiguous — and `rope.apply` returns a strided view — so `q`
 reached the attention matmul with a transposed layout. Candle's CPU gemm accepts that; its **CUDA**
 matmul does not. The whole EVA02-CLIP tower therefore failed at the first attention on the one platform
-this crate exists for, while every CPU unit test passed: the `reference_candle_worker_ci_test_gap` shape
-exactly. One `.contiguous()`, numerically a no-op, fixes q and k at once. Without it candle PuLID is
+this crate exists for, while every CPU unit test passed — the standing candle lesson that a green CPU
+suite proves a path compiles and runs, not that the CUDA kernels accept its layouts. One `.contiguous()`, numerically a no-op, fixes q and k at once. Without it candle PuLID is
 entirely non-functional at real weights on Windows/CUDA, so this was a blocker for the story's own
 acceptance criterion rather than adjacent cleanup.
 
