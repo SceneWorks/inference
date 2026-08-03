@@ -37,6 +37,7 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-2-mlx-request-peak-block-residency-2026-08-01-v1";
 
+#[cfg(test)]
 pub(crate) fn is_streamable_spec(provider_id: &str, spec: &LoadSpec) -> CoreResult<bool> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Ok(false);
