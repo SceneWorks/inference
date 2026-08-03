@@ -4,11 +4,12 @@
 
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
 use mlx_rs::error::Exception;
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, concatenate_axis, multiply, power, split, tanh};
 use mlx_rs::transforms::compile::compile;
@@ -220,6 +221,33 @@ impl FluxTransformer {
         height: u32,
         injector: Option<&dyn DitImageInjector>,
     ) -> Result<Array> {
+        self.forward_injected_memory(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// Request-scoped bounded-attention variant used by the shared memory ladder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_memory(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         self.forward_inner(
             hidden_states,
             prompt_embeds,
@@ -230,6 +258,7 @@ impl FluxTransformer {
             height,
             injector,
             None,
+            attention,
         )
     }
 
@@ -268,6 +297,7 @@ impl FluxTransformer {
             height,
             injector,
             control,
+            AttentionPlan::UNBOUNDED,
         )
     }
 
@@ -287,6 +317,7 @@ impl FluxTransformer {
         height: u32,
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Array], f32)>,
+        attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         let mut hidden = self.x_embedder.forward(hidden_states)?;
         let mut encoder = self.context_embedder.forward(prompt_embeds)?;
@@ -332,6 +363,7 @@ impl FluxTransformer {
                 &text_embeddings,
                 &rope,
                 injector.map(|inj| (inj, i)),
+                attention,
             )?;
             encoder = e;
             hidden = h;
@@ -363,7 +395,7 @@ impl FluxTransformer {
         // single-stream control residual (diffusers `controlnet_single_block_samples = None`); the
         // single-block injector seam below is the identity path, unchanged.
         for (i, block) in self.single_blocks.iter().enumerate() {
-            joint = block.forward(&joint, &text_embeddings, &rope)?;
+            joint = block.forward(&joint, &text_embeddings, &rope, attention)?;
             if let Some(inj) = injector {
                 if inj.injects_after_single(i) {
                     let img = joint.take_axis(&img_idx, 1)?;
@@ -429,7 +461,7 @@ impl FluxTransformer {
         let img_seq = hidden.shape()[1];
         let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
         for block in &self.single_blocks {
-            joint = block.forward(&joint, &text_embeddings, &rope)?;
+            joint = block.forward(&joint, &text_embeddings, &rope, AttentionPlan::UNBOUNDED)?;
         }
         let idx = Array::from_slice(
             &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
@@ -463,7 +495,7 @@ impl FluxTransformer {
             num_blocks
         };
         for block in self.single_blocks.iter().take(n) {
-            joint = block.forward(&joint, text_embeddings, &rope)?;
+            joint = block.forward(&joint, text_embeddings, &rope, AttentionPlan::UNBOUNDED)?;
         }
         let idx = Array::from_slice(
             &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
@@ -502,7 +534,7 @@ impl FluxTransformer {
         let joint = concatenate_axis(&[encoder, hidden], 1)?;
         let b = &self.single_blocks[0];
         let (normed, _gate) = b.norm.forward_three(&joint, text_embeddings)?;
-        let attn = b.attn.forward(&normed, &rope)?;
+        let attn = b.attn.forward(&normed, &rope, AttentionPlan::UNBOUNDED)?;
         let ff = gelu_tanh(&b.proj_mlp.forward(&normed)?)?;
         Ok(vec![
             ("sb0_norm".into(), normed),
@@ -625,7 +657,7 @@ impl JointBlock {
         emb: &Array,
         rope: &RopeTable,
     ) -> Result<(Array, Array)> {
-        self.forward_with_ip(hidden, encoder, emb, rope, None)
+        self.forward_with_ip(hidden, encoder, emb, rope, None, AttentionPlan::UNBOUNDED)
     }
 
     /// As [`forward`], but consulting the XLabs IP-Adapter image-query seam
@@ -638,6 +670,7 @@ impl JointBlock {
         emb: &Array,
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
+        plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.norm1.forward_six(hidden, emb)?;
@@ -645,7 +678,7 @@ impl JointBlock {
             self.norm1_context.forward_six(encoder, emb)?;
         let (attn_hidden, attn_context, ip_residual) =
             self.attn
-                .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip)?;
+                .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip, plan)?;
         let hidden = apply_norm_ff(
             hidden,
             &attn_hidden,
@@ -701,10 +734,16 @@ impl SingleBlock {
         })
     }
 
-    fn forward(&self, hidden: &Array, emb: &Array, rope: &RopeTable) -> Result<Array> {
+    fn forward(
+        &self,
+        hidden: &Array,
+        emb: &Array,
+        rope: &RopeTable,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let residual = hidden;
         let (normed, gate) = self.norm.forward_three(hidden, emb)?;
-        let attn = self.attn.forward(&normed, rope)?;
+        let attn = self.attn.forward(&normed, rope, plan)?;
         let ff = gelu_ffn(&self.proj_mlp.forward(&normed)?)?;
         let out = concatenate_axis(&[&attn, &ff], 2)?;
         let proj = self.proj_out.forward(&out)?;
@@ -769,6 +808,7 @@ impl JointAttention {
         encoder: &Array,
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
+        plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array, Option<Array>)> {
         let (q, k, v) = process_qkv(
             hidden,
@@ -793,7 +833,7 @@ impl JointAttention {
         let k = concatenate_axis(&[&ek, &k], 2)?;
         let v = concatenate_axis(&[&ev, &v], 2)?;
         let (q, k) = apply_rope(&q, &k, rope)?;
-        let out = attention(&q, &k, &v)?;
+        let out = attention(&q, &k, &v, plan)?;
         let txt_seq = encoder.shape()[1];
         // `out` is `[txt ; img]` along the sequence axis; split at `txt_seq` (a contiguous slice)
         // rather than gathering two aranges (F-111). `out_txt` is consumed by `to_add_out` below.
@@ -848,7 +888,7 @@ impl SingleAttention {
         })
     }
 
-    fn forward(&self, hidden: &Array, rope: &RopeTable) -> Result<Array> {
+    fn forward(&self, hidden: &Array, rope: &RopeTable, plan: AttentionPlan<'_>) -> Result<Array> {
         let (q, k, v) = process_qkv(
             hidden,
             &self.to_q,
@@ -858,7 +898,7 @@ impl SingleAttention {
             &self.norm_k,
         )?;
         let (q, k) = apply_rope(&q, &k, rope)?;
-        attention(&q, &k, &v)
+        attention(&q, &k, &v, plan)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -1063,9 +1103,9 @@ fn process_qkv(
     Ok((q, k, v))
 }
 
-fn attention(q: &Array, k: &Array, v: &Array) -> Result<Array> {
+fn attention(q: &Array, k: &Array, v: &Array, plan: AttentionPlan<'_>) -> Result<Array> {
     let b = q.shape()[0];
-    let y = scaled_dot_product_attention(q, k, v, (HEAD_DIM as f32).powf(-0.5), None, None)?;
+    let y = sdpa_budgeted_bhsd(q, k, v, (HEAD_DIM as f32).powf(-0.5), None, plan)?;
     Ok(y.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, -1, DIM])?)
 }
 

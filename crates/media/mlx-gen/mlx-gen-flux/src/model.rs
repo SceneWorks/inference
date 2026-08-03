@@ -100,11 +100,14 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         None => None,
     };
 
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(variant.id(), spec)?;
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
         residency: build_residency(variant, spec)?,
         ip_adapter,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     })
 }
 
@@ -253,10 +256,22 @@ pub struct Flux1 {
     /// `LoadSpec::ip_adapter` was supplied. A `Conditioning::Reference` request errors loudly when
     /// this is `None` — checked up front in `generate`, before any residency work.
     ip_adapter: Option<(FluxIpImageEncoder, FluxIpAdapter)>,
+    /// Loaded-contract copy used by the runtime selector and its defense-in-depth admission check.
+    memory_strategy: gen_core::MemoryProviderContract,
+    /// Exact load axes used to build [`Self::memory_strategy`]. Overlay-bearing specs deliberately
+    /// keep bounded attention unavailable until those extra attention paths have their own proof.
+    loaded_spec: LoadSpec,
 }
 
 impl Flux1 {
     pub fn new_for_tests(variant: FluxVariant) -> Self {
+        let loaded_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let memory_strategy = crate::memory_strategy::weights_free_memory_strategy_contract(
+            variant.id(),
+            &loaded_spec,
+        )
+        .expect("test-only FLUX contract");
         Self {
             descriptor: descriptor_for(variant),
             variant,
@@ -276,6 +291,8 @@ impl Flux1 {
                 },
             ),
             ip_adapter: None,
+            memory_strategy,
+            loaded_spec,
         }
     }
 }
@@ -347,6 +364,29 @@ impl Generator for Flux1 {
         self.generate_with_injector(req, None, on_progress)
             .map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            self.variant.id(),
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
 }
 
 /// Extract the single reference image + its optional `strength` (`ip_adapter_scale`) from a request,
@@ -393,13 +433,22 @@ impl Flux1 {
             },
             |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
                 let transformer = &heavy.transformer;
+                // Only the clean base route owns complete attention coverage. Any injector adds a
+                // distinct attention stack, so it preserves the historical unbounded forward even
+                // if a caller manually sets request memory outside the admitted contract.
+                let attention =
+                    if injector.is_none() && self.memory_strategy.lifecycle.attention_chunking {
+                        crate::memory_strategy::attention_plan(req)
+                    } else {
+                        mlx_gen::attention::AttentionPlan::UNBOUNDED
+                    };
                 self.run_denoise_with(
                     req,
                     &heavy.vae,
                     heavy.pid.as_ref(),
                     on_progress,
                     |x_in, _t, timestep, guidance| {
-                        transformer.forward_injected(
+                        transformer.forward_injected_memory(
                             x_in,
                             &prompt_embeds,
                             &pooled_prompt_embeds,
@@ -408,6 +457,7 @@ impl Flux1 {
                             req.width,
                             req.height,
                             injector,
+                            attention,
                         )
                     },
                 )
