@@ -93,10 +93,20 @@ pub fn register_providers(
     registry
         .register_generator(model::QUALITY_REGISTRATION)
         .register_memory_strategy(model::QUALITY_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
         .register_memory_behavior(model::QUALITY_MEMORY_BEHAVIOR)
         .register_activation_memory(QUALITY_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::FAST_REGISTRATION)
         .register_memory_strategy(model::FAST_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID_FAST,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_FAST, spec)
+            },
+        })
         .register_memory_behavior(model::FAST_MEMORY_BEHAVIOR)
 }
 

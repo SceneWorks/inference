@@ -32,6 +32,7 @@ pub const FAST_CALIBRATION_FINGERPRINT: &str =
 const QUALITY_Q8_ARTIFACT: &str =
     "8da38dde4c39722259a98cfc47643c88e48cea205595625fdbd9fec097f9dc4f";
 const FAST_Q8_ARTIFACT: &str = "a9f8968d44ec440bdd7bfb2937a61b847d6f80bb563ffe60ca56be0e395bcf50";
+const STATIC_BEHAVIOR_CALIBRATION: &str = "sensenova-static-registry-behavior-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ArtifactFileIdentity {
@@ -294,6 +295,25 @@ pub fn memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     let artifact = verified_artifact(spec);
     memory_strategy_contract_with_artifact(provider_id, spec, artifact.as_ref())
+}
+
+/// Weights-free contract used only by registry conformance. Production resolution never calls this
+/// seam and therefore never receives its synthetic calibration identity.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    let mut contract = memory_strategy_contract_with_artifact(provider_id, spec, None)?;
+    let route = if provider_id == crate::MODEL_ID_FAST {
+        "fast"
+    } else {
+        "quality"
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_CALIBRATION}-{route}"),
+        spec.load_shape,
+    ));
+    Ok(contract)
 }
 
 pub(crate) fn memory_strategy_contract_with_artifact(
@@ -623,6 +643,35 @@ mod tests {
             MemoryStrategySupport::Implemented
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn static_behavior_calibration_never_grants_unknown_runtime_artifacts() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        let runtime = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(runtime.calibration.is_none());
+
+        let fixture_contract =
+            weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(fixture_contract
+            .calibration
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .starts_with(STATIC_BEHAVIOR_CALIBRATION));
+        let fixtures =
+            registered_valid_fixture(&spec, &fixture_contract, MemoryStrategy::BoundedAttention)
+                .unwrap();
+        assert_eq!(fixtures.len(), 2);
+        assert_eq!(
+            registered_safety_check(&spec, &fixture_contract, &fixtures[0].context),
+            MemorySafetyDecision::Accept
+        );
+        assert!(matches!(
+            registered_safety_check(&spec, &runtime, &fixtures[0].context),
+            MemorySafetyDecision::Reject { .. }
+        ));
     }
 
     #[test]
