@@ -43,10 +43,6 @@ license = "Llama 3.1 Community License"
 size_class = "very-large"
 profiles = ["llm-macos"]
 environment = ["MLX_LLM_JOYCAPTION_SNAPSHOT"]
-# IN FLIGHT, NOT A PERMANENT EXEMPTION. sc-17250 (PR #456) adds the `mlx-llm-joycaption` lane that
-# references this variable. When that lands, DELETE this line — the gate asserts the converse, so a
-# referenced key carrying an unwired_reason fails the policy test on the second PR to merge.
-unwired_reason = "lane in flight on sc-17250 / PR #456; delete this line when it merges (sc-17266)"
 expected_files = [
     "config.json",
     "tokenizer.json",
@@ -73,9 +69,11 @@ environment = ["QWEN_IMAGE_SNAPSHOT"]
 # (C:\Users\Michael\.cache\huggingface\hub\models--Qwen--Qwen-Image\...) does not currently exist on
 # nax-windows, so a lane added today would fail closed on materialization anyway.
 #
-# SEPARATELY UNCOVERED, and NOT what this exemption blesses: ~17 mlx-gen-qwen-image real-weight
-# tests also read QWEN_IMAGE_SNAPSHOT and no macOS lane runs them either. That is a Mac-side gap
-# tracked on its own story; it cannot be closed from the Windows/CUDA box.
+# SEPARATELY UNCOVERED, and NOT what this exemption blesses: 45 mlx-gen-qwen-image real-weight
+# tests across 13 files also read QWEN_IMAGE_SNAPSHOT, plus two candle-gen-qwen-image CUDA tests
+# (tests/conformance.rs and the src/lib.rs probed-offload test). No lane runs any of them. The MLX
+# half needs a Mac, because mlx-gen does not build on Windows; the candle half is buildable here but
+# blocked on the ~60 GB snapshot above not existing on the box. Tracked as sc-17284.
 unwired_reason = "operator-run residency A/B (run-residency-ab.ps1), deliberately outside CI (sc-17266)"
 expected_files = [
     "model_index.json",
@@ -551,9 +549,6 @@ license = "Apache-2.0"
 size_class = "large"
 profiles = ["audio-macos"]
 environment = ["MOSS_TTS_REALTIME_SNAPSHOT"]
-# IN FLIGHT, NOT A PERMANENT EXEMPTION — see joycaption-beta-one above. sc-17250 (PR #456) adds the
-# `candle-audio-moss-tts-realtime` lane that references this variable; delete this line when it lands.
-unwired_reason = "lane in flight on sc-17250 / PR #456; delete this line when it merges (sc-17266)"
 expected_files = [
     "config.json",
     "model.safetensors",
@@ -572,9 +567,6 @@ license = "Apache-2.0"
 size_class = "large"
 profiles = ["audio-macos"]
 environment = ["MOSS_AUDIO_TOKENIZER_SNAPSHOT"]
-# IN FLIGHT, NOT A PERMANENT EXEMPTION — see joycaption-beta-one above. sc-17250 (PR #456) adds the
-# `candle-audio-moss-tts-realtime` lane that references this variable; delete this line when it lands.
-unwired_reason = "lane in flight on sc-17250 / PR #456; delete this line when it merges (sc-17266)"
 expected_files = [
     "config.json",
     "model.safetensors.index.json",

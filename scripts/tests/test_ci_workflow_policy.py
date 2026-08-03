@@ -441,6 +441,22 @@ def validate_binary_hashed_lock(
     return requirements
 
 
+def workflow_code(workflows: str) -> str:
+    """The workflow text with comment lines removed.
+
+    Over CODE only, for the same reason `test_real_weight_macos_steps_name_the_reviewed_cpython`
+    is: prose documenting a variable necessarily writes the very token being searched for. Without
+    this, a comment explaining why something WAS wired keeps counting as wiring long after the
+    mapping itself is deleted -- exactly the rot this gate exists to catch, hiding inside the gate.
+    `#` covers YAML and the bash `run:` blocks; `rem` covers the Windows `shell: cmd` ones.
+    """
+    return "\n".join(
+        line
+        for line in workflows.splitlines()
+        if not line.lstrip().startswith("#") and not line.lstrip().lower().startswith("rem ")
+    )
+
+
 def environment_variable_is_referenced(workflows: str, name: str) -> bool:
     """True when the workflows reference `name` as something a test process can actually read.
 
@@ -448,13 +464,15 @@ def environment_variable_is_referenced(workflows: str, name: str) -> bool:
     `MMAUDIO_VAE_44K_SNAPSHOT` exported, a bare substring test would call a hypothetical
     `MMAUDIO_VAE_44K` referenced too and that key's coverage gap would never surface.
 
-    A lone `${{ vars.NAME }}` does NOT count. A repository variable can be mapped onto a
-    differently-named job variable -- `MMAUDIO_BIGVGAN_V2_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}`
-    does exactly that -- so a `vars.` mention proves only that a value was read out of repository
-    settings, never that any process sees an environment variable under that name.
+    A lone `${{ vars.NAME }}` / `${{ env.NAME }}` / `${{ secrets.NAME }}` does NOT count. A
+    repository variable can be mapped onto a differently-named job variable --
+    `MMAUDIO_BIGVGAN_V2_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}` does exactly that -- so
+    those prove a value was read out of repository settings or an earlier step, never that any
+    process sees an environment variable under that name.
     """
-    for match in re.finditer(rf"(?<![A-Z0-9_]){re.escape(name)}(?![A-Z0-9_])", workflows):
-        if not workflows[: match.start()].endswith("vars."):
+    code = workflow_code(workflows)
+    for match in re.finditer(rf"(?<![A-Z0-9_]){re.escape(name)}(?![A-Z0-9_])", code):
+        if not code[: match.start()].endswith(("vars.", "env.", "secrets.")):
             return True
     return False
 
@@ -466,10 +484,11 @@ def models_exported_by_key(workflows: str) -> set[str]:
     so the variable name never appears in the workflow at all. The Stable Audio 3 lanes wire every
     snapshot this way; without this channel the gate would report them as orphans. Deliberately
     scoped to that script -- `ensure_model_snapshot.py --model <key>` takes the same flag but only
-    materializes weights on disk and exports nothing.
+    materializes weights on disk and exports nothing. Over code only, like the reference check --
+    a comment recalling a lane that USED to export a key must not keep that key looking wired.
     """
     keys: set[str] = set()
-    for tail in workflows.split("export_model_snapshot_paths.py")[1:]:
+    for tail in workflow_code(workflows).split("export_model_snapshot_paths.py")[1:]:
         command: list[str] = []
         for line in tail.splitlines():
             command.append(line)
@@ -1078,7 +1097,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(manifest_environment_wiring_errors(models, workflows), [])
 
-        # The detector has to detect. Each mutation below is a defect shape that really occurred:
+    def test_manifest_wiring_policy_discriminates_mutations(self) -> None:
+        # The detector has to detect. Each case below is a defect shape that really occurred:
         # sc-17250 found three orphans by hand, sc-17266 eight more, and Mochi-1's freeze is a
         # decision that must not read as an oversight once someone finally wires a lane for it.
         wired = {"key": "wired", "environment": ["WIRED_SNAPSHOT"]}
@@ -1148,6 +1168,37 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn(
             "referenced by no workflow",
             "\n".join(manifest_environment_wiring_errors([orphan], provisioned)),
+        )
+
+        # PROSE IS NOT WIRING. The comment documenting a variable necessarily writes its name, so
+        # without a code-only filter a comment left behind by a deleted mapping keeps the key
+        # looking wired forever -- the gate would hide the exact rot it exists to find. This one is
+        # not hypothetical: sc-17266's own comments name every variable the same commit wires.
+        for prose in (
+            "      # ORPHAN_SNAPSHOT used to be set here\n",
+            "          rem ORPHAN_SNAPSHOT is materialized elsewhere\n",
+            "      # historical: export_model_snapshot_paths.py --model orphan\n",
+        ):
+            with self.subTest(prose=prose.strip()):
+                self.assertIn(
+                    "referenced by no workflow",
+                    "\n".join(manifest_environment_wiring_errors([orphan], prose)),
+                )
+        # A real mapping still counts even when a comment above it names the same variable.
+        documented = (
+            "      # ORPHAN_SNAPSHOT feeds the decoder conformance test\n"
+            "      ORPHAN_SNAPSHOT: ${{ vars.SOMETHING_ELSE }}\n"
+        )
+        self.assertEqual(manifest_environment_wiring_errors([orphan], documented), [])
+
+        # A pure consumer proves nothing: `${{ env.X }}` reads a value someone else must define.
+        self.assertIn(
+            "referenced by no workflow",
+            "\n".join(
+                manifest_environment_wiring_errors(
+                    [orphan], "        run: echo ${{ env.ORPHAN_SNAPSHOT }}\n"
+                )
+            ),
         )
 
         self.assertIn(
