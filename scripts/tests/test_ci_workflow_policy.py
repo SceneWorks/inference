@@ -269,10 +269,13 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
 
     install_lines: list[tuple[int, str, re.Match[str]]] = []
     for line_number, command in pip_lines:
+        first_pip = pip_token.search(command)
+        assert first_pip is not None
         match = canonical_install.search(command)
-        if match is None:
+        if match is None or match.start() != first_pip.start():
             errors.append(
-                f"line {line_number}: pip command is not a canonical single-line install"
+                f"line {line_number}: first pip command is not a canonical "
+                "single-line install"
             )
             continue
         install_lines.append((line_number, command, match))
@@ -407,6 +410,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_real_weight_pip_policy_discriminates_bypass_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        canonical_macos_install = (
+            "python3 -m pip install --disable-pip-version-check "
+            "--only-binary=:all: --require-hashes --target \"$PYTHONPATH\" "
+            f"-r {MACOS_HUB_LOCK}"
+        )
         mutations = {
             "missing hashes": workflow.replace(" --require-hashes", "", 1),
             "missing binary only": workflow.replace(" --only-binary=:all:", "", 1),
@@ -422,6 +430,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             + "            install requests\n",
             "option before install bypass": workflow
             + "\n          python3 -m pip --disable-pip-version-check install requests\n",
+            "later canonical comment decoy": workflow.replace(
+                canonical_macos_install,
+                "python3 -m pip --disable-pip-version-check install requests # "
+                + canonical_macos_install,
+                1,
+            ),
+            "later canonical separator decoy": workflow.replace(
+                canonical_macos_install,
+                "python3 -m pip --disable-pip-version-check install requests ; "
+                + canonical_macos_install,
+                1,
+            ),
             "new superficially compliant install": workflow
             + f"\n          python3 -m pip install --disable-pip-version-check "
             f"--only-binary=:all: --require-hashes -r {MACOS_HUB_LOCK}\n",
