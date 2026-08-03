@@ -11,8 +11,8 @@
 //! ```
 //!
 //! Arms: `resident`, `staged`, `tile768`, `tile640`, `tile512`, `attention`, `rung4`,
-//! `cancel`, and `fault`. `FLUX1_LADDER_ROOT` may override the default Hugging Face cache root,
-//! but its canonical path must still be the exact pinned revision below. Outputs go to
+//! `cancel`, and `fault`. `FLUX1_LADDER_ROOT` may name either the exact Hugging Face revision root
+//! or its `q4` child; both resolve to and bind `snapshots/<revision>/q4`. Outputs go to
 //! `FLUX1_LADDER_OUTPUT_DIR` or a deterministic temporary directory.
 //!
 //! The provider currently has no integration-test-visible runtime window-event counter. The runner
@@ -107,33 +107,60 @@ fn default_snapshot() -> PathBuf {
     huggingface
         .join("hub/models--SceneWorks--flux1-dev-mlx/snapshots")
         .join(REVISION)
+        .join("q4")
 }
 
-fn snapshot() -> PathBuf {
-    let requested = std::env::var_os("FLUX1_LADDER_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_snapshot);
-    let canonical = std::fs::canonicalize(&requested).unwrap_or_else(|error| {
+fn bind_q4_snapshot(requested: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(requested).unwrap_or_else(|error| {
         panic!(
-            "exact cached FLUX.1-dev MLX revision is unavailable at {}: {error}",
+            "exact cached FLUX.1-dev MLX revision/tier is unavailable at {}: {error}",
             requested.display()
         )
     });
+    let canonical = match resolved.file_name().and_then(|part| part.to_str()) {
+        Some("q4") => resolved,
+        Some(REVISION) => std::fs::canonicalize(resolved.join("q4")).unwrap_or_else(|error| {
+            panic!(
+                "exact cached FLUX.1-dev MLX Q4 child is unavailable under {}: {error}",
+                resolved.display()
+            )
+        }),
+        _ => panic!(
+            "FLUX1_LADDER_ROOT must resolve to snapshots/{REVISION} or its q4 child, got {}",
+            resolved.display()
+        ),
+    };
     assert_eq!(
         canonical.file_name().and_then(|part| part.to_str()),
-        Some(REVISION),
-        "FLUX1_LADDER_ROOT must resolve to exact revision {REVISION}, got {}",
-        canonical.display()
+        Some("q4"),
+        "resolved artifact root must be the q4 tier"
     );
     assert_eq!(
         canonical
             .parent()
             .and_then(Path::file_name)
             .and_then(|part| part.to_str()),
+        Some(REVISION),
+        "q4 tier must belong to exact revision {REVISION}, got {}",
+        canonical.display()
+    );
+    assert_eq!(
+        canonical
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|part| part.to_str()),
         Some("snapshots"),
-        "exact root must be a Hugging Face snapshots/<revision> directory"
+        "exact tier must be a Hugging Face snapshots/<revision>/q4 directory"
     );
     canonical
+}
+
+fn snapshot() -> PathBuf {
+    let requested = std::env::var_os("FLUX1_LADDER_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_snapshot);
+    bind_q4_snapshot(&requested)
 }
 
 fn spec(root: &Path, arm: Arm) -> LoadSpec {
@@ -551,6 +578,22 @@ fn run_fault(generator: &dyn Generator) -> (usize, usize, Run) {
     let floor = (get_active_memory(), get_cache_memory());
     let recovery = run_success(generator, Arm::Rung4);
     (floor.0, floor.1, recovery)
+}
+
+#[test]
+fn snapshot_resolver_accepts_revision_or_q4_and_returns_the_bound_tier() {
+    let root = std::env::temp_dir().join(format!(
+        "flux1-ladder-root-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let revision = root.join("snapshots").join(REVISION);
+    let q4 = revision.join("q4");
+    std::fs::create_dir_all(&q4).unwrap();
+    let canonical_q4 = std::fs::canonicalize(&q4).unwrap();
+    assert_eq!(bind_q4_snapshot(&revision), canonical_q4);
+    assert_eq!(bind_q4_snapshot(&q4), canonical_q4);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
