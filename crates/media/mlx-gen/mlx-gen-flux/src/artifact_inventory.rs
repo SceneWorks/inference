@@ -10,6 +10,7 @@ use mlx_gen::gen_core::{Error as CoreError, Result as CoreResult};
 use mlx_gen::{LoadSpec, OffloadPolicy, Precision, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::MetadataExt;
@@ -30,8 +31,23 @@ struct ArtifactFileIdentity {
     changed_nanoseconds: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceEntryIdentity {
+    absolute_path: PathBuf,
+    is_symlink: bool,
+    symlink_target: Option<PathBuf>,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PinnedArtifact {
+    source: SourceEntryIdentity,
     identity: ArtifactFileIdentity,
     digest: String,
 }
@@ -50,6 +66,17 @@ impl PinnedArtifact {
     }
 
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
+        let source = source_entry_identity(&self.source.absolute_path).map_err(|error| {
+            CoreError::Msg(format!(
+                "flux1: pinned snapshot entry is no longer readable: {error}"
+            ))
+        })?;
+        if source != self.source {
+            return Err(CoreError::Unsupported(
+                "flux1: pinned snapshot entry or symlink target changed after verification"
+                    .to_owned(),
+            ));
+        }
         let current = file_identity(&self.identity.canonical_path).map_err(|error| {
             CoreError::Msg(format!(
                 "flux1: pinned packed artifact is no longer readable: {error}"
@@ -61,20 +88,55 @@ impl PinnedArtifact {
                     .to_owned(),
             ));
         }
+        let resolved = file_identity(&self.source.absolute_path).map_err(|error| {
+            CoreError::Msg(format!(
+                "flux1: pinned snapshot entry no longer resolves: {error}"
+            ))
+        })?;
+        if resolved != self.identity {
+            return Err(CoreError::Unsupported(
+                "flux1: pinned snapshot entry resolves to a different canonical target".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
+struct ComponentInventory {
+    name: &'static str,
+    source_directory: PathBuf,
+    visible_safetensors: Vec<OsString>,
+    model: PinnedArtifact,
+    config: PinnedArtifact,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PackedArtifactInventory {
-    components: [PinnedArtifact; 4],
+    components: [ComponentInventory; 4],
     t5_tokenizer: PinnedArtifact,
     composite_sha256: String,
 }
 
 impl PackedArtifactInventory {
     pub(crate) fn transformer_source(&self) -> &PinnedArtifact {
-        &self.components[2]
+        &self.components[2].model
+    }
+
+    pub(crate) fn clip_encoder_source(&self) -> &PinnedArtifact {
+        &self.components[0].model
+    }
+
+    pub(crate) fn t5_encoder_source(&self) -> &PinnedArtifact {
+        &self.components[1].model
+    }
+
+    pub(crate) fn vae_source(&self) -> &PinnedArtifact {
+        &self.components[3].model
+    }
+
+    pub(crate) fn t5_tokenizer_source(&self) -> &PinnedArtifact {
+        &self.t5_tokenizer
     }
 
     pub(crate) fn composite_sha256(&self) -> &str {
@@ -82,12 +144,40 @@ impl PackedArtifactInventory {
     }
 
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
-        for artifact in &self.components {
-            artifact.ensure_unchanged()?;
+        for component in &self.components {
+            let current = visible_safetensors(&component.source_directory)?;
+            if current != component.visible_safetensors {
+                return Err(CoreError::Unsupported(format!(
+                    "flux1: {} component safetensors membership changed after admission",
+                    component.name
+                )));
+            }
+            component.model.ensure_unchanged()?;
+            component.config.ensure_unchanged()?;
         }
         self.t5_tokenizer.ensure_unchanged()?;
         Ok(())
     }
+}
+
+fn source_entry_identity(path: &Path) -> std::io::Result<SourceEntryIdentity> {
+    let absolute_path = std::path::absolute(path)?;
+    let metadata = std::fs::symlink_metadata(&absolute_path)?;
+    let is_symlink = metadata.file_type().is_symlink();
+    Ok(SourceEntryIdentity {
+        symlink_target: is_symlink
+            .then(|| std::fs::read_link(&absolute_path))
+            .transpose()?,
+        absolute_path,
+        is_symlink,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
@@ -199,7 +289,9 @@ fn hash_exact_file(identity: &ArtifactFileIdentity) -> CoreResult<String> {
 
 fn pinned_artifact(path: &Path) -> CoreResult<PinnedArtifact> {
     loop {
-        let identity = file_identity(path)
+        let source = source_entry_identity(path)
+            .map_err(|error| CoreError::Msg(format!("flux1: lstat {}: {error}", path.display())))?;
+        let identity = file_identity(&source.absolute_path)
             .map_err(|error| CoreError::Msg(format!("flux1: stat {}: {error}", path.display())))?;
         let cache = digest_cache();
         let mut entries = cache
@@ -209,8 +301,14 @@ fn pinned_artifact(path: &Path) -> CoreResult<PinnedArtifact> {
         match entries.get(&identity).cloned() {
             Some(DigestState::Ready(digest)) => {
                 drop(entries);
-                if file_identity(path).ok().as_ref() == Some(&identity) {
-                    return Ok(PinnedArtifact { identity, digest });
+                if source_entry_identity(&source.absolute_path).ok().as_ref() == Some(&source)
+                    && file_identity(&source.absolute_path).ok().as_ref() == Some(&identity)
+                {
+                    return Ok(PinnedArtifact {
+                        source,
+                        identity,
+                        digest,
+                    });
                 }
             }
             Some(DigestState::Hashing) => {
@@ -224,7 +322,9 @@ fn pinned_artifact(path: &Path) -> CoreResult<PinnedArtifact> {
                 entries.insert(identity.clone(), DigestState::Hashing);
                 drop(entries);
                 let digest = hash_exact_file(&identity);
-                let unchanged = file_identity(path).ok().as_ref() == Some(&identity);
+                let unchanged = source_entry_identity(&source.absolute_path).ok().as_ref()
+                    == Some(&source)
+                    && file_identity(&source.absolute_path).ok().as_ref() == Some(&identity);
                 let mut entries = cache
                     .entries
                     .lock()
@@ -235,7 +335,11 @@ fn pinned_artifact(path: &Path) -> CoreResult<PinnedArtifact> {
                         entries
                             .retain(|cached, _| cached.canonical_path != identity.canonical_path);
                         entries.insert(identity.clone(), DigestState::Ready(digest.clone()));
-                        Ok(PinnedArtifact { identity, digest })
+                        Ok(PinnedArtifact {
+                            source,
+                            identity,
+                            digest,
+                        })
                     }
                     (false, _) => Err(CoreError::Unsupported(
                         "flux1: packed artifact changed while its content was hashed".to_owned(),
@@ -266,60 +370,95 @@ pub(crate) fn structurally_streamable(provider_id: &str, spec: &LoadSpec) -> boo
         && matches!(spec.weights, WeightsSource::Dir(_))
 }
 
-fn single_component_artifact(root: &Path, component: &str) -> CoreResult<PinnedArtifact> {
-    let dir = root.join(component);
-    let entries = std::fs::read_dir(&dir).map_err(|error| {
+fn visible_safetensors(dir: &Path) -> CoreResult<Vec<OsString>> {
+    let entries = std::fs::read_dir(dir).map_err(|error| {
         CoreError::Msg(format!(
             "flux1: read packed component {}: {error}",
             dir.display()
         ))
     })?;
-    let mut safetensors = Vec::new();
+    let mut names = Vec::new();
     for entry in entries {
-        let path = entry
-            .map_err(|error| {
-                CoreError::Msg(format!(
-                    "flux1: enumerate packed component {}: {error}",
-                    dir.display()
-                ))
-            })?
-            .path();
+        let entry = entry.map_err(|error| {
+            CoreError::Msg(format!(
+                "flux1: enumerate packed component {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let path = entry.path();
         if !mlx_gen::gen_core::weightsmeta::is_hidden_file(&path)
             && path.extension().is_some_and(|ext| ext == "safetensors")
         {
-            safetensors.push(path);
+            names.push(entry.file_name());
         }
     }
-    let only = safetensors.first().ok_or_else(|| {
-        CoreError::Unsupported(format!(
-            "flux1: {component} must contain exactly one model.safetensors"
-        ))
-    })?;
-    if safetensors.len() != 1
-        || only.file_name().and_then(|name| name.to_str()) != Some("model.safetensors")
-    {
+    names.sort();
+    Ok(names)
+}
+
+fn single_component_artifact(
+    root: &Path,
+    component: &'static str,
+) -> CoreResult<ComponentInventory> {
+    let dir = root.join(component);
+    let source_directory = std::path::absolute(&dir)
+        .map_err(|error| CoreError::Msg(format!("flux1: resolve {}: {error}", dir.display())))?;
+    let visible_safetensors = visible_safetensors(&source_directory)?;
+    if visible_safetensors.as_slice() != [OsString::from("model.safetensors")] {
         return Err(CoreError::Unsupported(format!(
             "flux1: {component} must contain exactly one model.safetensors"
         )));
     }
-    PinnedArtifact::verify_file(only)
+    Ok(ComponentInventory {
+        name: component,
+        model: PinnedArtifact::verify_file(&source_directory.join("model.safetensors"))?,
+        config: PinnedArtifact::verify_file(&source_directory.join("config.json"))?,
+        source_directory,
+        visible_safetensors,
+    })
 }
 
-fn component_quant_matches(root: &Path, component: &str, quant: Option<Quant>) -> bool {
+fn component_quant_matches(component: &ComponentInventory, quant: Option<Quant>) -> bool {
     let expected = quant.map(Quant::bits);
-    matches!(
-        mlx_gen::quant::packed_quant_bits(root, component),
-        Ok(actual) if actual == expected
-    )
+    let actual = (|| -> CoreResult<Option<i32>> {
+        component.config.ensure_unchanged()?;
+        let bytes = std::fs::read(component.config.canonical_path()).map_err(|error| {
+            CoreError::Msg(format!(
+                "flux1: read pinned {} config: {error}",
+                component.name
+            ))
+        })?;
+        component.config.ensure_unchanged()?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            CoreError::Msg(format!(
+                "flux1: parse pinned {} config: {error}",
+                component.name
+            ))
+        })?;
+        let Some(marker) = json.get("quantization") else {
+            return Ok(None);
+        };
+        let bits = marker.get("bits").and_then(serde_json::Value::as_i64);
+        let group_size = marker.get("group_size").and_then(serde_json::Value::as_i64);
+        match (bits, group_size) {
+            (Some(bits @ (4 | 8)), Some(64)) => Ok(Some(bits as i32)),
+            _ => Err(CoreError::Unsupported(format!(
+                "flux1: {} has an invalid packed quantization marker",
+                component.name
+            ))),
+        }
+    })();
+    matches!(actual, Ok(actual) if actual == expected)
 }
 
-fn composite_digest(components: &[PinnedArtifact; 4], t5_tokenizer: &PinnedArtifact) -> String {
+fn composite_digest(components: &[ComponentInventory; 4], t5_tokenizer: &PinnedArtifact) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"flux1-packed-component-inventory-v1\0");
-    for (name, artifact) in COMPONENTS.iter().zip(components) {
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        hasher.update(artifact.digest().as_bytes());
+    hasher.update(b"flux1-packed-component-inventory-v2\0");
+    for component in components {
+        hasher.update((component.name.len() as u64).to_le_bytes());
+        hasher.update(component.name.as_bytes());
+        hasher.update(component.model.digest().as_bytes());
+        hasher.update(component.config.digest().as_bytes());
     }
     let tokenizer_name = "tokenizer_2/tokenizer.json";
     hasher.update((tokenizer_name.len() as u64).to_le_bytes());
@@ -334,14 +473,6 @@ fn discover_inventory(spec: &LoadSpec) -> CoreResult<PackedArtifactInventory> {
             "flux1: deferred materialization needs a snapshot directory".to_owned(),
         ));
     };
-    if !COMPONENTS
-        .iter()
-        .all(|component| component_quant_matches(root, component, spec.quantize))
-    {
-        return Err(CoreError::Unsupported(
-            "flux1: every packed component quant marker must match the selected tier".to_owned(),
-        ));
-    }
     let t5_tokenizer = PinnedArtifact::verify_file(&root.join("tokenizer_2/tokenizer.json"))?;
     let components = [
         single_component_artifact(root, COMPONENTS[0])?,
@@ -349,19 +480,25 @@ fn discover_inventory(spec: &LoadSpec) -> CoreResult<PackedArtifactInventory> {
         single_component_artifact(root, COMPONENTS[2])?,
         single_component_artifact(root, COMPONENTS[3])?,
     ];
-    for artifact in &components {
-        artifact.ensure_unchanged()?;
+    if !components
+        .iter()
+        .all(|component| component_quant_matches(component, spec.quantize))
+    {
+        return Err(CoreError::Unsupported(
+            "flux1: every pinned component quant marker must match the selected tier".to_owned(),
+        ));
     }
-    t5_tokenizer.ensure_unchanged()?;
-    let composite_sha256 = composite_digest(&components, &t5_tokenizer);
-    for artifact in &components {
-        artifact.ensure_unchanged()?;
-    }
-    t5_tokenizer.ensure_unchanged()?;
-    Ok(PackedArtifactInventory {
+    let inventory = PackedArtifactInventory {
         components,
         t5_tokenizer,
+        composite_sha256: String::new(),
+    };
+    inventory.ensure_unchanged()?;
+    let composite_sha256 = composite_digest(&inventory.components, &inventory.t5_tokenizer);
+    inventory.ensure_unchanged()?;
+    Ok(PackedArtifactInventory {
         composite_sha256,
+        ..inventory
     })
 }
 
@@ -494,6 +631,86 @@ mod tests {
         std::fs::remove_file(root.join("tokenizer_2/tokenizer.json")).unwrap();
         assert!(verified_stream_inventory(crate::FLUX1_DEV_ID, &spec).is_none());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn admitted_snapshot_rejects_new_visible_safetensors_member() {
+        let root = unique_root("post-admission-extra-file");
+        write_snapshot(&root, None);
+        let inventory =
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, None)).unwrap();
+        std::fs::write(root.join("transformer/extra.safetensors"), [9_u8; 8]).unwrap();
+        assert!(inventory.ensure_unchanged().is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn admitted_snapshot_rejects_config_replacement() {
+        let root = unique_root("post-admission-config-replacement");
+        write_snapshot(&root, Some(Quant::Q4));
+        let inventory =
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, Some(Quant::Q4)))
+                .unwrap();
+        let replacement = root.join("transformer/config-replacement.json");
+        std::fs::write(
+            &replacement,
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        std::fs::rename(&replacement, root.join("transformer/config.json")).unwrap();
+        assert!(inventory.ensure_unchanged().is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_snapshot_rejects_model_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_root("post-admission-symlink-retarget");
+        write_snapshot(&root, None);
+        let component = root.join("transformer");
+        let objects = root.join("objects");
+        std::fs::create_dir_all(&objects).unwrap();
+        let original = objects.join("original.safetensors");
+        let replacement = objects.join("replacement.safetensors");
+        std::fs::rename(component.join("model.safetensors"), &original).unwrap();
+        std::fs::write(&replacement, [7_u8; 64]).unwrap();
+        symlink(
+            "../objects/original.safetensors",
+            component.join("model.safetensors"),
+        )
+        .unwrap();
+        let inventory =
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, None)).unwrap();
+        std::fs::remove_file(component.join("model.safetensors")).unwrap();
+        symlink(
+            "../objects/replacement.safetensors",
+            component.join("model.safetensors"),
+        )
+        .unwrap();
+        assert!(inventory.ensure_unchanged().is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_snapshot_rejects_parent_snapshot_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_root("post-admission-parent-symlink-retarget");
+        let first = base.join("snapshot-a");
+        let second = base.join("snapshot-b");
+        write_snapshot(&first, None);
+        write_snapshot(&second, None);
+        let root = base.join("current");
+        symlink("snapshot-a", &root).unwrap();
+        let inventory =
+            verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, None)).unwrap();
+        std::fs::remove_file(&root).unwrap();
+        symlink("snapshot-b", &root).unwrap();
+        assert!(inventory.ensure_unchanged().is_err());
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

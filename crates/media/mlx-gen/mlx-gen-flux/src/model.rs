@@ -170,16 +170,46 @@ pub(crate) fn resolve_root(variant: FluxVariant, spec: &LoadSpec) -> Result<&Pat
 /// Load the T5 + CLIP tokenizers and the T5-XXL / CLIP-L text encoders (+ optional whole-encoder
 /// Q4/Q8) — the phase-A components dropped first under `Sequential`. Factored so the `Resident` and
 /// `Sequential` paths build byte-identical encoders.
-pub(crate) fn load_flux_text(variant: FluxVariant, spec: &LoadSpec) -> Result<FluxTextOwned> {
+pub(crate) fn load_flux_text(
+    variant: FluxVariant,
+    spec: &LoadSpec,
+    stream_inventory: Option<&crate::artifact_inventory::PackedArtifactInventory>,
+) -> Result<FluxTextOwned> {
     let root = resolve_root(variant, spec)?;
-    let t5_tokenizer = loader::load_t5_tokenizer(root, variant)?;
+    if let Some(inventory) = stream_inventory {
+        inventory
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    let t5_tokenizer = match stream_inventory {
+        Some(inventory) => loader::load_t5_tokenizer_from_file(
+            inventory.t5_tokenizer_source().canonical_path(),
+            variant,
+        )?,
+        None => loader::load_t5_tokenizer(root, variant)?,
+    };
     let clip_tokenizer = loader::load_clip_tokenizer()?;
     let mut text_encoders = FluxTextEncoders {
-        t5: loader::load_t5_encoder(root)?,
-        clip: loader::load_clip_encoder(root)?,
+        t5: match stream_inventory {
+            Some(inventory) => {
+                loader::load_t5_encoder_from_file(inventory.t5_encoder_source().canonical_path())?
+            }
+            None => loader::load_t5_encoder(root)?,
+        },
+        clip: match stream_inventory {
+            Some(inventory) => loader::load_clip_encoder_from_file(
+                inventory.clip_encoder_source().canonical_path(),
+            )?,
+            None => loader::load_clip_encoder(root)?,
+        },
     };
     if let Some(q) = spec.quantize {
         text_encoders.quantize(q.bits())?;
+    }
+    if let Some(inventory) = stream_inventory {
+        inventory
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
     }
     Ok(FluxTextOwned {
         t5_tokenizer,
@@ -218,7 +248,16 @@ fn load_flux_heavy(
         }
         None => loader::load_transformer(root, variant)?,
     };
-    let mut vae = loader::load_vae(root)?;
+    let mut vae = match stream_inventory {
+        Some(inventory) => {
+            let vae = loader::load_vae_from_file(inventory.vae_source().canonical_path())?;
+            inventory
+                .ensure_unchanged()
+                .map_err(|error| Error::Msg(error.to_string()))?;
+            vae
+        }
+        None => loader::load_vae(root)?,
+    };
     if let Some(q) = spec.quantize {
         let bits = q.bits();
         if stream_inventory.is_some() {
@@ -272,25 +311,40 @@ fn build_residency(
     match spec.offload_policy {
         OffloadPolicy::Resident => Residency::from_policy(
             OffloadPolicy::Resident,
-            move || load_flux_text(variant, &spec_text),
+            move || load_flux_text(variant, &spec_text, None),
             move |use_pid| load_flux_heavy(variant, &spec_heavy, use_pid, None),
         ),
-        OffloadPolicy::Sequential => Ok(Residency::request_scoped(
-            move |_streamable| load_flux_text(variant, &spec_text),
-            move |use_pid, streamable| {
-                let inventory = if streamable {
-                    Some(stream_inventory.as_ref().ok_or_else(|| {
-                        Error::Unsupported(
-                            "flux1: block streaming requested without a verified inventory"
-                                .to_owned(),
-                        )
-                    })?)
-                } else {
-                    None
-                };
-                load_flux_heavy(variant, &spec_heavy, use_pid, inventory)
-            },
-        )),
+        OffloadPolicy::Sequential => {
+            let text_inventory = stream_inventory.clone();
+            Ok(Residency::request_scoped(
+                move |streamable| {
+                    let inventory = if streamable {
+                        Some(text_inventory.as_ref().ok_or_else(|| {
+                            Error::Unsupported(
+                                "flux1: block streaming requested without a verified inventory"
+                                    .to_owned(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+                    load_flux_text(variant, &spec_text, inventory)
+                },
+                move |use_pid, streamable| {
+                    let inventory = if streamable {
+                        Some(stream_inventory.as_ref().ok_or_else(|| {
+                            Error::Unsupported(
+                                "flux1: block streaming requested without a verified inventory"
+                                    .to_owned(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+                    load_flux_heavy(variant, &spec_heavy, use_pid, inventory)
+                },
+            ))
+        }
     }
 }
 

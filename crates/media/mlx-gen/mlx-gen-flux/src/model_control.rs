@@ -191,7 +191,7 @@ fn build_control_residency(
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_flux_text(FluxVariant::Dev, &spec_text),
+        move || load_flux_text(FluxVariant::Dev, &spec_text, None),
         // The control variant has no PiD overlay, so the heavy loader ignores `use_pid`.
         move |_use_pid| load_control_heavy(&spec_heavy),
     )
