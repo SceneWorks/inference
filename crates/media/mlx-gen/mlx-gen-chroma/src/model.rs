@@ -1121,13 +1121,13 @@ mod tests {
         (minimum_cosine, maximum_mae, peak)
     }
 
-    /// One bounded q8-transformer calibration for sc-16462. The production policy already passes
-    /// the strict q4 render and all component/residency gates, but its identical auxiliary payload
-    /// misses q8 MAE by 0.1967. Rank every remaining attention block individually, then add that
-    /// ranking cumulatively in this same process until the smallest viable expansion is observed.
+    /// One bounded q8-transformer calibration for sc-16462. The exhaustive single-block sweep
+    /// found block 20 to be the closest strict-quality correction, but it missed by only 0.0321
+    /// MAE and 0.0000076 cosine. Pair it exactly once with every other non-production attention
+    /// block to search the next-smallest affine surface without changing residual widths.
     #[test]
     #[ignore = "needs the shipped Chroma Base Q8 tier and Apple Silicon MLX"]
-    fn packed_t5_q8_attention_affine_sweep() {
+    fn packed_t5_q8_attention_affine_pair_sweep() {
         use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
 
         let baseline = PathBuf::from(
@@ -1149,54 +1149,18 @@ mod tests {
             .map(|block| (block, FeedForward))
             .collect::<Vec<_>>();
         current_f32.push((4, Attention));
-        measure_q8_affine_candidate(
-            &baseline_spec,
-            &reference,
-            reference_peak,
-            "current-production",
-            &current_f32,
-        );
-
-        let mut individuals = Vec::with_capacity(23);
-        for block in (0..24).filter(|block| *block != 4) {
+        current_f32.push((20, Attention));
+        for block in (0..24).filter(|block| *block != 4 && *block != 20) {
             let mut candidate = current_f32.clone();
             candidate.push((block, Attention));
-            let policy = format!("current-plus-attention-{block}");
-            let (cosine, mae, peak) = measure_q8_affine_candidate(
+            let policy = format!("current-plus-attention-20-and-{block}");
+            measure_q8_affine_candidate(
                 &baseline_spec,
                 &reference,
                 reference_peak,
                 &policy,
                 &candidate,
             );
-            individuals.push((block, cosine, mae, peak));
-        }
-
-        individuals.sort_by(|left, right| {
-            left.2
-                .total_cmp(&right.2)
-                .then_with(|| right.1.total_cmp(&left.1))
-        });
-        if individuals.iter().any(|(_, cosine, mae, peak)| {
-            *cosine >= 0.9999 && *mae <= 1.0 && *peak < reference_peak
-        }) {
-            return;
-        }
-
-        let mut cumulative = current_f32;
-        for (rank, (block, _, _, _)) in individuals.iter().enumerate() {
-            cumulative.push((*block, Attention));
-            let policy = format!("ranked-cumulative-{}", rank + 1);
-            let (cosine, mae, peak) = measure_q8_affine_candidate(
-                &baseline_spec,
-                &reference,
-                reference_peak,
-                &policy,
-                &cumulative,
-            );
-            if cosine >= 0.9999 && mae <= 1.0 && peak < reference_peak {
-                break;
-            }
         }
     }
 }
