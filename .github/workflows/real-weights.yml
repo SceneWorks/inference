@@ -172,53 +172,53 @@ jobs:
             sed -n 's/^.*SC16462_RESIDENCY //p' "$RUNNER_TEMP/chroma-q$bits-residency.log" \
               >> "$CHROMA_RESIDENCY_RAW"
             python3 - <<'PY'
-            import json
-            import os
-            from pathlib import Path
-            from statistics import median
+          import json
+          import os
+          from pathlib import Path
+          from statistics import median
 
-            tier = f"q{os.environ['SC8777_BITS']}"
-            rows = [
-                json.loads(line)
-                for line in Path(os.environ["CHROMA_RESIDENCY_RAW"]).read_text().splitlines()
-            ]
-            rows = [row for row in rows if row["tier"] == tier]
-            if len(rows) != 18:
-                raise SystemExit(f"{tier}: expected 18 fresh-process residency rows, got {len(rows)}")
-            peaks = {}
-            for component in ("t5", "vae"):
-                peaks[component] = {}
-                for mode in ("dense", "load-time", "packed"):
-                    values = [
-                        row["peakBytes"]
-                        for row in rows
-                        if row["component"] == component and row["mode"] == mode
-                    ]
-                    if len(values) != 3:
-                        raise SystemExit(
-                            f"{tier}/{component}/{mode}: expected 3 measurements, got {len(values)}"
-                        )
-                    peaks[component][mode] = {
-                        "median": int(median(values)),
-                        "samples": values,
-                    }
-                packed = peaks[component]["packed"]["median"]
-                load_time = peaks[component]["load-time"]["median"]
-                if packed >= load_time:
-                    raise SystemExit(
-                        f"{tier}/{component}: packed median {packed} must be below load-time {load_time}"
-                    )
-            summary = {
-                "model": os.environ["CHROMA_MODEL"],
-                "tier": tier,
-                "auxiliaryBits": 8,
-                "groupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
-                "freshProcessMedianPeakBytes": peaks,
-            }
-            with Path(os.environ["CHROMA_RESIDENCY_SUMMARY"]).open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(summary, sort_keys=True) + "\n")
-            print("SC16462_RESIDENCY_SUMMARY " + json.dumps(summary, sort_keys=True))
-            PY
+          tier = f"q{os.environ['SC8777_BITS']}"
+          rows = [
+              json.loads(line)
+              for line in Path(os.environ["CHROMA_RESIDENCY_RAW"]).read_text().splitlines()
+          ]
+          rows = [row for row in rows if row["tier"] == tier]
+          if len(rows) != 18:
+              raise SystemExit(f"{tier}: expected 18 fresh-process residency rows, got {len(rows)}")
+          peaks = {}
+          for component in ("t5", "vae"):
+              peaks[component] = {}
+              for mode in ("dense", "load-time", "packed"):
+                  values = [
+                      row["peakBytes"]
+                      for row in rows
+                      if row["component"] == component and row["mode"] == mode
+                  ]
+                  if len(values) != 3:
+                      raise SystemExit(
+                          f"{tier}/{component}/{mode}: expected 3 measurements, got {len(values)}"
+                      )
+                  peaks[component][mode] = {
+                      "median": int(median(values)),
+                      "samples": values,
+                  }
+              packed = peaks[component]["packed"]["median"]
+              load_time = peaks[component]["load-time"]["median"]
+              if packed >= load_time:
+                  raise SystemExit(
+                      f"{tier}/{component}: packed median {packed} must be below load-time {load_time}"
+                  )
+          summary = {
+              "model": os.environ["CHROMA_MODEL"],
+              "tier": tier,
+              "auxiliaryBits": 8,
+              "groupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
+              "freshProcessMedianPeakBytes": peaks,
+          }
+          with Path(os.environ["CHROMA_RESIDENCY_SUMMARY"]).open("a", encoding="utf-8") as handle:
+              handle.write(json.dumps(summary, sort_keys=True) + "\n")
+          print("SC16462_RESIDENCY_SUMMARY " + json.dumps(summary, sort_keys=True))
+          PY
             cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
               packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak -- --ignored \
               --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-calibration.log"
