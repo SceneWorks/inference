@@ -974,11 +974,36 @@ mod tests {
         );
     }
 
-    fn load_render_calibration_candidate(spec: &LoadSpec, group_size: i32) -> Result<Chroma> {
+    fn load_render_calibration_candidate(
+        spec: &LoadSpec,
+        secondary_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
+    ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_with_group_size(crate::convert::AUXILIARY_BITS, group_size)?;
+        let sensitive_sublayers = [
+            (4, mlx_gen_flux::T5Sublayer::Attention),
+            (1, mlx_gen_flux::T5Sublayer::FeedForward),
+            (2, mlx_gen_flux::T5Sublayer::FeedForward),
+            (18, mlx_gen_flux::T5Sublayer::FeedForward),
+            (15, mlx_gen_flux::T5Sublayer::Attention),
+            (1, mlx_gen_flux::T5Sublayer::Attention),
+            (16, mlx_gen_flux::T5Sublayer::Attention),
+            (14, mlx_gen_flux::T5Sublayer::Attention),
+            (18, mlx_gen_flux::T5Sublayer::Attention),
+            (19, mlx_gen_flux::T5Sublayer::Attention),
+            (13, mlx_gen_flux::T5Sublayer::FeedForward),
+        ];
+        t5.quantize_progressive_with_secondary_residuals(
+            crate::convert::AUXILIARY_BITS,
+            crate::convert::T5_RESIDUAL_BITS,
+            crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+            4,
+            crate::convert::T5_GROUP_SIZE,
+            &sensitive_sublayers,
+            false,
+            secondary_sublayers,
+        )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
             t5,
@@ -1071,15 +1096,45 @@ mod tests {
         drop(reference_model);
         clear_cache();
 
-        // Progressive residuals and boundary reconstruction variants all failed the unchanged
-        // strict render gate. Measure the remaining packed affine architecture: one Q8 term per
-        // complete T5 weight, with no residual qmm accumulation, at both valid group sizes.
-        let candidates = [("single-q8-group32", 32), ("single-q8-group64", 64)];
+        use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
 
-        for (policy, group_size) in candidates {
+        // Isolated third terms regressed, but the established top10+block13 first-residual surface
+        // is only 0.033 MAE outside the strict gate. Test one coherent Q4 correction across each
+        // remaining projection family, then their union. Boundaries and already-sensitive blocks
+        // are excluded because exact diagnostics showed that adding terms there regresses quality.
+        let sensitive_sublayers = [
+            (4, Attention),
+            (1, FeedForward),
+            (2, FeedForward),
+            (18, FeedForward),
+            (15, Attention),
+            (1, Attention),
+            (16, Attention),
+            (14, Attention),
+            (18, Attention),
+            (19, Attention),
+            (13, FeedForward),
+        ];
+        let remaining_attention = (0..24)
+            .map(|block| (block, Attention))
+            .filter(|sublayer| !sensitive_sublayers.contains(sublayer))
+            .collect::<Vec<_>>();
+        let remaining_feed_forward = (0..24)
+            .map(|block| (block, FeedForward))
+            .filter(|sublayer| !sensitive_sublayers.contains(sublayer))
+            .collect::<Vec<_>>();
+        let mut remaining_all = remaining_attention.clone();
+        remaining_all.extend(remaining_feed_forward.iter().copied());
+        let candidates = [
+            ("secondary-q4-remaining-attention", remaining_attention),
+            ("secondary-q4-remaining-ffn", remaining_feed_forward),
+            ("secondary-q4-remaining-all", remaining_all),
+        ];
+
+        for (policy, secondary_sublayers) in candidates {
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(&baseline_spec, group_size)
+            let model = load_render_calibration_candidate(&baseline_spec, &secondary_sublayers)
                 .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
@@ -1101,8 +1156,31 @@ mod tests {
                 serde_json::json!({
                     "policy": policy,
                     "primaryBits": crate::convert::AUXILIARY_BITS,
-                    "residualBits": serde_json::Value::Null,
-                    "groupSize": group_size,
+                    "residualBits": crate::convert::T5_RESIDUAL_BITS,
+                    "sensitiveResidualBits": crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
+                    "sensitiveSublayers": sensitive_sublayers
+                        .iter()
+                        .map(|(block, sublayer)| serde_json::json!({
+                            "block": block,
+                            "sublayer": match sublayer {
+                                Attention => "attention",
+                                FeedForward => "ffn",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                    "secondaryBits": 4,
+                    "secondaryBoundaries": false,
+                    "secondarySublayers": secondary_sublayers
+                        .iter()
+                        .map(|(block, sublayer)| serde_json::json!({
+                            "block": block,
+                            "sublayer": match sublayer {
+                                Attention => "attention",
+                                FeedForward => "ffn",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                    "groupSize": crate::convert::T5_GROUP_SIZE,
                     "minimumImageCosine": minimum_cosine,
                     "maximumMeanAbsolutePixelError": maximum_mae,
                     "passesStrictQuality": minimum_cosine >= 0.9999 && maximum_mae <= 1.0,
