@@ -258,11 +258,7 @@ fn calibration_fingerprint(
     }
 }
 
-pub(crate) fn can_stream_gen_with_artifact(
-    provider_id: &str,
-    spec: &LoadSpec,
-    artifact: Option<&PinnedArtifact>,
-) -> bool {
+fn structurally_can_stream_gen(provider_id: &str, spec: &LoadSpec) -> bool {
     if spec.load_shape != LoadShape::DeferredMaterialization
         || spec.precision != mlx_gen::Precision::Bf16
         || !spec.adapters.is_empty()
@@ -274,8 +270,18 @@ pub(crate) fn can_stream_gen_with_artifact(
         || spec.identity.is_some()
         || spec.text_encoder.is_some()
         || !matches!(spec.weights, WeightsSource::Dir(_))
-        || artifact.is_none()
     {
+        return false;
+    }
+    matches!(provider_id, crate::MODEL_ID | crate::MODEL_ID_FAST)
+}
+
+pub(crate) fn can_stream_gen_with_artifact(
+    provider_id: &str,
+    spec: &LoadSpec,
+    artifact: Option<&PinnedArtifact>,
+) -> bool {
+    if !structurally_can_stream_gen(provider_id, spec) || artifact.is_none() {
         return false;
     }
     if provider_id == crate::MODEL_ID_FAST {
@@ -286,7 +292,7 @@ pub(crate) fn can_stream_gen_with_artifact(
         // those unmerged blocks would silently change the model; only a pre-merged turnkey is exact.
         return root.join(crate::DISTILL_MERGED_MARKER).is_file();
     }
-    provider_id == crate::MODEL_ID
+    true
 }
 
 pub fn memory_strategy_contract(
@@ -303,17 +309,21 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    let mut contract = memory_strategy_contract_with_artifact(provider_id, spec, None)?;
     let route = if provider_id == crate::MODEL_ID_FAST {
         "fast"
     } else {
         "quality"
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        format!("{STATIC_BEHAVIOR_CALIBRATION}-{route}"),
-        spec.load_shape,
-    ));
-    Ok(contract)
+    build_memory_strategy_contract(
+        provider_id,
+        spec,
+        mlx_gen::gen_core::PerComponentBytes::default(),
+        structurally_can_stream_gen(provider_id, spec),
+        Some(MemoryCalibrationIdentity::new(
+            format!("{STATIC_BEHAVIOR_CALIBRATION}-{route}"),
+            spec.load_shape,
+        )),
+    )
 }
 
 pub(crate) fn memory_strategy_contract_with_artifact(
@@ -323,6 +333,18 @@ pub(crate) fn memory_strategy_contract_with_artifact(
 ) -> CoreResult<MemoryProviderContract> {
     let footprint = crate::model::component_footprint(spec)?;
     let streamable = can_stream_gen_with_artifact(provider_id, spec, artifact);
+    let calibration = calibration_fingerprint(provider_id, spec, artifact)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    build_memory_strategy_contract(provider_id, spec, footprint, streamable, calibration)
+}
+
+fn build_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    footprint: mlx_gen::gen_core::PerComponentBytes,
+    streamable: bool,
+    calibration: Option<MemoryCalibrationIdentity>,
+) -> CoreResult<MemoryProviderContract> {
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -333,8 +355,7 @@ pub(crate) fn memory_strategy_contract_with_artifact(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.calibration = calibration_fingerprint(provider_id, spec, artifact)
-        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
         variables: vec![
@@ -649,29 +670,45 @@ mod tests {
     fn static_behavior_calibration_never_grants_unknown_runtime_artifacts() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(LoadShape::DeferredMaterialization);
-        let runtime = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
-        assert!(runtime.calibration.is_none());
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let runtime = memory_strategy_contract(provider_id, &spec).unwrap();
+            assert!(runtime.calibration.is_none());
 
-        let fixture_contract =
-            weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
-        assert!(fixture_contract
-            .calibration
-            .as_ref()
-            .unwrap()
-            .fingerprint
-            .starts_with(STATIC_BEHAVIOR_CALIBRATION));
-        let fixtures =
-            registered_valid_fixture(&spec, &fixture_contract, MemoryStrategy::BoundedAttention)
-                .unwrap();
-        assert_eq!(fixtures.len(), 2);
-        assert_eq!(
-            registered_safety_check(&spec, &fixture_contract, &fixtures[0].context),
-            MemorySafetyDecision::Accept
-        );
-        assert!(matches!(
-            registered_safety_check(&spec, &runtime, &fixtures[0].context),
-            MemorySafetyDecision::Reject { .. }
-        ));
+            // This path does not exist: successful fixture construction proves the static builder
+            // performs no footprint, inventory, marker, or artifact traversal.
+            let fixture_contract =
+                weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                fixture_contract.asset_facts,
+                mlx_gen::gen_core::MemoryAssetFacts::default()
+            );
+            assert!(fixture_contract
+                .calibration
+                .as_ref()
+                .unwrap()
+                .fingerprint
+                .starts_with(STATIC_BEHAVIOR_CALIBRATION));
+            for strategy in [
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ] {
+                assert_eq!(
+                    fixture_contract.capability(strategy).unwrap().support,
+                    MemoryStrategySupport::Implemented
+                );
+                let fixtures =
+                    registered_valid_fixture(&spec, &fixture_contract, strategy).unwrap();
+                assert_eq!(fixtures.len(), 2);
+                assert_eq!(
+                    registered_safety_check(&spec, &fixture_contract, &fixtures[0].context),
+                    MemorySafetyDecision::Accept
+                );
+                assert!(matches!(
+                    registered_safety_check(&spec, &runtime, &fixtures[0].context),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+            }
+        }
     }
 
     #[test]
