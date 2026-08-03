@@ -14,8 +14,9 @@ Lazy pipeline construction calls `AdapterPlan::to_device`; it copies the retaine
 selected device and does not retain or revisit `AdapterSpec` paths. The weight-free regression
 removes the adapter file after planning and requires transfer to preserve the plan and values. The
 real-weight production-route regression removes the file after `load_variant` and requires first
-generation to succeed. Those tests fail if parsing, tensor loading, or plan construction happens a
-second time.
+generation to succeed. Those tests fail if parsing or tensor loading happens a second time. A
+dependency-injected unit seam counts exactly one load per requested adapter and one build for the
+complete stack; its builder is `FnOnce`, making a second plan-construction call a compile error.
 
 This does **not** correct or optimize Jacobi SVD. SVD was never duplicated by the two planning
 calls: `-xs` bases are computed only while an adapter is folded into a base checkpoint weight.

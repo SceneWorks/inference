@@ -382,7 +382,8 @@ impl Variant {
     ///
     /// It means a request that omits `audio.target_duration` renders **380 s** — a 6.3-minute track.
     /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load. The ≈ 10–16 minute CPU
-    /// figure is an estimate inferred from small-model CPU throughput, not a measured 380 s render.
+    /// figure is an estimate inferred from short-duration medium CPU runs, not a measured 380 s
+    /// render.
     /// The smalls' unspecified-duration render is 120 s / ≈ 10 s on Metal, so this is an order of
     /// magnitude more expensive for the same omission.
     ///

@@ -1147,16 +1147,16 @@ fn the_plan_preserves_request_order_at_both_ends() {
     assert_eq!(ops[1].adapter_index, 1);
 }
 
-/// `adapter_index` is the position in the caller's **original** request, across the zero-scale
-/// filter.
+/// `adapter_index` is the position in the caller's **original** request, across zero-scale op
+/// suppression.
 ///
-/// `plan_for` validates the whole stack, then rebuilds the plan from the zero-scale-**filtered**
-/// slice. Numbering the ops positionally while rebuilding would renumber the survivors: for
+/// `plan_for` validates the whole stack once and suppresses op insertion for zero-scale members.
+/// Numbering the ops by their position among inserted ops would renumber the survivors: for
 /// `[zero, live]` the live op would report index 0 and an error message would blame the wrong
 /// adapter — the inert one the caller explicitly turned off. Every other case in this file stacks
-/// only live adapters, so the filter is invisible to them and the bug is unobservable there.
+/// only live adapters, so the suppression is invisible to them and the bug is unobservable there.
 #[test]
-fn adapter_index_survives_the_zero_scale_filter() {
+fn adapter_index_survives_zero_scale_op_suppression() {
     let dir = scratch("index-filter");
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let targets = small_targets(TARGET, out_features, in_features);

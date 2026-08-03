@@ -287,7 +287,7 @@ Netting the cold start out of the 30 s / 8-step point leaves ≈ 55.5 s of gener
 for the same configuration on Metal (the 25-render calibration sweep completes in 161.79 s including
 one load). **CPU is ≈ 10× slower**, i.e. ≈ 0.54× realtime at 30 s / 8 steps, where Metal runs at
 ≈ 5.7× realtime. Extrapolating the ratio gives a **10–16 minute estimate** for a 380-second CPU
-render. That number is inferred from small-model CPU throughput and the measured 57–92 s Metal
+render. That number is inferred from short-duration medium CPU runs and the measured 57–92 s Metal
 render; it is not a measurement of a 380-second CPU render.
 
 That is slow, and it is not unusable — so CPU stays registered and no lane returns

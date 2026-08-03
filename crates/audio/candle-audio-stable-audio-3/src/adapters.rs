@@ -240,10 +240,9 @@ pub struct LoadedAdapter {
     /// Position in the caller's [`candle_audio::gen_core::LoadSpec::adapters`].
     ///
     /// Assigned by [`plan_for`], which is the only place that can know it: [`load_adapter`] reads
-    /// one path and has no view of the stack, so it leaves this `0`. It is carried on the adapter
-    /// rather than recomputed while planning because [`plan_for`] builds the plan a second time
-    /// over the **zero-scale-filtered** slice, and a positional `enumerate()` there would renumber
-    /// the survivors — reporting the live member of `[zero, live]` as index 0.
+    /// one path and has no view of the stack, so it leaves this `0`. Carrying the original index on
+    /// the loaded adapter lets [`AdapterPlan::build`] suppress zero-scale ops without renumbering
+    /// later live members — the live member of `[zero, live]` must still report index 1.
     pub spec_index: usize,
 }
 
@@ -415,7 +414,7 @@ pub struct AdapterOp {
     pub module: AdapterModule,
     /// Which entry of [`candle_audio::gen_core::LoadSpec::adapters`] this came from, for error
     /// messages. This is [`LoadedAdapter::spec_index`] — the position in the caller's **original**
-    /// request, not in the zero-scale-filtered slice the surviving plan is built from.
+    /// request, including zero-scale entries that were validated but contributed no op.
     pub adapter_index: usize,
 }
 
@@ -510,8 +509,9 @@ impl AdapterPlan {
     ) -> Result<Self> {
         let mut by_target: BTreeMap<String, Vec<AdapterOp>> = BTreeMap::new();
         for adapter in adapters {
-            // `adapter.spec_index`, never `enumerate()`: this function is called a second time over
-            // the zero-scale-filtered slice, where a positional index would be the wrong one.
+            // `adapter.spec_index`, never `enumerate()`: zero-scale entries remain in this single
+            // validation pass but contribute no op, so later live entries retain their request
+            // positions.
             let adapter_index = adapter.spec_index;
             let mut matched = 0usize;
             for (key, module) in &adapter.modules {
@@ -534,14 +534,16 @@ impl AdapterPlan {
                     )));
                 }
                 validate_module_against_target(adapter, key, module, shape)?;
-                by_target.entry(key.clone()).or_default().push(AdapterOp {
-                    kind: adapter.kind,
-                    effective_scale: (adapter.alpha as f64 / adapter.rank as f64)
-                        * adapter.scale as f64,
-                    rank: adapter.rank,
-                    module: module.clone(),
-                    adapter_index,
-                });
+                if adapter.scale != 0.0 {
+                    by_target.entry(key.clone()).or_default().push(AdapterOp {
+                        kind: adapter.kind,
+                        effective_scale: (adapter.alpha as f64 / adapter.rank as f64)
+                            * adapter.scale as f64,
+                        rank: adapter.rank,
+                        module: module.clone(),
+                        adapter_index,
+                    });
+                }
                 matched += 1;
             }
             if matched == 0 {
@@ -713,8 +715,8 @@ fn expect_shape(
 ///
 /// # `scale == 0.0`
 ///
-/// Never reaches here: [`AdapterPlan::build`]'s callers drop zero-scale adapters before an op is
-/// created, so a zero-scale stack produces an *empty plan* and the wrapper is not installed at all.
+/// Never reaches here: [`AdapterPlan::build`] validates zero-scale adapters but does not create ops
+/// for them, so a zero-scale stack produces an *empty plan* and the wrapper is not installed at all.
 /// That is the difference between "multiplies by zero" and "does not run" — the former turns a
 /// `NaN` or an `inf` in the adapter into a `NaN` in the weight, and is not bit-identical for a
 /// denormal base either.
@@ -1336,26 +1338,84 @@ pub fn plan_for(
     targets: &BTreeMap<String, Vec<usize>>,
     device: &Device,
 ) -> Result<AdapterPlan> {
+    plan_for_with(specs, targets, device, load_adapter, AdapterPlan::build)
+}
+
+/// Dependency-injected core of [`plan_for`].
+///
+/// `build` is deliberately `FnOnce`: the type system makes a second plan-construction pass
+/// impossible here. Tests also substitute counting closures to pin one load per spec and exactly
+/// one build without process-global instrumentation.
+fn plan_for_with<Load, Build>(
+    specs: &[AdapterSpec],
+    targets: &BTreeMap<String, Vec<usize>>,
+    device: &Device,
+    mut load: Load,
+    build: Build,
+) -> Result<AdapterPlan>
+where
+    Load: FnMut(&AdapterSpec, &Device) -> Result<LoadedAdapter>,
+    Build: FnOnce(&[LoadedAdapter], &BTreeMap<String, Vec<usize>>) -> Result<AdapterPlan>,
+{
     let mut loaded = Vec::with_capacity(specs.len());
     for (index, spec) in specs.iter().enumerate() {
-        let mut adapter = load_adapter(spec, device)?;
-        // Stamped here and carried through the zero-scale filter below, so an op built from the
-        // filtered slice still reports the caller's original position.
+        let mut adapter = load(spec, device)?;
+        // Stamped before the single validation/build pass so suppressing a zero-scale op cannot
+        // renumber the later live entries.
         adapter.spec_index = index;
         loaded.push(adapter);
     }
-    // Resolve the FULL stack — zero-scale members included — against the checkpoint. This call is
-    // the validation: a zero-scale adapter with a mistyped key, a wrong rank or a shape that does
-    // not fit its target is refused here, exactly as a scale-1.0 one would be. Discarding the
-    // result is the point; what survives is that it did not error.
-    AdapterPlan::build(&loaded, targets)?;
+    // The one pass validates the full stack, including zero-scale members, while `build` suppresses
+    // arithmetic ops for those members after validation.
+    build(&loaded, targets)
+}
 
-    let active: Vec<LoadedAdapter> = loaded
-        .into_iter()
-        .filter(|adapter| adapter.scale != 0.0)
-        .collect();
-    if active.is_empty() {
-        return Ok(AdapterPlan::default());
+#[cfg(test)]
+mod invocation_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn plan_for_loads_each_spec_once_and_builds_once() {
+        let specs = [
+            AdapterSpec::new(PathBuf::from("zero.safetensors"), 0.0, AdapterKind::Lora),
+            AdapterSpec::new(PathBuf::from("live.safetensors"), 1.0, AdapterKind::Lora),
+        ];
+        let loads = Cell::new(0usize);
+        let builds = Cell::new(0usize);
+        let targets = BTreeMap::new();
+
+        let plan = plan_for_with(
+            &specs,
+            &targets,
+            &Device::Cpu,
+            |spec, _device| {
+                loads.set(loads.get() + 1);
+                Ok(LoadedAdapter {
+                    path: spec.path.clone(),
+                    kind: AdapterType::Lora,
+                    rank: 1,
+                    alpha: 1.0,
+                    scale: spec.scale,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    modules: BTreeMap::new(),
+                    spec_index: usize::MAX,
+                })
+            },
+            |loaded, _targets| {
+                builds.set(builds.get() + 1);
+                assert_eq!(loaded.len(), specs.len());
+                assert_eq!(loaded[0].spec_index, 0);
+                assert_eq!(loaded[1].spec_index, 1);
+                Ok(AdapterPlan::default())
+            },
+        )
+        .expect("counted plan");
+
+        assert!(plan.is_empty());
+        assert_eq!(loads.get(), specs.len(), "each adapter must load once");
+        assert_eq!(builds.get(), 1, "the complete stack must be planned once");
     }
-    AdapterPlan::build(&active, targets)
 }
