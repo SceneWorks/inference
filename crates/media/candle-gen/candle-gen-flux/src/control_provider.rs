@@ -38,7 +38,8 @@ use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::preview::PreviewHook;
 use candle_gen::{CandleError, Result};
 
 use crate::control::{accepts_control_kind, FluxControlNet, FluxControlNetConfig};
@@ -94,6 +95,12 @@ pub struct Flux1ControlRequest {
     pub seed: u64,
     /// Shared FLUX memory ladder selected by worker admission.
     pub memory: GenerationMemory,
+    /// Per-step latent-preview sink (epic 16948, sc-16956) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot carry because it is worker-invoked by name rather than through a
+    /// registered descriptor. Default is inert, and an inert sink makes a seeded render byte-identical
+    /// to one with no preview at all.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -110,6 +117,7 @@ impl Default for Flux1ControlRequest {
             control_kind: "pose".into(),
             seed: 0,
             memory: GenerationMemory::default(),
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -311,6 +319,10 @@ impl Flux1DevControl {
         let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
         let guidance = req.guidance as f64;
 
+        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
+        // decode below is given. Both public entry points reach this one body, so `generate` and
+        // `generate_with_injector` cannot diverge on whether the sink is forwarded.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
             &state,
             &control_latent,
@@ -320,6 +332,7 @@ impl Flux1DevControl {
             injector,
             heavy.as_ref(),
             req.seed,
+            &preview,
             &req.cancel,
             on_progress,
         )?;
@@ -380,6 +393,7 @@ impl Flux1DevControl {
         injector: Option<&dyn DitImageInjector>,
         heavy: Option<&FluxRefHeavy>,
         seed: u64,
+        preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
@@ -397,7 +411,7 @@ impl Flux1DevControl {
             seed,
             cancel,
             on_progress,
-            None,
+            Some(preview),
             |img, t| -> Result<Tensor> {
                 candle_gen::check_cancel(cancel)?;
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;

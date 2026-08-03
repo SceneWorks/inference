@@ -84,6 +84,10 @@ fn real_weight_control() {
         control_kind: kind.clone(),
         seed: 12345,
         memory: candle_gen::gen_core::GenerationMemory::default(),
+        // This harness measures control steering, not previews; the strip has its own real-weight row
+        // (`tests/preview_real_weights.rs`, sc-16956). An inert sink leaves the seeded render
+        // byte-identical to what this row measured before the field existed.
+        preview: candle_gen::gen_core::PreviewSink::default(),
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};

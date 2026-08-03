@@ -648,6 +648,11 @@ impl Pipeline {
     /// the model sees `t == σ` directly, NOT `t·1000`); guidance is a per-batch tensor only embedded by
     /// the dev DiT. Cancellation + progress are owned by the driver; the per-step DiT forward (and the
     /// guidance embed) live inside the `predict` closure, so a multi-eval solver re-runs the whole step.
+    ///
+    /// `preview` is this render's per-step latent-preview hook (epic 16948, sc-16956), built by the
+    /// caller from the SAME `(width, height)` it hands the decode tail. The driver owns frame numbering
+    /// and the multi-eval dedup; an inert sink costs one branch per evaluation and leaves the render
+    /// byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
@@ -657,6 +662,7 @@ impl Pipeline {
         guidance: f64,
         seed: u64,
         req: &GenerationRequest,
+        preview: &candle_gen::preview::PreviewHook<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let b_sz = state.img.dim(0)?;
@@ -684,7 +690,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(preview),
             |img, t| -> Result<Tensor> {
                 // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
@@ -1303,6 +1309,11 @@ impl Pipeline {
             } else {
                 get_schedule(steps, None)
             };
+            // Per-step latent preview (epic 16948, sc-16956), built per image from the SAME
+            // `(width, height)` the decode below is given — one source for the hook's geometry and the
+            // render's. Per image, not per batch: each seed is its own driver call and therefore its own
+            // trajectory, numbered from frame 1.
+            let preview = crate::preview::hook(&req.preview, req.width, req.height);
             let latents = self.denoise(
                 heavy.dit.as_ref(),
                 &state,
@@ -1310,6 +1321,7 @@ impl Pipeline {
                 guidance,
                 seed,
                 req,
+                &preview,
                 on_progress,
             )?;
             on_progress(Progress::Decoding);

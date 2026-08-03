@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 
@@ -75,6 +76,12 @@ pub struct IpAdapterFluxRequest {
     pub seed: u64,
     /// Shared FLUX memory ladder selected by worker admission.
     pub memory: GenerationMemory,
+    /// Per-step latent-preview sink (epic 16948, sc-16956) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot carry because it is worker-invoked by name rather than through a
+    /// registered descriptor. Default is inert, and an inert sink makes a seeded render byte-identical
+    /// to one with no preview at all.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -90,6 +97,7 @@ impl Default for IpAdapterFluxRequest {
             ip_adapter_scale: DEFAULT_IP_SCALE,
             seed: 0,
             memory: GenerationMemory::default(),
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -273,6 +281,10 @@ impl IpAdapterFlux {
             0.0
         };
 
+        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
+        // decode below is given. The XLabs reference tokens are injected inside the DiT forward and
+        // never join the running latent, so the strip shows the target image alone.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
             &state,
             &timesteps,
@@ -280,6 +292,7 @@ impl IpAdapterFlux {
             &injector,
             heavy.as_ref(),
             req.seed,
+            &preview,
             &req.cancel,
             on_progress,
         )?;
@@ -316,6 +329,7 @@ impl IpAdapterFlux {
         injector: &FluxIpInjector,
         heavy: Option<&FluxRefHeavy>,
         seed: u64,
+        preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
@@ -335,7 +349,7 @@ impl IpAdapterFlux {
             seed,
             cancel,
             on_progress,
-            None,
+            Some(preview),
             |img, t| -> Result<Tensor> {
                 // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
                 // driver's `CandleError`. The XLabs IP residual injection lives inside this closure.

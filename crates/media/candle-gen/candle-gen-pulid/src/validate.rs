@@ -128,6 +128,10 @@ fn real_weight_pulid() {
         seed: 12345,
         // Native VAE: this harness validates the face-identity pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        // Identity recovery, not previews: the strip has its own real-weight row
+        // (`tests/preview_real_weights.rs`, sc-16956). An inert sink leaves the seeded render
+        // byte-identical to what this row measured before the field existed.
+        preview: candle_gen::gen_core::PreviewSink::default(),
         cancel: CancelFlag::new(),
     };
 

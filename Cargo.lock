@@ -519,6 +519,7 @@ name = "candle-gen-chroma"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-flux",
  "candle-gen-pid",
  "candle-transformers",
  "image",
@@ -526,6 +527,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -575,6 +577,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -745,6 +748,7 @@ dependencies = [
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
+ "image",
  "rand",
  "rand_distr",
  "serde_json",

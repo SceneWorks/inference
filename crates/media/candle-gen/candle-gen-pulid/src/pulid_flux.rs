@@ -28,7 +28,8 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, PidWeights, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, PidWeights, PreviewSink, Progress};
+use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::{
@@ -47,7 +48,7 @@ const NUM_SINGLE_BLOCKS: usize = 38;
 const DTYPE: DType = DType::BF16;
 const COND_DTYPE: DType = DType::F32;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
-const LATENT_CHANNELS: usize = 16;
+pub(crate) const LATENT_CHANNELS: usize = 16;
 // FLUX dev's flow-match time-shift endpoints (`BASE_SHIFT`/`MAX_SHIFT`) and the `flow_mu` linear map
 // are shared from `candle-gen-flux` (sc-11249 / F-140) — PuLID (always dev) reuses the exact
 // parity-critical schedule constants rather than maintaining a third copy.
@@ -127,6 +128,13 @@ pub struct PulidFluxRequest {
     /// (4× SR → 2K/4K) instead of the native FLUX.1 VAE. PiD is a *generative* decoder, so face likeness
     /// may shift — the user judges per-generation. `false` (default) keeps the byte-exact VAE decode.
     pub use_pid: bool,
+    /// Per-step latent-preview sink (epic 16948, sc-16956) - the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which PuLID cannot carry because it registers no descriptor at all (a `BESPOKE_UTILITY_CRATES`
+    /// member the worker drives by name). Frames are the *image* latent alone; the identity embedding
+    /// is injected inside the DiT forward and never joins it (see [`crate::preview`]). Default is
+    /// inert, and an inert sink makes a seeded render byte-identical to one with no preview at all.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -144,6 +152,7 @@ impl Default for PulidFluxRequest {
             scheduler: None,
             seed: 0,
             use_pid: false,
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -351,6 +360,10 @@ impl PulidFlux {
         let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
         let guidance = req.guidance as f64;
 
+        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
+        // decode below is given. The PuLID CA identity residuals are injected inside the DiT forward
+        // and never join the running latent, so the strip shows the developing image alone.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
             &state,
             &timesteps,
@@ -360,6 +373,7 @@ impl PulidFlux {
             req.sampler.as_deref(),
             req.scheduler.as_deref(),
             req.seed,
+            &preview,
             &req.cancel,
             on_progress,
         )?;
@@ -398,6 +412,7 @@ impl PulidFlux {
         sampler: Option<&str>,
         scheduler: Option<&str>,
         seed: u64,
+        preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
@@ -420,7 +435,7 @@ impl PulidFlux {
             seed,
             cancel,
             on_progress,
-            None,
+            Some(preview),
             |img, t| -> Result<Tensor> {
                 // The backbone dispatches to the loaded tier's DiT (BFL `IpFlux` or packed
                 // `PackedFluxDit`) `forward_injected`; the PuLID CA identity injection lives inside this

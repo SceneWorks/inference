@@ -46,7 +46,7 @@ use crate::transformer::ChromaTransformer;
 use crate::vae::Vae;
 
 /// The VAE latent channel count (the DiT works on the 2×2-packed 64-ch form).
-const LATENT_CHANNELS: usize = 16;
+pub(crate) const LATENT_CHANNELS: usize = 16;
 
 /// A light pipeline handle: the snapshot `root`, variant, and compute device. Heavy components load
 /// via [`load_components`](Self::load_components) and are owned/cached by the generator.
@@ -204,6 +204,11 @@ impl Pipeline {
                 return Err(CandleError::Canceled);
             }
             let latents = self.initial_packed_noise(seed, req.height, req.width)?;
+            // Per-step latent preview (epic 16948, sc-16956), built per image from the SAME
+            // `(width, height)` the decode below is given — one source for the hook's geometry and the
+            // render's. Per image, not per batch: each seed is its own driver call and therefore its own
+            // trajectory, numbered from frame 1.
+            let preview = crate::preview::hook(&req.preview, req.width, req.height);
             let latents = self.denoise(
                 &components.transformer,
                 latents,
@@ -217,6 +222,7 @@ impl Pipeline {
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
                 seed,
+                &preview,
                 &req.cancel,
                 on_progress,
             )?;
@@ -239,7 +245,7 @@ impl Pipeline {
 
     /// Chroma's flow-match sigma schedule (length `steps + 1`, descending to a trailing `0`). HD/Flash
     /// use the static-shift `linspace(1, 1/N, N)`; Base uses the beta-spaced schedule.
-    fn sigmas(&self, steps: usize) -> Vec<f32> {
+    pub(crate) fn sigmas(&self, steps: usize) -> Vec<f32> {
         if self.variant.use_beta_sigmas() {
             crate::beta::base_sigmas(steps)
         } else {
@@ -301,6 +307,7 @@ impl Pipeline {
         sampler: Option<&str>,
         scheduler: Option<&str>,
         seed: u64,
+        preview: &candle_gen::preview::PreviewHook<'_>,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
@@ -317,7 +324,7 @@ impl Pipeline {
             seed,
             cancel,
             on_progress,
-            None,
+            Some(preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = Tensor::from_vec(vec![sigma], 1, &self.device)?;
                 // pooled_temb depends only on the timestep — compute once and share across both branches.
