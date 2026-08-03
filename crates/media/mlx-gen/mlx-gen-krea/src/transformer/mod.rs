@@ -875,27 +875,28 @@ pub(crate) fn executable_test_fixture(
             .map(|index| (((index + seed) % 19) as f32 - 9.0) * 0.0075)
             .collect()
     };
-    let mut linear = |base: &str, out: i32, input: i32, bias: bool, seed: usize| {
-        weights.insert(
-            format!("{base}.weight"),
-            Array::from_slice(&values((out * input) as usize, seed), &[out, input]),
-        );
-        if bias {
+    {
+        let mut linear = |base: &str, out: i32, input: i32, bias: bool, seed: usize| {
             weights.insert(
-                format!("{base}.bias"),
-                Array::from_slice(&values(out as usize, seed + 3), &[out]),
+                format!("{base}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed), &[out, input]),
             );
-        }
-    };
-    linear("img_in", 8, 64, true, 1);
-    linear("time_embed.linear_1", 8, 8, true, 2);
-    linear("time_embed.linear_2", 8, 8, true, 3);
-    linear("time_mod_proj", 48, 8, true, 4);
-    linear("txt_in.linear_1", 8, 8, true, 5);
-    linear("txt_in.linear_2", 8, 8, true, 6);
-    linear("final_layer.linear", 64, 8, true, 7);
-    linear("text_fusion.projector", 1, 1, false, 8);
-    drop(linear);
+            if bias {
+                weights.insert(
+                    format!("{base}.bias"),
+                    Array::from_slice(&values(out as usize, seed + 3), &[out]),
+                );
+            }
+        };
+        linear("img_in", 8, 64, true, 1);
+        linear("time_embed.linear_1", 8, 8, true, 2);
+        linear("time_embed.linear_2", 8, 8, true, 3);
+        linear("time_mod_proj", 48, 8, true, 4);
+        linear("txt_in.linear_1", 8, 8, true, 5);
+        linear("txt_in.linear_2", 8, 8, true, 6);
+        linear("final_layer.linear", 64, 8, true, 7);
+        linear("text_fusion.projector", 1, 1, false, 8);
+    }
     for key in ["txt_in.norm.weight", "final_layer.norm.weight"] {
         weights.insert(key, Array::from_slice(&[0.0_f32; 8], &[8]));
     }
@@ -1220,7 +1221,12 @@ mod tests {
             &[1, 16, 2, 2],
         );
         let edit_positive = transformer
-            .prepare_edit(&positive_context, None, &latent, &[reference.clone()])
+            .prepare_edit(
+                &positive_context,
+                None,
+                &latent,
+                std::slice::from_ref(&reference),
+            )
             .unwrap();
         let edit_negative = transformer
             .prepare_edit(&negative_context, None, &latent, &[reference])

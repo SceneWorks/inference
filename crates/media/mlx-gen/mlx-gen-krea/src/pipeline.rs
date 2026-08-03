@@ -1824,11 +1824,21 @@ mod tests {
         );
         let cfg_edit = EditPlan {
             prep_pos: dit
-                .prepare_edit(&positive_context, None, &latent, &[reference.clone()])
+                .prepare_edit(
+                    &positive_context,
+                    None,
+                    &latent,
+                    std::slice::from_ref(&reference),
+                )
                 .unwrap(),
             prep_neg: Some(
-                dit.prepare_edit(&negative_context, None, &latent, &[reference.clone()])
-                    .unwrap(),
+                dit.prepare_edit(
+                    &negative_context,
+                    None,
+                    &latent,
+                    std::slice::from_ref(&reference),
+                )
+                .unwrap(),
             ),
         };
         let plain_edit = EditPlan {
