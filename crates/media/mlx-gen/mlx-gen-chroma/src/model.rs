@@ -1121,13 +1121,13 @@ mod tests {
         (minimum_cosine, maximum_mae, peak)
     }
 
-    /// One bounded q8-transformer calibration for sc-16462. The exhaustive single-block sweep
-    /// found block 20 to be the closest strict-quality correction, but it missed by only 0.0321
-    /// MAE and 0.0000076 cosine. Pair it exactly once with every other non-production attention
-    /// block to search the next-smallest affine surface without changing residual widths.
+    /// One bounded q8-transformer calibration for sc-16462. The block-20-anchored pair sweep found
+    /// blocks 20+0 to be the closest correction at MAE 1.0254 while retaining a below-dense peak.
+    /// Add every remaining non-production attention block exactly once along that evidence-ranked
+    /// chain without changing residual widths.
     #[test]
     #[ignore = "needs the shipped Chroma Base Q8 tier and Apple Silicon MLX"]
-    fn packed_t5_q8_attention_affine_pair_sweep() {
+    fn packed_t5_q8_attention_affine_triple_sweep() {
         use mlx_gen_flux::T5Sublayer::{Attention, FeedForward};
 
         let baseline = PathBuf::from(
@@ -1150,10 +1150,11 @@ mod tests {
             .collect::<Vec<_>>();
         current_f32.push((4, Attention));
         current_f32.push((20, Attention));
-        for block in (0..24).filter(|block| *block != 4 && *block != 20) {
+        current_f32.push((0, Attention));
+        for block in (0..24).filter(|block| *block != 4 && *block != 20 && *block != 0) {
             let mut candidate = current_f32.clone();
             candidate.push((block, Attention));
-            let policy = format!("current-plus-attention-20-and-{block}");
+            let policy = format!("current-plus-attention-20-and-0-and-{block}");
             measure_q8_affine_candidate(
                 &baseline_spec,
                 &reference,
