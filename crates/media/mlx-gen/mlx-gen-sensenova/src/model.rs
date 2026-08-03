@@ -143,6 +143,8 @@ pub struct SenseNova {
     model: T2iModel,
     /// The 8-step distilled variant — selects the distilled generation defaults (8 NFE, CFG 1.0).
     fast: bool,
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_quant: Option<Quant>,
 }
 
 impl SenseNova {
@@ -228,7 +230,15 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     // name during `from_weights`; this additionally rejects extra/renamed tensors that would
     // otherwise load silently with whatever subset matches.
     check_coverage(weights.keys(), &cfg).require_no_unexpected(id)?;
-    let mut model = T2iModel::from_weights(&weights, &cfg)?;
+    let deferred_gen = spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
+        && distill_lora_path.is_none();
+    let mut model = if deferred_gen {
+        T2iModel::from_weights_deferred(&weights, &cfg, spec.weights.clone(), spec.quantize)?
+    } else {
+        // A fast dense-base load needs a runtime LoRA merge into all generation blocks. Keep that
+        // exact path eager; the contract refuses rung 4 until the artifact is a pre-merged turnkey.
+        T2iModel::from_weights(&weights, &cfg)?
+    };
     // The fast variant merges the 8-step distill LoRA into the dense generation path — UNLESS the
     // tier is a **pre-merged** turnkey (sc-8775: the packed/dense fast tiers bake the merge in at
     // convert time and drop `DISTILL_MERGED_MARKER`). A pre-merged tier must NOT re-merge: for a
@@ -262,6 +272,8 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         tokenizer,
         model,
         fast,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(id, spec)?,
+        loaded_quant: spec.quantize,
     }))
 }
 
@@ -298,6 +310,18 @@ impl SenseNova {
             num_steps: req.steps.unwrap_or(def_steps) as usize,
             timestep_shift: req.scheduler_shift.unwrap_or(DEFAULT_TIMESTEP_SHIFT),
             seed,
+            attention_score_budget: req
+                .memory
+                .filter(|memory| memory.chunk_attention)
+                .and_then(|memory| memory.attention_chunk_size),
+            transformer_window_size: req
+                .memory
+                .filter(|memory| memory.stream_transformer_blocks)
+                .and_then(|memory| memory.transformer_window_size),
+            calibration_stream_fault: req.memory.is_some_and(|memory| {
+                memory.calibration_fault_harness_authorized
+                    && memory.calibration_error_phase == Some(gen_core::MemoryPhase::Denoise)
+            }),
             ..Default::default()
         }
     }
@@ -322,6 +346,30 @@ impl Generator for SenseNova {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_quant, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.loaded_quant,
+            context,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        )
     }
 }
 
@@ -464,6 +512,38 @@ mlx_gen::register_generators! {
     pub(crate) const QUALITY_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+pub const QUALITY_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const FAST_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID_FAST,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_FAST, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const QUALITY_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
+pub const FAST_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_FAST,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID_FAST, spec, contract, context)
+        },
+    };
 mlx_gen::register_generators! {
     pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast;
     footprint = component_footprint

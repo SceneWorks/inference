@@ -25,9 +25,10 @@ use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Quant, Result, WeightsSource};
 
 // Shared on-device decode primitives (sc-7159): the growing-concat KV cache, the standard-RoPE
 // table builder, and the half-split rotation. The bespoke dual-path / dual-theta-MRoPE / block-mask
@@ -208,13 +209,17 @@ impl Mlp {
 
 struct Layer {
     input_ln: Array,
-    input_ln_gen: Array,
     post_ln: Array,
-    post_ln_gen: Array,
     attn_und: AttnPath,
-    attn_gen: AttnPath,
     mlp_und: Mlp,
-    mlp_gen: Mlp,
+    gen: Option<GenLayer>,
+}
+
+struct GenLayer {
+    input_ln: Array,
+    post_ln: Array,
+    attn: AttnPath,
+    mlp: Mlp,
 }
 
 impl Layer {
@@ -222,25 +227,83 @@ impl Layer {
         let attn = format!("{prefix}.self_attn");
         Ok(Self {
             input_ln: require(w, &format!("{prefix}.input_layernorm.weight"))?,
-            input_ln_gen: require(w, &format!("{prefix}.input_layernorm_mot_gen.weight"))?,
             post_ln: require(w, &format!("{prefix}.post_attention_layernorm.weight"))?,
-            post_ln_gen: require(
-                w,
-                &format!("{prefix}.post_attention_layernorm_mot_gen.weight"),
-            )?,
             attn_und: AttnPath::from_weights(w, &attn, "")?,
-            attn_gen: AttnPath::from_weights(w, &attn, "_mot_gen")?,
             mlp_und: Mlp::from_weights(w, &format!("{prefix}.mlp"))?,
-            mlp_gen: Mlp::from_weights(w, &format!("{prefix}.mlp_mot_gen"))?,
+            gen: Some(GenLayer::from_weights(w, prefix)?),
+        })
+    }
+
+    fn from_weights_deferred(w: &Weights, prefix: &str) -> Result<Self> {
+        let attn = format!("{prefix}.self_attn");
+        Ok(Self {
+            input_ln: require(w, &format!("{prefix}.input_layernorm.weight"))?,
+            post_ln: require(w, &format!("{prefix}.post_attention_layernorm.weight"))?,
+            attn_und: AttnPath::from_weights(w, &attn, "")?,
+            mlp_und: Mlp::from_weights(w, &format!("{prefix}.mlp"))?,
+            gen: None,
         })
     }
 
     /// Quantize both paths' attention projections + SwiGLU linears in place.
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn_und.quantize(bits)?;
-        self.attn_gen.quantize(bits)?;
         self.mlp_und.quantize(bits)?;
-        self.mlp_gen.quantize(bits)
+        if let Some(gen) = &mut self.gen {
+            gen.quantize(bits)?;
+        }
+        Ok(())
+    }
+}
+
+impl GenLayer {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            input_ln: require(w, &format!("{prefix}.input_layernorm_mot_gen.weight"))?,
+            post_ln: require(
+                w,
+                &format!("{prefix}.post_attention_layernorm_mot_gen.weight"),
+            )?,
+            attn: AttnPath::from_weights(w, &format!("{prefix}.self_attn"), "_mot_gen")?,
+            mlp: Mlp::from_weights(w, &format!("{prefix}.mlp_mot_gen"))?,
+        })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.mlp.quantize(bits)
+    }
+}
+
+#[derive(Clone)]
+struct GenBlockStream {
+    source: WeightsSource,
+    base: String,
+    n_blocks: usize,
+    quant: Option<Quant>,
+}
+
+impl GenBlockStream {
+    fn open(&self) -> Result<Weights> {
+        match &self.source {
+            WeightsSource::Dir(root) => Weights::from_dir(root),
+            WeightsSource::File(file) => Weights::from_file(file),
+        }
+    }
+
+    fn materialize(&self, view: &mut Weights, index: usize) -> Result<GenLayer> {
+        if index >= self.n_blocks {
+            return Err(Error::Msg(format!(
+                "sensenova gen block {index} is outside the {}-block stack",
+                self.n_blocks
+            )));
+        }
+        let mut layer = GenLayer::from_weights(view, &format!("{}.{index}", self.base))?;
+        if let Some(quant) = self.quant {
+            layer.quantize(quant.bits())?;
+        }
+        view.remove_accessed();
+        Ok(layer)
     }
 }
 
@@ -295,6 +358,7 @@ pub struct Qwen3Backbone {
     eps: f32,
     rope_theta: f32,
     rope_theta_hw: f32,
+    gen_stream: Option<GenBlockStream>,
 }
 
 /// Precomputed tri-axis RoPE tables (`(cos, sin)` per temporal/H/W axis) and the additive block
@@ -342,6 +406,48 @@ impl Qwen3Backbone {
             eps: cfg.llm.rms_norm_eps,
             rope_theta: cfg.llm.rope_theta,
             rope_theta_hw: cfg.llm.rope_theta_hw,
+            gen_stream: None,
+        })
+    }
+
+    /// Build the deferred load shape: understanding weights stay resident for prefix/VQA/text
+    /// work, while the generation half of every dual-path block is reopened in bounded windows only
+    /// during denoise.
+    pub fn from_weights_deferred(
+        w: &Weights,
+        cfg: &NeoChatConfig,
+        prefix: &str,
+        source: WeightsSource,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        let model = format!("{prefix}.model");
+        let layers = (0..cfg.llm.num_hidden_layers)
+            .map(|i| Layer::from_weights_deferred(w, &format!("{model}.layers.{i}")))
+            .collect::<Result<Vec<_>>>()?;
+        let embed_tokens = require(w, &format!("{model}.embed_tokens.weight"))?;
+        let lm_head = if cfg.tie_word_embeddings {
+            embed_tokens.clone()
+        } else {
+            require(w, &format!("{prefix}.lm_head.weight"))?
+        };
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm: require(w, &format!("{model}.norm.weight"))?,
+            norm_gen: require(w, &format!("{model}.norm_mot_gen.weight"))?,
+            lm_head,
+            num_heads: cfg.llm.num_attention_heads as i32,
+            num_kv_heads: cfg.llm.num_key_value_heads as i32,
+            head_dim: cfg.llm.head_dim() as i32,
+            eps: cfg.llm.rms_norm_eps,
+            rope_theta: cfg.llm.rope_theta,
+            rope_theta_hw: cfg.llm.rope_theta_hw,
+            gen_stream: Some(GenBlockStream {
+                source,
+                base: format!("{model}.layers"),
+                n_blocks: cfg.llm.num_hidden_layers,
+                quant,
+            }),
         })
     }
 
@@ -379,10 +485,16 @@ impl Qwen3Backbone {
     pub fn merge_distill_lora(&mut self, lora: &Weights, prefix: &str) -> Result<usize> {
         let mut n = 0;
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            let gen = layer.gen.as_mut().ok_or_else(|| {
+                Error::Unsupported(
+                    "sensenova: a runtime distill-LoRA merge requires resident generation blocks"
+                        .to_owned(),
+                )
+            })?;
             let attn = format!("{prefix}.model.layers.{i}.self_attn");
-            n += layer.attn_gen.merge_distill_lora(lora, &attn, "_mot_gen")?;
+            n += gen.attn.merge_distill_lora(lora, &attn, "_mot_gen")?;
             let mlp = format!("{prefix}.model.layers.{i}.mlp_mot_gen");
-            n += layer.mlp_gen.merge_distill_lora(lora, &mlp)?;
+            n += gen.mlp.merge_distill_lora(lora, &mlp)?;
         }
         Ok(n)
     }
@@ -421,12 +533,15 @@ impl Qwen3Backbone {
                     &layer.attn_und,
                     &layer.mlp_und,
                 ),
-                Path::Gen => (
-                    &layer.input_ln_gen,
-                    &layer.post_ln_gen,
-                    &layer.attn_gen,
-                    &layer.mlp_gen,
-                ),
+                Path::Gen => {
+                    let gen = layer.gen.as_ref().ok_or_else(|| {
+                        Error::Unsupported(
+                            "sensenova: deferred generation blocks require a windowed forward"
+                                .to_owned(),
+                        )
+                    })?;
+                    (&gen.input_ln, &gen.post_ln, &gen.attn, &gen.mlp)
+                }
             };
             // Attention sub-block.
             let normed = rms_norm(&hidden, input_ln, self.eps)?;
@@ -519,30 +634,115 @@ impl Qwen3Backbone {
         cache: &mut KvCache,
         append: bool,
     ) -> Result<Array> {
+        self.forward_prepared_budgeted(embeds, rm, path, cache, append, AttentionPlan::UNBOUNDED)
+    }
+
+    /// [`Self::forward_prepared`] with an explicit shared attention plan. The production denoise
+    /// path selects a bounded plan per request; understanding/AR paths retain the historical
+    /// unbounded call so text, VQA, and think-token behavior are unchanged.
+    pub fn forward_prepared_budgeted(
+        &self,
+        embeds: &Array,
+        rm: &RopeMask,
+        path: Path,
+        cache: &mut KvCache,
+        append: bool,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        self.forward_prepared_memory(embeds, rm, path, cache, append, attention, None, false)
+    }
+
+    /// Request-memory-aware prepared forward. On a deferred load, every generation forward uses
+    /// the re-openable stream: an explicit `window` bounds it; `None` uses one all-covering window,
+    /// preserving resident selection semantics while still respecting the requested load shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prepared_memory(
+        &self,
+        embeds: &Array,
+        rm: &RopeMask,
+        path: Path,
+        cache: &mut KvCache,
+        append: bool,
+        attention: AttentionPlan<'_>,
+        window: Option<usize>,
+        calibration_stream_fault: bool,
+    ) -> Result<Array> {
+        if path == Path::Gen {
+            if let Some(stream) = &self.gen_stream {
+                if append {
+                    return Err(Error::Unsupported(
+                        "sensenova: deferred generation blocks are denoise-only (append=false)"
+                            .to_owned(),
+                    ));
+                }
+                let window = window.unwrap_or(stream.n_blocks);
+                let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks, window)?;
+                let uncancellable = CancelFlag::default();
+                let cancel = attention.cancel.unwrap_or(&uncancellable);
+                let hidden = mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    cancel,
+                    embeds.clone(),
+                    || stream.open(),
+                    |mut hidden, view, range| {
+                        for i in range {
+                            let layer = stream.materialize(view, i)?;
+                            if calibration_stream_fault && i == 0 {
+                                return Err(Error::Msg(
+                                    "sensenova: calibration fault after Gen block materialization"
+                                        .to_owned(),
+                                ));
+                            }
+                            hidden =
+                                self.forward_gen_layer(hidden, &layer, rm, cache, i, attention)?;
+                        }
+                        Ok(hidden)
+                    },
+                    |hidden: &Array| Ok(mlx_rs::transforms::eval([hidden])?),
+                )?;
+                return Ok(rms_norm(&hidden, &self.norm_gen, self.eps)?);
+            }
+            if window.is_some() {
+                return Err(Error::Unsupported(
+                    "sensenova: bounded transformer residency requires DeferredMaterialization"
+                        .to_owned(),
+                ));
+            }
+        }
+
         let mut hidden = embeds.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            let (input_ln, post_ln, attn, mlp) = match path {
-                Path::Und => (
-                    &layer.input_ln,
-                    &layer.post_ln,
-                    &layer.attn_und,
-                    &layer.mlp_und,
-                ),
-                Path::Gen => (
-                    &layer.input_ln_gen,
-                    &layer.post_ln_gen,
-                    &layer.attn_gen,
-                    &layer.mlp_gen,
-                ),
-            };
-            let normed = rms_norm(&hidden, input_ln, self.eps)?;
-            let attn_out = self.attention_cached(
-                &normed, attn, &rm.cos_t, &rm.sin_t, &rm.cos_h, &rm.sin_h, &rm.cos_w, &rm.sin_w,
-                &rm.mask, cache, i, append,
-            )?;
-            hidden = add(&hidden, &attn_out)?;
-            let normed = rms_norm(&hidden, post_ln, self.eps)?;
-            hidden = add(&hidden, &mlp.forward(&normed)?)?;
+            match path {
+                Path::Und => {
+                    let normed = rms_norm(&hidden, &layer.input_ln, self.eps)?;
+                    let attn_out = self.attention_cached(
+                        &normed,
+                        &layer.attn_und,
+                        &rm.cos_t,
+                        &rm.sin_t,
+                        &rm.cos_h,
+                        &rm.sin_h,
+                        &rm.cos_w,
+                        &rm.sin_w,
+                        &rm.mask,
+                        cache,
+                        i,
+                        append,
+                        attention,
+                    )?;
+                    hidden = add(&hidden, &attn_out)?;
+                    let normed = rms_norm(&hidden, &layer.post_ln, self.eps)?;
+                    hidden = add(&hidden, &layer.mlp_und.forward(&normed)?)?;
+                }
+                Path::Gen => {
+                    let gen = layer.gen.as_ref().ok_or_else(|| {
+                        Error::Unsupported(
+                            "sensenova: deferred generation blocks require the stream".to_owned(),
+                        )
+                    })?;
+                    hidden = self.forward_gen_layer(hidden, gen, rm, cache, i, attention)?;
+                }
+            }
         }
         // When persisting, the shared cache already advanced its sequence axis inside each layer's
         // `update` (and reports the new length via `offset()`); no separate length bookkeeping needed.
@@ -552,6 +752,36 @@ impl Qwen3Backbone {
             Path::Gen => &self.norm_gen,
         };
         Ok(rms_norm(&hidden, final_norm, self.eps)?)
+    }
+
+    fn forward_gen_layer(
+        &self,
+        mut hidden: Array,
+        layer: &GenLayer,
+        rm: &RopeMask,
+        cache: &mut KvCache,
+        index: usize,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let normed = rms_norm(&hidden, &layer.input_ln, self.eps)?;
+        let attn_out = self.attention_cached(
+            &normed,
+            &layer.attn,
+            &rm.cos_t,
+            &rm.sin_t,
+            &rm.cos_h,
+            &rm.sin_h,
+            &rm.cos_w,
+            &rm.sin_w,
+            &rm.mask,
+            cache,
+            index,
+            false,
+            attention,
+        )?;
+        hidden = add(&hidden, &attn_out)?;
+        let normed = rms_norm(&hidden, &layer.post_ln, self.eps)?;
+        add(&hidden, &layer.mlp.forward(&normed)?).map_err(Error::from)
     }
 
     /// Cached attention: project the new tokens, RoPE q/k, merge with the cache, GQA-expand, attend.
@@ -570,6 +800,7 @@ impl Qwen3Backbone {
         cache: &mut KvCache,
         layer_idx: usize,
         append: bool,
+        attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -627,13 +858,20 @@ impl Qwen3Backbone {
         let v_all = repeat_kv_bhsd(&v_all, groups)?;
 
         let scale = (hd as f32).powf(-0.5);
-        let scores = multiply(
-            &matmul(&q, &k_all.transpose_axes(&[0, 1, 3, 2])?)?,
-            Array::from_f32(scale),
-        )?;
-        let scores = add(&scores, mask)?;
-        let weights = softmax_axis(&scores, -1, true)?;
-        let out = matmul(&weights, &v_all)?;
+        // Preserve the historical eager kernel exactly unless rung 3 was selected. The shared MLX
+        // helper uses fused SDPA even when its budget does not split, which is mathematically
+        // equivalent but not byte-identical to SenseNova's reference eager softmax path.
+        let out = if attention.budget.is_unbounded() {
+            let scores = multiply(
+                &matmul(&q, &k_all.transpose_axes(&[0, 1, 3, 2])?)?,
+                Array::from_f32(scale),
+            )?;
+            let scores = add(&scores, mask)?;
+            let weights = softmax_axis(&scores, -1, true)?;
+            matmul(&weights, &v_all)?
+        } else {
+            sdpa_budgeted_bhsd(&q, &k_all, &v_all, scale, Some(mask), attention)?
+        };
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, self.num_heads * hd])?;

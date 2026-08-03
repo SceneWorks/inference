@@ -42,6 +42,7 @@ pub mod convert;
 pub mod distill;
 pub mod fm;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub(crate) mod quant;
 pub mod qwen3;
@@ -91,8 +92,12 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::QUALITY_REGISTRATION)
+        .register_memory_strategy(model::QUALITY_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::QUALITY_MEMORY_BEHAVIOR)
         .register_activation_memory(QUALITY_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::FAST_REGISTRATION)
+        .register_memory_strategy(model::FAST_MEMORY_REGISTRATION)
+        .register_memory_behavior(model::FAST_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX SenseNova provider catalog.
