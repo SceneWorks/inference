@@ -104,5 +104,59 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertNotIn(RESOLVE_STEP, names)
 
 
+class WeightSetLabelTests(unittest.TestCase):
+    """Every macOS job must select exactly one `rw-*` weight-set label.
+
+    A job left on the old shared `real-weights` label is the failure this guards: no macOS runner
+    carries that label any more, so the job does not fail — it QUEUES, silently, until someone
+    cancels the run. On a weekly scheduled lane that is a week of missing coverage that still
+    looks green at a glance, so it is asserted rather than reviewed.
+    """
+
+    KNOWN = {"rw-mage", "rw-sa3", "rw-krea", "rw-audio", "rw-llm", "rw-chroma"}
+
+    def setUp(self) -> None:
+        self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_every_macos_job_selects_exactly_one_known_weight_set(self) -> None:
+        macos = {
+            n: j for n, j in self.workflow["jobs"].items() if "macOS" in (j.get("runs-on") or [])
+        }
+        self.assertTrue(macos, "found no macOS jobs — the label scheme moved")
+        for name, job in macos.items():
+            with self.subTest(job=name):
+                selected = self.KNOWN.intersection(job["runs-on"])
+                self.assertEqual(
+                    len(selected),
+                    1,
+                    f"{name} selects {sorted(selected) or 'no'} weight-set label",
+                )
+                self.assertNotIn(
+                    "real-weights",
+                    job["runs-on"],
+                    f"{name} still carries the retired shared macOS label; it would queue forever",
+                )
+
+    def test_every_declared_label_is_documented_with_its_host(self) -> None:
+        """The header table is the only record of which box stores which set — keep it honest."""
+        header = WORKFLOW.read_text(encoding="utf-8").split("\non:", 1)[0]
+        used = {
+            label
+            for job in self.workflow["jobs"].values()
+            for label in (job.get("runs-on") or [])
+            if label.startswith("rw-")
+        }
+        for label in used:
+            with self.subTest(label=label):
+                self.assertIn(label, header, f"{label} is used but absent from the header table")
+
+    def test_the_cuda_pool_keeps_its_shared_label(self) -> None:
+        """Both Windows boxes share `real-weights` and already load-balance; do not split them."""
+        windows = [j for j in self.workflow["jobs"].values() if "windows" in (j.get("runs-on") or [])]
+        self.assertTrue(windows)
+        for job in windows:
+            self.assertIn("real-weights", job["runs-on"])
+
+
 if __name__ == "__main__":
     unittest.main()
