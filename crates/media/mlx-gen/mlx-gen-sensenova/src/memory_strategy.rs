@@ -14,6 +14,13 @@ use mlx_gen::gen_core::{
     MemoryStrategy, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{LoadShape, LoadSpec, Quant, WeightsSource};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Exact production parameters exercised by the serial real-Metal runner below.
 pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
@@ -26,15 +33,77 @@ const QUALITY_Q8_ARTIFACT: &str =
     "8da38dde4c39722259a98cfc47643c88e48cea205595625fdbd9fec097f9dc4f";
 const FAST_Q8_ARTIFACT: &str = "a9f8968d44ec440bdd7bfb2937a61b847d6f80bb563ffe60ca56be0e395bcf50";
 
-fn artifact_identity(spec: &LoadSpec) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ArtifactFileIdentity {
+    canonical_path: PathBuf,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
+    let canonical_path = std::fs::canonicalize(path)?;
+    let metadata = std::fs::metadata(&canonical_path)?;
+    Ok(ArtifactFileIdentity {
+        canonical_path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn digest_cache() -> &'static Mutex<HashMap<ArtifactFileIdentity, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<ArtifactFileIdentity, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn content_sha256(path: &Path) -> Option<String> {
+    let before = file_identity(path).ok()?;
+    if let Some(digest) = digest_cache().lock().ok()?.get(&before).cloned() {
+        return Some(digest);
+    }
+
+    let file = File::open(&before.canonical_path).ok()?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after = file_identity(path).ok()?;
+    if before != after {
+        return None;
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    let mut cache = digest_cache().lock().ok()?;
+    cache.retain(|identity, _| identity.canonical_path != before.canonical_path);
+    cache.insert(before, digest.clone());
+    Some(digest)
+}
+
+/// SHA-256 of the exact checkpoint bytes, cached by a mutation-sensitive filesystem identity.
+///
+/// The cache key includes device/inode/size plus mtime and ctime at nanosecond precision. A
+/// before/after identity comparison prevents caching a digest when the file changes while it is
+/// being read. This keeps repeated selector/contract calls cheap without trusting an HF blob
+/// basename (which is attacker-controlled local path text).
+pub fn verified_artifact_identity(spec: &LoadSpec) -> Option<String> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return None;
     };
-    std::fs::canonicalize(root.join("model.safetensors"))
-        .ok()?
-        .file_name()?
-        .to_str()
-        .map(str::to_owned)
+    content_sha256(&root.join("model.safetensors"))
 }
 
 fn calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'static str> {
@@ -51,9 +120,11 @@ fn calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'stati
     {
         return None;
     }
-    match (provider_id, artifact_identity(spec)?.as_str()) {
+    match (provider_id, verified_artifact_identity(spec)?.as_str()) {
         (crate::MODEL_ID, QUALITY_Q8_ARTIFACT) => Some(QUALITY_CALIBRATION_FINGERPRINT),
-        (crate::MODEL_ID_FAST, FAST_Q8_ARTIFACT) => Some(FAST_CALIBRATION_FINGERPRINT),
+        (crate::MODEL_ID_FAST, FAST_Q8_ARTIFACT) if matches!(&spec.weights, WeightsSource::Dir(root) if root.join(crate::DISTILL_MERGED_MARKER).is_file()) => {
+            Some(FAST_CALIBRATION_FINGERPRINT)
+        }
         _ => None,
     }
 }
@@ -160,11 +231,11 @@ pub(crate) fn safety_check(
 ) -> MemorySafetyDecision {
     let route_gate = || {
         if !matches!(
-            context.mode,
-            MemoryMode::TextToImage | MemoryMode::ImageToImage | MemoryMode::Edit
+            (&context.mode, context.geometry.reference_count),
+            (MemoryMode::TextToImage, 0) | (MemoryMode::Edit, 1)
         ) {
             return Err(CoreError::Unsupported(format!(
-                "{}: calibrated memory route covers T2I and single-reference image/edit only",
+                "{}: calibrated memory routes are exactly TextToImage with zero references and Edit with one reference",
                 contract.provider_id
             )));
         }
@@ -178,10 +249,9 @@ pub(crate) fn safety_check(
             || context.geometry.height != 1024
             || context.geometry.batch != 1
             || context.geometry.frames != 1
-            || context.geometry.reference_count > 1
         {
             return Err(CoreError::Unsupported(format!(
-                "{}: calibrated memory geometry is exactly 1024x1024, batch 1, one frame, and at most one reference",
+                "{}: calibrated memory geometry is exactly 1024x1024, batch 1, and one frame",
                 contract.provider_id
             )));
         }
@@ -300,10 +370,19 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core::{MemoryBehaviorRoute, MemoryStrategySupport};
     use mlx_gen::{LoadShape, LoadSpec, Quant, WeightsSource};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_root(label: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "sensenova-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn fixture_spec() -> (std::path::PathBuf, LoadSpec) {
-        let root =
-            std::env::temp_dir().join(format!("sensenova-memory-contract-{}", std::process::id()));
+        let root = unique_root("memory-contract");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("model.safetensors"), [0_u8; 8]).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
@@ -379,21 +458,83 @@ mod tests {
     }
 
     #[test]
-    fn calibration_is_bound_to_exact_q8_artifact_identity() {
-        let root = std::env::temp_dir().join(format!(
-            "sensenova-calibration-contract-{}",
-            std::process::id()
-        ));
+    fn expected_digest_basename_with_arbitrary_bytes_does_not_calibrate() {
+        let root = unique_root("calibration-contract");
         std::fs::create_dir_all(&root).unwrap();
         let blob = root.join(QUALITY_Q8_ARTIFACT);
         std::fs::write(&blob, [0_u8; 8]).unwrap();
         std::os::unix::fs::symlink(&blob, root.join("model.safetensors")).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q8);
         let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
-        assert_eq!(
-            contract.calibration.as_ref().unwrap().fingerprint,
-            QUALITY_CALIBRATION_FINGERPRINT
+        let first = verified_artifact_identity(&spec).unwrap();
+        assert_ne!(
+            first, QUALITY_Q8_ARTIFACT,
+            "the verifier must hash content instead of trusting the target basename"
         );
+        assert!(contract.calibration.is_none());
+
+        // Same path, inode and size: changing only the bytes must invalidate the cached result via
+        // ctime/mtime and remain uncalibrated.
+        std::fs::write(&blob, [1_u8; 8]).unwrap();
+        let second = verified_artifact_identity(&spec).unwrap();
+        assert_ne!(first, second);
+        assert!(memory_strategy_contract(crate::MODEL_ID, &spec)
+            .unwrap()
+            .calibration
+            .is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn safety_accepts_only_the_two_measured_mode_reference_pairs() {
+        let (root, spec) = fixture_spec();
+        let spec = spec.with_quant(Quant::Q8);
+        let mut contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            "sensenova-route-test",
+            spec.load_shape,
+        ));
+        let context = |mode, reference_count| {
+            mlx_gen::gen_core::standard_memory_behavior_context(
+                &contract,
+                MemoryStrategy::BoundedAttention,
+                MemoryNumericTier {
+                    precision: mlx_gen::Precision::Bf16,
+                    quant: Some(Quant::Q8),
+                    component_precision_floors: &[],
+                },
+                MemoryBehaviorRoute {
+                    mode,
+                    reference_count,
+                    use_pid: false,
+                    has_phases: true,
+                    overlay: None,
+                },
+            )
+            .unwrap()
+        };
+        for accepted in [
+            context(MemoryMode::TextToImage, 0),
+            context(MemoryMode::Edit, 1),
+        ] {
+            assert_eq!(
+                safety_check(&contract, Some(Quant::Q8), &accepted),
+                MemorySafetyDecision::Accept
+            );
+        }
+        for rejected in [
+            context(MemoryMode::ImageToImage, 1),
+            context(MemoryMode::TextToImage, 1),
+            context(MemoryMode::Edit, 0),
+            context(MemoryMode::Edit, 2),
+        ] {
+            assert!(matches!(
+                safety_check(&contract, Some(Quant::Q8), &rejected),
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("exactly TextToImage with zero references and Edit with one reference")
+            ));
+        }
+
         let context = mlx_gen::gen_core::standard_memory_behavior_context(
             &contract,
             MemoryStrategy::BoundedAttention,
@@ -436,7 +577,11 @@ mod tests {
         let deferred_spec = spec
             .clone()
             .with_load_shape(LoadShape::DeferredMaterialization);
-        let deferred = memory_strategy_contract(crate::MODEL_ID, &deferred_spec).unwrap();
+        let mut deferred = memory_strategy_contract(crate::MODEL_ID, &deferred_spec).unwrap();
+        deferred.calibration = Some(MemoryCalibrationIdentity::new(
+            "sensenova-route-test",
+            deferred_spec.load_shape,
+        ));
         let fixtures = registered_valid_fixture(
             &deferred_spec,
             &deferred,
@@ -464,13 +609,6 @@ mod tests {
             memory.transformer_window_size,
             Some(TRANSFORMER_WINDOW_SIZE)
         );
-
-        std::fs::remove_file(root.join("model.safetensors")).unwrap();
-        std::fs::write(root.join("model.safetensors"), [0_u8; 8]).unwrap();
-        assert!(memory_strategy_contract(crate::MODEL_ID, &spec)
-            .unwrap()
-            .calibration
-            .is_none());
         std::fs::remove_dir_all(root).ok();
     }
 }

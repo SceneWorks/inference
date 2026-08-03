@@ -44,10 +44,14 @@ fn root() -> PathBuf {
     root
 }
 
-fn load(shape: LoadShape) -> Box<dyn Generator> {
-    let spec = LoadSpec::new(WeightsSource::Dir(root()))
+fn spec(shape: LoadShape) -> LoadSpec {
+    LoadSpec::new(WeightsSource::Dir(root()))
         .with_quant(Quant::Q8)
-        .with_load_shape(shape);
+        .with_load_shape(shape)
+}
+
+fn load(shape: LoadShape) -> Box<dyn Generator> {
+    let spec = spec(shape);
     mlx_gen_sensenova::provider_registry()
         .unwrap()
         .load(&provider(), &spec)
@@ -161,6 +165,10 @@ fn drift(a: &mlx_gen::Image, b: &mlx_gen::Image) -> (u8, f64, f64) {
 #[ignore = "needs exact cached SenseNova Q8 weights and exclusive Apple/Metal access"]
 fn serial_resident_attention_and_rung4() {
     clear_cache();
+    let artifact_identity = mlx_gen_sensenova::memory_strategy::verified_artifact_identity(&spec(
+        LoadShape::EagerMaterialization,
+    ))
+    .expect("hash exact checkpoint content");
     let size = request(GenerationMemory::default()).width as i32;
     let mode = std::env::var("SENSENOVA_LADDER_MODE").unwrap_or_else(|_| "t2i".to_owned());
     let image_queries = size / 32;
@@ -291,8 +299,9 @@ fn serial_resident_attention_and_rung4() {
     );
 
     println!(
-        "RESULT status=pass provider={} tier=q8 mode={} size={} resident_peak_bytes={} attention_peak_bytes={} rung4_peak_bytes={} attention_query_block_rows_upper_bound={} window_size={} cancel_post_clear_active_bytes={} cancel_post_clear_cache_bytes={} fault_post_clear_active_bytes={} fault_post_clear_cache_bytes={}",
+        "RESULT status=pass provider={} tier=q8 artifact_sha256={} mode={} size={} resident_peak_bytes={} attention_peak_bytes={} rung4_peak_bytes={} attention_query_block_rows_upper_bound={} window_size={} cancel_post_clear_active_bytes={} cancel_post_clear_cache_bytes={} fault_post_clear_active_bytes={} fault_post_clear_cache_bytes={}",
         provider(),
+        artifact_identity,
         mode,
         size,
         resident.peak,

@@ -2461,6 +2461,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
