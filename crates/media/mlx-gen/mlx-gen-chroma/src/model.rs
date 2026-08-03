@@ -977,16 +977,18 @@ mod tests {
     fn load_render_calibration_candidate(
         spec: &LoadSpec,
         sensitive_sublayers: &[(usize, mlx_gen_flux::T5Sublayer)],
+        sensitive_ffn_projections: &[(usize, mlx_gen_flux::T5FeedForwardProjection)],
     ) -> Result<Chroma> {
         let variant = ChromaVariant::Base;
         let root = resolve_root(variant, spec)?;
         let mut t5 = loader::load_t5_encoder(root)?;
-        t5.quantize_progressive_with_sensitive_sublayers_residuals(
+        t5.quantize_progressive_with_sensitive_surfaces_residuals(
             crate::convert::AUXILIARY_BITS,
             crate::convert::T5_RESIDUAL_BITS,
             crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
             crate::convert::T5_GROUP_SIZE,
             sensitive_sublayers,
+            sensitive_ffn_projections,
         )?;
         let text = ChromaTextOwned {
             tokenizer: loader::load_tokenizer()?,
@@ -1108,27 +1110,34 @@ mod tests {
             (22, Attention),
             (13, Attention),
         ];
-        // The preceding pair search did not improve on top10 + rank13 (block-13 FFN). Since the
-        // render error is non-monotonic, remove each original top-10 entry once while retaining
-        // rank13. Every candidate is smaller than the near-pass surface and tests whether one of
-        // its interactions is masking the block-13 correction.
-        let mut candidates = Vec::new();
-        for removed_rank in 1..=10 {
-            let mut surface = ranked[..10]
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != removed_rank - 1)
-                .map(|(_, selected)| *selected)
-                .collect::<Vec<_>>();
-            surface.push(ranked[12]);
-            candidates.push((format!("top10-rank13-minus-rank{removed_rank}"), surface));
-        }
+        // Whole block-13 FFN produced the best strict-render result, while both additions and
+        // removals around that surface regressed. Calibrate its three packed projections directly
+        // to find the smallest subset that preserves the useful correction.
+        use mlx_gen_flux::T5FeedForwardProjection::{Wi0, Wi1, Wo};
+        let candidates = [
+            ("top10-block13-wi0", vec![Wi0]),
+            ("top10-block13-wi1", vec![Wi1]),
+            ("top10-block13-wo", vec![Wo]),
+            ("top10-block13-wi0-wi1", vec![Wi0, Wi1]),
+            ("top10-block13-wi0-wo", vec![Wi0, Wo]),
+            ("top10-block13-wi1-wo", vec![Wi1, Wo]),
+            ("top10-block13-wi0-wi1-wo", vec![Wi0, Wi1, Wo]),
+        ];
 
-        for (policy, sensitive_sublayers) in candidates {
+        for (policy, sensitive_ffn_projection_kinds) in candidates {
+            let sensitive_sublayers = ranked[..10].to_vec();
+            let sensitive_ffn_projections = sensitive_ffn_projection_kinds
+                .iter()
+                .map(|projection| (13, *projection))
+                .collect::<Vec<_>>();
             clear_cache();
             reset_peak_memory();
-            let model = load_render_calibration_candidate(&baseline_spec, &sensitive_sublayers)
-                .expect("load render sensitivity candidate");
+            let model = load_render_calibration_candidate(
+                &baseline_spec,
+                &sensitive_sublayers,
+                &sensitive_ffn_projections,
+            )
+            .expect("load render sensitivity candidate");
             let images = render_calibration_samples(&model);
             let peak = get_peak_memory();
             drop(model);
@@ -1156,6 +1165,17 @@ mod tests {
                             "sublayer": match sublayer {
                                 mlx_gen_flux::T5Sublayer::Attention => "attention",
                                 mlx_gen_flux::T5Sublayer::FeedForward => "ffn",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                    "sensitiveFfnProjections": sensitive_ffn_projections
+                        .iter()
+                        .map(|(block, projection)| serde_json::json!({
+                            "block": block,
+                            "projection": match projection {
+                                mlx_gen_flux::T5FeedForwardProjection::Wi0 => "wi_0",
+                                mlx_gen_flux::T5FeedForwardProjection::Wi1 => "wi_1",
+                                mlx_gen_flux::T5FeedForwardProjection::Wo => "wo",
                             },
                         }))
                         .collect::<Vec<_>>(),

@@ -624,6 +624,16 @@ pub enum T5Sublayer {
     FeedForward,
 }
 
+/// One projection within a T5 gated feed-forward sublayer. This is a finer calibration surface
+/// than [`T5Sublayer::FeedForward`]; selecting a projection changes only that packed residual's
+/// width and never retains its dense source weight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum T5FeedForwardProjection {
+    Wi0,
+    Wi1,
+    Wo,
+}
+
 impl T5TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Self::from_weights_with_group_size(w, prefix, GROUP_SIZE)
@@ -746,6 +756,29 @@ impl T5TextEncoder {
         group_size: i32,
         sensitive_sublayers: &[(usize, T5Sublayer)],
     ) -> Result<()> {
+        self.quantize_progressive_with_sensitive_surfaces_residuals(
+            bits,
+            residual_bits,
+            sensitive_residual_bits,
+            group_size,
+            sensitive_sublayers,
+            &[],
+        )
+    }
+
+    /// Progressively quantize T5 with both whole-sublayer and individual feed-forward projection
+    /// residual-width selections. Whole-FFN selection takes precedence and makes all three of its
+    /// projections sensitive; otherwise only explicitly selected projections use the wider packed
+    /// residual.
+    pub fn quantize_progressive_with_sensitive_surfaces_residuals(
+        &mut self,
+        bits: i32,
+        residual_bits: i32,
+        sensitive_residual_bits: i32,
+        group_size: i32,
+        sensitive_sublayers: &[(usize, T5Sublayer)],
+        sensitive_ffn_projections: &[(usize, T5FeedForwardProjection)],
+    ) -> Result<()> {
         validate_t5_group_size(group_size)?;
         if !matches!(bits, 4 | 8)
             || !matches!(residual_bits, 4 | 8)
@@ -755,7 +788,11 @@ impl T5TextEncoder {
                 "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} residuals"
             )));
         }
-        for &(block, _) in sensitive_sublayers {
+        for block in sensitive_sublayers
+            .iter()
+            .map(|(block, _)| *block)
+            .chain(sensitive_ffn_projections.iter().map(|(block, _)| *block))
+        {
             if block >= self.blocks.len() {
                 return Err(Error::Msg(format!(
                     "T5 sensitive-residual block {block} is outside 0..{}",
@@ -770,13 +807,21 @@ impl T5TextEncoder {
                 sensitive_sublayers.contains(&(index, T5Sublayer::Attention));
             let feed_forward_is_sensitive =
                 sensitive_sublayers.contains(&(index, T5Sublayer::FeedForward));
+            let sensitive_ffn_projection = |projection| {
+                feed_forward_is_sensitive
+                    || sensitive_ffn_projections.contains(&(index, projection))
+            };
             block.quantize_progressive(
                 bits,
                 residual_bits,
                 sensitive_residual_bits,
                 group_size,
                 attention_is_sensitive,
-                feed_forward_is_sensitive,
+                [
+                    sensitive_ffn_projection(T5FeedForwardProjection::Wi0),
+                    sensitive_ffn_projection(T5FeedForwardProjection::Wi1),
+                    sensitive_ffn_projection(T5FeedForwardProjection::Wo),
+                ],
             )?;
         }
         Ok(())
@@ -931,14 +976,9 @@ impl T5Block {
         sensitive_residual_bits: i32,
         group_size: i32,
         attention_is_sensitive: bool,
-        feed_forward_is_sensitive: bool,
+        sensitive_ffn_projections: [bool; 3],
     ) -> Result<()> {
         let attention_residual_bits = if attention_is_sensitive {
-            sensitive_residual_bits
-        } else {
-            residual_bits
-        };
-        let feed_forward_residual_bits = if feed_forward_is_sensitive {
             sensitive_residual_bits
         } else {
             residual_bits
@@ -949,8 +989,13 @@ impl T5Block {
             sensitive_residual_bits,
             group_size,
         )?;
-        self.ff
-            .quantize_progressive(bits, feed_forward_residual_bits, group_size)
+        self.ff.quantize_progressive_with_sensitive_projections(
+            bits,
+            residual_bits,
+            sensitive_residual_bits,
+            group_size,
+            sensitive_ffn_projections,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1208,18 +1253,27 @@ impl T5FeedForward {
         Ok(())
     }
 
-    fn quantize_progressive(
+    fn quantize_progressive_with_sensitive_projections(
         &mut self,
         bits: i32,
         residual_bits: i32,
+        sensitive_residual_bits: i32,
         group_size: i32,
+        sensitive: [bool; 3],
     ) -> Result<()> {
+        let selected_bits = |selected| {
+            if selected {
+                sensitive_residual_bits
+            } else {
+                residual_bits
+            }
+        };
         self.wi0
-            .quantize_progressive(bits, residual_bits, group_size)?;
+            .quantize_progressive(bits, selected_bits(sensitive[0]), group_size)?;
         self.wi1
-            .quantize_progressive(bits, residual_bits, group_size)?;
+            .quantize_progressive(bits, selected_bits(sensitive[1]), group_size)?;
         self.wo
-            .quantize_progressive(bits, residual_bits, group_size)
+            .quantize_progressive(bits, selected_bits(sensitive[2]), group_size)
     }
 
     fn quantize_progressive_with_secondary(
