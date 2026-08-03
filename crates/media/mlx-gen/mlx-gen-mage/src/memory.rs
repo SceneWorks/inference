@@ -19,8 +19,8 @@ pub const VAE_GB_PER_MEGAPIXEL: f64 = 2.039;
 ///
 /// **Q4 moved from 5.940 to 7.868 in sc-15071**, and the anchor had to move with it. The tier that
 /// measured 5.940 was the one that rendered a tiled texture instead of the prompt; the precision
-/// floors that make it render correctly (`crate::quant::FINAL_MOD_MIN_BITS`,
-/// `crate::quant::LM_LAYER_MIN_BITS`) put the Qwen3-VL LM's 36 decoder layers at 8 bits, which is
+/// floors in `crate::quant::COMPONENT_PRECISION_FLOORS` that make it render correctly put the
+/// Qwen3-VL LM's 36 decoder layers at 8 bits, which is
 /// ~1.9 GB of the difference. Leaving the old anchor in place would have been worse than a stale
 /// number: this gate is what stands between an over-large request and MLX's default allocation
 /// handler, which calls `exit(-1)` rather than returning a catchable error.

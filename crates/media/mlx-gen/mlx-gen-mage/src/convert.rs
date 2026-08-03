@@ -161,7 +161,8 @@ pub fn quantize_mage_transformer(src: &Path, dst: &Path, bits: Option<i32>) -> R
         return Ok(());
     };
     // Two passes, because `norm_out.linear` has an 8-bit floor (sc-15071 — a uniformly-Q4 DiT
-    // renders a tiled texture instead of the prompt; see `crate::quant::FINAL_MOD_MIN_BITS`).
+    // renders a tiled texture instead of the prompt; see
+    // `crate::quant::COMPONENT_PRECISION_FLOORS`).
     // Pass 2 re-reads pass 1's output, but its predicate matches only the still-dense floor base,
     // so already-packed codes are passed straight through rather than re-quantized.
     let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, |base| {
@@ -207,7 +208,8 @@ pub fn quantize_mage_text_encoder(src: &Path, dst: &Path, bits: Option<i32>) -> 
     let map = load_dir_map(src)?;
     let map = match bits {
         // Two passes for the same reason the DiT needs them: the 36 LM decoder layers have an
-        // 8-bit floor (sc-15071 — see `crate::quant::LM_LAYER_MIN_BITS`), while the token embedding
+        // 8-bit floor (sc-15071 — see `crate::quant::COMPONENT_PRECISION_FLOORS`), while the token
+        // embedding
         // and the vision tower take the tier's own width. Pass 2's predicate matches only keys pass
         // 1 left dense, so packed codes are never re-quantized.
         Some(bits) => {
