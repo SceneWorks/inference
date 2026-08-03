@@ -120,6 +120,71 @@ fn selected_decode_tiling(
     }
 }
 
+/// The exact output geometry requested for a pose-control render. Keeping this as a production seam
+/// prevents the feasibility gate, control preprocessing, and render options from independently
+/// resolving (or silently rewriting) width and height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestedControlGeometry {
+    width: u32,
+    height: u32,
+}
+
+impl RequestedControlGeometry {
+    fn from_request(req: &GenerationRequest) -> Self {
+        Self {
+            width: req.width,
+            height: req.height,
+        }
+    }
+
+    /// Dimensions supplied to the feasibility model. Render-facing access is available only after
+    /// [`Self::require_feasible`] succeeds.
+    fn feasibility_dimensions(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn require_feasible(self, feasible: bool) -> Result<AdmittedControlGeometry> {
+        crate::memory::require_control_geometry(self.width, self.height, feasible)?;
+        Ok(AdmittedControlGeometry(self))
+    }
+
+    /// Run control preprocessing only after this exact requested geometry passes the feasibility
+    /// gate. The callback seam keeps the ordering and dimension propagation weight-free-testable.
+    fn prepare_after_feasibility<T>(
+        self,
+        feasible: bool,
+        prepare: impl FnOnce(u32, u32) -> Result<T>,
+    ) -> Result<(AdmittedControlGeometry, T)> {
+        let admitted = self.require_feasible(feasible)?;
+        let (width, height) = admitted.dimensions();
+        let prepared = prepare(width, height)?;
+        Ok((admitted, prepared))
+    }
+}
+
+/// Requested geometry after the memory gate has admitted it. Both control preprocessing and the
+/// render options consume this value, so neither can diverge from the dimensions that were checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdmittedControlGeometry(RequestedControlGeometry);
+
+impl AdmittedControlGeometry {
+    fn dimensions(self) -> (u32, u32) {
+        (self.0.width, self.0.height)
+    }
+
+    fn turbo_options(self, req: &GenerationRequest, steps: usize, seed: u64) -> TurboOptions {
+        TurboOptions {
+            width: self.0.width,
+            height: self.0.height,
+            steps,
+            seed,
+            sampler: req.sampler.clone(),
+            scheduler: req.scheduler.clone(),
+            transformer_window_size: None,
+        }
+    }
+}
+
 /// Construct a [`KreaTurboControl`] from a [`LoadSpec`].
 ///
 /// `spec.weights` must be a [`mlx_gen::WeightsSource::Dir`] `krea/Krea-2-Turbo` snapshot (`transformer/
@@ -368,38 +433,37 @@ impl KreaTurboControl {
                 // width or height: an infeasible request is refused before control preprocessing or
                 // render. There is currently no provider-owned current measurement bundle from which to
                 // name a verified alternative, so `alternative` is truthfully absent.
+                let requested_geometry = RequestedControlGeometry::from_request(req);
+                let (requested_width, requested_height) =
+                    requested_geometry.feasibility_dimensions();
                 let feasible = crate::memory::control_geometry_fits(
                     safe_gib,
                     &heavy_owned.cfg,
                     heavy.branch.num_blocks(),
                     heavy_owned.base_tier,
                     heavy_owned.branch_tier,
-                    req.width,
-                    req.height,
+                    requested_width,
+                    requested_height,
                     text_co_resident,
                     decode_tile_edge,
                 );
-                crate::memory::require_control_geometry(req.width, req.height, feasible)?;
-
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
                 // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
-                let plan =
-                    heavy
-                        .heavy
-                        .prepare_control(&context, control_image, req.width, req.height)?;
+                let (admitted_geometry, plan) =
+                    requested_geometry.prepare_after_feasibility(feasible, |width, height| {
+                        heavy
+                            .heavy
+                            .prepare_control(&context, control_image, width, height)
+                    })?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
-                    let opts = TurboOptions {
-                        width: req.width,
-                        height: req.height,
+                    let opts = admitted_geometry.turbo_options(
+                        req,
                         steps,
-                        seed: base_seed.wrapping_add(n as u64),
-                        sampler: req.sampler.clone(),
-                        scheduler: req.scheduler.clone(),
-                        transformer_window_size: None,
-                    };
+                        base_seed.wrapping_add(n as u64),
+                    );
                     let img = heavy.heavy.render_control_from(
                         &plan,
                         heavy.branch,
@@ -532,26 +596,61 @@ mod tests {
     }
 
     #[test]
-    fn generate_call_path_preserves_requested_geometry_through_render() {
-        let source = include_str!("model_control.rs");
-        let start = source
-            .find("let feasible = crate::memory::control_geometry_fits(")
-            .expect("requested-geometry feasibility gate");
-        let end = source[start..]
-            .find("Ok(GenerationOutput::Images(images))")
-            .map(|offset| start + offset)
-            .expect("render-loop end");
-        let path = &source[start..end];
-        assert!(path
-            .contains("crate::memory::require_control_geometry(req.width, req.height, feasible)?"));
+    fn requested_geometry_drives_feasibility_preprocessing_and_render_options() {
+        use std::cell::Cell;
+
+        let req = GenerationRequest {
+            width: 640,
+            height: 384,
+            sampler: Some("euler".into()),
+            scheduler: Some("native".into()),
+            ..Default::default()
+        };
+
+        let requested = RequestedControlGeometry::from_request(&req);
+        assert_eq!(requested.feasibility_dimensions(), (640, 384));
+
+        let preprocessing_called = Cell::new(false);
+        let refusal = requested
+            .prepare_after_feasibility(false, |_, _| {
+                preprocessing_called.set(true);
+                Ok(())
+            })
+            .expect_err("infeasible requested geometry must be refused before rendering");
         assert!(
-            !path.contains("render_width") && !path.contains("render_height"),
-            "the admitted path must not introduce substitutable geometry variables"
+            !preprocessing_called.get(),
+            "control preprocessing must not run for refused geometry"
         );
-        assert!(path.contains(".prepare_control(&context, control_image, req.width, req.height)?"));
-        assert!(path.contains(
-            "let opts = TurboOptions {\n                        width: req.width,\n                        height: req.height,"
-        ));
+        assert!(
+            matches!(
+                refusal,
+                Error::GeometryRefused {
+                    requested_width: 640,
+                    requested_height: 384,
+                    alternative: None,
+                    ..
+                }
+            ),
+            "refusal must retain the exact requested geometry"
+        );
+
+        let prepared_dimensions = Cell::new(None);
+        let (admitted, ()) = requested
+            .prepare_after_feasibility(true, |width, height| {
+                prepared_dimensions.set(Some((width, height)));
+                Ok(())
+            })
+            .expect("feasible requested geometry must be admitted unchanged");
+        assert_eq!(prepared_dimensions.get(), Some((640, 384)));
+        assert_eq!(admitted.dimensions(), (640, 384));
+
+        let opts = admitted.turbo_options(&req, 8, 42);
+        assert_eq!((opts.width, opts.height), (640, 384));
+        assert_eq!(opts.steps, 8);
+        assert_eq!(opts.seed, 42);
+        assert_eq!(opts.sampler.as_deref(), Some("euler"));
+        assert_eq!(opts.scheduler.as_deref(), Some("native"));
+        assert_eq!(opts.transformer_window_size, None);
     }
 
     #[test]
