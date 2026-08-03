@@ -181,6 +181,7 @@ enum T5ProbePolicy {
     Q8Q4Progressive,
     Q8Q4ProgressiveGroup32,
     Q8Q4ProgressiveSensitiveQ8Group32,
+    Q8Q4ProgressiveSensitiveSublayerQ8Group32 { block: usize, sublayer: T5Sublayer },
     Q8Q8Progressive,
     Q8Linears,
     Q8Except { block: usize, sublayer: T5Sublayer },
@@ -210,6 +211,15 @@ fn t5_probe_outputs(
         T5ProbePolicy::Q8Q4ProgressiveSensitiveQ8Group32 => t5
             .quantize_progressive_with_sensitive_residuals(8, 4, 8, 32)
             .expect("load-time group-32 selective-residual T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayerQ8Group32 { block, sublayer } => t5
+            .quantize_progressive_with_sensitive_sublayer_residuals(
+                8,
+                4,
+                8,
+                32,
+                Some((block, sublayer)),
+            )
+            .expect("load-time group-32 sublayer-selective T5 quantization"),
         T5ProbePolicy::Q8Q8Progressive => t5
             .quantize_progressive(8, 8, 64)
             .expect("load-time Q8+Q8 progressive T5 quantization"),
@@ -528,7 +538,7 @@ fn t5_precision_sensitivity_sweep() {
         &prompts,
         T5ProbePolicy::Dense,
     );
-    let candidates = [
+    let mut candidates = vec![
         (
             "q8-plus-q4-packed-residual",
             T5ProbePolicy::Q8Q4Progressive,
@@ -583,6 +593,23 @@ fn t5_precision_sensitivity_sweep() {
             Some((23usize, T5Sublayer::FeedForward)),
         ),
     ];
+    for block in 0..24 {
+        for sublayer in [T5Sublayer::Attention, T5Sublayer::FeedForward] {
+            let name = match sublayer {
+                T5Sublayer::Attention => format!(
+                    "q8-plus-q4-packed-residual-sensitive-q8-group32-block{block}-attention"
+                ),
+                T5Sublayer::FeedForward => {
+                    format!("q8-plus-q4-packed-residual-sensitive-q8-group32-block{block}-ffn")
+                }
+            };
+            candidates.push((
+                Box::leak(name.into_boxed_str()),
+                T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayerQ8Group32 { block, sublayer },
+                None,
+            ));
+        }
+    }
 
     for (policy_name, policy, carveout) in candidates {
         let (candidate, peak) =

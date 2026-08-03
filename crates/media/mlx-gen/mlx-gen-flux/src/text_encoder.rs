@@ -552,6 +552,27 @@ impl T5TextEncoder {
         sensitive_residual_bits: i32,
         group_size: i32,
     ) -> Result<()> {
+        self.quantize_progressive_with_sensitive_sublayer_residuals(
+            bits,
+            residual_bits,
+            sensitive_residual_bits,
+            group_size,
+            None,
+        )
+    }
+
+    /// Progressively quantize T5 while additionally giving one attention or feed-forward block
+    /// the sensitive residual width. This keeps every source weight packed and provides a narrow
+    /// calibration seam for providers whose strict end-to-end quality gate needs more precision
+    /// than the shared embedding and relative-position bias alone.
+    pub fn quantize_progressive_with_sensitive_sublayer_residuals(
+        &mut self,
+        bits: i32,
+        residual_bits: i32,
+        sensitive_residual_bits: i32,
+        group_size: i32,
+        sensitive_sublayer: Option<(usize, T5Sublayer)>,
+    ) -> Result<()> {
         validate_t5_group_size(group_size)?;
         if !matches!(bits, 4 | 8)
             || !matches!(residual_bits, 4 | 8)
@@ -561,10 +582,27 @@ impl T5TextEncoder {
                 "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} residuals"
             )));
         }
+        if let Some((block, _)) = sensitive_sublayer {
+            if block >= self.blocks.len() {
+                return Err(Error::Msg(format!(
+                    "T5 sensitive-residual block {block} is outside 0..{}",
+                    self.blocks.len()
+                )));
+            }
+        }
         self.shared
             .quantize_progressive(bits, sensitive_residual_bits, group_size)?;
-        for block in &mut self.blocks {
-            block.quantize_progressive(bits, residual_bits, sensitive_residual_bits, group_size)?;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            let selected = sensitive_sublayer
+                .filter(|(selected, _)| *selected == index)
+                .map(|(_, sublayer)| sublayer);
+            block.quantize_progressive(
+                bits,
+                residual_bits,
+                sensitive_residual_bits,
+                group_size,
+                selected,
+            )?;
         }
         Ok(())
     }
@@ -659,11 +697,26 @@ impl T5Block {
         residual_bits: i32,
         sensitive_residual_bits: i32,
         group_size: i32,
+        sensitive_sublayer: Option<T5Sublayer>,
     ) -> Result<()> {
-        self.attn
-            .quantize_progressive(bits, residual_bits, sensitive_residual_bits, group_size)?;
+        let attention_residual_bits = if sensitive_sublayer == Some(T5Sublayer::Attention) {
+            sensitive_residual_bits
+        } else {
+            residual_bits
+        };
+        let feed_forward_residual_bits = if sensitive_sublayer == Some(T5Sublayer::FeedForward) {
+            sensitive_residual_bits
+        } else {
+            residual_bits
+        };
+        self.attn.quantize_progressive(
+            bits,
+            attention_residual_bits,
+            sensitive_residual_bits,
+            group_size,
+        )?;
         self.ff
-            .quantize_progressive(bits, residual_bits, group_size)
+            .quantize_progressive(bits, feed_forward_residual_bits, group_size)
     }
 
     fn quantize_linears(&mut self, bits: i32) -> Result<()> {
