@@ -201,8 +201,13 @@ mod preview_advertising {
     /// than hide it behind a family name. sc-16959's Sana base and Sprint will be two rows for the
     /// same reason — they run different drivers and carry different fits.
     ///
-    /// Krea alone today: sc-16950 is the only family wiring merged.
-    const PREVIEW_ROUTE_IDS: &[&str] = &["krea_2_turbo", "krea_2_raw", "krea_2_edit"];
+    /// Krea (sc-16950) plus Qwen-Image (sc-16952). Qwen-Image contributes exactly **one** row even
+    /// though sc-16952 wired three render routes: the crate registers a single generator descriptor
+    /// (`qwen_image`), and its edit and ControlNet/Fun lanes are bespoke providers the worker drives
+    /// by name — they carry a `preview` field on their own request types rather than a descriptor,
+    /// so there is no second id to advertise. The derived half still holds all three to account:
+    /// the route inventory on `candle-gen-qwen-image` below pins one hooked site per lane.
+    const PREVIEW_ROUTE_IDS: &[&str] = &["krea_2_turbo", "krea_2_raw", "krea_2_edit", "qwen_image"];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
     /// re-measured: an RGB fit is a property of a VAE latent space, not of a backend.
@@ -417,7 +422,31 @@ mod preview_advertising {
             dir: "candle-gen-qwen-image",
             register: candle_gen_qwen_image::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16952's inventory: one hooked `run_flow_sampler` site per shipped render lane —
+            // base txt2img (`lib.rs`), reference edit (`edit.rs`), and 2512-Fun ControlNet
+            // (`control_fun.rs`). No dark site: this crate has no trainer and no second denoise.
+            // All three project AFTER `pipeline::unpack_latents`, which is why `pipeline.rs` itself
+            // holds no sampler site and no direct emission.
+            routes: &[
+                FileRoutes {
+                    file: "control_fun.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "edit.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "lib.rs",
+                    hooked: 1,
+                    direct: 0,
+                    dark: &[],
+                },
+            ],
         },
         ProviderCrate {
             dir: "candle-gen-sana",

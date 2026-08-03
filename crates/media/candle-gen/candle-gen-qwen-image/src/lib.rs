@@ -407,6 +407,13 @@ impl Pipeline {
             let latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
                 .to_dtype(DIT_DTYPE)?;
 
+            // Per-step latent preview (epic 16948, sc-16952). Built per image so each seed's
+            // trajectory numbers from frame 1, and bound to the request dimensions because the
+            // sampler's running latent is PACKED `[1, seq, 64]` — the projector unpacks to
+            // `[1, 16, H/8, W/8]` before applying the QwenVae fit. True CFG lives entirely inside the
+            // predict closure below, so the hook only ever sees the single conditional trajectory.
+            let preview = crate::preview::hook(&req.preview, req.width, req.height);
+
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 gen_core::sampling::TimestepConvention::Sigma,
@@ -415,7 +422,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |latents, sigma| -> CResult<Tensor> {
                     let pos = transformer.forward_with_memory(
                         latents,
@@ -850,7 +857,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: true,
-            supports_preview: false,
+            // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
+            // bidirectional guard sc-16951 added to `candle-gen-catalog`.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
