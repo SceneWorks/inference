@@ -10,9 +10,9 @@
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
 //!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
 //! * T5 progressively packs every group-quantizable 2-D weight as a primary Q8 term plus a packed
-//!   reconstruction residual. Large attention/FFN projections use Q4 residuals; the shared token
-//!   embedding and relative-position bias use small Q8 residuals. RMSNorm scales remain dense
-//!   because affine quantization does not target vectors.
+//!   reconstruction residual. Most attention/FFN projections use Q4 residuals; the shared token
+//!   embedding, relative-position bias, and calibrated block-4 attention use small Q8 residuals.
+//!   RMSNorm scales remain dense because affine quantization does not target vectors.
 //! * The otherwise-convolutional VAE packs its encoder/decoder mid-block attention projections.
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
@@ -48,12 +48,19 @@ pub const AUXILIARY_BITS: i32 = 8;
 pub const T5_GROUP_SIZE: i32 = 32;
 /// The second-stage packed correction applied to Chroma's Q8 T5 surface.
 pub const T5_RESIDUAL_BITS: i32 = 4;
-/// The higher-fidelity correction used only for T5 tables reused across the full residual stream.
+/// The higher-fidelity correction used for the calibrated sensitive T5 surface.
 pub const T5_SENSITIVE_RESIDUAL_BITS: i32 = 8;
-/// Exact packed bases whose small Q8 residuals protect the T5 input and attention-bias boundaries.
+/// The attention block selected by the hosted all-block sensitivity sweep.
+pub const T5_SENSITIVE_RESIDUAL_BLOCK: usize = 4;
+/// Exact packed bases whose small Q8 residuals protect the T5 boundaries and calibrated attention
+/// block while keeping every source weight packed.
 pub const T5_SENSITIVE_RESIDUAL_BASES: &[&str] = &[
     "shared",
     "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+    "encoder.block.4.layer.0.SelfAttention.q",
+    "encoder.block.4.layer.0.SelfAttention.k",
+    "encoder.block.4.layer.0.SelfAttention.v",
+    "encoder.block.4.layer.0.SelfAttention.o",
 ];
 
 pub fn t5_residual_bits_for(base: &str) -> i32 {
@@ -418,6 +425,7 @@ mod tests {
     fn auxiliary_component_predicates_cover_the_complete_packed_surface() {
         for base in [
             "encoder.block.0.layer.0.SelfAttention.q",
+            "encoder.block.4.layer.0.SelfAttention.q",
             "encoder.block.23.layer.1.DenseReluDense.wi_0",
             "encoder.block.23.layer.1.DenseReluDense.wi_1",
             "encoder.block.23.layer.1.DenseReluDense.wo",
@@ -500,7 +508,11 @@ mod tests {
             &[64, 128],
         );
         let mut map = HashMap::new();
-        for base in ["encoder.block.0.layer.1.DenseReluDense.wi_0", "shared"] {
+        for base in [
+            "encoder.block.0.layer.1.DenseReluDense.wi_0",
+            "shared",
+            "encoder.block.4.layer.0.SelfAttention.q",
+        ] {
             map.insert(format!("{base}.weight"), weight.clone());
         }
         let out = quantize_map_with_residual_policy(
@@ -511,7 +523,11 @@ mod tests {
             t5_residual_bits_for,
         )
         .unwrap();
-        for base in ["encoder.block.0.layer.1.DenseReluDense.wi_0", "shared"] {
+        for base in [
+            "encoder.block.0.layer.1.DenseReluDense.wi_0",
+            "shared",
+            "encoder.block.4.layer.0.SelfAttention.q",
+        ] {
             let wbf16 = weight.as_dtype(Dtype::Bfloat16).unwrap();
             let (primary_weight, primary_scales, primary_biases) =
                 quantize(&wbf16, GROUP_SIZE, 8).unwrap();
@@ -542,6 +558,15 @@ mod tests {
             }
         }
         assert_eq!(t5_residual_bits_for("shared"), 8);
+        for projection in ["q", "k", "v", "o"] {
+            assert_eq!(
+                t5_residual_bits_for(&format!(
+                    "encoder.block.{}.layer.0.SelfAttention.{projection}",
+                    T5_SENSITIVE_RESIDUAL_BLOCK
+                )),
+                T5_SENSITIVE_RESIDUAL_BITS
+            );
+        }
         assert_eq!(
             t5_residual_bits_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
             4

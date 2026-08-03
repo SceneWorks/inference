@@ -8,9 +8,9 @@
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
 //! converter packs the **DiT `transformer/` block Linears**, every group-quantizable T5-XXL 2-D
 //! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer
-//! and uses q8 T5 primaries plus q4-packed T5 residuals for the large projection surface and
-//! q8-packed residuals for the shared embedding/relative bias because hosted image calibration
-//! rejects uniform single- and two-term policies; both routes load without a full dense auxiliary
+//! and uses q8 T5 primaries plus q4-packed T5 residuals for most projections and q8-packed residuals
+//! for the shared embedding, relative bias, and calibrated block-4 attention because hosted image
+//! calibration rejects smaller policies; both routes load without a full dense auxiliary
 //! transient. A
 //! packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)

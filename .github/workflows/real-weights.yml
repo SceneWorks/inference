@@ -249,6 +249,10 @@ jobs:
               "sensitive_residual_bases": [
                   "shared",
                   "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+                  "encoder.block.4.layer.0.SelfAttention.q",
+                  "encoder.block.4.layer.0.SelfAttention.k",
+                  "encoder.block.4.layer.0.SelfAttention.v",
+                  "encoder.block.4.layer.0.SelfAttention.o",
               ],
           }
           for key, value in expected_t5_policy.items():
@@ -450,6 +454,10 @@ jobs:
               "sensitive_residual_bases": [
                   "shared",
                   "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
+                  "encoder.block.4.layer.0.SelfAttention.q",
+                  "encoder.block.4.layer.0.SelfAttention.k",
+                  "encoder.block.4.layer.0.SelfAttention.v",
+                  "encoder.block.4.layer.0.SelfAttention.o",
               ],
           }
           for key, value in expected_t5_policy.items():

@@ -15,7 +15,7 @@ use std::path::Path;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_gen_flux::T5TextEncoder;
+use mlx_gen_flux::{T5Sublayer, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::Dtype;
 
@@ -59,11 +59,15 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
 /// source. Keeping this provider-owned seam shared by production and the real-weight identity test
 /// prevents the test from validating a hand-written quantization recipe that production never uses.
 pub fn quantize_t5_for_dense_source(t5: &mut T5TextEncoder) -> Result<()> {
-    t5.quantize_progressive_with_sensitive_residuals(
+    t5.quantize_progressive_with_sensitive_sublayer_residuals(
         crate::convert::AUXILIARY_BITS,
         crate::convert::T5_RESIDUAL_BITS,
         crate::convert::T5_SENSITIVE_RESIDUAL_BITS,
         crate::convert::T5_GROUP_SIZE,
+        Some((
+            crate::convert::T5_SENSITIVE_RESIDUAL_BLOCK,
+            T5Sublayer::Attention,
+        )),
     )
 }
 
@@ -491,19 +495,23 @@ mod tests {
         assert_eq!(t5_residual_policy(&root).unwrap(), None);
         std::fs::write(
             root.join("config.json"),
-            r#"{"quantization":{"bits":8,"group_size":32,"residual_bits":4,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias"]}}"#,
+            r#"{"quantization":{"bits":8,"group_size":32,"residual_bits":4,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o"]}}"#,
         )
         .unwrap();
         let policy = t5_residual_policy(&root).unwrap().unwrap();
         assert_eq!(policy.default_bits, 4);
         assert_eq!(policy.bits_for("shared"), 8);
         assert_eq!(
+            policy.bits_for("encoder.block.4.layer.0.SelfAttention.q"),
+            8
+        );
+        assert_eq!(
             policy.bits_for("encoder.block.0.layer.1.DenseReluDense.wi_0"),
             4
         );
         std::fs::write(
             root.join("config.json"),
-            r#"{"quantization":{"bits":8,"group_size":64,"residual_bits":8,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias"]}}"#,
+            r#"{"quantization":{"bits":8,"group_size":64,"residual_bits":8,"sensitive_residual_bits":8,"sensitive_residual_bases":["shared","encoder.block.0.layer.0.SelfAttention.relative_attention_bias","encoder.block.4.layer.0.SelfAttention.q","encoder.block.4.layer.0.SelfAttention.k","encoder.block.4.layer.0.SelfAttention.v","encoder.block.4.layer.0.SelfAttention.o"]}}"#,
         )
         .unwrap();
         assert!(t5_residual_policy(&root).is_err());
