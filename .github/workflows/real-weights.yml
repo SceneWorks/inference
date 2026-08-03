@@ -8,12 +8,17 @@ name: Real-weight validation
 # keep moving, and it should not cost a workflow PR each time.
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~95 GB    nax-macos
-#   rw-sa3      Stable Audio 3 / SAME                                ~0 GB     nax-macos
-#   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GB    nax-macos-2
-#   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~45 GB    nax-macos-2
-#   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GB    nax-macos-2
-#   rw-chroma   none stored; materializes from the Hub per run       ~0 GB     nax-macos-2
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos
+#   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
+#   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
+#   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
+#   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB   nax-macos-2
+#   rw-chroma   none stored; materializes from the Hub per run       ~0        nax-macos-2
+#
+# ON DISK is GiB as `du -sh` reports it, summed over each set's `models--*` repo directories.
+# MEASURED 2026-08-03 (sc-17271); previously these were arithmetic, and rw-audio was carrying a
+# ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
+# measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
 #
 # `rw-mage` is pinned to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB
 # frozen-Torch oracle bundle behind `MAGE_ORACLE_SEED_DIR`, which exists on no Hub and which this
@@ -944,19 +949,29 @@ jobs:
           done
       # sc-17271: the first run of this lane on a box that does not already hold the snapshot pays
       # a 16 GB Hub transfer into the shared `~/.cache/huggingface` every other rw-* lane on that
-      # runner reads from, and an ENOSPC partway through leaves partial blobs behind. This records
-      # the headroom that box actually had, and whether a transfer is about to happen at all, in
-      # the run log — the only view of a self-hosted runner's disk anyone gets after the fact.
-      # Report-only: a hard floor would have to guess a build-tree size, and would red the lane in
-      # the steady state, when the snapshot is already resident and nothing is transferred.
+      # runner reads from, and an ENOSPC partway through leaves partial blobs behind. Nobody has a
+      # shell on these runners, so this is the only view of their disk anyone gets after the fact.
+      #
+      # This is a RECORD, not a pre-dispatch gate — by the time it runs the runner is already
+      # claimed. It also cannot become a fail-closed floor without new data: release/
+      # real-weight-models.toml records `size_class`, never byte sizes, so any numeric threshold
+      # would be an invented per-model constant rather than something the manifest already knows.
       - name: Report runner disk headroom
         run: |
-          df -h "$HOME" "$RUNNER_TEMP"
+          df -h "$HOME" "${RUNNER_TEMP:-$HOME}" | awk 'NR == 1 || !seen[$0]++'
           for v in MLX_LLM_JOYCAPTION_SNAPSHOT; do
-            if [[ -d "${!v}" ]]; then
-              echo "$v: resident, $(du -shL "${!v}" | cut -f1)"
-            else
+            path="${!v}"
+            if [[ ! -d "$path" ]]; then
               echo "$v: ABSENT — this run materializes it from the Hub"
+            elif [[ "$(basename "$(dirname "$path")")" == snapshots ]]; then
+              # Size the whole `models--*` repo dir, not `snapshots/<rev>`: revisions share
+              # `blobs/`, so a per-revision figure understates what the cache costs on disk.
+              # Plain `du` here — `-L` would follow the snapshot symlinks back down into
+              # `blobs/` and count every blob a second time.
+              repo="$(dirname "$(dirname "$path")")"
+              echo "$v: resident, $(du -sh "$repo" | awk '{print $1}') ($(basename "$repo"))"
+            else
+              echo "$v: resident, $(du -shL "$path" | awk '{print $1}')"
             fi
           done
       - name: Materialize and verify immutable snapshots
@@ -1779,15 +1794,20 @@ jobs:
           done
       # sc-17271: same as the JoyCaption lane — the MOSS-TTS-Realtime AR stack and the MOSS-Audio
       # codec are an 11 GB transfer on a box that does not already hold them, into a cache shared
-      # with every other rw-audio lane. Report-only, for the reason given at the JoyCaption copy.
+      # with every other rw-audio lane. A record rather than a gate, for the reasons spelled out
+      # at the JoyCaption copy.
       - name: Report runner disk headroom
         run: |
-          df -h "$HOME" "$RUNNER_TEMP"
+          df -h "$HOME" "${RUNNER_TEMP:-$HOME}" | awk 'NR == 1 || !seen[$0]++'
           for v in MOSS_TTS_REALTIME_SNAPSHOT MOSS_AUDIO_TOKENIZER_SNAPSHOT WHISPER_SNAPSHOT CHATTERBOX_SNAPSHOT; do
-            if [[ -d "${!v}" ]]; then
-              echo "$v: resident, $(du -shL "${!v}" | cut -f1)"
-            else
+            path="${!v}"
+            if [[ ! -d "$path" ]]; then
               echo "$v: ABSENT — this run materializes it from the Hub"
+            elif [[ "$(basename "$(dirname "$path")")" == snapshots ]]; then
+              repo="$(dirname "$(dirname "$path")")"
+              echo "$v: resident, $(du -sh "$repo" | awk '{print $1}') ($(basename "$repo"))"
+            else
+              echo "$v: resident, $(du -shL "$path" | awk '{print $1}')"
             fi
           done
       - name: Materialize and verify immutable snapshots
