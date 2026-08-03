@@ -57,6 +57,7 @@ candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # `examples/z-image-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
 # real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
 image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = { workspace = true }
 # gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
 # (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
 # workspace pins (e9c569c2) so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
