@@ -107,7 +107,10 @@ pub fn load_flux_ip_adapter(dir: &Path) -> Result<(FluxIpImageEncoder, FluxIpAda
 /// Remap the raw VAE keys and build the Z-Image-config [`Vae`] (decoder + encoder). The shared body
 /// of [`load_vae`] / [`load_vae_from_source`], which differ only in how the `Weights` are sourced
 /// (sharded dir vs single file) (6941).
-fn vae_from_weights(mut w: Weights) -> Result<Vae> {
+/// Build the shared FLUX/Z-Image VAE from an already-opened weight map. Providers that enforce
+/// stricter artifact provenance can validate the map first without reopening the component and
+/// creating a second residency transient.
+pub fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
     remap_vae_decoder(&mut w)?;
     remap_vae_encoder(&mut w)?;
     Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
@@ -118,13 +121,13 @@ fn vae_from_weights(mut w: Weights) -> Result<Vae> {
 }
 
 pub fn load_vae(root: &Path) -> Result<Vae> {
-    vae_from_weights(Weights::from_dir(root.join("vae"))?)
+    load_vae_from_weights(Weights::from_dir(root.join("vae"))?)
 }
 
 pub fn load_vae_from_source(source: &WeightsSource) -> Result<Vae> {
     match source {
         WeightsSource::Dir(root) => load_vae(root),
-        WeightsSource::File(path) => vae_from_weights(Weights::from_file(path)?),
+        WeightsSource::File(path) => load_vae_from_weights(Weights::from_file(path)?),
     }
 }
 

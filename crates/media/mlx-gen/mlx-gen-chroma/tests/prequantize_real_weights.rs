@@ -6,12 +6,14 @@
 //! as dense floats → a degenerate (flat) render, which the pixel-std assertion catches.
 //!
 //! Chroma is a FLUX.1-schnell-derived DiT with a shared T5-XXL text encoder and FLUX.1 VAE. The
-//! converter packs the **DiT `transformer/` block Linears**, T5-XXL's complete attention/FFN Linear
-//! surface, and the FLUX.1 VAE mid-block attention. T5's token-embedding and relative-position-bias
-//! tables remain dense as an explicit sensitivity carve-out; its large attention/FFN Linear surface
-//! is packed. Shipping q4 preserves the existing q4 transformer and uses q8 auxiliaries because
-//! hosted image calibration rejects all-q4 quality; both routes load without a full dense auxiliary
-//! transient. A packed tier is loaded with `Quant::None` (the
+//! converter packs the **DiT `transformer/` block Linears**, every group-quantizable T5-XXL 2-D
+//! weight, and the FLUX.1 VAE mid-block attention. Shipping q4 preserves the existing q4 transformer
+//! and uses q8 T5 primaries plus q4-packed T5 residuals for most projections and q8-packed residuals
+//! for the shared embedding, relative bias, calibrated block-4 attention, and block-1 feed-forward
+//! projections because hosted image calibration rejects smaller policies; both routes load without
+//! a full dense auxiliary
+//! transient. A
+//! packed tier is loaded with `Quant::None` (the
 //! loader packed-detects via `{base}.scales`, so no in-app re-quantize is needed). The `bf16` (dense)
 //! tier is the mirrored source, loaded directly.
 //!
@@ -21,8 +23,9 @@
 //!
 //! Env knobs: SC8777_SRC (source snapshot dir; default the cached Chroma1-Base snapshot),
 //! SC8777_OUT (tier output dir), SC8777_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8777_MODEL
-//! (registry id: `chroma1_base` default / `chroma1_hd` / `chroma1_flash`), SC8777_KEEP (retain the
-//! tier), and SC16462_AUX_BITS (optional T5/VAE bit width for mixed-precision shipping evidence).
+//! (registry id: `chroma1_base` default / `chroma1_hd` / `chroma1_flash`), and SC8777_KEEP (retain
+//! the tier). The provider fixes T5/VAE at Q8 and the T5 affine group size at 32; those shipping
+//! choices are intentionally not environment-selectable.
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
@@ -73,11 +76,12 @@ fn bits_env() -> i32 {
         .unwrap_or(4)
 }
 
-fn auxiliary_bits_env(route_bits: i32) -> i32 {
-    std::env::var("SC16462_AUX_BITS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(route_bits)
+fn auxiliary_bits() -> i32 {
+    mlx_gen_chroma::convert::AUXILIARY_BITS
+}
+
+fn t5_group_size() -> i32 {
+    mlx_gen_chroma::convert::T5_GROUP_SIZE
 }
 
 fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
@@ -104,12 +108,38 @@ fn packed_tier(src: &std::path::Path, out: &std::path::Path, bits: i32) {
         let expected_bits = if component == "transformer" {
             bits
         } else {
-            auxiliary_bits_env(bits)
+            auxiliary_bits()
         };
         assert_eq!(
             config["quantization"]["bits"], expected_bits,
             "{component} packed bit-width provenance"
         );
+        let expected_group_size = if component == "text_encoder" {
+            t5_group_size()
+        } else {
+            mlx_gen::quant::DEFAULT_GROUP_SIZE
+        };
+        assert_eq!(
+            config["quantization"]["group_size"], expected_group_size,
+            "{component} packed group-size provenance"
+        );
+        if component == "text_encoder" {
+            assert_eq!(
+                config["quantization"]["residual_bits"],
+                mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
+                "T5 progressive residual bit-width provenance"
+            );
+            assert_eq!(
+                config["quantization"]["sensitive_residual_bits"],
+                mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BITS,
+                "T5 sensitive residual bit-width provenance"
+            );
+            assert_eq!(
+                config["quantization"]["sensitive_residual_bases"],
+                serde_json::json!(mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BASES),
+                "T5 sensitive residual surface provenance"
+            );
+        }
         let safetensors = std::fs::read_dir(out.join(component))
             .expect("packed component dir")
             .filter_map(|entry| entry.ok())
@@ -149,8 +179,23 @@ fn exact_f32(a: &[f32], b: &[f32]) -> bool {
 #[derive(Clone, Copy)]
 enum T5ProbePolicy {
     Dense,
+    Q8Q4Progressive,
+    Q8Q4ProgressiveGroup32,
+    Q8Q4ProgressiveSensitiveQ8Group32,
+    Q8Q4ProgressiveSensitiveSublayerQ8Group32 {
+        block: usize,
+        sublayer: T5Sublayer,
+    },
+    Q8Q4ProgressiveSensitiveSublayersQ8Group32 {
+        first: (usize, T5Sublayer),
+        second: (usize, T5Sublayer),
+    },
+    Q8Q8Progressive,
     Q8Linears,
-    Q8Except { block: usize, sublayer: T5Sublayer },
+    Q8Except {
+        block: usize,
+        sublayer: T5Sublayer,
+    },
 }
 
 type T5ProbeOutputs = Vec<(Vec<f32>, Vec<f32>)>;
@@ -168,6 +213,30 @@ fn t5_probe_outputs(
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     match policy {
         T5ProbePolicy::Dense => {}
+        T5ProbePolicy::Q8Q4Progressive => t5
+            .quantize_progressive(8, mlx_gen_chroma::convert::T5_RESIDUAL_BITS, 64)
+            .expect("load-time progressive T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveGroup32 => t5
+            .quantize_progressive(8, 4, 32)
+            .expect("load-time group-32 progressive T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveSensitiveQ8Group32 => t5
+            .quantize_progressive_with_sensitive_residuals(8, 4, 8, 32)
+            .expect("load-time group-32 selective-residual T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayerQ8Group32 { block, sublayer } => t5
+            .quantize_progressive_with_sensitive_sublayer_residuals(
+                8,
+                4,
+                8,
+                32,
+                Some((block, sublayer)),
+            )
+            .expect("load-time group-32 sublayer-selective T5 quantization"),
+        T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayersQ8Group32 { first, second } => t5
+            .quantize_progressive_with_sensitive_sublayers_residuals(8, 4, 8, 32, &[first, second])
+            .expect("load-time group-32 multi-sublayer-selective T5 quantization"),
+        T5ProbePolicy::Q8Q8Progressive => t5
+            .quantize_progressive(8, 8, 64)
+            .expect("load-time Q8+Q8 progressive T5 quantization"),
         T5ProbePolicy::Q8Linears => t5
             .quantize_linears(8)
             .expect("load-time T5 Linear quantization"),
@@ -238,8 +307,9 @@ fn t5_output(root: &std::path::Path, quantize_at_load: Option<i32>) -> (Vec<f32>
     let tokenizer = mlx_gen_chroma::loader::load_tokenizer_with_max_len(64).expect("tokenizer");
     let mut t5 = mlx_gen_chroma::loader::load_t5_encoder(root).expect("T5 weights");
     if let Some(bits) = quantize_at_load {
-        t5.quantize_linears(bits)
-            .expect("load-time T5 Linear quantization");
+        assert_eq!(bits, auxiliary_bits(), "dense T5 seam is provider-owned Q8");
+        mlx_gen_chroma::loader::quantize_t5_for_dense_source(&mut t5)
+            .expect("load-time complete progressive T5 quantization");
     }
     let (output, text_mask) = mlx_gen_chroma::text::encode_prompt(
         &tokenizer,
@@ -283,22 +353,41 @@ fn vae_output(
     root: &std::path::Path,
     quantize_at_load: Option<i32>,
 ) -> (Vec<f32>, Vec<f32>, usize) {
+    vae_output_at_geometry(root, quantize_at_load, 8, 64)
+}
+
+/// Exercise both VAE attention stacks at caller-selected geometry. Quality uses representative
+/// 8x8/64x64 tensors; the residency probe uses the minimum valid 1x1/8x8 tensors so activation
+/// allocation does not drown out the model-load transient the story is specifically measuring.
+fn vae_output_at_geometry(
+    root: &std::path::Path,
+    quantize_at_load: Option<i32>,
+    latent_edge: i32,
+    image_edge: i32,
+) -> (Vec<f32>, Vec<f32>, usize) {
+    assert!(latent_edge > 0 && image_edge >= 8);
     clear_cache();
     reset_peak_memory();
     let mut vae = mlx_gen_chroma::loader::load_vae(root).expect("VAE weights");
     if let Some(bits) = quantize_at_load {
-        vae.quantize(bits).expect("load-time VAE quantization");
+        assert_eq!(
+            bits,
+            auxiliary_bits(),
+            "dense VAE seam is provider-owned Q8"
+        );
+        mlx_gen_chroma::loader::quantize_vae_for_dense_source(&mut vae)
+            .expect("load-time VAE quantization");
     }
-    let latent_values = (0..16 * 8 * 8)
+    let latent_values = (0..16 * latent_edge * latent_edge)
         .map(|i| ((i as f32 * 0.013).sin() * 0.5).clamp(-1.0, 1.0))
         .collect::<Vec<_>>();
-    let latents = Array::from_slice(&latent_values, &[1, 16, 1, 8, 8]);
+    let latents = Array::from_slice(&latent_values, &[1, 16, 1, latent_edge, latent_edge]);
     let decoded = vae.decode(&latents).expect("VAE decode");
     let decoded = decoded.as_dtype(Dtype::Float32).expect("VAE decode f32");
-    let image_values = (0..3 * 64 * 64)
+    let image_values = (0..3 * image_edge * image_edge)
         .map(|i| ((i as f32 * 0.007).cos() * 0.5).clamp(-1.0, 1.0))
         .collect::<Vec<_>>();
-    let image = Array::from_slice(&image_values, &[1, 3, 1, 64, 64]);
+    let image = Array::from_slice(&image_values, &[1, 3, 1, image_edge, image_edge]);
     let encoded = vae.encode(&image).expect("VAE encode");
     let encoded = encoded.as_dtype(Dtype::Float32).expect("VAE encode f32");
     eval([&decoded, &encoded]).expect("materialize VAE outputs");
@@ -463,7 +552,35 @@ fn t5_precision_sensitivity_sweep() {
         &prompts,
         T5ProbePolicy::Dense,
     );
-    let candidates = [
+    let mut candidates = vec![
+        (
+            "q8-plus-q4-packed-residual",
+            T5ProbePolicy::Q8Q4Progressive,
+            None,
+        ),
+        (
+            "q8-plus-q4-packed-residual-group32",
+            T5ProbePolicy::Q8Q4ProgressiveGroup32,
+            None,
+        ),
+        (
+            "q8-plus-q4-packed-residual-sensitive-q8-group32",
+            T5ProbePolicy::Q8Q4ProgressiveSensitiveQ8Group32,
+            None,
+        ),
+        (
+            "q8-plus-q4-packed-residual-sensitive-q8-group32-block4-attention-block1-ffn",
+            T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayersQ8Group32 {
+                first: (4, T5Sublayer::Attention),
+                second: (1, T5Sublayer::FeedForward),
+            },
+            None,
+        ),
+        (
+            "q8-plus-q8-packed-residual-group64",
+            T5ProbePolicy::Q8Q8Progressive,
+            None,
+        ),
         ("q8-linears", T5ProbePolicy::Q8Linears, None),
         (
             "q8-except-block0-attention",
@@ -498,6 +615,23 @@ fn t5_precision_sensitivity_sweep() {
             Some((23usize, T5Sublayer::FeedForward)),
         ),
     ];
+    for block in 0..24 {
+        for sublayer in [T5Sublayer::Attention, T5Sublayer::FeedForward] {
+            let name = match sublayer {
+                T5Sublayer::Attention => format!(
+                    "q8-plus-q4-packed-residual-sensitive-q8-group32-block{block}-attention"
+                ),
+                T5Sublayer::FeedForward => {
+                    format!("q8-plus-q4-packed-residual-sensitive-q8-group32-block{block}-ffn")
+                }
+            };
+            candidates.push((
+                Box::leak(name.into_boxed_str()),
+                T5ProbePolicy::Q8Q4ProgressiveSensitiveSublayerQ8Group32 { block, sublayer },
+                None,
+            ));
+        }
+    }
 
     for (policy_name, policy, carveout) in candidates {
         let (candidate, peak) =
@@ -555,8 +689,8 @@ fn t5_precision_sensitivity_sweep() {
 /// the same tensors as the established dense-load-then-quantize seam, and stay inside the measured
 /// direct semantic-span diagnostic versus bf16. Because Chroma uses the reference's literal 0/1
 /// additive attention mask, the separate full-pipeline image gate is authoritative for runtime
-/// quality. T5 is also the residency discriminator: a packed load must avoid the dense-plus-packed
-/// high-water mark that load-time quantization necessarily incurs.
+/// quality. Peak figures emitted here are diagnostic only because all three modes share one process;
+/// [`component_residency_probe`] provides the authoritative fresh-process measurements.
 #[test]
 #[ignore = "needs real Chroma weights and Apple Silicon MLX"]
 fn packed_auxiliaries_match_load_time_quantization() {
@@ -565,11 +699,7 @@ fn packed_auxiliaries_match_load_time_quantization() {
     };
     let bits = bits_env();
     assert!(matches!(bits, 4 | 8), "SC8777_BITS must be 4 or 8");
-    let auxiliary_bits = auxiliary_bits_env(bits);
-    assert!(
-        matches!(auxiliary_bits, 4 | 8),
-        "SC16462_AUX_BITS must be 4 or 8"
-    );
+    let auxiliary_bits = auxiliary_bits();
     let out = std::env::var("SC8777_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join(format!("chroma-tier-q{bits}")));
@@ -577,18 +707,18 @@ fn packed_auxiliaries_match_load_time_quantization() {
 
     let packed_weights =
         mlx_gen::weights::Weights::from_dir(out.join("text_encoder")).expect("packed T5 weights");
-    assert_ne!(
+    assert_eq!(
         packed_weights.require("shared.weight").unwrap().dtype(),
         Dtype::Uint32,
-        "T5 token embedding is the explicit source-precision carve-out"
+        "T5 token embedding must be stored as packed codes"
     );
-    assert!(packed_weights.get("shared.scales").is_none());
+    assert!(packed_weights.get("shared.scales").is_some());
     let relative_bias = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias";
     assert!(
         packed_weights
             .get(&format!("{relative_bias}.scales"))
-            .is_none(),
-        "T5 relative-position bias is the explicit source-precision carve-out"
+            .is_some(),
+        "T5 relative-position bias must be stored as packed codes"
     );
     let t5_probe = "encoder.block.0.layer.0.SelfAttention.q";
     assert_eq!(
@@ -600,6 +730,12 @@ fn packed_auxiliaries_match_load_time_quantization() {
         "T5 attention/FFN surface must be stored as packed codes"
     );
     assert!(packed_weights.get(&format!("{t5_probe}.scales")).is_some());
+    assert!(
+        packed_weights
+            .get(&format!("{t5_probe}.residual.scales"))
+            .is_some(),
+        "T5 progressive correction must also be stored as packed codes"
+    );
     let packed_weights =
         mlx_gen::weights::Weights::from_dir(out.join("vae")).expect("packed VAE weights");
     let vae_probe = "decoder.mid_block.attentions.0.to_q";
@@ -631,13 +767,6 @@ fn packed_auxiliaries_match_load_time_quantization() {
         t5_all_positions_cosine.is_finite() && t5_active_span_cosine.is_finite(),
         "Q{auxiliary_bits} T5 diagnostic cosines must be finite"
     );
-    assert!(
-        packed_t5_peak < load_time_t5_peak,
-        "packed T5 peak {:.2} GiB must stay below load-time quantization peak {:.2} GiB",
-        gib(packed_t5_peak),
-        gib(load_time_t5_peak)
-    );
-
     let (dense_vae_decode, dense_vae_encode, dense_vae_peak) = vae_output(&src, None);
     let (load_time_vae_decode, load_time_vae_encode, load_time_vae_peak) =
         vae_output(&src, Some(auxiliary_bits));
@@ -659,13 +788,15 @@ fn packed_auxiliaries_match_load_time_quantization() {
         vae_decode_cosine >= vae_floor && vae_encode_cosine >= vae_floor,
         "Q{auxiliary_bits} VAE cosine fell below {vae_floor:.5} (decode={vae_decode_cosine:.7}, encode={vae_encode_cosine:.7})"
     );
-
     println!(
-        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
+        "SC16462_COMPONENT {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"t5AllPositionsCosine\":{:.8},\"t5ActiveSpanDiagnosticCosine\":{:.8},\"vaeDecodeCosine\":{:.8},\"vaeEncodeCosine\":{:.8},\"t5PeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}},\"vaePeakBytes\":{{\"dense\":{},\"loadTimeQuantized\":{},\"packed\":{}}}}}",
         model_id(),
         bits,
         auxiliary_bits,
         auxiliary_bits,
+        mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
+        mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BITS,
+        t5_group_size(),
         t5_all_positions_cosine,
         t5_active_span_cosine,
         vae_decode_cosine,
@@ -676,6 +807,53 @@ fn packed_auxiliaries_match_load_time_quantization() {
         dense_vae_peak,
         load_time_vae_peak,
         packed_vae_peak,
+    );
+}
+
+/// Emit one component/mode peak from a fresh test process. The hosted workflow invokes this probe
+/// three times for every component/mode and compares medians, avoiding allocator/order bias from
+/// measuring dense, load-time quantized, and packed residency in one Metal process. VAE uses its
+/// minimum valid decode/encode geometry so the measurement isolates model residency and the
+/// dense-to-packed load transient instead of being dominated by unrelated image activations.
+#[test]
+#[ignore = "needs real Chroma weights and Apple Silicon MLX"]
+fn component_residency_probe() {
+    let src = chroma_snapshot().expect("SC8777_SRC or cached Chroma snapshot required");
+    let packed = PathBuf::from(
+        std::env::var("SC8777_OUT").expect("SC8777_OUT must point to the candidate packed tier"),
+    );
+    let component = std::env::var("SC16462_RESIDENCY_COMPONENT")
+        .expect("SC16462_RESIDENCY_COMPONENT must be t5 or vae");
+    let mode = std::env::var("SC16462_RESIDENCY_MODE")
+        .expect("SC16462_RESIDENCY_MODE must be dense, load-time, or packed");
+    let repetition = std::env::var("SC16462_RESIDENCY_REPETITION")
+        .expect("SC16462_RESIDENCY_REPETITION is required")
+        .parse::<usize>()
+        .expect("SC16462_RESIDENCY_REPETITION must be an integer");
+    let auxiliary_bits = auxiliary_bits();
+    let (root, quantize_at_load) = match mode.as_str() {
+        "dense" => (src.as_path(), None),
+        "load-time" => (src.as_path(), Some(auxiliary_bits)),
+        "packed" => (packed.as_path(), None),
+        other => panic!("unsupported SC16462_RESIDENCY_MODE {other}"),
+    };
+    let peak = match component.as_str() {
+        "t5" => t5_output(root, quantize_at_load).2,
+        "vae" => vae_output_at_geometry(root, quantize_at_load, 1, 8).2,
+        other => panic!("unsupported SC16462_RESIDENCY_COMPONENT {other}"),
+    };
+    println!(
+        "SC16462_RESIDENCY {}",
+        serde_json::json!({
+            "model": model_id(),
+            "tier": format!("q{}", bits_env()),
+            "auxiliaryBits": auxiliary_bits,
+            "groupSize": t5_group_size(),
+            "component": component,
+            "mode": mode,
+            "repetition": repetition,
+            "peakBytes": peak,
+        })
     );
 }
 
@@ -701,7 +879,7 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         std::env::var("SC8777_OUT").expect("SC8777_OUT must point to the candidate packed tier"),
     );
     let bits = bits_env();
-    let auxiliary_bits = auxiliary_bits_env(bits);
+    let auxiliary_bits = auxiliary_bits();
     let id = model_id();
     let transformer = "transformer/diffusion_pytorch_model.safetensors";
     assert!(
@@ -736,11 +914,14 @@ fn packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak() {
         gib(baseline_peak)
     );
     println!(
-        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-linears-dense-embedding-relative-bias\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
+        "SC16462_CALIBRATION {{\"model\":\"{}\",\"tier\":\"q{}\",\"auxiliaryBits\":{},\"t5Policy\":\"q{}-plus-q{}-residual-sensitive-q{}-complete-group{}\",\"minimumImageCosine\":{:.8},\"maximumMeanAbsolutePixelError\":{:.8},\"peakBytes\":{{\"shippedDenseAuxiliary\":{},\"packedAuxiliary\":{}}},\"prompts\":{}}}",
         id,
         bits,
         auxiliary_bits,
         auxiliary_bits,
+        mlx_gen_chroma::convert::T5_RESIDUAL_BITS,
+        mlx_gen_chroma::convert::T5_SENSITIVE_RESIDUAL_BITS,
+        t5_group_size(),
         minimum_cosine,
         maximum_mae,
         baseline_peak,

@@ -1,6 +1,8 @@
 """Regression tests for trust boundaries around persistent self-hosted CI runners."""
 
 import re
+import subprocess
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -64,6 +66,38 @@ def evaluate_policy(
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_chroma_packed_build_script_is_valid_bash(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        step = re.search(
+            r"(?ms)^      - name: Build and validate packed q4/q8 tiers\n"
+            r".*?^        run: \|\n(?P<script>.*?)^      - name:",
+            workflow,
+        )
+        self.assertIsNotNone(step)
+        script = textwrap.dedent(step.group("script"))
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=script,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_chroma_shipping_policy_cannot_dispatch_unsupported_t5_geometry(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("chroma_t5_group_size:", workflow)
+        self.assertNotIn("SC16462_AUX_BITS", workflow)
+        self.assertNotIn("SC8777_BITS=8", workflow)
+        self.assertEqual(workflow.count('SC8777_BITS="$bits"'), 3)
+        self.assertEqual(workflow.count('SC16462_T5_GROUP_SIZE: "32"'), 2)
+        self.assertGreaterEqual(
+            workflow.count('test "$SC16462_T5_GROUP_SIZE" = "32"'), 2
+        )
+        self.assertEqual(workflow.count('"bits": 8,'), 2)
+        self.assertEqual(workflow.count('"group_size": 32,'), 2)
+
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)

@@ -30,7 +30,7 @@ pub use image_encoder::FluxIpImageEncoder;
 pub use ip_adapter::{FluxIpAdapter, FluxIpInjector};
 pub use loader::{
     load_clip_encoder, load_clip_tokenizer, load_control_transformer_dev, load_t5_encoder,
-    load_t5_tokenizer, load_transformer, load_vae,
+    load_t5_tokenizer, load_transformer, load_vae, load_vae_from_weights,
 };
 pub use model::{
     descriptor_dev, descriptor_for, descriptor_schnell, load_dev, load_schnell, Flux1,
