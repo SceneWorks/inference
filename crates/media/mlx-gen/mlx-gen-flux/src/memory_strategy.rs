@@ -183,6 +183,28 @@ pub fn memory_strategy_contract(
     memory_strategy_contract_with_inventory(provider_id, spec, inventory.as_ref())
 }
 
+/// Verify and identify the exact deferred packed artifact used by a real-weight evidence runner.
+///
+/// This is deliberately evidence-only: it performs the same full pinned inventory/content admission
+/// as production rung 4 and returns that inventory's composite SHA-256, but it does not grant or
+/// mutate a production calibration identity.
+#[doc(hidden)]
+pub fn verified_runner_artifact(provider_id: &str, spec: &LoadSpec) -> CoreResult<String> {
+    if !crate::artifact_inventory::structurally_streamable(provider_id, spec) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: runner artifact verification requires Sequential + DeferredMaterialization on a clean bf16/Q4/Q8 base route"
+        )));
+    }
+    let inventory = crate::artifact_inventory::verified_stream_inventory(provider_id, spec)
+        .ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "{provider_id}: runner artifact failed exact pinned inventory/content verification"
+            ))
+        })?;
+    inventory.ensure_unchanged()?;
+    Ok(inventory.composite_sha256().to_owned())
+}
+
 pub(crate) fn memory_strategy_contract_with_inventory(
     provider_id: &str,
     spec: &LoadSpec,
@@ -595,6 +617,8 @@ mod tests {
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(mlx_gen::Quant::Q4);
         let contract = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        let artifact = verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).unwrap();
+        assert_eq!(artifact.len(), 64);
         assert!(contract.calibration.is_none());
         assert_eq!(
             contract
@@ -618,6 +642,9 @@ mod tests {
                 .support,
             MemoryStrategySupport::Missing
         );
+        assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).is_err());
+        let resident = spec.clone().with_offload_policy(OffloadPolicy::Resident);
+        assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &resident).is_err());
         std::fs::remove_dir_all(root).ok();
     }
 
