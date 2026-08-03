@@ -112,6 +112,7 @@ fn real_weight_ip_adapter() {
         guidance: 3.5,
         ip_adapter_scale: 0.7,
         seed: 12345,
+        memory: candle_gen::gen_core::GenerationMemory::default(),
         cancel: CancelFlag::new(),
     };
 

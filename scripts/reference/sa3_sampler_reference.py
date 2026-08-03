@@ -12,9 +12,13 @@ import argparse
 import hashlib
 import json
 import math
-import subprocess
 import sys
 from pathlib import Path
+
+try:
+    from sa3_reference import validate_upstream_checkout
+except ModuleNotFoundError:
+    from .sa3_reference import validate_upstream_checkout
 
 ROOT = Path(__file__).resolve().parents[2]
 STORY = "sc-14542"
@@ -58,16 +62,12 @@ def sha256(path: Path) -> str:
 
 
 def validate_upstream(upstream: Path) -> None:
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=upstream,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
-    if commit != UPSTREAM_COMMIT:
-        raise InvalidReference("upstream checkout revision mismatch")
+    validate_upstream_checkout(
+        upstream,
+        UPSTREAM_COMMIT,
+        error_type=InvalidReference,
+        check_clean=False,
+    )
     for relative, expected in SOURCES.items():
         if sha256(upstream / relative) != expected:
             raise InvalidReference(f"upstream source mismatch: {relative}")
@@ -289,6 +289,8 @@ def generate(upstream: Path, output: Path) -> None:
 
 def verify(output: Path) -> None:
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise InvalidReference("sampler manifest must be a JSON object")
     if manifest.get("story") != STORY or manifest.get("upstreamCommit") != UPSTREAM_COMMIT:
         raise InvalidReference("manifest identity mismatch")
     if manifest.get("sourceSha256") != SOURCES:
@@ -303,6 +305,8 @@ def verify(output: Path) -> None:
     ):
         raise InvalidReference("artifact payload mismatch")
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise InvalidReference("sampler artifact must be a JSON object")
     if (
         payload.get("story") != STORY
         or payload.get("upstreamCommit") != UPSTREAM_COMMIT
@@ -332,19 +336,24 @@ def verify(output: Path) -> None:
         raise InvalidReference("terminal Pingpong draw is missing")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--generate", action="store_true")
     args = parser.parse_args()
-    if args.generate:
-        if args.upstream is None:
-            parser.error("--generate requires --upstream")
-        generate(args.upstream, args.output)
-    verify(args.output)
-    print("Stable Audio 3 sampler reference verified")
+    try:
+        if args.generate:
+            if args.upstream is None:
+                parser.error("--generate requires --upstream")
+            generate(args.upstream, args.output)
+        verify(args.output)
+        print("Stable Audio 3 sampler reference verified")
+    except (InvalidReference, OSError, json.JSONDecodeError) as error:
+        print(f"SA3 sampler reference error: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -135,7 +135,7 @@
     "dump_z_image_adapter_golden.py": "b8eae6ae0759129f9529e0d9f6d0da0cbfcc169fc41e4f7035dfa9a6aa0d6dc0",
     "dump_z_image_golden.py": "8dce2bc4696abb54d4e6d6f81ce974b5b66df7971f7c19d2dba8fbd683d60060",
     "record_adapter_parity_transcript.py": "1dee8c5f465766e825708feafee16c45c6530b429db7d90cba6a0c8c25ea2746",
-    "verify_adapter_parity_artifacts.py": "262048c9158b63c97b3bb4591066372e573b4bd014222a4a6eee8632968baf81"
+    "verify_adapter_parity_artifacts.py": "b8add2ccf74e90aa7d88c6fa59987b29576fad282648ebd829e7698b97cdfc8b"
   },
   "artifacts": {
     "hyper_flux_lora": {

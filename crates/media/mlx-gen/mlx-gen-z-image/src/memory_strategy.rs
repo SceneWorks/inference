@@ -1727,6 +1727,7 @@ mod tests {
             z_image_generation_memory(&contract(), &selection(MemoryStrategy::BoundedAttention)),
             Some(GenerationMemory {
                 chunk_attention: true,
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                 ..decode
             })
         );
@@ -1737,6 +1738,7 @@ mod tests {
             ),
             Some(GenerationMemory {
                 chunk_attention: true,
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                 stream_transformer_blocks: true,
                 transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
                 // SC-15794: rung 4 now carries its component scope through to the request.

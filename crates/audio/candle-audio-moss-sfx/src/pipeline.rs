@@ -75,6 +75,32 @@ pub const DEFAULT_SECONDS: f32 = 10.0;
 pub const DEFAULT_STEPS: usize = 100;
 pub const DEFAULT_CFG_SCALE: f32 = 4.0;
 
+fn configured_full_window_seconds(max_inference_seconds: u32) -> u32 {
+    max_inference_seconds.max(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SynthesisGeometry {
+    denoise_seconds: u32,
+    requested_samples: usize,
+}
+
+fn synthesis_geometry(
+    denoise_seconds: u32,
+    sample_rate: u32,
+    requested_seconds: f32,
+) -> SynthesisGeometry {
+    SynthesisGeometry {
+        denoise_seconds,
+        requested_samples: ((sample_rate as f64) * requested_seconds as f64).round() as usize,
+    }
+}
+
+fn crop_decoded_audio(mut samples: Vec<f32>, requested_samples: usize) -> Vec<f32> {
+    samples.truncate(requested_samples);
+    samples
+}
+
 /// Pipeline-level progress events, mapped by the provider onto
 /// [`gen_core::Progress`](candle_audio::gen_core::Progress) (one callback so the caller's
 /// progress sink is borrowed exactly once).
@@ -211,17 +237,16 @@ impl MossSfxPipeline {
         )?)
     }
 
-    /// The denoise window in whole seconds (see module docs).
-    ///
-    /// Always the model's full `max_inference_seconds`, matching the reference's
-    /// `full_seconds = int(max_inference_seconds or self.max_inference_seconds)` — the requested
-    /// duration selects only the *crop*, never the denoise length. Shortening the window to the
-    /// requested duration takes the DiT out of distribution and collapses the solve; see the
-    /// module docs. `seconds` is accepted so callers keep a single entry point and so a future
-    /// explicit per-call `max_inference_seconds` override (the reference's own knob) has an
-    /// obvious home, but it deliberately does not shorten the window.
-    pub fn window_seconds(&self, _seconds: f32) -> u32 {
-        self.config.index.max_inference_seconds.max(1)
+    /// The configured full denoise window in whole seconds. Requested output duration does not
+    /// enter this seam; it controls only the post-decode crop.
+    pub fn full_window_seconds(&self) -> u32 {
+        configured_full_window_seconds(self.config.index.max_inference_seconds)
+    }
+
+    /// Compatibility wrapper for the original public API. The argument was always deliberately
+    /// ignored: MOSS-SFX denoises the configured full window and crops only after decoding.
+    pub fn window_seconds(&self, _requested_seconds: f32) -> u32 {
+        self.full_window_seconds()
     }
 
     /// Synthesize one clip. `on_progress` receives [`PipelineProgress::Step`] after each
@@ -242,8 +267,8 @@ impl MossSfxPipeline {
                 "moss-sfx: seconds must be > 0 after 0.1 s rounding (got {seconds})"
             )));
         }
-        let window = self.window_seconds(seconds);
-        let latent_len = window as usize * sample_rate as usize / HOP_LENGTH;
+        let geometry = synthesis_geometry(self.full_window_seconds(), sample_rate, seconds);
+        let latent_len = geometry.denoise_seconds as usize * sample_rate as usize / HOP_LENGTH;
 
         if cancel() {
             return Err(AudioError::Canceled);
@@ -300,8 +325,31 @@ impl MossSfxPipeline {
             .decode(&latents, cancel)?
             .ok_or(AudioError::Canceled)?; // [1, 1, window·sr]
         let full: Vec<f32> = audio.flatten_all()?.to_vec1::<f32>()?;
-        let out_len = ((sample_rate as f64) * seconds as f64).round() as usize;
-        let out_len = out_len.min(full.len());
-        Ok(full[..out_len].to_vec())
+        Ok(crop_decoded_audio(full, geometry.requested_samples))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        configured_full_window_seconds, crop_decoded_audio, synthesis_geometry, SynthesisGeometry,
+    };
+
+    #[test]
+    fn denoise_window_is_configured_full_window_not_requested_crop() {
+        assert_eq!(
+            synthesis_geometry(30, 48_000, 4.0),
+            SynthesisGeometry {
+                denoise_seconds: 30,
+                requested_samples: 4 * 48_000,
+            }
+        );
+        assert_eq!(configured_full_window_seconds(0), 1);
+
+        let decoded = vec![0.0_f32; 30 * 48_000];
+        let allocation = decoded.as_ptr();
+        let cropped = crop_decoded_audio(decoded, 4 * 48_000);
+        assert_eq!(cropped.len(), 4 * 48_000);
+        assert_eq!(cropped.as_ptr(), allocation, "crop must truncate in place");
     }
 }

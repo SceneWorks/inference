@@ -14,6 +14,7 @@ mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # Link-time self-registration of the `Generator` into the core registry (sc-3194).
 # The shared on-device decode primitives (KV cache + sampler + RoPE). The dual-path AR runtime
 # (sc-3187) + denoise loop consume mlx-llm's `ContiguousKvCache` / `sample` / `Rope` instead of

@@ -25,7 +25,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, PidWeights, Progress, Quant};
+use candle_gen::gen_core::{Image, PidWeights, PreviewSink, Progress, Quant};
 // `LatentDecoder` brings the `PidDecoder::decode` trait method into scope (sc-8044).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -68,6 +68,12 @@ pub struct Flux2ControlRequest {
     /// loaded with [`with_pid`](Flux2Control::with_pid), the final latent is decoded by the `flux2` PiD
     /// student (4× SR → 2K/4K) instead of the native FLUX.2 VAE. `false` (default) keeps the VAE decode.
     pub use_pid: bool,
+    /// Per-step latent-preview sink (epic 16948, sc-16955) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot carry because it is worker-invoked by name rather than through a
+    /// registered descriptor. Default is inert, and an inert sink makes a seeded render
+    /// byte-identical to one with no preview at all.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -83,6 +89,7 @@ impl Default for Flux2ControlRequest {
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 0,
             use_pid: false,
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -206,6 +213,10 @@ impl Flux2Control {
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
+        // Per-step latent preview (epic 16948, sc-16955), bound to the same `(lat_h, lat_w)` the decode
+        // tail below unpacks against. `control_context` is a closure capture, constant across steps and
+        // never part of the running latent, so the control hint cannot reach a frame.
+        let preview = crate::preview::hook(&req.preview, &self.vae, lat_h, lat_w);
         // The driver does cancel + progress + the integrator step. The control forward lives inside the
         // predict closure so a multi-eval solver re-runs it. dev is guidance-distilled: a single forward
         // feeding the embedded guidance scalar (no negative pass). FLUX.2 embeds σ×1000.
@@ -217,7 +228,7 @@ impl Flux2Control {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
                 Ok(self.transformer.forward(

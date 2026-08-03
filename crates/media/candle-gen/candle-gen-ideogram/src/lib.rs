@@ -24,6 +24,7 @@ pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod pipeline;
+pub mod preview;
 pub mod quant;
 pub mod scheduler;
 pub mod text_encoder;
@@ -169,7 +170,12 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16955). Ideogram drives no shared sampler, so
+            // its bespoke flow-match loop emits directly (`crate::preview`); the VAE it loads is the
+            // FLUX.2 one tensor-for-tensor, so it reuses that fit rather than introducing one.
+            // `candle-gen-catalog`'s guard derives this flag from the sources — including from a
+            // bespoke crate's direct emission call — so it cannot run ahead of or behind the wiring.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

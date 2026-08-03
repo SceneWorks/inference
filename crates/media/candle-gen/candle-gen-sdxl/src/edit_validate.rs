@@ -109,6 +109,9 @@ fn real_weight_edit() {
         // Native VAE: this harness validates the edit/inpaint pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
         cancel: CancelFlag::new(),
+        // Inert: this harness validates the render, not the preview stream — sc-16954 covers that in
+        // `tests/preview_real_weights.rs`.
+        preview: candle_gen::gen_core::PreviewSink::default(),
     };
     let mut noop = |_p: Progress| {};
 

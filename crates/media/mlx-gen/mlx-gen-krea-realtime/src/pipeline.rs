@@ -25,7 +25,8 @@ use mlx_gen::{
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
 use crate::t2v::{
-    generate_i2v_reported, generate_t2v_reported, generate_v2v_reported, KreaRealtimeJob,
+    bounded_latent_frame_count, generate_i2v_reported, generate_t2v_reported,
+    generate_v2v_reported, KreaRealtimeJob,
 };
 
 /// The Self-Forcing few-step sampler name Krea Realtime advertises (a fixed short per-block flow-match
@@ -41,6 +42,46 @@ const DEFAULT_FPS: u32 = 16;
 /// trims back to this requested 81 (see [`crate::t2v::decode_latents_to_video`]). 81 is the reference
 /// realtime-video canonical clip length.
 const DEFAULT_FRAMES: u32 = 81;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedFrames {
+    fps: u32,
+    output: u32,
+    output_latent: usize,
+    generation_latent: usize,
+}
+
+/// Resolve the output cadence/count and its z16 latent count exactly once for provider validation and
+/// execution. Keeping explicit-frames, duration-derived, and default precedence here prevents the
+/// preflight and run paths from disagreeing about the model-local allocation cap.
+fn resolve_frames(req: &GenerationRequest) -> Result<ResolvedFrames> {
+    let fps = req.fps.unwrap_or(DEFAULT_FPS);
+    let output = req.frames.unwrap_or_else(|| {
+        req.duration
+            .map(|duration| ((duration * fps as f32).round() as u32).max(1))
+            .unwrap_or(DEFAULT_FRAMES)
+    });
+    let output_latent = bounded_latent_frame_count("requested output", output as usize)?;
+    // V2V derives its actual full-noise allocation from the source clip, then trims decode to the
+    // separately resolved requested output. Cap both dimensions without changing that output/trim
+    // contract. Route selection below uses the same first VideoClip.
+    let generation_latent = if let Some(source_frames) =
+        req.conditioning
+            .iter()
+            .find_map(|conditioning| match conditioning {
+                Conditioning::VideoClip { frames, .. } => Some(frames.as_slice()),
+                _ => None,
+            }) {
+        bounded_latent_frame_count("V2V source", source_frames.len())?
+    } else {
+        output_latent
+    };
+    Ok(ResolvedFrames {
+        fps,
+        output,
+        output_latent,
+        generation_latent,
+    })
+}
 
 /// Stable identity + advertised capabilities for Krea Realtime 14B (Wan-2.1-T2V-14B backbone,
 /// autoregressive self-forcing **text-to-video**; **CFG off** → no negative prompt / no guidance; a
@@ -173,6 +214,8 @@ struct ProductReportedGeneration<'a> {
     root: &'a std::path::Path,
     config: &'a KreaRealtimeConfig,
     job: &'a KreaRealtimeJob<'a>,
+    output_latent: usize,
+    generation_latent: usize,
     adapters: &'a [AdapterSpec],
     quant: Option<Quant>,
     cancel: &'a CancelFlag,
@@ -185,6 +228,7 @@ impl ReportedGeneration for ProductReportedGeneration<'_> {
             self.root,
             self.config,
             self.job,
+            self.output_latent,
             self.adapters,
             self.quant,
             self.cancel,
@@ -197,6 +241,7 @@ impl ReportedGeneration for ProductReportedGeneration<'_> {
             self.root,
             self.config,
             self.job,
+            self.output_latent,
             image,
             self.adapters,
             self.quant,
@@ -215,6 +260,7 @@ impl ReportedGeneration for ProductReportedGeneration<'_> {
             self.config,
             self.job,
             frames,
+            self.generation_latent,
             strength,
             self.adapters,
             self.quant,
@@ -269,9 +315,9 @@ impl Generator for KreaRealtime {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)
+        self.validate_and_resolve_frames(req)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn generate(
@@ -284,6 +330,13 @@ impl Generator for KreaRealtime {
 }
 
 impl KreaRealtime {
+    fn validate_and_resolve_frames(&self, req: &GenerationRequest) -> Result<ResolvedFrames> {
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)?;
+        resolve_frames(req)
+    }
+
     fn finish_reported_generation(
         &self,
         result: Result<(GenerationOutput, Vec<AdapterApplyReport>)>,
@@ -327,24 +380,14 @@ impl KreaRealtime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-
-        // Output frame count: explicit `frames`, else derived from `duration × fps`, else the default.
-        let fps = req.fps.unwrap_or(DEFAULT_FPS);
-        let num_frames = req.frames.unwrap_or_else(|| {
-            req.duration
-                .map(|d| ((d * fps as f32).round() as u32).max(1))
-                .unwrap_or(DEFAULT_FRAMES)
-        });
+        let frames = self.validate_and_resolve_frames(req)?;
 
         let job = KreaRealtimeJob {
             prompt: &req.prompt,
             width: req.width,
             height: req.height,
-            num_frames,
-            fps,
+            num_frames: frames.output,
+            fps: frames.fps,
             seed: req.seed.unwrap_or_else(default_seed),
             steps: req.steps.map(|s| s as usize),
         };
@@ -374,6 +417,8 @@ impl KreaRealtime {
             root: &self.root,
             config: &self.config,
             job: &job,
+            output_latent: frames.output_latent,
+            generation_latent: frames.generation_latent,
             adapters: &self.adapters,
             quant: self.quant,
             cancel: &req.cancel,
@@ -698,5 +743,159 @@ mod tests {
             .run(&bad, &mut noop)
             .expect_err("guidance must be rejected on a CFG-off model");
         assert!(err.to_string().contains("guidance"), "got: {err}");
+    }
+
+    #[test]
+    fn frame_cap_boundary_is_shared_and_rejected_before_staging() {
+        let provider = unloaded();
+        let request = |frames| GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            frames: Some(frames),
+            ..Default::default()
+        };
+
+        Generator::validate(&provider, &request(1_028))
+            .expect("1,028 output frames resolve to the maximum 257 latent frames");
+        let mut i2v_boundary = request(1_028);
+        i2v_boundary.conditioning = vec![Conditioning::Reference {
+            image: Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+            strength: None,
+        }];
+        Generator::validate(&provider, &i2v_boundary)
+            .expect("I2V keeps the same 1,028-output-frame boundary as T2V");
+        let validation_error = Generator::validate(&provider, &request(1_029))
+            .expect_err("1,029 output frames resolve to 258 latent frames and must be rejected");
+        assert!(
+            matches!(validation_error, mlx_gen::gen_core::Error::Unsupported(_)),
+            "the model-local cap is a typed capability refusal, got: {validation_error:?}"
+        );
+
+        let mut progress_calls = 0;
+        let run_error = provider
+            .run(&request(1_029), &mut |_| progress_calls += 1)
+            .expect_err("run must apply the same cap before touching the nonexistent snapshot");
+        assert!(
+            matches!(run_error, Error::Unsupported(_)),
+            "got: {run_error:?}"
+        );
+        assert_eq!(
+            progress_calls, 0,
+            "component staging emits Loading progress, so no progress proves pre-staging rejection"
+        );
+    }
+
+    #[test]
+    fn frame_resolver_keeps_explicit_duration_and_default_paths_consistent() {
+        let default = resolve_frames(&GenerationRequest::default()).unwrap();
+        assert_eq!(
+            default,
+            ResolvedFrames {
+                fps: 16,
+                output: 81,
+                output_latent: 21,
+                generation_latent: 21,
+            }
+        );
+
+        let from_duration = resolve_frames(&GenerationRequest {
+            fps: Some(16),
+            duration: Some(64.25),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(from_duration.output, 1_028);
+        assert_eq!(from_duration.output_latent, 257);
+        assert_eq!(from_duration.generation_latent, 257);
+
+        let duration_error = resolve_frames(&GenerationRequest {
+            fps: Some(16),
+            duration: Some(64.3125),
+            ..Default::default()
+        })
+        .expect_err("duration x fps resolving to 1,029 output frames must hit the same cap");
+        assert!(matches!(duration_error, Error::Unsupported(_)));
+
+        let explicit_wins = resolve_frames(&GenerationRequest {
+            frames: Some(5),
+            fps: Some(16),
+            duration: Some(64.3125),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(explicit_wins.output, 5);
+        assert_eq!(explicit_wins.output_latent, 2);
+        assert_eq!(explicit_wins.generation_latent, 2);
+    }
+
+    fn v2v_request(source_frames: usize) -> GenerationRequest {
+        let source = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![source; source_frames],
+                frame_idx: 0,
+                strength: 0.5,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v2v_source_frame_cap_is_resolved_and_rejected_before_staging() {
+        let provider = unloaded();
+        let accepted = v2v_request(1_028);
+        Generator::validate(&provider, &accepted)
+            .expect("1,028 V2V source frames resolve to the maximum 257 generation latents");
+        let resolved = provider.validate_and_resolve_frames(&accepted).unwrap();
+        assert_eq!(
+            resolved.output, DEFAULT_FRAMES,
+            "the output trim stays defaulted"
+        );
+        assert_eq!(resolved.output_latent, 21);
+        assert_eq!(resolved.generation_latent, 257);
+        let mut accepted_progress = 0;
+        let accepted_run_error = provider
+            .run(&accepted, &mut |_| accepted_progress += 1)
+            .expect_err("an accepted boundary request reaches the nonexistent snapshot guard");
+        assert!(
+            matches!(accepted_run_error, Error::Msg(_))
+                && accepted_run_error.to_string().contains("snapshot dir does not exist"),
+            "the accepted boundary must pass the cap and fail only on missing weights: {accepted_run_error:?}"
+        );
+        assert_eq!(accepted_progress, 0);
+
+        let rejected = v2v_request(1_029);
+        let validation_error = Generator::validate(&provider, &rejected)
+            .expect_err("1,029 V2V source frames resolve to 258 generation latents");
+        assert!(
+            matches!(validation_error, mlx_gen::gen_core::Error::Unsupported(_)),
+            "the V2V source cap must stay typed across the provider contract: {validation_error:?}"
+        );
+        let mut rejected_progress = 0;
+        let run_error = provider
+            .run(&rejected, &mut |_| rejected_progress += 1)
+            .expect_err(
+                "V2V source overflow must fail before the nonexistent snapshot is inspected",
+            );
+        assert!(
+            matches!(run_error, Error::Unsupported(_)),
+            "got: {run_error:?}"
+        );
+        assert_eq!(
+            rejected_progress, 0,
+            "no Loading progress proves the oversized source was rejected before staging"
+        );
     }
 }

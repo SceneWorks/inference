@@ -653,6 +653,52 @@ class AssignmentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             blind.assign(manifest)
 
+    def test_manifest_take_files_must_be_plain_non_special_basenames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            absolute = str((Path(temporary) / "take.wav").resolve())
+            for filename in ("", ".", "..", absolute, "nested/take.wav", r"nested\take.wav"):
+                with self.subTest(filename=filename):
+                    manifest = fake_manifest()
+                    manifest["takes"][0]["file"] = filename
+                    with self.assertRaisesRegex(ValueError, "take file|take filename"):
+                        blind.assign(manifest)
+
+    def test_materialize_preflights_all_sources_before_copying_anything(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "stimuli"
+            source.mkdir()
+            for take in self.manifest["takes"]:
+                (source / take["file"]).write_text("wav", encoding="utf-8")
+            playlists, key = blind.assign(self.manifest, panel=1)
+            missing = key["listeners"]["L01"]["ratings"][-1]["slots"][-1]["file"]
+            (source / missing).unlink()
+            panel = root / "panel"
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                blind.materialize(playlists, key, source, panel)
+            self.assertFalse(panel.exists())
+
+    def test_materialize_rejects_a_source_symlink_escape_before_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "stimuli"
+            source.mkdir()
+            for take in self.manifest["takes"]:
+                (source / take["file"]).write_text("wav", encoding="utf-8")
+            escaped_name = self.manifest["takes"][0]["file"]
+            escaped = root / "outside.wav"
+            escaped.write_text("secret", encoding="utf-8")
+            (source / escaped_name).unlink()
+            try:
+                (source / escaped_name).symlink_to(escaped)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            playlists, key = blind.assign(self.manifest, panel=1)
+            panel = root / "panel"
+            with self.assertRaisesRegex(ValueError, "escapes"):
+                blind.materialize(playlists, key, source, panel)
+            self.assertFalse(panel.exists())
+
     def test_materialize_copies_to_opaque_names(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -713,6 +759,20 @@ class SheetAndUnblindTests(unittest.TestCase):
             blind.unblind(self.key, [], [
                 {"listener": "L01", "screen": screen, "slot": "1", "rating": "101"},
             ])
+
+    def test_unblinding_rejects_duplicate_normalized_rating_keys(self) -> None:
+        screen = self.key["listeners"]["L01"]["ratings"][0]["screen"]
+        rows = [
+            {"listener": "L01", "screen": screen, "slot": "1", "rating": "50"},
+            {
+                "listener": " l01 ",
+                "screen": f" {screen.upper()} ",
+                "slot": "01",
+                "rating": "60",
+            },
+        ]
+        with self.assertRaisesRegex(ValueError, "duplicate rating response"):
+            blind.unblind(self.key, [], rows)
 
 
 class AnalysisTests(unittest.TestCase):
@@ -778,6 +838,32 @@ class AnalysisTests(unittest.TestCase):
         report = blind.analyze(simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0))
         self.assertIsNone(report["deviation"])
         self.assertNotIn("DEVIATION", report["conclusion"])
+
+    def test_missing_or_extra_rating_rows_are_non_overridable_deviations(self) -> None:
+        unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0)
+        mutations = (
+            unblinded["ratings"][:-1],
+            [*unblinded["ratings"], dict(unblinded["ratings"][0])],
+        )
+        expected = (
+            blind.PANEL_SIZE
+            * blind.RATING_SCREENS_PER_LISTENER
+            * blind.RATING_SLOTS_PER_SCREEN
+        )
+        self.assertEqual(len(unblinded["ratings"]), expected)
+        for ratings in mutations:
+            with self.subTest(observed=len(ratings)):
+                mutated = {**unblinded, "ratings": ratings}
+                report = blind.analyze(mutated)
+                self.assertIsNotNone(report["deviation"])
+                self.assertTrue(
+                    report["conclusion"].startswith("DEVIATION FROM PRE-REGISTRATION")
+                )
+                self.assertIn(
+                    f"pooled MOS rating rows: {len(ratings)} observed, {expected} pre-registered",
+                    report["deviation"],
+                )
+                self.assertIn("PREFERENCE FOR MEDIUM", report["conclusion"])
 
     def test_a_trimmed_panel_is_flagged_as_a_deviation_from_the_preregistration(self) -> None:
         """The garden-of-forking-paths hole the pre-registration exists to close.

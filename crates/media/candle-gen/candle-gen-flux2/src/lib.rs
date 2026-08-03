@@ -43,6 +43,7 @@ pub mod convert;
 pub mod edit_provider;
 pub mod pipeline;
 pub mod pos_embed;
+pub mod preview;
 pub mod quant;
 pub mod text_encoder;
 pub mod transformer;
@@ -639,6 +640,13 @@ impl Pipeline {
             let latents =
                 pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
 
+            // Per-step latent preview (epic 16948, sc-16955). The sampler's running latent is the packed
+            // 128-ch BN-normalized token sequence, so the hook unpacks it onto `(lat_h, lat_w)` — the same
+            // grid the decode tail below resolves — and runs the VAE's own de-normalize + unpatchify before
+            // projecting the raw 32-channel latent. Built per image so each seed's trajectory starts at
+            // frame 1. An inert sink is byte-identical to no hook at all.
+            let preview = preview::hook(&req.preview, vae, lat_h, lat_w);
+
             // The driver does cancel + progress + the euler/curated integrator step. The forward (and the
             // guidance>1 CFG blend) lives inside `predict` so a multi-eval solver re-runs it. FLUX.2 uses
             // the Sigma convention but the model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
@@ -650,7 +658,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
                     let out = if embedded_guidance {
@@ -821,7 +829,11 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
             supports_sequential_offload: true,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16955): every shipped FLUX.2 lane hands the
+            // shared sampler a `crate::preview` hook that projects the raw 32-channel latent through
+            // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this
+            // flag from the sources, so it cannot be set ahead of the wiring or left behind it.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

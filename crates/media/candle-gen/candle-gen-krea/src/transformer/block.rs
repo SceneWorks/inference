@@ -15,19 +15,13 @@ use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
 use crate::nvfp4_dit::DitPlan;
 use crate::quant::QLinear;
-use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+#[cfg(test)]
+use candle_gen::gen_core::attention_budget::AttentionBudget;
+use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::quant::AdaptLinear;
 
 fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
-    let max_score_elements = if budget == usize::MAX {
-        u64::MAX
-    } else {
-        budget as u64
-    };
-    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
-        max_score_elements,
-        false,
-    ))
+    AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(budget))
 }
 
 fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {

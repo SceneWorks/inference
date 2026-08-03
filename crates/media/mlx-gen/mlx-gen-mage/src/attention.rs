@@ -34,11 +34,12 @@
 //! for no numerical gain, and native-resolution packing (a 50k-token budget upstream) makes that
 //! worse quadratically.
 
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{concatenate_axis, split, split_sections, stack_axis};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
@@ -188,6 +189,17 @@ impl MageJointAttention {
     /// returned [`DualStream`] carries the two *attention outputs* (post `to_out` / `to_add_out`),
     /// **not** the residual — the block owns the gated add.
     pub fn forward(&self, stream: &DualStream, ctx: &PackContext) -> Result<DualStream> {
+        self.forward_budgeted(stream, ctx, AttentionPlan::UNBOUNDED)
+    }
+
+    /// The production joint-attention path under the shared request-selected scratch budget.
+    /// An unbounded plan preserves the historical single fused SDPA call byte-for-byte.
+    pub fn forward_budgeted(
+        &self,
+        stream: &DualStream,
+        ctx: &PackContext,
+        plan: AttentionPlan<'_>,
+    ) -> Result<DualStream> {
         let dim = self.heads * self.head_dim;
         let img_tokens = ctx.layout().img_tokens();
         let txt_tokens = ctx.layout().txt_tokens();
@@ -215,8 +227,13 @@ impl MageJointAttention {
         let img_q = apply_rope(&img_q, ctx.rope())?;
         let img_k = apply_rope(&img_k, ctx.rope())?;
 
-        let (img_out, txt_out) =
-            self.joint_sdpa([&img_q, &img_k, &img_v], [&txt_q, &txt_k, &txt_v], ctx, dim)?;
+        let (img_out, txt_out) = self.joint_sdpa(
+            [&img_q, &img_k, &img_v],
+            [&txt_q, &txt_k, &txt_v],
+            ctx,
+            dim,
+            plan,
+        )?;
 
         Ok(DualStream {
             img: self.to_out.forward(&img_out)?,
@@ -232,6 +249,7 @@ impl MageJointAttention {
         txt: [&Array; 3],
         ctx: &PackContext,
         dim: i32,
+        plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let segments = ctx.segments();
         let img_at = ctx.img_split_points();
@@ -260,7 +278,7 @@ impl MageJointAttention {
             let k = joint(&txt_k[s], &img_k[s])?;
             let v = joint(&txt_v[s], &img_v[s])?;
             // `causal=False`, no mask: per-sample isolation is the segmentation itself.
-            let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+            let out = sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?;
             let sh = out.shape();
             // `[1, heads, L, head_dim]` → `[L, heads · head_dim]` (`flatten(1, 2)`).
             let out = out
@@ -273,7 +291,10 @@ impl MageJointAttention {
 
         let repack = |parts: Vec<Array>, tokens: i32| -> Result<Array> {
             let flat = if parts.len() == 1 {
-                parts.into_iter().next().unwrap_or_else(|| unreachable!())
+                parts
+                    .into_iter()
+                    .next()
+                    .expect("one segment must produce one attention part")
             } else {
                 let refs: Vec<&Array> = parts.iter().collect();
                 concatenate_axis(&refs, 0)?

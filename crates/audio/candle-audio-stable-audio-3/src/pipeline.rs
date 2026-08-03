@@ -20,6 +20,13 @@ use crate::weights::{SnapshotKind, SnapshotLayout};
 pub const SAMPLE_RATE: u32 = 44_100;
 pub const CHANNELS: usize = 2;
 pub const LATENT_CHANNELS: usize = 256;
+
+#[derive(Clone, Copy)]
+enum ReferenceInputValidation {
+    Required,
+    Complete,
+}
+
 /// The upstream API default step count, which is also the post-trained checkpoints' own
 /// `training.demo.demo_steps`.
 pub const DEFAULT_STEPS: usize = 8;
@@ -119,11 +126,12 @@ pub struct VariantGeometry {
 /// which would isolate whether the dullness comes from the decoder — is filed as its own story with
 /// these numbers attached.
 ///
-/// The text side was never part of that decision. sc-14537 pinned the canonical cross-runtime text
-/// policy — BF16 weights on disk, F32 compute, one BF16 rounding at the raw-embedding boundary —
-/// and `tests/text_oracle.rs` gates it against the frozen Transformers 5.8.0 oracle on CPU and
-/// Metal. Switching T5Gemma to BF16 *compute* would move a surface with a numeric parity gate behind
-/// it for no memory win worth having: the encoder is 281 MB of medium's 10.4 GB resident set.
+/// The text side was never part of that decision. sc-14537 pinned BF16 weights on disk and F32
+/// compute on every backend. CPU keeps the raw encoder output F32; Metal and CUDA apply one BF16
+/// rounding at the raw-embedding boundary before F32 conditioning. `tests/text_oracle.rs` gates
+/// that policy against the frozen Transformers 5.8.0 oracle. Switching T5Gemma to BF16 *compute*
+/// would move a surface with a numeric parity gate behind it for no memory win worth having: the
+/// encoder is 281 MB of the exact 10,443,755,936-byte medium artifact pin set.
 ///
 /// # The F16 path did not load on CUDA at all until sc-14545's second fix cycle
 ///
@@ -384,6 +392,23 @@ impl ForwardedConditioning<'_> {
     }
 }
 
+/// A forwarding receipt constructed only after provider request validation has completed.
+///
+/// The crate-private validated synthesis entry accepts this type while the public defensive entry
+/// accepts [`ForwardedConditioning`]. Consequently, changing the production call back to the public
+/// entry is a type error rather than a silent second finiteness scan.
+pub(crate) struct ValidatedForwardedConditioning<'a>(ForwardedConditioning<'a>);
+
+impl<'a> ValidatedForwardedConditioning<'a> {
+    pub(crate) fn new(conditioning: ForwardedConditioning<'a>) -> Self {
+        Self(conditioning)
+    }
+
+    fn into_inner(self) -> ForwardedConditioning<'a> {
+        self.0
+    }
+}
+
 /// Where the request-local stream's draws sat relative to the source encode (sc-14547).
 ///
 /// Exposed for the draw-order gate. The invariant is `draws_after_initial_noise == 1`: the
@@ -408,24 +433,22 @@ pub struct ReferenceDrawOrder {
 ///
 /// The order is fixed and each step depends on the previous one:
 ///
-/// 1. **Resample the whole buffer** to [`SAMPLE_RATE`] through the shared
-///    [`candle_audio::dsp::resample`]. Off-rate source audio is converted, never rejected: the
+/// 1. **Resample only the retained global-output window** to [`SAMPLE_RATE`] through the shared
+///    [`candle_audio::dsp::resample_range`]. The full source remains visible to the FIR, so phase
+///    and clip-boundary semantics are byte-identical to slicing the whole-buffer result. Off-rate
+///    source audio is converted, never rejected: the
 ///    lane's other two audio generators emit 48 kHz, so rejecting would refuse audio produced one
 ///    step earlier in the same product, and the 160:147 stereo ratio is already gated in
 ///    `candle-audio`'s own resampler tests. (ACE-Step's "must be 48000 Hz" is a missing resampler,
 ///    not a policy — that crate contains no DSP resampling of any kind.)
-/// 2. **Trim or right-zero-pad from offset 0** to exactly `target_frames`, which is the adapted
-///    sample size for the *requested* duration. Source extent never moves the geometry.
-/// 3. **Conform channels after padding**: mono duplicates, stereo passes through, more than two
+/// 2. **Conform only retained frames**: mono duplicates, stereo passes through, more than two
 ///    channels keeps the first two.
+/// 3. **Right-zero-pad** that stereo prefix to exactly `target_frames`, which is the adapted sample
+///    size for the *requested* duration. Source extent never moves the geometry.
 ///
-/// Steps 1 and 2 genuinely depend on their predecessor and their results are asserted. Step 3's
-/// *position* is not observable and is not claimed to be gated: because the pad value is zero,
-/// conforming before padding and conforming after it produce byte-identical output (duplicating a
-/// zero and padding with zeros commute, as does taking the first two of four zeros). The spec's
-/// "conform after padding" bullet is therefore satisfied here **by construction, not by a test** —
-/// stated plainly so nobody reads the ordering as load-bearing and builds on it. It would only
-/// become observable if the pad value ever stopped being zero.
+/// This ordering avoids both the complete resampled clip and the former target-sized buffer at the
+/// source channel count. Because the pad value is zero, moving channel conformance before padding
+/// preserves the exact prior output for mono, stereo, and multichannel clips.
 ///
 /// Returns interleaved stereo of exactly `target_frames * CHANNELS` values.
 pub fn prepare_reference_pcm(
@@ -434,6 +457,11 @@ pub fn prepare_reference_pcm(
     channels: u16,
     target_frames: usize,
 ) -> Result<Vec<f32>> {
+    validate_reference_pcm(samples, sample_rate, channels)?;
+    prepare_validated_reference_pcm(samples, sample_rate, channels, target_frames)
+}
+
+fn validate_reference_pcm(samples: &[f32], sample_rate: u32, channels: u16) -> Result<()> {
     if channels == 0 {
         return Err(AudioError::Msg(
             "reference audio must declare at least one channel".into(),
@@ -461,14 +489,42 @@ pub fn prepare_reference_pcm(
             "reference audio contains the non-finite sample {value}"
         )));
     }
-    let resampled = candle_audio::dsp::resample(samples, sample_rate, SAMPLE_RATE, channels)?;
-    let available = (resampled.len() / source_channels).min(target_frames);
-    let mut conformed = vec![0.0f32; target_frames * source_channels];
-    conformed[..available * source_channels]
-        .copy_from_slice(&resampled[..available * source_channels]);
-    let mut output = vec![0.0f32; target_frames * CHANNELS];
-    for frame in 0..target_frames {
-        let source = &conformed[frame * source_channels..(frame + 1) * source_channels];
+    Ok(())
+}
+
+/// Prepare PCM whose request-facing shape and finiteness checks have already completed.
+///
+/// This is private because bypassing [`validate_reference_pcm`] is sound only on the generator's
+/// post-validation route. The resampler receives the complete source clip but evaluates only the
+/// retained prefix on its global output timeline, preserving whole-clip phase and FIR boundaries.
+/// Channel conformance writes that bounded prefix directly into the fixed stereo output; the tail
+/// is already zero, so there is no source-channel-wide padded allocation.
+fn prepare_validated_reference_pcm(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    target_frames: usize,
+) -> Result<Vec<f32>> {
+    let source_channels = channels as usize;
+    let source_frames = samples.len() / source_channels;
+    let full_output_frames =
+        candle_audio::dsp::resample_output_frames(source_frames, sample_rate, SAMPLE_RATE)?;
+    let retained_frames = full_output_frames.min(target_frames);
+    let resampled = candle_audio::dsp::resample_range(
+        samples,
+        sample_rate,
+        SAMPLE_RATE,
+        channels,
+        0..retained_frames,
+    )?;
+    let output_samples = target_frames.checked_mul(CHANNELS).ok_or_else(|| {
+        AudioError::Msg(format!(
+            "reference output sample count overflows usize ({target_frames} frames, {CHANNELS} channels)"
+        ))
+    })?;
+    let mut output = vec![0.0f32; output_samples];
+    for frame in 0..retained_frames {
+        let source = &resampled[frame * source_channels..(frame + 1) * source_channels];
         let (left, right) = match source_channels {
             1 => (source[0], source[0]),
             _ => (source[0], source[1]),
@@ -1249,6 +1305,7 @@ impl StableAudio3Pipeline {
             parameters,
             reference,
             None,
+            ReferenceInputValidation::Required,
             on_progress,
             on_decoding,
             is_canceled,
@@ -1290,6 +1347,55 @@ impl StableAudio3Pipeline {
         on_decoding: &mut dyn FnMut(),
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>> {
+        self.synthesize_conditioned_with_validation(
+            prompt,
+            negative_prompt,
+            parameters,
+            conditioning,
+            ReferenceInputValidation::Required,
+            on_progress,
+            on_decoding,
+            is_canceled,
+        )
+    }
+
+    /// Production request route after [`crate::model::validate_request`] has checked source shape
+    /// and finiteness. Kept crate-private so direct pipeline callers retain defensive validation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn synthesize_conditioned_validated(
+        &self,
+        prompt: &str,
+        negative_prompt: Option<&str>,
+        parameters: SynthesisParameters,
+        conditioning: ValidatedForwardedConditioning<'_>,
+        on_progress: &mut dyn FnMut(usize, usize),
+        on_decoding: &mut dyn FnMut(),
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>> {
+        self.synthesize_conditioned_with_validation(
+            prompt,
+            negative_prompt,
+            parameters,
+            conditioning.into_inner(),
+            ReferenceInputValidation::Complete,
+            on_progress,
+            on_decoding,
+            is_canceled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_conditioned_with_validation(
+        &self,
+        prompt: &str,
+        negative_prompt: Option<&str>,
+        parameters: SynthesisParameters,
+        conditioning: ForwardedConditioning<'_>,
+        reference_validation: ReferenceInputValidation,
+        on_progress: &mut dyn FnMut(usize, usize),
+        on_decoding: &mut dyn FnMut(),
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>> {
         conditioning.check()?;
         let ForwardedConditioning {
             reference, edit, ..
@@ -1301,6 +1407,7 @@ impl StableAudio3Pipeline {
                 parameters,
                 reference,
                 edit,
+                reference_validation,
                 on_progress,
                 on_decoding,
                 is_canceled,
@@ -1328,6 +1435,7 @@ impl StableAudio3Pipeline {
             parameters,
             None,
             Some(edit),
+            ReferenceInputValidation::Required,
             on_progress,
             on_decoding,
             is_canceled,
@@ -1347,6 +1455,7 @@ impl StableAudio3Pipeline {
         parameters: SynthesisParameters,
         reference: Option<ReferenceAudio<'_>>,
         edit: Option<AudioEdit<'_>>,
+        reference_validation: ReferenceInputValidation,
         on_progress: &mut dyn FnMut(usize, usize),
         on_decoding: &mut dyn FnMut(),
         is_canceled: &dyn Fn() -> bool,
@@ -1400,6 +1509,7 @@ impl StableAudio3Pipeline {
                 reference.channels,
                 &geometry,
                 &mut noise,
+                reference_validation,
                 is_canceled,
             )?;
             init_latents = Some(latents);
@@ -1415,6 +1525,7 @@ impl StableAudio3Pipeline {
                 edit.channels,
                 &geometry,
                 &mut noise,
+                reference_validation,
                 is_canceled,
             )?;
             order = Some(ReferenceDrawOrder {
@@ -1490,6 +1601,7 @@ impl StableAudio3Pipeline {
     /// Returns the prepared interleaved PCM alongside the latents because the edit path needs the
     /// exact same buffer again for [`stitch_outside_region`] — re-running `prepare_reference_pcm` at
     /// the tail would be a second, independently-drifting copy of the source's timeline.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_and_encode(
         &self,
         samples: &[f32],
@@ -1497,10 +1609,21 @@ impl StableAudio3Pipeline {
         channels: u16,
         geometry: &SampleGeometry,
         noise: &mut SeededNoise,
+        reference_validation: ReferenceInputValidation,
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<(Vec<f32>, Tensor)> {
         canceled(is_canceled)?;
-        let prepared = prepare_reference_pcm(samples, sample_rate, channels, geometry.sample_size)?;
+        let prepared = match reference_validation {
+            ReferenceInputValidation::Required => {
+                prepare_reference_pcm(samples, sample_rate, channels, geometry.sample_size)?
+            }
+            ReferenceInputValidation::Complete => prepare_validated_reference_pcm(
+                samples,
+                sample_rate,
+                channels,
+                geometry.sample_size,
+            )?,
+        };
         let planar = interleaved_to_planar(&prepared, geometry.sample_size, &self.device)?
             .to_dtype(self.dtypes.root)?;
         let diffusion = match &self.config.model {
@@ -1968,5 +2091,17 @@ mod tests {
                 vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             ]]
         );
+    }
+
+    #[test]
+    fn validated_reference_preparation_does_not_repeat_the_finiteness_scan() {
+        let samples = [0.25, -0.5, f32::NAN, 0.75];
+        assert!(prepare_reference_pcm(&samples, SAMPLE_RATE, 2, 2).is_err());
+
+        // The crate-private route is reachable only after model request validation. Feeding it the
+        // value that the public route rejects makes the absence of a second full-slice scan
+        // observable: equal-rate preparation copies the NaN instead of rediscovering it.
+        let prepared = prepare_validated_reference_pcm(&samples, SAMPLE_RATE, 2, 2).unwrap();
+        assert!(prepared[2].is_nan());
     }
 }

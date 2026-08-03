@@ -21,6 +21,7 @@ use std::path::Path;
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::residency::StagedHeavy;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
@@ -194,24 +195,80 @@ pub struct LensGenerator {
     precision: Precision,
     quant: Option<Quant>,
     streamable_text_encoder: bool,
+    streamable_dit: bool,
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
-    /// Component-residency strategy (sc-11030; hoisted to the shared seam in sc-11125), selected from
-    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the gpt-oss text encoder + DiT + VAE warm
-    /// for the whole job and across jobs; `Sequential` holds only the per-phase loader closures and
-    /// re-loads per generation in phase order (encode → **drop the text encoder** → denoise/decode),
-    /// bounding peak unified memory to `max(text-encoder, DiT+VAE)` — the gpt-oss encoder is the dominant
-    /// footprint, so lens-turbo drops ~13.1 GB (46%). The [`Residency`] seam owns the eval/drop/clear
-    /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
+    default_stage_residency: bool,
+    /// Request-scoped component owner (sc-11030; hoisted to the shared seam in sc-11125). The load
+    /// policy is retained separately in `default_stage_residency`: both defaults keep this owner lazy
+    /// so a later memory-ladder request can choose its physical materialization before any full warm
+    /// pair exists. The [`Residency`] seam owns eval/drop/clear, stage-boundary cancellation, and the
+    /// error-safe cache flush.
     residency: Residency<LensText, LensHeavyOwned>,
+    text_stream_residency: Residency<LensText, LensHeavyOwned>,
+    dit_stream_residency: Residency<LensText, LensHeavyOwned>,
+    both_stream_residency: Residency<LensText, LensHeavyOwned>,
 }
 
 /// The heavy render-phase components (the DiT + VAE via [`LensHeavy`], plus the optional PiD decoder) —
-/// everything but the text encoder. Owned by the `Resident` components or by a `Sequential` generate.
+/// everything but the text encoder. Owned for the duration selected by the request's residency plan.
 pub(crate) struct LensHeavyOwned {
     heavy: LensHeavy,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the spec carries
     /// `LoadSpec::pid`. `Some` → a `req.use_pid` generation decodes through the `flux2` student (4× SR).
     pid: Option<PidEngine>,
+}
+
+pub(crate) struct LensLightOwned {
+    vae: mlx_gen_flux2::Flux2Vae,
+    pid: Option<PidEngine>,
+}
+
+pub(crate) struct LensDecodeRef<'a> {
+    vae: &'a mlx_gen_flux2::Flux2Vae,
+    pid: Option<&'a PidEngine>,
+}
+
+impl StagedHeavy for LensHeavyOwned {
+    type Light = LensLightOwned;
+    type DecodeView<'a> = LensDecodeRef<'a>;
+
+    fn shed_dit(self) -> Self::Light {
+        LensLightOwned {
+            vae: self.heavy.into_vae(),
+            pid: self.pid,
+        }
+    }
+
+    fn decode_view(&self) -> Self::DecodeView<'_> {
+        LensDecodeRef {
+            vae: self.heavy.vae(),
+            pid: self.pid.as_ref(),
+        }
+    }
+
+    fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
+        LensDecodeRef {
+            vae: &light.vae,
+            pid: light.pid.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamScope {
+    TextEncoder,
+    Dit,
+    Both,
+}
+
+impl StreamScope {
+    fn text(self) -> bool {
+        matches!(self, Self::TextEncoder | Self::Both)
+    }
+
+    fn dit(self) -> bool {
+        matches!(self, Self::Dit | Self::Both)
+    }
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode body runs identically whether
@@ -235,19 +292,37 @@ impl LensHeavyOwned {
 const TEXT_ENCODER_WINDOW_DOMAIN: &[u32] = &[crate::memory_strategy::TEXT_ENCODER_WINDOW];
 
 fn resolve_encoder_window(req: &GenerationRequest, streamable: bool) -> Result<Option<usize>> {
+    Ok(resolve_transformer_windows(req, streamable, false)?.0)
+}
+
+fn resolve_transformer_windows(
+    req: &GenerationRequest,
+    text_streamable: bool,
+    dit_streamable: bool,
+) -> Result<(Option<usize>, Option<usize>)> {
     let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let component = memory.transformer_window_component.unwrap_or_default();
-    if component != mlx_gen::gen_core::TransformerComponent::TextEncoder {
-        return Err(Error::Unsupported(format!(
-            "lens: rung 4 implements the TextEncoder component only; requested {component:?}"
-        )));
-    }
-    if !streamable {
+    let needs_text = matches!(
+        component,
+        mlx_gen::gen_core::TransformerComponent::TextEncoder
+            | mlx_gen::gen_core::TransformerComponent::Both
+    );
+    let needs_dit = matches!(
+        component,
+        mlx_gen::gen_core::TransformerComponent::Dit
+            | mlx_gen::gen_core::TransformerComponent::Both
+    );
+    if needs_text && !text_streamable {
         return Err(Error::Unsupported(
-            "lens: text-encoder streaming requires a dense BF16, Sequential, deferred-materialization \
-             directory load; other loads do not advertise the measured production rung"
+            "lens: text-encoder streaming requires a deferred directory load whose numeric tier can be replayed without a load-time conversion"
+                .to_owned(),
+        ));
+    }
+    if needs_dit && !dit_streamable {
+        return Err(Error::Unsupported(
+            "lens: DiT streaming requires a deferred directory load with dense bf16 or exact prepacked weights and no adapters"
                 .to_owned(),
         ));
     }
@@ -260,7 +335,10 @@ fn resolve_encoder_window(req: &GenerationRequest, streamable: bool) -> Result<O
              {TEXT_ENCODER_WINDOW_DOMAIN:?}"
         )));
     }
-    Ok(Some(window as usize))
+    Ok((
+        needs_text.then_some(window as usize),
+        needs_dit.then_some(window as usize),
+    ))
 }
 
 /// Build a [`LensGenerator`] from a [`LoadSpec`] with the given per-variant defaults.
@@ -270,10 +348,11 @@ fn resolve_encoder_window(req: &GenerationRequest, streamable: bool) -> Result<O
 /// `spec.quantize` (Q4/Q8) quantizes the encoder's MoE experts at load (sc-3172); `spec.adapters`
 /// (LoRA/LoKr) merge into the DiT (sc-3174). `control` / `ip_adapter` are not part of the Lens port.
 ///
-/// Component residency (epic 10834 Phase 1, sc-11030): `Resident` (default) builds every phase now and
-/// holds it warm; `Sequential` keeps only the spec and re-loads per generate in phase order (encode →
-/// drop the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both
-/// use the same per-phase loaders, so the components are byte-identical.
+/// Component residency (epic 10834 Phase 1, sc-11030): both load defaults retain request-scoped
+/// loader closures here. The requested policy becomes the no-explicit-memory generation default:
+/// `Resident` holds both phases for that request, while `Sequential` drops the encoder before loading
+/// denoise/decode. Keeping construction lazy also lets an explicit memory plan choose TE, DiT, or Both
+/// bounded materialization without first allocating a full resident pair.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> {
     let memory_strategy = crate::memory_strategy::memory_strategy_contract(defaults.id, spec)?;
     Ok(Box::new(LensGenerator {
@@ -281,22 +360,41 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
         defaults,
         precision: spec.precision,
         quant: spec.quantize,
-        streamable_text_encoder: crate::memory_strategy::is_streamable_spec(spec),
+        streamable_text_encoder: crate::memory_strategy::can_stream_text(spec)?,
+        streamable_dit: crate::memory_strategy::can_stream_dit(spec)?,
         memory_strategy,
+        default_stage_residency: matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential),
         residency: build_residency(spec, defaults.id)?,
+        text_stream_residency: build_request_residency(spec, defaults.id, StreamScope::TextEncoder),
+        dit_stream_residency: build_request_residency(spec, defaults.id, StreamScope::Dit),
+        both_stream_residency: build_request_residency(spec, defaults.id, StreamScope::Both),
     }))
 }
 
-/// The policy→[`Residency`] dispatch both Lens variants share (sc-11030; hoisted to the shared
-/// [`Residency::from_policy`] seam in sc-11126, F-180) so the `match offload_policy` lives in one
-/// place. `Resident` eager-loads the gpt-oss text phase + heavy bundle now (the heavy loader with
-/// `use_pid = true`, loading any PiD overlay once and reusing it); `Sequential` captures the two
-/// per-phase loaders and loads nothing now, deferring each to [`Residency::run`]. Both use the same
-/// [`load_text_phase`] / [`load_heavy_phase`], so the `Resident` composition is byte-identical to the
-/// pre-seam one. The up-front [`resolve_root`] fails fast for BOTH policies (single-file and
-/// unsupported-overlay rejection, plus the precision→dtype mapping). Weight-free-testable: under
-/// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
-/// eager-load and fail the "Sequential defers" unit test.
+fn build_request_residency(
+    spec: &LoadSpec,
+    model_id: &'static str,
+    scope: StreamScope,
+) -> Residency<LensText, LensHeavyOwned> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::request_scoped(
+        move |_| {
+            let (root, dtype) = resolve_root(&spec_text)?;
+            load_text_phase_scoped(&spec_text, &root, dtype, model_id, scope.text())
+        },
+        move |use_pid, _| {
+            let (root, dtype) = resolve_root(&spec_heavy)?;
+            load_heavy_phase_scoped(&spec_heavy, &root, dtype, use_pid, model_id, scope.dit())
+        },
+    )
+}
+
+/// The ordinary request-scoped [`Residency`] owner both Lens variants share. Component construction
+/// remains lazy for both load defaults so an explicit memory-ladder request cannot inherit a full
+/// eager pair. [`LoadSpec::offload_policy`] is retained by [`LensGenerator`] and supplied as the
+/// default stage choice for requests without an explicit memory plan. The up-front [`resolve_root`]
+/// and packed-tier checks still fail fast for both policies before any request begins.
 pub(crate) fn build_residency(
     spec: &LoadSpec,
     model_id: &'static str,
@@ -321,17 +419,16 @@ pub(crate) fn build_residency(
     }
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
-        move || {
+    Ok(Residency::request_scoped(
+        move |_| {
             let (root, dtype) = resolve_root(&spec_text)?;
             load_text_phase(&spec_text, &root, dtype, model_id)
         },
-        move |use_pid| {
+        move |use_pid, _| {
             let (root, dtype) = resolve_root(&spec_heavy)?;
             load_heavy_phase(&spec_heavy, &root, dtype, use_pid, model_id)
         },
-    )
+    ))
 }
 
 /// Snapshot-dir + precision→dtype resolution (rejecting a single-file source / unsupported overlays),
@@ -361,6 +458,22 @@ fn resolve_root(spec: &LoadSpec) -> Result<(std::path::PathBuf, Dtype)> {
 /// Load the text-encode phase — the gpt-oss encoder dropped first under `Sequential`. `spec.quantize`
 /// quantizes the encoder's MoE experts at load (sc-3172).
 fn load_text_phase(spec: &LoadSpec, root: &Path, dtype: Dtype, model_id: &str) -> Result<LensText> {
+    load_text_phase_scoped(
+        spec,
+        root,
+        dtype,
+        model_id,
+        crate::memory_strategy::is_streamable_spec(spec),
+    )
+}
+
+fn load_text_phase_scoped(
+    spec: &LoadSpec,
+    root: &Path,
+    dtype: Dtype,
+    model_id: &str,
+    streamable: bool,
+) -> Result<LensText> {
     // F-010 (sc-12462): reject a requested-vs-packed tier mismatch BEFORE any weights load — a
     // packed turnkey's experts build `ExpertBank::Quant` from the on-disk shapes, so e.g. a Q4
     // request over a Q8 turnkey would otherwise silently serve Q8. The returned bool is unused:
@@ -369,7 +482,7 @@ fn load_text_phase(spec: &LoadSpec, root: &Path, dtype: Dtype, model_id: &str) -
     if let Some(q) = spec.quantize {
         mlx_gen::quant::needs_load_time_quant(root, "text_encoder", q.bits(), model_id)?;
     }
-    if crate::memory_strategy::is_streamable_spec(spec) {
+    if streamable {
         LensText::load_streamable(root, dtype, spec.quantize)
     } else {
         LensText::load(root, dtype, spec.quantize)
@@ -387,6 +500,17 @@ fn load_heavy_phase(
     load_pid: bool,
     model_id: &str,
 ) -> Result<LensHeavyOwned> {
+    load_heavy_phase_scoped(spec, root, dtype, load_pid, model_id, false)
+}
+
+fn load_heavy_phase_scoped(
+    spec: &LoadSpec,
+    root: &Path,
+    dtype: Dtype,
+    load_pid: bool,
+    model_id: &str,
+    streamable: bool,
+) -> Result<LensHeavyOwned> {
     // F-010 (sc-12462): reject a requested-vs-packed tier mismatch BEFORE any weights load — the
     // DiT projections load packed via `quant::lin` (a Quantized base on which
     // `AdaptableLinear::quantize` no-ops), so e.g. a Q4 request over a Q8 turnkey would otherwise
@@ -396,15 +520,32 @@ fn load_heavy_phase(
         Some(q) => mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?,
         None => false,
     };
-    let mut heavy = LensHeavy::load(root, dtype)?;
-    if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
-    }
-    if let Some(q) = spec.quantize {
+    let heavy = if streamable {
         if needs_quant {
-            heavy.quantize_dit(q)?;
+            return Err(Error::Unsupported(
+                "lens: deferred DiT windows cannot replay load-time quantization; use an exact prepacked snapshot"
+                    .to_owned(),
+            ));
         }
-    }
+        if !spec.adapters.is_empty() {
+            return Err(Error::Unsupported(
+                "lens: deferred DiT windows do not replay LoRA/LoKr mutations; use a non-streamed memory rung"
+                    .to_owned(),
+            ));
+        }
+        LensHeavy::load_streamable(root, dtype, spec.quantize)?
+    } else {
+        let mut heavy = LensHeavy::load(root, dtype)?;
+        if !spec.adapters.is_empty() {
+            heavy.apply_adapters(&spec.adapters)?;
+        }
+        if let Some(q) = spec.quantize {
+            if needs_quant {
+                heavy.quantize_dit(q)?;
+            }
+        }
+        heavy
+    };
     // PiD decoder overlay (epic 7840, sc-7847): load the shared `flux2` student + Gemma once when the
     // spec carries it AND this generate uses it (`load_pid`, F-177) — Resident passes `true` (loaded
     // once, reused), Sequential passes `req.use_pid` so a non-PiD generate skips the student + Gemma.
@@ -477,15 +618,19 @@ impl LensGenerator {
     /// The rich-`Result` body behind [`Generator::generate`]: map the request onto the residency,
     /// looping `count` with per-image seeds and streaming step/decode progress. The staged residency
     /// lifecycle (encode → drop the gpt-oss encoder under `Sequential` → load the DiT/VAE/PiD →
-    /// denoise/decode → free the heavy bundle) is driven by the shared [`Residency::run`] seam
-    /// (sc-11125), which owns the eval/drop/clear discipline, the stage-boundary cancel checks, and the
-    /// error-safe cache flush.
+    /// denoise/decode → free the heavy bundle) is driven by the shared request-scoped [`Residency`]
+    /// seam (sc-11125), which owns the eval/drop/clear discipline, stage-boundary cancellation, and
+    /// the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate_impl(req)?;
+
+        if req.memory.is_some() {
+            return self.generate_memory_impl(req, on_progress);
+        }
 
         let steps = req.steps.unwrap_or(self.defaults.steps) as usize;
         let guidance = req.guidance.unwrap_or(self.defaults.guidance);
@@ -500,8 +645,10 @@ impl LensGenerator {
         // gpt-oss encoder, encodes, materializes, then DROPS it + `clear_cache()` so its ~13 GB frees
         // before the DiT/VAE load below — the peak-bounding win. Encoding once (deterministic, no RNG
         // draw) is byte-identical to the pre-sc-11030 per-image re-encode (the init noise reseeds per
-        // image inside `render`). Under `Resident` it borrows the warm encoder.
-        self.residency.run(
+        // image inside `render`). Under the Resident default it remains live through this request.
+        self.residency.run_request_scoped(
+            self.default_stage_residency,
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -605,6 +752,181 @@ impl LensGenerator {
             },
         )
     }
+
+    /// Shared-ladder execution. The legacy no-memory path above is intentionally unchanged; an
+    /// admitted request selects all lifecycle and scratch levers explicitly here.
+    fn generate_memory_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let memory = req.memory.unwrap_or_default();
+        let (encoder_window, dit_window) =
+            resolve_transformer_windows(req, self.streamable_text_encoder, self.streamable_dit)?;
+        let component = memory.transformer_window_component.unwrap_or_default();
+        let residency = if memory.stream_transformer_blocks {
+            match component {
+                mlx_gen::gen_core::TransformerComponent::TextEncoder => &self.text_stream_residency,
+                mlx_gen::gen_core::TransformerComponent::Dit => &self.dit_stream_residency,
+                mlx_gen::gen_core::TransformerComponent::Both => &self.both_stream_residency,
+            }
+        } else {
+            &self.residency
+        };
+
+        // A cached generator has one physical warm shape at a time. Evict non-selected owners before
+        // loading the chosen component scope so switching requests cannot retain duplicate trunks.
+        for other in [
+            &self.residency,
+            &self.text_stream_residency,
+            &self.dit_stream_residency,
+            &self.both_stream_residency,
+        ] {
+            if !std::ptr::eq(other, residency) {
+                other.evict_warm()?;
+            }
+        }
+
+        let attention = if memory.chunk_attention {
+            mlx_gen::attention::AttentionPlan::budgeted(
+                mlx_gen::attention::AttentionBudget::from_score_elements(
+                    memory
+                        .attention_chunk_size
+                        .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE)
+                        as u64,
+                    true,
+                ),
+            )
+            .with_cancel(&req.cancel)
+        } else {
+            mlx_gen::attention::AttentionPlan::UNBOUNDED
+        };
+        let tiling = memory.tile_vae_decode.then(|| {
+            mlx_gen::tiling::TilingConfig::spatial_only(
+                memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE) as i32,
+                memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP) as i32,
+            )
+        });
+
+        let steps = req.steps.unwrap_or(self.defaults.steps) as usize;
+        let guidance = req.guidance.unwrap_or(self.defaults.guidance);
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
+        let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+
+        struct Denoised {
+            latents: Array,
+        }
+
+        residency.run_staged_request_scoped(
+            memory.stage_residency,
+            memory.stream_transformer_blocks,
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text| {
+                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
+                text.encode_prompt_windowed(
+                    &req.prompt,
+                    negative,
+                    DEFAULT_DATE,
+                    Some(&req.cancel),
+                    encoder_window,
+                )
+            },
+            |encoded| {
+                let Some((features, mask)) = encoded else {
+                    return Ok(());
+                };
+                let mut arrays: Vec<&Array> = features.iter().collect();
+                arrays.push(mask);
+                mlx_rs::transforms::eval(arrays)?;
+                Ok(())
+            },
+            |heavy, (features, mask), progress| {
+                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Denoise)?;
+                let mut out = Vec::with_capacity(req.count as usize);
+                for index in 0..req.count {
+                    let seed = base_seed.wrapping_add(index as u64);
+                    mlx_rs::random::seed(seed)?;
+                    let init = mlx_rs::random::normal::<f32>(
+                        &[1, (latent_h * latent_w) as i32, 128],
+                        None,
+                        None,
+                        None,
+                    )?;
+                    let latents = heavy.heavy.denoise_with_sampler_keep_with_preview_memory(
+                        &features,
+                        &mask,
+                        &init,
+                        latent_h,
+                        latent_w,
+                        steps,
+                        guidance,
+                        req.sampler.as_deref(),
+                        req.scheduler.as_deref(),
+                        seed,
+                        None,
+                        &req.cancel,
+                        &mut |current, total| {
+                            progress(Progress::Step {
+                                current: current as u32,
+                                total: total as u32,
+                            })
+                        },
+                        &req.preview,
+                        attention,
+                        dit_window,
+                    )?;
+                    out.push(Denoised { latents });
+                }
+                Ok(out)
+            },
+            |denoised| {
+                let arrays: Vec<&Array> = denoised.iter().map(|item| &item.latents).collect();
+                mlx_rs::transforms::eval(arrays)?;
+                Ok(())
+            },
+            |decode, denoised, progress| {
+                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode)?;
+                if decode.pid.is_some() {
+                    return Err(Error::Unsupported(
+                        "lens: the shared native-VAE memory ladder does not cover the PiD overlay"
+                            .to_owned(),
+                    ));
+                }
+                let mut images = Vec::with_capacity(denoised.len());
+                for item in denoised {
+                    progress(Progress::Decoding);
+                    let decoded = crate::vae::decode_with_tiling(
+                        decode.vae,
+                        &item.latents,
+                        latent_h,
+                        latent_w,
+                        None,
+                        tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?;
+                    images.push(crate::pipeline::decoded_to_image(&decoded)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
+    }
+}
+
+fn calibration_fault(req: &GenerationRequest, phase: mlx_gen::gen_core::MemoryPhase) -> Result<()> {
+    if req.memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    }) {
+        return Err(Error::Msg(format!("lens calibration fault at {phase:?}")));
+    }
+    Ok(())
 }
 
 /// The number of denoise steps the sampler actually runs — and therefore the `Progress::Step.total`
@@ -810,11 +1132,20 @@ mod tests {
             precision: spec.precision,
             quant: spec.quantize,
             streamable_text_encoder: true,
+            streamable_dit: false,
             memory_strategy: crate::memory_strategy::memory_strategy_contract(
                 MODEL_ID_TURBO,
                 spec,
             )?,
+            default_stage_residency: true,
             residency,
+            text_stream_residency: build_request_residency(
+                spec,
+                MODEL_ID_TURBO,
+                StreamScope::TextEncoder,
+            ),
+            dit_stream_residency: build_request_residency(spec, MODEL_ID_TURBO, StreamScope::Dit),
+            both_stream_residency: build_request_residency(spec, MODEL_ID_TURBO, StreamScope::Both),
         })
     }
 
@@ -903,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn only_sequential_accepts_the_text_encoder_scope() {
+    fn text_encoder_scope_requires_a_replayable_source() {
         let request = window_request(
             mlx_gen::gen_core::TransformerComponent::TextEncoder,
             Some(1),
@@ -911,26 +1242,44 @@ mod tests {
         assert_eq!(resolve_encoder_window(&request, true).unwrap(), Some(1));
         let error = resolve_encoder_window(&request, false).unwrap_err();
         assert!(
-            error.to_string().contains("dense BF16, Sequential"),
-            "Resident refusal must name the policy reason: {error}"
+            error.to_string().contains("deferred directory load"),
+            "refusal must name the replayable-source reason: {error}"
         );
     }
 
     #[test]
-    fn lens_refuses_unimplemented_dit_and_out_of_domain_windows() {
-        for component in [
-            mlx_gen::gen_core::TransformerComponent::Dit,
-            mlx_gen::gen_core::TransformerComponent::Both,
-        ] {
-            let error = resolve_encoder_window(&window_request(component, Some(1)), true)
-                .expect_err("Lens implements only the text-encoder component");
-            assert!(error.to_string().contains("TextEncoder component only"));
-        }
-        let error = resolve_encoder_window(
-            &window_request(
-                mlx_gen::gen_core::TransformerComponent::TextEncoder,
-                Some(3),
-            ),
+    fn component_scope_maps_to_the_exact_physical_trunks_and_unknown_windows_fail_closed() {
+        use mlx_gen::gen_core::TransformerComponent;
+        assert_eq!(
+            resolve_transformer_windows(
+                &window_request(TransformerComponent::TextEncoder, Some(1)),
+                true,
+                true,
+            )
+            .unwrap(),
+            (Some(1), None)
+        );
+        assert_eq!(
+            resolve_transformer_windows(
+                &window_request(TransformerComponent::Dit, Some(1)),
+                true,
+                true,
+            )
+            .unwrap(),
+            (None, Some(1))
+        );
+        assert_eq!(
+            resolve_transformer_windows(
+                &window_request(TransformerComponent::Both, Some(1)),
+                true,
+                true,
+            )
+            .unwrap(),
+            (Some(1), Some(1))
+        );
+        let error = resolve_transformer_windows(
+            &window_request(TransformerComponent::Both, Some(3)),
+            true,
             true,
         )
         .expect_err("an unswept window must fail closed");
@@ -1174,7 +1523,8 @@ mod tests {
 
     #[test]
     fn both_ids_resolve_in_registry() {
-        // The family catalog resolves both ids and fails on the bogus weights directory.
+        // The family catalog resolves both ids. Component access is intentionally request-scoped,
+        // so a missing snapshot is not touched until generation begins.
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
             let spec = LoadSpec {
                 weights: WeightsSource::Dir("/nonexistent/lens".into()),
@@ -1191,14 +1541,11 @@ mod tests {
                 load_shape: Default::default(),
                 components: Default::default(),
             };
-            let err = match crate::provider_registry().unwrap().load(id, &spec) {
-                Ok(_) => panic!("bogus weights dir must fail to load"),
-                Err(e) => e.to_string(),
-            };
-            assert!(
-                !err.contains("no generator registered"),
-                "{id} should resolve in the registry; got: {err}"
-            );
+            let generator = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .unwrap_or_else(|err| panic!("{id} should resolve in the registry; got: {err}"));
+            assert_eq!(generator.descriptor().id, id);
         }
     }
 
@@ -1231,20 +1578,15 @@ mod tests {
         };
         assert!(err.contains("not part of the Lens port"), "got: {err}");
 
-        // Quantize is NOT rejected (sc-3172) — it proceeds to the load and fails only on the bogus
-        // weights dir, never with an "unsupported" message.
+        // Quantize is NOT rejected (sc-3172). Construction remains lazy, so the bogus weights path
+        // is deferred until generation just like the unquantized path.
         let quant = LoadSpec {
             quantize: Some(Quant::Q8),
             ..base.clone()
         };
-        let err = match load_with(&quant, TURBO_DEFAULTS) {
-            Ok(_) => panic!("bogus weights dir must fail to load"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            !err.contains("quantization") && !err.contains("not part of"),
-            "quantize must be accepted (sc-3172); got: {err}"
-        );
+        let generator = load_with(&quant, TURBO_DEFAULTS)
+            .unwrap_or_else(|err| panic!("quantize must be accepted (sc-3172); got: {err}"));
+        assert_eq!(generator.descriptor().id, MODEL_ID_TURBO);
     }
 
     #[test]
@@ -1306,14 +1648,9 @@ mod tests {
         .is_ok());
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Lens's dispatch HONORS `offload_policy`.
-    // `build_residency` points at a non-existent snapshot *directory* (so the single-file /
-    // unsupported-overlay guard in `resolve_root` passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the gpt-oss text phase from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
+    // Request-scoped residency keeps both load policies lazy so a later rung-4 request can choose a
+    // different physical materialization shape without first loading a full warm pair. The generator
+    // retains `offload_policy` as `default_stage_residency` for unscoped compatibility requests.
     fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/lens-residency-test-snapshot".into(),
@@ -1448,30 +1785,17 @@ mod tests {
     }
 
     #[test]
-    fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(
-            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
-            MODEL_ID_BASE,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
-    }
-
-    #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(
-            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
-            MODEL_ID_BASE,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+    fn build_residency_defers_component_loads_for_both_load_defaults() {
+        for policy in [
+            mlx_gen::OffloadPolicy::Sequential,
+            mlx_gen::OffloadPolicy::Resident,
+        ] {
+            let res = build_residency(&missing_snapshot_spec(policy), MODEL_ID_BASE)
+                .expect("request-scoped owner must defer component loads");
+            assert!(
+                !res.is_sequential(),
+                "phase staging is selected per request, not baked into the shared owner"
+            );
+        }
     }
 }

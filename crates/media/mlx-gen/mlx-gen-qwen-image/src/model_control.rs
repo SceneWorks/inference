@@ -259,11 +259,10 @@ fn load_heavy(
     // Base + control applied dense first, THEN quantize together (the overlay-then-quantize ordering,
     // matching the Z-Image control port): quantizing before loading the control branch would not let
     // the dense control Linears compose. The text encoder + VAE stay dense (fork's quant scope).
+    // The control contract deliberately publishes no transformer-window lifecycle: its separate
+    // five-block branch is unbounded. Do not arm the base transformer's block stream here; without
+    // a selectable window it can never be driven. Base and Edit retain their streamed load path.
     let mut transformer = loader::load_transformer(root)?;
-    if crate::memory_strategy::is_streamable_spec(spec) {
-        transformer =
-            transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
-    }
     let mut controlnet = loader::load_controlnet(control)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
@@ -424,7 +423,7 @@ impl QwenImageControl {
             block_window,
             attention_budget,
             decode_tiling,
-        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
+        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117).
         let params = resolve_run_params(req, req.width, req.height);
@@ -450,19 +449,19 @@ impl QwenImageControl {
                         MODEL_ID,
                     )?)
                 };
-                Ok((pos, neg))
+                let encoded = (pos, neg);
+                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                    match &encoded.1 {
+                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                        None => mlx_rs::transforms::eval([&encoded.0])?,
+                    }
+                    Ok(())
+                })?;
+                Ok(encoded)
             },
-            // Materialize pos (+neg) while the encoder is still alive (Sequential only).
-            |encoded| {
-                let Some((pos, neg)) = encoded else {
-                    return Ok(());
-                };
-                match neg {
-                    Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
-                    None => mlx_rs::transforms::eval([pos])?,
-                }
-                Ok(())
-            },
+            // The shared boundary already forced pos (+neg) while the encoder was alive, for both
+            // residency modes; Sequential has nothing left to materialize before dropping it.
+            |_| Ok(()),
             // ── Establish the heavy render components (base DiT + control branch + VAE + PiD) and run
             // the denoise/decode body once against the `heavy` borrow — identical for both residencies.
             |heavy_owned, enc, on_progress| {

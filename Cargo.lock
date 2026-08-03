@@ -431,6 +431,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "windows-sys",
 ]
 
 [[package]]
@@ -439,10 +440,12 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-qwen-image",
+ "image",
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -508,6 +511,7 @@ dependencies = [
  "candle-gen-wan",
  "candle-gen-z-image",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]
@@ -586,6 +590,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -602,6 +607,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -639,6 +645,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -672,6 +679,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -754,6 +762,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -823,6 +832,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
  "tracing",
 ]
@@ -891,6 +901,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -2453,6 +2464,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

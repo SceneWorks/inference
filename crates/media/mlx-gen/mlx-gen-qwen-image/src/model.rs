@@ -246,7 +246,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
     // the only component with quantizable leaves. (Z-Image differs — its fork *does* quantize the
     // TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
-    if crate::memory_strategy::is_streamable_spec(spec) {
+    if crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec) {
         transformer =
             transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
     }
@@ -376,7 +376,7 @@ impl QwenImage {
             block_window,
             attention_budget,
             decode_tiling,
-        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
+        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
@@ -418,20 +418,20 @@ impl QwenImage {
                         MODEL_ID,
                     )?)
                 };
-                Ok((pos, neg))
+                let encoded = (pos, neg);
+                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                    match &encoded.1 {
+                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                        None => mlx_rs::transforms::eval([&encoded.0])?,
+                    }
+                    Ok(())
+                })?;
+                Ok(encoded)
             },
-            // Materialize pos (+neg) while the encoder is still alive (Sequential only) — MLX is lazy,
-            // so an un-evaluated output keeps the encoder referenced and the drop would free nothing.
-            |encoded| {
-                let Some((pos, neg)) = encoded else {
-                    return Ok(());
-                };
-                match neg {
-                    Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
-                    None => mlx_rs::transforms::eval([pos])?,
-                }
-                Ok(())
-            },
+            // The shared post-conditioning boundary above already forces the lazy arrays while the
+            // encoder is alive, for both Resident and Sequential. Nothing remains to materialize
+            // before the Sequential text drop.
+            |_| Ok(()),
             // ── Establish the heavy render components (DiT + VAE + PiD) and run the denoise/decode
             // body once against the `heavy` borrow — identical for both residencies.
             |heavy_owned, enc, on_progress| {

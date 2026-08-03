@@ -296,16 +296,7 @@ def generate(upstream: Path, snapshot: Path, output: Path) -> dict[str, Any]:
             "torch": versions["torch"],
             "transformers": versions["transformers"],
         },
-        "inputs": {
-            "seed": 14534,
-            "secondsTotal": 0.25,
-            "timestep": 0.5,
-            "latentShape": [1, 256, 16],
-            "promptShape": [1, 256, 768],
-            "localOrder": ["inpaint_mask", "inpaint_masked_input"],
-            "crossMask": None,
-            "paddingSemantics": "zero-v-only",
-        },
+        "inputs": EXPECTED_INPUTS,
         "artifact": {
             "file": ARTIFACT,
             "bytes": artifact.stat().st_size,

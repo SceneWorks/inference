@@ -1089,6 +1089,9 @@ impl MemoryProviderContract {
             decode_overlap: tile_vae_decode
                 .then_some(parameters.decode_overlap)
                 .flatten(),
+            attention_chunk_size: chunk_attention
+                .then_some(parameters.attention_chunk_size)
+                .flatten(),
             transformer_window_size: stream_transformer_blocks
                 .then_some(parameters.transformer_window_size)
                 .flatten(),

@@ -60,6 +60,7 @@ fn memory_strategy_contract_with_asset_facts(
     resident_components: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
+    let staged_residency = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential);
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -86,10 +87,14 @@ fn memory_strategy_contract_with_asset_facts(
             .map(|strategy| MemoryStrategyCapability {
                 strategy,
                 support: match strategy {
-                    MemoryStrategy::Resident
-                    | MemoryStrategy::StagedResidency
-                    | MemoryStrategy::BoundedDecode => MemoryStrategySupport::Implemented,
-                    MemoryStrategy::BoundedAttention
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode => {
+                        MemoryStrategySupport::Implemented
+                    }
+                    MemoryStrategy::StagedResidency if staged_residency => {
+                        MemoryStrategySupport::Implemented
+                    }
+                    MemoryStrategy::StagedResidency
+                    | MemoryStrategy::BoundedAttention
                     | MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
                 },
                 parameters: if strategy == MemoryStrategy::BoundedDecode {
@@ -114,7 +119,7 @@ fn memory_strategy_contract_with_asset_facts(
                 MemoryPhase::Denoise,
                 MemoryPhase::Decode,
             ],
-            synchronized_phase_release: true,
+            synchronized_phase_release: staged_residency,
             decode_tiling: true,
             attention_chunking: false,
             transformer_window_materialization: false,
@@ -375,6 +380,57 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
         }
+    }
+
+    #[test]
+    fn staged_residency_and_synchronized_release_require_a_sequential_control_load() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-krea-pose-residency-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        write_snapshot(&root);
+
+        let resident_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let resident = memory_strategy_contract("krea_2_turbo_control", &resident_spec).unwrap();
+        assert_eq!(
+            resident
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        assert!(!resident.lifecycle.synchronized_phase_release);
+        assert_eq!(
+            resident
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented,
+            "bounded decode is independent of the component load policy"
+        );
+
+        let sequential_spec = resident_spec.with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        let sequential =
+            memory_strategy_contract("krea_2_turbo_control", &sequential_spec).unwrap();
+        assert_eq!(
+            sequential
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(sequential.lifecycle.synchronized_phase_release);
+        assert_eq!(
+            sequential
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

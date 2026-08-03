@@ -77,6 +77,13 @@ pub(crate) fn is_streamable_spec(spec: &LoadSpec) -> bool {
         && spec.pid.is_none()
 }
 
+/// Whether a provider may arm the Qwen transformer block stream at load time. Base and Edit own a
+/// published transformer-window lifecycle; Control does not, because its separate five-block
+/// branch remains unbounded.
+pub(crate) fn should_arm_block_stream(provider_id: &str, spec: &LoadSpec) -> bool {
+    provider_id != crate::model_control::MODEL_ID && is_streamable_spec(spec)
+}
+
 /// Resolve the physical DiT cadence for a request. Eligible deferred loads always use the stream.
 /// SC-16353 found that reopening the view more often lowers the denoise-only counter but never the
 /// whole-request peak at 1024². The published cadence is nevertheless genuinely bounded; the
@@ -585,6 +592,37 @@ mod tests {
             MemoryStrategy::BoundedTransformerResidency,
             MemoryStrategy::StagedResidency
         ));
+    }
+
+    #[test]
+    fn block_stream_load_shape_predicate_is_exact_and_excludes_control() {
+        let eligible = spec();
+        assert!(is_streamable_spec(&eligible));
+        assert!(should_arm_block_stream(crate::model::MODEL_ID, &eligible));
+        assert!(should_arm_block_stream(
+            crate::model_edit::MODEL_ID,
+            &eligible
+        ));
+        assert!(!should_arm_block_stream(
+            crate::model_control::MODEL_ID,
+            &eligible
+        ));
+
+        let mut eager = eligible.clone();
+        eager.load_shape = LoadShape::EagerMaterialization;
+        let mut resident = eligible.clone();
+        resident.offload_policy = OffloadPolicy::Resident;
+        let mut file = eligible.clone();
+        file.weights = WeightsSource::File("transformer.safetensors".into());
+        let mut load_time_quant = eligible;
+        load_time_quant.quantize = Some(mlx_gen::Quant::Q4);
+        for ineligible in [eager, resident, file, load_time_quant] {
+            assert!(!is_streamable_spec(&ineligible));
+            assert!(!should_arm_block_stream(
+                crate::model::MODEL_ID,
+                &ineligible
+            ));
+        }
     }
 
     #[test]

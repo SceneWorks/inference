@@ -39,6 +39,10 @@ pub(crate) struct KreaBlockStream {
     cfg: Krea2Config,
     quant_bits: Option<i32>,
     adapters: Vec<BlockAdapters>,
+    #[cfg(test)]
+    test_blocks: Option<Vec<SingleStreamBlock>>,
+    #[cfg(test)]
+    test_materializations: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl KreaBlockStream {
@@ -49,7 +53,23 @@ impl KreaBlockStream {
             cfg,
             quant_bits: None,
             adapters: vec![BlockAdapters::default(); n_blocks],
+            #[cfg(test)]
+            test_blocks: None,
+            #[cfg(test)]
+            test_materializations: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        cfg: Krea2Config,
+        blocks: Vec<SingleStreamBlock>,
+        materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let mut stream = Self::new(WeightsSource::File(std::path::PathBuf::new()), cfg);
+        stream.test_blocks = Some(blocks);
+        stream.test_materializations = Some(materializations);
+        stream
     }
 
     pub(crate) fn n_blocks(&self) -> usize {
@@ -82,6 +102,10 @@ impl KreaBlockStream {
     }
 
     pub(crate) fn open(&self) -> Result<Weights> {
+        #[cfg(test)]
+        if self.test_blocks.is_some() {
+            return Ok(Weights::empty());
+        }
         match &self.source {
             WeightsSource::Dir(dir) => Weights::from_dir(dir),
             WeightsSource::File(file) => Weights::from_file(file),
@@ -98,6 +122,18 @@ impl KreaBlockStream {
                 "krea block stream: block {index} is out of range for a {}-block stack",
                 self.n_blocks()
             )));
+        }
+        #[cfg(test)]
+        if let Some(blocks) = &self.test_blocks {
+            if let Some(counter) = &self.test_materializations {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return blocks.get(index).cloned().ok_or_else(|| {
+                Error::Msg(format!(
+                    "krea test block stream: block {index} is absent from a {}-block fixture",
+                    blocks.len()
+                ))
+            });
         }
         let cfg = &self.cfg;
         let mut block = SingleStreamBlock::from_weights(

@@ -65,6 +65,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
@@ -74,6 +75,18 @@ use candle_gen_pid::{PidDecoder, PidEngine};
 /// The PiD backbone (latent-space) tag for FLUX (epic 7840 / sc-7853): the `flux` 16-ch latent-space
 /// student (4× SR). Shared by Boogu / Chroma / Z-Image, which reuse this FLUX.1 VAE latent space.
 const PID_BACKBONE: &str = "flux";
+
+fn request_attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {
+    let budget = if req.memory.is_some_and(|memory| memory.chunk_attention) {
+        req.memory
+            .and_then(|memory| memory.attention_chunk_size)
+            .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE) as u64
+    } else {
+        candle_gen::ATTN_SCORES_BUDGET as u64
+    };
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, false))
+        .with_cancel(&req.cancel)
+}
 use crate::vae::diffusers::{AutoEncoderKL, VaeConfig};
 use crate::vae::native::{AutoEncoder, Config as AeConfig};
 use candle_transformers::models::clip::text_model::{
@@ -84,7 +97,8 @@ use candle_transformers::models::flux::sampling::{get_schedule, unpack, State};
 use candle_transformers::models::t5::T5EncoderModel;
 use tokenizers::Tokenizer;
 
-use crate::ip_dit::IpFlux;
+use crate::ip_adapter::FluxIpInjector;
+use crate::ip_dit::{DitImageInjector, IpFlux};
 use crate::packed_dit::PackedFluxDit;
 use crate::packed_te::{ClipConfig, PackedClipText, PackedT5Encoder, T5Config as PackedT5Config};
 use crate::Variant;
@@ -192,7 +206,7 @@ pub(crate) enum LoadedDit {
 }
 
 impl LoadedDit {
-    fn as_ref(&self) -> DitRef<'_> {
+    pub(crate) fn as_ref(&self) -> DitRef<'_> {
         match self {
             LoadedDit::Stock(dit) => DitRef::Stock(dit),
             LoadedDit::Packed(dit) => DitRef::Packed(dit),
@@ -218,6 +232,7 @@ pub(crate) struct SeqHeavy {
     /// The optional PiD engine — `None` both when the caller never opted in via `LoadSpec::pid` and when
     /// THIS request will not decode through it (F-177, [`Pipeline::pid_to_load`]).
     pid: Option<Arc<PidEngine>>,
+    bounded_host_decode: bool,
 }
 
 /// The just-loaded text encoders owned by the sequential path (sc-10769). Held only across the encode
@@ -407,11 +422,18 @@ impl Pipeline {
     /// dense path (wrong tier / missing weights, no diagnostic). A well-formed config with no
     /// `quantization` block is a dense tier → `Ok(false)` (sc-9426, F-073 sibling).
     pub(crate) fn component_is_packed(&self, sub: &str) -> Result<bool> {
+        Ok(self.component_packed_config(sub)?.is_some())
+    }
+
+    fn component_packed_config(
+        &self,
+        sub: &str,
+    ) -> Result<Option<candle_gen::quant::PackedConfig>> {
         let path = self.root.join(sub).join("config.json");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             // No config.json at all → legitimate dense BFL / fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             // Present but unreadable (permissions, partial download) → surface, don't swallow.
             Err(e) => {
                 return Err(CandleError::Msg(format!(
@@ -427,7 +449,7 @@ impl Pipeline {
                 path.display()
             ))
         })?;
-        Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
+        Ok(candle_gen::quant::PackedConfig::from_config(&v))
     }
 
     /// Whether this snapshot uses the **diffusers component layout** (`transformer/`, `text_encoder*/`,
@@ -491,8 +513,17 @@ impl Pipeline {
 
     /// mmap a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`.
     fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+        self.component_vb_on(sub, self.dtype, &self.device)
+    }
+
+    fn component_vb_on(
+        &self,
+        sub: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
-        candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
+        candle_gen::mmap_var_builder(&files, dtype, device)
     }
 
     /// Build a VAE [`VarBuilder`] for a packed tier by dequantizing the 8 packed mid-block attention
@@ -501,11 +532,15 @@ impl Pipeline {
     /// `AutoEncoderKL` never sees a `.weight` u32/`.scales`/`.biases` triple it can't read (sc-9407, the
     /// z-image VAE path).
     fn vae_vb_dequantized(&self) -> Result<VarBuilder<'static>> {
+        self.vae_vb_dequantized_on(self.dtype, &self.device)
+    }
+
+    fn vae_vb_dequantized_on(&self, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
         use candle_gen::candle_core::safetensors::MmapedSafetensors;
         let files = self.component_files("vae")?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
-        let src = VarBuilder::from_backend(Box::new(st), self.dtype, self.device.clone());
+        let src = VarBuilder::from_backend(Box::new(st), dtype, device.clone());
 
         // SAFETY: same file set; a second mapping to enumerate keys + load the dense tensors.
         let st2 = unsafe { MmapedSafetensors::multi(&files)? };
@@ -521,20 +556,15 @@ impl Pipeline {
             }
             if let Some(base) = key.strip_suffix(".weight") {
                 if packed_bases.contains(base) {
-                    let dense = crate::quant::dequant_packed_to_dense(
-                        &src,
-                        base,
-                        &self.device,
-                        self.dtype,
-                    )?;
+                    let dense = crate::quant::dequant_packed_to_dense(&src, base, device, dtype)?;
                     tensors.insert(key.clone(), dense);
                     continue;
                 }
             }
-            let t = st2.load(&key, &self.device)?;
-            tensors.insert(key.clone(), t.to_dtype(self.dtype)?);
+            let t = st2.load(&key, device)?;
+            tensors.insert(key.clone(), t.to_dtype(dtype)?);
         }
-        Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
+        Ok(VarBuilder::from_tensors(tensors, dtype, device))
     }
 
     /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints ship as
@@ -659,10 +689,16 @@ impl Pipeline {
                 // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
                 let t_vec = Tensor::full(t, b_sz, dev)?;
+                let attention_plan = request_attention_plan(req);
+                let transformer_window = req
+                    .memory
+                    .and_then(|memory| memory.transformer_window_size)
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
                 let out = match dit {
                     // `IpFlux::forward` with `ip = None` is byte-identical to the stock
                     // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
-                    DitRef::Stock(transformer) => transformer.forward(
+                    DitRef::Stock(transformer) => transformer.forward_with_memory(
                         img,
                         &state.img_ids,
                         &state.txt,
@@ -671,8 +707,11 @@ impl Pipeline {
                         &state.vec,
                         Some(&guidance_t),
                         None,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
                     )?,
-                    DitRef::Packed(transformer) => transformer.forward(
+                    DitRef::Packed(transformer) => transformer.forward_with_memory(
                         img,
                         &state.img_ids,
                         &state.txt,
@@ -680,6 +719,9 @@ impl Pipeline {
                         &t_vec,
                         &state.vec,
                         packed_guidance,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
                     )?,
                 };
                 Ok(out)
@@ -743,6 +785,237 @@ impl Pipeline {
         }
     }
 
+    pub(crate) fn encode_control_ref(
+        &self,
+        components: &Components,
+        image: &Tensor,
+    ) -> Result<Tensor> {
+        match components {
+            Components::Stock { vae, .. } => vae.encode_mean(image).map_err(CandleError::from),
+            Components::Packed { vae, .. } => vae.encode_mean(image).map_err(CandleError::from),
+        }
+    }
+
+    /// Injected reference-lane forward over a request-scoped heavy phase. This is the staged-residency
+    /// twin of [`FluxRefBackbone`](crate::ref_backbone::FluxRefBackbone)'s resident component dispatch:
+    /// the PuLID/IP injector rides the same attention budget, cancellation token, and block window as
+    /// plain txt2img, while the caller keeps only its small identity/control modules resident.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_residency(
+        &self,
+        heavy: &SeqHeavy,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<Tensor> {
+        match heavy.dit.as_ref() {
+            DitRef::Stock(transformer) => transformer.forward_injected_with_memory(
+                img,
+                img_ids,
+                txt,
+                txt_ids,
+                timesteps,
+                pooled,
+                guidance,
+                injector,
+                attention_plan,
+                transformer_window,
+                cancel,
+            ),
+            DitRef::Packed(transformer) => transformer.forward_injected_with_memory(
+                img,
+                img_ids,
+                txt,
+                txt_ids,
+                timesteps,
+                pooled,
+                guidance,
+                injector,
+                attention_plan,
+                transformer_window,
+                cancel,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_ip_residency(
+        &self,
+        heavy: &SeqHeavy,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: &FluxIpInjector<'_>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<Tensor> {
+        match heavy.dit.as_ref() {
+            DitRef::Stock(transformer) => transformer.forward_with_memory(
+                img,
+                img_ids,
+                txt,
+                txt_ids,
+                timesteps,
+                pooled,
+                guidance,
+                Some(injector),
+                attention_plan,
+                transformer_window,
+                cancel,
+            ),
+            DitRef::Packed(transformer) => transformer.forward_ip_with_memory(
+                img,
+                img_ids,
+                txt,
+                txt_ids,
+                timesteps,
+                pooled,
+                guidance,
+                injector,
+                attention_plan,
+                transformer_window,
+                cancel,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_control_residency(
+        &self,
+        heavy: &SeqHeavy,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<Tensor> {
+        match heavy.dit.as_ref() {
+            DitRef::Stock(transformer) => transformer.forward_control_with_memory(
+                img,
+                img_ids,
+                txt,
+                txt_ids,
+                timesteps,
+                pooled,
+                guidance,
+                injector,
+                control,
+                attention_plan,
+                transformer_window,
+                cancel,
+            ),
+            DitRef::Packed(transformer) => transformer.forward_control_with_memory(
+                img,
+                img_ids,
+                txt,
+                txt_ids,
+                timesteps,
+                pooled,
+                guidance,
+                injector,
+                control,
+                attention_plan,
+                transformer_window,
+                cancel,
+            ),
+        }
+    }
+
+    pub(crate) fn encode_control_ref_residency(
+        &self,
+        heavy: &SeqHeavy,
+        image: &Tensor,
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<Tensor> {
+        candle_gen::check_cancel(cancel)?;
+        let image = if heavy.bounded_host_decode {
+            // The bounded decode rung owns an f32 CPU VAE. Control preprocessing intentionally
+            // produces the execution device/dtype used by the resident path, so cross the same
+            // explicit host seam before encode instead of feeding CUDA/bf16 into CPU weights.
+            bounded_control_encode_input(image, &self.device, cancel)?
+        } else {
+            image.clone()
+        };
+        candle_gen::check_cancel(cancel)?;
+        let encoded = match &heavy.vae {
+            LoadedVae::Stock(vae) => vae.encode_mean(&image).map_err(CandleError::from),
+            LoadedVae::Packed(vae) => vae.encode_mean(&image).map_err(CandleError::from),
+        }?;
+        candle_gen::check_cancel(cancel)?;
+        if !heavy.bounded_host_decode {
+            return Ok(encoded);
+        }
+        // ControlNet and the base DiT remain on the execution device at the provider dtype. Complete
+        // the host-to-device copy before the CPU VAE/local encode tensors can be released, and retain
+        // cancellation checks on both sides of the transfer boundary.
+        bounded_control_encode_output(&encoded, &self.device, self.dtype, cancel)
+    }
+
+    /// Decode a reference lane from its request-scoped heavy phase. The bounded route performs the
+    /// calibrated row-wise CUDA→host transfer and whole-frame f32 CPU VAE decode; FLUX GroupNorm makes
+    /// independently decoded spatial tiles unsafe. PiD is intentionally excluded from that native-VAE
+    /// rung and remains on its established decoder path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_ref_residency(
+        &self,
+        heavy: &SeqHeavy,
+        latents: &Tensor,
+        height: usize,
+        width: usize,
+        pid: Option<&PidDecoder>,
+        cancel: &gen_core::CancelFlag,
+        memory: gen_core::GenerationMemory,
+    ) -> Result<Image> {
+        if heavy.bounded_host_decode {
+            if pid.is_some() {
+                return Err(CandleError::Msg(
+                    "FLUX bounded host VAE decode cannot be combined with PiD".into(),
+                ));
+            }
+            let host_latents = bounded_host_latent_transfer(
+                latents,
+                height,
+                width,
+                cancel,
+                memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+            )?;
+            let decoded = match &heavy.vae {
+                LoadedVae::Stock(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
+                LoadedVae::Packed(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
+            };
+            return to_image(&decoded);
+        }
+        match &heavy.vae {
+            LoadedVae::Stock(vae) => self.decode(vae, pid, latents, height, width),
+            LoadedVae::Packed(vae) => self.decode_packed(vae, pid, latents, height, width),
+        }
+    }
+
     /// Load ONLY the text encoders for the sequential-residency path (epic 10765 Phase 1, sc-10769) —
     /// dropped right after the encode so the ~9 GB T5-XXL frees before the DiT loads. Same per-layout
     /// loads as [`load_stock_components`](Self::load_stock_components) /
@@ -797,14 +1070,74 @@ impl Pipeline {
     /// Load ONLY the DiT for the sequential path (sc-10769) — loaded after the text encoders were
     /// dropped, so it reuses their freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE).
     fn load_transformer_seq(&self, diffusers: bool) -> Result<LoadedDit> {
+        self.load_transformer_seq_with_memory(diffusers, false, &gen_core::CancelFlag::default())
+    }
+
+    fn load_transformer_seq_with_memory(
+        &self,
+        diffusers: bool,
+        stream_transformer_blocks: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<LoadedDit> {
         if diffusers {
             let (num_double, num_single) = self.dit_block_counts()?;
-            let dit_vb = self.component_vb("transformer")?;
+            if stream_transformer_blocks {
+                if let Some(packed) = self.component_packed_config("transformer")? {
+                    use candle_gen::candle_core::safetensors::MmapedSafetensors;
+                    use candle_gen::quant::PackedWeightSidecars;
+                    let files = self.component_files("transformer")?;
+                    // SAFETY: immutable snapshot files are held by this request-scoped mapping.
+                    let source = unsafe { MmapedSafetensors::multi(&files)? };
+                    let component = self.root.join("transformer");
+                    let double = PackedWeightSidecars::prepare_prefix_cancelable(
+                        &source,
+                        &component,
+                        packed,
+                        &self.device,
+                        cancel,
+                        "transformer_blocks.",
+                    );
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    let double = double?;
+                    let single = PackedWeightSidecars::prepare_prefix_cancelable(
+                        &source,
+                        &component,
+                        packed,
+                        &self.device,
+                        cancel,
+                        "single_transformer_blocks.",
+                    );
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    let single = single?;
+                    let vb =
+                        VarBuilder::from_backend(Box::new(source), self.dtype, self.device.clone());
+                    return Ok(LoadedDit::Packed(
+                        PackedFluxDit::new_block_streamed_with_sidecars(
+                            &flux_config(self.variant),
+                            num_double,
+                            num_single,
+                            vb,
+                            Arc::new(double),
+                            Arc::new(single),
+                        )?,
+                    ));
+                }
+                return Ok(LoadedDit::Packed(PackedFluxDit::new_block_streamed(
+                    &flux_config(self.variant),
+                    num_double,
+                    num_single,
+                    self.component_vb("transformer")?,
+                )?));
+            }
             Ok(LoadedDit::Packed(PackedFluxDit::new(
                 &flux_config(self.variant),
                 num_double,
                 num_single,
-                dit_vb,
+                self.component_vb("transformer")?,
             )?))
         } else {
             let dit_vb = crate::flux1_load::dit_vb(
@@ -814,10 +1147,13 @@ impl Pipeline {
                 &self.device,
                 "flux",
             )?;
-            Ok(LoadedDit::Stock(IpFlux::new(
-                &flux_config(self.variant),
-                dit_vb,
-            )?))
+            let config = flux_config(self.variant);
+            let dit = if stream_transformer_blocks {
+                IpFlux::new_block_streamed(&config, dit_vb)?
+            } else {
+                IpFlux::new(&config, dit_vb)?
+            };
+            Ok(LoadedDit::Stock(dit))
         }
     }
 
@@ -836,6 +1172,25 @@ impl Pipeline {
         }
     }
 
+    fn load_vae_seq_cpu(&self, diffusers: bool) -> Result<LoadedVae> {
+        let device = Device::Cpu;
+        if diffusers {
+            Ok(LoadedVae::Packed(Box::new(AutoEncoderKL::new(
+                &flux_vae_config(),
+                self.vae_vb_dequantized_on(DType::F32, &device)?,
+            )?)))
+        } else {
+            let (vae, _vae_vb) = crate::flux1_load::vae(
+                &self.root,
+                self.variant,
+                DType::F32,
+                &device,
+                "flux bounded host decode",
+            )?;
+            Ok(LoadedVae::Stock(Box::new(vae)))
+        }
+    }
+
     /// Load the whole heavy phase for the sequential path (sc-12089) — the DiT, then the VAE, then the
     /// optional PiD engine, in that order (the order the pre-seam code loaded them, kept so the tier
     /// routing and any load-time error surface identically). Runs AFTER the text encoders were dropped,
@@ -850,6 +1205,7 @@ impl Pipeline {
             dit: self.load_transformer_seq(diffusers)?,
             vae: self.load_vae_seq(diffusers)?,
             pid: self.load_pid(use_pid)?,
+            bounded_host_decode: false,
         })
     }
 
@@ -873,6 +1229,33 @@ impl Pipeline {
 
     pub(crate) fn load_heavy_residency(&self, use_pid: bool) -> Result<SeqHeavy> {
         self.load_heavy_seq(self.uses_diffusers_layout()?, use_pid)
+    }
+
+    pub(crate) fn load_heavy_residency_with_memory(
+        &self,
+        use_pid: bool,
+        stream_transformer_blocks: bool,
+        bounded_host_decode: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<SeqHeavy> {
+        candle_gen::check_cancel(cancel)?;
+        let diffusers = self.uses_diffusers_layout()?;
+        candle_gen::check_cancel(cancel)?;
+        let dit =
+            self.load_transformer_seq_with_memory(diffusers, stream_transformer_blocks, cancel)?;
+        candle_gen::check_cancel(cancel)?;
+        let vae = if bounded_host_decode {
+            self.load_vae_seq_cpu(diffusers)?
+        } else {
+            self.load_vae_seq(diffusers)?
+        };
+        candle_gen::check_cancel(cancel)?;
+        Ok(SeqHeavy {
+            dit,
+            vae,
+            pid: self.load_pid(use_pid)?,
+            bounded_host_decode,
+        })
     }
 
     pub(crate) fn render_residency(
@@ -930,6 +1313,26 @@ impl Pipeline {
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
+            if heavy.bounded_host_decode {
+                let memory = req.memory.unwrap_or_default();
+                let host_latents = bounded_host_latent_transfer(
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                    &req.cancel,
+                    memory
+                        .decode_tile_edge
+                        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                    memory
+                        .decode_overlap
+                        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                )?;
+                let decoded = match &heavy.vae {
+                    LoadedVae::Stock(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
+                    LoadedVae::Packed(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
+                };
+                return to_image(&decoded);
+            }
             match &heavy.vae {
                 LoadedVae::Stock(vae) => self.decode(
                     vae,
@@ -953,6 +1356,84 @@ impl Pipeline {
 /// Convert a decoded pixel tensor `(1, 3, H, W)` in `[-1, 1]` (f32) → RGB8 [`Image`] (`(x+1)·127.5`).
 /// Shared by the native VAE decode and the PiD super-resolving decode; the output size is read from the
 /// tensor, never assumed (PiD may be 4× the VAE-native size).
+fn bounded_control_encode_input(
+    image: &Tensor,
+    execution_device: &Device,
+    cancel: &gen_core::CancelFlag,
+) -> Result<Tensor> {
+    candle_gen::check_cancel(cancel)?;
+    let transferred = image
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)
+        .map_err(CandleError::from);
+    let transferred = candle_gen::synchronize_result(execution_device, transferred)?;
+    candle_gen::check_cancel(cancel)?;
+    Ok(transferred)
+}
+
+fn bounded_control_encode_output(
+    encoded: &Tensor,
+    execution_device: &Device,
+    execution_dtype: DType,
+    cancel: &gen_core::CancelFlag,
+) -> Result<Tensor> {
+    candle_gen::check_cancel(cancel)?;
+    let restored = encoded
+        .to_device(execution_device)?
+        .to_dtype(execution_dtype)
+        .map_err(CandleError::from);
+    let restored = candle_gen::synchronize_result(execution_device, restored)?;
+    candle_gen::check_cancel(cancel)?;
+    Ok(restored)
+}
+
+fn bounded_host_latent_transfer(
+    latents: &Tensor,
+    height: usize,
+    width: usize,
+    cancel: &gen_core::CancelFlag,
+    tile_edge: u32,
+    overlap: u32,
+) -> Result<Tensor> {
+    if tile_edge != crate::memory_strategy::DECODE_TILE_EDGE
+        || overlap != crate::memory_strategy::DECODE_OVERLAP
+    {
+        return Err(CandleError::Msg(format!(
+            "FLUX bounded host decode supports only the calibrated {}/{} tuple, got {tile_edge}/{overlap}",
+            crate::memory_strategy::DECODE_TILE_EDGE,
+            crate::memory_strategy::DECODE_OVERLAP,
+        )));
+    }
+    let output_stride = tile_edge.checked_sub(overlap).ok_or_else(|| {
+        CandleError::Msg(format!(
+            "FLUX bounded host decode requires overlap below tile edge, got {tile_edge}/{overlap}"
+        ))
+    })?;
+    let latent_rows = (output_stride / 8) as usize;
+    if latent_rows == 0 {
+        return Err(CandleError::Msg(
+            "FLUX bounded host decode transfer stride must cover at least one latent row".into(),
+        ));
+    }
+    let latents = unpack(latents, height, width)?;
+    let latent_height = latents.dim(2)?;
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < latent_height {
+        candle_gen::check_cancel(cancel)?;
+        let length = latent_rows.min(latent_height - start);
+        chunks.push(
+            latents
+                .narrow(2, start, length)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?,
+        );
+        start += length;
+    }
+    let refs = chunks.iter().collect::<Vec<_>>();
+    Ok(Tensor::cat(&refs, 2)?)
+}
+
 fn to_image(decoded: &Tensor) -> Result<Image> {
     let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
     let img = candle_gen::round_rgb8(&scaled)?;
@@ -1315,5 +1796,54 @@ mod tests {
                 .any(|(a, b)| (a - b).abs() > 1e-6),
             "dev time-shift should differ from the linear schedule"
         );
+    }
+
+    #[test]
+    fn bounded_host_transfer_reassembles_exactly_and_honors_cancel() -> Result<()> {
+        let tokens = Tensor::arange(0f32, 65_536f32, &Device::Cpu)?.reshape((1, 1024, 64))?;
+        let expected = unpack(&tokens, 512, 512)?;
+        let cancel = gen_core::CancelFlag::default();
+        let actual = bounded_host_latent_transfer(&tokens, 512, 512, &cancel, 512, 128)?;
+        assert_eq!(expected.dims(), actual.dims());
+        assert_eq!(
+            expected.flatten_all()?.to_vec1::<f32>()?,
+            actual.flatten_all()?.to_vec1::<f32>()?
+        );
+        let canceled = gen_core::CancelFlag::default();
+        canceled.cancel();
+        assert!(matches!(
+            bounded_host_latent_transfer(&tokens, 512, 512, &canceled, 512, 128),
+            Err(CandleError::Canceled)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_control_encode_crosses_cpu_f32_and_restores_execution_dtype() -> Result<()> {
+        let execution_device = Device::Cpu;
+        let cancel = gen_core::CancelFlag::default();
+        let device_input = Tensor::ones((1, 3, 8, 8), DType::BF16, &execution_device)?;
+
+        let host_input = bounded_control_encode_input(&device_input, &execution_device, &cancel)?;
+        assert_eq!(host_input.dtype(), DType::F32);
+        assert!(matches!(host_input.device(), Device::Cpu));
+
+        let cpu_latent = Tensor::ones((1, 16, 1, 1), DType::F32, &Device::Cpu)?;
+        let restored =
+            bounded_control_encode_output(&cpu_latent, &execution_device, DType::BF16, &cancel)?;
+        assert_eq!(restored.dtype(), DType::BF16);
+        assert!(matches!(restored.device(), Device::Cpu));
+
+        let canceled = gen_core::CancelFlag::default();
+        canceled.cancel();
+        assert!(matches!(
+            bounded_control_encode_input(&device_input, &execution_device, &canceled),
+            Err(CandleError::Canceled)
+        ));
+        assert!(matches!(
+            bounded_control_encode_output(&cpu_latent, &execution_device, DType::BF16, &canceled,),
+            Err(CandleError::Canceled)
+        ));
+        Ok(())
     }
 }

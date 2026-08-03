@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, PidWeights, Progress};
+use candle_gen::gen_core::{Image, PidWeights, PreviewSink, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
@@ -105,6 +105,11 @@ pub struct KolorsControlRequest {
     pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// The caller's live per-step latent preview sink (epic 16948, sc-16954). This provider is driven
+    /// by name rather than through the registry, so the sink travels on the request instead of on a
+    /// `GenerationRequest` -- the shape sc-16950 used for Krea's control route. The default (inert)
+    /// sink leaves the render byte-identical. See [`crate::preview`].
+    pub preview: PreviewSink,
 }
 
 impl Default for KolorsControlRequest {
@@ -122,6 +127,8 @@ impl Default for KolorsControlRequest {
             seed: 0,
             use_pid: false,
             cancel: CancelFlag::default(),
+            // Inert by default: a caller that never sets a sink gets exactly today's render.
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -319,6 +326,9 @@ impl KolorsControl {
             };
             // No IP installed on this UNet ⇒ `forward_instantid`'s decoupled branch is inert; the
             // ControlNet cross-attends to its OWN text projection (`cn_context`), the UNet to `projected`.
+            // The curated lane denoises in raw VE sigma-space, so the preview
+            // renormalizes before projecting (sc-16954). Built per image.
+            let preview = crate::preview::ve_hook(&req.preview);
             denoise_curated(
                 &self.unet,
                 Some(sampler_name),
@@ -333,6 +343,7 @@ impl KolorsControl {
                 req.seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 std::slice::from_ref(&control_ctx),
                 &cn_context,
             )?
@@ -341,11 +352,21 @@ impl KolorsControl {
             let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
             let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
             let total = sampler.num_steps() as u32;
+            // A bespoke loop numbers its own frames, on the STEP INDEX: this lane walks a
+            // `KolorsEulerSampler` timestep table, not a descending sigma array.
+            let preview_counter =
+                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
             for i in 0..sampler.num_steps() {
                 if req.cancel.is_cancelled() {
                     return Err(CandleError::Canceled);
                 }
                 let scaled = (&latents / sampler.scale_in(i) as f64)?;
+                // Per-step latent preview (epic 16948, sc-16954): `scaled` is the very tensor this
+                // step feeds the UNet, and therefore the domain the reused SDXL fit was measured in.
+                // Emitted BEFORE `model_in` may move it. Failures are swallowed.
+                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, i, || {
+                    crate::preview::project_spatial_latents(&scaled)
+                });
                 let model_in = if use_guide {
                     Tensor::cat(&[&scaled, &scaled], 0)?
                 } else {

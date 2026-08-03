@@ -646,6 +646,14 @@ impl InstantId {
                 req.seed,
                 &req.cancel,
                 on_progress,
+                // Deliberately dark (epic 16948, sc-16954). InstantID registers no
+                // `gen_core::ModelDescriptor` at all -- it is a `BESPOKE_UTILITY_CRATES` member and
+                // `candle-gen-catalog` actively forbids it acquiring one -- so there is no
+                // `supports_preview` to advertise and `InstantIdRequest` carries no sink to forward.
+                // MLX left InstantID unadvertised for the same reason. Wiring it means adding a
+                // `preview` field to `InstantIdRequest` and a worker that sets it; until then a `None`
+                // here is honest, where an invented always-inert sink would look wired and not be.
+                None,
                 controls,
                 controlnet_encoder,
             )
@@ -671,6 +679,8 @@ impl InstantId {
                 &mut rng,
                 &req.cancel,
                 on_progress,
+                // Deliberately dark -- see the curated branch above (sc-16954).
+                &candle_gen::gen_core::PreviewSink::default(),
                 controls,
                 controlnet_encoder,
             )

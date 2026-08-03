@@ -24,6 +24,15 @@ class Allocation(NamedTuple):
     document: Path
 
 
+class BaseRevisionUnavailable(Exception):
+    """The requested comparison revision cannot be resolved to a commit."""
+
+    def __init__(self, revision: str, returncode: int) -> None:
+        super().__init__(revision)
+        self.revision = revision
+        self.returncode = returncode
+
+
 # These four imported documents predate the repository-global sequence. Their
 # overlapping allocations are historical evidence, so freeze rather than rewrite them.
 LEGACY_ALLOCATIONS = (
@@ -84,21 +93,28 @@ def parse_registry(text: str) -> tuple[list[Allocation], list[str]]:
 def registry_at_revision(revision: str) -> str | None:
     if not revision or set(revision) == {"0"}:
         return None
-    subprocess.run(
-        ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-    )
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{REGISTRY.as_posix()}"],
+    resolution = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
     )
-    return result.stdout if result.returncode == 0 else None
+    # This fixed --verify invocation returns 1 for an unresolved object. Git's
+    # usage and operational failures use other statuses and must remain fatal.
+    if resolution.returncode == 1:
+        raise BaseRevisionUnavailable(revision, resolution.returncode)
+    resolution.check_returncode()
+    result = subprocess.run(
+        ["git", "show", f"{revision}:{REGISTRY.as_posix()}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.stdout
 
 
 def validate(root: Path = ROOT, *, base_registry_text: str | None = None) -> list[str]:
@@ -170,11 +186,23 @@ def main() -> int:
 
     try:
         base_registry_text = registry_at_revision(args.base) if args.base else None
-    except subprocess.CalledProcessError as error:
-        print(f"review finding id error: invalid base revision {args.base!r}: {error}", file=sys.stderr)
+    except BaseRevisionUnavailable as error:
+        print(
+            f"review finding id warning: unable to resolve base revision {error.revision!r} "
+            f"(git rev-parse exited {error.returncode}); validating the current tree "
+            "without an append-only base comparison",
+            file=sys.stderr,
+        )
+        base_registry_text = None
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(
+            f"review finding id error: unable to inspect base revision "
+            f"{args.base!r}: {error}",
+            file=sys.stderr,
+        )
         return 1
 
-    errors = validate(base_registry_text=base_registry_text)
+    errors = validate(ROOT, base_registry_text=base_registry_text)
     if errors:
         for error in errors:
             print(f"review finding id error: {error}", file=sys.stderr)

@@ -68,6 +68,10 @@ pub const DOWNSAMPLE_RATE: usize = 1920;
 pub const CODEBOOK_SIZE: usize = 1024;
 /// Per-code latent dimension (the `Embedding` width).
 pub const CODEBOOK_DIM: usize = 8;
+
+fn resample_for_encode(samples: &[f32], sample_rate: u32, native_rate: u32) -> Result<Vec<f32>> {
+    candle_audio::dsp::resample(samples, sample_rate, native_rate, 1)
+}
 /// The residual-quantizer working dimension the per-quantizer embeddings are summed in.
 pub const RVQ_DIM: usize = 512;
 /// The quantizer output / decoder input dimension.
@@ -1059,7 +1063,7 @@ impl MossAudioCodec {
     /// (`T ≤ the stage's causal context`, ≈ a 10 s clip), and the memory-bounded chunked/streaming path
     /// beyond it — byte-identical codes either way. [`encode_chunked`](Self::encode_chunked) /
     /// [`encode_single_shot`](Self::encode_single_shot) force a specific path.
-    pub fn encode(&self, samples: &[f32], sample_rate: u32) -> CandleResult<Vec<Vec<u32>>> {
+    pub fn encode(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<Vec<u32>>> {
         self.encode_stages(samples, sample_rate, Chunking::Auto)
     }
 
@@ -1068,11 +1072,7 @@ impl MossAudioCodec {
     /// [`encode`](Self::encode) and [`encode_chunked`](Self::encode_chunked) — exposed so callers and
     /// the conformance suite can pin one specific path (the single-shot oracle for the equivalence
     /// gate). For long clips prefer [`encode`](Self::encode) (auto) or [`encode_chunked`](Self::encode_chunked).
-    pub fn encode_single_shot(
-        &self,
-        samples: &[f32],
-        sample_rate: u32,
-    ) -> CandleResult<Vec<Vec<u32>>> {
+    pub fn encode_single_shot(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<Vec<u32>>> {
         self.encode_stages(samples, sample_rate, Chunking::SingleShot)
     }
 
@@ -1086,7 +1086,7 @@ impl MossAudioCodec {
         samples: &[f32],
         sample_rate: u32,
         chunk_duration: f64,
-    ) -> CandleResult<Vec<Vec<u32>>> {
+    ) -> Result<Vec<Vec<u32>>> {
         self.encode_stages(samples, sample_rate, Chunking::Chunked { chunk_duration })
     }
 
@@ -1098,12 +1098,11 @@ impl MossAudioCodec {
         samples: &[f32],
         sample_rate: u32,
         chunking: Chunking,
-    ) -> CandleResult<Vec<Vec<u32>>> {
+    ) -> Result<Vec<Vec<u32>>> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        let wav = candle_audio::dsp::resample(samples, sample_rate, self.config.sample_rate, 1)
-            .map_err(|error| candle_audio::candle_core::Error::Msg(error.to_string()))?;
+        let wav = resample_for_encode(samples, sample_rate, self.config.sample_rate)?;
         let dr = self.config.downsample_rate;
         let valid_frames = wav.len() / dr; // ⌊T / downsample_rate⌋ — the reference valid length
         if valid_frames == 0 {
@@ -1157,7 +1156,7 @@ impl MossAudioCodec {
 
     /// Get-or-build the encoder half, mmapping the retained shards on first use. Thread-safe and
     /// idempotent (a lost init race just discards the redundant build).
-    fn encoder_half(&self) -> CandleResult<&EncoderHalf> {
+    fn encoder_half(&self) -> Result<&EncoderHalf> {
         if let Some(e) = self.encoder.get() {
             return Ok(e);
         }
@@ -1238,6 +1237,13 @@ mod tests {
             "num_quantizers": 32, "output_dim": 768, "quantizer_type": "rlfq", "rvq_dim": 512
         }
     }"#;
+
+    #[test]
+    fn encode_resampling_preserves_typed_audio_errors() {
+        let error = resample_for_encode(&[0.0], 0, SAMPLE_RATE).unwrap_err();
+        assert!(matches!(error, AudioError::Msg(_)));
+        assert!(error.to_string().contains("rates must be non-zero"));
+    }
 
     #[test]
     fn config_parses_and_validates_the_pinned_scalars() {

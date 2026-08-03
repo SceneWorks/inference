@@ -34,13 +34,16 @@
 //! `crates/media/mlx-gen/tools/`.
 
 use image::{imageops::FilterType, RgbImage};
-use mlx_gen::{Error, Progress, Result};
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::gen_core::GenerationMemory;
+use mlx_gen::tiling::{SpatialTiling, TilingConfig};
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{LATENT_CHANNELS, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::{encode_noise, GsKey};
-use crate::rope_embedder::{ImgShape, PackLayout};
+use crate::rope_embedder::{ImgShape, PackContext, PackLayout};
 use crate::text_encoder::{MageTextEncoder, PromptKind};
 use crate::transformer::MageTransformer;
 use crate::vae::MageVae;
@@ -107,6 +110,381 @@ pub struct EditTrace {
     pub image_u8: Array,
 }
 
+/// Conditioning retained after the request-scoped text phase has been synchronized and released.
+pub(crate) struct EncodedGenerationPack {
+    pub(crate) pack: GenerationPack,
+    cond: Array,
+    positive_lens: Vec<i32>,
+    negative: Option<(Array, Vec<i32>)>,
+}
+
+pub(crate) struct DenoisedGenerationSample {
+    tokens: Array,
+    gh: i32,
+    gw: i32,
+    height: u32,
+    width: u32,
+    trajectories: Vec<Array>,
+}
+pub(crate) struct DenoisedGenerationBatch {
+    samples: Vec<DenoisedGenerationSample>,
+    packs: Vec<GenerationPack>,
+}
+
+pub(crate) struct EncodedEdit {
+    cond: Array,
+    cond_len: i32,
+    negative: Option<(Array, i32)>,
+}
+
+pub(crate) struct DenoisedEdit {
+    target: Array,
+    reference_tokens: Array,
+    trajectories: Vec<Array>,
+    gh: i32,
+    gw: i32,
+}
+
+pub(crate) fn encode_generation_phase(
+    text: &MageTextEncoder,
+    samples: &[GenerationSample<'_>],
+    cfg: f32,
+    cancel: &CancelFlag,
+) -> Result<Vec<EncodedGenerationPack>> {
+    let packs = plan_generation_packs(samples)?;
+    packs
+        .into_iter()
+        .map(|pack| {
+            let pack_samples = &samples[pack.sample_range.clone()];
+            let mut texts = pack_samples
+                .iter()
+                .map(|sample| sample.prompt)
+                .collect::<Vec<_>>();
+            if uses_cfg(cfg) {
+                texts.extend(pack_samples.iter().map(|sample| sample.negative_prompt));
+            }
+            let conditioning = text.encode_with_cancel(&texts, PromptKind::Gen, Some(cancel))?;
+            let count = pack_samples.len();
+            let positive_lens = conditioning.seq_lens[..count]
+                .iter()
+                .map(|&len| len as i32)
+                .collect::<Vec<_>>();
+            let positive_tokens: i32 = positive_lens.iter().sum();
+            let parts = if uses_cfg(cfg) {
+                conditioning.txt.split_axis(&[positive_tokens], 0)?
+            } else {
+                vec![conditioning.txt]
+            };
+            let cond = parts[0].reshape(&[1, positive_tokens, -1])?;
+            let negative = if uses_cfg(cfg) {
+                let lens = conditioning.seq_lens[count..]
+                    .iter()
+                    .map(|&len| len as i32)
+                    .collect::<Vec<_>>();
+                Some((parts[1].reshape(&[1, lens.iter().sum(), -1])?, lens))
+            } else {
+                None
+            };
+            Ok(EncodedGenerationPack {
+                pack,
+                cond,
+                positive_lens,
+                negative,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn materialize_generation_encoded(encoded: &Vec<EncodedGenerationPack>) -> Result<()> {
+    for pack in encoded {
+        mlx_rs::transforms::eval(
+            std::iter::once(&pack.cond).chain(pack.negative.as_ref().map(|(txt, _)| txt)),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_generation_phase(
+    transformer: &MageTransformer,
+    samples: &[GenerationSample<'_>],
+    encoded: Vec<EncodedGenerationPack>,
+    steps: usize,
+    cfg: f32,
+    gs_key: &GsKey,
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<DenoisedGenerationBatch> {
+    let sigmas = mage_flow_sigmas(steps)?;
+    let total_steps = steps * encoded.len();
+    let mut out = Vec::with_capacity(samples.len());
+    let mut packs = Vec::with_capacity(encoded.len());
+    for (pack_index, encoded) in encoded.into_iter().enumerate() {
+        let pack_samples = &samples[encoded.pack.sample_range.clone()];
+        packs.push(encoded.pack.clone());
+        let initial = pack_samples
+            .iter()
+            .map(|sample| {
+                initial_tokens(
+                    sample.height,
+                    sample.width,
+                    sample.seed,
+                    gs_key,
+                    Dtype::Bfloat16,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let refs = initial.iter().collect::<Vec<_>>();
+        let tokens = concatenate_axis(&refs, 1)?;
+        let layout = generation_layout(&encoded.pack.grids, encoded.positive_lens)?;
+        let mut trajectories = Vec::new();
+        let tokens = denoise_capture(
+            transformer,
+            tokens,
+            &encoded.cond,
+            layout,
+            encoded
+                .negative
+                .as_ref()
+                .map(|(txt, lens)| (txt, lens.clone())),
+            cfg,
+            false,
+            &sigmas,
+            memory,
+            cancel,
+            &mut |step, latent| {
+                if step < 2 {
+                    trajectories.push(latent.clone());
+                }
+                on_progress(Progress::Step {
+                    current: (pack_index * steps + step + 1) as u32,
+                    total: total_steps as u32,
+                });
+            },
+        )?;
+        let boundaries = encoded
+            .pack
+            .grids
+            .iter()
+            .scan(0, |at, &(gh, gw)| {
+                *at += gh * gw;
+                Some(*at)
+            })
+            .collect::<Vec<_>>();
+        let split = &boundaries[..boundaries.len().saturating_sub(1)];
+        let pieces = tokens.split_axis(split, 1)?;
+        for ((tokens, &(gh, gw)), sample) in pieces
+            .into_iter()
+            .zip(&encoded.pack.grids)
+            .zip(pack_samples)
+        {
+            out.push(DenoisedGenerationSample {
+                tokens,
+                gh,
+                gw,
+                height: sample.height,
+                width: sample.width,
+                trajectories: if pack_samples.len() == 1 {
+                    std::mem::take(&mut trajectories)
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+    }
+    Ok(DenoisedGenerationBatch {
+        samples: out,
+        packs,
+    })
+}
+
+pub(crate) fn decode_generation_phase(
+    vae: &MageVae,
+    denoised: DenoisedGenerationBatch,
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+) -> Result<BatchGenerationTrace> {
+    let mut samples = Vec::with_capacity(denoised.samples.len());
+    for item in denoised.samples {
+        let image_u8 = decode_with_memory(vae, &item.tokens, item.gh, item.gw, memory, cancel)?;
+        samples.push(GenerationTrace {
+            final_latent: unpack_tokens(&item.tokens, item.gh, item.gw)?,
+            final_tokens: item.tokens,
+            trajectories: item.trajectories,
+            image_u8,
+        });
+        debug_assert_eq!(
+            samples.last().unwrap().image_u8.shape(),
+            [item.height as i32, item.width as i32, 3]
+        );
+    }
+    Ok(BatchGenerationTrace {
+        samples,
+        packs: denoised.packs,
+    })
+}
+
+pub(crate) fn materialize_generation_denoised(denoised: &DenoisedGenerationBatch) -> Result<()> {
+    mlx_rs::transforms::eval(denoised.samples.iter().map(|sample| &sample.tokens))?;
+    Ok(())
+}
+
+pub(crate) fn encode_edit_phase(
+    text: &MageTextEncoder,
+    instruction: &str,
+    negative_instruction: &str,
+    references: &[RgbImage],
+    cfg: f32,
+    cancel: &CancelFlag,
+) -> Result<EncodedEdit> {
+    let positive = text.encode_edit_with_cancel(instruction, references, Some(cancel))?;
+    let cond_len = positive.seq_lens[0] as i32;
+    let cond = positive.txt.reshape(&[1, cond_len, -1])?;
+    let negative = if uses_cfg(cfg) {
+        let encoded =
+            text.encode_edit_with_cancel(negative_instruction, references, Some(cancel))?;
+        let len = encoded.seq_lens[0] as i32;
+        Some((encoded.txt.reshape(&[1, len, -1])?, len))
+    } else {
+        None
+    };
+    Ok(EncodedEdit {
+        cond,
+        cond_len,
+        negative,
+    })
+}
+
+pub(crate) fn materialize_edit_encoded(encoded: &EncodedEdit) -> Result<()> {
+    mlx_rs::transforms::eval(
+        std::iter::once(&encoded.cond).chain(encoded.negative.as_ref().map(|(txt, _)| txt)),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_edit_phase(
+    transformer: &MageTransformer,
+    vae: &MageVae,
+    encoded: EncodedEdit,
+    references: &[RgbImage],
+    height: u32,
+    width: u32,
+    steps: usize,
+    cfg: f32,
+    seed: i64,
+    gs_key: &GsKey,
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<DenoisedEdit> {
+    let (gh, gw) = edit_latent_hw(height, width)?;
+    let resized = references
+        .iter()
+        .map(|image| reference_nchw(image, height, width))
+        .collect::<Result<Vec<_>>>()?;
+    let refs = resized.iter().collect::<Vec<_>>();
+    let ref_batch = concatenate_axis(&refs, 0)?;
+    let reference_tokens = vae
+        .encode_sample(&ref_batch, seed as u64)?
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[1, references.len() as i32 * gh * gw, LATENT_CHANNELS])?
+        .as_dtype(Dtype::Bfloat16)?;
+    let mut target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
+    let shapes = std::iter::repeat_n(ImgShape::latent(gh, gw), references.len() + 1).collect();
+    let total_tokens = (references.len() as i32 + 1) * gh * gw;
+    let layout = PackLayout::new(shapes, vec![total_tokens], vec![encoded.cond_len])?;
+    let cond_ctx = transformer.pack_context(layout.clone())?;
+    let sigmas = mage_flow_sigmas(steps)?;
+    let mut trajectories = Vec::with_capacity(2);
+    for (step, pair) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let sequence = assemble_edit_sequence(&target, &reference_tokens)?;
+        if step < 2 {
+            trajectories.push(if encoded.negative.is_some() {
+                concatenate_axis(&[&sequence, &sequence], 1)?
+            } else {
+                sequence.clone()
+            });
+        }
+        let velocity = if let Some((negative, neg_len)) = &encoded.negative {
+            let fused_ctx = transformer.pack_context(layout.fused_cfg(&[*neg_len])?)?;
+            let fused_img = concatenate_axis(&[&sequence, &sequence], 1)?;
+            let fused_txt = concatenate_axis(&[&encoded.cond, negative], 1)?;
+            let sigma = Array::from_slice(
+                &vec![pair[0]; fused_ctx.segments()],
+                &[fused_ctx.segments() as i32],
+            );
+            let output = transformer_forward(
+                transformer,
+                &fused_img,
+                &fused_txt,
+                &sigma,
+                &fused_ctx,
+                memory,
+                cancel,
+            )?;
+            let split = output.split_axis(&[total_tokens], 1)?;
+            cfg_velocity(&split[0], &split[1], cfg, false)?
+        } else {
+            let sigma = Array::from_slice(&[pair[0]], &[1]);
+            transformer_forward(
+                transformer,
+                &sequence,
+                &encoded.cond,
+                &sigma,
+                &cond_ctx,
+                memory,
+                cancel,
+            )?
+        };
+        let target_velocity = velocity.split_axis(&[gh * gw], 1)?.swap_remove(0);
+        target = flow_euler_step(&target, &target_velocity, pair[1] - pair[0])?;
+        mlx_rs::transforms::eval([&target])?;
+        on_progress(Progress::Step {
+            current: (step + 1) as u32,
+            total: steps as u32,
+        });
+    }
+    Ok(DenoisedEdit {
+        target,
+        reference_tokens,
+        trajectories,
+        gh,
+        gw,
+    })
+}
+
+pub(crate) fn decode_edit_phase(
+    vae: &MageVae,
+    denoised: DenoisedEdit,
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+) -> Result<EditTrace> {
+    let image_u8 = decode_with_memory(
+        vae,
+        &denoised.target,
+        denoised.gh,
+        denoised.gw,
+        memory,
+        cancel,
+    )?;
+    Ok(EditTrace {
+        final_tokens: denoised.target,
+        reference_tokens: denoised.reference_tokens,
+        trajectories: denoised.trajectories,
+        image_u8,
+    })
+}
+
+pub(crate) fn materialize_edit_denoised(denoised: &DenoisedEdit) -> Result<()> {
+    mlx_rs::transforms::eval([&denoised.target, &denoised.reference_tokens])?;
+    Ok(())
+}
+
 /// Where each Mage-Flow component's weights live.
 ///
 /// The published upstream snapshot is FLAT — one directory holding `transformer/`, `text_encoder/`
@@ -158,7 +536,11 @@ fn component_packed_bits(dir: &Path) -> Result<Option<i32>> {
 /// already packed at the requested tier (or a dense tier was requested and the artifact is dense).
 /// A tier mismatch in either direction is a hard error, never a silent downgrade: `quantize` is a
 /// no-op over packed weights, so serving a Q4 request from a Q8 artifact would quietly hand back Q8.
-fn load_time_quant_bits(dir: &Path, requested: Option<i32>, model_id: &str) -> Result<Option<i32>> {
+pub(crate) fn load_time_quant_bits(
+    dir: &Path,
+    requested: Option<i32>,
+    model_id: &str,
+) -> Result<Option<i32>> {
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
     else {
         return Err(Error::Msg(format!(
@@ -180,6 +562,88 @@ fn load_time_quant_bits(dir: &Path, requested: Option<i32>, model_id: &str) -> R
         Some(bits) => Ok(mlx_gen::quant::needs_load_time_quant(parent, name, bits, model_id)?
             .then_some(bits)),
     }
+}
+
+pub(crate) struct MageHeavyComponents {
+    pub(crate) transformer: MageTransformer,
+    pub(crate) vae: MageVae,
+}
+
+pub(crate) fn load_text_component(
+    dirs: &MageComponentDirs,
+    quant_bits: Option<i32>,
+    multimodal: bool,
+    stream_lm: bool,
+) -> Result<MageTextEncoder> {
+    let bits = load_time_quant_bits(&dirs.text_encoder, quant_bits, "mage_flow")?;
+    if stream_lm && bits.is_some() {
+        return Err(Error::Unsupported(
+            "mage_flow: deferred text-layer residency requires a dense bf16 snapshot or a prepacked matching tier; load-time layer quantization is not streamable".into(),
+        ));
+    }
+    let mut text = if multimodal {
+        crate::text_encoder::load_multimodal_dir(&dirs.text_encoder)?
+    } else {
+        crate::text_encoder::load_dir(&dirs.text_encoder)?
+    };
+    if let Some(bits) = bits {
+        text.quantize(bits)?;
+    }
+    if quant_bits.is_some() {
+        verify_quantized_counts("text encoder", text.quantized_linear_count(), 253)?;
+    }
+    if stream_lm {
+        text.arm_lm_block_stream(mlx_gen::WeightsSource::Dir(dirs.text_encoder.clone()), None)?;
+        if text.resident_lm_layer_count() != 0 {
+            return Err(Error::Msg(
+                "mage_flow: deferred text encoder retained resident language-model layers".into(),
+            ));
+        }
+    }
+    Ok(text)
+}
+
+pub(crate) fn load_heavy_components(
+    dirs: &MageComponentDirs,
+    quant_bits: Option<i32>,
+    part: crate::vae::VaePart,
+    stream_transformer: bool,
+    adapters: &[mlx_gen::AdapterSpec],
+) -> Result<MageHeavyComponents> {
+    let dit_bits = load_time_quant_bits(&dirs.transformer, quant_bits, "mage_flow")?;
+    let vae_bits = load_time_quant_bits(&dirs.vae, quant_bits, "mage_flow")?;
+    if stream_transformer && dit_bits.is_some() {
+        return Err(Error::Unsupported(
+            "mage_flow: deferred DiT residency requires a dense bf16 snapshot or a prepacked matching tier; load-time block quantization is not streamable".into(),
+        ));
+    }
+    let mut transformer = MageTransformer::load(&dirs.transformer)?;
+    if stream_transformer {
+        transformer = transformer.with_block_stream(
+            mlx_gen::WeightsSource::Dir(dirs.transformer.clone()),
+            dit_bits,
+        );
+    }
+    let mut vae = crate::vae::load(&dirs.vae, part, Dtype::Bfloat16)?;
+    if let Some(bits) = dit_bits {
+        transformer.quantize(bits)?;
+    }
+    if let Some(bits) = vae_bits {
+        vae.quantize(bits)?;
+    }
+    crate::adapters::apply_mage_adapters(&mut transformer, adapters)?;
+    if quant_bits.is_some() {
+        verify_quantized_counts("DiT", transformer.quantized_linear_count(), 174)?;
+        let (expected, packed) = vae.quantization_count();
+        verify_quantized_counts("VAE", packed, expected)?;
+    }
+    transformer.finalize_block_stream()?;
+    if stream_transformer && transformer.resident_block_count() != 0 {
+        return Err(Error::Msg(
+            "mage_flow: deferred DiT retained resident transformer blocks".into(),
+        ));
+    }
+    Ok(MageHeavyComponents { transformer, vae })
 }
 
 impl MageFlowPipeline {
@@ -220,21 +684,42 @@ impl MageFlowPipeline {
         quant_bits: Option<i32>,
         part: crate::vae::VaePart,
     ) -> Result<Self> {
+        Self::load_components_with_shape(dirs, quant_bits, part, false)
+    }
+
+    pub(crate) fn load_components_with_shape(
+        dirs: &MageComponentDirs,
+        quant_bits: Option<i32>,
+        part: crate::vae::VaePart,
+        stream_transformer: bool,
+    ) -> Result<Self> {
         const MODEL_ID: &str = "mage_flow";
         // Resolve every tier decision BEFORE loading, so a mismatched tier fails fast instead of
         // after an 8 GB read.
         let te_bits = load_time_quant_bits(&dirs.text_encoder, quant_bits, MODEL_ID)?;
         let dit_bits = load_time_quant_bits(&dirs.transformer, quant_bits, MODEL_ID)?;
         let vae_bits = load_time_quant_bits(&dirs.vae, quant_bits, MODEL_ID)?;
+        if stream_transformer && dit_bits.is_some() {
+            return Err(Error::Unsupported(
+                "mage_flow: deferred DiT residency requires a dense bf16 snapshot or a prepacked matching tier; load-time block quantization is not streamable".into(),
+            ));
+        }
 
         let multimodal = matches!(part, crate::vae::VaePart::Both);
+        let mut transformer = MageTransformer::load(&dirs.transformer)?;
+        if stream_transformer {
+            transformer = transformer.with_block_stream(
+                mlx_gen::WeightsSource::Dir(dirs.transformer.clone()),
+                dit_bits,
+            );
+        }
         let mut pipeline = Self {
             text_encoder: if multimodal {
                 crate::text_encoder::load_multimodal_dir(&dirs.text_encoder)?
             } else {
                 crate::text_encoder::load_dir(&dirs.text_encoder)?
             },
-            transformer: MageTransformer::load(&dirs.transformer)?,
+            transformer,
             vae: crate::vae::load(&dirs.vae, part, Dtype::Bfloat16)?,
         };
         if let Some(bits) = te_bits {
@@ -256,6 +741,7 @@ impl MageFlowPipeline {
             let (expected_vae, packed_vae) = pipeline.vae.quantization_count();
             verify_quantized_counts("VAE", packed_vae, expected_vae)?;
         }
+        pipeline.transformer.finalize_block_stream()?;
         Ok(pipeline)
     }
 
@@ -337,6 +823,40 @@ impl MageFlowPipeline {
         renormalize: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<EditTrace> {
+        self.edit_trace_with_memory(
+            instruction,
+            negative_instruction,
+            references,
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            gs_key,
+            renormalize,
+            None,
+            &CancelFlag::default(),
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_trace_with_memory(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[RgbImage],
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        memory: Option<GenerationMemory>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<EditTrace> {
         if references.is_empty() {
             return Err(Error::Msg(
                 "mage_flow edit: at least one reference image is required".into(),
@@ -344,7 +864,7 @@ impl MageFlowPipeline {
         }
         let reference_tokens =
             self.sample_reference_tokens(references, height, width, seed as u64)?;
-        self.edit_trace_from_reference_tokens(
+        self.edit_trace_from_reference_tokens_with_memory(
             instruction,
             negative_instruction,
             references,
@@ -356,6 +876,8 @@ impl MageFlowPipeline {
             seed,
             gs_key,
             renormalize,
+            memory,
+            cancel,
             on_progress,
         )
     }
@@ -409,6 +931,42 @@ impl MageFlowPipeline {
         seed: i64,
         gs_key: &GsKey,
         renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<EditTrace> {
+        self.edit_trace_from_reference_tokens_with_memory(
+            instruction,
+            negative_instruction,
+            references,
+            reference_tokens,
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            gs_key,
+            renormalize,
+            None,
+            &CancelFlag::default(),
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_trace_from_reference_tokens_with_memory(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[RgbImage],
+        reference_tokens: &Array,
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        memory: Option<GenerationMemory>,
+        cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<EditTrace> {
         if references.is_empty() {
@@ -471,15 +1029,28 @@ impl MageFlowPipeline {
                     &vec![pair[0]; fused_ctx.segments()],
                     &[fused_ctx.segments() as i32],
                 );
-                let output = self
-                    .transformer
-                    .forward(&fused_img, &fused_txt, &sigma, &fused_ctx)?;
+                let output = transformer_forward(
+                    &self.transformer,
+                    &fused_img,
+                    &fused_txt,
+                    &sigma,
+                    &fused_ctx,
+                    memory,
+                    cancel,
+                )?;
                 let split = output.split_axis(&[total_tokens], 1)?;
                 cfg_velocity(&split[0], &split[1], cfg, renormalize)?
             } else {
                 let sigma = Array::from_slice(&[pair[0]], &[1]);
-                self.transformer
-                    .forward(&sequence, &cond, &sigma, &cond_ctx)?
+                transformer_forward(
+                    &self.transformer,
+                    &sequence,
+                    &cond,
+                    &sigma,
+                    &cond_ctx,
+                    memory,
+                    cancel,
+                )?
             };
             let target_velocity = velocity.split_axis(&[gh * gw], 1)?.swap_remove(0);
             target = flow_euler_step(&target, &target_velocity, pair[1] - pair[0])?;
@@ -489,7 +1060,7 @@ impl MageFlowPipeline {
                 total: steps as u32,
             });
         }
-        let image_u8 = decode(&self.vae, &target, gh, gw)?;
+        let image_u8 = decode_with_memory(&self.vae, &target, gh, gw, memory, cancel)?;
         Ok(EditTrace {
             final_tokens: target,
             reference_tokens,
@@ -525,6 +1096,30 @@ impl MageFlowPipeline {
         cfg: f32,
         gs_key: &GsKey,
         renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<BatchGenerationTrace> {
+        self.generate_batch_trace_with_memory(
+            samples,
+            steps,
+            cfg,
+            gs_key,
+            renormalize,
+            None,
+            &CancelFlag::default(),
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_batch_trace_with_memory(
+        &self,
+        samples: &[GenerationSample<'_>],
+        steps: usize,
+        cfg: f32,
+        gs_key: &GsKey,
+        renormalize: bool,
+        memory: Option<GenerationMemory>,
+        cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<BatchGenerationTrace> {
         let packs = plan_generation_packs(samples)?;
@@ -601,6 +1196,8 @@ impl MageFlowPipeline {
                 cfg,
                 renormalize,
                 &sigmas,
+                memory,
+                cancel,
                 &mut |step, latent| {
                     if sample_count == 1 && step < 2 {
                         trajectories.push(latent.clone());
@@ -627,7 +1224,7 @@ impl MageFlowPipeline {
             {
                 let final_latent = unpack_tokens(&tokens, gh, gw)?;
                 on_progress(Progress::Decoding);
-                let image_u8 = decode(&self.vae, &tokens, gh, gw)?;
+                let image_u8 = decode_with_memory(&self.vae, &tokens, gh, gw, memory, cancel)?;
                 debug_assert_eq!(
                     image_u8.shape(),
                     [sample.height as i32, sample.width as i32, 3]
@@ -929,6 +1526,8 @@ pub fn denoise(
         cfg,
         renormalize,
         sigmas,
+        None,
+        &CancelFlag::default(),
         &mut |_, _| {},
     )
 }
@@ -943,6 +1542,8 @@ fn denoise_capture(
     cfg: f32,
     renormalize: bool,
     sigmas: &[f32],
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize, &Array),
 ) -> Result<Array> {
     if sigmas.len() < 2 {
@@ -969,7 +1570,15 @@ fn denoise_capture(
                 &vec![pair[0]; fused_ctx.segments()],
                 &[fused_ctx.segments() as i32],
             );
-            let out = transformer.forward(&fused_img, &fused_txt, &sigma, &fused_ctx)?;
+            let out = transformer_forward(
+                transformer,
+                &fused_img,
+                &fused_txt,
+                &sigma,
+                &fused_ctx,
+                memory,
+                cancel,
+            )?;
             let n = img.shape()[1];
             let parts = out.split_axis(&[n], 1)?;
             cfg_velocity(&parts[0], &parts[1], cfg, renormalize)?
@@ -979,7 +1588,15 @@ fn denoise_capture(
                 &vec![pair[0]; cond_ctx.segments()],
                 &[cond_ctx.segments() as i32],
             );
-            transformer.forward(&img, cond_txt, &sigma, &cond_ctx)?
+            transformer_forward(
+                transformer,
+                &img,
+                cond_txt,
+                &sigma,
+                &cond_ctx,
+                memory,
+                cancel,
+            )?
         };
         // Diffusers' FlowMatchEulerDiscreteScheduler upcasts the sample, performs the complete
         // Euler addition in f32, then casts the result back to model_output.dtype. Casting the
@@ -992,7 +1609,32 @@ fn denoise_capture(
 
 /// Decode a final token stream and apply the reference's clamp/range conversion.
 pub fn decode(vae: &MageVae, tokens: &Array, gh: i32, gw: i32) -> Result<Array> {
-    let pixels = vae.decode(&unpack_tokens(tokens, gh, gw)?)?;
+    decode_with_memory(vae, tokens, gh, gw, None, &CancelFlag::default())
+}
+
+fn decode_with_memory(
+    vae: &MageVae,
+    tokens: &Array,
+    gh: i32,
+    gw: i32,
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let latent = unpack_tokens(tokens, gh, gw)?;
+    let pixels = match memory.filter(|m| m.tile_vae_decode) {
+        Some(memory) => vae.decode_tiled(
+            &latent,
+            &TilingConfig {
+                spatial: Some(SpatialTiling {
+                    tile_px: memory.decode_tile_edge.unwrap_or(512) as i32,
+                    overlap_px: memory.decode_overlap.unwrap_or(256) as i32,
+                }),
+                temporal: None,
+            },
+            Some(cancel),
+        )?,
+        None => vae.decode(&latent)?,
+    };
     let pixels = maximum(&pixels, Array::from_slice(&[-1.0f32], &[1]))?;
     let pixels = minimum(&pixels, Array::from_slice(&[1.0f32], &[1]))?;
     let scaled = pixels
@@ -1006,6 +1648,33 @@ pub fn decode(vae: &MageVae, tokens: &Array, gh: i32, gw: i32) -> Result<Array> 
             gw * VAE_DOWNSAMPLE_FACTOR as i32,
             3,
         ])?)
+}
+
+fn transformer_forward(
+    transformer: &MageTransformer,
+    img: &Array,
+    txt: &Array,
+    sigma: &Array,
+    ctx: &PackContext,
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let attention = match memory.filter(|m| m.chunk_attention) {
+        Some(memory) => AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            memory.attention_chunk_size.unwrap_or(16_777_216) as u64,
+            true,
+        ))
+        .with_cancel(cancel),
+        None => AttentionPlan::UNBOUNDED,
+    };
+    let window = transformer.block_window(
+        memory
+            .filter(|m| m.stream_transformer_blocks)
+            .and_then(|m| m.transformer_window_size)
+            .map(|size| size as usize),
+        cancel,
+    )?;
+    transformer.forward_with_rungs(img, txt, sigma, ctx, attention, window)
 }
 
 /// Generation layout for a list of latent grids and encoded prompt lengths.

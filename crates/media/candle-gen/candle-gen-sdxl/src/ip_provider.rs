@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
-use candle_gen::gen_core::{Image, Progress, WeightsSource};
+use candle_gen::gen_core::{Image, PreviewSink, Progress, WeightsSource};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -97,6 +97,11 @@ pub struct IpAdapterSdxlRequest {
     pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// The caller's live per-step latent preview sink (epic 16948, sc-16954). This provider is driven
+    /// by name rather than through the registry, so — like Krea's control route and the Qwen-Image
+    /// edit/Fun lanes — the sink travels on the request instead of on a `GenerationRequest`. The
+    /// default (inert) sink leaves the render byte-identical. See [`crate::preview`].
+    pub preview: PreviewSink,
 }
 
 impl Default for IpAdapterSdxlRequest {
@@ -114,6 +119,8 @@ impl Default for IpAdapterSdxlRequest {
             seed: 0,
             use_pid: false,
             cancel: CancelFlag::default(),
+            // Inert by default: a caller that never sets a sink gets exactly today's render.
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -298,6 +305,8 @@ impl IpAdapterSdxl {
                 seeded_sigma_prior(req.seed, req.width, req.height, sigmas[0], &self.device)?;
             // Pure IP: no ControlNet branch (`controls = &[]`); `conditioning` is the UNet cross-attn
             // context (and fills the unused `controlnet_encoder` slot). IP tokens preconditioned above.
+            // The curated lane denoises in raw VE σ-space, so the preview renormalizes (sc-16954).
+            let preview = crate::preview::ve_hook(&req.preview);
             denoise_curated(
                 &self.unet,
                 Some(sampler_name),
@@ -312,6 +321,7 @@ impl IpAdapterSdxl {
                 req.seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 &[],
                 &conditioning,
             )?
@@ -334,7 +344,8 @@ impl IpAdapterSdxl {
                 &mut rng,
                 &req.cancel,
                 on_progress,
-                &[],           // pure IP — no ControlNet branches
+                &req.preview, // ancestral: the running latent is already in the fit's domain
+                &[],          // pure IP — no ControlNet branches
                 &conditioning, // controlnet_encoder is unused with no controls
             )?
         };

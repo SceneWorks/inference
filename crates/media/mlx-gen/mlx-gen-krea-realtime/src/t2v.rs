@@ -72,6 +72,9 @@ use crate::load::{
 
 /// z16 Wan VAE temporal compression (a latent frame decodes to `TEMPORAL_STRIDE` output frames).
 const TEMPORAL_STRIDE: usize = 4;
+/// Model-local ceiling for the full latent clip allocated by the AR loop. The z16 temporal mapping
+/// means this accepts at most 1,028 source/output frames (`ceil(frames / 4) == 257`).
+pub(crate) const MAX_LATENT_FRAMES: usize = 257;
 /// z16 Wan VAE spatial stride (latent → pixel; 8× per side). Mirrors `WanModelConfig::vae_stride.1/.2`.
 const SPATIAL_STRIDE: usize = 8;
 
@@ -117,12 +120,25 @@ pub fn mac_ar_config(base: &KreaRealtimeConfig) -> KreaRealtimeConfig {
 
 /// Latent frame count for `num_frames` **output** frames at the z16 VAE's 4× temporal compression
 /// (`(frames − 1)/4 + 1`, the reference latent convention; decode returns `4·T_lat` frames).
-fn latent_frame_count(num_frames: u32) -> Result<usize> {
-    let f = num_frames as usize;
-    let fm1 = f
+pub(crate) fn latent_frame_count(num_frames: usize) -> Result<usize> {
+    let fm1 = num_frames
         .checked_sub(1)
-        .ok_or_else(|| Error::Msg("krea t2v: num_frames must be >= 1".into()))?;
+        .ok_or_else(|| Error::Msg("krea realtime: frame count must be >= 1".into()))?;
     Ok(fm1 / TEMPORAL_STRIDE + 1)
+}
+
+/// Resolve and enforce the model-local full-clip allocation bound before any component staging.
+/// `what` identifies whether the effective generation length came from requested output frames or a
+/// V2V source clip while keeping the capability refusal typed.
+pub(crate) fn bounded_latent_frame_count(what: &str, num_frames: usize) -> Result<usize> {
+    let latent = latent_frame_count(num_frames)?;
+    if latent > MAX_LATENT_FRAMES {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: {num_frames} {what} frames resolve to {latent} latent frames, exceeding the \
+             model maximum of {MAX_LATENT_FRAMES} latent frames (1,028 source/output frames)"
+        )));
+    }
+    Ok(latent)
 }
 
 /// Build the per-request AR config: the [`mac_ar_config`] streaming-window bound **plus** the
@@ -765,8 +781,18 @@ pub fn generate_t2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
-    generate_t2v_reported(root, base_cfg, job, adapters, quant, cancel, on_progress)
-        .map(|(output, _)| output)
+    let num_latent = bounded_latent_frame_count("requested output", job.num_frames as usize)?;
+    generate_t2v_reported(
+        root,
+        base_cfg,
+        job,
+        num_latent,
+        adapters,
+        quant,
+        cancel,
+        on_progress,
+    )
+    .map(|(output, _)| output)
 }
 
 /// Provider entrypoint that preserves the public generation output while also returning the actual
@@ -776,6 +802,7 @@ pub(crate) fn generate_t2v_reported(
     root: &Path,
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
+    num_latent_frames: usize,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
     cancel: &CancelFlag,
@@ -798,7 +825,6 @@ pub(crate) fn generate_t2v_reported(
             job.width, job.height
         )));
     }
-    let num_latent_frames = latent_frame_count(job.num_frames)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent_frames)?;
 
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
@@ -934,10 +960,12 @@ pub fn generate_i2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    let total_latent = bounded_latent_frame_count("requested output", job.num_frames as usize)?;
     generate_i2v_reported(
         root,
         base_cfg,
         job,
+        total_latent,
         reference_image,
         adapters,
         quant,
@@ -952,6 +980,7 @@ pub(crate) fn generate_i2v_reported(
     root: &Path,
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
+    total_latent: usize,
     reference_image: &Image,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
@@ -959,7 +988,6 @@ pub(crate) fn generate_i2v_reported(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     let (latent_h, latent_w) = resolve_latent_size(root, job, "i2v")?;
-    let total_latent = latent_frame_count(job.num_frames)?;
     // The reference still is latent frame 0 (one clean context frame); generate the rest.
     const F_REF: usize = 1;
     let num_generate = total_latent
@@ -1022,11 +1050,13 @@ pub fn generate_v2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    let num_latent = bounded_latent_frame_count("V2V source", source_frames.len())?;
     generate_v2v_reported(
         root,
         base_cfg,
         job,
         source_frames,
+        num_latent,
         strength,
         adapters,
         quant,
@@ -1042,18 +1072,17 @@ pub(crate) fn generate_v2v_reported(
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
     source_frames: &[Image],
+    num_latent: usize,
     strength: f32,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
-    let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     if source_frames.is_empty() {
         return Err(Error::Msg("krea v2v: source clip has no frames".into()));
     }
-    // The generated latent-frame count is derived from the source clip length.
-    let num_latent = latent_frame_count(source_frames.len() as u32)?;
+    let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
     let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
@@ -1101,6 +1130,75 @@ mod tests {
         assert_eq!(latent_frame_count(9).unwrap(), 3);
         assert_eq!(latent_frame_count(81).unwrap(), 21);
         assert!(latent_frame_count(0).is_err());
+    }
+
+    #[test]
+    fn direct_generation_routes_enforce_the_cap_before_snapshot_resolution() {
+        let cfg = KreaRealtimeConfig::default();
+        let cancel = CancelFlag::default();
+        let mut progress_calls = 0;
+        let oversized_output = KreaRealtimeJob {
+            prompt: "",
+            width: 512,
+            height: 512,
+            num_frames: 1_029,
+            fps: 16,
+            seed: 0,
+            steps: None,
+        };
+        let missing = Path::new("/nonexistent-krea-realtime-snapshot");
+        let t2v_error = generate_t2v(
+            missing,
+            &cfg,
+            &oversized_output,
+            &[],
+            None,
+            &cancel,
+            &mut |_| progress_calls += 1,
+        )
+        .expect_err("direct T2V must reject before inspecting the snapshot");
+        assert!(matches!(t2v_error, Error::Unsupported(_)));
+
+        let reference = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        let i2v_error = generate_i2v(
+            missing,
+            &cfg,
+            &oversized_output,
+            &reference,
+            &[],
+            None,
+            &cancel,
+            &mut |_| progress_calls += 1,
+        )
+        .expect_err("direct I2V must reject before inspecting the snapshot");
+        assert!(matches!(i2v_error, Error::Unsupported(_)));
+
+        let bounded_output = KreaRealtimeJob {
+            num_frames: 81,
+            ..oversized_output
+        };
+        let source_frames = vec![reference; 1_029];
+        let v2v_error = generate_v2v(
+            missing,
+            &cfg,
+            &bounded_output,
+            &source_frames,
+            0.5,
+            &[],
+            None,
+            &cancel,
+            &mut |_| progress_calls += 1,
+        )
+        .expect_err("direct V2V must cap its source-derived generation length before the snapshot");
+        assert!(matches!(v2v_error, Error::Unsupported(_)));
+        assert_eq!(
+            progress_calls, 0,
+            "no direct route may begin component staging"
+        );
     }
 
     /// sc-8438 S5 follow-up: the Mac AR config bounds the KV window to the streaming frame count

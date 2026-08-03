@@ -241,7 +241,13 @@ pub const CHROMA1_HD: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
-/// `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k` — the Candle SDXL bigG tokenizer / text tower.
+/// `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k` — the bigG tokenizer / text tower **SDXL and SD3.5**
+/// both condition on.
+///
+/// SD3.5's `text_encoder_2/` is a redistributed copy of this tower, keyed here per the
+/// redistributed-component rule; `candle-gen-sd3/src/clip_tokenizer.rs` is where that name is
+/// recorded. Naming only the SDXL use under-described a row every registered SD3.5 id reaches on
+/// both backends.
 pub const CLIP_VIT_BIGG_14_LAION2B: ComponentLicense = ComponentLicense {
     component: "clip_vit_bigg_14_laion2b",
     source_url: "https://huggingface.co/laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
@@ -931,8 +937,16 @@ pub const T5_V1_1_XXL: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
-/// `google/umt5-xxl` and its tokenizer — the text encoder five Wan routes, Bernini, SCAIL-2 and
+/// `google/umt5-xxl` and its tokenizer — the text encoder five Wan routes, Bernini and
 /// krea-realtime share.
+///
+/// **Not SCAIL-2**, though an earlier revision of this line listed it. Every route above reads a
+/// *standalone stock-Wan* `text_encoder/`: Bernini's converter copies it "verbatim from a base
+/// Wan2.2-T2V-A14B diffusers snapshot" (`candle-gen-bernini/src/convert.rs`), and
+/// `Wan-AI/Wan2.1-VACE-14B-diffusers` ships the transformer alone, so VACE must be given one.
+/// SCAIL-2's converted snapshot ships its **own bundled** copy whose upstream no source names, which
+/// is why [`SCAIL_2`] omits it and `scail2_umt5` is a pinned hole. Sharing `candle-gen-wan`'s
+/// `Umt5Encoder` module is an architecture fact, not a provenance one.
 pub const UMT5_XXL: ComponentLicense = ComponentLicense {
     component: "umt5_xxl",
     source_url: "https://huggingface.co/google/umt5-xxl",
@@ -1462,6 +1476,14 @@ mod tests {
             ("ideogram_qwen3_vl_8b", "UNDETERMINED"),
             ("z_image_qwen3_text_encoder", "UNDETERMINED"),
             ("qwen_image_qwen2_5_vl", "UNDETERMINED"),
+            // These three are SCAIL-2's own **bundled** auxiliaries, and they stay holes. Reusing
+            // `candle-gen-wan`'s `Umt5Encoder` / `WanVae16` modules is not evidence of provenance:
+            // Bernini's converter states it copies the stock Wan2.2 `text_encoder/` and `vae/`
+            // "verbatim from a base Wan2.2-T2V-A14B diffusers snapshot"
+            // (`candle-gen-bernini/src/convert.rs`) and `Wan-AI/Wan2.1-VACE-14B-diffusers` ships the
+            // transformer alone, so both of those are established reads of a named upstream. The
+            // converted `SceneWorks/scail2-mlx` snapshot ships its own copies and no source names
+            // where they came from — see [`SCAIL_2`]. sc-16667 re-checked this and left the keys.
             ("scail2_umt5", "UNDETERMINED"),
             ("scail2_open_clip_vit_h", "UNDETERMINED"),
             ("scail2_wan2_1_vae", "UNDETERMINED"),

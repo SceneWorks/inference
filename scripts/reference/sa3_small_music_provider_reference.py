@@ -9,9 +9,7 @@ the exact initial, Pingpong, SoftNorm, and decoder-token noise sequence.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,8 +23,10 @@ from sa3_reference import (
     _localize_t5,
     _torch_modules,
     load_snapshot_lock,
+    portable_values as _portable_values,
     sha256_file,
     snapshot_revision,
+    validate_upstream_checkout,
 )
 
 
@@ -63,47 +63,22 @@ EXPECTED_TENSORS = {
     "decoded_chunk_0": {"dtype": "F32", "shape": [1, 2, 524_288]},
     "sampled_latents": {"dtype": "F32", "shape": [1, 256, 388]},
 }
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def portable_values(torch, shape: tuple[int, ...], stream: int):
-    count = 1
-    for dim in shape:
-        count *= dim
-    index = torch.arange(count, dtype=torch.int64)
-    bits = (index * 1_664_525 + (SEED + stream) * 1_013_904_223) & 0xFFFF_FFFF
-    return (
-        (bits.to(torch.float64) / 2_147_483_648.0 - 1.0)
-        .to(torch.float32)
-        .reshape(shape)
-    )
+    return _portable_values(torch, shape, stream, seed=SEED)
 
 
 def validate_upstream(path: Path) -> None:
-    revision = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
-    if revision != UPSTREAM_COMMIT:
-        raise InvalidReference("upstream checkout revision mismatch")
-    entries = subprocess.run(
-        ["git", "-C", str(path), "status", "--porcelain=v1", "--ignored"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.splitlines()
-    unexpected = [
-        entry
-        for entry in entries
-        if "/__pycache__/" not in entry
-        and not entry.endswith("/__pycache__/")
-        and not entry.startswith("!! .venv/")
-    ]
-    if unexpected:
-        raise InvalidReference(f"upstream checkout has source changes: {unexpected[:3]}")
+    validate_upstream_checkout(
+        path,
+        UPSTREAM_COMMIT,
+        error_type=InvalidReference,
+        allow_venv=True,
+        allow_pycache=True,
+        include_ignored=True,
+    )
 
 
 class PortableNoise:
@@ -427,7 +402,7 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("docs/migration/sa3-small-music-provider-reference"),
+        default=ROOT / "docs/migration/sa3-small-music-provider-reference",
     )
     args = parser.parse_args()
     if not args.verify and not all((args.upstream, args.snapshot)):

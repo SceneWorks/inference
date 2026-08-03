@@ -273,6 +273,116 @@ pub struct ControlPlan {
 }
 
 impl KreaHeavy {
+    fn prepared_cfg_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: Option<&JointPrep>,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        match negative {
+            Some(negative) => {
+                let (positive, negative) = dit
+                    .forward_prepared_pair_windowed(latent, timestep, positive, negative, window)?;
+                krea_cfg_combine(&positive, &negative, guidance)
+            }
+            None => dit.forward_prepared_windowed(latent, timestep, positive, window),
+        }
+    }
+
+    fn base_t2i_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::prepared_cfg_velocity(
+            dit,
+            latent,
+            timestep,
+            &plan.prep_pos,
+            plan.prep_neg.as_ref(),
+            guidance,
+            window,
+        )
+    }
+
+    fn multiphase_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        let negative = if guidance > 0.0 {
+            Some(plan.prep_neg.as_ref().ok_or_else(|| {
+                mlx_gen::Error::Msg(
+                    "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                     unconditional prep, but the plan was built without one"
+                        .into(),
+                )
+            })?)
+        } else {
+            None
+        };
+        Self::prepared_cfg_velocity(
+            dit,
+            latent,
+            timestep,
+            &plan.prep_pos,
+            negative,
+            guidance,
+            window,
+        )
+    }
+
+    fn base_img2img_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &Img2ImgPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::prepared_cfg_velocity(
+            dit,
+            latent,
+            timestep,
+            &plan.prep_pos,
+            plan.prep_neg.as_ref(),
+            guidance,
+            window,
+        )
+    }
+
+    fn edit_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &EditPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        match &plan.prep_neg {
+            Some(negative) => {
+                let (positive, negative) = dit.forward_prepared_edit_pair_windowed(
+                    latent,
+                    timestep,
+                    &plan.prep_pos,
+                    negative,
+                    window,
+                )?;
+                krea_cfg_combine(&positive, &negative, guidance)
+            }
+            None => dit.forward_prepared_edit_windowed(latent, timestep, &plan.prep_pos, window),
+        }
+    }
+
     /// Load the single-stream DiT + Qwen-Image VAE from a Krea 2 snapshot's `transformer/` + `vae/`
     /// dirs.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
@@ -736,18 +846,7 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond =
-                    self.dit
-                        .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
-                let v = match &plan.prep_neg {
-                    Some(neg) => {
-                        let uncond =
-                            self.dit
-                                .forward_prepared_windowed(x, &t, neg, block_window)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    }
-                    None => cond,
-                };
+                let v = Self::base_t2i_velocity(&self.dit, x, &t, plan, guidance, block_window)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
@@ -793,20 +892,7 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = dit.forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
-                let v = if guidance > 0.0 {
-                    let neg = plan.prep_neg.as_ref().ok_or_else(|| {
-                        mlx_gen::Error::Msg(
-                            "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
-                             unconditional prep, but the plan was built without one"
-                                .into(),
-                        )
-                    })?;
-                    let uncond = dit.forward_prepared_windowed(x, &t, neg, block_window)?;
-                    krea_cfg_combine(&cond, &uncond, guidance)?
-                } else {
-                    cond
-                };
+                let v = Self::multiphase_velocity(dit, x, &t, plan, guidance, block_window)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )
@@ -1007,18 +1093,8 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond =
-                    self.dit
-                        .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
-                let v = match &plan.prep_neg {
-                    Some(neg) => {
-                        let uncond =
-                            self.dit
-                                .forward_prepared_windowed(x, &t, neg, block_window)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    }
-                    None => cond,
-                };
+                let v =
+                    Self::base_img2img_velocity(&self.dit, x, &t, plan, guidance, block_window)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
@@ -1161,18 +1237,7 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond =
-                    self.dit
-                        .forward_prepared_edit_windowed(x, &t, &plan.prep_pos, block_window)?;
-                let v = match &plan.prep_neg {
-                    Some(neg) => {
-                        let uncond =
-                            self.dit
-                                .forward_prepared_edit_windowed(x, &t, neg, block_window)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    }
-                    None => cond,
-                };
+                let v = Self::edit_velocity(&self.dit, x, &t, plan, guidance, block_window)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
@@ -1657,6 +1722,263 @@ mod tests {
 
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn every_cfg_route_delegates_to_its_executable_velocity_seam() {
+        let source = include_str!("pipeline.rs");
+        let cases = [
+            (
+                "base t2i",
+                "    pub fn render_base_from(",
+                "    fn denoise_phase_from(",
+                "Self::base_t2i_velocity(",
+            ),
+            (
+                "multi-phase CFG",
+                "    fn denoise_phase_from(",
+                "    pub fn prepare_multiphase(",
+                "Self::multiphase_velocity(",
+            ),
+            (
+                "base img2img",
+                "    pub fn render_base_img2img_from(",
+                "    pub fn render_edit(",
+                "Self::base_img2img_velocity(",
+            ),
+            (
+                "edit",
+                "    pub fn render_edit_from(",
+                "    fn decode_latents(",
+                "Self::edit_velocity(",
+            ),
+        ];
+
+        for (route, start, end, seam) in cases {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {route} end"))
+                .0;
+            assert_eq!(
+                body.matches(seam).count(),
+                1,
+                "{route} must call its tested velocity seam exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn all_four_velocity_seams_execute_cfg_and_non_cfg_in_resident_and_windowed_modes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let dit =
+            crate::transformer::executable_test_fixture(Arc::clone(&materializations)).unwrap();
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let positive_context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let negative_context = Array::from_slice(
+            &(0..8)
+                .map(|index| 0.4 - index as f32 * 0.03)
+                .collect::<Vec<_>>(),
+            &[1, 1, 1, 8],
+        );
+        let t2i_plan = |with_negative: bool| -> Result<T2iPlan> {
+            Ok(T2iPlan {
+                prep_pos: dit.prepare(&positive_context, None, &latent)?,
+                prep_neg: with_negative
+                    .then(|| dit.prepare(&negative_context, None, &latent))
+                    .transpose()?,
+            })
+        };
+        let cfg_t2i = t2i_plan(true).unwrap();
+        let plain_t2i = t2i_plan(false).unwrap();
+        let cfg_img2img = Img2ImgPlan {
+            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
+            prep_neg: Some(dit.prepare(&negative_context, None, &latent).unwrap()),
+            clean: latent.clone(),
+        };
+        let plain_img2img = Img2ImgPlan {
+            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
+            prep_neg: None,
+            clean: latent.clone(),
+        };
+        let reference = Array::from_slice(
+            &(0..64)
+                .map(|index| 0.15 - index as f32 * 0.004)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let cfg_edit = EditPlan {
+            prep_pos: dit
+                .prepare_edit(
+                    &positive_context,
+                    None,
+                    &latent,
+                    std::slice::from_ref(&reference),
+                )
+                .unwrap(),
+            prep_neg: Some(
+                dit.prepare_edit(
+                    &negative_context,
+                    None,
+                    &latent,
+                    std::slice::from_ref(&reference),
+                )
+                .unwrap(),
+            ),
+        };
+        let plain_edit = EditPlan {
+            prep_pos: dit
+                .prepare_edit(&positive_context, None, &latent, &[reference])
+                .unwrap(),
+            prep_neg: None,
+        };
+        let expected_positive = dit
+            .forward_prepared_windowed(&latent, &timestep, &cfg_t2i.prep_pos, None)
+            .unwrap();
+        let expected_negative = dit
+            .forward_prepared_windowed(&latent, &timestep, cfg_t2i.prep_neg.as_ref().unwrap(), None)
+            .unwrap();
+        let guidance = 0.75;
+        let expected_cfg =
+            krea_cfg_combine(&expected_positive, &expected_negative, guidance).unwrap();
+        let expected_edit_positive = dit
+            .forward_prepared_edit_windowed(&latent, &timestep, &cfg_edit.prep_pos, None)
+            .unwrap();
+        let expected_edit_negative = dit
+            .forward_prepared_edit_windowed(
+                &latent,
+                &timestep,
+                cfg_edit.prep_neg.as_ref().unwrap(),
+                None,
+            )
+            .unwrap();
+        let expected_edit_cfg =
+            krea_cfg_combine(&expected_edit_positive, &expected_edit_negative, guidance).unwrap();
+        let cancel = CancelFlag::new();
+        let window = dit.block_window(Some(1), &cancel).unwrap();
+
+        macro_rules! assert_route {
+            ($label:literal, $expected:expr, $resident:expr, $windowed:expr) => {{
+                materializations.store(0, Ordering::Relaxed);
+                let resident = $resident.unwrap();
+                mlx_rs::transforms::eval([&resident, $expected]).unwrap();
+                assert_eq!(
+                    resident.as_slice::<f32>(),
+                    $expected.as_slice::<f32>(),
+                    "{} resident parity",
+                    $label
+                );
+                assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+                materializations.store(0, Ordering::Relaxed);
+                let windowed = $windowed.unwrap();
+                mlx_rs::transforms::eval([&windowed, $expected]).unwrap();
+                assert_eq!(
+                    windowed.as_slice::<f32>(),
+                    $expected.as_slice::<f32>(),
+                    "{} windowed parity",
+                    $label
+                );
+                assert_eq!(
+                    materializations.load(Ordering::Relaxed),
+                    dit.num_blocks(),
+                    "{} must materialize every block exactly once",
+                    $label
+                );
+            }};
+        }
+
+        assert_route!(
+            "base t2i CFG",
+            &expected_cfg,
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, None),
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, window)
+        );
+        assert_route!(
+            "base t2i non-CFG",
+            &expected_positive,
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &plain_t2i, guidance, None),
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &plain_t2i, guidance, window)
+        );
+        assert_route!(
+            "multi-phase CFG",
+            &expected_cfg,
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, None),
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, window)
+        );
+        assert_route!(
+            "multi-phase non-CFG",
+            &expected_positive,
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &plain_t2i, 0.0, None),
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &plain_t2i, 0.0, window)
+        );
+        assert_route!(
+            "base img2img CFG",
+            &expected_cfg,
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_img2img,
+                guidance,
+                None
+            ),
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_img2img,
+                guidance,
+                window
+            )
+        );
+        assert_route!(
+            "base img2img non-CFG",
+            &expected_positive,
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_img2img,
+                guidance,
+                None
+            ),
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_img2img,
+                guidance,
+                window
+            )
+        );
+        assert_route!(
+            "edit CFG",
+            &expected_edit_cfg,
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &cfg_edit, guidance, None),
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &cfg_edit, guidance, window)
+        );
+        assert_route!(
+            "edit non-CFG",
+            &expected_edit_positive,
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, None),
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, window)
+        );
     }
 
     #[test]

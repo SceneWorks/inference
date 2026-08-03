@@ -59,7 +59,6 @@ pub mod providers {
 /// Listed here so their platform membership is as explicit as a registered generator.
 pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "sam2", "sam3"];
 
-/// Platform-owned crates that are **compiled but not yet registered** — scaffolds whose providers
 /// Provider crates deliberately compiled but not yet composed into this platform registry.
 ///
 /// Empty after sc-14041 registered the complete Mage-Flow RL provider. Future structure-only
@@ -495,9 +494,9 @@ mod tests {
         assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 59);
     }
 
-    /// The scaffolded Mage-Flow crate is compiled into the platform package but must **not** reach
-    /// the shipped registry until it can load (sc-14041). Pinned so turning it on is a deliberate,
-    /// reviewable edit rather than a side effect, and so the pending state cannot rot silently.
+    /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface
+    /// (sc-14041). Pin both the registrations and the now-empty pending list so a later composition
+    /// edit cannot silently revert the completed registration.
     #[test]
     fn mage_rl_is_on_the_shipped_platform_surface() {
         assert!(super::PENDING_REGISTRATION_CRATES.is_empty());

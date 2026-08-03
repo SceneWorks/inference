@@ -9,10 +9,11 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::nn::silu;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Quant, Result, WeightsSource};
 
 use super::rope::LensRope3d;
 use super::{join, load_weight, LensTransformerBlock, Linear};
@@ -114,6 +115,9 @@ pub struct LensTransformer {
     time_linear_2: Linear,
     rope: LensRope3d,
     blocks: Vec<LensTransformerBlock>,
+    /// Re-openable source for request-scoped DiT windows. When present, `blocks` is deliberately
+    /// empty so the 48-block trunk is not retained alongside the lazy source.
+    stream: Option<super::stream::DitBlockStream>,
     norm_out: AdaLayerNormContinuous,
     proj_out: AdaptableLinear,
     // `pub(crate)` so the trainer can read `num_layers` to size the per-block checkpoint-target map
@@ -157,11 +161,63 @@ impl LensTransformer {
             )?,
             rope: LensRope3d::new(10000.0, cfg.axes_dims_rope),
             blocks,
+            stream: None,
             norm_out: AdaLayerNormContinuous::from_weights(w, "norm_out", dtype)?,
             proj_out: load_biased_adaptable(w, "proj_out", dtype)?,
             cfg: *cfg,
             dtype,
         })
+    }
+
+    /// Build the request-scoped form: retain only the front/back projections and reopen the 48-block
+    /// trunk through the shared block-residency driver. Callers must prove that `quant` is either
+    /// absent or already packed; replaying load-time quantization is intentionally rejected by the
+    /// registry before this constructor is reached.
+    pub fn from_streamable_source(
+        mut w: Weights,
+        source: WeightsSource,
+        cfg: &LensDitConfig,
+        dtype: Dtype,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        let mut txt_norm = Vec::with_capacity(cfg.num_text_layers);
+        for i in 0..cfg.num_text_layers {
+            txt_norm.push(load_weight(&w, &format!("txt_norm.{i}"), dtype)?);
+        }
+        let out = Self {
+            img_in: load_biased_adaptable(&w, "img_in", dtype)?,
+            txt_norm,
+            txt_in: load_biased_adaptable(&w, "txt_in", dtype)?,
+            time_linear_1: Linear::load(
+                &w,
+                "time_text_embed.timestep_embedder.linear_1",
+                true,
+                dtype,
+            )?,
+            time_linear_2: Linear::load(
+                &w,
+                "time_text_embed.timestep_embedder.linear_2",
+                true,
+                dtype,
+            )?,
+            rope: LensRope3d::new(10000.0, cfg.axes_dims_rope),
+            blocks: Vec::new(),
+            stream: Some(super::stream::DitBlockStream::new(
+                source, *cfg, dtype, quant,
+            )),
+            norm_out: AdaLayerNormContinuous::from_weights(&w, "norm_out", dtype)?,
+            proj_out: load_biased_adaptable(&w, "proj_out", dtype)?,
+            cfg: *cfg,
+            dtype,
+        };
+        // Constructors clone ref-counted handles. Remove every front/back tensor read above before
+        // dropping the source view or the retained preamble would have a duplicate owner.
+        w.remove_accessed();
+        Ok(out)
+    }
+
+    pub fn is_streamable(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// Quantize the DiT's compute-heavy linears to Q4/Q8 (sc-3175): `img_in`, `txt_in`, `proj_out`,
@@ -218,6 +274,35 @@ impl LensTransformer {
         h: usize,
         w: usize,
     ) -> Result<Array> {
+        self.forward_with_memory(
+            hidden_states,
+            text_feats,
+            text_valid,
+            timestep,
+            frame,
+            h,
+            w,
+            AttentionPlan::UNBOUNDED,
+            None,
+            &CancelFlag::default(),
+        )
+    }
+
+    /// Inference forward with request-scoped attention and optional DiT block windows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory(
+        &self,
+        hidden_states: &Array,
+        text_feats: &[Array],
+        text_valid: Option<&Array>,
+        timestep: &Array,
+        frame: usize,
+        h: usize,
+        w: usize,
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
         // Reachable from the `Result`-returning public forward; error instead of panicking the
         // worker if the capture-layer count ever drifts from the config (F-014).
         if text_feats.len() != self.cfg.num_text_layers {
@@ -249,19 +334,49 @@ impl LensTransformer {
             None => None,
         };
 
-        for block in &self.blocks {
-            let (e, hs) = block.forward(
-                &hidden,
-                &enc,
+        if let Some(window) = transformer_window {
+            let stream = self.stream.as_ref().ok_or_else(|| {
+                Error::Unsupported(
+                    "lens: DiT block streaming requires a deferred, re-openable transformer source"
+                        .to_owned(),
+                )
+            })?;
+            let (_, streamed_hidden) = super::stream::run_windowed_blocks(
+                stream,
+                window,
+                cancel,
+                enc,
+                hidden,
                 &temb,
                 &img_cos,
                 &img_sin,
                 &txt_cos,
                 &txt_sin,
                 mask.as_ref(),
+                attention,
             )?;
-            enc = e;
-            hidden = hs;
+            hidden = streamed_hidden;
+        } else {
+            if self.blocks.len() != self.cfg.num_layers {
+                return Err(Error::Unsupported(
+                    "lens: a streamed DiT must be given a transformer window".to_owned(),
+                ));
+            }
+            for block in &self.blocks {
+                let (e, hs) = block.forward_with_attention(
+                    &hidden,
+                    &enc,
+                    &temb,
+                    &img_cos,
+                    &img_sin,
+                    &txt_cos,
+                    &txt_sin,
+                    mask.as_ref(),
+                    attention,
+                )?;
+                enc = e;
+                hidden = hs;
+            }
         }
 
         let hidden = self.norm_out.forward(&hidden, &temb)?;

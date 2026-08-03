@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -18,6 +17,21 @@ from pathlib import Path
 
 import numpy as np
 from safetensors import safe_open
+
+try:
+    from scripts.release.mage_reference_environment import (
+        REFERENCE_PACKAGES,
+        REFERENCE_PYTHON,
+        validate_python_version,
+        validate_reference_environment,
+    )
+except ModuleNotFoundError:  # Direct execution outside the repository root.
+    from mage_reference_environment import (
+        REFERENCE_PACKAGES,
+        REFERENCE_PYTHON,
+        validate_python_version,
+        validate_reference_environment,
+    )
 
 ROOT = Path(__file__).resolve().parents[2]
 MLX = ROOT / "crates/media/mlx-gen"
@@ -86,25 +100,6 @@ EDIT_IMG_SHAPES = [[1, 16, 16]] * 4
 PROMPT = "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
 EDIT_INSTRUCTION = "Replace the background with a field of sunflowers"
 REFERENCE = "microsoft/Mage @ _vendor/mage_flow (see VENDORED.md)"
-REFERENCE_PACKAGES = {
-    "accelerate": "1.13.0",
-    "diffusers": "0.38.0",
-    "einops": "0.8.2",
-    "loguru": "0.7.3",
-    "numpy": "2.4.3",
-    "pillow": "12.3.0",
-    "pydantic": "2.12.5",
-    "safetensors": "0.8.0",
-    "torch": "2.13.0",
-    "torchvision": "0.28.0",
-    "transformers": "5.5.0",
-    "typing_extensions": "4.15.0",
-}
-# Keep this aligned with real-weights.yml. The self-hosted macOS oracle runner installs this exact
-# standalone interpreter in runner temp via uv, avoiding system Python and global tool caches.
-REFERENCE_PYTHON = (3, 12, 10)
-
-
 class InvalidOracle(RuntimeError):
     pass
 
@@ -142,26 +137,11 @@ def _producer_environment(
 
 
 def _validate_python_version(version: tuple[int, int, int]) -> None:
-    if version != REFERENCE_PYTHON:
-        raise InvalidOracle(
-            f"reference Python is {'.'.join(map(str, version))}, "
-            f"expected {'.'.join(map(str, REFERENCE_PYTHON))}"
-        )
+    validate_python_version(version, InvalidOracle)
 
 
 def _validate_reference_environment() -> dict[str, str]:
-    _validate_python_version(sys.version_info[:3])
-    actual = {}
-    for package, expected in REFERENCE_PACKAGES.items():
-        try:
-            actual[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError as error:
-            raise InvalidOracle(f"pinned reference package is missing: {package}=={expected}") from error
-        if actual[package] != expected:
-            raise InvalidOracle(
-                f"pinned reference package mismatch: {package}=={actual[package]}, expected {expected}"
-            )
-    return actual
+    return validate_reference_environment(InvalidOracle)
 
 
 def _sha256(path: Path) -> str:
@@ -300,11 +280,19 @@ def _validate_manifest_header(
         raise InvalidOracle("Mage oracle manifest header/population is incomplete or stale")
 
 
-def _validate_manifest_file_record(record: dict, path: Path) -> None:
+def _validate_manifest_file_record(
+    record: dict, path: Path, actual: dict[str, object] | None = None
+) -> None:
+    if actual is None:
+        actual = {
+            "name": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
     if (
         type(record.get("bytes")) is not int
-        or record.get("sha256") != _sha256(path)
-        or record["bytes"] != path.stat().st_size
+        or record.get("sha256") != actual["sha256"]
+        or record["bytes"] != actual["bytes"]
     ):
         raise InvalidOracle(f"{path.name} hash/size differs from the manifest")
 
@@ -520,7 +508,9 @@ def verify(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
         raise InvalidOracle("Mage oracle manifest file population is incomplete or stale")
     for record in records:
         manifest_record = expected[record["name"]]
-        _validate_manifest_file_record(manifest_record, output / record["name"])
+        _validate_manifest_file_record(
+            manifest_record, output / record["name"], actual=record
+        )
     print(f"verified {len(records)} CPU Mage oracles for revision {revision} under {output}")
 
 
