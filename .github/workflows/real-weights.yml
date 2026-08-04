@@ -1461,35 +1461,56 @@ jobs:
       # `--exact` after the `--` (cargo rejects it in its own argument position, exit 1) plus the
       # run-count assertion: name-selection alone turns a rename into "0 passed; N filtered out" and
       # a green step, which on a four-hour job would be an expensive way to gate nothing (sc-17250).
+      #
+      # `KREA_S18_ROWS` is set even though it matches the Rust-side default, because the 21 below is
+      # rows x seeds and this job must own both factors — otherwise a change to the default row set
+      # silently turns the count assertion into a false red (or, at a wider default, a false green).
       - name: Run the S18 coherence sweep (three seeds)
         env:
           KREA_SMOKE_W: "832"
           KREA_SMOKE_H: "480"
+          KREA_S18_ROWS: ABCDFEZ
           KREA_S18_SEEDS: "7,11,23"
         run: |
           set -o pipefail
           name=long_clip_coherence_under_the_bounded_window
+          # Streamed to a FILE as well as the log, because the evidence extraction below has to survive
+          # this command failing. `bash -e` kills the step at this assignment on a non-zero cargo exit,
+          # and the sweep's own verdict rule panics on evidence it judges unresolvable — precisely the
+          # run whose 21 cells someone needs to read. Extraction and upload are separate `always()`
+          # steps for the same reason.
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
             cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            "$name" -- --exact --ignored --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/s18-sweep.log" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
           fi
-          # The sweep's product is its per-cell evidence, not the green check. Every (row, seed) emits
-          # one `S18CELL` TSV line precisely so a run can be re-aggregated without the log.
-          grep -E "^(S18CELL|  VERDICT:)" <<<"$out" > "$RUNNER_TEMP/s18-cells.tsv" || true
-          cells="$(grep -c '^S18CELL' "$RUNNER_TEMP/s18-cells.tsv" || true)"
+          cells="$(grep -c '^S18CELL' "$RUNNER_TEMP/s18-sweep.log" || true)"
           if [[ "$cells" -ne 21 ]]; then
-            echo "::error::expected 21 S18CELL rows (the default ABCDFEZ rows x the three seeds above), captured $cells — the sweep did not measure what this job claims" >&2
+            echo "::error::expected 21 S18CELL rows (the ${KREA_S18_ROWS} rows x the three seeds above), captured $cells — the sweep did not measure what this job claims" >&2
             exit 1
           fi
+      # The sweep's product is its per-cell evidence, not the green check: every (row, seed) emits one
+      # `S18CELL` TSV line precisely so a run can be re-aggregated without the log. `always()` because
+      # a four-hour run that ends in an unresolvable verdict still measured 21 real cells, and throwing
+      # them away would mean paying for the sweep twice to read them.
+      - name: Extract the S18 cell evidence
+        if: always()
+        run: |
+          touch "$RUNNER_TEMP/s18-sweep.log"
+          grep -E "^(S18CELL|  VERDICT:)" "$RUNNER_TEMP/s18-sweep.log" > "$RUNNER_TEMP/s18-cells.tsv" || true
+          echo "captured $(grep -c '^S18CELL' "$RUNNER_TEMP/s18-cells.tsv" || true) S18CELL rows"
       - name: Upload the S18 cell evidence
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: krea-s18-sweep-${{ github.sha }}
           if-no-files-found: error
-          path: ${{ runner.temp }}/s18-cells.tsv
+          path: |
+            ${{ runner.temp }}/s18-cells.tsv
+            ${{ runner.temp }}/s18-sweep.log
 
   # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
