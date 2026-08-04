@@ -295,7 +295,7 @@ fn build_klein_contract(
         attention_chunking: clean,
         transformer_window_materialization: streamable,
     };
-    if provider_id == crate::FLUX2_KLEIN_9B_ID {
+    if provider_id == crate::FLUX2_KLEIN_9B_ID && spec.pid.is_some() {
         contract.pid_decode_routes = Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
             native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
                 tile_edges: routes.native_edges().to_vec(),
@@ -312,7 +312,7 @@ fn build_klein_contract(
             MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
             MemoryStrategy::StagedResidency if staged => MemoryStrategySupport::Implemented,
             MemoryStrategy::BoundedDecode if clean => {
-                if provider_id == crate::FLUX2_KLEIN_9B_ID {
+                if contract.pid_decode_routes.is_some() {
                     capability.parameters.decode_tile_edges = routes.published_edges();
                     capability.parameters.decode_overlaps = routes.published_overlaps();
                 } else {
@@ -942,5 +942,33 @@ mod tests {
             panic!("base contract admitted PiD without loaded weights");
         };
         assert!(reason.contains("without loaded PiD weights"), "{reason}");
+    }
+
+    #[test]
+    fn klein_contract_advertises_pid_decode_only_when_pid_weights_are_loaded() {
+        let base = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        let native = weights_free_klein_contract(crate::FLUX2_KLEIN_9B_ID, &base).unwrap();
+        assert!(native.pid_decode_routes.is_none());
+        assert_eq!(
+            native
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            DECODE_TILE_EDGES
+        );
+
+        let pid_spec = base.with_pid(
+            WeightsSource::File("/nonexistent/pid.safetensors".into()),
+            WeightsSource::Dir("/nonexistent/gemma".into()),
+        );
+        let pid = weights_free_klein_contract(crate::FLUX2_KLEIN_9B_ID, &pid_spec).unwrap();
+        assert!(pid.pid_decode_routes.is_some());
+        let fixtures =
+            registered_klein_fixture(&pid_spec, &pid, MemoryStrategy::BoundedDecode).unwrap();
+        assert!(fixtures.iter().any(|fixture| !fixture.context.use_pid));
+        assert!(fixtures.iter().any(|fixture| fixture.context.use_pid));
     }
 }
