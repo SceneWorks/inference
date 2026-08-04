@@ -37,6 +37,11 @@ candle-audio-whisper = { path = "../candle-audio-whisper" }
 # speaker-identity gate (the cloned output resembles the reference speaker more than the default
 # voice). Dev-only + env-gated (CHATTERBOX_SNAPSHOT), so the shipping surface is unchanged.
 candle-audio-chatterbox = { path = "../candle-audio-chatterbox" }
+# Kokoro renders the committed voice-clone reference clip (sc-17264,
+# `examples/voiceclone_ref_clip`) — the repository's sanctioned reference-audio path, so no
+# third-party audio fixture is committed and there is no clip licence to clear. Used only by that
+# example; no test and no shipping surface depends on it.
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 
 [features]
 default = []
