@@ -16,7 +16,8 @@
 //!   packs the same T5-XXL (`text_encoder_2/`) and AutoencoderKL. Carrying them at bf16 on a q4/q8
 //!   tier is above-tier residency — the thing `config/tier-integrity.jsonc` exists to eliminate. T5
 //!   packs at [`T5_GROUP_SIZE`] (32), which measurably halves packed-T5 render error versus the
-//!   codebase-default 64 at the same width; the VAE packs its attention projections at [`GROUP_SIZE`].
+//!   codebase-default 64 at the same width; the VAE packs its attention projections at the crate
+//!   group size (`crate::quant::GROUP_SIZE`, the codebase default 64).
 //!
 //! The per-component pack predicate matches the loader's `.quantize` scope exactly — a missed site (or
 //! a wrongly-packed dense tensor) loads u32 codes as dense floats → a garbage render. The completeness
