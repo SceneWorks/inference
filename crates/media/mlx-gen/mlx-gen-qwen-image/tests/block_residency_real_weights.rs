@@ -5,7 +5,7 @@
 //! same-stream unbounded 60-block attribution control with genuinely bounded 8/4/2/1 cadences.
 //!
 //! ```text
-//! QWEN_IMAGE_SNAPSHOT=<explicit bf16/q8/q4 tier dir> QWEN_RUNG4_TIER=q8 \
+//! MLX_GEN_QWEN_SNAPSHOT=<explicit bf16/q8/q4 tier dir> QWEN_RUNG4_TIER=q8 \
 //!   cargo test -p mlx-gen-qwen-image --release --test block_residency_real_weights \
 //!   -- --ignored --nocapture
 //! ```
@@ -29,8 +29,8 @@ fn env_u32(key: &str, default: u32) -> u32 {
 }
 
 fn snapshot() -> PathBuf {
-    PathBuf::from(std::env::var("QWEN_IMAGE_SNAPSHOT").expect(
-        "set QWEN_IMAGE_SNAPSHOT to an explicit Qwen-Image tier directory; the test never fetches",
+    PathBuf::from(std::env::var("MLX_GEN_QWEN_SNAPSHOT").expect(
+        "set MLX_GEN_QWEN_SNAPSHOT to an explicit Qwen-Image tier directory; the test never fetches",
     ))
 }
 

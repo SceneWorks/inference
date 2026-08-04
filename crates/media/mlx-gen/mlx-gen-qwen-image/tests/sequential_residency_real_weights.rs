@@ -11,7 +11,7 @@
 //! ~15 GB encoder is comparable to the ~20 GB DiT, so this is the biggest image-lane saving (36→20 GB,
 //! fits a 32 GB Mac). A repeat-job check confirms nothing stays resident across jobs.
 //!
-//! Snapshot env overrides: T2I `QWEN_IMAGE_SNAPSHOT`; Edit `QWEN_IMAGE_EDIT_SNAPSHOT`; Control base
+//! Snapshot env overrides: T2I `MLX_GEN_QWEN_SNAPSHOT`; Edit `QWEN_IMAGE_EDIT_SNAPSHOT`; Control base
 //! `QWEN_CONTROL_BASE_SNAPSHOT` + branch `QWEN_CONTROL_WEIGHTS`. Defaults pick the SceneWorks q8
 //! re-host tiers in the HF cache. Set `QWEN_SEQ_Q8=1` for the T2I Q8 case; `QWEN_SEQ_STEPS`/
 //! `QWEN_SEQ_SIZE` tune all three.
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 
@@ -83,7 +83,7 @@ fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, 
 }
 
 #[test]
-#[ignore = "needs a real Qwen/Qwen-Image snapshot (QWEN_IMAGE_SNAPSHOT or the HF cache)"]
+#[ignore = "needs a real Qwen/Qwen-Image snapshot (MLX_GEN_QWEN_SNAPSHOT or the HF cache)"]
 fn sequential_bounds_peak_and_is_byte_identical() {
     let req = probe_request();
     let (pixels_resident, peak_resident) = render_measured(OffloadPolicy::Resident, &req);
@@ -122,7 +122,7 @@ fn sequential_bounds_peak_and_is_byte_identical() {
 }
 
 #[test]
-#[ignore = "needs a real Qwen/Qwen-Image snapshot (QWEN_IMAGE_SNAPSHOT or the HF cache)"]
+#[ignore = "needs a real Qwen/Qwen-Image snapshot (MLX_GEN_QWEN_SNAPSHOT or the HF cache)"]
 fn sequential_repeat_job_stays_bounded() {
     let req = probe_request();
     let (_p1, peak1) = render_measured(OffloadPolicy::Sequential, &req);
