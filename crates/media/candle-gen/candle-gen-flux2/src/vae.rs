@@ -393,7 +393,8 @@ impl Flux2Vae {
     /// `[B, 128, h, w]` (NCHW), using this VAE's own bn stats. Thin binding of
     /// [`raw_latent_from_packed`] — see it for why the seam exists as a function at all.
     pub fn raw_latent_from_packed(&self, packed: &Tensor) -> Result<Tensor> {
-        raw_latent_from_packed(packed, &self.bn_std, &self.bn_mean)
+        let packed = packed.to_device(self.bn_mean.device())?;
+        raw_latent_from_packed(&packed, &self.bn_std, &self.bn_mean)
     }
 
     /// Decode packed transformer latents `[1, 128, lat_h, lat_w]` (NCHW) → RGB image `[1, 3, H, W]`
@@ -403,6 +404,44 @@ impl Flux2Vae {
         let latents = self.raw_latent_from_packed(packed)?; // [1, 32, 2h, 2w]
         let z = self.post_quant_conv.forward(&latents)?;
         self.decode(&z)
+    }
+
+    /// Decode with a bounded, overlap-blended upsampling tail. The attention-bearing middle is run
+    /// once over the complete latent (so the result preserves the full-image receptive field); only
+    /// the spatially-local upsampling tail is split into output-pixel tiles.
+    pub fn decode_packed_tiled(
+        &self,
+        packed: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let latents = self.raw_latent_from_packed(packed)?;
+        let z = self.post_quant_conv.forward(&latents)?;
+        let mut mid = self.conv_in.forward(&z)?;
+        mid = self.mid_resnet0.forward(&mid)?;
+        mid = self.mid_attn.forward(&mid)?;
+        mid = self.mid_resnet1.forward(&mid)?;
+
+        let cfg = candle_gen::gen_core::tiling::TilingConfig::spatial_only(
+            tile_edge as i32,
+            overlap as i32,
+        );
+        let mid = mid.unsqueeze(2)?;
+        let decoded = candle_gen::vae_tiling::decode_tiled(
+            candle_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE,
+            "flux2 vae",
+            &mid,
+            &cfg,
+            |tile| -> candle_gen::candle_core::Result<Tensor> {
+                let mut h = tile.squeeze(2)?;
+                for block in &self.up_blocks {
+                    h = block.forward(&h)?;
+                }
+                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                self.conv_out.forward(&h)?.unsqueeze(2)
+            },
+        )?;
+        decoded.squeeze(2)
     }
 
     fn decode(&self, z: &Tensor) -> Result<Tensor> {
