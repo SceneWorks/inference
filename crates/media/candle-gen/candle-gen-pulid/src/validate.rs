@@ -33,6 +33,93 @@ use candle_gen::CandleError;
 
 use crate::pulid_flux::{PulidFlux, PulidFluxPaths, PulidFluxRequest};
 
+fn memory_strategy_from_env() -> candle_gen::gen_core::MemoryStrategy {
+    use candle_gen::gen_core::MemoryStrategy;
+    match std::env::var("PULID_MEMORY_STRATEGY")
+        .unwrap_or_else(|_| "resident".to_owned())
+        .as_str()
+    {
+        "resident" => MemoryStrategy::Resident,
+        "staged_residency" => MemoryStrategy::StagedResidency,
+        "bounded_decode" => MemoryStrategy::BoundedDecode,
+        "bounded_attention" => MemoryStrategy::BoundedAttention,
+        "bounded_transformer_residency" => MemoryStrategy::BoundedTransformerResidency,
+        value => panic!("unsupported PULID_MEMORY_STRATEGY={value}"),
+    }
+}
+
+fn memory_strategy_key(strategy: candle_gen::gen_core::MemoryStrategy) -> &'static str {
+    use candle_gen::gen_core::MemoryStrategy;
+    match strategy {
+        MemoryStrategy::Resident => "resident",
+        MemoryStrategy::StagedResidency => "staged_residency",
+        MemoryStrategy::BoundedDecode => "bounded_decode",
+        MemoryStrategy::BoundedAttention => "bounded_attention",
+        MemoryStrategy::BoundedTransformerResidency => "bounded_transformer_residency",
+    }
+}
+
+/// One fresh-process, real-weight request for the exact full PuLID route. The external SC-15839
+/// harness runs this test once per rung while sampling device memory, then compares the emitted PPMs.
+#[test]
+#[ignore = "real-weight CUDA memory rung; set PULID_* env and PULID_MEMORY_STRATEGY"]
+fn real_weight_memory_rung() {
+    use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
+
+    let out_dir = env_path("PULID_OUT");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let paths = PulidFluxPaths {
+        flux_base: env_path("PULID_FLUX_BASE"),
+        pulid_weights: env_path("PULID_WEIGHTS"),
+        eva_weights: env_path("PULID_EVA"),
+        face_dir: env_path("PULID_FACE_DIR"),
+    };
+    let strategy = memory_strategy_from_env();
+    let contract = crate::memory_strategy::provider_contract(&paths).unwrap();
+    let tier = crate::memory_strategy::resolved_numeric_tier(&paths).unwrap();
+    let context = candle_gen::gen_core::standard_memory_behavior_context(
+        &contract,
+        strategy,
+        tier,
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("character_image".to_owned()),
+            reference_count: 1,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some("identity".to_owned()),
+        },
+    )
+    .unwrap();
+    let model = PulidFlux::load_with_memory_context(&paths, context.clone()).unwrap();
+    let reference = read_ppm(&env_path("PULID_REF"));
+    let request = PulidFluxRequest {
+        prompt: "portrait of a person, color photo, cinematic lighting, sharp focus, high detail"
+            .to_owned(),
+        steps: std::env::var("PULID_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4),
+        seed: 12345,
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let output = model
+        .generate_with_memory_context(&context, &request, &reference, &mut make_progress())
+        .unwrap();
+    let name = format!("pulid_memory_{}.ppm", memory_strategy_key(strategy));
+    write_ppm(&out_dir.join(name), &output);
+    eprintln!(
+        "SC15839_RECEIPT provider={} strategy={} tier={:?} overlay=identity geometry={}x{}x1 reference_count=1 calibration={} elapsed_ms={}",
+        crate::memory_strategy::PROVIDER_ID,
+        memory_strategy_key(strategy),
+        tier.quant,
+        request.width,
+        request.height,
+        crate::memory_strategy::CALIBRATION_FINGERPRINT,
+        started.elapsed().as_millis()
+    );
+}
+
 /// Mean absolute per-byte difference between two equal-size renders (the injection-changes-output sanity).
 fn mean_abs_diff(a: &Image, b: &Image) -> f64 {
     assert_eq!(a.pixels.len(), b.pixels.len(), "render size mismatch");

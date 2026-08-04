@@ -180,6 +180,17 @@ pub struct SafetensorsTensorHeader {
     pub data_bytes: u64,
 }
 
+impl SafetensorsTensorHeader {
+    /// Whether Candle's shared `Weights` loader casts this source dtype to its requested float
+    /// compute dtype. Integer and boolean tensors remain stored-width.
+    pub fn is_float(&self) -> bool {
+        matches!(
+            self.dtype,
+            Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64
+        )
+    }
+}
+
 /// Read tensor shapes/dtypes/byte ranges from one safetensors file or one recursively sharded
 /// directory without reading tensor data. Directory duplicate-key semantics match
 /// [`CheckpointMeta::from_dir`]: files are sorted and the later shard wins. File symlinks are
@@ -227,7 +238,8 @@ pub fn safetensors_path_tensor_headers(
                 Error::Msg(format!("safetensors header in {}: {error}", path.display()))
             })?;
         let available = file_len - data_start;
-        json.into_iter()
+        let mut tensors = json
+            .into_iter()
             .filter(|(name, _)| name != "__metadata__")
             .map(|(name, value)| {
                 let info: safetensors::tensor::TensorInfo =
@@ -256,14 +268,39 @@ pub fn safetensors_path_tensor_headers(
                         path.display()
                     ))
                 })?;
-                Ok(SafetensorsTensorHeader {
-                    name,
-                    dtype: info.dtype,
-                    shape: info.shape,
-                    data_bytes,
-                })
+                Ok((
+                    start,
+                    end,
+                    SafetensorsTensorHeader {
+                        name,
+                        dtype: info.dtype,
+                        shape: info.shape,
+                        data_bytes,
+                    },
+                ))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        tensors.sort_by(|left, right| {
+            (left.0, left.1, left.2.name.as_str()).cmp(&(right.0, right.1, right.2.name.as_str()))
+        });
+        let mut expected_start = 0_usize;
+        for (start, end, header) in &tensors {
+            if *start != expected_start {
+                return Err(Error::Msg(format!(
+                    "safetensors tensor {:?} in {} starts at {start}, expected contiguous offset {expected_start}",
+                    header.name,
+                    path.display()
+                )));
+            }
+            expected_start = *end;
+        }
+        if u64::try_from(expected_start).ok() != Some(available) {
+            return Err(Error::Msg(format!(
+                "safetensors tensor payload in {} covers {expected_start} bytes but file contains {available}",
+                path.display()
+            )));
+        }
+        Ok(tensors.into_iter().map(|(_, _, header)| header).collect())
     }
 
     fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -1036,6 +1073,51 @@ mod tests {
         assert!(error.contains("100000000-byte maximum"), "{error}");
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn header_only_reader_rejects_non_contiguous_or_unowned_payload_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "gencore_invalid_tensor_topology_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let write_raw = |name: &str, raw_header: &str, payload_bytes: usize| {
+            let path = root.join(name);
+            let mut header = raw_header.as_bytes().to_vec();
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.extend(vec![0_u8; payload_bytes]);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+
+        let overlap = write_raw(
+            "overlap.safetensors",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[2,6]}}"#,
+            6,
+        );
+        let gap = write_raw(
+            "gap.safetensors",
+            r#"{"a":{"dtype":"F16","shape":[1],"data_offsets":[0,2]},"b":{"dtype":"F16","shape":[1],"data_offsets":[4,6]}}"#,
+            6,
+        );
+        let trailing = write_raw(
+            "trailing.safetensors",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            8,
+        );
+
+        for path in [overlap, gap, trailing] {
+            assert!(
+                safetensors_path_tensor_headers(&path).is_err(),
+                "{} must fail closed",
+                path.display()
+            );
+        }
     }
 
     #[test]

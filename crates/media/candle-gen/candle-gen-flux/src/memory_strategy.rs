@@ -16,16 +16,16 @@ use candle_gen::gen_core::{
     PerComponentBytes, Precision, Quant, TransformerComponent, WeightsSource,
 };
 
-pub(crate) const DECODE_TILE_EDGE: u32 = 512;
+pub const DECODE_TILE_EDGE: u32 = 512;
 // The tuple bounds row-wise latent transfer into a whole-frame CPU decode. It is deliberately not a
 // family of independently decoded spatial VAE tiles: FLUX GroupNorm makes that numerically unsafe.
-pub(crate) const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE];
-pub(crate) const DECODE_OVERLAP: u32 = 128;
-pub(crate) const ATTENTION_CHUNK_SIZE: u32 =
+pub const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE];
+pub const DECODE_OVERLAP: u32 = 128;
+pub const ATTENTION_CHUNK_SIZE: u32 =
     gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
-pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
-pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
-pub(crate) const TRANSFORMER_BLOCKS: u32 = 57;
+pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
+pub const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
+pub const TRANSFORMER_BLOCKS: u32 = 57;
 pub const CALIBRATION_FINGERPRINT: &str =
     "flux1-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
 
@@ -90,6 +90,24 @@ pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
+    reference_backbone_contract(
+        provider_id,
+        spec,
+        overlay_components(spec),
+        CALIBRATION_FINGERPRINT,
+    )
+}
+
+/// Build the shared FLUX.1 reference-backbone ladder for a bespoke provider that owns a resident
+/// conditioning stack. The caller supplies the exact resident components and a provider-specific
+/// calibration identity; this deliberately prevents a bespoke identity route from inheriting base
+/// FLUX evidence merely because both routes execute the same 57-block trunk.
+pub fn reference_backbone_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    resident_components: Vec<MemoryResidentComponent>,
+    calibration_fingerprint: &str,
+) -> gen_core::Result<MemoryProviderContract> {
     let streamable = streamable(spec);
     let components = PerComponentBytes::from_spec_subdirs(
         spec,
@@ -103,7 +121,6 @@ pub(crate) fn provider_contract(
         MemoryPhase::Denoise,
         MemoryPhase::Decode,
     ];
-    let resident_components = overlay_components(spec);
     let overlay_bytes = resident_components
         .iter()
         .map(|component| component.resident_bytes)
@@ -192,7 +209,7 @@ pub(crate) fn provider_contract(
             resident_components,
         },
         calibration: Some(MemoryCalibrationIdentity::new(
-            CALIBRATION_FINGERPRINT,
+            calibration_fingerprint,
             spec.load_shape,
         )),
         asset_facts: MemoryAssetFacts {
@@ -237,7 +254,7 @@ pub(crate) fn snapshot_quant_tier(
         .transpose()
 }
 
-pub(crate) fn resolved_numeric_tier(
+pub fn resolved_numeric_tier(
     spec: &LoadSpec,
     provider_id: &str,
 ) -> gen_core::Result<MemoryNumericTier> {
