@@ -6,17 +6,20 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::adapters::loader::ApplyReport;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result,
+    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result, StagedHeavy,
     TimestepConvention, WeightsSource,
 };
 
+use crate::block_stream::BlockWindow;
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
-use crate::loader::{load_heavy_phase, load_text_phase, AnimaComponents};
+use crate::loader::{load_heavy_phase_with_stream, load_text_phase, AnimaComponents};
 use crate::text_encoder::AnimaQwen3;
 use crate::tokenizer::AnimaTokenizers;
 use crate::transformer::CosmosDiT;
@@ -451,16 +454,58 @@ pub(crate) fn denoise_loop(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_loop_bounded(
+        dit,
+        init,
+        cond,
+        uncond,
+        steps,
+        guidance,
+        sampler,
+        scheduler,
+        seed,
+        dit_dtype,
+        preview,
+        cancel,
+        on_progress,
+        AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+/// [`denoise_loop`] under the request's memory plan — ladder rungs 3 and 4 (SC-15524).
+///
+/// `attention` and `window` reach **every** advertised denoise route: the plain Turbo single forward
+/// and BOTH forwards of the Base/Aesthetic CFG pair. Neither changes precision, seed, σ schedule,
+/// sampler or conditioning; `UNBOUNDED` + `None` is byte-for-byte [`denoise_loop`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_loop_bounded(
+    dit: &CosmosDiT,
+    init: &Array,
+    cond: &Array,
+    uncond: Option<&Array>,
+    steps: usize,
+    guidance: f32,
+    sampler: &str,
+    scheduler: Option<&str>,
+    seed: u64,
+    dit_dtype: Dtype,
+    preview: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    attention: AttentionPlan<'_>,
+    window: Option<BlockWindow<'_>>,
+) -> Result<Array> {
     let sigmas = anima_schedule(scheduler, steps);
     let previews = AnimaPreview::new(preview, &sigmas);
     let guidance = Array::from_slice(&[guidance], &[1]);
     let predict = |x: &Array, sigma: f32| -> Result<Array> {
         let s = Array::from_slice(&[sigma], &[1]);
-        let v_cond = dit.forward(x, &s, cond, dit_dtype)?;
+        let v_cond = dit.forward_bounded(x, &s, cond, dit_dtype, attention, window)?;
         let v = match uncond {
             // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
             Some(u) => {
-                let v_u = dit.forward(x, &s, u, dit_dtype)?;
+                let v_u = dit.forward_bounded(x, &s, u, dit_dtype, attention, window)?;
                 add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
             }
             None => v_cond,
@@ -586,9 +631,20 @@ pub struct AnimaHeavy {
 
 impl AnimaHeavy {
     /// Load the DiT + bundled conditioner (`diffusion_models/`) + VAE (`vae/`), via the shared
-    /// [`load_heavy_phase`] the resident `AnimaComponents::load` also uses.
+    /// [`load_heavy_phase`](crate::loader::load_heavy_phase) the resident `AnimaComponents::load`
+    /// also uses.
     pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
-        let (dit, conditioner, vae) = load_heavy_phase(source, variant)?;
+        Self::load_with_stream(source, variant, false)
+    }
+
+    /// [`load`](Self::load) in the component form this request selected (SC-15524). `streamable`
+    /// arms ladder rung 4 on the DiT; every other component is loaded identically.
+    pub fn load_with_stream(
+        source: &WeightsSource,
+        variant: Variant,
+        streamable: bool,
+    ) -> Result<Self> {
+        let (dit, conditioner, vae) = load_heavy_phase_with_stream(source, variant, streamable)?;
         Ok(Self {
             dit,
             conditioner,
@@ -596,11 +652,34 @@ impl AnimaHeavy {
         })
     }
 
+    /// Whether ladder rung 4 can execute on this bundle.
+    pub fn can_stream_blocks(&self) -> bool {
+        self.dit.can_stream_blocks()
+    }
+
     /// Bake LoRA/LoKr adapters onto the DiT **and** the bundled conditioner in one strict pass
     /// (sc-10521 / sc-10274). Both live on this bundle, so the whole spec — `blocks.*` (DiT) +
     /// `llm_adapter.*` (conditioner) — is validated together and a span-both LoRA can't load partial.
+    ///
+    /// The per-block adapter capture for rung 4 happens HERE, immediately after the strict install,
+    /// so a streamed block replays exactly what the resident block ended up holding. Doing it any
+    /// later would leave a window at which a rung-4 render silently drops every LoRA — identity-free
+    /// output with no error (the `anima-turbo-lora-v0.2` 508-target failure mode).
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<ApplyReport> {
-        crate::adapters::apply_anima_adapters(&mut self.dit, &mut self.conditioner, specs)
+        let report =
+            crate::adapters::apply_anima_adapters(&mut self.dit, &mut self.conditioner, specs)?;
+        self.dit.capture_block_adapters();
+        Ok(report)
+    }
+
+    /// Plan a rung-4 block window for this request, or `None` for the resident stack. A window
+    /// requested on a bundle that cannot stream is a typed error, never a silent resident execution.
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a CancelFlag,
+    ) -> Result<Option<BlockWindow<'a>>> {
+        self.dit.block_window(window_size, cancel)
     }
 
     /// Run the conditioner forward over the phase-A inputs → `encoder_hidden_states` `[1, 512, 1024]`.
@@ -630,8 +709,51 @@ impl AnimaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let latent = self.denoise_one(
+            cond,
+            uncond,
+            width,
+            height,
+            steps,
+            guidance,
+            sampler,
+            scheduler,
+            seed,
+            preview,
+            cancel,
+            on_progress,
+            AttentionPlan::UNBOUNDED,
+            None,
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_view().decode_one(&latent, cancel, None)
+    }
+
+    /// The denoise half of [`render_one`] — seed → noise → flow denoise (`dit`, bf16) → latent.
+    ///
+    /// Split out for ladder rung 1: the staged schedule materializes every latent while the DiT is
+    /// alive, sheds the DiT + conditioner, and only then decodes. `attention`/`window` carry rungs 3
+    /// and 4; `UNBOUNDED` + `None` reproduces the historical trajectory exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        scheduler: Option<&str>,
+        seed: u64,
+        preview: &PreviewSink,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        attention: AttentionPlan<'_>,
+        window: Option<BlockWindow<'_>>,
+    ) -> Result<Array> {
         let noise = create_noise(seed, width, height)?;
-        let latent = denoise_loop(
+        denoise_loop_bounded(
             &self.dit,
             &noise,
             cond,
@@ -645,9 +767,57 @@ impl AnimaHeavy {
             preview,
             cancel,
             on_progress,
-        )?;
-        let decoded = self.vae.decode(&latent)?; // [1, 3, 1, H, W] f32 in [-1, 1]
+            attention,
+            window,
+        )
+    }
+}
+
+/// What survives ladder rung 1's denoise→decode boundary: the ~250 MB Qwen-Image VAE. The DiT and the
+/// bundled conditioner — the 4.18 GB the request is actually bound by — are dropped.
+pub struct AnimaLight {
+    vae: QwenVae,
+}
+
+/// A borrow of whichever VAE the decode phase should use: the warm bundle's (Resident) or the shed
+/// bundle's (staged). One decode body serves both, so a staged request is byte-identical to a warm one.
+pub struct AnimaDecodeView<'a> {
+    vae: &'a QwenVae,
+}
+
+impl AnimaDecodeView<'_> {
+    /// Decode one `[1, 16, 1, H/8, W/8]` latent to RGB, optionally through the bounded (tiled) VAE
+    /// path — ladder rung 2. The tiled decode preserves the exact output geometry: the shared
+    /// `mlx_gen::vae_tiling` accumulator blends `scale×` tile slabs into the same `H×W` buffer the
+    /// single-pass decode writes.
+    pub fn decode_one(
+        &self,
+        latent: &Array,
+        cancel: &CancelFlag,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        let decoded = match tiling {
+            Some(tiling) => self.vae.decode_tiled(latent, tiling, Some(cancel))?,
+            None => self.vae.decode(latent)?,
+        }; // [1, 3, 1, H, W] f32 in [-1, 1]
         decoded_to_image(&decoded)
+    }
+}
+
+impl StagedHeavy for AnimaHeavy {
+    type Light = AnimaLight;
+    type DecodeView<'a> = AnimaDecodeView<'a>;
+
+    fn shed_dit(self) -> AnimaLight {
+        AnimaLight { vae: self.vae }
+    }
+
+    fn decode_view(&self) -> AnimaDecodeView<'_> {
+        AnimaDecodeView { vae: &self.vae }
+    }
+
+    fn light_view(light: &AnimaLight) -> AnimaDecodeView<'_> {
+        AnimaDecodeView { vae: &light.vae }
     }
 }
 

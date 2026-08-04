@@ -26,10 +26,12 @@
 //! EOS) for the conditioner's query tokens ([`tokenizer`]).
 
 pub mod adapters;
+mod block_stream;
 pub mod conditioner;
 pub mod config;
 pub mod convert;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod prompt_weight;
@@ -49,7 +51,9 @@ pub use model::{
     descriptor_aesthetic, descriptor_base, descriptor_turbo, load_aesthetic, load_base, load_turbo,
     Anima,
 };
-pub use pipeline::{anima_sigmas, AnimaPipeline, GenOptions, DEFAULT_SAMPLER};
+pub use pipeline::{
+    anima_sigmas, AnimaDecodeView, AnimaLight, AnimaPipeline, GenOptions, DEFAULT_SAMPLER,
+};
 pub use prompt_weight::{parse_prompt_weights, strip_prompt_weights};
 pub use text_encoder::AnimaQwen3;
 pub use training::{
@@ -74,8 +78,32 @@ pub fn register_providers(
     registry
         .register_generator(model::BASE_REGISTRATION)
         .register_activation_memory(BASE_ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "anima_base",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("anima_base", spec)
+            },
+        })
+        .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR)
         .register_generator(model::AESTHETIC_REGISTRATION)
+        .register_memory_strategy(model::AESTHETIC_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "anima_aesthetic",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("anima_aesthetic", spec)
+            },
+        })
+        .register_memory_behavior(model::AESTHETIC_MEMORY_BEHAVIOR)
         .register_generator(model::TURBO_REGISTRATION)
+        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: "anima_turbo",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("anima_turbo", spec)
+            },
+        })
+        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_trainer(training::BASE_TRAINER_REGISTRATION)
         .register_trainer(training::AESTHETIC_TRAINER_REGISTRATION)
         .register_trainer(training::TURBO_TRAINER_REGISTRATION)
@@ -108,5 +136,25 @@ mod explicit_registry_tests {
             explicit_trainers,
             ["anima_base", "anima_aesthetic", "anima_turbo"]
         );
+    }
+
+    /// The shared weights-free behavior oracle: every registered contract, safety check, fixture and
+    /// request scope has to agree with the ladder each provider declares — including that a rung the
+    /// contract calls `Missing` cannot be begun, and that an admitted scope's lifecycle hooks accept
+    /// exactly the parameters it advertised.
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        for load_shape in [
+            mlx_gen::LoadShape::DeferredMaterialization,
+            mlx_gen::LoadShape::EagerMaterialization,
+        ] {
+            let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(load_shape);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
+                &registry, &spec,
+            );
+        }
     }
 }

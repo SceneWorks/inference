@@ -6,12 +6,12 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Residency, Result, SizeFloor,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
-use crate::pipeline::{AnimaCondInputs, AnimaHeavy, AnimaText};
+use crate::pipeline::{AnimaCondInputs, AnimaDecodeView, AnimaHeavy, AnimaText};
 
 const MAX_COUNT: u32 = 8;
 const RES_MIN: u32 = 512;
@@ -102,6 +102,15 @@ pub struct Anima {
     descriptor: ModelDescriptor,
     variant: Variant,
     residency: Residency<AnimaText, AnimaHeavy>,
+    /// The spec this generator was loaded from — the memory contract is per-`LoadSpec` (rung 4 is a
+    /// per-LOAD declaration), and `safety_check` must reproduce the loaded generator's tier.
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// Ladder rung 1's default when a request carries no `GenerationMemory` — the legacy load-time
+    /// `OffloadPolicy`. A shared-contract request overrides it per request.
+    default_stage_residency: bool,
+    /// Whether this load can rebuild transformer blocks per window (ladder rung 4).
+    streamable: bool,
 }
 
 pub fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -142,6 +151,11 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
         descriptor: descriptor_for(variant),
         variant,
         residency: build_residency(spec, variant)?,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(id, spec)
+            .map_err(|error| Error::Msg(error.to_string()))?,
+        default_stage_residency: spec.offload_policy == OffloadPolicy::Sequential,
+        streamable: crate::memory_strategy::streamable(spec),
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -162,12 +176,16 @@ pub(crate) fn build_residency(
 ) -> Result<Residency<AnimaText, AnimaHeavy>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
+    Residency::request_scoped_from_policy(
         spec.offload_policy,
-        move || AnimaText::load(&spec_text.weights, variant),
-        move |_use_pid| {
-            let mut heavy = AnimaHeavy::load(&spec_heavy.weights, variant)?;
+        // The Qwen3 TE has no re-materializable form here: rung 4's only implemented component scope
+        // is the DiT, and rung 1 already sheds the whole tower before the heavy phase loads.
+        move |_streamable| AnimaText::load(&spec_text.weights, variant),
+        move |_use_pid, streamable| {
+            let mut heavy = AnimaHeavy::load_with_stream(&spec_heavy.weights, variant, streamable)?;
             if !spec_heavy.adapters.is_empty() {
+                // Strict-applies DiT + conditioner in one pass AND captures the per-block adapters
+                // rung 4 replays, so a windowed render carries the same LoRA the resident one does.
                 heavy.apply_adapters(&spec_heavy.adapters)?;
             }
             Ok(heavy)
@@ -175,16 +193,64 @@ pub(crate) fn build_residency(
     )
 }
 
-mlx_gen::impl_generator!(Anima {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+impl Generator for Anima {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl Anima {
-    /// The staged residency lifecycle (encode the Qwen3 conditioner inputs → **drop the Qwen3 TE**
-    /// under `Sequential` → conditioner forward + DiT denoise + VAE decode → free the heavy bundle) is
-    /// driven by the shared [`Residency::run`] seam (sc-10840), which owns the eval/drop/clear
-    /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
+    /// One request, driven by the shared three-phase [`Residency::run_staged_request_scoped`] seam
+    /// (SC-15524). It owns the eval/drop/`clear_cache` discipline, the stage-boundary cancel checks
+    /// and the error-safe flush; this body only supplies Anima's phase tensors.
+    ///
+    /// **Rung 1 is request-scoped.** `stage_residency` comes from the request's
+    /// [`GenerationMemory`](mlx_gen::gen_core::GenerationMemory) when the shared contract admitted
+    /// one, and falls back to the legacy load-time `OffloadPolicy` otherwise — so one cached
+    /// generator serves warm → staged → warm without reconstruction, and a request that carries no
+    /// memory block is byte-for-byte unaffected.
+    ///
+    /// **Staging is a real three-phase schedule here, not two.** The historical seam released only
+    /// the Qwen3 TE and then held the DiT + conditioner + VAE through the decode. Every latent is now
+    /// materialized while the DiT is alive, the 4.18 GB DiT + conditioner are shed, and only the
+    /// ~250 MB VAE survives into the decode — which is also what makes rung 4's window worth
+    /// selecting, and why rung 4 declares rung 1 as a same-request prerequisite.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -207,15 +273,41 @@ impl Anima {
             .unwrap_or_else(|| crate::pipeline::DEFAULT_SAMPLER.to_string());
         let scheduler = req.scheduler.clone();
 
-        self.residency.run(
+        // Resolve the whole ladder up front so an unimplementable request fails BEFORE any component
+        // loads, rather than part-way through a staged schedule.
+        let stage_residency =
+            crate::memory_strategy::stage_residency(req, self.default_stage_residency);
+        let attention = crate::memory_strategy::attention_plan(req);
+        let window_size = crate::memory_strategy::transformer_window_size(req)?;
+        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        if window_size.is_some() && !self.streamable {
+            return Err(Error::Unsupported(format!(
+                "{}: bounded transformer residency requires a DeferredMaterialization load",
+                self.descriptor.id
+            )));
+        }
+        if window_size.is_some() && !stage_residency {
+            return Err(Error::Unsupported(format!(
+                "{}: bounded transformer residency requires staged residency engaged in the same \
+                 request — bounding the DiT while the conditioner and VAE stay resident does not \
+                 move the request peak",
+                self.descriptor.id
+            )));
+        }
+
+        self.residency.run_staged_request_scoped(
+            stage_residency,
+            // Only build the re-materializable DiT form when this request will actually window it:
+            // arming it otherwise would evict a warm pair for nothing.
+            window_size.is_some(),
             &req.cancel,
             // Anima has no PiD overlay; the heavy loader ignores `use_pid`.
             false,
             on_progress,
             // ── Phase A: encode the conditioner INPUTS (Qwen3 forward + mask-multiply). Seed-independent
             // (no RNG). `uncond` is encoded iff the variant uses CFG (NOT gated on the guidance value —
-            // preserving the pre-seam behavior of running the uncond forward even at guidance 1.0). Under
-            // `Sequential` the shared seam materializes these + DROPS the Qwen3 TE before the heavy load.
+            // preserving the pre-seam behavior of running the uncond forward even at guidance 1.0). When
+            // staged, the shared seam materializes these + DROPS the Qwen3 TE before the heavy load.
             |text: &AnimaText| {
                 let cond = text.encode_inputs(&req.prompt)?;
                 let uncond = if variant.uses_cfg() {
@@ -226,7 +318,7 @@ impl Anima {
                 Ok((cond, uncond))
             },
             // Materialize the masked Qwen3 states + T5 ids (cond + optional uncond) while the TE is still
-            // alive (Sequential only) — MLX is lazy, so an un-evaluated `source` keeps the TE referenced
+            // alive (staged only) — MLX is lazy, so an un-evaluated `source` keeps the TE referenced
             // and dropping it would free nothing. The T5 weights are host data (no eval).
             |encoded: Option<&(AnimaCondInputs, Option<AnimaCondInputs>)>| {
                 let Some((cond, uncond)) = encoded else {
@@ -241,15 +333,16 @@ impl Anima {
                 Ok(())
             },
             // ── Phase B: conditioner forward (once per cond/uncond — seed-independent) then the count
-            // loop of denoise/decode. Identical body for both residencies, so a Sequential job is
-            // byte-identical to Resident.
+            // loop of denoise. Identical body for every residency and rung, so a staged or windowed job
+            // is numerically identical to a warm unbounded one.
             |heavy: &AnimaHeavy, (cond, uncond), on_progress: &mut dyn FnMut(Progress)| {
+                let window = heavy.block_window(window_size, &req.cancel)?;
                 let cond_enc = heavy.conditioner_forward(&cond)?;
                 let uncond_enc = match &uncond {
                     Some(u) => Some(heavy.conditioner_forward(u)?),
                     None => None,
                 };
-                let mut images = Vec::with_capacity(req.count as usize);
+                let mut latents = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     // Release the MLX cache between images so a batch doesn't accumulate to a SIGKILL
                     // (sc-5567).
@@ -257,7 +350,7 @@ impl Anima {
                         mlx_rs::memory::clear_cache();
                     }
                     let seed = base_seed.wrapping_add(n as u64);
-                    let img = heavy.render_one(
+                    latents.push(heavy.denoise_one(
                         &cond_enc,
                         uncond_enc.as_ref(),
                         req.width,
@@ -270,8 +363,22 @@ impl Anima {
                         &req.preview,
                         &req.cancel,
                         on_progress,
-                    )?;
-                    images.push(img);
+                        attention,
+                        window,
+                    )?);
+                }
+                Ok(latents)
+            },
+            // Force every latent before the DiT + conditioner are shed: an unevaluated latent still
+            // references the DiT graph, so dropping it would free nothing (the SC-15750 MLX trap, one
+            // level up from the block window).
+            |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            // ── Phase C: decode from whichever VAE survived — the warm bundle's or the shed one's.
+            |view: AnimaDecodeView<'_>, latents, on_progress: &mut dyn FnMut(Progress)| {
+                on_progress(Progress::Decoding);
+                let mut images = Vec::with_capacity(latents.len());
+                for latent in &latents {
+                    images.push(view.decode_one(latent, &req.cancel, decode_tiling.as_ref())?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -301,6 +408,47 @@ mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
     footprint = crate::loader::component_footprint
 }
+
+/// The shared-ladder registration pair every Anima catalog entry publishes. All three route to the
+/// SAME contract builder and safety check — the implementation is shared by construction — while the
+/// contract itself is still built per `LoadSpec`, so rung 4's per-LOAD declaration is preserved.
+macro_rules! memory_registration {
+    ($registration:ident, $behavior:ident, $provider_id:expr) => {
+        pub(crate) const $registration: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| {
+                    crate::memory_strategy::memory_strategy_contract($provider_id, spec)
+                },
+                safety_check: crate::memory_strategy::safety_check,
+            };
+        pub(crate) const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+                begin_request: |spec, contract, context| {
+                    crate::memory_strategy::registered_begin_request(
+                        $provider_id,
+                        spec,
+                        contract,
+                        context,
+                    )
+                },
+            };
+    };
+}
+
+memory_registration!(BASE_MEMORY_REGISTRATION, BASE_MEMORY_BEHAVIOR, "anima_base");
+memory_registration!(
+    AESTHETIC_MEMORY_REGISTRATION,
+    AESTHETIC_MEMORY_BEHAVIOR,
+    "anima_aesthetic"
+);
+memory_registration!(
+    TURBO_MEMORY_REGISTRATION,
+    TURBO_MEMORY_BEHAVIOR,
+    "anima_turbo"
+);
 mlx_gen::register_generators! {
     pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic;
     footprint = crate::loader::component_footprint
