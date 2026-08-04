@@ -20,9 +20,9 @@ use candle_gen::gen_core::{
 use std::sync::{Arc, Mutex};
 
 pub const DECODE_TILE_EDGE: u32 = 512;
-pub const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE, 640, 768];
+pub const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE, 640, 768, 896];
 pub const DECODE_OVERLAP: u32 = 128;
-pub const DECODE_OVERLAPS: &[u32] = &[DECODE_OVERLAP, 192, 256];
+pub const DECODE_OVERLAPS: &[u32] = &[DECODE_OVERLAP, 192, 256, 384];
 pub const ATTENTION_CHUNK_SIZE: u32 =
     gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
@@ -32,7 +32,7 @@ pub const BASE_SINGLE_BLOCKS: u32 = 48;
 pub const BASE_TRANSFORMER_BLOCKS: u32 = BASE_DOUBLE_BLOCKS + BASE_SINGLE_BLOCKS;
 pub const CONTROL_BLOCKS: u32 = 4;
 pub const CALIBRATION_FINGERPRINT: &str =
-    "flux2-dev-cuda-staged-host-decode-bounded-attention-device-format-blocks-v2";
+    "flux2-dev-cuda-staged-host-decode-bounded-attention-device-format-blocks-v3";
 pub const CONTROL_OVERLAY: &str = "control";
 
 fn path(source: &WeightsSource) -> &std::path::Path {
