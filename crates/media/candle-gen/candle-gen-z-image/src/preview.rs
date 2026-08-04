@@ -80,8 +80,10 @@
 //! sc-16956 pinned as the FLUX.1 diffusers container. Their `vae/config.json` even names its origin:
 //! `"_name_or_path": "flux-dev"`. The fit donor `SceneWorks/z-image-turbo-mlx` @
 //! `bb2bc9893b3c49ae96c813350775f791a2e8bc80` `bf16/vae/model.safetensors` (SHA-256
-//! `0fbab8b6…3810`, 167,666,968 bytes) is that same file re-containered: all 244 tensors byte-identical,
-//! the 66-byte size difference being the safetensors header's `__metadata__` alone.
+//! `0fbab8b6…3810`, 167,666,968 bytes) is that same file re-containered: all 244 tensors byte-identical
+//! over the same 167,639,366 payload bytes, with the entire 66-byte size difference living in the JSON
+//! **header encoding** — the two writers differ in per-tensor key order, in offset digit widths, in the
+//! `__metadata__` value and in trailing padding. Only a tensor walk can settle identity across that.
 //!
 //! So epic 16624 committed **two** fits over **one** latent space — this one and
 //! `mlx-gen-flux/src/preview.rs`'s — measured on different render sets. That is a duplication, not a
@@ -747,9 +749,12 @@ mod tests {
     const SAMPLER_ARITY: usize = 9;
     const PREVIEW_ARGUMENT: usize = 7;
 
-    /// `emit_preview_at`'s argument count and the 0-based position of its **sink** argument.
+    /// `emit_preview_at`'s argument count and the 0-based positions of its **sink** and **step index**
+    /// arguments. Both are pinned: the sink says *which* sink a bespoke loop emits into, the index says
+    /// *what it counts*, and the two failure modes are independent.
     const EMIT_ARITY: usize = 4;
     const SINK_ARGUMENT: usize = 0;
+    const STEP_INDEX_ARGUMENT: usize = 2;
 
     /// The test-only attribute whose item is dropped before the scan. Spelled once, and asserted to
     /// leave no survivor behind.
@@ -947,7 +952,7 @@ mod tests {
 
     /// Every shipped Z-Image render lane emits, pinned at the source level, per file and per site.
     ///
-    /// Eleven lanes, three files, two wiring layers — the widest inventory in this epic so far:
+    /// Nine lanes, three files, two wiring layers — the widest inventory in this epic so far:
     ///
     /// * `pipeline.rs` — **four** hooked driver sites: the Turbo and base resident routes (`render`,
     ///   `render_base`) that the two registered descriptors reach, and their staged-residency twins
@@ -959,15 +964,26 @@ mod tests {
     ///
     /// `training.rs` is the deliberate omission and is pinned as such below.
     ///
+    /// Counts alone are not the whole assertion. Each direct emission also has its **sink** and its
+    /// **step index** pinned positionally, per file: `control.rs`'s two must emit into `&req.preview`
+    /// at the absolute `step_i`, `edit.rs`'s one at the re-based `step_i - start` its reduced schedule
+    /// requires. Both are silent-wrong-output defects that a count cannot see.
+    ///
     /// This is the crate-local half of the epic-16948 guard; `candle-gen-catalog`'s
     /// `preview_advertising` module carries the same counts as the family's route inventory and ties
     /// them to the advertised `supports_preview`.
     #[test]
     fn every_shipped_render_lane_emits_a_preview() {
-        for (file, source, hooked, direct) in [
-            ("pipeline.rs", include_str!("pipeline.rs"), 4usize, 0usize),
-            ("control.rs", include_str!("control.rs"), 2, 2),
-            ("edit.rs", include_str!("edit.rs"), 0, 1),
+        for (file, source, hooked, direct, step_index) in [
+            (
+                "pipeline.rs",
+                include_str!("pipeline.rs"),
+                4usize,
+                0usize,
+                "",
+            ),
+            ("control.rs", include_str!("control.rs"), 2, 2, "step_i"),
+            ("edit.rs", include_str!("edit.rs"), 0, 1, "step_i - start"),
         ] {
             let sites = call_sites(file, &format!("{DRIVER}("), source);
             assert_eq!(
@@ -1013,6 +1029,21 @@ mod tests {
                     "&req.preview",
                     "{file}: {EMIT} #{index} must emit against the request's own sink: {args:?}"
                 );
+                // Same shape, applied to the argument this crate is likeliest to get wrong. The two
+                // bespoke bodies count DIFFERENTLY: `control.rs` runs the full `0..steps` schedule and
+                // emits at the absolute `step_i`, while `edit.rs` runs the strength-reduced
+                // `start..steps` tail against a counter built over `steps - start` and must re-base to
+                // `step_i - start` — feeding it the absolute index would number the first frame
+                // `start + 1` and emit nothing at all once `start >= total`. That is exactly what
+                // `the_bespoke_counter_follows_a_reduced_img2img_schedule` describes, but that row
+                // re-derives the arithmetic on a local counter and never reads a call site, so on its
+                // own it cannot see the two spellings swapped. This is the row that can.
+                assert_eq!(
+                    args[STEP_INDEX_ARGUMENT].as_str(),
+                    step_index,
+                    "{file}: {EMIT} #{index} must emit at `{step_index}`, not `{}`: {args:?}",
+                    args[STEP_INDEX_ARGUMENT]
+                );
             }
         }
     }
@@ -1022,7 +1053,7 @@ mod tests {
     /// a `PreviewSink`. Z-Image is structurally immune to that shape, and this row is what pins the
     /// structure rather than asserting the immunity in prose.
     ///
-    /// No Z-Image lane takes a preview hook (or a sink) as a **parameter**. Every one of the seven
+    /// No Z-Image lane takes a preview hook (or a sink) as a **parameter**. Every one of the nine
     /// emitting lanes takes the whole request — `&GenerationRequest` in `pipeline.rs`,
     /// `&ZImageControlRequest` in `control.rs`, `&ZImageEditRequest` in `edit.rs` — and reads
     /// `req.preview` at the site itself. A caller therefore has nothing to drop: forwarding the request

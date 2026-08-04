@@ -317,7 +317,7 @@ mod preview_advertising {
     ///   table in this module could see it: `PROVIDER_CRATES` is keyed on a registration function.
     ///
     /// Z-Image (sc-16957) contributes two rows — `z_image_turbo` and `z_image`, one crate, two
-    /// descriptors — while wiring **seven** lanes across three files, and it adds two things no earlier
+    /// descriptors — while wiring **nine** lanes across three files, and it adds two things no earlier
     /// family showed:
     ///
     /// * **Both wiring layers on the same registered pair.** `pipeline.rs` holds four hooked driver
@@ -329,7 +329,7 @@ mod preview_advertising {
     /// * **The `_control` route ids in this crate are memory strategies, not descriptors.**
     ///   `z_image_turbo_control` / `z_image_control` register a `MemoryRegistration` and nothing else,
     ///   so they have no id to advertise here — exactly the `candle-gen-flux` control/IP shape, and the
-    ///   reason the two ids above cover seven lanes. `edit.rs`'s img2img provider is the same: a
+    ///   reason the two ids above cover nine lanes. `edit.rs`'s img2img provider is the same: a
     ///   name-driven worker stream carrying a `preview` field on its own request type.
     ///
     /// Z-Image also settles a question sc-16955 raised and sc-16956 half-answered. Its VAE is
@@ -856,7 +856,7 @@ mod preview_advertising {
             dir: "candle-gen-z-image",
             register: candle_gen_z_image::register_providers,
             denoise: Denoise::Shared,
-            // sc-16957's inventory — seven emitting lanes across three files, plus one deliberately
+            // sc-16957's inventory — nine emitting lanes across three files, plus one deliberately
             // dark trainer site, and the first crate to mix both wiring layers on a *registered* pair:
             //   * `control.rs` — the name-driven Fun-ControlNet provider's FOUR lanes. Its base halves
             //     (staged `denoise_base_with`, resident `generate_base`) drive the shared sampler with

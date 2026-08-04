@@ -39,10 +39,18 @@ FLUX.1 16-ch VAE, so it aliases the `flux` PiD latent-space student", and `commo
 ### Consequence: epic 16624 committed **two** fits over **one** latent space
 
 `mlx-gen-flux/src/preview.rs` and `mlx-gen-z-image/src/preview.rs` are two independent OLS solutions
-over the same 16-channel VAE, measured on different render sets. They are close but not equal — same
-sign and comparable magnitude on all 16 rows (e.g. row 0 `[-0.0125, +0.0163, +0.0434]` vs
-`[-0.0132, +0.0206, +0.0503]`; row 13 `[-0.0802, -0.0311, -0.0829]` vs `[-0.0728, -0.0102, -0.0743]`),
-which is exactly what two samples of one linear relationship look like.
+over the same 16-channel VAE, measured on different render sets. They are close but not equal, and the
+aggregate is what carries that rather than a row-by-row eyeball: projecting a standard-normal 16-channel
+latent through both tables gives a per-channel Pearson of **+0.9929 / +0.9671 / +0.9838** (R/G/B) and a
+mean |Δ| of **3.9 / 6.5 / 7.6 of 255** — recognisably the same picture in a slightly different palette.
+Coefficient by coefficient, **15 of the 16 rows agree in sign on all three channels** and one does not:
+row 5's R is `+0.006346` (flux) against `−0.005458` (z-image), near zero in both and flipped. Individual
+coefficients can also differ by a large *ratio* while staying small in absolute terms — row 5 B is
+`+0.013491` vs `+0.000727` (18.6×), row 13 G is `−0.031118` vs `−0.010184` (3.1×) — so "same sign,
+comparable magnitude on every row" is the wrong summary. The largest single coefficient gap is 0.0209
+(row 13 G) and the largest bias gap 0.0242 (B). Typical rows do track closely: row 0 is
+`[-0.0125, +0.0163, +0.0434]` vs `[-0.0132, +0.0206, +0.0503]`, row 13 `[-0.0802, -0.0311, -0.0829]` vs
+`[-0.0728, -0.0102, -0.0743]`. Two noisy samples of one linear relationship, which is the conclusion.
 
 This is a **duplication, not a contradiction**. Either fit would preview either family; the difference
 is decorative colour nuance, and the denoise path never reads these constants.
@@ -56,15 +64,30 @@ is decorative colour nuance, and the denoise path never reads these constants.
    cross-backend parity property every other family in this epic preserves.
 
 Collapsing the two into one fit would change **MLX** preview bytes on one of the two families, so it is
-a cross-engine decision, not a candle one. Recorded as a follow-up in §8 rather than taken here.
+a cross-engine decision, not a candle one. Recorded as a follow-up in §10 rather than taken here.
 
 ### The fit donor is the same file, re-containered
 
 `SceneWorks/z-image-turbo-mlx` @ `bb2bc9893b3c49ae96c813350775f791a2e8bc80`, `bf16/vae/model.safetensors`
 — SHA-256 `0fbab8b661f6ee6af81c88a6eb1501ec1f7b4b8fe4ad29803507ebe0cf863810`, 167,666,968 bytes, 244
 tensors — is the container `mlx-gen-z-image/src/preview.rs` names. Its hash differs from the diffusers
-file's and its length differs by **66 bytes**, which is the safetensors header's `__metadata__`
-(`{"format":"pt"}`) that the MLX writer omits. Every learned tensor underneath is bit-identical, at both
+file's and its length differs by **66 bytes**, and every one of those bytes is in the JSON **header**:
+the tensor payload is the same 167,639,366 bytes on both sides. The MLX header is the *larger* of the
+two — 27,594 bytes against 27,528 — decomposing exactly as
+
+| component | mlx | diffusers | Δ |
+| --- | --- | --- | --- |
+| `__metadata__` segment | `"__metadata__":null` (19 B) | `"__metadata__":{"format":"pt"}` (30 B) | **−11** |
+| trailing pad spaces | 0 | 7 | **−7** |
+| per-tensor entries | 27,572 B | 27,488 B | **+84** |
+| **header total** | **27,594** | **27,528** | **+66** |
+
+The +84 is entirely `data_offsets` digit width — 4,106 offset digit characters against 4,022, because
+the MLX packer lays the 244 tensors out in a different order — and the two writers also disagree on
+per-tensor key order (`data_offsets, dtype, shape` vs `dtype, shape, data_offsets`), which costs
+nothing but makes the headers textually unrelated. Note in particular that the MLX writer **does** emit
+a `__metadata__` key; it writes `null` where diffusers writes `{"format":"pt"}`, and that difference
+runs the *opposite* way to the size delta. Every learned tensor underneath is bit-identical, at both
 the Turbo and the base snapshot:
 
 ```
@@ -298,8 +321,8 @@ Euler. Every pair was **pixel-identical**, so an active sink perturbs no render 
 | --- | --- | --- | --- | --- | --- | --- |
 | `z_image_turbo-resident` | hooked | 8 | 8 | ↓ 71.6 % (52.75 → 14.99) | +0.051 → **+0.921** | 0.90 |
 | `z_image_turbo-staged` | hooked | 8 | 8 | ↓ 71.6 % (52.75 → 14.99) | +0.051 → **+0.921** | 0.90 |
-| `z_image-resident` | hooked | 20 | 20 | ↓ 56.2 % (50.81 → 22.26) | +0.115 → **+0.836** | 0.80 |
-| `z_image-staged` | hooked | 20 | 20 | ↓ 56.2 % (50.81 → 22.26) | +0.115 → **+0.836** | 0.80 |
+| `z_image-resident` | hooked | 20 | 20 | ↓ 56.2 % (50.81 → 22.26) | +0.115 → **+0.836** | 0.81 |
+| `z_image-staged` | hooked | 20 | 20 | ↓ 56.2 % (50.81 → 22.26) | +0.115 → **+0.836** | 0.81 |
 | `z_image_turbo-heun` | hooked | 8 (**15 evals**) | 8 | ↓ 69.1 % (51.25 → 15.83) | +0.086 → **+0.913** | 0.89 |
 | `z_image_turbo_control-resident` | **direct** | 8 | 8 | ↓ 73.6 % (49.64 → 13.12) | +0.099 → **+0.942** | 0.92 |
 | `z_image_turbo_control-staged` | **direct** | 8 | 8 | ↓ 73.6 % (49.64 → 13.12) | +0.099 → **+0.942** | 0.92 |
@@ -330,14 +353,18 @@ Four things the table shows that prose could not:
   asserted `> steps` *before* the frame count is, so the dedup guard cannot pass vacuously. 15 rather
   than 16 because the final step's second evaluation lands at σ = 0.
 * **The bespoke-loop lanes work end to end.** `z_image_turbo_control` reaches the highest correlation of
-  the eight (+0.942) — a pose-locked composition resolves earlier than a free one — and it is one of the
+  the ten (+0.942) — a pose-locked composition resolves earlier than a free one — and it is one of the
   two lanes with *no* driver at all. The catalog tally can see that a direct emission call exists; only
   this can see that it produces frames.
 * **The base path's schedule, not the wiring, is what caps its correlation.** `z_image` reaches +0.836
   where Turbo reaches +0.921, because the static shift=6.0 σ table is heavily back-loaded — its strip is
   visibly noise for two thirds of its length and then resolves fast (frame 13 is +0.306, frame 20 is
   +0.836). The hook emits *before* each solver step, so the largest single advancement is never
-  previewed. That is why `min_r_last` is per-lane and each floor carries its measured number.
+  previewed: the base strip's own distance-to-final falls **5.38** in the last previewed step alone, and
+  the 20-step base-control strip back-loads the same way at **7.34**. That is why `min_r_last` is
+  per-lane, each floor carrying its lane's measured number rounded down by two to two-and-a-half points
+  (the six floors sit 0.020–0.026 under their measurements; no lane is given a wider margin than
+  another).
 
 #### The img2img lane needed its own "develops" pair — and that is a finding, not a threshold fudge
 
@@ -346,7 +373,7 @@ ceiling is a *txt2img* statement ("the first frame is pre-denoise noise"), and i
 a strength-reduced img2img strip: the first emission is `x_t = (1 − σ_start)·source + σ_start·noise`, so
 it opens partly converged **by construction** — that is what a structure-preserving edit means.
 
-Loosening the global constant would have weakened all seven other lanes to accommodate one. Instead the
+Loosening the global constant would have weakened all nine other strips to accommodate one. Instead the
 pair is per-lane: `FROM_NOISE { max_r_first: 0.75, min_rise: 0.30 }` for every txt2img and control lane
 (the epic's numbers, unchanged), and `FROM_A_PARTIAL_LATENT { max_r_first: 0.85, min_rise: 0.08 }` for
 the one lane that does not start on noise, with both numbers carrying their measurement. The two
@@ -424,7 +451,11 @@ run reproduces the same two ids before and after. Not fixed here.
    `mlx-gen-z-image/src/preview.rs` are independent OLS solutions over a byte-identical VAE.
    Consolidating them is worth doing but is a **cross-engine** change — collapsing to one set would move
    MLX preview bytes on whichever family loses its own fit — so it belongs to a story that owns both
-   engines, not to a candle wiring story. Candidate scope: pick the fit with the better *pooled* holdout
+   engines, not to a candle wiring story. The two are close but not uniformly so — §1 has the numbers,
+   and a consolidation story should read them there rather than assume the tables agree row by row: one
+   of the 16 rows flips sign (row 5 R, near zero in both) and several individual coefficients differ by
+   3–19× while staying small. The pooled agreement is what justifies calling it duplication, not the
+   per-row agreement. Candidate scope: pick the fit with the better *pooled* holdout
    over both families' render sets, retire the other, and re-point `candle-gen-flux`,
    `candle-gen-chroma`, `candle-gen-pulid`, `candle-gen-boogu` (sc-17218) and `candle-gen-z-image` at
    the survivor.

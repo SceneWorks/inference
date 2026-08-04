@@ -178,10 +178,12 @@ fn assert_same_learned_tensors(label: &str, a: &Path, b: &Path) -> usize {
 /// candle actually loads are the same 244 learned tensors.
 ///
 /// A hash equality could not have replaced this row: the fit donor is the MLX packer's re-container of
-/// the diffusers file, so its SHA-256 and its length differ (167,666,968 vs 167,666,902) — by exactly
-/// the safetensors header's `__metadata__` block, which the MLX writer omits. Every learned tensor
-/// underneath is byte-identical, at both tiers Z-Image ships (Turbo and base), so the fit's input
-/// domain is the same whichever snapshot a render loads.
+/// the diffusers file, so its SHA-256 and its length differ (167,666,968 vs 167,666,902). The whole
+/// 66-byte gap is in the JSON **header**, not in the weights — the two writers disagree on per-tensor
+/// key order, on how wide the `data_offsets` integers print, on the `__metadata__` value and on
+/// trailing padding, and the tensor payload is the same 167,639,366 bytes on both sides. Every learned
+/// tensor underneath is byte-identical, at both tiers Z-Image ships (Turbo and base), so the fit's
+/// input domain is the same whichever snapshot a render loads.
 #[test]
 #[ignore = "needs ZIMAGE_FIT_VAE + ZIMAGE_DIFFUSERS_VAE + ZIMAGE_BASE_DIFFUSERS_VAE; run with --ignored"]
 fn the_committed_fit_donor_is_the_shipped_z_image_vae() {
@@ -1039,7 +1041,9 @@ fn the_edit_route_previews_its_reduced_schedule() {
 
 // ── The measured per-lane correlation floors ──────────────────────────────────────────────────────
 //
-// Each carries the number measured on that lane at 512², with roughly two points of slack. They are
+// Each carries the number measured on that lane at 512², rounded down by roughly two points of slack:
+// the six floors sit 0.020–0.026 under their measurements, none of them given a wider margin than the
+// rest. They are
 // deliberately NOT one constant: `min_r_last` is a joint statement about the fit's ceiling
 // (√0.98133 ≈ 0.9906) and about how much of the trajectory the lane's SCHEDULE leaves to the one step
 // the hook never previews (it emits before each solver step, sc-16949). Turbo's linear 8-step schedule
@@ -1055,8 +1059,10 @@ const MIN_R_LAST_TURBO: f64 = 0.90;
 const MIN_R_LAST_TURBO_HEUN: f64 = 0.89;
 /// Measured +0.836 on the 20-step 512² base CFG lane, resident and staged alike. The lowest of the six
 /// and the most schedule-bound: shift=6.0 back-loads the trajectory, so the unpreviewed terminal step
-/// carries a large share (the strip's own distance-to-final falls 7.3 in that last previewed step).
-const MIN_R_LAST_BASE: f64 = 0.80;
+/// carries a large share — the strip's own distance-to-final falls **5.38** in the last previewed step
+/// alone (50.81 → 22.26 over the whole 20-frame strip), and the 20-step base-control lane back-loads
+/// the same way at 7.34 (60.53 → 20.49).
+const MIN_R_LAST_BASE: f64 = 0.81;
 /// Measured +0.942 on the 8-step 512² Turbo control lane — the BESPOKE-loop lane, and the highest of
 /// the six, because a pose-locked composition resolves earlier than a free one.
 const MIN_R_LAST_TURBO_CONTROL: f64 = 0.92;
