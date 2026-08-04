@@ -357,6 +357,36 @@ mod preview_advertising {
     /// `z_image::vae::AutoEncoderKL` as a Rust *type* is exactly the reasoning this table refuses to
     /// ground a reuse in. See `docs/migration/evidence/sc-16958-sd3-candle-preview.md`.
     ///
+    /// SANA (sc-16959) closes Tier 1 and contributes the two rows this table's "ids, not families"
+    /// rule was written for. `sana_1600m` and `sana_sprint_1600m` are one crate, two registered
+    /// descriptors, **two user-reachable lanes and two different shared sampler drivers** — the only
+    /// candle family in this epic that drives more than one:
+    ///
+    /// * `sana_1600m` reaches `candle_gen::run_flow_sampler` through `pipeline::denoise_cfg`
+    ///   (true-CFG flow-match Euler over a static shift-3.0 schedule, the whole curated epic-7114
+    ///   sampler menu advertised, so `heun` / `dpmpp_sde` exercise the multi-eval dedup on that one
+    ///   site);
+    /// * `sana_sprint_1600m` reaches `candle_gen::run_scm_sampler` through `pipeline::denoise_sprint`
+    ///   (CFG-free SCM / TrigFlow consistency, 1–4 steps, only the `"default"` sentinel advertised —
+    ///   the SCM loop is not a curated `Solver` at all).
+    ///
+    /// They also carry **two different fits**, and that is what makes the two rows load-bearing rather
+    /// than clerical. The two snapshots ship DC-AE autoencoders at an *identical* 1,249,044,836-byte
+    /// container size whose SHA-256s differ — `15a4b09e…d9d87f` (base) against `dfd991d1…4454bb`
+    /// (Sprint) — and each is byte-identical to the file the corresponding epic-16624 fit was measured
+    /// on. A tensor walk says exactly how they relate, and the answer is a shape none of this epic's
+    /// earlier stories showed: they **partially overlap**. 320 of 375 tensors are byte-identical,
+    /// including the *entire* 179-tensor encoder, and all 55 that differ are in the `decoder.` subtree
+    /// — Sprint's DC-AE 1.1 is a decoder-tail fine-tune of base's DC-AE 1.0. So this is **one latent
+    /// space with two decoders**, and since an RGB preview fit maps a latent to *decoded* pixels, one
+    /// fit still cannot serve both routes. Shipping one for both is the specific mistake sc-16959 was
+    /// written to avoid; `candle-gen-sana/src/preview.rs` pins that three ways and
+    /// `sana_base_and_sprint_are_two_independent_rows` pins it here.
+    ///
+    /// Sprint additionally needs a `1/σ_data` correction the flow cohort does not: `run_scm_sampler`
+    /// pre-scales its running latent by `σ_data` and hands the hook the scaled tensor. That is the
+    /// candle spelling of `mlx-gen-sana`'s `inverse_sigma_data` argument.
+    ///
     /// `instantid` is deliberately absent from *this* list and cannot be added: it registers no
     /// descriptor at all (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Three shipped tests
     /// hold that in place — the second half of
@@ -393,7 +423,14 @@ mod preview_advertising {
         "sd3_5_large",
         "sd3_5_large_turbo",
         "sd3_5_medium",
+        "sana_1600m",
+        "sana_sprint_1600m",
     ];
+
+    /// The two SANA rows above are asserted **individually** by
+    /// `sana_base_and_sprint_are_two_independent_rows`, because they are the one pair in this table
+    /// that must never be treated as one. See that test and `candle-gen-sana/src/preview.rs`.
+    const SANA_ROUTE_IDS: [&str; 2] = ["sana_1600m", "sana_sprint_1600m"];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
     /// re-measured: an RGB fit is a property of a VAE latent space, not of a backend.
@@ -783,7 +820,25 @@ mod preview_advertising {
             dir: "candle-gen-sana",
             register: candle_gen_sana::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16959's inventory, and the only row in this table whose two hooked sites are two
+            // DIFFERENT drivers: `pipeline.rs` holds one `run_flow_sampler` call (`denoise_cfg`, the
+            // `sana_1600m` lane) and one `run_scm_sampler` call (`denoise_sprint`, the
+            // `sana_sprint_1600m` lane). `hooked: 2` is therefore also the lane count — each
+            // registered descriptor has exactly one user-reachable txt2img lane, because both `load`
+            // functions refuse quantization, adapters and control / IP-adapter overlays outright, so
+            // the crate ships no img2img fork and no name-driven provider.
+            //
+            // No dark site: this crate has no trainer and no second denoise anywhere. No direct
+            // emission either — `preview.rs` carries only the two reused epic-16624 32-channel fits,
+            // the layout check, and the `1/σ_data` correction the SCM route's pre-scaled running
+            // latent needs; SANA's latent is already the `[1, C, h, w]` contract on both routes, with
+            // nothing to unpack and no frame axis to drop.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 2,
+                direct: 0,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-scail2",
@@ -2099,6 +2154,74 @@ mod preview_advertising {
             advertising_ids(),
             expected,
             "only providers with an actual PreviewSink denoise route may advertise support"
+        );
+    }
+
+    /// **The two SANA routes are two independent rows, asserted one at a time** (sc-16959).
+    ///
+    /// The bidirectional guard above is a set comparison, so it is satisfied by `sana_1600m` and
+    /// `sana_sprint_1600m` collectively; and `source_level_wiring_and_advertised_capability_agree…`
+    /// is satisfied by **either** id advertising, because both live in one crate — `advertised` only
+    /// has to be non-empty. Neither would notice one SANA route being dropped while the other kept
+    /// advertising, and that is precisely the mistake this story exists to avoid: the two routes run
+    /// different sampler drivers over different DC-AE autoencoders and carry different committed
+    /// fits, so one can never stand in for the other.
+    ///
+    /// So each is checked on its own terms here: present in the allowlist, present in the registry,
+    /// advertising, and registered by `candle-gen-sana` itself rather than by some other crate that
+    /// happened to claim the id. The crate's two hooked sites — one per driver — are pinned by the
+    /// route inventory above and by `candle-gen-sana/src/preview.rs`'s own source scan.
+    #[test]
+    fn sana_base_and_sprint_are_two_independent_rows() {
+        let sana = PROVIDER_CRATES
+            .iter()
+            .find(|provider| provider.dir == "candle-gen-sana")
+            .expect("candle-gen-sana must be in the wiring table");
+        let registered = ids_of(sana);
+        let advertising = advertising_ids();
+
+        for id in SANA_ROUTE_IDS {
+            assert!(
+                PREVIEW_ROUTE_IDS.contains(&id),
+                "{id} must be its OWN row in PREVIEW_ROUTE_IDS — the base flow route and the Sprint \
+                 SCM route are different drivers over different latent spaces and neither covers the \
+                 other"
+            );
+            assert!(
+                registered.iter().any(|registered| registered == id),
+                "{id} must be registered by candle-gen-sana itself, not merely named in a list"
+            );
+            assert!(
+                advertising.contains(id),
+                "{id} must advertise supports_preview on its own descriptor"
+            );
+        }
+        assert_eq!(
+            registered.len(),
+            SANA_ROUTE_IDS.len(),
+            "candle-gen-sana registers exactly the two routes this row accounts for: {registered:?}"
+        );
+
+        // And the crate really does drive BOTH shared samplers with a hook — one site each. A single
+        // hooked site would mean one of the two routes is dark while the other keeps both ids
+        // advertising, which is the exact shape the two rows above exist to make visible.
+        let wiring = scan(sana.dir);
+        let mut hooked: Vec<&str> = wiring
+            .sites
+            .iter()
+            .filter(|site| site.hooked)
+            .map(|site| site.driver)
+            .collect();
+        hooked.sort_unstable();
+        assert_eq!(
+            hooked,
+            vec!["run_flow_sampler", "run_scm_sampler"],
+            "candle-gen-sana must hook the flow driver (base) AND the SCM driver (Sprint); got \
+             {hooked:?}"
+        );
+        assert!(
+            wiring.sites.iter().all(|site| site.hooked),
+            "candle-gen-sana declares no dark site, so every sampler call it makes must be hooked"
         );
     }
 
