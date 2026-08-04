@@ -1750,14 +1750,21 @@ jobs:
   # `MOSS_AUDIO_TOKENIZER_SNAPSHOT` is new with this job: the codec became a passed-in component in
   # sc-13662, so the provider no longer self-fetches it and every test here fails without it.
   #
-  # Budget: PROVISIONAL, like every other family that has not completed a weekly run. All nine
-  # invocations below were measured `--release` on an M5 Max dev box against these exact pinned
-  # revisions — 816 s of test time total, of which the three whisper/CAMPPlus round-trip gates are
+  # Budget: PROVISIONAL, like every other family that has not completed a weekly run. sc-17250
+  # measured eight invocations `--release` on an M5 Max dev box against these exact pinned
+  # revisions — 720 s of test time total, of which the three whisper/CAMPPlus round-trip gates are
   # 630 s (asr_roundtrip 235 s, multi_turn_conversation 254 s, multi_turn_user_context 141 s); the
-  # six others are 3.99 / 6.04 / 18.1 / 23.3 / 38.6 / 95.6 s. The last is the sc-17263 chunked-encode
-  # gate — a 7.1 GB codec load, a single-shot `[1,20,3200,3200]` CPU attention, and three chunked
-  # encodes — and it is the one figure here measured as a RANGE (67-96 s over three runs) rather
-  # than a point; 95.6 s is the conservative end. 120 minutes is ~9x the total, to absorb a slower
+  # five others were 3.99 / 6.04 / 18.1 / 23.3 / 38.6 s. sc-17263 adds a ninth (the chunked-encode
+  # gate: a 7.1 GB codec load, a single-shot `[1,20,3200,3200]` CPU attention, three chunked
+  # encodes) at 67-106 s over five runs — call the lane ~830 s.
+  #
+  # Two caveats on those numbers, both pointing the same way. The codec cross-check's figure
+  # predates sc-17270 widening it to actually run the reference-parity arm, so it is a floor, not a
+  # current reading. And re-timing the five cheap arms on a dev box busy with other work gave
+  # 12.5 / 26.2 / 29.4 / 62.8 / 101.2 s — uniformly ~2.6-3x the sc-17250 figures, from contention
+  # alone. That is the honest spread a "measured on a dev box" number carries, and the reason these
+  # stay PROVISIONAL rather than being rewritten each time someone re-runs them.
+  # 120 minutes is ~8.7x the total, to absorb a slower
   # runner plus the cold `--release` build of the candle tree that `clean: true` forces every week.
   # Re-size from the first weekly that executes this lane (sc-17057's scope).
   candle-audio-moss-tts-realtime:
