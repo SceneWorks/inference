@@ -113,8 +113,12 @@ environment = ["FLUX_DEV_DIR"]
 #     `mlx-qwen-image-pid` job now runs on the schedule.
 # `test_residency_ab_is_operator_run_without_ci_model_dependencies` used to enforce the operator-run
 # decision by asserting the string FLUX_DEV_DIR never appears in real-weights.yml. That proxy was
-# only ever valid while the CUDA A/B was the sole consumer; it now gates the A/B directly instead
-# (no `residency-ab`, no `--features cuda`, neither `*_probed_generate_for_offload_ab` test).
+# only ever valid while the CUDA A/B was the sole consumer; it now gates the A/B directly instead:
+# no `residency-ab`, neither `*_probed_generate_for_offload_ab` test name, and neither operator
+# repository variable (`vars.FLUX_DEV_DIR` / `vars.QWEN_IMAGE_SNAPSHOT`, which hold Windows paths).
+# It does NOT ban `--features cuda` — real-weights.yml has 57 of those for the Windows lanes — so a
+# BLANKET `cargo test -p candle-gen-qwen-image --features cuda -- --ignored` would still conscript
+# the A/B without naming it. Name-selecting every CUDA step is what closes that, not this test.
 #
 # `FLUX_DEV_DIR` is deliberately NOT folded into the crate's own MLX_GEN_FLUX_DEV_SNAPSHOT, which
 # names the same snapshot for adapter/hyper/ip-adapter tests. That variable gates ~11 further
@@ -146,20 +150,30 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# 13 run in `mlx-qwen-image` on the schedule, 3 more in `mlx-qwen-image-pid`, 1 in the dispatch-only
-# `mlx-qwen-image-producers`. The rest are NOT covered, each for a recorded reason:
-#   * 24 golden-parity tests (adapter 9, e2e 7, img2img 6, text_encoder 2) read `tools/golden/`,
-#     which is gitignored by design and minted by the frozen `mflux` fork against the ~60 GB torch
-#     original. Needs a Mage-shaped operator seed bundle — sc-17503.
-#   * `perf.rs` x2 — they FAIL on real weights, and always have. sc-17284 ran them for the first
-#     time and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3
-#     (Edit) against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip
-#     shape was removed in the same pass, so they now fail loudly instead of reporting 1 passed.
+# The 45 account for exactly, and the arithmetic is the point — 21 + 19 + 5 = 45:
+#
+# WIRED, 19: 15 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2), 3 in
+# `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing on
+# nax-macos 2026-08-04.
+#
+# BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
+# `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
+# ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
+# adapter_real_weights": three of that file's tests resolve no golden at all.
+#
+# EXCLUDED WITH A MEASUREMENT, 5. A lane that is red every week is ignored within a month
+# (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
+#   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
+#     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
+#     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
+#     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
 #   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
+#   * `lightning_loras_apply_cleanly` x1 — FAILS: asserts 840 per-block modules, and the pinned
+#     lightx2v file carries 12 of 14 per block (no img/txt modulation) so it applies 720 with zero
+#     unmatched. Golden-free, so it joins the wired adapter step the moment sc-17518 settles it.
 #   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
 #     exist in no repository and on no Hub.
-# A lane that is red every week is ignored within a month (sc-16981); a failing test is recorded
-# here with its measurement and its story instead of being wired red or quietly dropped.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
 revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
@@ -198,6 +212,13 @@ expected_files = [
 # q8 ONLY, and that is not a tuning choice: this repo's `bf16/` tier is metadata-only (~31 MB of
 # configs and tokenizer files, no `vae/`, no transformer shards), so pointing the test at it fails
 # to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
+#
+# WHAT "WIRED" DOES NOT MEAN HERE. `QWEN_IMAGE_EDIT_SNAPSHOT` also gates 19 tests this lane does not
+# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7) — plus one arm of
+# `perf.rs`. The gate is per-variable, so this row now reads as covered while those 19 still execute
+# nowhere; that is the same hazard recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and
+# it is accepted here rather than avoided because the sequential-residency Edit arm genuinely needs
+# this artifact. The 19 are tracked in sc-17519; do not read this row as evidence they run.
 key = "qwen-image-edit-2511-mlx"
 repository = "SceneWorks/qwen-image-edit-2511-mlx"
 revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"

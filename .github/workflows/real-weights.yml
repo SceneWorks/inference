@@ -9,9 +9,9 @@ name: Real-weight validation
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
 #   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos
-#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~168 GiB  nax-macos
+#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
-#               FLUX.1-dev  (sc-17284)
+#               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
 #   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
 #   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
 #   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
@@ -32,8 +32,14 @@ name: Real-weight validation
 # rebalancing knob: move it to shift ~83 min of wall clock without moving a single stored byte.
 # It does need the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
 #
-# The sc-17284 Qwen/FLUX set is the largest row here and it moved ZERO bytes onto the box: those
-# repos were already resident on nax-macos, and they are a large part of why it is at 98% (sc-17271).
+# The sc-17284 Qwen/FLUX set is the largest row here. It transferred almost nothing onto the box —
+# all of it but the two ~0.85 GB Lightning LoRAs was already resident on nax-macos, and it is a large
+# part of why that box is at 98% (sc-17271). But "already there" is not "free": these bytes were
+# opportunistic app/dev cache that could be reclaimed, and wiring them makes them CI-REQUIRED. The
+# 31.4 GiB FLUX.1-dev snapshot in particular changes status here, because `flux-1-dev` gains
+# `media-macos`. Measured 2026-08-04 with `du -sh` over the nine `models--*` repo dirs; the two jobs
+# together consume ~131 GiB of that (the `q4` Qwen tier is stored but no wired test selects it).
+#
 # It shares `rw-mage` rather than taking an `rw-qwen` of its own only because a label no runner
 # carries queues silently (see below) — the set has no oracle-bundle pin, so splitting it out is a
 # one-line change here plus an org-settings change the moment the budget wants it on the other box.
@@ -1193,10 +1199,11 @@ jobs:
     # MEASURED 2026-08-04 on an M5 Max with the weight set already resident, per test:
     #   control        3 + 3 + 3 + 15 =  24s      sampler       31 + 30       =  61s
     #   sequential   102 + 101 + 116 + 114 = 433s block residency             = 173s
-    #   lightning     23 + 21        =  44s       TOTAL COMPUTE               = 735s (12.3 min)
+    #   lightning     23 + 21        =  44s       adapter (golden-free) 0 + 1 =   1s
+    #                                             TOTAL COMPUTE               = 736s (12.3 min)
     # The cap is 90, not ~25, because only the 12 minutes above is compute: the rest is the
-    # first-run materialization budget for ~121 GiB of tiers on a box that does not already hold
-    # them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
+    # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
+    # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
     timeout-minutes: 90
     env:
@@ -1255,12 +1262,26 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-mlx --snapshot "$QWEN_IMAGE_MLX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-edit-2511-mlx --snapshot "$QWEN_IMAGE_EDIT_MLX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-2512-fun-controlnet-union --snapshot "$QWEN_CONTROL_UNION_SNAPSHOT"
-          # The revision comes from the manifest, never from a second copy written here.
+          # The Lightning revisions come from the manifest, never from a second copy written here.
+          # Assigned into a variable and shape-checked FIRST: `$(revision …)` interpolated straight
+          # into an argument is a command substitution, and `set -e` does not fire on those — a
+          # failing helper would silently produce `…/snapshots/` with an empty revision. Same
+          # `^[0-9a-f]{40}$` guard the Mage oracle key step above uses, for the same reason.
           revision() { python3.12 -c "import sys,tomllib,pathlib;m=tomllib.loads(pathlib.Path('release/real-weight-models.toml').read_text());print(next(x['revision'] for x in m['models'] if x['key']==sys.argv[1]))" "$1"; }
-          echo "QWEN_LIGHTNING_SNAPSHOT=$MLX_GEN_MODELS_ROOT/models--lightx2v--Qwen-Image-Lightning/snapshots/$(revision qwen-image-lightning)" >> "$GITHUB_ENV"
-          echo "QWEN_EDIT_LIGHTNING_SNAPSHOT=$MLX_GEN_MODELS_ROOT/models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots/$(revision qwen-image-edit-2511-lightning)" >> "$GITHUB_ENV"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-lightning --snapshot "$MLX_GEN_MODELS_ROOT/models--lightx2v--Qwen-Image-Lightning/snapshots/$(revision qwen-image-lightning)"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-edit-2511-lightning --snapshot "$MLX_GEN_MODELS_ROOT/models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots/$(revision qwen-image-edit-2511-lightning)"
+          for key in qwen-image-lightning qwen-image-edit-2511-lightning; do
+            rev="$(revision "$key")"
+            if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "manifest revision for $key is missing or malformed: '$rev'" >&2
+              exit 1
+            fi
+            case "$key" in
+              qwen-image-lightning) var=QWEN_LIGHTNING_SNAPSHOT; repo=models--lightx2v--Qwen-Image-Lightning ;;
+              *)                    var=QWEN_EDIT_LIGHTNING_SNAPSHOT; repo=models--lightx2v--Qwen-Image-Edit-2511-Lightning ;;
+            esac
+            dir="$MLX_GEN_MODELS_ROOT/$repo/snapshots/$rev"
+            echo "$var=$dir" >> "$GITHUB_ENV"
+            PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model "$key" --snapshot "$dir"
+          done
       # EVERY step below selects by NAME with `--exact` and asserts the run count. All three halves of
       # that are load-bearing and were verified by direct execution for this story:
       #   1. `--exact` goes AFTER the `--`. It is a libtest flag; cargo rejects it in its own
@@ -1270,9 +1291,12 @@ jobs:
       #      nothing. Only the count assertion catches that (sc-17250).
       #   3. A run count still cannot see a test that reads an optional env var and returns early:
       #      that reports "1 passed" in 0.00s. Every test selected here was read for that shape
-      #      first. None of them has it — each panics on a missing variable. The two `perf.rs`
-      #      tests DO have it (they `eprintln!("skip: ...")` and `return` when the snapshot is
-      #      absent) and are therefore NOT in this lane; see the manifest note.
+      #      first. None of them has it — each panics on a missing variable. `perf.rs` DID have it
+      #      (`eprintln!("skip: ...")` + `return`); this commit removed that, so those two tests now
+      #      fail loudly. They are still not in this lane, for a different reason: they FAIL on real
+      #      weights and always have (sc-17513). Nor is `fit_preview_rgb_factors` (sc-17515) or
+      #      `lightning_loras_apply_cleanly` (sc-17518). A lane that is red every week is ignored
+      #      within a month; each exclusion is recorded with its measurement in the manifest.
       - name: Run Qwen-Image control-branch gates
         run: |
           set -o pipefail
@@ -1368,14 +1392,41 @@ jobs:
           }
           run_one lightning_render_is_coherent
           run_one edit_lightning_render_is_coherent
+      # Two of `adapter_real_weights.rs`'s nine tests resolve NO golden — they only need the real
+      # 60-block tree — so they do not wait on the sc-17503 oracle bundle the other six do.
+      # `routing_map_covers_full_fork_surface` proves the host LoRA map reaches all 60 x 14 fork
+      # targets and refuses the paths it should; `kohya_matches_peft_on_real_tree` proves the two
+      # adapter naming conventions produce byte-identical results across all 840 modules.
+      #
+      # `lightning_loras_apply_cleanly` is the third golden-free one and is NOT here: it asserts
+      # `applied == 840`, and the pinned `Qwen-Image-Lightning-8steps-V1.1-bf16` file carries only
+      # 12 of the 14 per-block modules (no img/txt modulation), so it applies 720 with zero
+      # unmatched. sc-17518.
+      - name: Run Qwen-Image adapter-surface gates (golden-free)
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
+              cargo test --locked --release -p mlx-gen-qwen-image \
+              --test adapter_real_weights \
+              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one routing_map_covers_full_fork_surface
+          run_one kohya_matches_peft_on_real_tree
 
   # sc-17284 — the integrated PiD (progressive-in-decoder) super-resolution decode seam, for BOTH
   # engines that have one. Split from the job above because it is the only place `FLUX_DEV_DIR` and
   # the Gemma conditioner are needed, and a 31 GiB FLUX materialization should be able to fail
   # without taking the Qwen regression gates with it.
   #
-  # Each of these five tests falls back to a GITIGNORED `tools/golden/pid/*.safetensors` when its
-  # checkpoint variable is unset. No CI checkout has those files, so the fallback is a guaranteed
+  # Four of these five tests fall back to a GITIGNORED `tools/golden/pid/*.safetensors` when its
+  # checkpoint variable is unset (`use_pid_without_loaded_pid_errors` never resolves one — it is
+  # the negative arm). No CI checkout has those files, so the fallback is a guaranteed
   # failure, not a silent skip — but it is also why this lane must set PID_QWEN_SAFETENSORS and
   # PID_FLUX_SAFETENSORS explicitly at the published re-hosts rather than relying on any default.
   mlx-qwen-image-pid:
@@ -1522,6 +1573,16 @@ jobs:
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
           fi
+      # The whole point of a producer lane. `tools/golden/pid/` is gitignored, so without this the
+      # next checkout's clean deletes the output and the run has produced nothing anyone can read —
+      # the same "surrender your evidence" contract `mlx-krea-realtime-s18-sweep` is held to.
+      - name: Upload the Run-B latents
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qwen-image-pid-runb-latents-${{ github.sha }}
+          path: crates/media/mlx-gen/tools/golden/pid/runb_*.safetensors
+          if-no-files-found: error
 
   # sc-8446 (epic 8431) — the FIRST real-weight video lane. Kept a separate job from `mlx-media`
   # because that one is entirely Mage-Flow oracle machinery (a pinned reference Python, a

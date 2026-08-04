@@ -36,25 +36,14 @@ use mlx_rs::{random, Array, Dtype};
 /// `eprintln!("skip: …")` + `return`. That is a FALSE GREEN, not a skip: libtest reports
 /// `test result: ok. 1 passed` in 0.00s, so neither a `--exact` selection nor a run-count
 /// assertion — the two things that catch a renamed or filtered-out test — can see that the gate
-/// never ran. Every sibling real-weight test in this crate panics instead, with the epic-13657
-/// message; this one is now the same. If you want to skip it, do not run it.
-fn snapshot(env: &str, repo: &str) -> PathBuf {
-    if let Ok(p) = std::env::var(env) {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("MLX_GEN_MODELS_ROOT").unwrap_or_else(|_| panic!("set {env} to the required snapshot dir, or MLX_GEN_MODELS_ROOT to the explicit models root; inference never self-fetches or derives a cache location (epic 13657)"));
-    let snaps = PathBuf::from(home).join(repo).join("snapshots");
-    std::fs::read_dir(&snaps)
-        .unwrap_or_else(|e| panic!("read {}: {e}; set {env} instead", snaps.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .unwrap_or_else(|| {
-            panic!(
-                "no snapshot directory under {}; set {env} instead",
-                snaps.display()
-            )
-        })
+/// never ran. If you want to skip it, do not run it.
+///
+/// The HF-cache fallback went with it. It resolved a repository ROOT, but `load_transformer` needs
+/// a TIER directory (`…/bf16`, `…/q8`) of the SceneWorks re-hosts these engines actually load, so
+/// the fallback could never have succeeded — and deriving a cache location is what epic 13657
+/// forbids anyway.
+fn snapshot(env: &str) -> PathBuf {
+    PathBuf::from(std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the required snapshot TIER dir; inference never self-fetches or derives a cache location (epic 13657)")))
 }
 
 fn env_i32(var: &str, default: i32) -> i32 {
@@ -144,12 +133,9 @@ fn inputs(img_seq: i32, txt_seq: i32) -> (Array, Array) {
 }
 
 #[test]
-#[ignore = "needs real Qwen-Image weights (MLX_GEN_QWEN_SNAPSHOT or HF cache)"]
+#[ignore = "needs real Qwen-Image weights (MLX_GEN_QWEN_SNAPSHOT tier dir)"]
 fn qwen_t2i_per_step_compiled_vs_eager() {
-    let snap = snapshot(
-        "MLX_GEN_QWEN_SNAPSHOT",
-        "models--SceneWorks--qwen-image-mlx",
-    );
+    let snap = snapshot("MLX_GEN_QWEN_SNAPSHOT");
     let size = env_i32("QWEN_PERF_SIZE", 1024);
     let txt_seq = env_i32("QWEN_PERF_TXT", 128);
     let lat = size / 16; // patched grid (VAE/8 then 2×2 patch)
@@ -168,12 +154,9 @@ fn qwen_t2i_per_step_compiled_vs_eager() {
 }
 
 #[test]
-#[ignore = "needs real Qwen-Image-Edit-2511 weights (QWEN_IMAGE_EDIT_SNAPSHOT or HF cache)"]
+#[ignore = "needs real Qwen-Image-Edit-2511 weights (QWEN_IMAGE_EDIT_SNAPSHOT tier dir)"]
 fn qwen_edit_per_step_compiled_vs_eager() {
-    let snap = snapshot(
-        "QWEN_IMAGE_EDIT_SNAPSHOT",
-        "models--SceneWorks--qwen-image-edit-2511-mlx",
-    );
+    let snap = snapshot("QWEN_IMAGE_EDIT_SNAPSHOT");
     let size = env_i32("QWEN_PERF_SIZE", 1024);
     let txt_seq = env_i32("QWEN_PERF_TXT", 128);
     let lat = (size / 16) as usize; // noise grid; one same-size reference (cond_grids=[(lat,lat)])
