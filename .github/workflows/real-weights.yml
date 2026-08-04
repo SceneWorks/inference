@@ -1708,20 +1708,23 @@ jobs:
   # sc-13334 streaming-TTS AR brain (~4.4 GB) plus the sc-13392 MOSS-Audio-Tokenizer RLFQ codec
   # (~7.1 GB, the figure the crate and the model manifest both use; `du` reports it as 6.6 GiB).
   # Both snapshots sat on a runner for a year with NO workflow running the eleven
-  # `#[ignore]` tests they back. EIGHT of those eleven are wired below. Of the three that are not:
-  # the two voice-clone tests hard-require `MOSS_VOICECLONE_REF`, a 24 kHz f32-LE reference clip that
-  # exists in no repo, on no Hub, and in no provisioning script (sc-17264); and the chunked-encode
-  # test fails on a machine-sensitive memory assertion (sc-17263, at its exclusion below). Nothing
-  # here is wired to a path that would not resolve or to an assertion already known to be red.
+  # `#[ignore]` tests they back. NINE of those eleven are wired below. The two that are not are the
+  # voice-clone pair, which hard-require `MOSS_VOICECLONE_REF` — a 24 kHz f32-LE reference clip that
+  # exists in no repo, on no Hub, and in no provisioning script (sc-17264). The chunked-encode test
+  # was the third exclusion until sc-17263 fixed its machine-sensitive memory probe; it is wired
+  # below. Nothing here is wired to a path that would not resolve or to an assertion known to be red.
   #
   # `MOSS_AUDIO_TOKENIZER_SNAPSHOT` is new with this job: the codec became a passed-in component in
   # sc-13662, so the provider no longer self-fetches it and every test here fails without it.
   #
-  # Budget: PROVISIONAL, like every other family that has not completed a weekly run. All eight
+  # Budget: PROVISIONAL, like every other family that has not completed a weekly run. All nine
   # invocations below were measured `--release` on an M5 Max dev box against these exact pinned
-  # revisions — 720 s of test time total, of which the three whisper/CAMPPlus round-trip gates are
+  # revisions — 816 s of test time total, of which the three whisper/CAMPPlus round-trip gates are
   # 630 s (asr_roundtrip 235 s, multi_turn_conversation 254 s, multi_turn_user_context 141 s); the
-  # five others are 3.99 / 6.04 / 18.1 / 23.3 / 38.6 s. 120 minutes is ~10x that, to absorb a slower
+  # six others are 3.99 / 6.04 / 18.1 / 23.3 / 38.6 / 95.6 s. The last is the sc-17263 chunked-encode
+  # gate — a 7.1 GB codec load, a single-shot `[1,20,3200,3200]` CPU attention, and three chunked
+  # encodes — and it is the one figure here measured as a RANGE (67-96 s over three runs) rather
+  # than a point; 95.6 s is the conservative end. 120 minutes is ~9x the total, to absorb a slower
   # runner plus the cold `--release` build of the candle tree that `clean: true` forces every week.
   # Re-size from the first weekly that executes this lane (sc-17057's scope).
   candle-audio-moss-tts-realtime:
@@ -1797,13 +1800,21 @@ jobs:
           # "SKIPPED", and still reports `1 passed`. The run-count assertion CANNOT see that; it is
           # the same false-green shape sc-17250 fixed in joycaption.rs, one level further in.
           run_one moss_audio_codec_encode_roundtrip_and_reference
-          # NOT WIRED: moss_audio_codec_chunked_encode_matches_single_shot (sc-14181). Its
-          # correctness half is perfect — chunked encode reproduces single-shot codes exactly, 0/6400
-          # differing at both chunk durations, on all four dev-box runs. Its SECOND half asserts a
-          # transient-RSS gap > 200 MB, measured by a 5 ms `ps` sampler; that undercounts a spike that
-          # a faster box makes shorter, and it reproducibly measures ~165-175 MB here (single-shot
-          # +290/+291/+294 MB vs chunked +115/+125/+116 MB over three runs) — a deterministic FAIL.
-          # Re-tuning an sc-14181 memory gate to make this lane green is not this story's call: sc-17263.
+          # The sc-14181 DoD: chunked/streaming encode reproduces single-shot codes exactly (0/6400
+          # differing at both chunk durations) AND bounds the first stage's quadratic attention.
+          # Was unwired while its memory half sampled `ps -o rss=` on a 5 ms timer — a wall-clock
+          # proxy for a transient, so a faster box caught less of the spike and the gate's verdict
+          # tracked machine speed (it read 291 MB of a 1669 MB spike here and failed a >200 MB bar).
+          # sc-17263 moved that half to an allocator high-water mark: +68 MB chunked vs +1669 MB
+          # single-shot, and it goes RED when `forward_chunked` is degraded to the unbounded
+          # `forward` (which the identity half alone does NOT catch). The bounds carry deliberate
+          # headroom over those dev-box figures — this runner is not that box, and rayon scratch
+          # scales with core count.
+          # KEEP THIS LANE FEATURELESS. The memory half counts HEAP, so it self-skips (printing a
+          # reason, but still `1 passed` — the run-count grep cannot see it) whenever the codec
+          # loads onto a non-CPU device. Adding `--features metal` here would keep this green while
+          # silently deleting the memory coverage entirely; the identity half would still run.
+          run_one moss_audio_codec_chunked_encode_matches_single_shot
           # AR stage: a fixed text + seed emits >= 2 real 16-codebook RVQ frames, every token in
           # [0, 1027), deterministic run-to-run and non-degenerate. A broken backbone / weight mapping /
           # RoPE / multi-embedding sum / local-transformer head would fail here.

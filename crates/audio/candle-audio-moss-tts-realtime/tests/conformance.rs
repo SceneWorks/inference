@@ -25,8 +25,13 @@
 //!
 //! `#[ignore]`d and snapshot-gated like every audio family's real-weight tests:
 //! ```text
-//! cargo test --locked -p candle-audio-moss-tts-realtime --test conformance -- --ignored --nocapture
+//! cargo test --locked -p candle-audio-moss-tts-realtime --test conformance -- \
+//!     --ignored --nocapture --test-threads=1
 //! ```
+//! `--test-threads=1` is **required**, not tidiness: this binary installs a process-wide
+//! [`TrackingAlloc`] global allocator (sc-17263) and
+//! [`moss_audio_codec_chunked_encode_matches_single_shot`] measures heap high-water marks through
+//! it, so a test running concurrently in the same process would land in its measurement window.
 //! Set `MOSS_TTS_REALTIME_SNAPSHOT` to the AR snapshot dir (~4.66 GB, holding `config.json`,
 //! `model.safetensors`, `tokenizer.json`) — **required**, a passed-in path: inference never
 //! self-fetches or derives a cache location (epic 13657). The MOSS-Audio-Tokenizer codec (~7.1 GB) is
@@ -737,43 +742,137 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
 // ~100 fps, so a single-shot encode materializes a `[1, H, T, T]` attention that is quadratic in the
 // clip length (a 60 s clip → T ≈ 6000 → multi-GB per layer). The streaming path bounds that to
 // `[1, H, chunk, chunk + context]` per layer. This gate asserts the two paths emit **identical
-// codes** on a real ≥ 30 s clip, and that the streaming path's peak RSS sits well below single-shot's.
+// codes** on a real ≥ 30 s clip, and that the streaming path's peak heap sits well below
+// single-shot's — measured at the allocator, not by sampling RSS on a timer (sc-17263).
 // ---------------------------------------------------------------------------------------------
 
-/// Current resident-set size of this process, in bytes, via `ps -o rss=` (KiB on both macOS and
-/// Linux). Unlike `getrusage`'s `ru_maxrss` — a monotonic high-water mark the 7 GB codec load already
-/// pins far above any encode transient — this reads the *instantaneous* RSS, so a sampler can catch
-/// the transient attention spike. `0` if the probe fails (the memory assertion then no-ops).
-fn current_rss_bytes() -> u64 {
-    std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|kib| kib * 1024)
-        .unwrap_or(0)
+/// One `AtomicU64` on its own cache line. Every allocation in the process touches both counters
+/// below, from whatever rayon worker candle's gemm is using; packed adjacently they would share a
+/// line and turn each allocation into a false-sharing round trip. 128 B is Apple Silicon's line
+/// size (and a safe over-estimate of x86's 64 B).
+#[repr(align(128))]
+struct PaddedCounter(std::sync::atomic::AtomicU64);
+
+/// Live heap bytes currently handed out by [`TrackingAlloc`], and a resettable high-water mark of
+/// that same quantity. `PEAK` is only ever raised by the allocator and re-armed by
+/// [`with_peak_alloc`]; both are plain byte counts, meaningful only relative to the base captured
+/// at the start of a measurement window.
+static LIVE_BYTES: PaddedCounter = PaddedCounter(std::sync::atomic::AtomicU64::new(0));
+static PEAK_BYTES: PaddedCounter = PaddedCounter(std::sync::atomic::AtomicU64::new(0));
+
+/// A `System`-delegating global allocator that tracks in-flight heap bytes and their high-water
+/// mark (sc-17263).
+///
+/// This replaces the previous probe — `ps -o rss=` sampled on a 5 ms timer — which measured a
+/// *transient* with a wall-clock sampler: the faster the box, the shorter the quadratic-attention
+/// burst, the fewer samples landed inside it, and the further the measured peak fell below the true
+/// one. That made the gate's verdict a function of machine speed (it read ~291 MB of a ~1.6 GB
+/// spike on an M5 Max and failed a bound tuned elsewhere). Counting at the allocator is
+/// event-driven, so it observes every byte regardless of how briefly it is held.
+///
+/// **Precision.** Exact for `alloc`/`alloc_zeroed`/`dealloc`, in the sense that every byte the
+/// caller *requested* is counted — not the size class the allocator actually reserved, so the true
+/// footprint is a little larger than the number reported. `realloc` is counted as a delta, so a
+/// *relocating* grow (malloc-new + copy + free-old) undercounts the window in which both blocks are
+/// live. Neither approximation is load-bearing here: the quantity under test is one multi-hundred-MB
+/// `Tensor` allocation, and the bounds below clear the error by orders of magnitude.
+///
+/// **Cost to the rest of the binary.** Installing this is process-wide, so the other real-weight
+/// tests here pay two relaxed atomic RMWs per allocation. A/B'd on the heaviest of them
+/// (`moss_tts_realtime_asr_roundtrip_fidelity`, a whisper round-trip): 517 s / 311 s installed vs
+/// 327 s / 361 s not installed — no measurable penalty, and the installed arm was not the slower
+/// one. Run-to-run spread on a loaded box (~60%) is far wider than any effect here, so read that as
+/// ruling out a large regression, not as a precise overhead figure.
+///
+/// It measures the right thing here because candle's CPU tensor storage is a `Vec<T>`
+/// (`cpu_backend/mod.rs`), so the first stage's `[1, H, T, T]` attention is a single
+/// global-allocator request. Note the codec's ~7.1 GB of weights are **not** excluded by being
+/// mmapped: `VarBuilder::from_mmaped_safetensors` copies each tensor onto the Rust heap on the way
+/// in (`convert_slice` → `Tensor::from_slice` → `to_cpu_storage` → `data.to_vec()`), so they sit in
+/// `LIVE_BYTES` too. What isolates the transient is [`with_peak_alloc`] subtracting the resting
+/// total — which is why the warm-up call in the test below is load-bearing, not hygiene.
+struct TrackingAlloc;
+
+impl TrackingAlloc {
+    /// Add `n` bytes to the live count and raise the high-water mark to match.
+    fn record_alloc(n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if n == 0 {
+            return;
+        }
+        let live = LIVE_BYTES.0.fetch_add(n as u64, Relaxed) + n as u64;
+        PEAK_BYTES.0.fetch_max(live, Relaxed);
+    }
 }
 
-/// Run `f` while a background thread samples [`current_rss_bytes`] every few ms, and return
-/// `(result, peak_rss_during_f)`. Used to measure each encode path's transient memory spike.
-fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
-    let stop = Arc::new(AtomicBool::new(false));
-    let peak = Arc::new(AtomicU64::new(0));
-    let (s, p) = (Arc::clone(&stop), Arc::clone(&peak));
-    let sampler = std::thread::spawn(move || {
-        while !s.load(Ordering::Relaxed) {
-            p.fetch_max(current_rss_bytes(), Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+// SAFETY: every arm delegates to `System` (itself a valid `GlobalAlloc`) with the caller's original
+// pointer/layout contract untouched, and only adds relaxed atomic bookkeeping around it. The
+// counters are advisory-only — no allocation decision reads them — so a torn or reordered count can
+// never affect memory safety.
+unsafe impl std::alloc::GlobalAlloc for TrackingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = std::alloc::System.alloc(layout);
+        if !p.is_null() {
+            Self::record_alloc(layout.size());
         }
-    });
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = std::alloc::System.alloc_zeroed(layout);
+        if !p.is_null() {
+            Self::record_alloc(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        LIVE_BYTES
+            .0
+            .fetch_sub(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        std::alloc::System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let p = std::alloc::System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            // Only the delta moves; a grow can set a new peak, a shrink never can.
+            match new_size.checked_sub(layout.size()) {
+                Some(grew) => Self::record_alloc(grew),
+                None => {
+                    LIVE_BYTES.0.fetch_sub(
+                        (layout.size() - new_size) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+        p
+    }
+}
+
+/// Installed for this **test binary only** — `tests/conformance.rs` is its own crate root, so the
+/// shipping library and its consumers keep the default allocator.
+#[global_allocator]
+static ALLOC: TrackingAlloc = TrackingAlloc;
+
+/// Run `f` and return `(result, peak_heap_bytes_above_the_pre-call_live_total)` — the transient this
+/// call added, with the already-resident heap (weights included) subtracted out.
+///
+/// Measured process-wide, so a *concurrently running* test in the same binary would add noise: the
+/// real-weight harness selects one test at a time (`--exact`) and the module doc requires
+/// `--test-threads=1`. The two encode paths are measured back-to-back on the same thread, and the
+/// ordering here rests on that same-thread program order — not on the `Relaxed` counter updates,
+/// which deliberately claim no cross-thread happens-before. Allocations made by rayon workers
+/// candle has already fenced into the call are counted; anything genuinely concurrent is noise the
+/// bounds below are sized to absorb.
+fn with_peak_alloc<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = LIVE_BYTES.0.load(Relaxed);
+    PEAK_BYTES.0.store(base, Relaxed);
     let out = f();
-    peak.fetch_max(current_rss_bytes(), Ordering::Relaxed);
-    stop.store(true, Ordering::Relaxed);
-    sampler.join().expect("rss sampler thread");
-    (out, peak.load(Ordering::Relaxed))
+    let peak = PEAK_BYTES.0.load(Relaxed);
+    (out, peak.saturating_sub(base))
 }
 
 /// Total number of differing codes between two `frames[T][nq]` grids (plus any length gap), for the
@@ -797,7 +896,7 @@ fn count_code_mismatches(a: &[Vec<u32>], b: &[Vec<u32>]) -> usize {
 /// feature) — see the `codec::tests::chunked_stage_matches_single_shot` unit gate for the stage-level
 /// equivalence proof this end-to-end test complements.
 #[test]
-#[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture"]
+#[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture --test-threads=1 (the heap probe is process-wide)"]
 fn moss_audio_codec_chunked_encode_matches_single_shot() {
     use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
     let codec = MossAudioCodec::load(&codec_dir(), 16).expect("load codec");
@@ -824,23 +923,30 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
         "clip must be ≥ 30 s to exercise the bound (got {secs:.1}s)"
     );
 
-    // Warm the lazy encoder half (mmap + build) on a short slice so the memory probe below measures
-    // the analysis attention, not the one-time weight fault-in.
+    // Warm the lazy encoder half on a short slice. This is **load-bearing for the measurement**, not
+    // hygiene: `from_mmaped_safetensors` copies every weight onto the Rust heap, so building the
+    // encoder half allocates GBs through the probe. Doing it here folds that into the resting total
+    // `with_peak_alloc` subtracts, leaving the windows below measuring analysis attention alone.
     let warm_len = 48_000.min(clip.len());
     let _ = codec
         .encode_chunked(&clip[..warm_len], moss::codec::SAMPLE_RATE, 10.0)
         .expect("warm encoder half");
 
-    // Sample the instantaneous RSS spike each path adds above its immediately-preceding resting RSS,
-    // so the transient attention allocation is isolated from the (huge, already-resident) model.
-    let rest_chunk = current_rss_bytes();
-    let (chunked_small, peak_chunk) = with_peak_rss(|| {
+    // Measure the heap high-water mark each path adds above the already-resident total, so the
+    // transient attention allocation is isolated from the (huge, heap-resident) model. The half-clip
+    // chunked window is measured too: it is what turns "peak memory is independent of clip length"
+    // from an unbacked claim in a comment into something this test actually observes.
+    let (_, chunk_spike_half) = with_peak_alloc(|| {
+        codec
+            .encode_chunked(&clip[..clip.len() / 2], moss::codec::SAMPLE_RATE, 1.5)
+            .expect("chunked encode (1.5 s window, half clip)")
+    });
+    let (chunked_small, chunk_spike) = with_peak_alloc(|| {
         codec
             .encode_chunked(&clip, moss::codec::SAMPLE_RATE, 1.5)
             .expect("chunked encode (1.5 s window)")
     });
-    let rest_single = current_rss_bytes();
-    let (single, peak_single) = with_peak_rss(|| {
+    let (single, single_spike) = with_peak_alloc(|| {
         codec
             .encode_single_shot(&clip, moss::codec::SAMPLE_RATE)
             .expect("single-shot encode")
@@ -879,23 +985,77 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
 
     // (2) Memory bound: single-shot's quadratic first-stage attention spikes materially above the
     // bounded streaming path. For this clip the first stage is ~[1,20,3200,3200] f32 ≈ 780 MB/layer
-    // single-shot vs the chunked ~[1,20,~150,~1150] ≈ 55 MB — a several-hundred-MB gap.
-    let chunk_spike = peak_chunk.saturating_sub(rest_chunk);
-    let single_spike = peak_single.saturating_sub(rest_single);
+    // single-shot — scores plus the softmax over them, so ~1.6 GB in flight — vs the chunked
+    // ~[1,20,~150,~1150]. Measured: +1669 MB vs +68 MB, a ~24x gap, byte-identical run to run.
+    //
+    // Four bounds. (a) alone is not enough: it goes green whenever the two paths differ by 200 MB,
+    // including the case this gate most needs to catch — *both* arms expensive (chunked 1.0 GB,
+    // single-shot 1.3 GB) because the streaming window stopped bounding anything. So:
+    //   (a) the gap — sc-14181's original >200 MB bar, unchanged;
+    //   (b) the ratio — scale-free, so proportional drift on another machine does not erode it;
+    //   (c) an absolute ceiling on the chunked arm — catches "both expensive", and stays meaningful
+    //       even if the single-shot arm ever stops being quadratic;
+    //   (d) growth across clip length — the streaming claim itself, measured rather than asserted.
+    //
+    // Heap-counted, so this arm needs the CPU device: on `metal`/`cuda` the stage tensors are device
+    // buffers the global allocator never sees and both paths would read as ~nothing. Keyed on the
+    // device the codec actually loaded onto (`candle_audio::default_device`, exactly what
+    // `MossAudioCodec::load` calls) rather than on this crate's feature flags, which are only a
+    // proxy for it. The identity half above has already run either way.
+    let device_is_cpu = moss::candle_audio::default_device()
+        .expect("resolve the codec's device")
+        .is_cpu();
+    if !device_is_cpu {
+        println!(
+            "sc-14181 memory bound SKIPPED — the codec loaded onto a non-CPU device, whose stage \
+             tensors are device buffers, not heap; run this gate on the default (CPU) build"
+        );
+        return;
+    }
     println!(
-        "sc-14181 transient RSS spike above resting: chunked(1.5s) +{:.0} MB, single-shot +{:.0} MB",
+        "sc-14181 transient heap high-water above resting: chunked(1.5s) +{:.0} MB, single-shot \
+         +{:.0} MB (ratio {:.1}x); chunked on the half clip +{:.0} MB",
         chunk_spike as f64 / 1e6,
         single_spike as f64 / 1e6,
+        single_spike as f64 / chunk_spike.max(1) as f64,
+        chunk_spike_half as f64 / 1e6,
     );
-    if peak_chunk > 0 && peak_single > 0 {
-        assert!(
-            single_spike > chunk_spike + 200_000_000,
-            "single-shot's transient RSS spike (+{} MB) should exceed the chunked path's (+{} MB) by \
-             >200 MB — the streaming path is not bounding the first-stage attention",
-            single_spike / 1_000_000,
-            chunk_spike / 1_000_000,
-        );
-    }
+    assert!(
+        single_spike > chunk_spike + 200_000_000,
+        "single-shot's transient heap spike (+{} MB) should exceed the chunked path's (+{} MB) by \
+         >200 MB — the streaming path is not bounding the first-stage attention",
+        single_spike / 1_000_000,
+        chunk_spike / 1_000_000,
+    );
+    assert!(
+        single_spike >= chunk_spike.saturating_mul(8),
+        "single-shot's transient heap spike (+{} MB) should be at least 8x the chunked path's \
+         (+{} MB) — the streaming window is not bounding attention the way `forward_chunked` claims",
+        single_spike / 1_000_000,
+        chunk_spike / 1_000_000,
+    );
+    assert!(
+        chunk_spike < 250_000_000,
+        "the chunked path's transient heap spike (+{} MB) on this {secs:.1}s clip must stay under \
+         250 MB — a bounded sliding window cannot need that much, so the streaming path is \
+         materializing something proportional to the clip",
+        chunk_spike / 1_000_000,
+    );
+    // Doubling the clip must not double the chunked transient: the window is fixed, so only the
+    // linear side-buffers (input PCM, per-stage activations) may grow. A quadratic — or even
+    // linear-dominated — chunked path fails here while (a)-(c) could still pass.
+    //
+    // Measured 56 MB → 68 MB across the 16 s → 32 s doubling, i.e. 1.21x. A linear-dominated path
+    // would read ~2.0x and a quadratic one ~4x, so the 1.5x bar sits between what is healthy and
+    // the cheapest regression it must catch.
+    assert!(
+        chunk_spike < chunk_spike_half.saturating_mul(3) / 2,
+        "chunked spike grew from +{} MB on {:.1}s to +{} MB on {secs:.1}s — doubling the clip must \
+         not scale the streaming path's peak memory; the window is supposed to bound it",
+        chunk_spike_half / 1_000_000,
+        secs / 2.0,
+        chunk_spike / 1_000_000,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
