@@ -10,7 +10,7 @@
 //! `quantized_matmul` f32 inputs (no bf16 upcast needed). LoRA over these bases = sc-2646.
 
 use mlx_rs::error::Exception;
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
@@ -19,6 +19,7 @@ use std::f32::consts::LN_10;
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -103,10 +104,16 @@ fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, 
 }
 
 /// SDPA over `[B,H,S,D]` → `[B,S,H·D]`.
-fn attention(q: &Array, k: &Array, v: &Array, head_dim: i32) -> Result<Array> {
+fn attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    head_dim: i32,
+    plan: AttentionPlan<'_>,
+) -> Result<Array> {
     let b = q.shape()[0];
     let scale = (head_dim as f32).powf(-0.5);
-    let o = scaled_dot_product_attention(q, k, v, scale, None, None)?;
+    let o = sdpa_budgeted_bhsd(q, k, v, scale, None, plan)?;
     Ok(o.transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[b, -1, q.shape()[1] * head_dim])?)
 }
@@ -178,7 +185,7 @@ impl FeedForward {
     }
 }
 
-struct DoubleBlock {
+pub(crate) struct DoubleBlock {
     attn: DoubleAttention,
     ff: FeedForward,
     ff_context: FeedForward,
@@ -202,7 +209,7 @@ struct DoubleAttention {
 }
 
 impl DoubleAttention {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         heads: i32,
@@ -254,6 +261,7 @@ impl DoubleAttention {
         cos: &Array,
         sin: &Array,
         cache: CacheSlot<'_>,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (iq, ik, iv) = process_qkv(
             img,
@@ -286,7 +294,7 @@ impl DoubleAttention {
             Some((c, idx)) => c.apply(Stream::Double, idx, k, v)?,
             None => (k, v),
         };
-        let o = attention(&q, &k, &v, self.head_dim)?;
+        let o = attention(&q, &k, &v, self.head_dim, attention_plan)?;
         let txt_seq = txt.shape()[1];
         // `[txt ; img]` is a contiguous split at `txt_seq`; split rather than gather two aranges (F-111).
         let parts = o.split_axis(&[txt_seq], 1)?;
@@ -297,7 +305,7 @@ impl DoubleAttention {
 }
 
 impl DoubleBlock {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         heads: i32,
@@ -338,6 +346,7 @@ impl DoubleBlock {
         sin: &Array,
         cache: CacheSlot<'_>,
         ffn_chunk: Option<usize>,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -351,7 +360,9 @@ impl DoubleBlock {
             c_shift_msa,
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, cos, sin, cache)?;
+        let (img_attn, txt_attn) =
+            self.attn
+                .forward(&norm_img, &norm_txt, cos, sin, cache, attention_plan)?;
         img = gated(&img, gate_msa, &img_attn)?;
         txt = gated(&txt, c_gate_msa, &txt_attn)?;
 
@@ -374,7 +385,7 @@ impl DoubleBlock {
     }
 }
 
-struct SingleBlock {
+pub(crate) struct SingleBlock {
     to_qkv_mlp: AdaptableLinear,
     to_out: AdaptableLinear,
     norm_q: Array,
@@ -385,7 +396,7 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         heads: i32,
@@ -418,6 +429,7 @@ impl SingleBlock {
         cos: &Array,
         sin: &Array,
         cache: CacheSlot<'_>,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<Array> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden, None, None, LN_EPS)?, scale, shift)?;
@@ -445,7 +457,7 @@ impl SingleBlock {
             Some((c, idx)) => c.apply(Stream::Single, idx, k, v)?,
             None => (k, v),
         };
-        let attn = attention(&q, &k, &v, self.head_dim)?;
+        let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?;
 
         let mlp = swiglu(&mlp)?;
         let cat = concatenate_axis(&[&attn, &mlp], -1)?;
@@ -521,6 +533,7 @@ pub struct Flux2Transformer {
     norm_out_linear: AdaptableLinear,
     proj_out: AdaptableLinear,
     time_channels: usize,
+    block_stream: Option<crate::block_stream::Flux2BlockStream>,
 }
 
 /// The conditioning inputs every [`Flux2Transformer`] forward shares, grouped so the four entry
@@ -608,7 +621,34 @@ impl Flux2Transformer {
             norm_out_linear: lin(w, "norm_out.linear.weight", quant)?,
             proj_out: lin(w, "proj_out.weight", quant)?,
             time_channels: cfg.timestep_channels,
+            block_stream: None,
         })
+    }
+
+    /// Arm exact snapshot-backed reconstruction for Klein's double and single block stacks. The
+    /// caller must finalize only after quantization and adapter transforms have completed.
+    pub(crate) fn with_block_stream(
+        mut self,
+        inventory: crate::artifact_inventory::KleinArtifactInventory,
+        cfg: Flux2Config,
+        quant: Option<Flux2Quant>,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::Flux2BlockStream::new(
+            inventory, cfg, quant,
+        ));
+        self
+    }
+
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = self.block_stream.as_ref() else {
+            return Ok(());
+        };
+        crate::block_stream::evict_resident_blocks(
+            &mut self.double_blocks,
+            &mut self.single_blocks,
+            stream.double_blocks(),
+            stream.single_blocks(),
+        )
     }
 
     /// Quantize every transformer `nn.Linear` to Q4/Q8 (group_size 64) in place — the mlx-rs
@@ -706,6 +746,8 @@ impl Flux2Transformer {
             None,
             None,
             &MemoryConfig::OFF,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -730,6 +772,8 @@ impl Flux2Transformer {
             cache,
             None,
             &MemoryConfig::OFF,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -742,6 +786,8 @@ impl Flux2Transformer {
         inputs: &Flux2ForwardInputs,
         cache: Option<&Flux2KvCache>,
         mem: &MemoryConfig,
+        attention_plan: AttentionPlan<'_>,
+        block_window: Option<(usize, &mlx_gen::CancelFlag)>,
     ) -> Result<Array> {
         self.forward_inner(
             inputs.hidden_states,
@@ -753,6 +799,8 @@ impl Flux2Transformer {
             cache,
             None,
             mem,
+            attention_plan,
+            block_window,
         )
     }
 
@@ -778,6 +826,8 @@ impl Flux2Transformer {
             None,
             Some(control),
             &MemoryConfig::OFF,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -797,6 +847,8 @@ impl Flux2Transformer {
         cache: Option<&Flux2KvCache>,
         control: Option<(&Flux2ControlBranch, &Array, f32)>,
         mem: &MemoryConfig,
+        attention_plan: AttentionPlan<'_>,
+        block_window: Option<(usize, &mlx_gen::CancelFlag)>,
     ) -> Result<Array> {
         let temb = self.temb(timestep, guidance)?;
         let mut img = self
@@ -840,39 +892,127 @@ impl Flux2Transformer {
             None => None,
         };
 
-        for (idx, block) in self.double_blocks.iter().enumerate() {
-            (txt, img) = block.forward(
-                img,
-                txt,
-                &img_mod,
-                &txt_mod,
-                &cos,
-                &sin,
-                cache.map(|c| (c, idx)),
-                mem.ffn_seq_chunk,
-            )?;
-            // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
-            // base double blocks. `scale = 0` → `+0` → byte-identical to the base forward.
-            if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
-                if let Some(n) = branch.hint_index(idx) {
-                    img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
+        match block_window {
+            None => {
+                if self.block_stream.is_some() {
+                    return Err(Error::Unsupported(
+                        "flux2: a deferred transformer requires an explicit block window"
+                            .to_owned(),
+                    ));
+                }
+                for (idx, block) in self.double_blocks.iter().enumerate() {
+                    (txt, img) = block.forward(
+                        img,
+                        txt,
+                        &img_mod,
+                        &txt_mod,
+                        &cos,
+                        &sin,
+                        cache.map(|c| (c, idx)),
+                        mem.ffn_seq_chunk,
+                        attention_plan,
+                    )?;
+                    if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
+                        if let Some(n) = branch.hint_index(idx) {
+                            img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
+                        }
+                    }
+                    if mem.eval_per_block {
+                        mlx_rs::transforms::eval([&img, &txt])?;
+                    }
                 }
             }
-            // sc-6266: cap the per-step lazy-graph peak at ~one block's transients (bit-exact). Gated
-            // off (`mem.eval_per_block == false`) for every shipped path → no extra evals there.
-            if mem.eval_per_block {
-                mlx_rs::transforms::eval([&img, &txt])?;
+            Some((size, cancel)) => {
+                if control.is_some()
+                    || !self.double_blocks.is_empty()
+                    || !self.single_blocks.is_empty()
+                {
+                    return Err(Error::Unsupported(
+                        "flux2: deferred block streaming is available only for an evicted Klein base stack".to_owned(),
+                    ));
+                }
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported("flux2: no snapshot-backed block stream".to_owned())
+                })?;
+                let plan = mlx_gen::block_residency::BlockPlan::new(source.double_blocks(), size)?;
+                (txt, img) = mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    cancel,
+                    (txt, img),
+                    || source.open(),
+                    |(mut txt, mut img), view, range| {
+                        for idx in range {
+                            let block = source.materialize_double(view, idx)?;
+                            (txt, img) = block.forward(
+                                img,
+                                txt,
+                                &img_mod,
+                                &txt_mod,
+                                &cos,
+                                &sin,
+                                cache.map(|c| (c, idx)),
+                                mem.ffn_seq_chunk,
+                                attention_plan,
+                            )?;
+                        }
+                        Ok((txt, img))
+                    },
+                    |(txt, img)| {
+                        mlx_rs::transforms::eval([txt, img])?;
+                        source.verify_materialized_window()
+                    },
+                )?;
             }
         }
 
         let txt_seq = txt.shape()[1];
         let mut hidden = concatenate_axis(&[&txt, &img], 1)?;
         let ms = self.mod_single.forward(&temb)?;
-        for (idx, block) in self.single_blocks.iter().enumerate() {
-            hidden = block.forward(&hidden, &ms[0], &cos, &sin, cache.map(|c| (c, idx)))?;
-            // sc-6266: per-block eval-to-free (bit-exact), gated off for shipped paths.
-            if mem.eval_per_block {
-                mlx_rs::transforms::eval([&hidden])?;
+        match block_window {
+            None => {
+                for (idx, block) in self.single_blocks.iter().enumerate() {
+                    hidden = block.forward(
+                        &hidden,
+                        &ms[0],
+                        &cos,
+                        &sin,
+                        cache.map(|c| (c, idx)),
+                        attention_plan,
+                    )?;
+                    if mem.eval_per_block {
+                        mlx_rs::transforms::eval([&hidden])?;
+                    }
+                }
+            }
+            Some((size, cancel)) => {
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported("flux2: no snapshot-backed block stream".to_owned())
+                })?;
+                let plan = mlx_gen::block_residency::BlockPlan::new(source.single_blocks(), size)?;
+                hidden = mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    cancel,
+                    hidden,
+                    || source.open(),
+                    |mut hidden, view, range| {
+                        for idx in range {
+                            let block = source.materialize_single(view, idx)?;
+                            hidden = block.forward(
+                                &hidden,
+                                &ms[0],
+                                &cos,
+                                &sin,
+                                cache.map(|c| (c, idx)),
+                                attention_plan,
+                            )?;
+                        }
+                        Ok(hidden)
+                    },
+                    |hidden| {
+                        mlx_rs::transforms::eval([hidden])?;
+                        source.verify_materialized_window()
+                    },
+                )?;
             }
         }
 
@@ -1061,9 +1201,17 @@ impl Flux2ControlBranch {
                 })?;
                 c = add(&bp.forward(&c)?, img_embed)?;
             }
-            let (new_txt, new_c) = block
-                .base
-                .forward(c, txt, img_mod, txt_mod, cos, sin, None, None)?;
+            let (new_txt, new_c) = block.base.forward(
+                c,
+                txt,
+                img_mod,
+                txt_mod,
+                cos,
+                sin,
+                None,
+                None,
+                AttentionPlan::UNBOUNDED,
+            )?;
             hints.push(block.after_proj.forward(&new_c)?);
             c = new_c;
             txt = new_txt;
@@ -1651,6 +1799,7 @@ mod tests {
             norm_out_linear: dummy_lin(),
             proj_out: dummy_lin(),
             time_channels: 256,
+            block_stream: None,
         }
     }
 
@@ -1828,6 +1977,7 @@ mod tests {
             norm_out_linear: dummy_lin(),
             proj_out: dummy_lin(),
             time_channels: 256,
+            block_stream: None,
         }
     }
 

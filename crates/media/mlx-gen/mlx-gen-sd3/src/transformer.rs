@@ -138,6 +138,7 @@ fn attention(
     v: &Array,
     head_dim: i32,
     sdpa_checkpoint: bool,
+    plan: mlx_gen::attention::AttentionPlan<'_>,
 ) -> Result<Array> {
     let b = q.shape()[0];
     // q is `[B,H,S,D]` here (post `process_qkv` transpose), so axis 1 is the head count, not the
@@ -155,7 +156,7 @@ fn attention(
             .next()
             .ok_or_else(|| Error::Msg("sd3: SDPA checkpoint produced no output".into()))?
     } else {
-        scaled_dot_product_attention(q, k, v, scale, None, None)?
+        mlx_gen::attention::sdpa_budgeted_bhsd(q, k, v, scale, None, plan)?
     };
     Ok(o.transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[b, -1, num_heads * head_dim])?)
@@ -266,7 +267,12 @@ impl JointAttention {
     /// Joint attention over `[img ; txt]` (diffusers concatenates the text AFTER the image along the
     /// sequence). Returns `(img_attn_out, Option<txt_attn_out>)`; the text output is `None` on the
     /// final `context_pre_only` block.
-    fn forward(&self, img: &Array, txt: &Array) -> Result<(Array, Option<Array>)> {
+    fn forward(
+        &self,
+        img: &Array,
+        txt: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<(Array, Option<Array>)> {
         let (iq, ik, iv) = process_qkv(
             img,
             &self.to_q,
@@ -291,7 +297,7 @@ impl JointAttention {
         let q = concatenate_axis(&[&iq, &tq], 2)?;
         let k = concatenate_axis(&[&ik, &tk], 2)?;
         let v = concatenate_axis(&[&iv, &tv], 2)?;
-        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
+        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint, plan)?;
 
         // The joint output is `[img ; txt]` concatenated along the sequence (axis 1). The two halves
         // are contiguous, so a single `split_axis` at the image/text boundary reproduces exactly the
@@ -416,7 +422,7 @@ impl SelfAttention {
     }
 
     /// Image-stream self-attention over `x [B,S,H·D]` → `[B,S,H·D]`.
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, plan: mlx_gen::attention::AttentionPlan<'_>) -> Result<Array> {
         let (q, k, v) = process_qkv(
             x,
             &self.to_q,
@@ -427,7 +433,7 @@ impl SelfAttention {
             self.heads,
             self.head_dim,
         )?;
-        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
+        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint, plan)?;
         self.to_out.forward(&o)
     }
 }
@@ -667,7 +673,7 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 // ----------------------------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct JointBlock {
+pub(crate) struct JointBlock {
     /// Plain block: AdaLN-zero (6 chunks). MMDiT-X dual block: `SD35AdaLayerNormZeroX` (9 chunks).
     norm1: ImageNorm,
     /// Non-final: AdaLN-zero (6 chunks). Final (`context_pre_only`): AdaLN-continuous (2 chunks).
@@ -695,7 +701,7 @@ enum ContextNorm {
 }
 
 impl JointBlock {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         idx: usize,
         is_last: bool,
@@ -796,7 +802,13 @@ impl JointBlock {
     /// encoder_hidden_states)`. On the final block `encoder_hidden_states` is returned unchanged
     /// (`context_pre_only`: the text stream is read-only after attention). Faithful mirror of
     /// diffusers `JointTransformerBlock.forward`.
-    fn forward(&self, img: &Array, txt: &Array, temb: &Array) -> Result<(Array, Array)> {
+    pub(crate) fn forward(
+        &self,
+        img: &Array,
+        txt: &Array,
+        temb: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         // Image-stream norm1: plain AdaLN-zero (6 chunks) OR SD35AdaLayerNormZeroX (9 chunks). In the
         // dual case the extra (norm_img2, gate_msa2) drive the second `attn2` self-attention branch.
         let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, dual_mod) =
@@ -835,7 +847,7 @@ impl JointBlock {
         let finish_image = |img_attn: &Array| -> Result<Array> {
             let mut img = gated(img, &gate_msa, img_attn)?;
             if let (Some((norm_img2, gate_msa2)), Some(attn2)) = (&dual_mod, &self.attn2) {
-                let attn2_out = attn2.forward(norm_img2)?;
+                let attn2_out = attn2.forward(norm_img2, plan)?;
                 img = gated(&img, gate_msa2, &attn2_out)?;
             }
             let norm_img_mlp = modulated_layer_norm(&img, &shift_mlp, &scale_mlp)?;
@@ -850,7 +862,7 @@ impl JointBlock {
                     zero.forward(temb)?;
                 let norm_txt = modulated_layer_norm(txt, &c_shift_msa, &c_scale_msa)?;
 
-                let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
+                let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, plan)?;
                 let txt_attn = txt_attn.ok_or_else(|| {
                     Error::Msg("sd3 non-final block: missing text attention output".into())
                 })?;
@@ -873,7 +885,7 @@ impl JointBlock {
                 let (c_shift, c_scale) = cont.forward(temb)?;
                 let norm_txt = modulated_layer_norm(txt, &c_shift, &c_scale)?;
 
-                let (img_attn, _txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
+                let (img_attn, _txt_attn) = self.attn.forward(&norm_img, &norm_txt, plan)?;
 
                 let img = finish_image(&img_attn)?;
 
@@ -1094,6 +1106,7 @@ pub struct Sd3Transformer {
     time_text_embed: TimeTextEmbed,
     context_embedder: AdaptableLinear,
     blocks: Vec<JointBlock>,
+    block_stream: Option<crate::block_stream::Sd3BlockStream>,
     norm_out: AdaLnContinuous,
     proj_out: AdaptableLinear,
 }
@@ -1119,6 +1132,7 @@ impl Sd3Transformer {
             time_text_embed: TimeTextEmbed::from_weights(w, arch)?,
             context_embedder: lin(w, "context_embedder")?,
             blocks,
+            block_stream: None,
             norm_out: AdaLnContinuous::from_weights(w, "norm_out")?,
             proj_out: lin(w, "proj_out")?,
         })
@@ -1165,7 +1179,26 @@ impl Sd3Transformer {
     /// The number of joint `transformer_blocks` — the trainer's gradient-checkpoint bookkeeping
     /// indexes per block.
     pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
+        self.block_stream.as_ref().map_or(
+            self.blocks.len(),
+            crate::block_stream::Sd3BlockStream::blocks,
+        )
+    }
+
+    pub(crate) fn with_block_stream(
+        mut self,
+        inventory: crate::artifact_inventory::Sd3ArtifactInventory,
+        arch: Sd3Arch,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::Sd3BlockStream::new(inventory, arch));
+        self
+    }
+
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = &self.block_stream else {
+            return Ok(());
+        };
+        crate::block_stream::evict_resident_blocks(&mut self.blocks, stream.blocks())
     }
 
     /// Cast the whole MMDiT to the training compute `dtype` in place (T2 sc-7883). Covers every
@@ -1220,7 +1253,35 @@ impl Sd3Transformer {
     ) -> Result<Array> {
         // f32-exact inference: do NOT follow the base weight dtype (see method docs). The training
         // seam is the only caller that runs the body in bf16, via `forward_with`.
-        self.forward_with(latent, context, pooled, timestep, Dtype::Float32)
+        self.forward_inference(
+            latent,
+            context,
+            pooled,
+            timestep,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_inference(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<(usize, &mlx_gen::CancelFlag)>,
+    ) -> Result<Array> {
+        self.forward_body(
+            latent,
+            context,
+            pooled,
+            timestep,
+            Dtype::Float32,
+            plan,
+            window,
+        )
     }
 
     /// MMDiT forward at an explicitly-chosen compute `dtype` — the shared body behind
@@ -1238,6 +1299,28 @@ impl Sd3Transformer {
         timestep: &Array,
         dt: Dtype,
     ) -> Result<Array> {
+        self.forward_body(
+            latent,
+            context,
+            pooled,
+            timestep,
+            dt,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_body(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        dt: Dtype,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<(usize, &mlx_gen::CancelFlag)>,
+    ) -> Result<Array> {
         let latent = latent.as_dtype(dt)?;
         let context = context.as_dtype(dt)?;
 
@@ -1249,10 +1332,44 @@ impl Sd3Transformer {
         let mut txt = self.context_embedder.forward(&context)?;
 
         // 4. joint blocks (Large: 38 plain; Medium MMDiT-X: 13 dual-attention + 11 plain).
-        for block in &self.blocks {
-            let (i, t) = block.forward(&img, &txt, &temb)?;
-            img = i;
-            txt = t;
+        if let Some((window_size, cancel)) = window {
+            if window_size != 1 {
+                return Err(Error::Unsupported(format!(
+                    "sd3: only a one-block transformer window is implemented (got {window_size})"
+                )));
+            }
+            let stream = self.block_stream.as_ref().ok_or_else(|| {
+                Error::Unsupported(
+                    "sd3: transformer streaming requested for an unverified resident artifact"
+                        .to_owned(),
+                )
+            })?;
+            let mut weights = stream.open()?;
+            for index in 0..stream.blocks() {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                let block = stream.materialize(&mut weights, index)?;
+                let (i, t) = block.forward(&img, &txt, &temb, plan)?;
+                mlx_rs::transforms::eval([&i, &t])?;
+                img = i;
+                txt = t;
+                drop(block);
+                mlx_rs::memory::clear_cache();
+                stream.verify_materialized_window()?;
+            }
+        } else {
+            if self.blocks.is_empty() {
+                return Err(Error::Unsupported(
+                    "sd3: resident transformer blocks were evicted; select the advertised one-block window"
+                        .to_owned(),
+                ));
+            }
+            for block in &self.blocks {
+                let (i, t) = block.forward(&img, &txt, &temb, plan)?;
+                img = i;
+                txt = t;
+            }
         }
 
         // 5. AdaLN-continuous output norm + proj_out.
@@ -1353,7 +1470,12 @@ impl Sd3Transformer {
                         }]);
                 }
                 let (img_o, txt_o) = b
-                    .forward(&inp[0], &inp[1], &temb_c)
+                    .forward(
+                        &inp[0],
+                        &inp[1],
+                        &temb_c,
+                        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+                    )
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![img_o, txt_o])
             });

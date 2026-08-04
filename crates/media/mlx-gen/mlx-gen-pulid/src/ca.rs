@@ -10,13 +10,14 @@
 //! matching the reference's shared running counter. LayerNorm ε=1e-5 (nn.LayerNorm default); the
 //! factored `(q·s)@(k·s)` + f32-softmax attention is reproduced by MLX SDPA(scale=dim_head^-0.5).
 
-use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
+use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{matmul, multiply, split};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Result};
 use mlx_gen_flux::transformer::DitImageInjector;
 
 const EPS: f32 = 1e-5;
@@ -64,6 +65,15 @@ impl PerceiverAttentionCA {
 
     /// `id_embedding`: `[B, 32, kv_dim]`; `img`: `[B, S, dim]` → residual `[B, S, dim]`.
     pub fn forward(&self, id_embedding: &Array, img: &Array) -> Result<Array> {
+        self.forward_with_attention(id_embedding, img, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn forward_with_attention(
+        &self,
+        id_embedding: &Array,
+        img: &Array,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let x = layer_norm(id_embedding, Some(&self.norm1_w), Some(&self.norm1_b), EPS)?;
         let lat = layer_norm(img, Some(&self.norm2_w), Some(&self.norm2_b), EPS)?;
         let (b, s) = (lat.shape()[0], lat.shape()[1]);
@@ -81,7 +91,7 @@ impl PerceiverAttentionCA {
         let v = to_heads(&parts[1], n_kv)?;
 
         let scale = (hd as f32).powf(-0.5);
-        let attn = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
+        let attn = sdpa_budgeted_bhsd(&q, &k, &v, scale, None, attention)?;
         let out = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, h * hd])?;
@@ -99,6 +109,8 @@ pub struct PulidCa {
     double_interval: usize,
     single_interval: usize,
     n_double_inject: usize,
+    bounded_attention: bool,
+    cancel: CancelFlag,
 }
 
 impl PulidCa {
@@ -127,7 +139,23 @@ impl PulidCa {
             double_interval,
             single_interval,
             n_double_inject,
+            bounded_attention: false,
+            cancel: CancelFlag::default(),
         })
+    }
+
+    pub fn with_bounded_attention(mut self, cancel: CancelFlag, enabled: bool) -> Self {
+        self.cancel = cancel;
+        self.bounded_attention = enabled;
+        self
+    }
+
+    fn attention(&self) -> AttentionPlan<'_> {
+        if self.bounded_attention {
+            AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&self.cancel)
+        } else {
+            AttentionPlan::UNBOUNDED
+        }
     }
 
     pub fn num_ca(&self) -> usize {
@@ -158,9 +186,13 @@ impl DitImageInjector for PulidCa {
             return Ok(None); // bit-identical to plain FLUX
         }
         match self.double_ca_idx(block_idx) {
-            Some(ca_idx) => Ok(Some(
-                self.scaled(self.ca[ca_idx].forward(&self.id_embedding, img_hidden)?)?,
-            )),
+            Some(ca_idx) => Ok(Some(self.scaled(
+                self.ca[ca_idx].forward_with_attention(
+                    &self.id_embedding,
+                    img_hidden,
+                    self.attention(),
+                )?,
+            )?)),
             None => Ok(None),
         }
     }
@@ -174,9 +206,13 @@ impl DitImageInjector for PulidCa {
             return Ok(None);
         }
         match self.single_ca_idx(block_idx) {
-            Some(ca_idx) => Ok(Some(
-                self.scaled(self.ca[ca_idx].forward(&self.id_embedding, img_tokens)?)?,
-            )),
+            Some(ca_idx) => Ok(Some(self.scaled(
+                self.ca[ca_idx].forward_with_attention(
+                    &self.id_embedding,
+                    img_tokens,
+                    self.attention(),
+                )?,
+            )?)),
             None => Ok(None),
         }
     }

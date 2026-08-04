@@ -409,13 +409,12 @@ impl Flux1 {
     fn requested_transformer_window(
         &self,
         req: &GenerationRequest,
-        injector: Option<&dyn crate::transformer::DitImageInjector>,
+        _injector: Option<&dyn crate::transformer::DitImageInjector>,
     ) -> Result<Option<usize>> {
         let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
             return Ok(None);
         };
-        if injector.is_some()
-            || req.use_pid
+        if req.use_pid
             || !memory.stage_residency
             || !self
                 .memory_strategy
@@ -639,15 +638,13 @@ impl Flux1 {
                                 == Some(gen_core::MemoryPhase::Denoise)
                     }),
                 )?;
-                // Only the clean base route owns complete attention coverage. Any injector adds a
-                // distinct attention stack, so it preserves the historical unbounded forward even
-                // if a caller manually sets request memory outside the admitted contract.
-                let attention =
-                    if injector.is_none() && self.memory_strategy.lifecycle.attention_chunking {
-                        crate::memory_strategy::attention_plan(req)
-                    } else {
-                        mlx_gen::attention::AttentionPlan::UNBOUNDED
-                    };
+                // The shared plan covers the FLUX trunk. Identity providers independently bound
+                // their injector attention before advertising this request configuration.
+                let attention = if self.memory_strategy.lifecycle.attention_chunking {
+                    crate::memory_strategy::attention_plan(req)
+                } else {
+                    mlx_gen::attention::AttentionPlan::UNBOUNDED
+                };
                 self.run_denoise_with(
                     req,
                     &heavy.vae,
@@ -691,11 +688,13 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let transformer_window = self.requested_transformer_window(req, Some(pos_injector))?;
+        let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
-        self.residency.run_request_scoped(
+        let result = self.residency.run_request_scoped(
             matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
-            false,
+            streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -713,13 +712,27 @@ impl Flux1 {
             },
             |heavy, (pos_embeds, pos_pooled, neg_embeds, neg_pooled), on_progress| {
                 let transformer = &heavy.transformer;
+                let block_window = transformer.block_window(
+                    transformer_window,
+                    &req.cancel,
+                    req.memory.is_some_and(|memory| {
+                        memory.calibration_fault_harness_authorized
+                            && memory.calibration_error_phase
+                                == Some(gen_core::MemoryPhase::Denoise)
+                    }),
+                )?;
+                let attention = if self.memory_strategy.lifecycle.attention_chunking {
+                    crate::memory_strategy::attention_plan(req)
+                } else {
+                    mlx_gen::attention::AttentionPlan::UNBOUNDED
+                };
                 self.run_denoise_with(
                     req,
                     &heavy.vae,
                     heavy.pid.as_ref(),
                     on_progress,
                     |x_in, t, timestep, guidance| {
-                        let pos = transformer.forward_injected(
+                        let pos = transformer.forward_injected_memory_windowed(
                             x_in,
                             &pos_embeds,
                             &pos_pooled,
@@ -728,9 +741,11 @@ impl Flux1 {
                             req.width,
                             req.height,
                             Some(pos_injector),
+                            attention,
+                            block_window,
                         )?;
                         if t >= timestep_to_start_cfg {
-                            let neg = transformer.forward_injected(
+                            let neg = transformer.forward_injected_memory_windowed(
                                 x_in,
                                 &neg_embeds,
                                 &neg_pooled,
@@ -739,6 +754,8 @@ impl Flux1 {
                                 req.width,
                                 req.height,
                                 Some(neg_injector),
+                                attention,
+                                block_window,
                             )?;
                             // neg + true_cfg · (pos − neg)
                             Ok(add(
@@ -751,7 +768,8 @@ impl Flux1 {
                     },
                 )
             },
-        )
+        );
+        self.finish_streamed_generation(streamable, result)
     }
 
     /// Shared denoise scaffold for the injector generators (F-108): resolve seed / sampler / steps /

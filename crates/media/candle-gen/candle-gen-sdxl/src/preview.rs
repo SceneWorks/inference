@@ -319,4 +319,295 @@ mod tests {
             .to_string();
         assert!(error.contains("needs the schedule sigma"), "{error}");
     }
+
+    // ── The forwarded hook, pinned against this crate's own source ────────────────────────────────
+    //
+    // `denoise::denoise_curated` takes `Option<&PreviewHook>` and forwards it to the shared driver.
+    // `candle-gen-catalog`'s `preview_advertising` inventory classifies the argument at the DRIVER
+    // call — inside `denoise_curated`'s own body, where it reads `preview` and therefore always says
+    // `hooked: 1`. It cannot see what the *callers* pass. Blanking `ip_provider.rs`'s `Some(&preview)`
+    // to `None` therefore takes the IP-adapter lane preview-dark while the inventory, the route ids
+    // and `supports_preview: true` all keep advertising, and the CPU suite stays green — the same
+    // two-hop hole sc-16958's review found in `candle-gen-sd3` (closed there by making the parameter
+    // a non-`Option`, which is not available here: `denoise_curated` is `pub` and `candle-gen-kolors`
+    // / `candle-gen-instantid` reach it too, and InstantID passes `None` on purpose).
+    //
+    // `Pipeline::denoise_curated` and `Pipeline::denoise_lightning` need no row: each builds its hook
+    // in the same body that drives the sampler, which is exactly the shape the catalog already sees.
+
+    /// The shared curated-denoise helper the in-crate IP lane forwards its hook through. Spelled
+    /// without its open paren so this module cannot match itself.
+    const SHARED_DENOISE: &str = "denoise_curated";
+
+    /// `denoise::denoise_curated`'s argument count and the position of its preview argument, both
+    /// re-derived from the declaration by
+    /// [`the_shared_curated_denoise_signature_pins_the_preview_argument_position`] rather than
+    /// trusted — a reordered signature must fail loudly instead of shifting the pin below onto a
+    /// neighbouring argument.
+    const SHARED_DENOISE_ARITY: usize = 16;
+    const SHARED_DENOISE_PREVIEW_AT: usize = 13;
+
+    /// Every module this crate ships, so a caller added anywhere is seen.
+    ///
+    /// `ip_validate.rs` and `edit_validate.rs` are the only `src` files left out: `lib.rs` declares
+    /// both under `#[cfg(test)] mod`, so neither ships.
+    const MODULES: [(&str, &str); 25] = [
+        ("adapters.rs", include_str!("adapters.rs")),
+        ("clip.rs", include_str!("clip.rs")),
+        ("conditioning.rs", include_str!("conditioning.rs")),
+        ("denoise.rs", include_str!("denoise.rs")),
+        ("edit_provider.rs", include_str!("edit_provider.rs")),
+        ("ip_adapter.rs", include_str!("ip_adapter.rs")),
+        ("ip_provider.rs", include_str!("ip_provider.rs")),
+        ("ldm.rs", include_str!("ldm.rs")),
+        ("lib.rs", include_str!("lib.rs")),
+        ("loaders.rs", include_str!("loaders.rs")),
+        ("pipeline.rs", include_str!("pipeline.rs")),
+        ("preview.rs", include_str!("preview.rs")),
+        ("sampler.rs", include_str!("sampler.rs")),
+        ("training.rs", include_str!("training.rs")),
+        ("vision_encoder.rs", include_str!("vision_encoder.rs")),
+        ("weights.rs", include_str!("weights.rs")),
+        ("unet/attention.rs", include_str!("unet/attention.rs")),
+        ("unet/controlnet.rs", include_str!("unet/controlnet.rs")),
+        ("unet/conv.rs", include_str!("unet/conv.rs")),
+        ("unet/embeddings.rs", include_str!("unet/embeddings.rs")),
+        ("unet/mod.rs", include_str!("unet/mod.rs")),
+        ("unet/resnet.rs", include_str!("unet/resnet.rs")),
+        ("unet/unet_2d.rs", include_str!("unet/unet_2d.rs")),
+        (
+            "unet/unet_2d_blocks.rs",
+            include_str!("unet/unet_2d_blocks.rs"),
+        ),
+        ("unet/vae_encode.rs", include_str!("unet/vae_encode.rs")),
+    ];
+
+    /// `source` with its comments removed and its string literals left intact, so the helper's name
+    /// written in prose can never be read as a call site.
+    fn code_only(file: &str, source: &str) -> String {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            let (ch, next) = (chars[i], chars.get(i + 1).copied());
+            // A raw string literal (`r"…"` / `r#"…"#`), whose body may hold unescaped quotes.
+            if ch == 'r'
+                && !i
+                    .checked_sub(1)
+                    .is_some_and(|p| chars[p].is_alphanumeric() || chars[p] == '_')
+            {
+                let mut hashes = 0usize;
+                while chars.get(i + 1 + hashes) == Some(&'#') {
+                    hashes += 1;
+                }
+                if chars.get(i + 1 + hashes) == Some(&'"') {
+                    out.push(' ');
+                    i += 2 + hashes;
+                    loop {
+                        assert!(i < chars.len(), "{file}: unterminated raw string literal");
+                        if chars[i] == '"'
+                            && (0..hashes).all(|h| chars.get(i + 1 + h) == Some(&'#'))
+                        {
+                            i += 1 + hashes;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            match (ch, next) {
+                ('/', Some('/')) => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    out.push(' ');
+                }
+                ('/', Some('*')) => {
+                    let mut nesting = 0usize;
+                    loop {
+                        assert!(i < chars.len(), "{file}: unterminated block comment");
+                        match (chars[i], chars.get(i + 1).copied()) {
+                            ('/', Some('*')) => {
+                                nesting += 1;
+                                i += 2;
+                            }
+                            ('*', Some('/')) => {
+                                nesting -= 1;
+                                i += 2;
+                                if nesting == 0 {
+                                    break;
+                                }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    out.push(' ');
+                }
+                ('"', _) => {
+                    out.push('"');
+                    i += 1;
+                    let mut escaped = false;
+                    loop {
+                        assert!(i < chars.len(), "{file}: unterminated string literal");
+                        let c = chars[i];
+                        out.push(c);
+                        i += 1;
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    out.push(ch);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The comma-separated top-level arguments of one call or parameter list, given everything after
+    /// its open paren. Bounded by the call's own bracket balance.
+    fn call_arguments(site: &str, rest: &str) -> Vec<String> {
+        let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let chars: Vec<char> = rest.chars().collect();
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut depth = 1usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let ch = chars[i];
+            i += 1;
+            match ch {
+                '"' => {
+                    current.push('"');
+                    loop {
+                        assert!(i < chars.len(), "{site}: unterminated string literal");
+                        let c = chars[i];
+                        i += 1;
+                        current.push(c);
+                        if c == '\\' {
+                            i += 1;
+                        } else if c == '"' {
+                            break;
+                        }
+                    }
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let last = normalize(&current);
+                        if !last.is_empty() {
+                            args.push(last);
+                        }
+                        return args;
+                    }
+                    current.push(ch);
+                }
+                ',' if depth == 1 => {
+                    args.push(normalize(&current));
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        panic!("{site} is unterminated: no closing paren before end of file")
+    }
+
+    /// Every **call** to the free function `denoise::denoise_curated` in one module.
+    ///
+    /// The declaration (`fn denoise_curated(`) and `Pipeline`'s same-named *method*
+    /// (`self.denoise_curated(`) are both skipped by their prefix — the method builds its own hook in
+    /// its own body and is therefore already visible to the catalog's inventory.
+    fn shared_denoise_calls(file: &str, source: &str) -> Vec<Vec<String>> {
+        let code = code_only(file, source);
+        let call = format!("{SHARED_DENOISE}(");
+        let mut sites = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(offset) = code[cursor..].find(&call) {
+            let at = cursor + offset;
+            let args_start = at + call.len();
+            let before = &code[..at];
+            if !before.ends_with('.') && !before.trim_end().ends_with("fn") {
+                let site = format!("{file}: {SHARED_DENOISE} call #{}", sites.len());
+                sites.push(call_arguments(&site, &code[args_start..]));
+            }
+            cursor = args_start;
+        }
+        sites
+    }
+
+    /// The preview argument's position is read out of `denoise_curated`'s own declaration, so a
+    /// reordered or widened signature fails here instead of quietly moving the pin below onto a
+    /// neighbouring argument.
+    #[test]
+    fn the_shared_curated_denoise_signature_pins_the_preview_argument_position() {
+        let code = code_only("denoise.rs", include_str!("denoise.rs"));
+        let declaration = format!("pub fn {SHARED_DENOISE}(");
+        let at = code
+            .find(&declaration)
+            .expect("denoise.rs must declare the shared curated denoise helper");
+        let parameters = call_arguments(
+            "denoise.rs: the denoise_curated declaration",
+            &code[at + declaration.len()..],
+        );
+        assert_eq!(
+            parameters.len(),
+            SHARED_DENOISE_ARITY,
+            "parsed {parameters:?}"
+        );
+        assert_eq!(
+            parameters[SHARED_DENOISE_PREVIEW_AT],
+            "preview: Option<&candle_gen::preview::PreviewHook<'_>>",
+            "parsed {parameters:?}"
+        );
+    }
+
+    /// Every caller of `denoise::denoise_curated` in this crate, classified by the argument it passes
+    /// in the preview slot — positionally, so the pin cannot be satisfied by the word appearing
+    /// elsewhere in the call.
+    ///
+    /// The `#[cfg(test)]` rows in `denoise.rs` are listed rather than stripped: classifying **every**
+    /// occurrence is what makes the shipped count exact, and a scan that guessed which ones were test
+    /// code would be a second place to get that wrong.
+    #[test]
+    fn every_shipped_caller_of_the_shared_curated_denoise_passes_a_hook() {
+        let mut inventory: Vec<(&str, String)> = Vec::new();
+        for (file, source) in MODULES {
+            for args in shared_denoise_calls(file, source) {
+                assert_eq!(
+                    args.len(),
+                    SHARED_DENOISE_ARITY,
+                    "{file}: expected {SHARED_DENOISE_ARITY} arguments with the preview argument at \
+                     position {SHARED_DENOISE_PREVIEW_AT}, parsed {args:?}"
+                );
+                inventory.push((file, args[SHARED_DENOISE_PREVIEW_AT].clone()));
+            }
+        }
+        let inventory: Vec<(&str, &str)> = inventory
+            .iter()
+            .map(|(file, argument)| (*file, argument.as_str()))
+            .collect();
+        assert_eq!(
+            inventory,
+            [
+                // `denoise.rs`'s own structural rows: no request, no sink, nothing to emit into.
+                ("denoise.rs", "None"),
+                ("denoise.rs", "None"),
+                // The one SHIPPED caller — the IP-adapter provider's curated lane. `None` here is a
+                // dark render route that no other guard in this repo can see.
+                ("ip_provider.rs", "Some(&preview)"),
+            ],
+            "the shared curated denoise gained, lost or re-classified a caller"
+        );
+    }
 }

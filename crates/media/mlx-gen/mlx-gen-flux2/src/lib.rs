@@ -18,6 +18,8 @@
 //! text-encoder (S1), VAE (S2), and transformer (S3) modules land.
 
 pub mod adapters;
+mod artifact_inventory;
+mod block_stream;
 pub mod caption_upsample;
 pub mod chunk;
 pub mod config;
@@ -93,7 +95,21 @@ pub fn register_providers(
     registry
         .register_generator(model::KLEIN_REGISTRATION)
         .register_activation_memory(KLEIN_ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX2_KLEIN_9B_ID,
+            contract: |spec| memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_ID, spec),
+        })
+        .register_memory_behavior(model::KLEIN_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_EDIT_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: FLUX2_KLEIN_9B_EDIT_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_EDIT_ID, spec)
+            },
+        })
+        .register_memory_behavior(model::KLEIN_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
         .register_generator(model::DEV_REGISTRATION)
         .register_generator(model::DEV_EDIT_REGISTRATION)
@@ -156,5 +172,22 @@ mod explicit_registry_tests {
             .expect("FLUX.2-dev edit memory contract");
         assert_eq!(contract.provider_id, super::FLUX2_DEV_EDIT_ID);
         assert!(contract.conformance_errors().is_empty());
+    }
+
+    #[test]
+    fn klein_shared_ladder_passes_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_pid(
+                mlx_gen::WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                mlx_gen::WeightsSource::Dir("/nonexistent/gemma".into()),
+            );
+        gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+        assert!(registry
+            .memory_strategy_contract(super::FLUX2_KLEIN_9B_KV_EDIT_ID, &spec)
+            .unwrap()
+            .is_none());
     }
 }

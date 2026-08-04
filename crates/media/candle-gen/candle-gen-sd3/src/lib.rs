@@ -32,6 +32,7 @@ pub mod conditioning;
 pub mod config;
 pub mod memory;
 pub mod pipeline;
+pub mod preview;
 pub mod quant;
 pub mod transformer;
 pub mod vae;
@@ -273,7 +274,10 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // pipeline, so it does not require the loader to pre-shift.
             requires_sigma_shift: false,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // sc-16958: every SD3.5 route emits per-step latent previews. All three variants share
+            // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
+            // for the lane enumeration and the reused epic-16624 16-channel fit.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

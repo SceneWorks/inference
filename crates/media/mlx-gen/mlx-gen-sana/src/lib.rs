@@ -43,6 +43,7 @@
 pub mod config;
 pub mod convert;
 pub mod dc_ae;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preview;
@@ -81,6 +82,20 @@ pub fn register_providers(
         .register_generator(model::BASE_REGISTRATION)
         .register_generator(model::SPRINT_REGISTRATION)
         .register_activation_memory(SPRINT_ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
+        .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR_REGISTRATION)
+        .register_memory_strategy(model::SPRINT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: SPRINT_MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(SPRINT_MODEL_ID, spec)
+            },
+        })
+        .register_memory_behavior(model::SPRINT_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Sana provider catalog.
@@ -90,6 +105,10 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    use mlx_gen::gen_core::{
+        LoadSpec, MemoryStrategy, MemoryStrategySupport, OffloadPolicy, WeightsSource,
+    };
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -99,5 +118,51 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["sana_1600m", "sana_sprint_1600m"]);
+    }
+
+    #[test]
+    fn explicit_catalog_resolves_both_memory_contracts() {
+        let registry = super::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/sana-memory-contract-fixture".into(),
+        ))
+        .with_offload_policy(OffloadPolicy::Sequential);
+
+        for provider_id in [super::MODEL_ID, super::SPRINT_MODEL_ID] {
+            let contract = registry
+                .memory_strategy_contract(provider_id, &spec)
+                .unwrap()
+                .expect("SANA provider should expose a memory contract");
+
+            assert_eq!(contract.provider_id, provider_id);
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::StagedResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Implemented
+            );
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Implemented
+            );
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedAttention)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            );
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            );
+        }
     }
 }

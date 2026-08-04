@@ -609,9 +609,18 @@ impl ScmScheduler {
 ///
 /// **The hook receives the running `latents`, which are pre-scaled by `sigma_data`.** This loop
 /// multiplies the seed latent by `σ_data` on entry and divides the result back out on exit, so a
-/// family's projector must apply the same `1/σ_data` correction before projecting or the preview is
-/// uniformly over-scaled (`σ_data = 0.5` for Sprint, i.e. 2× too bright). This mirrors the
+/// family's projector must apply the same `1/σ_data` correction before projecting. This mirrors the
 /// `inverse_sigma_data` argument the MLX Sprint preview carries.
+///
+/// An uncorrected frame is **flatter, not brighter** — the direction epic 16948 predicted is the
+/// wrong way round, and sc-16959 measured it on real Sprint weights. `σ_data = 0.5` for Sprint, so
+/// the pre-scale *shrinks* the latent and the projection collapses *toward* the fit's intercept
+/// rather than toward the rails: over SANA-Sprint's SCM prior the uncorrected frame's rail-clipped
+/// fraction is **0.0000**, *lower* than the corrected frame's 0.0003 (base SANA's own flow prior sits
+/// at 0.0007). Rail-clipping is therefore not the statistic that catches a missing correction on this
+/// driver. Contrast about the intercept is, and it comes out at exactly the scale factor: mean |Δ|
+/// from the intercept frame is **25.93** corrected against **12.96** uncorrected, a ratio of 2.0008.
+/// See `docs/migration/evidence/sc-16959-sana-candle-preview.md`.
 pub fn run_scm_sampler(
     scheduler: &ScmScheduler,
     latents: Tensor,

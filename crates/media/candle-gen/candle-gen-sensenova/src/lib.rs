@@ -25,6 +25,14 @@
 //! replaced a hard `DType::F32` mmap that widened the bf16 checkpoint for no extra precision — a
 //! measured 70.5 GB peak on sm_120 for a 32.7 GiB checkpoint.
 //!
+//! **Live denoise preview (epic 16948, sc-16960).** Both ids advertise `supports_preview` and emit one
+//! RGB8 frame per outer solver step from the bespoke flow-match loop in `crate::t2i`. SenseNova is
+//! the epic's **Tier 2** family: it drives no shared `candle_gen` sampler, so the emission is a direct
+//! `PreviewHook::emit_step` inside its own loop; and — contrary to the epic's scoping — it has **no
+//! VAE at all**, so its fit could not be inherited from epic 16624 and had to be measured. It
+//! denoises in pixel space, which is why [`preview`]'s fit is over **three** channels rather than a
+//! VAE latent width. See that module and `tests/fit_preview_rgb.rs`.
+//!
 //! **Understanding surface (VQA + interleave, sc-5501):** SenseNova-U1's text / text+image modes
 //! ([`T2iModel::vqa`], [`T2iModel::interleave_gen`]) output what the neutral
 //! `GenerationOutput` contract can't express, so they are exposed as
@@ -35,6 +43,7 @@
 mod config;
 mod distill;
 mod fm;
+pub mod preview;
 mod quant;
 mod qwen3;
 mod runtime;
@@ -143,7 +152,10 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16960). Both ids reach the one bespoke
+            // flow-match denoise loop in `t2i.rs`, which emits directly through
+            // `PreviewHook::emit_step`; `preview` owns the fit and the pool to the token grid.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -260,6 +272,13 @@ impl SenseNovaGenerator {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (w, h) = (req.width as usize, req.height as usize);
 
+        // The per-step preview seam (epic 16948, sc-16960): ONE hook, built over the REQUEST's own
+        // sink, carrying the token cell of the very model whose denoise loop the frames come from.
+        // It is threaded into `T2iModel::generate` as a non-`Option` `&PreviewHook` — this crate
+        // drives no shared sampler, so there is no driver argument `candle-gen-catalog`'s route
+        // inventory could classify, and an `Option` anywhere on the path would be blankable here.
+        // An inert sink costs one branch per denoise step and leaves the render byte-identical.
+        let preview = preview::t2i_hook(&req.preview, comps.model.cell());
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // A 50-step 8B run is multi-minute; check cancellation between images too (the per-step
             // check lives in the denoise loop).
@@ -275,6 +294,7 @@ impl SenseNovaGenerator {
                 &opts,
                 &req.cancel,
                 on_progress,
+                &preview,
             )?;
             // `?` bridges the candle-side `tensor_to_image` error into `CandleError`.
             Ok(tensor_to_image(&img)?)
@@ -542,6 +562,9 @@ mod tests {
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(d.capabilities.supports_kv_cache);
         assert!(d.capabilities.requires_sigma_shift);
+        // sc-16960: the bespoke denoise loop emits per-step frames on BOTH ids.
+        assert!(d.capabilities.supports_preview);
+        assert!(descriptor_fast().capabilities.supports_preview);
         // The fast variant shares the capability surface; only id + defaults differ.
         let f = descriptor_fast();
         assert_eq!(f.id, MODEL_ID_FAST);

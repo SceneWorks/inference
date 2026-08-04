@@ -232,6 +232,8 @@ pub struct Sana {
     /// `true` for SANA-Sprint (CFG-free SCM few-step) — read at encode time (before the heavy bundle is
     /// available under `Sequential`) to gate the uncond forward and resolve the default guidance.
     sprint: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
 }
 
 /// Construct a SANA generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -264,10 +266,13 @@ fn load_from(
     // component build, but these overrides are still wrong, so reject them here).
     load_components(spec, id)?;
     let residency = build_residency(spec, sprint, id)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(id, spec)?;
     Ok(Box::new(Sana {
         descriptor,
         residency,
         sprint,
+        loaded_spec: spec.clone(),
+        memory_strategy,
     }))
 }
 
@@ -290,7 +295,7 @@ pub(crate) fn build_residency(
     Residency::from_policy(
         spec.offload_policy,
         move || load_text_encoder_component(load_components(&spec_text, id)?),
-        move |_use_pid| load_heavy(load_components(&spec_heavy, id)?, sprint),
+        move |needs_encoder| load_heavy(load_components(&spec_heavy, id)?, sprint, needs_encoder),
     )
 }
 
@@ -306,27 +311,33 @@ fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
 /// path builds the same bundle up front. Components are independent of the text encoder (separate weight
 /// files, packed-detected quant — no RNG), so both residencies are byte-identical. The trunk is loaded
 /// first (mirroring the pre-seam `build_pipeline` order), then the DC-AE from the shared `vae/` source.
-fn load_heavy(root: &Path, sprint: bool) -> Result<SanaHeavy> {
+fn load_heavy(root: &Path, sprint: bool, needs_encoder: bool) -> Result<SanaHeavy> {
     let trunk_w = Weights::from_dir(root.join("transformer"))?;
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
     // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
-    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
+    let encoder = needs_encoder
+        .then(|| DcAeEncoder::from_weights(&vae_w, dcfg.clone()))
+        .transpose()?;
     if sprint {
         let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
         let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
         let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
-        Ok(SanaHeavy::new_sprint(
-            trunk,
-            encoder,
-            decoder,
-            dcfg,
-            guidance_embeds_scale,
-        ))
+        Ok(match encoder {
+            Some(encoder) => {
+                SanaHeavy::new_sprint(trunk, encoder, decoder, dcfg, guidance_embeds_scale)
+            }
+            None => {
+                SanaHeavy::new_sprint_text_to_image(trunk, decoder, dcfg, guidance_embeds_scale)
+            }
+        })
     } else {
         let trunk = SanaTransformer::from_weights(&trunk_w, SanaTransformerConfig::sana_1600m())?;
-        Ok(SanaHeavy::new(trunk, encoder, decoder, dcfg))
+        Ok(match encoder {
+            Some(encoder) => SanaHeavy::new(trunk, encoder, decoder, dcfg),
+            None => SanaHeavy::new_text_to_image(trunk, decoder, dcfg),
+        })
     }
 }
 
@@ -403,10 +414,47 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-mlx_gen::impl_generator!(Sana {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+impl Generator for Sana {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl Sana {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -443,11 +491,13 @@ impl Sana {
         } else {
             DEFAULT_GUIDANCE
         });
+        let tiling =
+            crate::pipeline::resolve_decode_tiling(req.memory, self.residency.is_sequential());
 
-        self.residency.run(
+        self.residency.run_staged(
             &req.cancel,
-            // SANA has no PiD overlay; the heavy loader ignores `use_pid`.
-            false,
+            // The generic flag is free on SANA and selects the optional DC-AE encoder for img2img.
+            init_image.is_some(),
             on_progress,
             // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
             // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the shared seam LOADS
@@ -476,10 +526,10 @@ impl Sana {
                 mlx_rs::transforms::eval(arrays)?;
                 Ok(())
             },
-            // ── Phase B: denoise/decode from the heavy bundle (trunk + DC-AE), one image per seed.
-            // Runs identically for both residencies. `on_progress` is threaded through the seam (F-179).
+            // Phase B produces and materializes every latent while the DiT is alive. Sequential then
+            // sheds the DiT and optional encoder before phase-C decode; Resident borrows a warm view.
             |heavy: &SanaHeavy, cond, on_progress: &mut dyn FnMut(Progress)| {
-                let mut images = Vec::with_capacity(req.count as usize);
+                let mut latents = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let seed = base_seed.wrapping_add(n as u64);
                     let sana_req = SanaGenerateRequest {
@@ -495,15 +545,24 @@ impl Sana {
                         init_image,
                         strength,
                     };
-                    let img = heavy.render_one_with_preview(
+                    latents.push(heavy.denoise_one_with_preview(
                         &cond,
                         &sana_req,
                         guidance,
                         &req.cancel,
                         on_progress,
                         &req.preview,
-                    )?;
-                    images.push(img);
+                    )?);
+                }
+                mlx_rs::transforms::eval(latents.iter())?;
+                Ok(latents)
+            },
+            |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            |view: crate::pipeline::SanaDecodeView<'_>, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                let mut images = Vec::with_capacity(latents.len());
+                for latent in &latents {
+                    images.push(view.decode_one(latent, &req.cancel, tiling.as_ref())?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -528,6 +587,40 @@ mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+pub const BASE_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::safety_check,
+    };
+pub const BASE_MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+pub const SPRINT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: SPRINT_MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(SPRINT_MODEL_ID, spec),
+        safety_check: crate::memory_strategy::safety_check,
+    };
+pub const SPRINT_MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: SPRINT_MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                SPRINT_MODEL_ID,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
 mlx_gen::register_generators! {
     pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint;
     footprint = component_footprint

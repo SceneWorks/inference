@@ -45,3 +45,8 @@ candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # workspace pins so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
 # #[ignore]d — it runs a real generate, so it needs weights + GPU).
 sceneworks-gen-core-testkit = { workspace = true }
+# sc-16960 preview provenance: hash the checkpoint the fit was measured against (`tests/fit_preview_rgb.rs`).
+# SenseNova-U1 ships NO autoencoder, and that row proves it structurally — from the snapshot layout,
+# `config.json`, and the shard headers, which it reads directly rather than pulling in `safetensors`
+# to deserialize a 20 GB container. Test-only; nothing in the engine hashes or re-parses weights.
+sha2 = { workspace = true }

@@ -15,12 +15,17 @@
 //!    [`velocity`], and takes an [`euler_step`]. CFG blends the condition/uncondition velocities.
 //! 3. [`unpatchify`] the final latent → RGB `[1, 3, H, W]` (model space ≈ `[-1, 1]`).
 //!
+//! The running state of step 2 is therefore the **image itself**, in pixel space — SenseNova-U1 has no
+//! VAE — which is what makes [`crate::preview`]'s fit a three-channel one and its per-step frame a
+//! pooled view of the state rather than a decoded latent.
+//!
 //! Deterministic, launch-portable initial noise from a fixed-algorithm CPU RNG (`StdRng`, sc-3673) —
 //! same-backend determinism only; cross-backend pixel-equality vs `mlx-gen-sensenova` is NOT a goal.
 
 use candle_gen::candle_core::{Device, IndexOp, Result as CResult, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
+use candle_gen::preview::{PreviewCounter, PreviewHook};
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -320,6 +325,13 @@ impl T2iModel {
 
     /// Generate an image for `prompt` at `width × height` (both multiples of `patch·merge`). Emits
     /// per-step [`Progress`] and aborts on `cancel`. Returns the model-space image `[1, 3, H, W]`.
+    ///
+    /// `preview` is the caller's per-step frame seam (epic 16948, sc-16960), taken by **non-`Option`
+    /// reference** at every hop between [`crate::SenseNovaGenerator`]'s request and the loop below:
+    /// an `Option` here would be blankable at a caller, and this crate drives no shared sampler whose
+    /// argument `candle-gen-catalog`'s route inventory could classify instead. Build it with
+    /// `crate::preview::t2i_hook` over the request's own sink; an inert sink costs one branch per
+    /// step and leaves the render byte-identical.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -330,6 +342,7 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewHook<'_>,
     ) -> Result<Tensor> {
         let cell = self.cell();
         if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
@@ -370,11 +383,19 @@ impl T2iModel {
             opts,
             cancel,
             on_progress,
+            preview,
         )?;
         Ok(image)
     }
 
     /// The flow-matching denoise loop. Returns the final model-space image `[1,3,H,W]`.
+    ///
+    /// This is SenseNova-U1's **only registered denoise lane** and it is genuinely bespoke: the crate
+    /// drives no `candle_gen::run_flow_sampler` / `run_curated_sampler` / `run_scm_sampler` anywhere,
+    /// because the unified AR backbone's per-step `KvCache` mutation makes a multi-eval curated solver
+    /// unsound (see [`crate::descriptor`]'s empty sampler menu). So the per-step preview seam is a
+    /// **direct** [`PreviewHook::emit_step`] from inside this loop rather than a hook handed to a
+    /// driver — the `Denoise::Bespoke` shape `candle-gen-catalog`'s route inventory declares.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
@@ -388,6 +409,7 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewHook<'_>,
     ) -> Result<Tensor> {
         let cell = self.cell();
         let token_h = height / cell;
@@ -411,10 +433,24 @@ impl T2iModel {
             None => None,
         };
 
+        // Per-step preview numbering (epic 16948, sc-16960). Keyed on the **step index**, because this
+        // loop walks an ascending `t` boundary grid (`step_schedule`: `0 → 1`, noise → image) rather
+        // than a descending σ array — `PreviewCounter::new(sigmas)` has nothing to key against, exactly
+        // as it has nothing to key against on the σ-less SCM driver. The counter is local to this call
+        // and `generate` is called once per seed, so a batched request starts each image at frame 1.
+        let preview_counter = PreviewCounter::with_steps(steps);
+
         for i in 0..steps {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            // Emitted BEFORE the step, matching the shared drivers' contract and Ideogram's bespoke
+            // loop: the frame shows the state this step is about to advance, so the fully denoised
+            // state is never previewed (the finished image lands instead). `image` is the running
+            // model-space latent `[1, 3, H, W]`; `crate::preview` owns the pool to the token grid.
+            // Projection failures are swallowed inside — a lost decorative frame never fails a render
+            // — and an inert sink never even runs the projection.
+            preview.emit_step(&preview_counter, i, &image);
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
 

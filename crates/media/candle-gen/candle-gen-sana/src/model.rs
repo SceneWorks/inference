@@ -87,6 +87,7 @@ trait BaseBatchPipeline {
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> candle_gen::Result<Image>;
 }
 
@@ -108,8 +109,9 @@ impl BaseBatchPipeline for SanaPipeline {
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> candle_gen::Result<Image> {
-        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress)
+        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress, preview)
     }
 }
 
@@ -168,7 +170,9 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // No candle `render_sequential` residency seam wired (sc-11126).
             supports_sequential_offload: false,
-            supports_preview: false,
+            // sc-16959: the base flow lane emits per-step latent previews through
+            // `crate::preview::base_hook` over the epic-16624 BASE DC-AE fit — not Sprint's.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -225,7 +229,10 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
-            supports_preview: false,
+            // sc-16959: the SCM lane emits per-step latent previews through
+            // `crate::preview::sprint_hook` over the epic-16624 SPRINT fit, with the `1/σ_data`
+            // correction the SCM driver's pre-scaled running latent needs.
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -308,11 +315,19 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
+/// Render `req.count` base-SANA images, previewing every step of every one.
+///
+/// `preview` is built HERE, over the request's own [`gen_core::PreviewSink`], and threaded down to
+/// [`crate::pipeline::denoise_cfg`]'s [`candle_gen::run_flow_sampler`] call as a non-`Option`
+/// reference — see `crate::preview` for why the whole path is typed that way rather than only the
+/// driver argument. It is the **base** hook: `sana_1600m` and `sana_sprint_1600m` are fits over two
+/// different DC-AE autoencoders and must never share one.
 fn generate_base_images(
     pipeline: &impl BaseBatchPipeline,
     req: &GenerationRequest,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> gen_core::Result<Vec<Image>> {
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
@@ -352,6 +367,7 @@ fn generate_base_images(
                 device,
                 &req.cancel,
                 on_progress,
+                preview,
             )
             .map_err(gen_core::Error::from)
     })
@@ -374,7 +390,9 @@ impl Generator for SanaGenerator {
         self.validate(req)?;
         let pipeline = self.pipeline()?;
 
-        let images = generate_base_images(pipeline.as_ref(), req, &self.device, on_progress)?;
+        let preview = crate::preview::base_hook(&req.preview);
+        let images =
+            generate_base_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -415,6 +433,7 @@ trait SprintBatchPipeline {
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> candle_gen::Result<Image>;
 }
 
@@ -432,16 +451,23 @@ impl SprintBatchPipeline for SanaSprintPipeline {
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> candle_gen::Result<Image> {
-        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress)
+        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress, preview)
     }
 }
 
+/// Render `req.count` SANA-Sprint images, previewing every SCM step of every one.
+///
+/// The Sprint twin of [`generate_base_images`], and deliberately its own function rather than a
+/// generic over both: the hook it threads carries the **Sprint** fit and the `1/σ_data` correction the
+/// SCM driver's running latent needs, neither of which the base lane wants.
 fn generate_sprint_images(
     pipeline: &impl SprintBatchPipeline,
     req: &GenerationRequest,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> gen_core::Result<Vec<Image>> {
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
@@ -467,6 +493,7 @@ fn generate_sprint_images(
                 device,
                 &req.cancel,
                 on_progress,
+                preview,
             )
             .map_err(gen_core::Error::from)
     })
@@ -530,7 +557,9 @@ impl Generator for SanaSprintGenerator {
         self.validate(req)?;
         let pipeline = self.pipeline()?;
 
-        let images = generate_sprint_images(pipeline.as_ref(), req, &self.device, on_progress)?;
+        let preview = crate::preview::sprint_hook(&req.preview);
+        let images =
+            generate_sprint_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -546,9 +575,17 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::Quant;
+    use candle_gen::gen_core::{PreviewSink, Quant};
+    use candle_gen::preview::PreviewHook;
 
     use std::cell::{Cell, RefCell};
+
+    /// An inert preview hook for the adapter rows below, which measure conditioning reuse and the
+    /// per-seed fan-out rather than previews. The seam's own coverage is `crate::preview`'s tests and
+    /// `tests/preview_wiring.rs`; an inert sink here keeps these rows byte-identical to pre-sc-16959.
+    fn inert_hook(sink: &PreviewSink) -> PreviewHook<'_> {
+        crate::preview::base_hook(sink)
+    }
 
     struct BaseFixturePipeline {
         encoder_calls: Cell<usize>,
@@ -579,6 +616,7 @@ mod tests {
             _device: &Device,
             _cancel: &gen_core::CancelFlag,
             _on_progress: &mut dyn FnMut(Progress),
+            _preview: &candle_gen::preview::PreviewHook<'_>,
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
@@ -606,6 +644,7 @@ mod tests {
             _device: &Device,
             _cancel: &gen_core::CancelFlag,
             _on_progress: &mut dyn FnMut(Progress),
+            _preview: &candle_gen::preview::PreviewHook<'_>,
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
@@ -632,7 +671,15 @@ mod tests {
             .map(|seed| fixture_image(expected_conditioning, seed))
             .to_vec();
 
-        let actual = generate_base_images(&pipeline, &request, &Device::Cpu, &mut |_| {}).unwrap();
+        let inert = PreviewSink::default();
+        let actual = generate_base_images(
+            &pipeline,
+            &request,
+            &Device::Cpu,
+            &mut |_| {},
+            &inert_hook(&inert),
+        )
+        .unwrap();
 
         assert_eq!(pipeline.encoder_calls.get(), 2);
         assert_eq!(
@@ -655,7 +702,15 @@ mod tests {
             ..req(256, 256)
         };
 
-        let images = generate_base_images(&pipeline, &request, &Device::Cpu, &mut |_| {}).unwrap();
+        let inert = PreviewSink::default();
+        let images = generate_base_images(
+            &pipeline,
+            &request,
+            &Device::Cpu,
+            &mut |_| {},
+            &inert_hook(&inert),
+        )
+        .unwrap();
 
         assert_eq!(pipeline.encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![7, 8, 9]);
@@ -678,8 +733,15 @@ mod tests {
             .map(|seed| fixture_image(b"sprint cond", seed))
             .to_vec();
 
-        let actual =
-            generate_sprint_images(&pipeline, &request, &Device::Cpu, &mut |_| {}).unwrap();
+        let inert = PreviewSink::default();
+        let actual = generate_sprint_images(
+            &pipeline,
+            &request,
+            &Device::Cpu,
+            &mut |_| {},
+            &inert_hook(&inert),
+        )
+        .unwrap();
 
         assert_eq!(pipeline.encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![11, 12, 13]);

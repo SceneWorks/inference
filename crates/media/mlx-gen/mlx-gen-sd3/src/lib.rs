@@ -62,9 +62,12 @@
 //! Native LoRA training (T1–T4) is a separate epic story and is NOT implemented here.
 
 pub mod adapters;
+mod artifact_inventory;
+mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preview;
@@ -111,8 +114,26 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::LARGE_REGISTRATION)
+        .register_memory_strategy(model::LARGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_contract(MODEL_ID, spec),
+        })
+        .register_memory_behavior(model::LARGE_MEMORY_BEHAVIOR)
         .register_generator(model::TURBO_REGISTRATION)
+        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: TURBO_MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_contract(TURBO_MODEL_ID, spec),
+        })
+        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_generator(model::MEDIUM_REGISTRATION)
+        .register_memory_strategy(model::MEDIUM_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: MEDIUM_MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_contract(MEDIUM_MODEL_ID, spec),
+        })
+        .register_memory_behavior(model::MEDIUM_MEMORY_BEHAVIOR)
         .register_trainer(training::LARGE_TRAINER_REGISTRATION)
         .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
 }
@@ -141,5 +162,14 @@ mod explicit_registry_tests {
             ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
         );
         assert_eq!(explicit_trainers, ["sd3_5_large", "sd3_5_medium"]);
+    }
+
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
     }
 }
