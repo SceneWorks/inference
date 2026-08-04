@@ -30,6 +30,30 @@
 //! alongside it and the request peak does not move. The prerequisite is declared on the contract, so
 //! the shared selector enforces it rather than each caller re-deriving it.
 //!
+//! ## Disclosure: an optimized request may EVICT the warm cross-request cache
+//!
+//! Rungs 1 and 4 are request-scoped, so one cached generator serves warm → staged → warm without
+//! reconstruction — but that is not free in both directions, and the cost is worth stating plainly
+//! rather than discovering as a latency regression:
+//!
+//! * **Rung 1** evicts the warm pair for the duration of the staged request and rebuilds it lazily on
+//!   the next warm one. That is inherent: a phase schedule that releases completed phases cannot also
+//!   hold them.
+//! * **Rung 4** additionally needs the heavy bundle in its *streamable* component form, which is a
+//!   different shape from the warm one. `Residency::ensure_warm_locked` therefore evicts and rebuilds
+//!   a warm pair whose shape does not match, so alternating windowed and non-windowed requests on one
+//!   generator pays a heavy reload each time it flips.
+//!
+//! Both are already carried in the contract's declared identity rather than left implicit: the
+//! default [`MemoryRuntimeSemantics`](mlx_gen::gen_core::MemoryRuntimeSemantics)
+//! `cache` axis keys a cached provider on its **engaged composition**, and the component shape is the
+//! typed `load_shape` axis on [`MemoryCalibrationIdentity`] and on the contract itself. A selector
+//! that treats a rung-4 admission as free of reload cost is reading neither.
+//!
+//! This is also why `generate` arms the streamable form **only when the request will actually window**
+//! (`window_size.is_some()`), instead of whenever the load permits it: arming it on a load-shape flag
+//! alone would evict warm pairs for requests that never use the stream.
+//!
 //! **This is the MLX column, and it is not the Candle column.** `candle-gen-anima` is a separate
 //! delivery and inherits nothing from here — not a rung's presence, not its magnitude, not its
 //! mechanism, and above all not a candidate set. Every number in this file was measured on
