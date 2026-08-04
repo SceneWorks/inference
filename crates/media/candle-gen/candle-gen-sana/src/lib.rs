@@ -42,12 +42,20 @@
 //! [`transformer::SanaTransformer::forward_with_guidance`], 1–4 steps, no CFG uncond pass), and the
 //! gen-core [`model`] adapter registered under `sana_sprint_1600m`. The base `sana_1600m` pipeline /
 //! trunk `forward` / example are byte-unchanged — Sprint is purely additive.
+//!
+//! **sc-16959** (epic 16948) wires per-step latent [`preview`]s into **both** routes. This is the only
+//! candle family driving two shared samplers, and the only one carrying two committed fits: base
+//! previews through [`candle_gen::run_flow_sampler`] with the epic-16624 base DC-AE fit, Sprint through
+//! [`candle_gen::run_scm_sampler`] with the Sprint fit and a `1/σ_data` correction. The two
+//! autoencoders differ in their tensor bytes at an identical container size, so the two fits are not
+//! interchangeable — see [`preview`] for the enumeration, the provenance and the guards.
 
 pub mod config;
 pub mod dc_ae;
 pub mod model;
 pub mod nvfp4_dit;
 pub mod pipeline;
+pub mod preview;
 pub mod text_encoder;
 pub mod transformer;
 

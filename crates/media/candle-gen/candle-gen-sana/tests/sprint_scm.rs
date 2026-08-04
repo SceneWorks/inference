@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{CancelFlag, Progress};
+use candle_gen::gen_core::{CancelFlag, PreviewSink, Progress};
+use candle_gen::preview::PreviewHook;
 use candle_gen::{ScmScheduler, Weights};
 use candle_gen_sana::{denoise_sprint, SanaTransformer, SanaTransformerConfig};
 
@@ -70,6 +71,19 @@ fn det(shape: &[usize], seed: u64) -> Tensor {
     Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
 }
 
+/// An inert preview hook (sc-16959): `denoise_sprint` takes its hook by reference rather than as an
+/// `Option`, so a row that is not measuring previews supplies one over a default sink. That is
+/// byte-identical to a run without the seam: `run_scm_sampler` returns before any tensor work when
+/// the sink is inactive. The seam's own coverage is `tests/preview_wiring.rs`.
+fn inert_hook(sink: &PreviewSink) -> PreviewHook<'_> {
+    PreviewHook::new(sink, |latents: &Tensor| {
+        candle_gen_sana::preview::project_sprint_latents(
+            latents,
+            candle_gen_sana::preview::SPRINT_INVERSE_SIGMA_DATA,
+        )
+    })
+}
+
 fn stats(t: &Tensor) -> (f32, f32) {
     let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     (
@@ -102,6 +116,7 @@ fn sprint_scm_2step_finite_nondegenerate() {
         }
     };
 
+    let inert = PreviewSink::default();
     let denoised = denoise_sprint(
         &trunk,
         &scheduler,
@@ -113,6 +128,7 @@ fn sprint_scm_2step_finite_nondegenerate() {
         &dev,
         &cancel,
         &mut on_progress,
+        &inert_hook(&inert),
     )
     .expect("Sprint SCM denoise");
 
@@ -145,6 +161,7 @@ fn sprint_scm_single_step_finite() {
 
     let cancel = CancelFlag::default();
     let mut steps = 0usize;
+    let inert = PreviewSink::default();
     let out = denoise_sprint(
         &trunk,
         &scheduler,
@@ -160,6 +177,7 @@ fn sprint_scm_single_step_finite() {
                 steps += 1;
             }
         },
+        &inert_hook(&inert),
     )
     .expect("single-step Sprint SCM denoise");
     assert_eq!(steps, 1, "single-step SCM runs exactly one step");
@@ -180,6 +198,7 @@ fn sprint_scm_seed_determinism() {
         let latents = det(&[1, cfg.out_channels as usize, 4, 4], 9);
         let scheduler = ScmScheduler::new(4);
         let cancel = CancelFlag::default();
+        let inert = PreviewSink::default();
         let out = denoise_sprint(
             &trunk,
             &scheduler,
@@ -191,6 +210,7 @@ fn sprint_scm_seed_determinism() {
             &dev,
             &cancel,
             &mut |_| {},
+            &inert_hook(&inert),
         )
         .unwrap();
         out.flatten_all().unwrap().to_vec1::<f32>().unwrap()

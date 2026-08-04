@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::{build_flow_sigmas, TimestepConvention};
-use candle_gen::gen_core::{CancelFlag, Image, Progress};
+use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
 use candle_gen::{
     resolve_flow_schedule, run_flow_sampler, run_scm_sampler, CandleError, Result, ScmScheduler,
     Weights,
@@ -101,6 +101,17 @@ pub fn sana_sigmas(scheduler_name: Option<&str>, steps: usize) -> Vec<f32> {
 /// runs the SANA trunk twice (cond + uncond) and combines `uncond + scale·(cond − uncond)`; the Euler
 /// step then advances the latents in σ-space. The trunk timestep is `σ·1000`. When `guidance_scale`
 /// is `<= 1.0` the uncond branch is skipped (CFG off, one forward per step; diffusers parity).
+///
+/// `preview` is the base route's per-step latent preview hook (epic 16948, sc-16959) — the **single**
+/// [`run_flow_sampler`] site in this crate, and the whole of the `sana_1600m` lane's wiring. It is
+/// taken by **reference, not as an `Option`**, so a caller cannot take this lane dark by editing one
+/// argument, which is invisible to `candle-gen-catalog`'s route inventory because that classifies the
+/// driver argument one hop further in. Handing a hook over an inert [`PreviewSink`] is the
+/// way to run this without previews, and it is byte-identical to a run without the seam.
+///
+/// The preview projects the **combined** running latent, never a fused unconditional half: the CFG
+/// pair is two separate trunk forwards inside `predict` and is blended before the solver ever sees it,
+/// so no `[2, …]` batch is ever the tensor handed to the hook.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfg(
     transformer: &SanaTransformer,
@@ -114,6 +125,7 @@ pub fn denoise_cfg(
     device: &Device,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
     let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
@@ -137,7 +149,7 @@ pub fn denoise_cfg(
         seed,
         cancel,
         on_progress,
-        None,
+        Some(preview),
         predict,
     )
 }
@@ -270,10 +282,11 @@ impl SanaPipeline {
         device: &Device,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
         let conditioning = self.encode_conditioning(req, guidance)?;
-        self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress)
+        self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress, preview)
     }
 
     /// Encode the seed-independent prompt inputs once for a whole `count` batch.
@@ -302,6 +315,7 @@ impl SanaPipeline {
         device: &Device,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
@@ -324,16 +338,24 @@ impl SanaPipeline {
             device,
             cancel,
             on_progress,
+            preview,
         )?;
         on_progress(Progress::Decoding);
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
     }
 
     /// Convenience [`SanaPipeline::generate_with`] with a no-op cancel + progress (examples / tests).
+    ///
+    /// Deliberately preview-inert: it takes no [`PreviewSink`], so it hands the denoise a hook over a
+    /// default (inert) one. That costs one `is_active()` check per evaluation and is byte-identical to
+    /// a run without the seam. The **registered** `Generator` lane is [`crate::model`], which builds
+    /// its hook over the request's real sink.
     pub fn generate(&self, req: &SanaGenerateRequest<'_>, device: &Device) -> Result<Image> {
         let cancel = CancelFlag::default();
         let mut noop = |_: Progress| {};
-        self.generate_with(req, device, &cancel, &mut noop)
+        let inert = PreviewSink::default();
+        let preview = crate::preview::base_hook(&inert);
+        self.generate_with(req, device, &cancel, &mut noop, &preview)
     }
 }
 
@@ -447,6 +469,18 @@ pub const SPRINT_DEFAULT_GUIDANCE: f32 = 4.5;
 /// [`candle_gen::run_scm_sampler`] with a single-trunk-forward-per-step `predict` closure. The SCM
 /// scheduler math (angle schedule, trigflow recombination, renoise) lives in the shared sampler; this
 /// only wires the trunk call.
+///
+/// `preview` is the Sprint route's per-step latent preview hook (epic 16948, sc-16959) — the **single**
+/// [`run_scm_sampler`] site in this crate, and the whole of the `sana_sprint_1600m` lane's wiring.
+/// Taken by **reference, not as an `Option`**, for the reason spelled out on [`denoise_cfg`].
+///
+/// Two things differ from the base lane and both are the hook's concern rather than this function's.
+/// The SCM loop has **no σ schedule** — it walks `ScmScheduler` angle timesteps — so the driver keys
+/// frames on the step index, and a 1-step schedule is a real request shape rather than an edge case.
+/// And the loop hands the hook a latent **pre-scaled by `σ_data`**, which the Sprint projector
+/// ([`crate::preview::project_sprint_latents`], through the crate-internal `sprint_hook`) divides back
+/// out. There is no unconditional half here at all: Sprint's guidance is an embedded scalar, not a
+/// cond/uncond pair.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_sprint(
     transformer: &SanaTransformer,
@@ -459,6 +493,7 @@ pub fn denoise_sprint(
     device: &Device,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
     // The embedded guidance scalar (CFG-free): guidance_scale · guidance_embeds_scale, a [1] tensor
     // fed to the trunk's guidance embedder. Constant across steps.
@@ -471,7 +506,15 @@ pub fn denoise_sprint(
             .forward_with_guidance(lat_in, cond, &t, Some(&guidance))
             .map_err(CandleError::from)
     };
-    run_scm_sampler(scheduler, latents, seed, cancel, on_progress, None, predict)
+    run_scm_sampler(
+        scheduler,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        Some(preview),
+        predict,
+    )
 }
 
 /// The composed **SANA-Sprint** text-to-image pipeline (CFG-free SCM/TrigFlow few-step, sc-11781) — a
@@ -539,9 +582,10 @@ impl SanaSprintPipeline {
         device: &Device,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let cond = self.encode_conditioning(req.prompt)?;
-        self.generate_with_conditioning(req, &cond, device, cancel, on_progress)
+        self.generate_with_conditioning(req, &cond, device, cancel, on_progress, preview)
     }
 
     /// Encode the seed-independent Sprint prompt once for a whole `count` batch.
@@ -557,6 +601,7 @@ impl SanaSprintPipeline {
         device: &Device,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
@@ -575,16 +620,22 @@ impl SanaSprintPipeline {
             device,
             cancel,
             on_progress,
+            preview,
         )?;
         on_progress(Progress::Decoding);
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
     }
 
     /// Convenience [`SanaSprintPipeline::generate_with`] with a no-op cancel + progress.
+    ///
+    /// Preview-inert for the same reason [`SanaPipeline::generate`] is, and over the **Sprint** hook —
+    /// the two are not interchangeable, because the two routes carry different fits.
     pub fn generate(&self, req: &SanaGenerateRequest<'_>, device: &Device) -> Result<Image> {
         let cancel = CancelFlag::default();
         let mut noop = |_: Progress| {};
-        self.generate_with(req, device, &cancel, &mut noop)
+        let inert = PreviewSink::default();
+        let preview = crate::preview::sprint_hook(&inert);
+        self.generate_with(req, device, &cancel, &mut noop, &preview)
     }
 }
 
