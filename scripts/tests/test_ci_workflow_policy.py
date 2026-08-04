@@ -7,12 +7,18 @@ import re
 import shutil
 import subprocess
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+MODEL_MANIFEST = WORKFLOW.parents[2] / "release" / "real-weight-models.toml"
+# An `unwired_reason` has to carry an actual explanation. "n/a" or "todo" would silence the gate
+# while recording nothing, which is precisely the failure this exists to prevent -- a deliberate
+# non-goal has to stay legible as a decision. Every real exemption in the manifest is far longer.
+MINIMUM_UNWIRED_REASON = 20
 REAL_WEIGHT_REQUIREMENTS = WORKFLOW.parent.parent / "requirements"
 MACOS_HUB_LOCK = (
     ".github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt"
@@ -433,6 +439,103 @@ def validate_binary_hashed_lock(
         extra = sorted(set(requirements) - expected_packages)
         raise AssertionError(f"lock package set differs: missing={missing}, extra={extra}")
     return requirements
+
+
+def workflow_code(workflows: str) -> str:
+    """The workflow text with comment lines removed.
+
+    Over CODE only, for the same reason `test_real_weight_macos_steps_name_the_reviewed_cpython`
+    is: prose documenting a variable necessarily writes the very token being searched for. Without
+    this, a comment explaining why something WAS wired keeps counting as wiring long after the
+    mapping itself is deleted -- exactly the rot this gate exists to catch, hiding inside the gate.
+    `#` covers YAML and the bash `run:` blocks; `rem` covers the Windows `shell: cmd` ones.
+    """
+    return "\n".join(
+        line
+        for line in workflows.splitlines()
+        if not line.lstrip().startswith("#") and not line.lstrip().lower().startswith("rem ")
+    )
+
+
+def environment_variable_is_referenced(workflows: str, name: str) -> bool:
+    """True when the workflows reference `name` as something a test process can actually read.
+
+    Whole-token, so a longer name cannot lend its wiring to a shorter one: with
+    `MMAUDIO_VAE_44K_SNAPSHOT` exported, a bare substring test would call a hypothetical
+    `MMAUDIO_VAE_44K` referenced too and that key's coverage gap would never surface.
+
+    A lone `${{ vars.NAME }}` / `${{ env.NAME }}` / `${{ secrets.NAME }}` does NOT count. A
+    repository variable can be mapped onto a differently-named job variable --
+    `MMAUDIO_BIGVGAN_V2_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}` does exactly that -- so
+    those prove a value was read out of repository settings or an earlier step, never that any
+    process sees an environment variable under that name.
+    """
+    code = workflow_code(workflows)
+    for match in re.finditer(rf"(?<![A-Z0-9_]){re.escape(name)}(?![A-Z0-9_])", code):
+        if not code[: match.start()].endswith(("vars.", "env.", "secrets.")):
+            return True
+    return False
+
+
+def models_exported_by_key(workflows: str) -> set[str]:
+    """Model keys wired through `export_model_snapshot_paths.py --model <key>`.
+
+    That helper reads the manifest and writes `<environment name>=<path>` straight into GITHUB_ENV,
+    so the variable name never appears in the workflow at all. The Stable Audio 3 lanes wire every
+    snapshot this way; without this channel the gate would report them as orphans. Deliberately
+    scoped to that script -- `ensure_model_snapshot.py --model <key>` takes the same flag but only
+    materializes weights on disk and exports nothing. Over code only, like the reference check --
+    a comment recalling a lane that USED to export a key must not keep that key looking wired.
+    """
+    keys: set[str] = set()
+    for tail in workflow_code(workflows).split("export_model_snapshot_paths.py")[1:]:
+        command: list[str] = []
+        for line in tail.splitlines():
+            command.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        keys.update(re.findall(r"--model[=\s]+([A-Za-z0-9._-]+)", " ".join(command)))
+    return keys
+
+
+def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> list[str]:
+    """Report manifest `environment` keys no workflow references, and exemptions that went stale.
+
+    Both directions matter, and only checking one is how this rots. A key nothing references means
+    the model is pinned, provisioned and holding disk on a runner while the tests it gates run
+    NOWHERE -- sc-17266 found eleven at once, among them the MMAudio MM-DiT and both decoder stages,
+    each with real conformance gates that had never executed. An `unwired_reason` on a key that IS
+    referenced means the exemption outlived its justification, which is how the record of a
+    deliberate non-goal (Mochi-1's freeze) decays into something indistinguishable from an oversight.
+    """
+    exported_by_key = models_exported_by_key(workflows)
+    errors: list[str] = []
+    for model in models:
+        key = model.get("key", "<unkeyed>")
+        reason = model.get("unwired_reason")
+        variables = model.get("environment", [])
+        if not variables:
+            errors.append(f"{key}: declares no environment variable")
+            continue
+        if reason is not None and (
+            not isinstance(reason, str) or len(reason.strip()) < MINIMUM_UNWIRED_REASON
+        ):
+            errors.append(
+                f"{key}: unwired_reason must explain the exemption, got {reason!r}"
+            )
+        for name in variables:
+            if key in exported_by_key or environment_variable_is_referenced(workflows, name):
+                if reason is not None:
+                    errors.append(
+                        f"{key}: {name} is referenced by a workflow but still carries "
+                        "unwired_reason -- delete the stale exemption"
+                    )
+            elif reason is None:
+                errors.append(
+                    f"{key}: {name} is declared but referenced by no workflow -- wire a lane "
+                    "or record an unwired_reason"
+                )
+    return errors
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
@@ -983,6 +1086,127 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(script.count(qwen_fingerprint), 1)
         self.assertEqual(script.count("$QwenCalibrationFingerprint"), 4)
         self.assertNotIn("qwen-image-cuda-residency-v1", script)
+
+    def test_manifest_environment_keys_are_wired_or_explicitly_exempt(self) -> None:
+        models = tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        # Every workflow, not just the two that exist today: a lane added in a third file must
+        # count as wiring, or this gate would start reporting phantom orphans.
+        workflows = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(WORKFLOW.parent.glob("*.yml"))
+        )
+        self.assertEqual(manifest_environment_wiring_errors(models, workflows), [])
+
+    def test_manifest_wiring_policy_discriminates_mutations(self) -> None:
+        # The detector has to detect. Each case below is a defect shape that really occurred:
+        # sc-17250 found three orphans by hand, sc-17266 eight more, and Mochi-1's freeze is a
+        # decision that must not read as an oversight once someone finally wires a lane for it.
+        wired = {"key": "wired", "environment": ["WIRED_SNAPSHOT"]}
+        exempt = {
+            "key": "exempt",
+            "environment": ["OFF_SNAPSHOT"],
+            "unwired_reason": "operator-run by design, not a CI lane",
+        }
+        text = "      WIRED_SNAPSHOT: ${{ vars.WIRED_SNAPSHOT }}\n"
+        self.assertEqual(manifest_environment_wiring_errors([wired, exempt], text), [])
+
+        orphan = {"key": "orphan", "environment": ["ORPHAN_SNAPSHOT"]}
+        self.assertIn(
+            "referenced by no workflow",
+            "\n".join(manifest_environment_wiring_errors([orphan], text)),
+        )
+
+        stale = dict(exempt, environment=["WIRED_SNAPSHOT"])
+        self.assertIn(
+            "delete the stale exemption",
+            "\n".join(manifest_environment_wiring_errors([stale], text)),
+        )
+
+        for empty in ("", "   ", "n/a", None):
+            hollow = dict(orphan, unwired_reason=empty)
+            self.assertNotEqual(
+                manifest_environment_wiring_errors([hollow], text),
+                [],
+                f"unwired_reason={empty!r} must not be able to silence the gate",
+            )
+
+        # A longer referenced name must not lend its wiring to a shorter declared one.
+        prefix = {"key": "prefix", "environment": ["WIRED"]}
+        self.assertIn(
+            "referenced by no workflow",
+            "\n".join(manifest_environment_wiring_errors([prefix], text)),
+        )
+
+        # A repository variable mapped onto a DIFFERENT job variable does not wire its own name.
+        remapped = "      OTHER_SNAPSHOT: ${{ vars.ORPHAN_SNAPSHOT }}\n"
+        self.assertIn(
+            "referenced by no workflow",
+            "\n".join(manifest_environment_wiring_errors([orphan], remapped)),
+        )
+
+        # ...but the same name on the left of the mapping does.
+        self.assertEqual(
+            manifest_environment_wiring_errors(
+                [orphan], "      ORPHAN_SNAPSHOT: ${{ vars.SOMETHING_ELSE }}\n"
+            ),
+            [],
+        )
+
+        # export_model_snapshot_paths.py wires by MODEL KEY, so the variable name never appears.
+        exported = "        run: python3.12 scripts/release/export_model_snapshot_paths.py --model orphan\n"
+        self.assertEqual(manifest_environment_wiring_errors([orphan], exported), [])
+        self.assertEqual(
+            models_exported_by_key(
+                "python3.12 scripts/release/export_model_snapshot_paths.py \\\n"
+                "  --model alpha --model beta\n"
+                "python scripts/release/ensure_model_snapshot.py --model provisioned-only\n"
+            ),
+            {"alpha", "beta"},
+        )
+        # Materializing weights is not wiring: ensure_model_snapshot.py exports nothing.
+        provisioned = "        run: python scripts/release/ensure_model_snapshot.py --model orphan\n"
+        self.assertIn(
+            "referenced by no workflow",
+            "\n".join(manifest_environment_wiring_errors([orphan], provisioned)),
+        )
+
+        # PROSE IS NOT WIRING. The comment documenting a variable necessarily writes its name, so
+        # without a code-only filter a comment left behind by a deleted mapping keeps the key
+        # looking wired forever -- the gate would hide the exact rot it exists to find. This one is
+        # not hypothetical: sc-17266's own comments name every variable the same commit wires.
+        for prose in (
+            "      # ORPHAN_SNAPSHOT used to be set here\n",
+            "          rem ORPHAN_SNAPSHOT is materialized elsewhere\n",
+            "      # historical: export_model_snapshot_paths.py --model orphan\n",
+        ):
+            with self.subTest(prose=prose.strip()):
+                self.assertIn(
+                    "referenced by no workflow",
+                    "\n".join(manifest_environment_wiring_errors([orphan], prose)),
+                )
+        # A real mapping still counts even when a comment above it names the same variable.
+        documented = (
+            "      # ORPHAN_SNAPSHOT feeds the decoder conformance test\n"
+            "      ORPHAN_SNAPSHOT: ${{ vars.SOMETHING_ELSE }}\n"
+        )
+        self.assertEqual(manifest_environment_wiring_errors([orphan], documented), [])
+
+        # A pure consumer proves nothing: `${{ env.X }}` reads a value someone else must define.
+        self.assertIn(
+            "referenced by no workflow",
+            "\n".join(
+                manifest_environment_wiring_errors(
+                    [orphan], "        run: echo ${{ env.ORPHAN_SNAPSHOT }}\n"
+                )
+            ),
+        )
+
+        self.assertIn(
+            "declares no environment variable",
+            "\n".join(
+                manifest_environment_wiring_errors([{"key": "bare", "environment": []}], text)
+            ),
+        )
 
     def test_memory_evidence_v1_lane_is_exact_artifact_bound_and_operator_dispatched(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")

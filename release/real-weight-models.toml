@@ -1,3 +1,15 @@
+# Pinned real-weight model catalogue.
+#
+# `environment` names the variables that point a real-weight test at this model's snapshot. Every
+# such name is expected to be referenced somewhere under `.github/workflows/` — otherwise the model
+# is provisioned, pinned and stored, but the tests it gates run nowhere. That is not a hypothetical:
+# an exhaustive cross-check in sc-17266 found eleven such keys at once, several of them backing
+# real conformance and parity gates that had never executed.
+#
+# `test_manifest_environment_keys_are_wired_or_explicitly_exempt` in
+# `scripts/tests/test_ci_workflow_policy.py` enforces this both ways. A model whose keys are
+# deliberately NOT wired must say so in `unwired_reason`, and a model that carries an
+# `unwired_reason` must NOT be referenced — so an exemption cannot quietly outlive its reason.
 schema_version = 1
 captured_on = "2026-07-12"
 
@@ -49,6 +61,20 @@ license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-cuda-residency-ab"]
 environment = ["QWEN_IMAGE_SNAPSHOT"]
+# The `media-cuda-residency-ab` profile is operator-run by design, not a CI lane:
+# `scripts/release/run-residency-ab.ps1` drives it by hand, and
+# `test_residency_ab_is_operator_run_without_ci_model_dependencies` asserts this variable never
+# appears in real-weights.yml. Wiring it would contradict that recorded decision, so the exemption
+# is recorded here instead (sc-17266). Note the repository variable's value
+# (C:\Users\Michael\.cache\huggingface\hub\models--Qwen--Qwen-Image\...) does not currently exist on
+# nax-windows, so a lane added today would fail closed on materialization anyway.
+#
+# SEPARATELY UNCOVERED, and NOT what this exemption blesses: 45 mlx-gen-qwen-image real-weight
+# tests across 13 files also read QWEN_IMAGE_SNAPSHOT, plus two candle-gen-qwen-image CUDA tests
+# (tests/conformance.rs and the src/lib.rs probed-offload test). No lane runs any of them. The MLX
+# half needs a Mac, because mlx-gen does not build on Windows; the candle half is buildable here but
+# blocked on the ~60 GB snapshot above not existing on the box. Tracked as sc-17284.
+unwired_reason = "operator-run residency A/B (run-residency-ab.ps1), deliberately outside CI (sc-17266)"
 expected_files = [
     "model_index.json",
     "tokenizer/tokenizer.json",
@@ -68,6 +94,12 @@ license = "FLUX-1-dev Non-Commercial License"
 size_class = "very-large"
 profiles = ["media-cuda-residency-ab"]
 environment = ["FLUX_DEV_DIR"]
+# Same operator-run residency A/B profile as qwen-image above (sc-17266): driven by
+# scripts/release/run-residency-ab.ps1, and kept out of real-weights.yml by
+# test_residency_ab_is_operator_run_without_ci_model_dependencies. The snapshot IS present on
+# nax-windows (E:\huggingface\hub\models--black-forest-labs--FLUX.1-dev\...), so unlike qwen-image
+# this one is earning its disk through the operator lane.
+unwired_reason = "operator-run residency A/B (run-residency-ab.ps1), deliberately outside CI (sc-17266)"
 expected_files = [
     "model_index.json",
     "tokenizer/vocab.json",
@@ -452,6 +484,12 @@ license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MOCHI_SNAPSHOT"]
+# Michael, 2026-08-03: "Mochi-1 does not need to be tested. That code is frozen until a lightning
+# version is released. I don't want any weights tests because it will take hours. It's the slowest
+# model I've ever seen." The 13 crate files reading MOCHI_SNAPSHOT are therefore ungated ON PURPOSE.
+# Do not "fix" this by adding a lane; revisit only when a Mochi lightning variant makes a
+# real-weight run tractable.
+unwired_reason = "frozen until a Mochi lightning variant lands; a real-weight run takes hours (sc-17266)"
 expected_files = [
     "model_index.json",
     "tokenizer/spiece.model",
@@ -636,7 +674,12 @@ revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "very-large"
 profiles = ["audio-cuda"]
-environment = ["MMAUDIO_DIT_44K_SNAPSHOT"]
+# sc-17266: this declared MMAUDIO_DIT_44K_SNAPSHOT, a name NO crate file has ever read. Unlike the
+# 16k DiT (MMAUDIO_DIT_SNAPSHOT, tests/mmdit_conformance.rs) the 44k network has no standalone
+# component test; it is reached only through tests/common/mod.rs::dit_44k_source(), which joins
+# `weights/mmaudio_large_44k_v2.pth` onto the shared hkchengrex repo dir. That shared dir variable is
+# what the checkpoint actually resolves from, so it is the one declared here.
+environment = ["MMAUDIO_MMAUDIO_SNAPSHOT"]
 expected_files = ["weights/mmaudio_large_44k_v2.pth"]
 download_files = ["weights/mmaudio_large_44k_v2.pth"]
 

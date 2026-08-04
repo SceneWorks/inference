@@ -3319,7 +3319,11 @@ jobs:
       # vocoder), apple/DFN5B-CLIP (clip), nvidia/bigvgan (44k vocoder).
       MMAUDIO_MMAUDIO_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       MMAUDIO_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
-      MMAUDIO_BIGVGAN_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}
+      # The nvidia 44k vocoder repo. The repository VARIABLE is still named MMAUDIO_BIGVGAN_SNAPSHOT
+      # (renaming it is an out-of-band action on the box); the env var the crate reads is
+      # MMAUDIO_BIGVGAN_V2_SNAPSHOT, because MMAUDIO_BIGVGAN_SNAPSHOT means hkchengrex/MMAudio's
+      # *16k* best_netG.pt everywhere else (manifest + conformance_output.rs) — sc-17266.
+      MMAUDIO_BIGVGAN_V2_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}
       # Standalone encoder conformance (sc-13474): the Synchformer + DFN5B-CLIP encoder tests read
       # their OWN env vars. Point them at the SAME snapshots the video->audio provider tests already
       # materialize above (no extra materialize step needed): synchformer resolves under
@@ -3327,6 +3331,16 @@ jobs:
       # tower at <MMAUDIO_CLIP_SNAPSHOT>/open_clip_pytorch_model.bin (clip.rs::load).
       SYNCHFORMER_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       DFN_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
+      # Standalone component conformance (sc-17266): the MM-DiT / 16k-decoder / 44k-decoder tests
+      # each read their own per-component var, all four of which resolve INSIDE the hkchengrex
+      # snapshot already materialized above (vae 16k -> ext_weights/v1-16.pth, 16k vocoder ->
+      # ext_weights/best_netG.pt, vae 44k -> ext_weights/v1-44.pth, dit 16k ->
+      # weights/mmaudio_small_16k.pth). These were declared in release/real-weight-models.toml but
+      # exported by no job, so the three test binaries below had never run anywhere.
+      MMAUDIO_DIT_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_VAE_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_BIGVGAN_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_VAE_44K_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -3362,7 +3376,7 @@ jobs:
           python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
       - name: Run mmaudio real-weight renders
         shell: cmd
         run: |
@@ -3373,3 +3387,34 @@ jobs:
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test clip_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio_44k -- --ignored --nocapture || exit /b 1
+      # Standalone component conformance (sc-17266). These three binaries were never invoked by any
+      # lane, so the MM-DiT flow/sampler and both decoder stages had ZERO automated coverage even
+      # though the manifest declared and pinned their checkpoints.
+      #
+      # Selected by name with `--exact` + a run-count assertion, NOT by whole test binary: an
+      # `#[ignore]` test that stops matching reports "0 passed; N filtered out" and cargo exits 0, so
+      # a rename would silently delete the only coverage these have. `--exact` must come AFTER `--`;
+      # before it, cargo rejects the argument outright and the step never runs at all.
+      #
+      # Two `#[ignore]` tests in these binaries are deliberately NOT selected, because each
+      # early-`return`s to a passing result when its side-channel env var is unset — a run-count
+      # assertion cannot tell that apart from real work:
+      #   - conformance_output::output_parity_dump    — MMAUDIO_DUMP_DIR, a torch-harness dump helper
+      #   - mmdit_conformance::mmdit_matches_reference — MMAUDIO_DIT_PARITY_DIR, a ref_dump.py
+      #     directory that is provisioned by no script and lives in no repo
+      - name: Run mmaudio standalone component conformance
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          call :run_one conformance_output output_latent_to_waveform_finite_deterministic || exit /b 1
+          call :run_one conformance_output_44k output_44k_latent_to_waveform_finite_deterministic || exit /b 1
+          call :run_one mmdit_conformance mmdit_flow_shape_finite_deterministic || exit /b 1
+          call :run_one mmdit_conformance mmdit_sample_shape_finite_deterministic || exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%RUNNER_TEMP%\mmaudio-%~2.log"
+          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test %~1 %~2 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
