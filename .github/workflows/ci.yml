@@ -126,12 +126,16 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Validate normalized workspace
         run: ./scripts/check-workspace.py
+      # Installed BEFORE the tooling tests, not after: `test_mmaudio_reference.py` regenerates the
+      # MMAudio parity fixtures' deterministic inputs (a 28 MP synthetic clip) and compares digests,
+      # which needs numpy. Leaving this after the discover step would turn that gate into an import
+      # error rather than a check (sc-17285).
+      - name: Install pinned tooling test dependencies
+        run: python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0
       - name: Test repository tooling
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Test Mage oracle provisioning failures
-        run: |
-          python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0
-          python3 scripts/release/provision_mage_oracles.py --self-test
+        run: python3 scripts/release/provision_mage_oracles.py --self-test
 
   contracts:
     name: contracts + conformance testkits (Linux)

@@ -3594,13 +3594,20 @@ jobs:
       # a rename would silently delete the only coverage these have. `--exact` must come AFTER `--`;
       # before it, cargo rejects the argument outright and the step never runs at all.
       #
-      # Two `#[ignore]` tests in these binaries are deliberately NOT selected, because each
-      # early-`return`s to a passing result when its side-channel env var is unset — a run-count
-      # assertion cannot tell that apart from real work:
-      #   - conformance_output::output_parity_dump    — MMAUDIO_DUMP_DIR, a torch-harness dump helper
-      #   - mmdit_conformance::mmdit_matches_reference — MMAUDIO_DIT_PARITY_DIR, a ref_dump.py
-      #     directory that is provisioned by no script and lives in no repo
-      - name: Run mmaudio standalone component conformance
+      # The last five entries are the torch-parity gates (sc-17285) — the strongest correctness
+      # evidence this port has. The conformance tests above prove shape, finiteness, range and
+      # determinism; only these compare the candle numbers against the PyTorch reference, so only
+      # these would catch a subtly wrong weight mapping that still produces plausible audio.
+      #
+      # All five were unreachable until sc-17285: each read a dump path from an environment variable
+      # that no workflow set and no committed script produced. Two of them —
+      # conformance_output::output_16k_matches_reference (then `output_parity_dump`) and
+      # mmdit_conformance::mmdit_matches_reference — additionally `return`ed early to a PASSING
+      # result when their variable was unset, which is why sc-17266 had to exclude them by name
+      # here rather than inherit a vacuous green. Their references are now committed fixtures under
+      # tests/fixtures/, resolved from CARGO_MANIFEST_DIR by
+      # `scripts/reference/mmaudio_reference.py`, so there is no unset case and no exclusion left.
+      - name: Run mmaudio standalone component and torch-parity conformance
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -3608,6 +3615,11 @@ jobs:
           call :run_one conformance_output_44k output_44k_latent_to_waveform_finite_deterministic || exit /b 1
           call :run_one mmdit_conformance mmdit_flow_shape_finite_deterministic || exit /b 1
           call :run_one mmdit_conformance mmdit_sample_shape_finite_deterministic || exit /b 1
+          call :run_one conformance_output output_16k_matches_reference || exit /b 1
+          call :run_one mmdit_conformance mmdit_matches_reference || exit /b 1
+          call :run_one parity_reference assembly_matches_reference_waveform || exit /b 1
+          call :run_one parity_reference_44k assembly_44k_matches_reference_waveform || exit /b 1
+          call :run_one parity_reference_44k_decoder decoder_44k_matches_reference_mel_and_waveform || exit /b 1
           exit /b 0
 
           :run_one

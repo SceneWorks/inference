@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "upstreamRepository": "hkchengrex/MMAudio",
+  "upstreamRevision": "974010a026c731054592d8f777218bd9d85a6c24",
+  "vendorTreeSha256": "3001949a37b78ae4fb274ce5f2ea617d15696788fa784c7af2d865ad53c6cead",
+  "device": "cpu",
+  "dtype": "float32",
+  "prompt": "a wooden door creaks open, then footsteps on gravel",
+  "negativePrompt": "music",
+  "seed": 42,
+  "cfgStrength": 4.5,
+  "numSteps": 25,
+  "duration": 8.0,
+  "snapshotRevisions": {
+    "dfn5b-clip-vit-h14-384": "01b771ed0d1395ca5ffdd279897d665ebe00dfd2",
+    "mmaudio-bigvgan-16k": "eb13a1a98fdbec91753775c57b074ccdfc60587c",
+    "mmaudio-large-44k-v2": "eb13a1a98fdbec91753775c57b074ccdfc60587c",
+    "mmaudio-small-16k": "eb13a1a98fdbec91753775c57b074ccdfc60587c",
+    "mmaudio-vae-16k": "eb13a1a98fdbec91753775c57b074ccdfc60587c",
+    "mmaudio-vae-44k": "eb13a1a98fdbec91753775c57b074ccdfc60587c",
+    "nvidia-bigvgan-v2-44khz-128band-512x": "95a9d1dcb12906c03edd938d77b9333d6ded7dfb",
+    "synchformer": "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+  },
+  "producerEnvironment": {
+    "einops": "0.8.2",
+    "huggingface-hub": "1.26.0",
+    "librosa": "0.11.0",
+    "numpy": "2.4.6",
+    "omegaconf": "2.3.1",
+    "open_clip_torch": "3.3.0",
+    "requests": "2.34.2",
+    "safetensors": "0.8.0",
+    "timm": "1.0.28",
+    "torch": "2.13.0",
+    "torchdiffeq": "0.2.5",
+    "torchvision": "0.28.0",
+    "tqdm": "4.70.0"
+  },
+  "deterministicInputs": {
+    "clip_frames_u8": "f02f5884e00d147ab7e8283928a5d83d9ebb368eeee520365df7a9a7bb5edcd0",
+    "sync_frames_u8": "dfce11b69a81352fd5ad8c5cab971d752b2e7e10643567e54496d031f43366be",
+    "fixed_latent_16k": "4ec39c7cf7849f35b2aea8f01e6b7d06afd69660abc8a76956b2f7fdc2cddbb6"
+  },
+  "files": {
+    "mmaudio_parity_reference.safetensors": {
+      "bytes": 2015312,
+      "sha256": "3b18b2db58e89432d67e1557f921543cf3aceec552827d69db08679a140e00cb"
+    },
+    "mmaudio_parity_reference_44k.safetensors": {
+      "bytes": 2951632,
+      "sha256": "b10132b0840383022bb8539a08800fb9860d703fdc06a7bb7458ae9fd270abda"
+    },
+    "mmaudio_parity_reference_44k_decoder.safetensors": {
+      "bytes": 1821840,
+      "sha256": "f61a08e2a43b19d75b97dd2517368eea4cafbad41c57b5fcb6a47b36ac9a2370"
+    },
+    "mmaudio_parity_output_16k.safetensors": {
+      "bytes": 133096,
+      "sha256": "a1a4b3e7f37bfb8a08ac1f6b155dc1e6cc496af63f94f35790a02b09cc1af25f"
+    },
+    "mmaudio_parity_mmdit.safetensors": {
+      "bytes": 1247964,
+      "sha256": "cf942ac38d455ae0433cd55e29f0c957753212cfe6c2a6062bf959f9a9f3445d"
+    }
+  }
+}
