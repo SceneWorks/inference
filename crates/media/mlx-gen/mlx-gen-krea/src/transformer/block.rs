@@ -14,6 +14,7 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -139,6 +140,17 @@ impl GatedAttention {
     /// `x`: `[b, s, hidden]`. `rope`: `Some((cos, sin))` (`[1, s, head_dim/2]`) for the single-stream
     /// blocks; `None` for the text-fusion blocks (no positional encoding). Unmasked (B=1 full sequence).
     pub fn forward(&self, x: &Array, rope: Option<(&Array, &Array)>) -> Result<Array> {
+        self.forward_budgeted(x, rope, AttentionPlan::UNBOUNDED)
+    }
+
+    /// Inference forward with request-scoped query-row chunking. Training keeps calling
+    /// [`Self::forward`], so checkpointed SDPA never evaluates inside an autograd trace.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        rope: Option<(&Array, &Array)>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let q = self
@@ -186,7 +198,7 @@ impl GatedAttention {
                 mlx_gen::Error::Msg("krea: SDPA checkpoint produced no output".into())
             })?
         } else {
-            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, attention)?
         };
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?
@@ -412,6 +424,17 @@ impl SingleStreamBlock {
     /// `x`: `[b, s, hidden]`, `tvec`: `[b, 1, 6·hidden]` (shared `time_mod_proj` output), `cos`/`sin`:
     /// `[1, s, head_dim/2]`.
     pub fn forward(&self, x: &Array, tvec: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+        self.forward_budgeted(x, tvec, cos, sin, AttentionPlan::UNBOUNDED)
+    }
+
+    pub(crate) fn forward_budgeted(
+        &self,
+        x: &Array,
+        tvec: &Array,
+        cos: &Array,
+        sin: &Array,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let m = add(tvec, &self.scale_shift_table)?; // [b, 1, 6·hidden]
         let m = split(&m, 6, 2)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&m[0], &m[1], &m[2]);
@@ -421,7 +444,9 @@ impl SingleStreamBlock {
             &multiply(&self.prenorm.forward(x)?, &plus1(prescale)?)?,
             preshift,
         )?;
-        let attn = self.attn.forward(&pre, Some((cos, sin)))?;
+        let attn = self
+            .attn
+            .forward_budgeted(&pre, Some((cos, sin)), attention)?;
         let x = add(x, &multiply(pregate, &attn)?)?;
 
         let post = add(

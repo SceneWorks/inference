@@ -34,6 +34,7 @@ use crate::config::Krea2Config;
 use crate::quant::lin;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::train::lora::LoraParams;
 use rope::RopeTables;
 
@@ -342,7 +343,13 @@ impl Krea2Transformer {
         timestep: &Array,
         prep: &EditPrep,
     ) -> Result<Array> {
-        self.forward_prepared_edit_windowed(noise_latent, timestep, prep, None)
+        self.forward_prepared_edit_windowed_budgeted(
+            noise_latent,
+            timestep,
+            prep,
+            None,
+            AttentionPlan::UNBOUNDED,
+        )
     }
 
     fn edit_joint_inputs(
@@ -388,11 +395,19 @@ impl Krea2Transformer {
         prep: &JointPrep,
     ) -> Result<Array> {
         let j = self.joint_inputs(latent, timestep, prep)?;
-        let combined = self.run_blocks(j.combined.clone(), &j.tvec, &j.rcos, &j.rsin, None)?;
+        let combined = self.run_blocks(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            None,
+            AttentionPlan::UNBOUNDED,
+        )?;
         self.finalize(&combined, &j.t, &j)
     }
 
     /// Prepared text-to-image/img2img forward with an optional shared block-residency window.
+    #[cfg(test)]
     pub(crate) fn forward_prepared_windowed(
         &self,
         latent: &Array,
@@ -400,14 +415,39 @@ impl Krea2Transformer {
         prep: &JointPrep,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        self.forward_prepared_windowed_budgeted(
+            latent,
+            timestep,
+            prep,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let j = self.joint_inputs(latent, timestep, prep)?;
-        let combined = self.run_blocks(j.combined.clone(), &j.tvec, &j.rcos, &j.rsin, window)?;
+        let combined = self.run_blocks(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            window,
+            attention,
+        )?;
         self.finalize(&combined, &j.t, &j)
     }
 
     /// Run conditional and unconditional prepared states through one block traversal. Under bounded
     /// residency each block is reconstructed once, then applied to both independent carries before
     /// both are evaluated and the window is released.
+    #[cfg(test)]
     pub(crate) fn forward_prepared_pair_windowed(
         &self,
         latent: &Array,
@@ -416,6 +456,25 @@ impl Krea2Transformer {
         negative: &JointPrep,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<(Array, Array)> {
+        self.forward_prepared_pair_windowed_budgeted(
+            latent,
+            timestep,
+            positive,
+            negative,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         let positive = self.joint_inputs(latent, timestep, positive)?;
         let negative = self.joint_inputs(latent, timestep, negative)?;
         let (positive_combined, negative_combined) = self.run_blocks_paired(
@@ -423,6 +482,7 @@ impl Krea2Transformer {
             (&positive.tvec, &positive.rcos, &positive.rsin),
             (&negative.tvec, &negative.rcos, &negative.rsin),
             window,
+            attention,
         )?;
         Ok((
             self.finalize(&positive_combined, &positive.t, &positive)?,
@@ -431,6 +491,7 @@ impl Krea2Transformer {
     }
 
     /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
+    #[cfg(test)]
     pub(crate) fn forward_prepared_edit_windowed(
         &self,
         latent: &Array,
@@ -438,8 +499,25 @@ impl Krea2Transformer {
         prep: &EditPrep,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        self.forward_prepared_edit_windowed_budgeted(
+            latent,
+            timestep,
+            prep,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_edit_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let (mut combined, t, tvec) = self.edit_joint_inputs(latent, timestep, prep)?;
-        combined = self.run_blocks(combined, &tvec, &prep.rcos, &prep.rsin, window)?;
+        combined = self.run_blocks(combined, &tvec, &prep.rcos, &prep.rsin, window, attention)?;
         let out = self.final_layer(&combined, &t)?;
         let img_len = prep.ht * prep.wt;
         let head = prep.cap_len + prep.n_refs * img_len;
@@ -448,6 +526,7 @@ impl Krea2Transformer {
     }
 
     /// Paired conditional/unconditional edit forward with one block-window traversal.
+    #[cfg(test)]
     pub(crate) fn forward_prepared_edit_pair_windowed(
         &self,
         latent: &Array,
@@ -455,6 +534,25 @@ impl Krea2Transformer {
         positive: &EditPrep,
         negative: &EditPrep,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        self.forward_prepared_edit_pair_windowed_budgeted(
+            latent,
+            timestep,
+            positive,
+            negative,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_edit_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (positive_combined, positive_t, positive_tvec) =
             self.edit_joint_inputs(latent, timestep, positive)?;
@@ -465,6 +563,7 @@ impl Krea2Transformer {
             (&positive_tvec, &positive.rcos, &positive.rsin),
             (&negative_tvec, &negative.rcos, &negative.rsin),
             window,
+            attention,
         )?;
         let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
             let out = self.final_layer(combined, t)?;
@@ -479,17 +578,46 @@ impl Krea2Transformer {
         ))
     }
 
+    /// Pose-control forward over the same request-scoped base-block window as the ordinary routes.
+    /// The control branch remains a separately-accounted resident overlay; `inject` applies its
+    /// precomputed residual immediately before each matching frozen base block.
+    pub(crate) fn forward_prepared_injected_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+        mut inject: impl FnMut(usize, Array, i32) -> Result<Array>,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks_injected(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            window,
+            attention,
+            j.cap_len,
+            &mut inject,
+        )?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
     fn run_blocks_paired(
         &self,
         mut states: (Array, Array),
         positive: (&Array, &Array, &Array),
         negative: (&Array, &Array, &Array),
         window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let Some(window) = window else {
             for block in &self.blocks {
-                states.0 = block.forward(&states.0, positive.0, positive.1, positive.2)?;
-                states.1 = block.forward(&states.1, negative.0, negative.1, negative.2)?;
+                states.0 = block
+                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+                states.1 = block
+                    .forward_budgeted(&states.1, negative.0, negative.1, negative.2, attention)?;
             }
             return Ok(states);
         };
@@ -517,8 +645,14 @@ impl Krea2Transformer {
                     states,
                     range,
                     |index| stream.materialize(view, index),
-                    |block, state| block.forward(&state, positive.0, positive.1, positive.2),
-                    |block, state| block.forward(&state, negative.0, negative.1, negative.2),
+                    |block, state| {
+                        block
+                            .forward_budgeted(&state, positive.0, positive.1, positive.2, attention)
+                    },
+                    |block, state| {
+                        block
+                            .forward_budgeted(&state, negative.0, negative.1, negative.2, attention)
+                    },
                 )
             },
             |(positive, negative): &(Array, Array)| {
@@ -534,10 +668,11 @@ impl Krea2Transformer {
         rcos: &Array,
         rsin: &Array,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         let Some(window) = window else {
             for block in &self.blocks {
-                combined = block.forward(&combined, tvec, rcos, rsin)?;
+                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
             }
             return Ok(combined);
         };
@@ -564,7 +699,58 @@ impl Krea2Transformer {
                 let mut current = state;
                 for index in range {
                     let block = stream.materialize(view, index)?;
-                    current = block.forward(&current, tvec, rcos, rsin)?;
+                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
+                }
+                Ok(current)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blocks_injected(
+        &self,
+        mut combined: Array,
+        tvec: &Array,
+        rcos: &Array,
+        rsin: &Array,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+        cap_len: i32,
+        inject: &mut impl FnMut(usize, Array, i32) -> Result<Array>,
+    ) -> Result<Array> {
+        let Some(window) = window else {
+            for (index, block) in self.blocks.iter().enumerate() {
+                combined = inject(index, combined, cap_len)?;
+                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
+            }
+            return Ok(combined);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            combined,
+            || stream.open(),
+            |state, view, range| {
+                let mut current = state;
+                for index in range {
+                    current = inject(index, current, cap_len)?;
+                    let block = stream.materialize(view, index)?;
+                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
                 }
                 Ok(current)
             },
@@ -740,13 +926,6 @@ impl Krea2Transformer {
     /// bookkeeping indexes per block.
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
-    }
-
-    /// The frozen single-stream blocks, for the pose-control branch's own injection loop (sc-8465,
-    /// [`crate::control`]): it drives `blk.forward(..)` per block and adds a residual before selected
-    /// blocks, rather than the straight-through [`Self::forward_prepared`] loop.
-    pub(crate) fn blocks(&self) -> &[SingleStreamBlock] {
-        &self.blocks
     }
 
     /// Patch-embed a latent through the frozen base `img_in` (the SAME embedder the noisy image latent
@@ -1188,6 +1367,43 @@ mod tests {
         assert_exact(&resident_positive, &expected_positive);
         assert_exact(&resident_negative, &expected_negative);
         assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        let attention = mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(1, false),
+        );
+        let bounded_positive = transformer
+            .forward_prepared_windowed_budgeted(&latent, &timestep, &positive, None, attention)
+            .unwrap();
+        mlx_rs::transforms::eval([&bounded_positive, &expected_positive]).unwrap();
+        let expected = expected_positive.as_slice::<f32>();
+        let bounded = bounded_positive.as_slice::<f32>();
+        let peak = expected
+            .iter()
+            .fold(0.0_f32, |value, item| value.max(item.abs()))
+            .max(1e-12);
+        let delta = expected
+            .iter()
+            .zip(bounded)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max)
+            / peak;
+        assert!(
+            delta <= 2e-3,
+            "bounded Krea attention changed the prepared DiT output: peak-relative delta {delta:e}"
+        );
+        let cancelled = mlx_gen::CancelFlag::new();
+        cancelled.cancel();
+        let result = transformer.forward_prepared_windowed_budgeted(
+            &latent,
+            &timestep,
+            &positive,
+            None,
+            attention.with_cancel(&cancelled),
+        );
+        assert!(
+            matches!(result, Err(mlx_gen::Error::Canceled)),
+            "a pre-cancelled bounded plan must cross a physical query-chunk boundary"
+        );
 
         materializations.store(0, Ordering::Relaxed);
         let cancel = mlx_gen::CancelFlag::new();
