@@ -59,6 +59,9 @@ fn real_weight_edit() {
         strength: 0.6,
         seed: 12345,
         cancel: CancelFlag::new(),
+        // Inert: this harness validates the img2img strength ablation. The per-step preview stream
+        // (epic 16948, sc-16957) has its own real-weight harness, `tests/preview_real_weights.rs`.
+        preview: candle_gen::gen_core::PreviewSink::default(),
     };
 
     // A second, stylistically distinct prompt at the same seed/strength — proves the edit follows the

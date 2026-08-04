@@ -41,6 +41,11 @@ mod pipeline;
 // candle-transformers models.
 mod packed_dit;
 mod packed_te;
+// The per-step latent-preview seam (epic 16948, sc-16957): the REUSED epic-16624 Z-Image 16-channel
+// fit plus the `[1, 16, 1, h, w]` → `[1, 16, h, w]` frame-axis drop that reaches it. Public because
+// [`control`] and [`edit`] are themselves public, name-driven entry points, so a consumer that stages
+// its own denoise against them needs the same projector rather than a second copy of the fit.
+pub mod preview;
 mod quant;
 mod training;
 
@@ -431,7 +436,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16957). Every Turbo render lane emits: the
+            // resident and staged txt2img/img2img routes hand `run_flow_sampler` a projector hook, and
+            // the name-driven control + edit providers' bespoke Euler loops emit directly. The
+            // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

@@ -44,6 +44,15 @@ pub(crate) const PATCH_SIZE: u32 = 2;
 /// Z-Image latent channel count (the VAE's `latent_channels` and the DiT's `in_channels`).
 pub(crate) const LATENT_CHANNELS: usize = 16;
 
+/// The axis `candle_transformers::models::z_image::preprocess::prepare_inputs` inserts, and the one
+/// the decode tail drops again: the singleton **frame** axis of the `(1, 16, 1, h, w)` running latent.
+///
+/// Named because two seams have to agree about it — [`decode`] squeezes it before handing the VAE its
+/// `(1, 16, h, w)` NCHW latent, and [`crate::preview`] drops the same axis off the same tensor before
+/// projecting it (epic 16948, sc-16957). Spelling it once is what keeps the preview's geometry and the
+/// render's geometry from diverging: there is one source, not two numbers that happen to agree.
+pub(crate) const LATENT_FRAME_AXIS: usize = 2;
+
 /// Qwen3 pad token id (`<|endoftext|>`). Only consulted when padding to a fixed length, which the
 /// Z-Image tokenizer config does not do (`pad_to_max_length: false`); carried for correctness/parity
 /// with the mlx loader.
@@ -276,7 +285,7 @@ pub(crate) fn decode(
     // the FLUX.1 latent space) super-resolves; else the native VAE (its own `/scaling + shift` un-scale
     // is applied inside `decode`). PiD emits a larger `[1,3,4H,4W]` tensor; `postprocess_image` reads
     // the size from the tensor (never `latent*8`).
-    let latents = latents.squeeze(2)?;
+    let latents = latents.squeeze(LATENT_FRAME_AXIS)?;
     let decoded = match pid {
         Some(pid) => pid.decode(&latents)?,
         None => vae.decode(&latents)?.to_dtype(DType::F32)?, // (1, 3, H, W) in [-1, 1]

@@ -966,6 +966,7 @@ impl Krea {
                             sampler: req.sampler.clone(),
                             scheduler: req.scheduler.clone(),
                             transformer_window_size,
+                            memory: req.memory.unwrap_or_default(),
                         };
                         images.push(heavy.heavy.render_multiphase(
                             &plans,
@@ -1050,6 +1051,7 @@ impl Krea {
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                         transformer_window_size,
+                        memory: req.memory.unwrap_or_default(),
                     };
                     // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
                     // both residencies, so a Sequential job (text phase already dropped) is byte-identical

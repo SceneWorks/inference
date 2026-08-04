@@ -44,7 +44,7 @@ use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, LoadPhase, PidWeights, Progress};
+use candle_gen::gen_core::{GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
@@ -181,6 +181,16 @@ pub struct ZImageControlRequest {
     /// the historical resident, unbounded path byte-for-byte unchanged.
     pub memory: GenerationMemory,
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16957) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot use because the worker drives it by name rather than through the
+    /// registry. [`PreviewSink::default`] is inert and byte-identical to a render with no preview at
+    /// all.
+    ///
+    /// Both control modes emit: the base lane hands this to
+    /// [`run_flow_sampler`](candle_gen::run_flow_sampler) as a hook, the distilled Turbo lane's own
+    /// Euler loop emits against it directly.
+    pub preview: PreviewSink,
 }
 
 impl Default for ZImageControlRequest {
@@ -197,6 +207,7 @@ impl Default for ZImageControlRequest {
             use_pid: false,
             memory: GenerationMemory::default(),
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -764,8 +775,17 @@ impl ZImageControl {
         scheduler.set_timesteps(steps, Some(mu));
         let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), &self.device)?;
         let mut latents = prepared.latents;
+        // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
+        // against the shared step-keyed counter — over the same `steps` it reports as `Progress::Step
+        // { total }`, so the preview and the progress bar cannot disagree. Emitted at the TOP of the
+        // iteration, on the latent ENTERING step `step_i`, which is exactly where the shared drivers
+        // emit (`candle-gen/src/sampler.rs`).
+        let preview_counter = crate::preview::bespoke_counter(steps);
         for step_i in 0..steps {
             candle_gen::check_cancel(&req.cancel)?;
+            candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step_i, || {
+                crate::preview::project_frame_latents(&latents)
+            });
             let t = Tensor::from_vec(
                 vec![scheduler.current_timestep_normalized() as f32],
                 (1,),
@@ -823,6 +843,10 @@ impl ZImageControl {
             None => None,
         };
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        // Per-step latent preview (epic 16948, sc-16957). The CFG blend and the constant control
+        // context both live inside the predict closure below, so the hook only ever sees the single
+        // conditional target trajectory.
+        let preview = crate::preview::hook(&req.preview);
         candle_gen::run_flow_sampler(
             None,
             TimestepConvention::OneMinusSigma,
@@ -831,7 +855,7 @@ impl ZImageControl {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |latents, timestep| {
                 let t = Tensor::from_vec(vec![timestep], (1,), &self.device)?;
                 let conditional = transformer
@@ -1033,10 +1057,19 @@ impl ZImageControl {
         let mut latents = prepared.latents;
         let scale = req.control_scale as f64;
 
+        // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
+        // against the shared step-keyed counter — over the same `steps` it reports as `Progress::Step
+        // { total }`. Emitted at the TOP of the iteration, on the latent ENTERING step `step_i`, which
+        // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The 33-channel control
+        // context is a closure capture inside `forward_control`, never part of `latents`.
+        let preview_counter = crate::preview::bespoke_counter(steps);
         for step_i in 0..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step_i, || {
+                crate::preview::project_frame_latents(&latents)
+            });
             let t_norm = scheduler.current_timestep_normalized();
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
             // Dual-injection control forward; the velocity is negated (Z-Image sign convention).
@@ -1139,6 +1172,10 @@ impl ZImageControl {
             None => None,
         };
 
+        // Per-step latent preview (epic 16948, sc-16957). The CFG blend and the constant 33-channel
+        // control context both live inside the predict closure below, so the hook only ever sees the
+        // single conditional target trajectory.
+        let preview = crate::preview::hook(&req.preview);
         let latents = candle_gen::run_flow_sampler(
             None,
             TimestepConvention::OneMinusSigma,
@@ -1147,7 +1184,7 @@ impl ZImageControl {
             req.seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview),
             |latents, t| -> Result<Tensor> {
                 let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                 // Conditional velocity (Z-Image sign convention: the DiT output is negated before the

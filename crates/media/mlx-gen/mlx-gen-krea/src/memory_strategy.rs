@@ -2,6 +2,12 @@
 //!
 //! This module declares only the quality-preserving mechanisms the provider actually executes.
 //! Exact peak envelopes remain in SceneWorks' promoted calibration bundle.
+//!
+//! SC-15517's real q4 1024²/1-step pose-control A/B held staged residency plus the verified 512/64
+//! decode in both arms. Adding 64 Mi-score attention to the resident seven-block pose branch and both
+//! attention/windowing to the reopenable 28-block base DiT reduced request peak from 15.574 GiB to
+//! 9.200 GiB (40.9%) with zero pixel delta. The overlay remains explicitly resident in
+//! `resident_components`; only the base DiT advertises `TransformerComponent::Dit` windowing.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 #[cfg(test)]
@@ -12,13 +18,15 @@ use mlx_gen::gen_core::{
     MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategySupport, Result as CoreResult,
+    MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "krea-control-mlx-v4-q4-pose-bounded-decode-512-64";
+    "krea-control-mlx-full-ladder-512-64-attn64m-window1-2026-08-03-v2";
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
+pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
+pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// Exact tile-edge domain admitted by current real-weight evidence. The 384 px candidate is
 /// deliberately excluded: the clean 1024² sc-16099 run exceeded the established diffusion-latent
 /// maximum-error threshold, so it must not inherit the 512 px calibration.
@@ -37,7 +45,13 @@ pub fn memory_strategy_contract(
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
     let (asset_facts, resident_components) = asset_facts(spec, provider_id)?;
-    memory_strategy_contract_with_asset_facts(provider_id, spec, asset_facts, resident_components)
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        spec,
+        asset_facts,
+        resident_components,
+        streamable_base_transformer(spec, provider_id)?,
+    )
 }
 
 /// Declaration-equivalent contract used only by weights-free registry conformance.
@@ -50,6 +64,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
         spec,
         MemoryAssetFacts::default(),
         Vec::new(),
+        streamable_base_transformer(spec, provider_id)?,
     )
 }
 
@@ -58,6 +73,7 @@ fn memory_strategy_contract_with_asset_facts(
     spec: &LoadSpec,
     asset_facts: MemoryAssetFacts,
     resident_components: Vec<MemoryResidentComponent>,
+    streamable_transformer: bool,
 ) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
     let staged_residency = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential);
@@ -73,6 +89,8 @@ fn memory_strategy_contract_with_asset_facts(
         MemoryFormulaVariable::ConditioningTokenCount,
         MemoryFormulaVariable::OverlayBytes,
         MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+        MemoryFormulaVariable::TransformerWindowSize,
     ];
     Ok(MemoryProviderContract {
         provider_id: provider_id.to_owned(),
@@ -87,30 +105,51 @@ fn memory_strategy_contract_with_asset_facts(
             .map(|strategy| MemoryStrategyCapability {
                 strategy,
                 support: match strategy {
-                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode => {
+                    MemoryStrategy::Resident
+                    | MemoryStrategy::BoundedDecode
+                    | MemoryStrategy::BoundedAttention => MemoryStrategySupport::Implemented,
+                    MemoryStrategy::BoundedTransformerResidency if streamable_transformer => {
                         MemoryStrategySupport::Implemented
                     }
                     MemoryStrategy::StagedResidency if staged_residency => {
                         MemoryStrategySupport::Implemented
                     }
                     MemoryStrategy::StagedResidency
-                    | MemoryStrategy::BoundedAttention
                     | MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
                 },
-                parameters: if strategy == MemoryStrategy::BoundedDecode {
-                    MemoryParameterRanges {
+                parameters: match strategy {
+                    MemoryStrategy::BoundedDecode => MemoryParameterRanges {
                         decode_tile_edges: routes.native_edges().to_vec(),
                         decode_overlaps: vec![DECODE_OVERLAP],
                         ..Default::default()
+                    },
+                    MemoryStrategy::BoundedAttention => MemoryParameterRanges {
+                        attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
+                        ..Default::default()
+                    },
+                    MemoryStrategy::BoundedTransformerResidency if streamable_transformer => {
+                        MemoryParameterRanges {
+                            transformer_window_sizes: vec![TRANSFORMER_WINDOW_SIZE],
+                            transformer_window_components: vec![TransformerComponent::Dit],
+                            ..Default::default()
+                        }
                     }
-                } else {
-                    MemoryParameterRanges::default()
+                    _ => MemoryParameterRanges::default(),
                 },
             })
             .collect(),
         pid_decode_routes: None,
         load_shape: spec.load_shape,
-        additional_prerequisites: Vec::new(),
+        additional_prerequisites: streamable_transformer
+            .then_some((
+                MemoryStrategy::BoundedTransformerResidency,
+                mlx_gen::gen_core::MemoryStrategyPrerequisite::Rung {
+                    rung: MemoryStrategy::StagedResidency,
+                    scope: mlx_gen::gen_core::MemoryPrerequisiteScope::EngagedInSameRequest,
+                },
+            ))
+            .into_iter()
+            .collect(),
         default_engagement_exclusions: Vec::new(),
         resident_request_memory: mlx_gen::gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
@@ -121,8 +160,8 @@ fn memory_strategy_contract_with_asset_facts(
             ],
             synchronized_phase_release: staged_residency,
             decode_tiling: true,
-            attention_chunking: false,
-            transformer_window_materialization: false,
+            attention_chunking: true,
+            transformer_window_materialization: streamable_transformer,
         },
         formula: if resident_components.is_empty() {
             MemoryFormulaKind::PhaseEnvelope { phases, variables }
@@ -140,6 +179,22 @@ fn memory_strategy_contract_with_asset_facts(
         asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
     })
+}
+
+fn streamable_base_transformer(spec: &LoadSpec, provider_id: &str) -> CoreResult<bool> {
+    let mlx_gen::WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(false);
+    };
+    let plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
+    Ok(
+        matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
+            && matches!(
+                spec.load_shape,
+                mlx_gen::gen_core::LoadShape::DeferredMaterialization
+            )
+            && !crate::model::adapters_have_diff_patch(&spec.adapters)
+            && plan.load_time_quant_bits.is_none(),
+    )
 }
 
 fn asset_facts(
@@ -336,7 +391,7 @@ fn begin_request_with_cleanup(
         return Err(CoreError::Unsupported(reason));
     }
     let routes = decode_routes(provider_id)?;
-    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -348,6 +403,14 @@ fn begin_request_with_cleanup(
                 .map_err(CoreError::Unsupported)
         },
     )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten();
     Ok(Some(Box::new(
         mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
     )))
@@ -429,6 +492,43 @@ mod tests {
                 .unwrap()
                 .support,
             MemoryStrategySupport::Implemented
+        );
+
+        let streamable_spec =
+            sequential_spec.with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+        let streamable =
+            memory_strategy_contract("krea_2_turbo_control", &streamable_spec).unwrap();
+        for strategy in [
+            MemoryStrategy::Resident,
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ] {
+            assert_eq!(
+                streamable.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Implemented,
+                "{strategy:?} must be executable on the deferred control composition"
+            );
+        }
+        assert_eq!(
+            streamable
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .parameters
+                .transformer_window_components,
+            vec![TransformerComponent::Dit],
+            "the seven-block pose overlay stays explicitly resident; the reopenable base DiT is windowed"
+        );
+        assert_eq!(
+            streamable.engaged_composition(MemoryStrategy::BoundedTransformerResidency),
+            vec![
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ]
         );
         std::fs::remove_dir_all(root).ok();
     }

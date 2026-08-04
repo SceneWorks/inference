@@ -78,6 +78,7 @@ fn assemble_turnkey_loads() {
                 sampler: None,
                 scheduler: None,
                 transformer_window_size: None,
+                memory: Default::default(),
             },
         )
         .expect("generate_turbo");

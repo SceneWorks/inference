@@ -92,12 +92,13 @@ impl Run {
     }
 }
 
-fn run(stream: bool) -> Run {
+fn run_memory(memory: GenerationMemory) -> Run {
     let generator = mlx_gen_krea::provider_registry()
         .expect("Krea registry")
         .load("krea_2_turbo", &spec())
         .expect("load krea_2_turbo");
-    let req = request(stream);
+    let mut req = request(false);
+    req.memory = Some(memory);
     clear_cache();
     reset_peak_memory();
     let start = std::time::Instant::now();
@@ -133,6 +134,16 @@ fn run(stream: bool) -> Run {
         seconds,
         image,
     }
+}
+
+fn run(stream: bool) -> Run {
+    run_memory(GenerationMemory {
+        stage_residency: true,
+        stream_transformer_blocks: stream,
+        transformer_window_size: stream.then_some(1),
+        transformer_window_component: stream.then_some(TransformerComponent::Dit),
+        ..Default::default()
+    })
 }
 
 fn image_delta(a: &Image, b: &Image) -> (u8, f64) {
@@ -188,5 +199,123 @@ fn window_one_reduces_the_full_request_peak_against_the_resident_attribution_con
     assert!(
         max_delta <= 1,
         "windowed output changed: max channel delta {max_delta}, mean {mean_delta:.6}"
+    );
+}
+
+#[test]
+#[ignore = "needs real Krea weights and Apple/Metal"]
+fn full_shared_ladder_exercises_every_rung_and_preserves_the_image() {
+    let size = std::env::var("KREA_RUNG4_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("set KREA_RUNG4_SIZE to a value greater than 512 so bounded decode launches multiple tiles");
+    assert!(
+        size > mlx_gen_krea::block_memory_strategy::DECODE_TILE_EDGE,
+        "KREA_RUNG4_SIZE={size} does not exceed the 512 px tile edge"
+    );
+    let arms = [
+        (
+            "staged",
+            GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "bounded-decode",
+            GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                decode_tile_edge: Some(mlx_gen_krea::block_memory_strategy::DECODE_TILE_EDGE),
+                decode_overlap: Some(mlx_gen_krea::block_memory_strategy::DECODE_OVERLAP),
+                ..Default::default()
+            },
+        ),
+        (
+            "bounded-attention",
+            GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                chunk_attention: true,
+                decode_tile_edge: Some(mlx_gen_krea::block_memory_strategy::DECODE_TILE_EDGE),
+                decode_overlap: Some(mlx_gen_krea::block_memory_strategy::DECODE_OVERLAP),
+                attention_chunk_size: Some(
+                    mlx_gen_krea::block_memory_strategy::ATTENTION_CHUNK_SIZE,
+                ),
+                ..Default::default()
+            },
+        ),
+        (
+            "bounded-transformer",
+            GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                decode_tile_edge: Some(mlx_gen_krea::block_memory_strategy::DECODE_TILE_EDGE),
+                decode_overlap: Some(mlx_gen_krea::block_memory_strategy::DECODE_OVERLAP),
+                attention_chunk_size: Some(
+                    mlx_gen_krea::block_memory_strategy::ATTENTION_CHUNK_SIZE,
+                ),
+                transformer_window_size: Some(
+                    mlx_gen_krea::block_memory_strategy::TRANSFORMER_WINDOW_SIZE,
+                ),
+                transformer_window_component: Some(TransformerComponent::Dit),
+                ..Default::default()
+            },
+        ),
+    ];
+
+    let mut runs = Vec::with_capacity(arms.len());
+    for (name, memory) in arms {
+        let run = run_memory(memory);
+        println!(
+            "ARM name={name} conditioning_gib={:.3} denoise_gib={:.3} decode_gib={:.3} request_gib={:.3} seconds={:.2}",
+            gib(run.conditioning),
+            gib(run.denoise),
+            gib(run.decode),
+            gib(run.request_peak()),
+            run.seconds,
+        );
+        runs.push((name, run));
+    }
+
+    let baseline = &runs[0].1;
+    let tiled = &runs[1].1;
+    let (decode_max, decode_mean) = image_delta(&baseline.image, &tiled.image);
+    println!(
+        "PARITY rung=bounded-decode max_channel_delta={decode_max} mean_channel_delta={decode_mean:.6}"
+    );
+    assert!(
+        decode_mean < 0.25 && decode_max <= 64,
+        "tiled Qwen-VAE decode exceeded the established seam-tolerance envelope: max {decode_max}, mean {decode_mean:.6}"
+    );
+    for (name, run) in runs.iter().skip(2) {
+        let (max_delta, mean_delta) = image_delta(&tiled.image, &run.image);
+        println!(
+            "PARITY rung={name} vs=bounded-decode max_channel_delta={max_delta} mean_channel_delta={mean_delta:.6}"
+        );
+        assert!(
+            max_delta <= 1,
+            "{name} changed denoise numerics beyond one channel level: max {max_delta}, mean {mean_delta:.6}"
+        );
+    }
+    let full = &runs.last().unwrap().1;
+    assert!(
+        full.request_peak() < baseline.request_peak(),
+        "the full ladder must reduce request peak: full {:.3} GiB, staged {:.3} GiB",
+        gib(full.request_peak()),
+        gib(baseline.request_peak())
+    );
+    println!(
+        "RESULT status=pass provider=krea_2_turbo tier={} fingerprint={} decode_edge={} decode_overlap={} attention_chunk_size={} transformer_window_size={} staged_peak_gib={:.3} full_ladder_peak_gib={:.3}",
+        tier().0,
+        mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
+        mlx_gen_krea::block_memory_strategy::DECODE_TILE_EDGE,
+        mlx_gen_krea::block_memory_strategy::DECODE_OVERLAP,
+        mlx_gen_krea::block_memory_strategy::ATTENTION_CHUNK_SIZE,
+        mlx_gen_krea::block_memory_strategy::TRANSFORMER_WINDOW_SIZE,
+        gib(baseline.request_peak()),
+        gib(full.request_peak()),
     );
 }
