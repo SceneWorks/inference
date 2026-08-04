@@ -19,9 +19,17 @@ use candle_gen::gen_core::{
 };
 use std::sync::{Arc, Mutex};
 
-pub const DECODE_TILE_EDGE: u32 = 512;
+/// Full output edge used by the bounded-decode hook at the representative 1024px calibration cell.
+/// This intentionally does not spatially partition that cell: the saving comes from separating the
+/// full-image attention-bearing head from the upsampling tail's live envelope, while preserving a
+/// near-monolithic numerical path.
+pub const DECODE_TILE_EDGE: u32 = 1024;
 pub const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE];
-pub const DECODE_OVERLAP: u32 = 128;
+/// The shared contract requires a positive overlap domain. At the 1024px full-edge calibration cell
+/// no neighboring tiles exist, so this value is an inert, exactly keyed sentinel rather than a claim
+/// that spatial blending occurred.
+pub const DECODE_OVERLAP: u32 = 1;
+pub const DECODE_OVERLAPS: &[u32] = &[DECODE_OVERLAP];
 pub const ATTENTION_CHUNK_SIZE: u32 =
     gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
@@ -31,7 +39,7 @@ pub const BASE_SINGLE_BLOCKS: u32 = 48;
 pub const BASE_TRANSFORMER_BLOCKS: u32 = BASE_DOUBLE_BLOCKS + BASE_SINGLE_BLOCKS;
 pub const CONTROL_BLOCKS: u32 = 4;
 pub const CALIBRATION_FINGERPRINT: &str =
-    "flux2-dev-cuda-staged-host-decode-bounded-attention-device-format-blocks-v1";
+    "flux2-dev-cuda-staged-host-full-edge-decode-bounded-attention-device-format-blocks-v2";
 pub const CONTROL_OVERLAY: &str = "control";
 
 fn path(source: &WeightsSource) -> &std::path::Path {
@@ -95,7 +103,7 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
             parameters: match strategy {
                 MemoryStrategy::BoundedDecode => MemoryParameterRanges {
                     decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
-                    decode_overlaps: vec![DECODE_OVERLAP],
+                    decode_overlaps: DECODE_OVERLAPS.to_vec(),
                     ..Default::default()
                 },
                 MemoryStrategy::BoundedAttention => MemoryParameterRanges {
@@ -148,6 +156,8 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases.clone(),
             synchronized_phase_release: true,
+            // The hook is implemented, but the sole 1024px production candidate is full-edge and
+            // therefore does not spatially partition the representative calibration cell.
             decode_tiling: true,
             attention_chunking: true,
             transformer_window_materialization: streamable,
@@ -663,7 +673,7 @@ impl MemoryRequestScope for Flux2MemoryScope {
                 "flux2_dev: PiD has no admitted FLUX.2 VAE decode plan".to_owned(),
             ));
         }
-        if DECODE_TILE_EDGES.contains(&tile_edge) && overlap == DECODE_OVERLAP {
+        if DECODE_TILE_EDGES.contains(&tile_edge) && DECODE_OVERLAPS.contains(&overlap) {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
@@ -861,6 +871,12 @@ mod tests {
                 .parameters
                 .decode_tile_edges,
             DECODE_TILE_EDGES
+        );
+        assert_eq!(
+            capability(&contract, MemoryStrategy::BoundedDecode)
+                .parameters
+                .decode_overlaps,
+            DECODE_OVERLAPS
         );
         assert_eq!(
             capability(&contract, MemoryStrategy::BoundedAttention)

@@ -1925,13 +1925,198 @@ mod tests {
         }
     }
 
+    const BOUNDED_DECODE_MAX_ABS_ERROR: f64 = 2.0;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct RgbParityMetrics {
+        changed_fraction: f64,
+        maximum_error: u8,
+        mean_error: f64,
+        root_mean_square_error: f64,
+        psnr_db: f64,
+    }
+
+    fn rgb_parity_metrics(reference: &[u8], candidate: &[u8]) -> Result<RgbParityMetrics, String> {
+        if reference.len() != candidate.len() {
+            return Err(format!(
+                "RGB length mismatch: resident={} candidate={}",
+                reference.len(),
+                candidate.len()
+            ));
+        }
+        if reference.is_empty() {
+            return Err("RGB parity requires a non-empty output".to_owned());
+        }
+        let mut changed = 0u64;
+        let mut maximum = 0u8;
+        let mut absolute_sum = 0u64;
+        let mut square_sum = 0u64;
+        for (&resident, &bounded) in reference.iter().zip(candidate) {
+            let error = resident.abs_diff(bounded);
+            changed += u64::from(error != 0);
+            maximum = maximum.max(error);
+            absolute_sum += u64::from(error);
+            square_sum += u64::from(error) * u64::from(error);
+        }
+        let count = reference.len() as f64;
+        let mean_error = absolute_sum as f64 / count;
+        let root_mean_square_error = (square_sum as f64 / count).sqrt();
+        let psnr_db = if root_mean_square_error == 0.0 {
+            f64::INFINITY
+        } else {
+            20.0 * (255.0 / root_mean_square_error).log10()
+        };
+        Ok(RgbParityMetrics {
+            changed_fraction: changed as f64 / count,
+            maximum_error: maximum,
+            mean_error,
+            root_mean_square_error,
+            psnr_db,
+        })
+    }
+
+    fn output_parity_contract(
+        strategy: gen_core::MemoryStrategy,
+    ) -> gen_core::MemoryParityContract {
+        if strategy >= gen_core::MemoryStrategy::BoundedDecode {
+            gen_core::MemoryParityContract::Tolerance {
+                metric: "rgb8_max_abs_error".to_owned(),
+                maximum_error: BOUNDED_DECODE_MAX_ABS_ERROR,
+            }
+        } else {
+            gen_core::MemoryParityContract::Exact
+        }
+    }
+
+    fn assess_output_parity(
+        strategy: gen_core::MemoryStrategy,
+        reference: &[u8],
+        output: &[u8],
+    ) -> (
+        gen_core::MemoryParityContract,
+        gen_core::MemoryParityResult,
+        Option<RgbParityMetrics>,
+    ) {
+        let bounded = strategy >= gen_core::MemoryStrategy::BoundedDecode;
+        let contract = output_parity_contract(strategy);
+        let metrics = match rgb_parity_metrics(reference, output) {
+            Ok(metrics) => metrics,
+            Err(reason) => {
+                return (
+                    contract,
+                    gen_core::MemoryParityResult::Failed { reason },
+                    None,
+                );
+            }
+        };
+        let passed = if bounded {
+            f64::from(metrics.maximum_error) <= BOUNDED_DECODE_MAX_ABS_ERROR
+        } else {
+            metrics.maximum_error == 0
+        };
+        let result = if passed {
+            gen_core::MemoryParityResult::Passed
+        } else {
+            gen_core::MemoryParityResult::Failed {
+                reason: format!(
+                    "{} parity failed: max_abs={} mean_abs={:.12} rmse={:.12}",
+                    if bounded { "bounded decode" } else { "exact" },
+                    metrics.maximum_error,
+                    metrics.mean_error,
+                    metrics.root_mean_square_error,
+                ),
+            }
+        };
+        (contract, result, Some(metrics))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn measured_output_parity(
+        strategy: gen_core::MemoryStrategy,
+        output: &[u8],
+    ) -> (gen_core::MemoryParityContract, gen_core::MemoryParityResult) {
+        let contract = output_parity_contract(strategy);
+        let Ok(reference_path) = std::env::var("FLUX2_PARITY_REFERENCE") else {
+            return (contract, gen_core::MemoryParityResult::NotRun);
+        };
+        let reference = std::fs::read(&reference_path).unwrap_or_else(|error| {
+            panic!("read FLUX2_PARITY_REFERENCE={reference_path}: {error}")
+        });
+        let (contract, result, metrics) = assess_output_parity(strategy, &reference, output);
+        if let Some(metrics) = metrics {
+            eprintln!(
+                "MEMORY_PARITY_DIAGNOSTIC strategy={strategy:?} reference={} changed_fraction={:.12} max_abs={} mean_abs={:.12} rmse={:.12} psnr_db={:.12}",
+                reference_path,
+                metrics.changed_fraction,
+                metrics.maximum_error,
+                metrics.mean_error,
+                metrics.root_mean_square_error,
+                metrics.psnr_db,
+            );
+        }
+        (contract, result)
+    }
+
+    #[test]
+    fn rgb_parity_metrics_cover_exact_bounded_and_shape_failure() {
+        let exact = rgb_parity_metrics(&[0, 1, 255], &[0, 1, 255]).unwrap();
+        assert_eq!(exact.maximum_error, 0);
+        assert_eq!(exact.changed_fraction, 0.0);
+        assert!(exact.psnr_db.is_infinite());
+
+        let bounded = rgb_parity_metrics(&[0, 10, 255, 100], &[2, 9, 254, 100]).unwrap();
+        assert_eq!(bounded.maximum_error, 2);
+        assert_eq!(bounded.changed_fraction, 0.75);
+        assert_eq!(bounded.mean_error, 1.0);
+        assert!((bounded.root_mean_square_error - (1.5f64).sqrt()).abs() < 1e-12);
+        assert!(rgb_parity_metrics(&[0], &[0, 1]).is_err());
+
+        for strategy in [
+            gen_core::MemoryStrategy::Resident,
+            gen_core::MemoryStrategy::StagedResidency,
+        ] {
+            let (contract, result, _) = assess_output_parity(strategy, &[1, 2], &[1, 2]);
+            assert_eq!(contract, gen_core::MemoryParityContract::Exact);
+            assert_eq!(result, gen_core::MemoryParityResult::Passed);
+        }
+        let (contract, result, _) =
+            assess_output_parity(gen_core::MemoryStrategy::BoundedDecode, &[0, 10], &[2, 9]);
+        assert_eq!(
+            contract,
+            gen_core::MemoryParityContract::Tolerance {
+                metric: "rgb8_max_abs_error".to_owned(),
+                maximum_error: 2.0,
+            }
+        );
+        assert_eq!(result, gen_core::MemoryParityResult::Passed);
+        let (_, result, _) = assess_output_parity(
+            gen_core::MemoryStrategy::BoundedTransformerResidency,
+            &[0],
+            &[3],
+        );
+        assert!(matches!(
+            result,
+            gen_core::MemoryParityResult::Failed { .. }
+        ));
+        let (_, result, metrics) =
+            assess_output_parity(gen_core::MemoryStrategy::Resident, &[0], &[0, 1]);
+        assert!(matches!(
+            result,
+            gen_core::MemoryParityResult::Failed { .. }
+        ));
+        assert!(metrics.is_none());
+    }
+
     /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008
     /// klein). Loads `label`'s snapshot from the `dir_env` env var and runs ONE probed 1024²
     /// generation whose residency mode is carried by `GenerationMemory::stage_residency`, calibrated
-    /// with `FLUX2_OFFLOAD_MODE=request-staged`; it prints one strict `MEMORY_EVIDENCE_V1` record and writes the raw RGB pixels to
-    /// `FLUX2_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and compare: the pixel
-    /// files must be byte-identical (parity) and the sequential peak materially lower (the dense text
-    /// encoder dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc caching
+    /// with `FLUX2_OFFLOAD_MODE=request-staged`; it prints one strict `MEMORY_EVIDENCE_V1` record and
+    /// writes the raw RGB pixels to `FLUX2_OUT`. Run each rung in a SEPARATE process, setting
+    /// `FLUX2_PARITY_REFERENCE` to the resident raw RGB after that first run. Staged residency must be
+    /// byte-exact; decode-composed rungs use the provider-owned `rgb8_max_abs_error <= 2` contract and
+    /// also print changed fraction, mean absolute error, RMSE, and PSNR. The staged peak must be
+    /// materially lower because the dense text encoder is dropped before the DiT loads. Separate
+    /// processes are REQUIRED — candle's cudarc caching
     /// allocator never returns pages to the driver, so a second in-process run reuses the first run's
     /// pool and reads the same peak. `honor_quant` reads `FLUX2_QUANT` (q4/q8) — set for both dev (folds
     /// the 32B DiT + Mistral TE) and klein (sc-11031: folds only the 9B DiT, Qwen3 TE stays dense);
@@ -2042,9 +2227,10 @@ mod tests {
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
+        let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
         eprintln!(
             "{}",
-            candle_gen::testkit::memory_evidence_v1_line(
+            candle_gen::testkit::memory_evidence_v1_line_with_parity(
                 candle_gen::testkit::MemoryEvidenceProbe {
                     resolved_route: label,
                     declared_calibration: candle_gen::testkit::expected_memory_calibration(
@@ -2069,7 +2255,9 @@ mod tests {
                     observed_peak_bytes: live_peak_bytes,
                     harness_version: "candle-flux2-memory-ladder-v1",
                     output_bytes: &img.pixels,
-                }
+                },
+                parity,
+                parity_result,
             )
         );
         eprintln!(
