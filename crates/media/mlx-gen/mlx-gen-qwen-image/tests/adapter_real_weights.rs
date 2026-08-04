@@ -1,7 +1,7 @@
 //! sc-2528: end-to-end Qwen-Image LoRA/LoKr adapter consumption against real weights.
 //!
 //! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot in the HF cache (env
-//! `QWEN_IMAGE_SNAPSHOT`) and the adapter goldens from `tools/dump_qwen_adapter_golden.py`
+//! `MLX_GEN_QWEN_SNAPSHOT`) and the adapter goldens from `tools/dump_qwen_adapter_golden.py`
 //! (gitignored, local). Run:
 //!   python3 crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py
 //!   cargo test -p mlx-gen-qwen-image --release --test adapter_real_weights -- --ignored --nocapture --test-threads=1
@@ -23,7 +23,7 @@ use mlx_rs::ops::array_eq;
 use mlx_rs::Array;
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 

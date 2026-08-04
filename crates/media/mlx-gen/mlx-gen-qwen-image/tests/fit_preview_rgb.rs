@@ -35,7 +35,7 @@
 //! at this configuration, and the printed block is what should replace it.
 //!
 //! ```sh
-//! QWEN_IMAGE_SNAPSHOT=/path/to/Qwen-Image \
+//! MLX_GEN_QWEN_SNAPSHOT=/path/to/Qwen-Image \
 //!   cargo test -p mlx-gen-qwen-image --release --test fit_preview_rgb -- --ignored --nocapture
 //! ```
 
@@ -110,9 +110,9 @@ const COMMITTED_FACTORS: [[f32; 3]; 16] = [
 const COMMITTED_BIAS: [f32; 3] = [0.406258, 0.385829, 0.287052];
 
 fn snapshot() -> PathBuf {
-    PathBuf::from(std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| {
+    PathBuf::from(std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| {
         panic!(
-            "set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or \
+            "set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or \
              derives a cache location (epic 13657)"
         )
     }))
@@ -253,7 +253,7 @@ fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<[f64; 3]>) -> Vec<[f64; 3]> {
 }
 
 #[test]
-#[ignore = "needs the Qwen/Qwen-Image snapshot (QWEN_IMAGE_SNAPSHOT); renders 2x1024^2"]
+#[ignore = "needs the Qwen/Qwen-Image snapshot (MLX_GEN_QWEN_SNAPSHOT); renders 2x1024^2"]
 #[allow(clippy::needless_range_loop)] // see `solve` — normal-equation assembly indexes in lockstep
 fn fit_preview_rgb_factors() {
     let root = snapshot();

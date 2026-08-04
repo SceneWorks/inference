@@ -69,11 +69,21 @@ environment = ["QWEN_IMAGE_SNAPSHOT"]
 # (C:\Users\Michael\.cache\huggingface\hub\models--Qwen--Qwen-Image\...) does not currently exist on
 # nax-windows, so a lane added today would fail closed on materialization anyway.
 #
-# SEPARATELY UNCOVERED, and NOT what this exemption blesses: 45 mlx-gen-qwen-image real-weight
-# tests across 13 files also read QWEN_IMAGE_SNAPSHOT, plus two candle-gen-qwen-image CUDA tests
-# (tests/conformance.rs and the src/lib.rs probed-offload test). No lane runs any of them. The MLX
-# half needs a Mac, because mlx-gen does not build on Windows; the candle half is buildable here but
-# blocked on the ~60 GB snapshot above not existing on the box. Tracked as sc-17284.
+# THIS NAME NO LONGER HAS AN MLX CONSUMER (sc-17284). Until then the 45 mlx-gen-qwen-image
+# real-weight tests read QWEN_IMAGE_SNAPSHOT too — and fed it something this row does not describe.
+# The repo's own provenance receipt records what they were actually given:
+# `tools/adapter_parity_receipt.json` pins QWEN_IMAGE_SNAPSHOT at
+# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16`, an MLX re-host at a different
+# revision of a different repository from the `Qwen/Qwen-Image@75e0b4be` pinned here. One name
+# cannot be verified against two pins: `ensure_model_snapshot.py --model qwen-image` checks for
+# revision 75e0b4be and would fail closed on the re-host. So the MLX half was renamed to
+# MLX_GEN_QWEN_SNAPSHOT (matching the sibling crate's MLX_GEN_FLUX_SNAPSHOT) and given its own
+# `qwen-image-mlx` row below, which the macOS `mlx-qwen-image` lane wires.
+#
+# What is left under THIS name is the CUDA half, and it is still unrun: the operator A/B above plus
+# `candle-gen-qwen-image` (tests/conformance.rs and the src/lib.rs probed-offload test). Both are
+# buildable on nax-windows and both are blocked on the ~60 GB snapshot not existing there — a disk
+# decision, tracked separately, NOT something this exemption resolves.
 unwired_reason = "operator-run residency A/B (run-residency-ab.ps1), deliberately outside CI (sc-17266)"
 expected_files = [
     "model_index.json",
@@ -92,14 +102,27 @@ repository = "black-forest-labs/FLUX.1-dev"
 revision = "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
 license = "FLUX-1-dev Non-Commercial License"
 size_class = "very-large"
-profiles = ["media-cuda-residency-ab"]
+profiles = ["media-cuda-residency-ab", "media-macos"]
 environment = ["FLUX_DEV_DIR"]
-# Same operator-run residency A/B profile as qwen-image above (sc-17266): driven by
-# scripts/release/run-residency-ab.ps1, and kept out of real-weights.yml by
-# test_residency_ab_is_operator_run_without_ci_model_dependencies. The snapshot IS present on
-# nax-windows (E:\huggingface\hub\models--black-forest-labs--FLUX.1-dev\...), so unlike qwen-image
-# this one is earning its disk through the operator lane.
-unwired_reason = "operator-run residency A/B (run-residency-ab.ps1), deliberately outside CI (sc-17266)"
+# WIRED as of sc-17284 — the exemption this row used to carry is deleted, not weakened.
+#
+# Two consumers, and unlike qwen-image above they want the SAME pinned artifact, so one name and one
+# row still describe it truthfully:
+#   - `scripts/release/run-residency-ab.ps1` (CUDA, operator-run, still deliberately outside CI);
+#   - `mlx-gen-flux/tests/pid_decode_real_weights.rs`, whose two `#[ignore]` tests the macOS
+#     `mlx-qwen-image-pid` job now runs on the schedule.
+# `test_residency_ab_is_operator_run_without_ci_model_dependencies` used to enforce the operator-run
+# decision by asserting the string FLUX_DEV_DIR never appears in real-weights.yml. That proxy was
+# only ever valid while the CUDA A/B was the sole consumer; it now gates the A/B directly instead:
+# no `residency-ab`, neither `*_probed_generate_for_offload_ab` test name, and neither operator
+# repository variable (`vars.FLUX_DEV_DIR` / `vars.QWEN_IMAGE_SNAPSHOT`, which hold Windows paths).
+# It does NOT ban `--features cuda` — real-weights.yml has 57 of those for the Windows lanes — so a
+# BLANKET `cargo test -p candle-gen-qwen-image --features cuda -- --ignored` would still conscript
+# the A/B without naming it. Name-selecting every CUDA step is what closes that, not this test.
+#
+# `FLUX_DEV_DIR` is deliberately NOT folded into the crate's own MLX_GEN_FLUX_DEV_SNAPSHOT, which
+# names the same snapshot for adapter/hyper/ip-adapter tests. That variable gates ~11 further
+# mlx-gen-flux `#[ignore]` tests this lane does not run, so wiring it would mark them covered.
 expected_files = [
     "model_index.json",
     "tokenizer/vocab.json",
@@ -112,6 +135,190 @@ expected_files = [
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/config.json",
     "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-17284 — what `mlx-gen-qwen-image` ACTUALLY loads. The engine never reads `Qwen/Qwen-Image`
+# above: every real-weight test takes a tier directory of this SceneWorks MLX re-host, whose q4/q8
+# READMEs carry the upstream Qwen-Image-2512 card. Each tier subdir is a complete diffusers-layout
+# snapshot, so tests are pointed one level in (`/bf16`, `/q8`) — the same shape as
+# krea-realtime-14b-mlx.
+#
+# BOTH tiers are required and neither is redundant. `bf16` is the only dense tier, so it is what the
+# on-the-fly `LoadSpec::with_quant` paths and the dense control/sampler forwards need; `q8` is a
+# pre-quantized tier and is what `block_residency_real_weights` measures against (`QWEN_RUNG4_TIER`).
+# `q4` is not fetched — no test in the wired lane selects it.
+#
+# COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
+# The 45 account for exactly, and the arithmetic is the point — 21 + 19 + 5 = 45:
+#
+# WIRED, 19: 15 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2), 3 in
+# `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing on
+# nax-macos 2026-08-04.
+#
+# BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
+# `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
+# ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
+# adapter_real_weights": three of that file's tests resolve no golden at all.
+#
+# EXCLUDED WITH A MEASUREMENT, 5. A lane that is red every week is ignored within a month
+# (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
+#   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
+#     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
+#     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
+#     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
+#   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
+#   * `lightning_loras_apply_cleanly` x1 — FAILS: asserts 840 per-block modules, and the pinned
+#     lightx2v file carries 12 of 14 per block (no img/txt modulation) so it applies 720 with zero
+#     unmatched. Golden-free, so it joins the wired adapter step the moment sc-17518 settles it.
+#   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
+#     exist in no repository and on no Hub.
+key = "qwen-image-mlx"
+repository = "SceneWorks/qwen-image-mlx"
+revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+# QWEN_CONTROL_BASE_SNAPSHOT is the same artifact under a second name: the control engine takes the
+# base transformer separately from the control branch. Both are wired by the `mlx-qwen-image` job.
+environment = [
+    "QWEN_IMAGE_MLX_SNAPSHOT",
+    "MLX_GEN_QWEN_SNAPSHOT",
+    "QWEN_CONTROL_BASE_SNAPSHOT",
+]
+download_files = ["bf16/*", "q8/*"]
+expected_files = [
+    "bf16/model_index.json",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors.index.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+    "q8/model_index.json",
+    "q8/tokenizer/tokenizer.json",
+    "q8/text_encoder/model.safetensors.index.json",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# The Edit sibling, for the one `sequential_residency_real_weights` arm whose dropped component is
+# the Qwen2.5-VL *vision-language* encoder rather than the text encoder.
+#
+# q8 ONLY, and that is not a tuning choice: this repo's `bf16/` tier is metadata-only (~31 MB of
+# configs and tokenizer files, no `vae/`, no transformer shards), so pointing the test at it fails
+# to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
+#
+# WHAT "WIRED" DOES NOT MEAN HERE. `QWEN_IMAGE_EDIT_SNAPSHOT` also gates 19 tests this lane does not
+# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7) — plus one arm of
+# `perf.rs`. The gate is per-variable, so this row now reads as covered while those 19 still execute
+# nowhere; that is the same hazard recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and
+# it is accepted here rather than avoided because the sequential-residency Edit arm genuinely needs
+# this artifact. The 19 are tracked in sc-17519; do not read this row as evidence they run.
+key = "qwen-image-edit-2511-mlx"
+repository = "SceneWorks/qwen-image-edit-2511-mlx"
+revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["QWEN_IMAGE_EDIT_MLX_SNAPSHOT", "QWEN_IMAGE_EDIT_SNAPSHOT"]
+download_files = ["q8/*"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/tokenizer/tokenizer.json",
+    "q8/text_encoder/model.safetensors.index.json",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# The alibaba-pai VACE-style control branch (`Qwen-Image-2512-Fun-Controlnet-Union`) that replaced
+# the retired InstantX union shape. Single-file per tier; the tests take the file, not the dir.
+key = "qwen-image-2512-fun-controlnet-union"
+repository = "SceneWorks/qwen-image-2512-fun-controlnet-union"
+revision = "a061fbc42a4744d6a7ec206370fbd3a37d4a7cca"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["QWEN_CONTROL_UNION_SNAPSHOT", "QWEN_CONTROL_WEIGHTS"]
+download_files = ["bf16/*"]
+expected_files = ["bf16/model.safetensors"]
+
+[[models]]
+# The converted PiD (progressive-in-decoder) super-resolution students for the two engines whose
+# integrated decode seam is gated on the schedule. Each test falls back to a GITIGNORED
+# `tools/golden/pid/*.safetensors` when its env var is unset, which no CI checkout has — the
+# published re-hosts below are what make these three + two tests wirable at all.
+key = "pid-qwenimage"
+repository = "SceneWorks/pid-qwenimage"
+revision = "39d7b0a9003a3fc934d36d8b5658b2d8ea9c1231"
+license = "NVIDIA License"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["PID_QWEN_SNAPSHOT", "PID_QWEN_SAFETENSORS"]
+expected_files = ["pid_qwenimage_2kto4k.safetensors"]
+
+[[models]]
+key = "pid-flux"
+repository = "SceneWorks/pid-flux"
+revision = "52d9474830ad05ea8dc55edb59a21cb14d1a4615"
+license = "NVIDIA License"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["PID_FLUX_SNAPSHOT", "PID_FLUX_SAFETENSORS"]
+expected_files = ["pid_flux_2kto4k.safetensors"]
+
+[[models]]
+# The lightx2v 8-step Lightning distillation LoRAs for T2I and Edit-2511. Only the one file each
+# suite loads is fetched (~0.85 GB apiece), not the repos' full variant matrices.
+#
+# These resolve through MLX_GEN_MODELS_ROOT + a HARD-CODED `models--<org>--<repo>/snapshots/<rev>`
+# layout inside the tests, not from their own variable, so the lane derives the path from the models
+# root and the revision below rather than carrying a second repository variable that could drift out
+# of agreement with this pin.
+key = "qwen-image-lightning"
+repository = "lightx2v/Qwen-Image-Lightning"
+revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["QWEN_LIGHTNING_SNAPSHOT"]
+download_files = ["Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors"]
+expected_files = ["Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors"]
+
+[[models]]
+key = "qwen-image-edit-2511-lightning"
+repository = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+revision = "d74eba145674fd7e31b949324e148e21e7118abd"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["QWEN_EDIT_LIGHTNING_SNAPSHOT"]
+# The 4-step file backs `edit_lightning_user_lora_reference_repro`, which is NOT wired: it also
+# needs a user-supplied LoRA (QWEN_EDIT_REPRO_LORA) and a reference PPM (QWEN_EDIT_REPRO_REF_PPM)
+# that exist in no repository and on no Hub. It is a bug-repro harness, not a gate.
+download_files = ["Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"]
+expected_files = ["Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"]
+
+[[models]]
+# The PiD decoder's text conditioner. Both PiD suites load it alongside the full base model, which is
+# why they default to Q8 — Qwen/FLUX + the PiD net + Gemma coexist in one process.
+key = "gemma-2-2b-it"
+repository = "SceneWorks/gemma-2-2b-it"
+revision = "684c553b5b41a1c835989d89f62f585e6269a7de"
+license = "Gemma Terms of Use"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["PID_GEMMA_SNAPSHOT", "PID_GEMMA_DIR"]
+expected_files = [
+    "config.json",
+    "tokenizer.json",
+    "model.safetensors.index.json",
 ]
 
 [[models]]

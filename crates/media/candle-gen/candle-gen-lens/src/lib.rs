@@ -97,9 +97,16 @@ pub const VAE_SCALE_FACTOR: u32 = 16;
 /// source-format conversion inside each window rather than the required post-SC-16096 device-format
 /// transfer.
 pub const DEFAULT_TEXT_ENCODER_WINDOW: usize = 1;
-#[cfg(any(feature = "cuda", test))]
-const TEXT_ENCODER_LAYER_COUNT: u32 = 24;
-
+/// Shared Lens/Candle ladder candidates. These match the proved MLX geometry where the backend
+/// primitives are equivalent; entry-specific calibration remains owned by the catalog stories.
+pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256];
+pub const DECODE_TILE_EDGE: u32 = 512;
+pub const DECODE_OVERLAP: u32 = 128;
+pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
+pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 12, 24];
+pub const TRANSFORMER_BLOCK_COUNT: u32 = 48;
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "lens-candle-cuda-shared-ladder-device-format-blocks-v1";
 /// Fixed harmony-preamble `Current date:`. The preamble is the first [`TXT_OFFSET`] tokens, which are
 /// **sliced off** before the DiT conditioning, so the date never reaches the image path — a fixed
 /// constant keeps generation deterministic regardless of wall-clock.
@@ -348,16 +355,42 @@ impl Pipeline {
         })
     }
 
-    fn load_heavy_components(&self) -> CResult<HeavyComponents> {
+    fn load_heavy_components(
+        &self,
+        stream_transformer_blocks: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<HeavyComponents> {
         self.guard_packed_group_size("transformer")?;
-        let mut transformer = LensTransformer::new(
-            &LensDitConfig::lens(),
-            self.component_vb("transformer", DIT_DTYPE)?,
-        )?;
+        candle_gen::check_cancel(cancel)?;
+        let mut transformer = if stream_transformer_blocks {
+            if !self.adapters.is_empty() {
+                return Err(CandleError::Msg(
+                    "lens: streamed DiT residency is not calibrated with adapters".into(),
+                ));
+            }
+            let sidecars = self
+                .packed_sidecars("transformer", cancel)?
+                .ok_or_else(|| {
+                    CandleError::Msg(
+                        "lens: streamed DiT residency requires an already-packed q4/q8 transformer"
+                            .into(),
+                    )
+                })?;
+            LensTransformer::new_block_streamed(
+                &LensDitConfig::lens(),
+                self.component_vb("transformer", DIT_DTYPE)?,
+                sidecars,
+            )?
+        } else {
+            LensTransformer::new(
+                &LensDitConfig::lens(),
+                self.component_vb("transformer", DIT_DTYPE)?,
+            )?
+        };
         if !self.adapters.is_empty() {
             adapters::install_additive(&mut transformer, &self.adapters)?;
         }
-        if let Some(quant) = self.quant {
+        if let Some(quant) = self.quant.filter(|_| !stream_transformer_blocks) {
             transformer.quantize(quant)?;
         }
         let vae = Flux2Vae::new(self.component_vb("vae", VAE_DTYPE)?)?;
@@ -503,6 +536,7 @@ impl Pipeline {
         scheduler: Option<&str>,
         seed: u64,
         cancel: &gen_core::CancelFlag,
+        memory: gen_core::GenerationMemory,
         preview: Option<&candle_gen::preview::PreviewHook<'_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
@@ -510,6 +544,26 @@ impl Pipeline {
         let native = lens_sigmas(num_steps, latent_h, latent_w);
         let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, num_steps, &native);
         let init = init_latents.to_dtype(DIT_DTYPE)?;
+        let attention_budget = if memory.chunk_attention {
+            let size = memory.attention_chunk_size.ok_or_else(|| {
+                CandleError::Msg("lens: bounded attention is missing its chunk size".into())
+            })?;
+            gen_core::attention_budget::AttentionBudget::from_score_elements(size as u64, false)
+        } else {
+            gen_core::attention_budget::AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )
+        };
+        let attention_plan = gen_core::attention_budget::AttentionPlan::budgeted(attention_budget)
+            .with_cancel(cancel);
+        let transformer_window = if memory.stream_transformer_blocks {
+            memory.transformer_window_size.ok_or_else(|| {
+                CandleError::Msg("lens: streamed DiT is missing its window size".into())
+            })? as usize
+        } else {
+            TRANSFORMER_BLOCK_COUNT as usize
+        };
         candle_gen::run_flow_sampler(
             sampler,
             TimestepConvention::Sigma,
@@ -523,7 +577,7 @@ impl Pipeline {
                 if !guided {
                     // Guidance disabled: cfg_rescale(cond, ·, 1.0) == cond, so run a single
                     // cond-only (batch-1) forward and skip the wasted uncond half (sc-8993).
-                    return Ok(comps.transformer.forward(
+                    return comps.transformer.forward_with_memory(
                         latents,
                         features,
                         Some(mask),
@@ -531,11 +585,14 @@ impl Pipeline {
                         1,
                         latent_h,
                         latent_w,
-                    )?);
+                        attention_plan,
+                        transformer_window,
+                        cancel,
+                    );
                 }
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
                 let hidden = Tensor::cat(&[latents, latents], 0)?; // [2, seq, 128]
-                let noise = comps.transformer.forward(
+                let noise = comps.transformer.forward_with_memory(
                     &hidden,
                     features,
                     Some(mask),
@@ -543,6 +600,9 @@ impl Pipeline {
                     1,
                     latent_h,
                     latent_w,
+                    attention_plan,
+                    transformer_window,
+                    cancel,
                 )?;
                 let cond = noise.narrow(0, 0, 1)?;
                 let uncond = noise.narrow(0, 1, 1)?;
@@ -591,6 +651,7 @@ impl Pipeline {
             defaults.id,
         )?;
 
+        let memory = req.memory.unwrap_or_default();
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let init = create_noise(seed, latent_h, latent_w, &self.device)?;
             // Per-step latent preview (epic 16948, sc-16955), bound to the same `(latent_h, latent_w)`
@@ -611,6 +672,7 @@ impl Pipeline {
                 req.scheduler.as_deref(),
                 seed,
                 &req.cancel,
+                memory,
                 Some(&preview),
                 on_progress,
             )?;
@@ -628,7 +690,13 @@ impl Pipeline {
                         .contiguous()?;
                     pid.decode(&packed)?
                 }
-                None => vae::decode(&comps.heavy.vae, &latents, latent_h, latent_w)?,
+                None => vae::decode_with_tiling(
+                    &comps.heavy.vae,
+                    &latents,
+                    latent_h,
+                    latent_w,
+                    decode_tile(memory, defaults.id)?,
+                )?,
             };
             to_image(&decoded)
         })
@@ -641,31 +709,10 @@ impl Pipeline {
         stream_text: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Vec<Image>> {
+        // Conditioning is always streamed one GPT-OSS layer at a time on the deferred packed
+        // route. The shared rung-4 window belongs to the DiT and is consumed by `denoise` below.
         let window = if stream_text {
-            let window = req
-                .memory
-                .as_ref()
-                .and_then(|memory| memory.transformer_window_size)
-                .unwrap_or(DEFAULT_TEXT_ENCODER_WINDOW as u32) as usize;
-            if window != DEFAULT_TEXT_ENCODER_WINDOW {
-                return Err(CandleError::Msg(format!(
-                    "{}: text-encoder window is fixed at {DEFAULT_TEXT_ENCODER_WINDOW}, got {window}",
-                    defaults.id
-                )));
-            }
-            if let Some(component) = req
-                .memory
-                .as_ref()
-                .and_then(|memory| memory.transformer_window_component)
-            {
-                if component != gen_core::TransformerComponent::TextEncoder {
-                    return Err(CandleError::Msg(format!(
-                        "{}: transformer window must target TextEncoder, got {component:?}",
-                        defaults.id
-                    )));
-                }
-            }
-            Some(window)
+            Some(DEFAULT_TEXT_ENCODER_WINDOW)
         } else {
             None
         };
@@ -698,7 +745,9 @@ impl Pipeline {
         drop(text);
         self.device.synchronize()?;
 
-        let heavy = self.load_heavy_components()?;
+        let memory = req.memory.unwrap_or_default();
+        let stream_transformer_blocks = memory.stream_transformer_blocks;
+        let heavy = self.load_heavy_components(stream_transformer_blocks, &req.cancel)?;
         let pid_decoder =
             candle_gen_pid::resolve_pid_decoder(heavy.pid.as_deref(), req, base_seed, defaults.id)?;
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
@@ -720,6 +769,7 @@ impl Pipeline {
                 req.scheduler.as_deref(),
                 seed,
                 &req.cancel,
+                memory,
                 Some(&preview),
                 on_progress,
             )?;
@@ -733,11 +783,35 @@ impl Pipeline {
                         .contiguous()?;
                     pid.decode(&packed)?
                 }
-                None => vae::decode(&heavy.vae, &latents, latent_h, latent_w)?,
+                None => vae::decode_with_tiling(
+                    &heavy.vae,
+                    &latents,
+                    latent_h,
+                    latent_w,
+                    decode_tile(memory, defaults.id)?,
+                )?,
             };
             to_image(&decoded)
         })
     }
+}
+
+fn decode_tile(
+    memory: gen_core::GenerationMemory,
+    provider_id: &str,
+) -> CResult<Option<(u32, u32)>> {
+    if !memory.tile_vae_decode {
+        return Ok(None);
+    }
+    let edge = memory.decode_tile_edge.ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{provider_id}: tiled decode is missing a tile edge"
+        ))
+    })?;
+    let overlap = memory.decode_overlap.ok_or_else(|| {
+        CandleError::Msg(format!("{provider_id}: tiled decode is missing an overlap"))
+    })?;
+    Ok(Some((edge, overlap)))
 }
 
 /// Zero-pad each `[B, cur, C]` feature layer along the sequence axis to length `target`.
@@ -834,13 +908,38 @@ const BASE_DEFAULTS: Defaults = Defaults::from(MODEL_ID_BASE, BASE);
 
 #[cfg(any(feature = "cuda", test))]
 fn build_lens_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
-    build_lens_turbo_memory_strategy_contract_with_eligibility(spec, streams_text_encoder(spec))
+    build_lens_memory_strategy_contract_with_eligibility(
+        MODEL_ID_TURBO,
+        spec,
+        streams_dit_blocks(spec),
+    )
+}
+
+#[cfg(test)]
+fn build_lens_turbo_memory_strategy_contract_with_eligibility(
+    spec: &LoadSpec,
+    streamable: bool,
+) -> gen_core::MemoryProviderContract {
+    build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_TURBO, spec, streamable)
 }
 
 #[cfg(any(feature = "cuda", test))]
-fn build_lens_turbo_memory_strategy_contract_with_eligibility(
+fn build_lens_memory_strategy_contract(
+    provider_id: &'static str,
     spec: &LoadSpec,
-    bounded_text: bool,
+) -> gen_core::MemoryProviderContract {
+    build_lens_memory_strategy_contract_with_eligibility(
+        provider_id,
+        spec,
+        streams_dit_blocks(spec),
+    )
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn build_lens_memory_strategy_contract_with_eligibility(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    streamable: bool,
 ) -> gen_core::MemoryProviderContract {
     use gen_core::{
         MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
@@ -849,44 +948,53 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
         MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
-    // Auxiliary overlays were not part of this calibration. Refuse every optimized rung for such a
-    // load instead of publishing a phase envelope that omits their independently resident bytes.
-    let staged = bounded_text;
+    let components = gen_core::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+    .unwrap_or_default();
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
     let strategies = MemoryStrategy::ALL
         .into_iter()
-        .map(|strategy| {
-            let implemented = match strategy {
-                MemoryStrategy::Resident => true,
-                MemoryStrategy::StagedResidency => staged,
-                MemoryStrategy::BoundedDecode | MemoryStrategy::BoundedAttention => false,
-                MemoryStrategy::BoundedTransformerResidency => bounded_text,
-            };
-            MemoryStrategyCapability {
-                strategy,
-                support: if implemented {
-                    MemoryStrategySupport::Implemented
-                } else {
-                    MemoryStrategySupport::Missing
+        .map(|strategy| MemoryStrategyCapability {
+            strategy,
+            support: if strategy == MemoryStrategy::BoundedTransformerResidency && !streamable {
+                MemoryStrategySupport::Missing
+            } else {
+                MemoryStrategySupport::Implemented
+            },
+            parameters: match strategy {
+                MemoryStrategy::BoundedDecode => MemoryParameterRanges {
+                    decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
+                    decode_overlaps: vec![DECODE_OVERLAP],
+                    ..Default::default()
                 },
-                parameters: if strategy == MemoryStrategy::BoundedTransformerResidency
-                    && bounded_text
-                {
+                MemoryStrategy::BoundedAttention => MemoryParameterRanges {
+                    attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
+                    ..Default::default()
+                },
+                MemoryStrategy::BoundedTransformerResidency if streamable => {
                     MemoryParameterRanges {
-                        transformer_window_sizes: vec![DEFAULT_TEXT_ENCODER_WINDOW as u32],
-                        transformer_window_components: vec![
-                            gen_core::TransformerComponent::TextEncoder,
-                        ],
+                        transformer_window_sizes: TRANSFORMER_WINDOW_SIZES.to_vec(),
+                        transformer_window_components: vec![gen_core::TransformerComponent::Dit],
                         ..Default::default()
                     }
-                } else {
-                    MemoryParameterRanges::default()
+                }
+                _ => MemoryParameterRanges {
+                    ..Default::default()
                 },
-            }
+            },
         })
         .collect();
 
     MemoryProviderContract {
-        provider_id: MODEL_ID_TURBO.to_owned(),
+        provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
@@ -897,50 +1005,57 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
-        // Lens does not publish bounded decode, and PiD-bearing loads deliberately fail closed for
-        // calibrated optimized admission below. There is therefore no native/PiD tiled route split
-        // for this provider contract to advertise.
         pid_decode_routes: None,
         load_shape: spec.load_shape,
-        additional_prerequisites: bounded_text
-            .then_some((
-                MemoryStrategy::BoundedTransformerResidency,
+        additional_prerequisites: [
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ]
+        .into_iter()
+        .map(|strategy| {
+            (
+                strategy,
                 MemoryStrategyPrerequisite::Rung {
                     rung: MemoryStrategy::StagedResidency,
                     scope: MemoryPrerequisiteScope::EngagedInSameRequest,
                 },
-            ))
-            .into_iter()
-            .collect(),
+            )
+        })
+        .collect(),
         default_engagement_exclusions: Vec::new(),
-        resident_request_memory: gen_core::ResidentRequestMemory::ExplicitResident,
+        resident_request_memory: gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
-            phases: vec![
-                MemoryPhase::Conditioning,
-                MemoryPhase::Denoise,
-                MemoryPhase::Decode,
-            ],
-            synchronized_phase_release: staged,
-            decode_tiling: false,
-            attention_chunking: false,
-            transformer_window_materialization: bounded_text,
+            phases: phases.clone(),
+            synchronized_phase_release: true,
+            decode_tiling: true,
+            attention_chunking: true,
+            transformer_window_materialization: streamable,
         },
         formula: MemoryFormulaKind::PhaseEnvelope {
-            phases: vec![
-                MemoryPhase::Conditioning,
-                MemoryPhase::Denoise,
-                MemoryPhase::Decode,
-            ],
+            phases,
             variables: vec![
+                MemoryFormulaVariable::AssetBytes,
                 MemoryFormulaVariable::ConditioningTokenCount,
-                MemoryFormulaVariable::TransformerWindowSize,
                 MemoryFormulaVariable::PixelCount,
                 MemoryFormulaVariable::BatchCount,
                 MemoryFormulaVariable::OverlayBytes,
+                MemoryFormulaVariable::DecodeTileArea,
+                MemoryFormulaVariable::AttentionChunkSize,
+                MemoryFormulaVariable::TransformerWindowSize,
             ],
         },
-        calibration: memory_calibration(spec, bounded_text),
-        asset_facts: gen_core::MemoryAssetFacts::default(),
+        calibration: memory_calibration(spec, streamable),
+        asset_facts: gen_core::MemoryAssetFacts {
+            base_bytes: components
+                .text_encoder
+                .saturating_add(components.dit)
+                .saturating_add(components.vae),
+            conditioning_bytes: components.text_encoder,
+            transformer_bytes: components.dit,
+            decoder_bytes: components.vae,
+            overlay_bytes: 0,
+        },
         runtime: MemoryRuntimeSemantics::default(),
     }
 }
@@ -966,8 +1081,12 @@ fn lens_memory_strategy_safety_decision(
 
 #[cfg(any(feature = "cuda", test))]
 struct LensMemoryScope {
+    provider_id: &'static str,
     device: Device,
+    geometry: gen_core::MemoryGeometry,
     memory: Option<gen_core::GenerationMemory>,
+    transformer_window: Option<u32>,
+    use_pid: bool,
     finished: bool,
 }
 
@@ -981,14 +1100,54 @@ fn lens_generation_memory(
 
 #[cfg(any(feature = "cuda", test))]
 impl LensMemoryScope {
+    fn new(
+        provider_id: &'static str,
+        device: Device,
+        contract: &gen_core::MemoryProviderContract,
+        context: &gen_core::MemoryRunContext,
+    ) -> Self {
+        Self {
+            provider_id,
+            device,
+            geometry: context.geometry,
+            memory: contract.generation_memory(&context.selection),
+            transformer_window: contract
+                .engages(
+                    context.selection.strategy,
+                    gen_core::MemoryStrategy::BoundedTransformerResidency,
+                )
+                .then_some(context.selection.parameters.transformer_window_size)
+                .flatten(),
+            use_pid: context.use_pid,
+            finished: false,
+        }
+    }
+
     fn ensure_active(&self) -> gen_core::Result<()> {
         if self.finished {
-            Err(gen_core::Error::Msg(
-                "lens_turbo memory-strategy request scope is already finished".to_owned(),
-            ))
+            Err(gen_core::Error::Msg(format!(
+                "{} memory-strategy request scope is already finished",
+                self.provider_id
+            )))
         } else {
             Ok(())
         }
+    }
+
+    fn validate_geometry(&self, geometry: gen_core::MemoryGeometry) -> gen_core::Result<()> {
+        if geometry.width == self.geometry.width
+            && geometry.height == self.geometry.height
+            && geometry.frames == self.geometry.frames
+            && geometry.reference_count == self.geometry.reference_count
+            && geometry.batch > 0
+            && geometry.batch <= self.geometry.batch
+        {
+            return Ok(());
+        }
+        Err(gen_core::Error::Unsupported(format!(
+            "{}: hook geometry does not fit the admitted request geometry",
+            self.provider_id
+        )))
     }
 }
 
@@ -996,11 +1155,24 @@ impl LensMemoryScope {
 impl gen_core::MemoryRequestScope for LensMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if request.use_pid || !request.conditioning.is_empty() || request.phases.is_some() {
-            return Err(gen_core::Error::Unsupported(
-                "lens_turbo: optimized memory strategies cover ordinary text-to-image only"
-                    .to_owned(),
-            ));
+        if request.use_pid != self.use_pid
+            || !request.conditioning.is_empty()
+            || request.phases.is_some()
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: optimized memory strategies cover ordinary text-to-image only",
+                self.provider_id
+            )));
+        }
+        if request.width != self.geometry.width
+            || request.height != self.geometry.height
+            || request.count != self.geometry.batch
+            || request.image_reference_count() != self.geometry.reference_count
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: request geometry changed after memory admission",
+                self.provider_id
+            )));
         }
         request.memory = self.memory;
         Ok(())
@@ -1016,19 +1188,38 @@ impl gen_core::MemoryRequestScope for LensMemoryScope {
 
     fn configure_decode(
         &mut self,
-        _tile_edge: u32,
-        _overlap: u32,
-        _geometry: gen_core::MemoryGeometry,
+        tile_edge: u32,
+        overlap: u32,
+        geometry: gen_core::MemoryGeometry,
     ) -> gen_core::Result<()> {
-        Err(gen_core::Error::Unsupported(
-            "lens_turbo: bounded decode is not implemented".to_owned(),
-        ))
+        self.ensure_active()?;
+        self.validate_geometry(geometry)?;
+        if self.use_pid {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: PiD does not consume the native VAE tile plan",
+                self.provider_id
+            )));
+        }
+        if DECODE_TILE_EDGES.contains(&tile_edge) && overlap == DECODE_OVERLAP {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "{}: native decode tiling does not publish {tile_edge}/{overlap}",
+                self.provider_id
+            )))
+        }
     }
 
-    fn configure_attention(&mut self, _chunk_size: u32) -> gen_core::Result<()> {
-        Err(gen_core::Error::Unsupported(
-            "lens_turbo: bounded attention is not implemented".to_owned(),
-        ))
+    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if chunk_size == ATTENTION_CHUNK_SIZE {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "{}: attention chunk size is fixed at {ATTENTION_CHUNK_SIZE}, got {chunk_size}",
+                self.provider_id
+            )))
+        }
     }
 
     fn materialize_transformer_window(
@@ -1037,15 +1228,31 @@ impl gen_core::MemoryRequestScope for LensMemoryScope {
         block_count: u32,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if first_block < TEXT_ENCODER_LAYER_COUNT
-            && block_count == DEFAULT_TEXT_ENCODER_WINDOW as u32
-        {
+        let Some(window) = self.transformer_window else {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded transformer residency was not selected",
+                self.provider_id
+            )));
+        };
+        if window == 0 || block_count == 0 || !first_block.is_multiple_of(window) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: invalid transformer window {block_count} at {first_block}",
+                self.provider_id
+            )));
+        }
+        if first_block >= TRANSFORMER_BLOCK_COUNT {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: transformer window starts past the {TRANSFORMER_BLOCK_COUNT}-block stack",
+                self.provider_id
+            )));
+        }
+        let expected = window.min(TRANSFORMER_BLOCK_COUNT - first_block);
+        if block_count == expected {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "lens_turbo: invalid text-encoder window first={first_block} count={block_count}; \
-                 layer count is {TEXT_ENCODER_LAYER_COUNT} and window is fixed at \
-                 {DEFAULT_TEXT_ENCODER_WINDOW}"
+                "{}: admitted window {window} requires {expected} blocks at {first_block}, got {block_count}",
+                self.provider_id
             )))
         }
     }
@@ -1077,8 +1284,11 @@ pub struct LensGenerator {
     defaults: Defaults,
     pipeline: Pipeline,
     components: Mutex<Option<Components>>,
+    /// Serializes the manual conditioning/denoise/decode lifecycle and makes cache eviction safe.
+    lifecycle: Mutex<()>,
     sequential: bool,
     stream_text: bool,
+    stream_dit: bool,
     loaded_precision: Precision,
     loaded_quant: Option<Quant>,
     memory_contract: Option<gen_core::MemoryProviderContract>,
@@ -1095,8 +1305,10 @@ impl LensGenerator {
             defaults: TURBO_DEFAULTS,
             pipeline: Pipeline::load(root.as_ref(), &device, Vec::new(), None, None),
             components: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             sequential: false,
             stream_text: false,
+            stream_dit: false,
             loaded_precision: Precision::Bf16,
             loaded_quant: None,
             memory_contract: None,
@@ -1116,23 +1328,27 @@ impl LensGenerator {
             .as_ref()
             .map(|memory| memory.stage_residency)
             .unwrap_or(self.sequential);
-        let stream_text = req
+        let stream_dit = req
             .memory
             .as_ref()
             .map(|memory| memory.stream_transformer_blocks)
-            .unwrap_or(self.stream_text);
-        if stream_text && !stage_residency {
-            return Err(gen_core::Error::Unsupported(
-                "lens_turbo: text-encoder windows require staged residency in the same request"
-                    .to_owned(),
-            ));
+            .unwrap_or(false);
+        let has_bounded_work = req.memory.as_ref().is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        });
+        if has_bounded_work && !stage_residency {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded memory strategies require staged residency in the same request",
+                self.defaults.id
+            )));
         }
-        if stream_text && !self.stream_text {
-            return Err(gen_core::Error::Unsupported(
-                "lens_turbo: this load is not an eligible packed q4/q8 text-encoder stream"
-                    .to_owned(),
-            ));
+        if stream_dit && !self.stream_dit {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: this load is not an eligible packed q4/q8 DiT stream",
+                self.defaults.id
+            )));
         }
+        let stream_text = stage_residency && self.stream_text;
         Ok((stage_residency, stream_text))
     }
 
@@ -1187,6 +1403,7 @@ impl LensGenerator {
             None,
             0,
             &cancel,
+            gen_core::GenerationMemory::default(),
             None,
             &mut |_| {},
         )?;
@@ -1236,21 +1453,22 @@ impl Generator for LensGenerator {
                 || context.use_pid
                 || context.has_phases
             {
-                return Err(gen_core::Error::Unsupported(
-                    "lens_turbo: optimized memory strategies cover ordinary text-to-image only"
-                        .to_owned(),
-                ));
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: optimized memory strategies cover ordinary text-to-image only",
+                    self.defaults.id
+                )));
             }
             if let gen_core::MemorySafetyDecision::Reject { reason } =
                 self.memory_strategy_safety_check(context)
             {
                 return Err(gen_core::Error::Unsupported(reason));
             }
-            Ok(Some(Box::new(LensMemoryScope {
-                device: self.pipeline.device.clone(),
-                memory: contract.generation_memory(&context.selection),
-                finished: false,
-            })))
+            Ok(Some(Box::new(LensMemoryScope::new(
+                self.defaults.id,
+                self.pipeline.device.clone(),
+                contract,
+                context,
+            ))))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1269,8 +1487,21 @@ impl Generator for LensGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let (stage_residency, stream_text) = self.execution_mode(req)?;
         let images = if stage_residency {
+            // A prior resident request may have populated the lazy cache. Drop it before entering
+            // the staged phase envelope; the lifecycle lock proves no concurrent request holds a
+            // clone of those components while we synchronize and release them.
+            let cached = candle_gen::lock_recover(&self.components).take();
+            let had_cached = cached.is_some();
+            drop(cached);
+            if had_cached {
+                self.pipeline
+                    .device
+                    .synchronize()
+                    .map_err(CandleError::from)?;
+            }
             self.pipeline
                 .render_sequential(req, self.defaults, stream_text, on_progress)?
         } else if !self.cache_components_for_request(stage_residency) {
@@ -1512,15 +1743,11 @@ fn transformer_numeric_tier_matches(spec: &LoadSpec, expected_bits: usize) -> bo
             return false;
         }
     }
-    match declared {
-        Some(packed) => {
-            packed.bits == expected_bits as i32
-                && packed.group_size == candle_gen::quant::MLX_GROUP_SIZE as i32
-                && packed_triples > 0
-                && packed_triples == u32_weights
-        }
-        None => u32_weights == 0 && packed_triples == 0,
-    }
+    matches!(declared, Some(packed)
+        if packed.bits == expected_bits as i32
+            && packed.group_size == candle_gen::quant::MLX_GROUP_SIZE as i32
+            && packed_triples > 0
+            && packed_triples == u32_weights)
 }
 
 fn is_plain_measured_load(spec: &LoadSpec) -> bool {
@@ -1549,26 +1776,29 @@ fn streams_text_encoder(spec: &LoadSpec) -> bool {
         && is_plain_measured_load(spec)
         && packed.bits == expected_bits
         && packed.group_size == candle_gen::quant::MLX_GROUP_SIZE as i32
-        && transformer_numeric_tier_matches(spec, expected_bits as usize)
+}
+
+fn streams_dit_blocks(spec: &LoadSpec) -> bool {
+    let expected_bits = match spec.quantize {
+        Some(Quant::Q4) => 4,
+        Some(Quant::Q8) => 8,
+        _ => return false,
+    };
+    streams_text_encoder(spec) && transformer_numeric_tier_matches(spec, expected_bits)
 }
 
 #[cfg(any(feature = "cuda", test))]
 fn memory_calibration(
     spec: &LoadSpec,
-    bounded_text: bool,
+    _streamable: bool,
 ) -> Option<gen_core::MemoryCalibrationIdentity> {
     // The base resident envelope does not carry typed adapter/PiD component bytes. Refuse calibrated
     // admission for those load shapes until they have their own measured component accounting.
     if !is_plain_measured_load(spec) {
         return None;
     }
-    let fingerprint = match spec.quantize {
-        Some(Quant::Q4) if bounded_text => "lens-turbo-candle-cuda-q4-text-window-v1",
-        Some(Quant::Q8) if bounded_text => "lens-turbo-candle-cuda-q8-text-window-v1",
-        _ => "lens-turbo-candle-cuda-resident-v1",
-    };
     Some(gen_core::MemoryCalibrationIdentity::new(
-        fingerprint,
+        MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
     ))
 }
@@ -1601,8 +1831,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
     }
     let device = candle_gen::default_device()?;
     #[cfg(feature = "cuda")]
-    let memory_contract =
-        (defaults.id == MODEL_ID_TURBO).then(|| build_lens_turbo_memory_strategy_contract(spec));
+    let memory_contract = Some(build_lens_memory_strategy_contract(defaults.id, spec));
     #[cfg(not(feature = "cuda"))]
     let memory_contract = None;
     Ok(Box::new(LensGenerator {
@@ -1619,12 +1848,14 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             spec.pid.clone(),
         ),
         components: Mutex::new(None),
+        lifecycle: Mutex::new(()),
         sequential: matches!(spec.offload_policy, OffloadPolicy::Sequential),
         // This provider's text-window implementation is physically coupled to the staged lifecycle:
         // conditioning must finish and release before the heavy phase opens. It is also published
         // only for packed q4/q8, whose post-SC-16096 sidecars make each window a device-format
         // transfer. Sequential+Eager remains a valid rung-1-only path with a resident text phase.
         stream_text: streams_text_encoder(spec),
+        stream_dit: streams_dit_blocks(spec),
         loaded_precision: spec.precision,
         loaded_quant: spec.quantize,
         memory_contract,
@@ -1650,6 +1881,13 @@ fn registered_lens_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     Ok(build_lens_turbo_memory_strategy_contract(spec))
+}
+
+#[cfg(feature = "cuda")]
+fn registered_lens_base_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_lens_memory_strategy_contract(MODEL_ID_BASE, spec))
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1706,11 +1944,17 @@ fn registered_lens_begin_request(
     {
         return Err(gen_core::Error::Unsupported(reason));
     }
-    Ok(Some(Box::new(LensMemoryScope {
-        device: Device::Cpu,
-        memory: contract.generation_memory(&context.selection),
-        finished: false,
-    })))
+    let provider_id = if contract.provider_id == MODEL_ID_BASE {
+        MODEL_ID_BASE
+    } else {
+        MODEL_ID_TURBO
+    };
+    Ok(Some(Box::new(LensMemoryScope::new(
+        provider_id,
+        Device::Cpu,
+        contract,
+        context,
+    ))))
 }
 
 #[cfg(test)]
@@ -1751,9 +1995,22 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     safety_check: registered_lens_turbo_memory_strategy_safety_check,
 };
 #[cfg(feature = "cuda")]
+const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID_BASE,
+    contract: registered_lens_base_memory_strategy_contract,
+    safety_check: registered_lens_turbo_memory_strategy_safety_check,
+};
+#[cfg(feature = "cuda")]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID_TURBO,
+        valid_fixtures: registered_lens_valid_fixture,
+        begin_request: registered_lens_begin_request,
+    };
+#[cfg(feature = "cuda")]
+const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_BASE,
         valid_fixtures: registered_lens_valid_fixture,
         begin_request: registered_lens_begin_request,
     };
@@ -1768,7 +2025,9 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR);
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR);
     registry.register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -1973,8 +2232,8 @@ mod integration_tests {
         candle_gen::candle_core::safetensors::save(&dense, component.join("model.safetensors"))
             .unwrap();
         assert!(
-            transformer_numeric_tier_matches(&spec, 4),
-            "a dense transformer is quantized to the selected tier at runtime"
+            !transformer_numeric_tier_matches(&spec, 4),
+            "rung 4 requires a packed transformer whose blocks are transfer-ready"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -2258,6 +2517,177 @@ mod integration_tests {
         Ok(())
     }
 
+    /// SC-15819 authoritative serial smoke: one production request per cumulative ladder rung on a
+    /// single q4 Lens-Turbo artifact. This is implementation evidence only; catalog calibration and
+    /// promotion remain owned by the entry-level stories.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "real Lens q4 weights + CUDA; set SC15819_LENS_ROOT"]
+    fn sc15819_real_weights_five_rung_sequence() -> CResult<()> {
+        let Ok(root) = std::env::var("SC15819_LENS_ROOT") else {
+            println!("[sc-15819] SKIP: SC15819_LENS_ROOT not set");
+            return Ok(());
+        };
+        let device = Device::new_cuda(0)?;
+        let pool = candle_gen::cuda_mempool::MemPool::device_default(0)
+            .expect("CUDA device 0 default memory pool");
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        let optimized_spec = || {
+            LoadSpec::new(WeightsSource::Dir(PathBuf::from(&root)))
+                .with_quant(Quant::Q4)
+                .with_offload_policy(OffloadPolicy::Sequential)
+                .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
+        };
+        let contract = build_lens_memory_strategy_contract(MODEL_ID_TURBO, &optimized_spec());
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(
+            contract
+                .calibration
+                .as_ref()
+                .map(|value| value.fingerprint.as_str()),
+            Some(MEMORY_CALIBRATION_FINGERPRINT)
+        );
+
+        // Prepare content-addressed sidecars outside every measured request.
+        let prep = Pipeline::load(Path::new(&root), &device, Vec::new(), Some(Quant::Q4), None);
+        drop(prep.load_streamable_text_components(&gen_core::CancelFlag::new())?);
+        drop(prep.load_heavy_components(true, &gen_core::CancelFlag::new())?);
+        sc15800_quiesce(&device, pool)?;
+
+        let staged = gen_core::GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        };
+        let decode = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(DECODE_TILE_EDGE),
+            decode_overlap: Some(DECODE_OVERLAP),
+            ..staged
+        };
+        let attention = gen_core::GenerationMemory {
+            chunk_attention: true,
+            attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+            ..decode
+        };
+        let transformer = gen_core::GenerationMemory {
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(4),
+            transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+            ..attention
+        };
+        let rows = [
+            (
+                "resident",
+                OffloadPolicy::Resident,
+                gen_core::LoadShape::EagerMaterialization,
+                None,
+            ),
+            (
+                "staged",
+                OffloadPolicy::Sequential,
+                gen_core::LoadShape::DeferredMaterialization,
+                Some(staged),
+            ),
+            (
+                "decode",
+                OffloadPolicy::Sequential,
+                gen_core::LoadShape::DeferredMaterialization,
+                Some(decode),
+            ),
+            (
+                "attention",
+                OffloadPolicy::Sequential,
+                gen_core::LoadShape::DeferredMaterialization,
+                Some(attention),
+            ),
+            (
+                "transformer",
+                OffloadPolicy::Sequential,
+                gen_core::LoadShape::DeferredMaterialization,
+                Some(transformer),
+            ),
+        ];
+        let mut images = Vec::new();
+        for (label, policy, shape, memory) in rows {
+            let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&root)))
+                .with_quant(Quant::Q4)
+                .with_offload_policy(policy)
+                .with_load_shape(shape);
+            let generator = provider_registry()?.load(MODEL_ID_TURBO, &spec)?;
+            let req = GenerationRequest {
+                prompt: "a red fox in soft window light".to_owned(),
+                width: 1024,
+                height: 1024,
+                count: 1,
+                seed: Some(15_819),
+                steps: Some(1),
+                guidance: Some(1.0),
+                memory,
+                ..Default::default()
+            };
+            sc15800_quiesce(&device, pool)?;
+            let output = generator.generate(&req, &mut |_| {})?;
+            device.synchronize()?;
+            let live = pool.used_high().expect("USED_MEM_HIGH") as f64 / gib;
+            let reserved = pool.reserved_high().expect("RESERVED_MEM_HIGH") as f64 / gib;
+            let image = match output {
+                GenerationOutput::Images(mut values) if values.len() == 1 => values.remove(0),
+                _ => return Err(CandleError::Msg("expected one image".to_owned())),
+            };
+            let checksum = image.pixels.iter().fold(0_u64, |sum, value| {
+                sum.wrapping_mul(16777619) ^ u64::from(*value)
+            });
+            println!(
+                "[sc-15819] {label}: live={live:.3} GiB reserved={reserved:.3} GiB checksum={checksum:016x}"
+            );
+            assert_eq!((image.width, image.height), (1024, 1024));
+            assert!(!image.pixels.is_empty());
+            images.push((label, image));
+            drop(generator);
+            sc15800_quiesce(&device, pool)?;
+        }
+        assert_eq!(
+            images[0].1.pixels, images[1].1.pixels,
+            "staging changed pixels"
+        );
+        assert_eq!(
+            images[2].1.pixels, images[3].1.pixels,
+            "attention changed tiled pixels"
+        );
+        assert_eq!(
+            images[3].1.pixels, images[4].1.pixels,
+            "DiT windows changed pixels"
+        );
+
+        let generator = provider_registry()?.load(MODEL_ID_TURBO, &optimized_spec())?;
+        let canceled = GenerationRequest {
+            prompt: "cancel cleanup".to_owned(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            memory: Some(transformer),
+            ..Default::default()
+        };
+        canceled.cancel.cancel();
+        assert!(matches!(
+            generator.generate(&canceled, &mut |_| {}),
+            Err(gen_core::Error::Canceled)
+        ));
+        let invalid = GenerationRequest {
+            prompt: "invalid prerequisite cleanup".to_owned(),
+            memory: Some(gen_core::GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(generator.generate(&invalid, &mut |_| {}).is_err());
+        drop(generator);
+        sc15800_quiesce(&device, pool)?;
+        Ok(())
+    }
+
     #[test]
     fn descriptors_are_lens() {
         for (d, id, steps, g) in [
@@ -2393,12 +2823,17 @@ mod integration_tests {
     }
 
     #[test]
-    fn memory_contract_is_load_exact_and_text_encoder_scoped() {
+    fn memory_contract_is_load_exact_and_dit_scoped() {
         use gen_core::{LoadShape, MemoryStrategy, MemoryStrategySupport, TransformerComponent};
 
         let base = || LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
         let (eligible_root, eligible) = packed_memory_spec(Quant::Q4);
         let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&eligible, true);
+        let _detected_contract = build_lens_memory_strategy_contract(MODEL_ID_BASE, &eligible);
+        let base_contract =
+            build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_BASE, &eligible, true);
+        assert_eq!(base_contract.provider_id, MODEL_ID_BASE);
+        assert!(base_contract.conformance_errors().is_empty());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         assert!(matches!(
             contract
@@ -2414,22 +2849,39 @@ mod integration_tests {
             bounded.support,
             MemoryStrategySupport::Implemented
         ));
-        assert_eq!(bounded.parameters.transformer_window_sizes, [1]);
+        assert_eq!(
+            bounded.parameters.transformer_window_sizes,
+            TRANSFORMER_WINDOW_SIZES
+        );
         assert_eq!(
             bounded.parameters.transformer_window_components,
-            [TransformerComponent::TextEncoder]
+            [TransformerComponent::Dit]
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            DECODE_TILE_EDGES
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .parameters
+                .attention_chunk_sizes,
+            [ATTENTION_CHUNK_SIZE]
         );
         assert!(contract.calibration.is_some());
-        assert!(contract
-            .calibration
-            .as_ref()
-            .unwrap()
-            .fingerprint
-            .contains("q4"));
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
         let (q8_root, q8_spec) = packed_memory_spec(Quant::Q8);
         let q8_contract =
             build_lens_turbo_memory_strategy_contract_with_eligibility(&q8_spec, true);
-        assert_ne!(contract.calibration, q8_contract.calibration);
+        assert_eq!(contract.calibration, q8_contract.calibration);
         let mut adapted = eligible.clone();
         adapted.adapters.push(AdapterSpec::new(
             eligible_root.join("adapter.safetensors"),
@@ -2461,16 +2913,9 @@ mod integration_tests {
                     .support,
                 MemoryStrategySupport::Missing
             ));
-            assert!(matches!(
-                contract
-                    .capability(MemoryStrategy::StagedResidency)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Missing
-            ));
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
-                "lens-turbo-candle-cuda-resident-v1"
+                MEMORY_CALIBRATION_FINGERPRINT
             );
         }
         std::fs::remove_dir_all(eligible_root).ok();
@@ -2487,8 +2932,10 @@ mod integration_tests {
             defaults: TURBO_DEFAULTS,
             pipeline: Pipeline::load(&root, &Device::Cpu, Vec::new(), Some(Quant::Q4), None),
             components: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             sequential: true,
             stream_text: true,
+            stream_dit: true,
             loaded_precision: Precision::Bf16,
             loaded_quant: Some(Quant::Q4),
             memory_contract: Some(contract),
@@ -2497,9 +2944,11 @@ mod integration_tests {
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,
                 parameters: gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(DECODE_TILE_EDGE),
+                    decode_overlap: Some(DECODE_OVERLAP),
+                    attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                     transformer_window_size: Some(1),
-                    transformer_window_component: Some(gen_core::TransformerComponent::TextEncoder),
-                    ..Default::default()
+                    transformer_window_component: Some(gen_core::TransformerComponent::Dit),
                 },
                 tier: gen_core::MemoryNumericTier {
                     precision: Precision::Bf16,
@@ -2551,7 +3000,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn selected_text_window_reaches_the_request_scope() {
+    fn selected_dit_window_reaches_the_request_scope() {
         use gen_core::MemoryRequestScope;
 
         let (root, spec) = packed_memory_spec(Quant::Q4);
@@ -2574,7 +3023,7 @@ mod integration_tests {
                     gen_core::MemoryStrategyParameters::default()
                 )
             ),
-            Some(gen_core::GenerationMemory::default())
+            None
         );
         assert_eq!(
             lens_generation_memory(
@@ -2592,35 +3041,46 @@ mod integration_tests {
         let selection = select(
             gen_core::MemoryStrategy::BoundedTransformerResidency,
             gen_core::MemoryStrategyParameters {
-                transformer_window_size: Some(DEFAULT_TEXT_ENCODER_WINDOW as u32),
-                transformer_window_component: Some(gen_core::TransformerComponent::TextEncoder),
-                ..Default::default()
+                decode_tile_edge: Some(DECODE_TILE_EDGE),
+                decode_overlap: Some(DECODE_OVERLAP),
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+                transformer_window_size: Some(4),
+                transformer_window_component: Some(gen_core::TransformerComponent::Dit),
             },
         );
         let memory = lens_generation_memory(&contract, selection).unwrap();
         assert!(memory.stage_residency);
         assert!(memory.stream_transformer_blocks);
-        assert_eq!(memory.transformer_window_size, Some(1));
+        assert_eq!(memory.decode_tile_edge, Some(DECODE_TILE_EDGE));
+        assert_eq!(memory.attention_chunk_size, Some(ATTENTION_CHUNK_SIZE));
+        assert_eq!(memory.transformer_window_size, Some(4));
         assert_eq!(
             memory.transformer_window_component,
-            Some(gen_core::TransformerComponent::TextEncoder)
+            Some(gen_core::TransformerComponent::Dit)
         );
 
+        let mut request = GenerationRequest::default();
         let mut scope = LensMemoryScope {
+            provider_id: MODEL_ID_TURBO,
             device: Device::Cpu,
+            geometry: gen_core::MemoryGeometry {
+                width: request.width,
+                height: request.height,
+                batch: request.count,
+                frames: 1,
+                reference_count: 0,
+            },
             memory: Some(memory),
+            transformer_window: Some(4),
+            use_pid: false,
             finished: false,
         };
-        let mut request = GenerationRequest::default();
         scope.configure_request(&mut request).unwrap();
         assert_eq!(request.memory, Some(memory));
-        scope
-            .materialize_transformer_window(0, DEFAULT_TEXT_ENCODER_WINDOW as u32)
-            .unwrap();
+        scope.materialize_transformer_window(0, 4).unwrap();
+        scope.materialize_transformer_window(44, 4).unwrap();
         assert!(scope.materialize_transformer_window(0, 2).is_err());
-        assert!(scope
-            .materialize_transformer_window(TEXT_ENCODER_LAYER_COUNT, 1)
-            .is_err());
+        assert!(scope.materialize_transformer_window(48, 1).is_err());
         scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
         std::fs::remove_dir_all(root).ok();
     }
@@ -2638,8 +3098,10 @@ mod integration_tests {
                 None,
             ),
             components: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             sequential: true,
             stream_text: true,
+            stream_dit: true,
             loaded_precision: Precision::Bf16,
             loaded_quant: Some(Quant::Q4),
             memory_contract: None,
@@ -2662,8 +3124,28 @@ mod integration_tests {
                 stage_residency: true,
                 ..Default::default()
             })),
-            (true, false)
+            (true, true)
         );
+        for memory in [
+            gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(DECODE_TILE_EDGE),
+                decode_overlap: Some(DECODE_OVERLAP),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+                ..Default::default()
+            },
+        ] {
+            assert!(generator
+                .execution_mode(&GenerationRequest {
+                    memory: Some(memory),
+                    ..Default::default()
+                })
+                .is_err());
+        }
         assert_eq!(resolved(None), (true, true));
         assert!(
             !generator.cache_components_for_request(false),
@@ -2673,6 +3155,7 @@ mod integration_tests {
 
         let ineligible = LensGenerator {
             stream_text: false,
+            stream_dit: false,
             ..generator
         };
         assert!(ineligible
@@ -2681,7 +3164,7 @@ mod integration_tests {
                     stage_residency: true,
                     stream_transformer_blocks: true,
                     transformer_window_size: Some(1),
-                    transformer_window_component: Some(gen_core::TransformerComponent::TextEncoder),
+                    transformer_window_component: Some(gen_core::TransformerComponent::Dit),
                     ..Default::default()
                 }),
                 ..Default::default()

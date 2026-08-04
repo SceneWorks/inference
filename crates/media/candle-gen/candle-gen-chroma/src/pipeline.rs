@@ -17,8 +17,9 @@
 //!   timestep-only) is computed once per step and shared across both CFG branches; the RoPE table is
 //!   built once per branch.
 //!
-//! Components are loaded at **f32** (the DiT runs f32 activations; the bf16 checkpoint loaded as f32
-//! keeps the bf16 weight values — mlx parity) and cached by the generator across `generate` calls.
+//! The DiT is loaded at **f32**. The dense T5-XXL and VAE stay at their native **bf16** width; their
+//! outputs are promoted at the existing F32 activation boundaries. Components are cached by the
+//! generator across `generate` calls.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -89,13 +90,14 @@ impl Pipeline {
     }
 
     /// Load the four heavy components from the Chroma diffusers snapshot (`tokenizer/` vendored,
-    /// `text_encoder/` T5, `transformer/` DiT, `vae/` AutoencoderKL), all at f32.
+    /// `text_encoder/` T5, `transformer/` DiT, `vae/` AutoencoderKL). The DiT stays F32; the T5 and
+    /// VAE stay at their native BF16 checkpoint width.
     ///
     /// The DiT loads through the shared packed-detect seam (sc-9409): a pre-quantized MLX-packed tier
     /// (`SceneWorks/chroma1-*-mlx` q4/q8, whose `transformer/config.json` carries a `quantization`
     /// block) loads straight from the packed parts (no dense bf16 staging); a dense diffusers snapshot
     /// takes the plain path unchanged. The **T5-XXL encoder and VAE ship dense bf16 in every tier** (the
-    /// convert job quantizes only the transformer), so their loaders are unchanged. The packed
+    /// convert job quantizes only the transformer), so their loaders retain those native bytes. The packed
     /// `group_size` is read from the transformer `config.json` (default 64 when absent — never a silent
     /// dense read of the u32 codes).
     pub(crate) fn load_components(&self) -> Result<Components> {
@@ -104,8 +106,9 @@ impl Pipeline {
         let t5 = text::load_t5(&self.root, &self.device)?;
         let dit_dir = self.root.join("transformer");
         let gs = self.transformer_group_size(&dit_dir);
-        let transformer = ChromaTransformer::new_gs(cfg, self.f32_vb(&dit_dir)?, gs)?;
-        let vae = Vae::new(self.f32_vb(&self.root.join("vae"))?)?;
+        let transformer = ChromaTransformer::new_gs(cfg, self.vb(&dit_dir, DType::F32)?, gs)?;
+        let vae_dtype = crate::native_component_dtype(crate::NativeComponent::Vae);
+        let vae = Vae::new(self.vb(&self.root.join("vae"), vae_dtype)?)?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
         // in via `LoadSpec::pid`; Chroma is a FLUX.1-lineage latent space (`flux` student).
         let pid = match self.pid_spec.as_ref() {
@@ -141,9 +144,9 @@ impl Pipeline {
             .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE)
     }
 
-    /// mmap an f32 [`VarBuilder`] over every `.safetensors` in `dir` (the DiT + VAE ship sharded).
-    fn f32_vb(&self, dir: &Path) -> Result<VarBuilder<'static>> {
-        candle_gen::load_sorted_mmap(dir, DType::F32, &self.device, "chroma")
+    /// mmap a [`VarBuilder`] at `dtype` over every `.safetensors` in `dir`.
+    fn vb(&self, dir: &Path, dtype: DType) -> Result<VarBuilder<'static>> {
+        candle_gen::load_sorted_mmap(dir, dtype, &self.device, "chroma")
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring

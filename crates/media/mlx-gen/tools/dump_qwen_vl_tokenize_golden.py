@@ -7,7 +7,7 @@ formatted text (`vl_tokenizer::build_edit_text`) and tokenizes via the materiali
 asserting byte-exact `input_ids` — verifying the template string + the special-token mapping.
 
 Prereq: the Edit snapshot ships only vocab.json + merges.txt, so materialize the fast tokenizer once:
-    QWEN_IMAGE_SNAPSHOT=<edit-snapshot-dir> uv run python tools/build_qwen_tokenizer.py
+    MLX_GEN_QWEN_SNAPSHOT=<edit-snapshot-dir> uv run python tools/build_qwen_tokenizer.py
 Run (fork venv):
     cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_qwen_vl_tokenize_golden.py
 Output (gitignored): tools/golden/qwen_vl_tokenize_golden.safetensors

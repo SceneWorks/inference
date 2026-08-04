@@ -385,9 +385,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 25 since sc-17276 split the Krea S18 coherence sweep into its own dispatch-only job
+        # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
+        # `mlx-qwen-image-producers` jobs
         # (24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 24,
+        MACOS_HUB_LOCK: 27,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -553,7 +554,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 24)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 27)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1086,10 +1087,43 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(all(line.endswith(" \\") for line in requirement_lines))
 
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        """The CUDA residency A/B stays operator-run — gated directly, not by variable name.
+
+        This used to assert the strings QWEN_IMAGE_SNAPSHOT and FLUX_DEV_DIR never appear in
+        real-weights.yml. That proxy held only while the A/B was the sole consumer of both names,
+        and sc-17284 found it was not: 45 mlx-gen-qwen-image and 2 mlx-gen-flux `#[ignore]` tests
+        read the same two names on the Mac, so the ban was blocking a lane for a *different*
+        backend rather than protecting this decision. The A/B is now gated by what it actually is.
+
+        FLUX_DEV_DIR is therefore allowed in the workflow — the macOS PiD lane sets it, and
+        `flux-1-dev` names one artifact both consumers want. QWEN_IMAGE_SNAPSHOT is still banned:
+        it names the ~60 GB torch original, whose only consumers are this A/B and the candle CUDA
+        tests, and the MLX half was renamed off it (MLX_GEN_QWEN_SNAPSHOT) precisely because the
+        re-host it was being fed is a different repository at a different revision.
+        """
+        # Over CODE, not prose: `mlx-qwen-image`'s header comment has to name QWEN_IMAGE_SNAPSHOT to
+        # explain why the MLX half was renamed off it. Same reason `workflow_code` exists for the
+        # wiring gate — a comment can document a variable but can never wire one.
+        workflow = workflow_code(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
         self.assertNotIn("residency-ab", workflow)
         self.assertNotIn("QWEN_IMAGE_SNAPSHOT", workflow)
-        self.assertNotIn("FLUX_DEV_DIR", workflow)
+
+        # The A/B's own two tests are what must never be invoked from CI. This is the assertion the
+        # name ban was standing in for, and unlike the ban it cannot be satisfied by a rename.
+        self.assertNotIn("qwen_image_probed_generate_for_offload_ab", workflow)
+        self.assertNotIn("flux_dev_probed_generate_for_offload_ab", workflow)
+
+        # The operator repository variables hold nax-windows paths (`E:\huggingface\hub\...`,
+        # `C:\Users\...`). A macOS lane that read one would resolve to a path that cannot exist on
+        # a Mac, so no workflow may consume them; the macOS PiD lane maps its own variable onto
+        # FLUX_DEV_DIR instead.
+        self.assertNotIn("vars.FLUX_DEV_DIR", workflow)
+        self.assertNotIn("vars.QWEN_IMAGE_SNAPSHOT", workflow)
+
+        # Every assertion above is negative and would stay true if the macOS PiD lane were deleted.
+        # The positive counterpart is not duplicated here because it already exists and is stronger:
+        # `test_manifest_environment_keys_are_wired_or_explicitly_exempt` fails the moment
+        # FLUX_DEV_DIR stops being referenced, because `flux-1-dev` no longer carries an exemption.
 
         script = RESIDENCY_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("qwen_image_probed_generate_for_offload_ab", script)
@@ -1338,6 +1372,141 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--skip kv_cache_residency_at_the_production_geometry", step)
         self.assertIn("--skip long_clip_coherence_under_the_bounded_window", step)
         self.assertIn('grep -qE "test result: ok\\. 6 passed"', step)
+
+    def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
+        """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.
+
+        Each of the 20 selections has to survive all three traps at once. `--exact` AFTER the `--`,
+        because cargo rejects it in its own argument position; a run-count assertion, because with
+        `--exact` accepted a renamed test yields `0 passed; N filtered out` and cargo EXITS 0; and a
+        NAME, because `--ignored` alone is a blanket that silently conscripts whatever `#[ignore]`
+        test lands in the file next -- which is exactly how an 85-minute sweep joined a 20-minute
+        regression lane in sc-17276.
+
+        Four tests are deliberately absent and must stay absent while their stories are open:
+        `perf.rs` x2 (sc-17513) and `fit_preview_rgb_factors` (sc-17515) FAIL on real weights, and
+        `lightning_loras_apply_cleanly` (sc-17518) asserts 840 modules against a published LoRA that
+        carries 720. A red weekly lane is ignored within a month, so they are recorded rather than
+        wired.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
+        # Slice to the NEXT job key at the same indentation, not to the next Qwen job — the last of
+        # the three would otherwise swallow the rest of the file and read other lanes' commands.
+        lines = workflow.splitlines(keepends=True)
+        starts = {}
+        for index, line in enumerate(lines):
+            match = re.fullmatch(r"  ([a-z0-9][a-z0-9-]*):\n", line)
+            if match:
+                starts[index] = match.group(1)
+        keys = sorted(starts)
+        bodies = {}
+        for position, index in enumerate(keys):
+            name = starts[index]
+            if name not in jobs:
+                continue
+            end = keys[position + 1] if position + 1 < len(keys) else len(lines)
+            bodies[name] = "".join(lines[index:end])
+        self.assertEqual(sorted(bodies), sorted(jobs), "a Qwen-Image job was renamed or removed")
+
+        selected = {
+            "mlx-qwen-image": [
+                "control_loads_and_emits_hints",
+                "scale_zero_matches_base",
+                "scale_one_changes_output",
+                "public_generate_runs",
+                "default_sampler_equals_explicit_euler",
+                "named_sampler_dpmpp_2m_is_coherent_and_distinct",
+                "sequential_bounds_peak_and_is_byte_identical",
+                "sequential_repeat_job_stays_bounded",
+                "edit_sequential_bounds_peak_and_is_byte_identical",
+                "control_sequential_bounds_peak_and_is_byte_identical",
+                "bounded_window_is_distinct_from_the_unbounded_stream_control",
+                "lightning_render_is_coherent",
+                "edit_lightning_render_is_coherent",
+                "routing_map_covers_full_fork_surface",
+                "kohya_matches_peft_on_real_tree",
+            ],
+            "mlx-qwen-image-pid": [
+                "use_pid_without_loaded_pid_errors",
+                "qwen_image_pid_decode_vs_vae",
+                "qwen_image_pid_from_ldm_early_stop",
+                "flux_dev_pid_decode_vs_vae",
+                "flux_dev_pid_from_ldm_early_stop",
+            ],
+            "mlx-qwen-image-producers": ["dump_runb_latents"],
+        }
+        for job, names in selected.items():
+            body = bodies[job]
+            for name in names:
+                # `run_one <name>` in the multi-test steps, `name=<name>` in the single-test ones.
+                self.assertTrue(
+                    f"run_one {name}\n" in body or f"name={name}\n" in body,
+                    f"{job}: {name} is no longer selected by name",
+                )
+            # Join `\`-continued shell lines first: every invocation here spans several, and a
+            # per-LINE check cannot see that `--exact` moved from after the `--` to before it.
+            joined, buffer = [], ""
+            for line in body.splitlines():
+                stripped = line.strip()
+                buffer += " " + stripped.removesuffix("\\")
+                if not stripped.endswith("\\"):
+                    joined.append(buffer)
+                    buffer = ""
+            invocations = [command for command in joined if "cargo test " in command]
+            self.assertTrue(invocations, f"{job}: no cargo test invocation")
+            # Per STEP, not per job: without pipefail the `| tee /dev/stderr` swallows cargo's exit
+            # status, and one step losing it is invisible to a bare `assertIn`.
+            self.assertEqual(
+                body.count("set -o pipefail"),
+                len(invocations),
+                f"{job}: every step that runs cargo test needs its own `set -o pipefail`",
+            )
+            # Trap 1: `--exact` is a libtest flag, and cargo REJECTS it in its own argument position
+            # ("error: unexpected argument '--exact' found", exit 1). Everything before the ` -- `
+            # is cargo's; everything after is libtest's.
+            for command in invocations:
+                cargo_arguments, separator, _ = command.partition(" -- ")
+                self.assertTrue(separator, f"{job}: cargo test invocation has no `--`: {command}")
+                self.assertNotIn(
+                    "--exact",
+                    cargo_arguments,
+                    f"{job}: --exact must follow the `--`, not precede it",
+                )
+            # Trap 2: with `--exact` accepted, a rename yields `0 passed; N filtered out` and cargo
+            # exits 0. Every selection must be paired with the count assertion.
+            self.assertEqual(
+                body.count("-- --exact --ignored --nocapture"),
+                body.count('grep -qE "test result: ok\\. 1 passed"'),
+                f"{job}: every `--exact` selection needs its own run-count assertion",
+            )
+
+        # Absent, and each with an open story. Over CODE only: the steps' comments have to NAME these
+        # tests to say why they are excluded, and prose can never select a test.
+        for name in (
+            "qwen_t2i_per_step_compiled_vs_eager",
+            "qwen_edit_per_step_compiled_vs_eager",
+            "fit_preview_rgb_factors",
+            "lightning_loras_apply_cleanly",
+            "edit_lightning_user_lora_reference_repro",
+        ):
+            for job in jobs:
+                self.assertNotIn(
+                    name,
+                    workflow_code(bodies[job]),
+                    f"{job}: {name} is excluded for a recorded reason",
+                )
+
+        # Trap 4: measured, and nowhere near GitHub's 360-minute ceiling (sc-16981).
+        for job, cap in (("mlx-qwen-image", 90), ("mlx-qwen-image-pid", 60), ("mlx-qwen-image-producers", 60)):
+            self.assertIn(f"timeout-minutes: {cap}", bodies[job])
+
+        # The producers job is dispatch-only and must surrender its evidence, or it spends a Metal
+        # box producing a gitignored file the next checkout deletes.
+        producers = bodies["mlx-qwen-image-producers"]
+        self.assertNotIn("github.event_name == 'schedule'", producers)
+        self.assertIn("actions/upload-artifact", producers)
+        self.assertIn("if-no-files-found: error", producers)
 
     def test_windows_cuda_check_rejects_fork_prs_but_preserves_trusted_events(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

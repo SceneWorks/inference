@@ -12,6 +12,9 @@
 //!   --model hd --prompt "a photo of a rusty robot holding a lit candle" --seed 42 --out out.png
 //! ```
 //!
+//! Add `--measure-vram --repeat 2` on an idle GPU to report the cold load+render peak, settled
+//! resident footprint, and warm-render peak from the shared device-level VRAM probe.
+//!
 //! The snapshot is a Chroma diffusers tree (`tokenizer/`, `text_encoder/`, `transformer/`, `vae/`).
 //! `--model hd|base` defaults to 28 steps / true_cfg 4.0; `--model flash` to 8 steps / true_cfg 1.0.
 
@@ -27,6 +30,10 @@ fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn has_flag(args: &[String], key: &str) -> bool {
+    args.iter().any(|arg| arg == key)
 }
 
 fn main() -> Result<()> {
@@ -67,11 +74,14 @@ fn main() -> Result<()> {
     let out = arg(&args, "--out")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("chroma_smoke.png"));
+    let measure_vram = has_flag(&args, "--measure-vram");
 
     println!(
         "[smoke] snapshot={snapshot}\n[smoke] engine={engine} {width}x{height} steps={steps:?} true_cfg={true_cfg:?} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
+    let mut vram_probe =
+        measure_vram.then(|| candle_gen::testkit::VramProbe::start_rendered().assert_idle(1.0));
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
     let gen = candle_gen_chroma::provider_registry()?.load(engine, &spec)?;
     println!(
@@ -95,6 +105,7 @@ fn main() -> Result<()> {
     let mut call_secs: Vec<f32> = Vec::with_capacity(repeat as usize);
     let mut images = Vec::new();
     for call in 0..repeat {
+        let vram_phase = vram_probe.as_ref().map(|probe| probe.phase());
         let mut on_progress = |p: Progress| match p {
             Progress::Step { current, total } => {
                 print!(
@@ -109,6 +120,13 @@ fn main() -> Result<()> {
         };
         let t_call = std::time::Instant::now();
         let output = gen.generate(&req, &mut on_progress)?;
+        if let (Some(probe), Some(phase)) = (vram_probe.as_mut(), vram_phase) {
+            if call == 0 {
+                probe.end_load(phase);
+            } else {
+                probe.end_gen(phase);
+            }
+        }
         call_secs.push(t_call.elapsed().as_secs_f32());
         images = match output {
             GenerationOutput::Images(imgs) => imgs,
@@ -117,6 +135,10 @@ fn main() -> Result<()> {
     }
     let gen_s = *call_secs.last().unwrap();
     println!("[smoke] {} image(s) in {gen_s:.1}s total", images.len());
+    if let Some(probe) = &vram_probe {
+        let report = probe.report().assert_trustworthy(1.0);
+        println!("[smoke] vram {report}");
+    }
 
     for (i, img) in images.iter().enumerate() {
         let path = if images.len() == 1 {

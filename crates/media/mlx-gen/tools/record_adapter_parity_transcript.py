@@ -252,14 +252,14 @@ def expected_runs(manifest: dict) -> list[dict]:
             "mlx-gen-qwen-image",
             "adapter_real_weights",
             "lora_render_matches_fork_golden",
-            {"QWEN_IMAGE_SNAPSHOT": models["qwen_image"]["snapshot_path"]},
+            {"MLX_GEN_QWEN_SNAPSHOT": models["qwen_image"]["snapshot_path"]},
         ),
         (
             "qwen_lokr",
             "mlx-gen-qwen-image",
             "adapter_real_weights",
             "lokr_render_matches_fork_golden",
-            {"QWEN_IMAGE_SNAPSHOT": models["qwen_image"]["snapshot_path"]},
+            {"MLX_GEN_QWEN_SNAPSHOT": models["qwen_image"]["snapshot_path"]},
         ),
     )
     runs = []
@@ -304,7 +304,7 @@ def residual_diagnostic_runs(manifest: dict) -> list[dict]:
         (
             "qwen_residual_diagnostic",
             "mlx-gen-qwen-image",
-            {"QWEN_IMAGE_SNAPSHOT": models["qwen_image"]["snapshot_path"]},
+            {"MLX_GEN_QWEN_SNAPSHOT": models["qwen_image"]["snapshot_path"]},
         ),
     )
     return [
@@ -359,7 +359,7 @@ def qwen_effect_diagnostic_runs(manifest: dict) -> list[dict]:
             "env": {
                 **proof_environment(),
                 "CARGO_TARGET_DIR": TARGET_DIR,
-                "QWEN_IMAGE_SNAPSHOT": manifest["validation_models"]["qwen_image"][
+                "MLX_GEN_QWEN_SNAPSHOT": manifest["validation_models"]["qwen_image"][
                     "snapshot_path"
                 ],
             },

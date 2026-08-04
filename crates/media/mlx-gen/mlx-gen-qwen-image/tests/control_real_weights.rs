@@ -2,7 +2,7 @@
 //! (strict pose) port — the VACE-style alibaba-pai control branch that **replaces** the retired
 //! InstantX `Qwen-Image-ControlNet-Union` shape.
 //!
-//! `#[ignore]`d — needs the real `Qwen/Qwen-Image-2512` base snapshot (env `QWEN_IMAGE_SNAPSHOT`,
+//! `#[ignore]`d — needs the real `Qwen/Qwen-Image-2512` base snapshot (env `MLX_GEN_QWEN_SNAPSHOT`,
 //! else the HF cache) and the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (env
 //! `QWEN_CONTROL_WEIGHTS`, else the HF cache — the `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors`).
 //! Gates, smallest-footprint first:
@@ -47,7 +47,7 @@ const CONTROL_IN_DIM: i32 = 132;
 
 /// Base `Qwen/Qwen-Image-2512` snapshot dir (env override, else the HF cache).
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 

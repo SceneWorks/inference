@@ -1,6 +1,6 @@
 //! sc-2530: real-weights validation of the Qwen-Image **T2I img2img** port against the frozen fork.
 //!
-//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `QWEN_IMAGE_SNAPSHOT`, else the HF
+//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `MLX_GEN_QWEN_SNAPSHOT`, else the HF
 //! cache) and the golden produced by `tools/dump_qwen_image_img2img_golden.py` (gitignored, local).
 //! Run with:
 //!   cargo test -p mlx-gen-qwen-image --release --test img2img_real_weights -- --ignored --nocapture
@@ -34,7 +34,7 @@ const Q8_GOLDEN: &str = concat!(
 );
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 
