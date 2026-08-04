@@ -829,8 +829,30 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
 
-/// **The rung-4 window sweep**, and the bit-identity proof that the eleven streamed sub-stacks
-/// reproduce the resident ones exactly.
+/// **The rung-4 cadence sweep** — the whole published domain, peak *and* wall clock — plus the
+/// bit-identity proof that the eleven streamed sub-stacks reproduce the resident ones exactly.
+///
+/// The first revision of this test swept a one-value domain, which made it a sweep in name only. It
+/// now drives every cadence in [`ms::TRANSFORMER_WINDOW_SIZES`] and asserts the three facts the
+/// domain's publication rests on:
+///
+/// 1. **every cadence bounds the peak** (each row < control by a 3% margin, against a measured
+///    −12.31%);
+/// 2. **every cadence bounds it to the SAME value** — this is the finding that made the domain worth
+///    publishing, because it means the wider cadences give up no memory at all. Asserted at 1%, which
+///    is far outside the observed spread: the peak rows reproduce **to the millibyte** (15.516 GiB at
+///    all four cadences, across four separate runs), so unlike the latency numbers this one can be
+///    pinned tightly;
+/// 3. **widening the cadence buys time back monotonically**, which is what makes the domain a
+///    frontier rather than four spellings of one choice.
+///
+/// Latency assertions are deliberately loose. Four runs of the window-1 row measured 3654 / 3674 /
+/// 3698 / 3790 ms/step — a ~4% spread — so the margins below are set well outside that, and the
+/// failure they exist to catch is a re-open path that starts *thrashing*, not one that drifts.
+///
+/// `SDXL_WINDOW_PROBE_SIZE` re-runs the sweep at another output edge. The 768² numbers in
+/// [`ms::TRANSFORMER_WINDOW_SIZES`]' table come from it, and they are what establish that the flat
+/// peak is a property of this family rather than of 1024².
 #[test]
 #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn transformer_window_sweep_and_streamed_output_identity() {
@@ -841,26 +863,32 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     // The attribution control: the same composition WITHOUT rung 4, on a deferred load, so the only
     // difference between the two rows is the window itself.
     const STEPS: u32 = 6;
-    let control = measure(&dir, "q8", deferred, &request(Some(staged()), 1024, STEPS));
+    let edge: u32 = std::env::var("SDXL_WINDOW_PROBE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let control = measure(&dir, "q8", deferred, &request(Some(staged()), edge, STEPS));
     println!(
-        "[sc-15525 rung4 q8 1024²] staged, no window (attribution control) {:.3} GiB, \
+        "[sc-15525 rung4 q8 {edge}²] staged, no window (attribution control) {:.3} GiB, \
          {:.0} ms/step",
         control.peak_gib,
         ms_per_step(&control, STEPS)
     );
+    let mut rows: Vec<(u32, f64, f64)> = Vec::new();
     for window in ms::TRANSFORMER_WINDOW_SIZES {
         let row = measure(
             &dir,
             "q8",
             deferred,
-            &request(Some(full_ladder(*window)), 1024, STEPS),
+            &request(Some(full_ladder(*window)), edge, STEPS),
         );
+        rows.push((*window, row.peak_gib, ms_per_step(&row, STEPS)));
         // SC-16355 named re-materialization latency as an explicit hazard, so it is reported beside
         // the peak rather than left for a user to discover. The window re-opens the U-Net snapshot
         // once per `Transformer2D` per step — eleven re-opens covering 70 blocks — and what that
         // costs is a fact about this rung, not an implementation detail.
         println!(
-            "[sc-15525 rung4 window {window}] request peak {:.3} GiB ({:+.2}% vs control), \
+            "[sc-15525 rung4 {edge}² window {window}] request peak {:.3} GiB ({:+.2}% vs control), \
              {:.0} ms/step ({:+.1}% vs control)",
             row.peak_gib,
             100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
@@ -886,20 +914,165 @@ fn transformer_window_sweep_and_streamed_output_identity() {
             row.peak_gib,
             control.peak_gib
         );
-        // A LOOSE latency ceiling, and deliberately loose. The measured cost is 4.9x
-        // (767 -> 3790 ms/step), which is the number the ladder publishes; a wall clock moves with
-        // thermal state and with whatever else the machine is doing, so asserting anything near the
-        // measurement would be asserting the weather. 10x still leaves a doubling of the current
-        // regression detectable, which is the failure worth catching — a re-open path that starts
-        // thrashing rather than one that drifts 15%.
+        // A LOOSE latency ceiling, and deliberately loose. The tightest cadence measures ~4.9x at
+        // 1024² and ~7.4x at 768²; a wall clock moves with thermal state and with whatever else the
+        // machine is doing, so asserting anything near the measurement would be asserting the
+        // weather. 12x still leaves a substantial worsening detectable, which is the failure worth
+        // catching — a re-open path that starts thrashing rather than one that drifts 15%.
         let slowdown = ms_per_step(&row, STEPS) / ms_per_step(&control, STEPS);
         assert!(
-            slowdown < 10.0,
+            slowdown < 12.0,
             "window {window} re-materialization cost {slowdown:.1}x the control's ms/step — \
-             SC-16355 flagged exactly this as a severe-regression risk, and past 10x the rung stops \
+             SC-16355 flagged exactly this as a severe-regression risk, and past 12x the rung stops \
              being a trade a selector could reasonably make"
         );
     }
+
+    // ── The two facts that make this a DOMAIN rather than four spellings of one choice ───────────
+    assert!(
+        rows.len() >= 2,
+        "a cadence sweep needs at least two published cadences to compare; got {rows:?}"
+    );
+    // (a) Every cadence bounds the peak to the SAME value. This is the finding the multi-value
+    //     domain rests on: the wider cadences give up no memory, so the latency they buy back is
+    //     free. 1% is far outside the observed spread — the peak rows reproduce to the millibyte
+    //     across four runs — so unlike the latency margins this one is tight on purpose. If a
+    //     future change makes the peak cadence-sensitive, the domain needs per-cadence calibration
+    //     and this reddens to say so.
+    let (tightest, tight_peak, tight_ms) = rows[0];
+    let (widest, _wide_peak, wide_ms) = *rows.last().expect("at least one row");
+    for (window, peak, _) in &rows {
+        assert!(
+            (peak - tight_peak).abs() < tight_peak * 0.01,
+            "cadence {window} peaked at {peak:.4} GiB against cadence {tightest}'s {tight_peak:.4} \
+             — the published domain claims every cadence bounds the peak identically, which is why \
+             the widest is the default. If that is genuinely no longer true, the domain owes \
+             per-cadence evidence and the default must be revisited"
+        );
+    }
+    // (b) And widening it buys time back. Measured 3654 -> 1318 ms/step (2.77x) at 1024² and
+    //     3355 -> 979 (3.43x) at 768²; run-to-run latency spread is ~4%, so a 0.75 ratio is a floor
+    //     noise cannot clear while still failing loudly if the re-open count stops tracking the
+    //     cadence at all (which is what a `BlockPlan` that ignored the window would look like).
+    assert!(
+        wide_ms < tight_ms * 0.75,
+        "widening the cadence {tightest} -> {widest} did not buy time back ({tight_ms:.0} -> \
+         {wide_ms:.0} ms/step). The domain is published as a time/memory frontier; if every cadence \
+         costs the same, it is not one and only the tightest should ship"
+    );
+    println!(
+        "[sc-15525 rung4 {edge}² frontier] cadence {tightest} -> {widest}: peak flat at \
+         {tight_peak:.3} GiB, wall clock {tight_ms:.0} -> {wide_ms:.0} ms/step ({:.2}x cheaper)",
+        tight_ms / wide_ms
+    );
+}
+
+/// **The published window domain is enforced on both layers, and it is REACHABLE on both.**
+///
+/// The Anima PR shipped a published rung-4 domain whose out-of-domain values were never checked
+/// through the production path; this is the SDXL twin of that check, written so it cannot pass
+/// vacuously. For every cadence it emits a `WINDOW-REQUEST` receipt naming what happened, and it
+/// asserts **both** directions:
+///
+/// * every value in [`ms::TRANSFORMER_WINDOW_SIZES`] is *admitted* and renders — a gate that refused
+///   the whole domain would otherwise satisfy every negative case here;
+/// * every value outside it is *refused*, including interior gaps (3, 4, 6, 7, 9) that a
+///   "clamp to the nearest legal cadence" bug would silently absorb, and values past the deepest
+///   sub-stack (11, 70).
+///
+/// The interior gaps are the ones worth having. A domain of `[1, 2, 5, 10]` with a clamping resolver
+/// would accept 7 and quietly execute 5 — under-predicting nothing, but executing a strategy the
+/// selector did not choose, which is precisely what the shared contract forbids.
+///
+/// **This exercises the request-side layer specifically**, and that is the point of driving
+/// `generate` with a hand-built `GenerationMemory`: it is the path a calibration harness takes, and
+/// it never crosses admission, so the shared parameter validator is not in play. Disarming
+/// `memory_strategy::validate_window` and re-running proves how thin the remaining margin is — 7 of
+/// these 8 cadences are then **admitted and rendered**, and only `0` still fails, caught much deeper
+/// by `BlockPlan::new`'s own `>= 1` guard. That one provider-side function is the whole gate on this
+/// path.
+#[test]
+#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path() {
+    let Some(dir) = tier_dir(REPRESENTATIVE, "q8") else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing q8/");
+    };
+    let registry = mlx_gen_sdxl::provider_registry().expect("provider registry");
+    let model = registry
+        .load(
+            "sdxl",
+            &spec(&dir, "q8", LoadShape::DeferredMaterialization),
+        )
+        .expect("load sdxl deferred");
+
+    let mut admitted = 0_usize;
+    for size in ms::TRANSFORMER_WINDOW_SIZES {
+        let outcome = model.generate(&request(Some(full_ladder(*size)), 1024, 2), &mut |_| {});
+        println!(
+            "[sc-15525 rung4 domain] WINDOW-REQUEST size={size} admitted={} refused={}",
+            outcome.is_ok(),
+            outcome.is_err()
+        );
+        outcome.unwrap_or_else(|err| {
+            panic!("published cadence {size} must be admitted by the production path: {err}")
+        });
+        admitted += 1;
+    }
+    assert_eq!(
+        admitted,
+        ms::TRANSFORMER_WINDOW_SIZES.len(),
+        "every published cadence must render"
+    );
+
+    // Collected rather than asserted in-loop, so a regression reports EVERY cadence it affects
+    // instead of stopping at the first. That matters here: the interesting failure mode is "the
+    // interior gaps got clamped while the extremes still error", and a fail-fast loop that trips on
+    // cadence 0 would hide exactly that.
+    const OUT_OF_DOMAIN: [u32; 8] = [0, 3, 4, 6, 7, 9, 11, 70];
+    let mut silently_admitted = Vec::new();
+    let mut refused_elsewhere = Vec::new();
+    let mut refused_by_the_window_validator = 0_usize;
+    for bad in OUT_OF_DOMAIN {
+        assert!(
+            !ms::TRANSFORMER_WINDOW_SIZES.contains(&bad),
+            "the negative list must stay disjoint from the published domain"
+        );
+        let outcome = model.generate(&request(Some(full_ladder(bad)), 1024, 2), &mut |_| {});
+        println!(
+            "[sc-15525 rung4 domain] WINDOW-REQUEST size={bad} admitted={} refused={}",
+            outcome.is_ok(),
+            outcome.is_err()
+        );
+        match outcome {
+            Ok(_) => silently_admitted.push(bad),
+            Err(err) if err.to_string().contains("transformer window") => {
+                refused_by_the_window_validator += 1;
+            }
+            Err(err) => refused_elsewhere.push(format!("{bad}: {err}")),
+        }
+    }
+    assert!(
+        silently_admitted.is_empty(),
+        "cadences {silently_admitted:?} are outside {:?} and were ADMITTED — a clamped or ignored \
+         window executes a strategy the selector did not choose, which is the defect this domain's \
+         publication depends on not existing",
+        ms::TRANSFORMER_WINDOW_SIZES
+    );
+    // Refused-by-something-else is a weaker guarantee than refused-by-the-window-validator, and the
+    // difference is worth failing over: `BlockPlan::new` rejects a zero window on its own, so a
+    // provider whose own validator silently stopped working would still look fine at that end of the
+    // range while admitting the interior gaps. Requiring the provider's own refusal keeps the two
+    // layers independently proven rather than letting the deeper one mask the nearer one.
+    assert!(
+        refused_elsewhere.is_empty(),
+        "these cadences were refused, but NOT by memory_strategy::validate_window — the provider's \
+         own domain gate is not the thing rejecting them: {refused_elsewhere:?}"
+    );
+    assert_eq!(
+        refused_by_the_window_validator,
+        OUT_OF_DOMAIN.len(),
+        "every out-of-domain cadence must be refused by the provider's window validator"
+    );
 }
 
 /// **Rung 4 fails closed on every precondition**, on real weights, through the production path.
@@ -941,8 +1114,14 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
     };
     assert!(err.to_string().contains("staged residency"), "got: {err}");
 
-    // 3. A window CADENCE outside the published domain.
+    // 3. A window CADENCE outside the published domain. (The exhaustive both-directions check is
+    //    `the_published_window_domain_is_enforced_and_reachable_on_the_production_path`; these are
+    //    the fail-closed spot checks that belong beside the other preconditions.)
     for bad in [0_u32, 3, 7, 70] {
+        assert!(
+            !ms::TRANSFORMER_WINDOW_SIZES.contains(&bad),
+            "the negative list must stay disjoint from the published domain"
+        );
         let err = match deferred.generate(&request(Some(full_ladder(bad)), 1024, 2), &mut |_| {}) {
             Ok(_) => panic!("an out-of-domain window {bad} must be refused"),
             Err(err) => err,

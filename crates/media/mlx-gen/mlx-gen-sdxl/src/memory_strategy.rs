@@ -18,7 +18,7 @@
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
 //! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) exists and bounds the decode 14.360 → 11.237 GiB, but no fixed tile edge holds its quality across the advertised output range |
-//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the request peak 0.00% (and the U-Net seam +5.08%), and its query-row axis is not bit-exact on Metal |
+//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the request peak 0.00% (and the U-Net seam +5.1%), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
 //! ## What this family actually buys, measured (`realvisxl`, Apple/Metal, 1024², 6 steps)
@@ -27,50 +27,41 @@
 //! |---|---|---:|---:|---:|---|
 //! | resident | bf16 | 20.513 GiB | — | — | — |
 //! | + rung 1 | bf16 | **19.003** | **−7.4%** | 780 | byte-identical |
-//! | staged (control) | q8 | 17.693 | — | 767-913 | — |
-//! | + rung 4, window 1 | q8 | **15.516** | **−12.31%** | **3698-3790** | byte-identical |
+//! | staged (control) | q8 | 17.693 | — | 740-913 | — |
+//! | + rung 4, window 1 | q8 | **15.516** | **−12.31%** | 3591-3790 | byte-identical |
+//! | + rung 4, window 10 (default) | q8 | **15.516** | **−12.31%** | **1318-1325** | byte-identical |
 //!
-//! ## Rung 4 costs 4-5× the wall clock, and that is published rather than discovered
+//! ## Rung 4's cost is time, and the CADENCE is the dial that sets it
 //!
 //! SC-16355 carried re-materialization latency as an explicit hazard — *"70 blocks across 11
 //! re-opens could be a severe regression on exactly the small Macs this rung exists for"* — and it
-//! was right. Nothing had measured it. Two full runs of the suite on this Mac:
+//! was right. Nothing had measured it, and the first revision of this file published a single
+//! cadence of 1, which turns out to be the **worst** point on the frontier: it costs **+310%** wall
+//! clock for a saving every other cadence also achieves. At the published default of 10 the same
+//! −12.31% costs **+51%**.
 //!
-//! | run | control | window 1 | ratio |
-//! |---|---:|---:|---:|
-//! | A | 767 ms/step | 3790 | **4.94×** |
-//! | B | 913 ms/step | 3698 | **4.05×** |
+//! The full sweep — peak, time and byte-identity per cadence, at two geometries — is on
+//! [`TRANSFORMER_WINDOW_SIZES`]. The short version is that the peak column is **flat**: this family
+//! is activation-bound rather than weight-bound, so widening the window buys time back for free.
 //!
-//! Quoted as a range rather than a point because it is a wall clock and it moves with thermal state
-//! and machine load; the *peak* rows either run agrees to the millibyte. Call it **4-5×**.
+//! Latency is quoted as a range because it is a wall clock and moves with thermal state and machine
+//! load (five runs of the window-1 row: 3591 / 3654 / 3674 / 3698 / 3790 ms/step, a ~5% spread). The
+//! *peak* rows agree to the millibyte across every run, which is why the peak assertions in the sweep
+//! are tight and the latency ones deliberately are not.
 //!
-//! That does not make the rung a bad trade, and it is emphatically not a reason to withhold it: on a
-//! host where the unwindowed composition does not fit, 4-5× slower is the difference between a render
-//! and no render (`the_full_ladder_renders_under_a_memory_cap` runs the whole ladder under an 8 GiB
-//! cap). But it is a first-class cost, the selector cannot weigh a cost nobody published, and a rung
-//! that quietly quintupled render time would be discovered by users rather than by us. So it is
-//! measured on every rung-4 row and printed beside the peak, and the sweep asserts a loose 10×
-//! ceiling — loose on purpose, so that a re-open path which starts *thrashing* reddens while thermal
-//! noise does not.
+//! None of this withholds the rung: on a host where the unwindowed composition does not fit, even
+//! +310% is the difference between a render and no render
+//! (`the_full_ladder_renders_under_a_memory_cap` runs the whole ladder under an 8 GiB cap). What it
+//! changes is that a selector can now pick the cheap end of the frontier instead of the expensive
+//! one — which it could not do while the domain had a single value.
 //!
-//! For contrast, and this is the comparison that makes the number worth publishing: the rung-2
-//! geometry this family **withholds** would have bought −16.51% of the peak for ~7% wall clock. Rung
-//! 4 buys −12.31% for 300-400%. They are not the same kind of lever.
+//! For contrast: the rung-2 geometry this family **withholds** would have bought −16.51% of the peak
+//! for ~5% wall clock. Rung 4 at its default buys −12.31% for +51%.
 //!
 //! The obvious lever against it is a **wider cadence** — the re-open count per sub-stack falls as the
 //! window widens — which is the one thing this domain does not currently offer. That is tracked
 //! rather than guessed at: publishing a second cadence requires its own measurement on every entry,
 //! and this story measured one.
-//!
-//! Rung 4's published domain is the **single tightest cadence** ([`TRANSFORMER_WINDOW_SIZES`] is
-//! `[1]`), so there is one rung-4 row and not a sweep of them. An earlier draft of this table carried
-//! a second "window 2" row at the same peak; it was never measured and could not have been — the
-//! sweep iterates this constant, and `validate_window` refuses every cadence outside it. A wider
-//! cadence is also the wrong direction to explore first:
-//! [`BlockPlan::new`](mlx_gen::block_residency::BlockPlan::new) clamps a window to its stack's
-//! depth, so any cadence ≥ 2 degrades **five of the eleven** sub-stacks (the 2-deep ones) to fully
-//! resident while bounding the other six less tightly. If a future story wants that trade it owes
-//! its own measurement.
 //!
 //! ## Per-entry coverage is NOT uniform — measured, per entry, per tier
 //!
@@ -334,7 +325,7 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 ///
 ///    Measured instead at the U-Net seam, where the effect is not diluted by the rest of the request
 ///    (`attention_chunking_is_measured_at_the_unet_seam`), one CFG-batched 1024² forward goes
-///    **6.2685 → 6.5868 GiB, +5.08%**: chunking *adds* transients here rather than bounding
+///    **6.2587-6.2685 → 6.5868 GiB, +5.1%**: chunking *adds* transients here rather than bounding
 ///    anything. That is the hazard `mlx_gen::attention`'s own docs name — when q/k/v are already
 ///    materialized and pinned, chunking only adds — and on a U-Net it is the normal case, because
 ///    the conv/resnet trunk between every attention has already broken the lazy graph that
@@ -377,14 +368,61 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// The production transformer-window domain for rung 4: how many consecutive `TransformerBlock`s of
 /// **each** `Transformer2D` are held materialized at once.
 ///
-/// The domain is a **cadence**, applied independently to eleven sub-stacks of two depths.
-/// [`BlockPlan::new`](mlx_gen::block_residency::BlockPlan::new) clamps a window to its stack's
-/// depth, so a cadence wider than 2 degrades the five 2-deep sub-stacks to fully resident rather
-/// than erroring — which is why the domain is stated once and not per depth.
-pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
+/// The domain is a **cadence**, applied independently to eleven sub-stacks of two depths
+/// (`[2,2,10,10,10,10,10,10,2,2,2]`). [`BlockPlan::new`](mlx_gen::block_residency::BlockPlan::new)
+/// clamps a window to its stack's depth, so a cadence wider than 2 degrades the five 2-deep
+/// sub-stacks to fully resident rather than erroring — which is why the domain is stated once and
+/// not per depth. 10 is therefore the widest cadence that means anything here: it holds one *whole*
+/// deep sub-stack, i.e. one re-open per stack per step instead of ten.
+///
+/// ## All four cadences bound the peak identically. They differ only in time.
+///
+/// `transformer_window_sweep_and_streamed_output_identity`, `realvisxl` q8, fresh bundle per row,
+/// every row byte-identical to the resident control:
+///
+/// | cadence | 1024² peak | vs control | 1024² ms/step | 768² peak | vs control | 768² ms/step |
+/// |---:|---:|---:|---:|---:|---:|---:|
+/// | control (resident) | 17.693 GiB | — | 740-877 | 11.546 GiB | — | 451 |
+/// | 1 | **15.516** | −12.31% | 3591-3654 | **9.368** | −18.86% | 3355 |
+/// | 2 | **15.516** | −12.31% | 2221-2265 | **9.368** | −18.86% | 1953 |
+/// | 5 | **15.516** | −12.31% | 1554-1565 | **9.368** | −18.86% | 1220 |
+/// | **10** | **15.516** | −12.31% | **1318-1325** | **9.368** | −18.86% | **979** |
+///
+/// Absolute ms/step is indicative, not a spec: a wall clock tracks machine load. One run taken while
+/// the box was busy read control 1243 / cadence 1 5195 / cadence 10 2230 — every number inflated,
+/// **the peak column unchanged**, and the cadence-1→10 ratio still 2.33×. Across five runs that ratio
+/// sits at **2.33-2.77×**, which is the quantity worth quoting; MLX's peak accounting is per process
+/// and does not move at all.
+///
+/// **The peak column is flat to the millibyte at both geometries**, and that is the whole finding.
+/// It is also exactly what this family's profile predicts: the down→up **skip stack** holds the whole
+/// forward's activations alive, and rung 4 bounds *weights*. Once the windowed weight residency drops
+/// below that activation floor, widening the window buys back time without costing memory — and even
+/// a whole 10-deep sub-stack resident does not reach that floor. `docs/sc-16195/resolution-sweep.json`
+/// already put illustrious q8 at 4.74 GiB resident against a 14.04 GiB transient; this is that ratio
+/// showing up as a lever.
+///
+/// So the domain is published as **all four**, because they are four genuinely different points on a
+/// real time/memory frontier and the selector — not this file — owns that choice. That is the same
+/// posture `mlx_gen_z_image` takes for its decode ladder: *a domain, not a recommendation.*
+///
+/// An earlier revision published `[1]` alone and claimed windows 1 and 2 were "identical". The peak
+/// half of that was right by accident; the claim was unmeasurable as written (the sweep iterates this
+/// constant and `validate_window` refused everything outside it), and it hid the fact that the single
+/// published cadence was the **worst** point on the frontier — the same memory for 2.7× the time.
+pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 
 /// The transformer window rung 4 executes at when a request names none.
-pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
+///
+/// **The widest cadence, not the tightest**, and that is a measured choice rather than a default
+/// inherited from the DiT adopters. On both measured geometries every cadence bounds the request peak
+/// to the same value (see [`TRANSFORMER_WINDOW_SIZES`]), so a caller who names nothing should get the
+/// cheapest point that achieves it: 10 costs +51% wall clock where 1 costs +310%.
+///
+/// A cadence of 1 is still published and still selectable — the flatness is measured at 1024² and
+/// 768² on q8, and a selector facing a geometry where the activation floor is lower may want the
+/// tighter weight bound. What it must not be is the value a caller gets by accident.
+pub const TRANSFORMER_WINDOW_SIZE: u32 = 10;
 
 /// The rung-4 **component scopes** this provider implements.
 ///
@@ -404,7 +442,17 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 ///
 /// Load shape is a typed evidence-key axis carried separately on [`MemoryCalibrationIdentity`]; this
 /// content fingerprint stays shape-independent.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v1";
+/// `v2` because the rung-4 parameter domain changed shape: [`TRANSFORMER_WINDOW_SIZES`] went from
+/// one cadence to four and [`TRANSFORMER_WINDOW_SIZE`] moved from the tightest to the widest.
+/// Evidence generated against the single-cadence draft describes a different set of selectable
+/// executions — and a different default execution — so it must not be reusable here.
+///
+/// **The paired evidence must be keyed per cadence, not per rung.** All four cadences bound the peak
+/// identically on this family (that is the whole reason the domain has four values), but they differ
+/// by up to 2.7× in wall clock, so a selector weighing peak against time needs a row per candidate.
+/// `MemoryFormulaVariable::TransformerWindowSize` is already declared on the formula for exactly
+/// this: the window is a variable of the cost, not a constant folded into it.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v2";
 
 /// Whether THIS load can execute rung 4. **Four** independent facts decide it.
 ///
@@ -686,7 +734,7 @@ pub(crate) fn safety_check(
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
             return Err(CoreError::Unsupported(format!(
                 "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the request peak 0.00% here (and +5.08% at the U-Net seam), and \
+                 Missing): it moves the request peak 0.00% here (and +5.1% at the U-Net seam), and \
                  the query-row chunking axis is not bit-exact on Metal, which an fp16 \
                  chaos-sensitive schedule amplifies to a different image — see \
                  memory_strategy::ATTENTION_SUPPORT",
@@ -901,7 +949,7 @@ pub(crate) fn attention_plan(
     if req.memory.is_some_and(|memory| memory.chunk_attention) {
         return Err(mlx_gen::Error::Unsupported(
             "sdxl: bounded attention is not selectable on this provider (rung 3 is declared \
-             Missing): it moves the request peak 0.00% here (and +5.08% at the U-Net seam), and the \
+             Missing): it moves the request peak 0.00% here (and +5.1% at the U-Net seam), and the \
              query-row chunking axis is not bit-exact on Metal, which an fp16 chaos-sensitive \
              schedule amplifies to a different image — see memory_strategy::ATTENTION_SUPPORT"
                 .to_owned(),
@@ -1132,12 +1180,32 @@ mod tests {
                 Some(*size as usize)
             );
         }
-        for bad in [0_u32, 2, 3, 5, 10, 70] {
+        // Out-of-domain cadences, chosen to sit *between* and *beyond* the published ones rather
+        // than merely far from them: 3/4/6/7/9 are interior gaps a "clamp to the nearest legal
+        // value" bug would silently absorb, and 11/70 are past the widest sub-stack.
+        for bad in [0_u32, 3, 4, 6, 7, 9, 11, 70] {
+            assert!(
+                !TRANSFORMER_WINDOW_SIZES.contains(&bad),
+                "the negative case list must stay disjoint from the published domain"
+            );
             assert!(
                 transformer_window_size(&request(windowed(Some(bad), None))).is_err(),
                 "window {bad} must be refused"
             );
         }
+        // The request-side default is the widest cadence, not the tightest — a request that engages
+        // rung 4 without naming a size must not silently get the most expensive point on the
+        // frontier. This is the resolver half of `TRANSFORMER_WINDOW_SIZE`'s claim.
+        assert_eq!(
+            transformer_window_size(&request(windowed(None, None))).unwrap(),
+            Some(TRANSFORMER_WINDOW_SIZE as usize)
+        );
+        assert_eq!(
+            TRANSFORMER_WINDOW_SIZE,
+            *TRANSFORMER_WINDOW_SIZES.last().unwrap(),
+            "the default must be the widest published cadence: every cadence bounds the peak \
+             identically on this family, so the cheapest one is the honest default"
+        );
         for component in [
             TransformerComponent::TextEncoder,
             TransformerComponent::Both,
@@ -1213,6 +1281,21 @@ mod tests {
         assert!(
             (TRANSFORMER_WINDOW_SIZES[0] as usize) < 2,
             "the tightest published cadence must bound the 2-deep sub-stacks"
+        );
+        // Ascending and duplicate-free. The assertion above indexes `[0]` for "tightest" and
+        // `TRANSFORMER_WINDOW_SIZE` is checked against `.last()` for "widest", so the ordering is
+        // load-bearing rather than cosmetic.
+        assert!(
+            TRANSFORMER_WINDOW_SIZES.windows(2).all(|w| w[0] < w[1]),
+            "the domain must be strictly ascending: {TRANSFORMER_WINDOW_SIZES:?}"
+        );
+        // The widest published cadence must be the widest sub-stack. Anything larger is
+        // indistinguishable from it (`BlockPlan::new` clamps), so publishing it would put a
+        // choice in front of the selector that cannot differ from one it already has.
+        assert_eq!(
+            *TRANSFORMER_WINDOW_SIZES.last().unwrap() as usize,
+            widest,
+            "the widest cadence must equal the deepest sub-stack — one re-open per stack per step"
         );
     }
 
