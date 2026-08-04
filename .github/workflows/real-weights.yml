@@ -1758,6 +1758,38 @@ jobs:
   # here is the within-regime attribution" is a passing outcome, because the drift itself is
   # sc-15571's open question, not this lane's. What it does gate is that the sweep still runs, still
   # produces a resolvable verdict, and that no row freezes or blows highlights.
+  #
+  # STANDING CADENCE: dispatch-only, permanently. sc-17324 was asked to choose between this and "its
+  # own cron on a night the weekly does not run", and settled it on two measurements — do not re-open
+  # it without new ones.
+  #
+  #   1. A second `cron:` entry cannot be scoped to this job as the workflow is written. THIRTY-ONE
+  #      jobs here gate on a bare `github.event_name == 'schedule'`, so any cron added to `on:` fires
+  #      the entire real-weight suite, not the sweep. Scoping it would mean rewriting all thirty-one
+  #      to `github.event.schedule == '0 2 * * 1'` — and the failure mode of missing one is a lane
+  #      that silently stops running weekly, which is strictly worse than the gap being closed.
+  #   2. A calendar is the wrong trigger anyway. These numbers move when the AR loop, the KV
+  #      window/sink, the scheduler or the decode path moves — not when a week passes. Re-running an
+  #      unchanged tree at 4.3 h a go buys a re-measurement of the same 21 cells.
+  #
+  # Point 1 is about THIS file, and there is an obvious way around it: lift the job into its own
+  # workflow with its own `on: schedule`. That was considered and NOT taken, because point 2 does not
+  # go away with it — a separate file still buys a scheduled re-measurement of an unchanged tree, at
+  # 4.3 h of a box that runs four `rw-*` pools one at a time, and it splits one real-weight lane
+  # across two files and two policy-test fixtures for that. If a cron is ever actually wanted, the
+  # separate workflow is the right shape for it; the reason to want one is not "coverage is zero",
+  # it is a specific question a scheduled run would answer that a triggered one would not.
+  #
+  # What actually holds the sweep together between dispatches is CI, not the clock: the decision rule
+  # and the recorded evidence are covered by seven NON-ignored tests in `generate_smoke.rs` that need
+  # no weights and run in every `cargo test` — `the_s18_verdict_rule_distinguishes_its_outcomes`,
+  # `the_recorded_s18_sweep_is_what_the_docs_claim`, `the_withdrawn_s18_claims_do_not_survive_in_crate_prose`,
+  # `the_s18_bounded_dose_ladder_spans_thirteen_ten_and_five_rolls`,
+  # `an_s18_cell_retains_tail_motion_from_the_live_sweep`, and the two drift-metric shape gates. A
+  # rename or a rule change goes red there, in minutes, without a runner.
+  #
+  # So: DISPATCH THIS when the thing it measures changes — the AR rollout, `local_attn_size`/`sink_size`,
+  # the sigma schedule across chunks, the VAE decode path — or before closing sc-15571. Not on a date.
   mlx-krea-realtime-s18-sweep:
     name: MLX Krea Realtime S18 coherence sweep (operator dispatch)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'krea-s18-sweep'
@@ -1837,6 +1869,18 @@ jobs:
       # `S18CELL` TSV line precisely so a run can be re-aggregated without the log. `always()` because
       # a four-hour run that ends in an unresolvable verdict still measured 21 real cells, and throwing
       # them away would mean paying for the sweep twice to read them.
+      #
+      # KNOWN LIMIT of that guarantee, measured — it covers a FAILING SWEEP, not a DYING RUNNER.
+      # `always()` schedules these steps when the sweep step fails; it cannot schedule them when the
+      # job itself stops existing. sc-17324's first powered dispatch (run 30948568453) lost
+      # `nax-macos-2` 2 h 42 m in — "The self-hosted runner lost communication with the server" — and
+      # because the runner died, these two steps never ran, no artifact was produced, and GitHub kept
+      # no partial log (the run's log zip is empty). Every cell measured up to that point was lost.
+      # Closing that hole needs the sweep split so each row surrenders its cells as it finishes, plus
+      # a re-aggregation entry point to rebuild the verdict from the pieces — the test's own docs say
+      # the S18CELL lines exist to make that possible, but nothing exposes it to CI today. Not built
+      # here: one runner loss is n = 1, and sc-17355 records the standing posture for nax-macos-2
+      # anomalies (observe, do not redesign, until it recurs). Tracked in sc-17655.
       - name: Extract the S18 cell evidence
         if: always()
         run: |
