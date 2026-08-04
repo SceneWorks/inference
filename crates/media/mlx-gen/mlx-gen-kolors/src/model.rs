@@ -210,10 +210,7 @@ pub(crate) fn render_sample(
     // `render_sample`), so this stays correct if the preview ever runs a B=1 (CFG-off) batch.
     let time_ids = kolors_time_ids(pooled.shape()[0], edge as i32, edge as i32);
     let latents = sampler.scale_initial_noise(&init_noise)?;
-    let d = Denoiser {
-        unet,
-        sampler: &sampler,
-    };
+    let d = Denoiser::new(unet, &sampler);
     let latents = denoise(
         &d,
         latents,
@@ -556,10 +553,7 @@ impl KolorsHeavy {
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
+        let d = Denoiser::new(&self.unet, &sampler);
         denoise_registered(
             &d,
             latents,
@@ -608,10 +602,7 @@ impl KolorsHeavy {
         // Seed the init: raw `x₀ + noise·σ_start` (diffusers EulerDiscrete add_noise at begin_index).
         let latents = sampler.add_noise(init_latents, noise)?;
 
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
+        let d = Denoiser::new(&self.unet, &sampler);
         denoise_registered(
             &d,
             latents,
@@ -749,6 +740,10 @@ impl KolorsHeavy {
             // `control_encoder = None` ⇒ the Kolors ControlNet cross-attends to the text
             // `conditioning` (its own `encoder_hid_proj`), matching the bespoke combined-pose path.
             None,
+            // Kolors has not adopted the SC-15525 memory ladder: it re-exports the SDXL U-Net but
+            // registers its own provider, and rungs are declared per provider. The unbounded plan is
+            // its exact pre-ladder behaviour. SC-15521 owns its adoption.
+            mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -800,10 +795,7 @@ impl KolorsHeavy {
             scale: control_scale,
         };
 
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
+        let d = Denoiser::new(&self.unet, &sampler);
         denoise_control_registered(
             &d,
             latents,
@@ -854,10 +846,7 @@ impl KolorsHeavy {
         // (the uncond row gets no image conditioning); the image tokens alone when guidance is off.
         let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
 
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
+        let d = Denoiser::new(&self.unet, &sampler);
         denoise_ip_registered(
             &d,
             latents,
@@ -940,10 +929,7 @@ impl KolorsHeavy {
         // `denoise_ip_latents`.
         let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
 
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
+        let d = Denoiser::new(&self.unet, &sampler);
         // `control_encoder = conditioning`: the Kolors ControlNet cross-attends to the ChatGLM3 text
         // context (its own `encoder_hid_proj`), NOT the IP tokens. `cn_enc = control_encoder
         // .unwrap_or(conditioning)` in `denoise_core`, so passing the text conditioning here is the

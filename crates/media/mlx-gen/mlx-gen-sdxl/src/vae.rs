@@ -20,6 +20,26 @@ use crate::unet::ResnetBlock2D;
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
 
+/// The SDXL VAE's tiling geometry for ladder rung 2 (SC-15525).
+///
+/// A **still-image** VAE: spatial ×8 (three `upsample_nearest(2)`+conv stages in `up_blocks.0..2`;
+/// `up_blocks.3` does not upsample), and the temporal axis is a singleton, so `temporal_scale: 1`
+/// non-causal makes it a no-op and only H/W tile.
+///
+/// `full_res_channels: 128` — `VaeConfig::sdxl_base().block_out_channels[0]`, the width of the last
+/// `up_blocks` stage and of the `conv_norm_out` input, which is the widest tensor written at full
+/// output resolution. That is the *correctness* input to [`VaeTiling::writable_frame_cap`], not a
+/// memory estimate; it is inert at SDXL's 2048² ceiling (128 × 2048² = 5.4e8, 0.25× the bound).
+///
+/// Declared here rather than in `gen_core::tiling` deliberately: the presets there are the ones
+/// shared by more than one crate, and this geometry has exactly one consumer.
+const VAE_TILING: mlx_gen::tiling::VaeTiling = mlx_gen::tiling::VaeTiling {
+    spatial_scale: 8,
+    temporal_scale: 1,
+    causal_temporal: false,
+    full_res_channels: 128,
+};
+
 /// Single-head spatial self-attention used in the VAE mid block (the vendored `vae.Attention`).
 struct VaeAttention {
     gn_w: Array,
@@ -167,10 +187,37 @@ impl Decoder {
     }
 
     fn forward(&self, z: &Array) -> Result<Array> {
+        self.tail(&self.head(z)?)
+    }
+
+    /// The **globally-scoped** half of the decode: `conv_in` → mid resnet → mid **attention** → mid
+    /// resnet, all at latent resolution.
+    ///
+    /// Split out for ladder rung 2 (SC-15525). `mid_attn` is a single-head self-attention over every
+    /// `H·W` latent token ([`VaeAttention::forward`]), so its result depends on the whole grid. Tiling
+    /// across it would silently change the arithmetic — each tile would attend only to its own tokens
+    /// — which is a *wrong decode*, not a blend artifact. The head is also cheap to run whole: at
+    /// 1024² it is a `[1, 128, 128, 512]` f32 activation (32 MiB), three orders of magnitude under the
+    /// full-resolution tail it protects. So the head runs once on the full latent and only the tail
+    /// tiles, which is the same split `mlx_gen_qwen_image`'s `decode_tiled` uses.
+    fn head(&self, z: &Array) -> Result<Array> {
         let mut x = conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
         x = self.mid_resnet0.forward(&x, None)?;
         x = self.mid_attn.forward(&x)?;
-        x = self.mid_resnet1.forward(&x, None)?;
+        self.mid_resnet1.forward(&x, None)
+    }
+
+    /// The **spatially-local** half of the decode: the four `up_blocks` (×8 nearest+conv upsample)
+    /// and the `conv_norm_out` → `silu` → `conv_out` head. This is where the full-resolution
+    /// activations live, and it is what rung 2 tiles.
+    ///
+    /// It is *not* purely local: every `ResnetBlock2D` and the final `conv_norm_out` are GroupNorms
+    /// whose statistics are computed over the spatial extent they are handed. A tile therefore
+    /// normalizes against its own statistics rather than the image's, which is a real (bounded)
+    /// deviation and the reason the admitted tile ladder is a measurement rather than a preset —
+    /// see [`crate::memory_strategy::DECODE_SUPPORT`].
+    fn tail(&self, x: &Array) -> Result<Array> {
+        let mut x = x.clone();
         for ub in &self.up_blocks {
             x = ub.forward(&x)?;
         }
@@ -271,6 +318,61 @@ impl Autoencoder {
         let z = multiply(latents, scalar(1.0 / self.scaling_factor))?;
         let z = self.post_quant_proj.forward(&z)?;
         self.decoder.forward(&z)
+    }
+
+    /// Ladder rung 2 — **bounded decode** (SC-15525): the same decode with the full-resolution
+    /// upsample tail run tile-by-tile and trapezoidally blended, bounding the decode's peak by one
+    /// tile's activations instead of the whole image's.
+    ///
+    /// `cfg` is the requested geometry; when it does not actually tile this latent
+    /// ([`TilingConfig::needs_tiling`](mlx_gen::tiling::TilingConfig::needs_tiling)) the call falls through to the exact single-pass
+    /// [`decode`](Self::decode) rather than assembling a one-tile plan, so a small render pays
+    /// nothing. The blend geometry is [`mlx_gen::tiling`] and the array loop is
+    /// [`mlx_gen::vae_tiling::tiled_decode`] — this crate contributes only the head/tail split and
+    /// the NHWC axis mapping.
+    ///
+    /// **What is exact and what is not.** Denormalize, `post_quant_conv`, `conv_in`, the mid resnets
+    /// and the mid **attention** run once on the full latent (`Decoder::head`), so nothing globally
+    /// scoped is tiled. The tail's GroupNorms *are* tiled, and they normalize against per-tile
+    /// statistics — a bounded deviation from the untiled reference which is swept and published as
+    /// [`crate::memory_strategy::DECODE_SUPPORT`] rather than assumed away.
+    ///
+    /// `cancel` is checked between tiles by the shared loop; decode is a dominant fraction of an SDXL
+    /// render's wall clock and previously had no cancellation point at all.
+    pub fn decode_tiled(
+        &self,
+        latents: &Array,
+        cfg: &mlx_gen::tiling::TilingConfig,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        let sh = latents.shape();
+        if sh.len() != 4 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "sdxl tiled decode expects NHWC latents [B, H, W, C], got {sh:?}"
+            )));
+        }
+        let (hl, wl) = (sh[1], sh[2]);
+        if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
+            return self.decode(latents);
+        }
+        let z = multiply(latents, scalar(1.0 / self.scaling_factor))?;
+        let z = self.post_quant_proj.forward(&z)?;
+        // Head once on the whole latent, then a singleton temporal axis so the shared rank-5
+        // slice/pad/accumulate loop can address it: `[B, 1, Hl, Wl, C]`, tiled axes `[1, 2, 3]`.
+        let head = self.decoder.head(&z)?;
+        let hs = head.shape();
+        let head = head.reshape(&[hs[0], 1, hs[1], hs[2], hs[3]])?;
+        let plan = cfg.plan(VAE_TILING, 1, hl, wl);
+        let out = mlx_gen::vae_tiling::tiled_decode(&head, &plan, [1, 2, 3], cancel, |tile| {
+            let ts = tile.shape();
+            let tail = self
+                .decoder
+                .tail(&tile.reshape(&[ts[0], ts[2], ts[3], ts[4]])?)?;
+            let os = tail.shape();
+            Ok(tail.reshape(&[os[0], 1, os[1], os[2], os[3]])?)
+        })?;
+        let os = out.shape();
+        Ok(out.reshape(&[os[0], os[2], os[3], os[4]])?)
     }
 
     /// Encode an image `[B, 3, ...]`-normalized NHWC `[B, H, W, 3]` → latent **mean** `[B, H/8, W/8,

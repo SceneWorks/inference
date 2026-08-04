@@ -10,9 +10,12 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
+use mlx_gen::attention::sdpa_budgeted_bhsd;
 use mlx_gen::nn::{gelu_exact, group_norm};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+use crate::plan::SdxlForwardPlan;
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
@@ -109,14 +112,33 @@ impl AttentionMHA {
         }
     }
 
-    fn forward(&self, x: &Array, context: &Array) -> Result<Array> {
-        self.forward_ip(x, context, None)
-    }
-
-    /// As [`forward`](Self::forward), plus the IP-Adapter branch when `ip = Some((tokens, scale))`
-    /// and this module has IP projections installed: `o += scale · sdpa(q, to_k_ip(tokens),
-    /// to_v_ip(tokens))`, sharing the query `q`, before the output projection.
-    fn forward_ip(&self, x: &Array, context: &Array, ip: Option<(&Array, f32)>) -> Result<Array> {
+    /// The single attention entry point. There is deliberately no un-planned wrapper: rung 3 must
+    /// reach BOTH attentions of every block, and a convenience `forward` that dropped the plan is
+    /// exactly how a bounded rung silently stops being bounded on one of its two call sites.
+    ///
+    /// Runs `sdpa(q, k, v)` and, when `ip = Some((tokens, scale))` and this module has IP
+    /// projections installed, the decoupled branch
+    /// `o += scale · sdpa(q, to_k_ip(tokens), to_v_ip(tokens))` sharing the query `q`, before the
+    /// output projection.
+    ///
+    /// `plan` carries ladder rung 3 (SC-15525). Both attention calls route through
+    /// [`sdpa_budgeted_bhsd`], which is **exactly** the previous single
+    /// [`scaled_dot_product_attention`] call whenever the budget leaves the whole call in bounds —
+    /// including for the default [`AttentionPlan::UNBOUNDED`](mlx_gen::attention::AttentionPlan::UNBOUNDED),
+    /// where it takes a documented fast path. Precision, `scale`, dtypes and k/v are untouched, so
+    /// the schedule, the seed and the output contract cannot move.
+    ///
+    /// The training SDPA-checkpoint branch is deliberately left on the raw kernel: rung 3's saving
+    /// on MLX comes from `AttentionBudget::eval_per_chunk`, and `eval` is invalid inside an autograd
+    /// trace. The two are mutually exclusive by construction rather than by a runtime guard, because
+    /// the trainers never build a bounded plan.
+    fn forward_ip(
+        &self,
+        x: &Array,
+        context: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
         let (b, l) = (x.shape()[0], x.shape()[1]);
         let s = context.shape()[1];
         let to_heads = |a: Array, n: i32| -> Result<Array> {
@@ -141,7 +163,7 @@ impl AttentionMHA {
                 .next()
                 .ok_or_else(|| Error::Msg("sdxl: checkpoint SDPA produced no output".into()))?
         } else {
-            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan.attention)?
         };
 
         // IP-Adapter decoupled cross-attention (shares the query `q`).
@@ -150,7 +172,7 @@ impl AttentionMHA {
             let n_ip = tokens.shape()[1];
             let k_i = to_heads(k_ip.forward(tokens)?, n_ip)?;
             let v_i = to_heads(v_ip.forward(tokens)?, n_ip)?;
-            let o_ip = scaled_dot_product_attention(&q, &k_i, &v_i, self.scale, None, None)?;
+            let o_ip = sdpa_budgeted_bhsd(&q, &k_i, &v_i, self.scale, None, plan.attention)?;
             o = add(
                 &o,
                 &multiply(&o_ip, &scalar(scale).as_dtype(o_ip.dtype())?)?,
@@ -166,8 +188,13 @@ impl AttentionMHA {
 
 /// One spatial-transformer block: pre-norm self-attn, pre-norm cross-attn to the text memory, and a
 /// pre-norm GEGLU FFN (`linear1(y) * gelu(linear2(y)) → linear3`). All residual.
+///
+/// `pub(crate)` for ladder rung 4 (SC-16355): [`crate::block_stream`] rebuilds one of these from the
+/// snapshot with the **same** constructor the resident stack used. A second, stream-local block
+/// constructor would be a divergence hazard — two ways to build a block that can silently drift
+/// apart — which is exactly what the shared-ladder epic exists to remove.
 #[derive(Clone)]
-struct TransformerBlock {
+pub(crate) struct TransformerBlock {
     norm1_w: Array,
     norm1_b: Array,
     norm2_w: Array,
@@ -185,7 +212,12 @@ struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    fn from_weights(w: &Weights, prefix: &str, model_dims: i32, num_heads: i32) -> Result<Self> {
+    pub(crate) fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        model_dims: i32,
+        num_heads: i32,
+    ) -> Result<Self> {
         // GEGLU: `ff.net.0.proj` is one `[2*hidden, D]` Linear on disk, row-split into value/gate
         // halves. Determine `2*hidden` from the packed `.scales` grid (rows) when present, else from
         // the dense weight — the split rows are identical either way (sc-8746). The packed row-slice
@@ -232,7 +264,7 @@ impl TransformerBlock {
         })
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn1.quantize(bits)?;
         self.attn2.quantize(bits)?;
         self.linear1.quantize(bits, None)?;
@@ -244,6 +276,34 @@ impl TransformerBlock {
     /// Install this block's IP-Adapter K/V projections into its cross-attention (sc-3059).
     fn install_ip(&mut self, k_ip: Array, v_ip: Array) {
         self.attn2.install_ip(k_ip, v_ip);
+    }
+
+    /// The **already-built** IP-Adapter K/V projections on this block's cross-attention, for rung-4
+    /// replay ([`crate::block_stream`]).
+    ///
+    /// This captures the `AdaptableLinear`s rather than the raw `[hidden, cross_attention_dim]`
+    /// arrays deliberately. `install_ip_adapter` runs BEFORE `unet.quantize` in
+    /// `model::load_heavy`, so on a quantized tier the resident block's IP projections are *packed*;
+    /// re-installing the raw arrays would give a streamed block dense IP projections against a
+    /// packed base — a wrong image with no error. Cloning the built module carries whatever the
+    /// resident block actually ended up holding.
+    pub(crate) fn ip_projections(&self) -> Option<(AdaptableLinear, AdaptableLinear)> {
+        match (&self.attn2.to_k_ip, &self.attn2.to_v_ip) {
+            (Some(k), Some(v)) => Some((k.clone(), v.clone())),
+            _ => None,
+        }
+    }
+
+    /// Re-install captured IP-Adapter projections on a freshly materialized block (rung 4).
+    pub(crate) fn set_ip_projections(&mut self, k_ip: AdaptableLinear, v_ip: AdaptableLinear) {
+        self.attn2.to_k_ip = Some(k_ip);
+        self.attn2.to_v_ip = Some(v_ip);
+    }
+
+    /// Whether this block's cross-attention carries IP-Adapter projections. Used by the rung-4
+    /// stream to prove a streamed block is not silently missing the pair its resident twin held.
+    pub(crate) fn has_ip(&self) -> bool {
+        self.attn2.to_k_ip.is_some() && self.attn2.to_v_ip.is_some()
     }
 
     /// Toggle SDPA-segment checkpointing on both attentions (sc-4941).
@@ -275,13 +335,22 @@ impl TransformerBlock {
     /// Run the block. The cross-attention (`attn2`) also injects the IP-Adapter branch when `ip` is
     /// supplied (sc-3059); self-attention never gets IP. (No no-IP wrapper — callers always thread
     /// the `Option`, passing `None` when there's no IP-Adapter.)
-    fn forward_ip(&self, x: &Array, memory: &Array, ip: Option<(&Array, f32)>) -> Result<Array> {
-        // Self-attention.
+    pub(crate) fn forward_ip(
+        &self,
+        x: &Array,
+        memory: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
+        // Self-attention. Rung 3 reaches this one too: it is the LARGER of the two by far — its key
+        // axis is the latent grid (16384 at 1024² in the shallowest sub-stacks) against the text
+        // memory's fixed 77·2, so a bounded-attention rung that skipped it would bound the smaller
+        // half and report a saving it did not make.
         let y = layer_norm(x, Some(&self.norm1_w), Some(&self.norm1_b), LN_EPS)?;
-        let x = add(x, &self.attn1.forward(&y, &y)?)?;
+        let x = add(x, &self.attn1.forward_ip(&y, &y, None, plan)?)?;
         // Cross-attention to the text memory (+ optional IP-Adapter branch).
         let y = layer_norm(&x, Some(&self.norm2_w), Some(&self.norm2_b), LN_EPS)?;
-        let x = add(&x, &self.attn2.forward_ip(&y, memory, ip)?)?;
+        let x = add(&x, &self.attn2.forward_ip(&y, memory, ip, plan)?)?;
         // GEGLU FFN.
         let y = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), LN_EPS)?;
         let y = multiply(
@@ -301,6 +370,20 @@ pub struct Transformer2D {
     proj_in: AdaptableLinear,
     blocks: Vec<TransformerBlock>,
     proj_out: AdaptableLinear,
+    /// The block shape this sub-stack was built at, recorded so ladder rung 4 can rebuild a block
+    /// from the SAME derivation the resident stack used rather than a second spelling of it.
+    model_dims: i32,
+    num_heads: i32,
+    /// Ladder rung 4 (SC-15525 / SC-16355): how to rebuild **this sub-stack's** blocks from the
+    /// snapshot one window at a time. `None` when the load did not arm streaming, so a rung-4
+    /// request on an eagerly materialized generator is a typed rejection rather than a silent
+    /// resident execution. See [`crate::block_stream`].
+    ///
+    /// One stream per `Transformer2D` rather than one per model: the eleven sub-stacks have two
+    /// different depths and eleven different key prefixes, and each one's window bounds only its own
+    /// blocks. The conv/resnet trunk, the samplers, `norm`/`proj_in`/`proj_out` and the down→up skip
+    /// stack are the resident remainder and are *not* bounded by this rung.
+    block_stream: Option<crate::block_stream::SdxlBlockStream>,
 }
 
 impl Transformer2D {
@@ -329,7 +412,51 @@ impl Transformer2D {
             proj_in: crate::quant::lin(w, &format!("{prefix}.proj_in"), true)?,
             blocks,
             proj_out: crate::quant::lin(w, &format!("{prefix}.proj_out"), true)?,
+            model_dims,
+            num_heads,
+            block_stream: None,
         })
+    }
+
+    /// Arm ladder rung 4 on this sub-stack by recording where its blocks can be re-read from.
+    ///
+    /// `source` must be the exact U-Net checkpoint the resident stack was built from and `prefix`
+    /// the same `attentions.{i}` path, so a streamed block reads byte-identical keys. Called from
+    /// [`UNet2DConditionModel::arm_block_streams`](crate::unet::UNet2DConditionModel) after the
+    /// resident stack is fully built, quantized and adapted.
+    pub(crate) fn arm_block_stream(
+        &mut self,
+        source: mlx_gen::WeightsSource,
+        prefix: &str,
+        quant_bits: Option<i32>,
+    ) {
+        let mut stream = crate::block_stream::SdxlBlockStream::new(
+            source,
+            prefix,
+            self.model_dims,
+            self.num_heads,
+            self.blocks.len(),
+            quant_bits,
+        );
+        stream.capture_from(&mut self.blocks);
+        self.block_stream = Some(stream);
+    }
+
+    /// Disarm rung 4 on this sub-stack. Used when an in-place mutation lands that a re-materialized
+    /// block could not reproduce — see
+    /// [`UNet2DConditionModel::set_sdpa_checkpoint`](crate::unet::UNet2DConditionModel).
+    pub(crate) fn disarm_block_stream(&mut self) {
+        self.block_stream = None;
+    }
+
+    /// Whether rung 4 can execute on this sub-stack.
+    pub(crate) fn can_stream_blocks(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    /// How many `TransformerBlock`s this sub-stack holds — its own window domain.
+    pub(crate) fn depth(&self) -> usize {
+        self.blocks.len()
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -362,26 +489,97 @@ impl Transformer2D {
 
     /// `x`: NHWC `[B, H, W, C]`; `encoder_x`: text memory `[B, S, Dctx]`.
     pub fn forward(&self, x: &Array, encoder_x: &Array) -> Result<Array> {
-        self.forward_ip(x, encoder_x, None)
+        self.forward_ip(x, encoder_x, None, SdxlForwardPlan::UNBOUNDED)
     }
 
     /// As [`forward`](Self::forward) but threads the IP-Adapter tokens + scale into each block's
-    /// cross-attention (sc-3059).
+    /// cross-attention (sc-3059), and the ladder's rung-3/rung-4 plan into the block loop.
+    ///
+    /// **This is the rung-4 seam** (SC-16355). The hidden `Array` between `proj_in` and `proj_out`
+    /// is exactly the window driver's carried state, and the blocks in a range are exactly its
+    /// `apply` — so `mlx_gen::block_residency::run_windowed` applies here unchanged, per
+    /// `Transformer2D`. The U-Net's skip connections do **not** invalidate that: they live in
+    /// `forward_core` as a `Vec<Array>` of *activations* spanning the down→up path, entirely outside
+    /// this block window, which bounds *weights*. They bound how much the rung can be worth, not
+    /// whether it is correct.
     pub fn forward_ip(
         &self,
         x: &Array,
         encoder_x: &Array,
         ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.norm_w, &self.norm_b, GN_GROUPS, GN_EPS)?;
-        let mut y = self.proj_in.forward(&y.reshape(&[b, h * w_, c])?)?;
-        for block in &self.blocks {
-            y = block.forward_ip(&y, encoder_x, ip)?;
-        }
+        let y = self.proj_in.forward(&y.reshape(&[b, h * w_, c])?)?;
+        let y = match plan.window {
+            Some(window) => self.run_windowed_blocks(y, encoder_x, ip, plan, window)?,
+            None => {
+                let mut y = y;
+                for block in &self.blocks {
+                    y = block.forward_ip(&y, encoder_x, ip, plan)?;
+                }
+                y
+            }
+        };
         let y = self.proj_out.forward(&y)?.reshape(&[b, h, w_, c])?;
         Ok(add(&y, x)?)
+    }
+
+    /// Rung 4's block loop for this sub-stack: walk its blocks in windows, materializing each
+    /// window's weights from the snapshot and releasing them before the next window opens.
+    ///
+    /// The lifecycle — one fresh lazy view per window, **materialize before release**, `clear_cache`
+    /// after, and a cancellation check at every window boundary — belongs entirely to
+    /// [`mlx_gen::block_residency::run_windowed`]; nothing here re-implements it. The `materialize`
+    /// callback is the MLX trap SC-15750 measured: MLX is lazy, so the carried hidden state is an
+    /// unevaluated graph node still referencing the window's weights, and dropping before forcing
+    /// evaluation frees **nothing** — with correct output either way. Silent, not loud.
+    fn run_windowed_blocks(
+        &self,
+        y: Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+        window: crate::plan::SdxlBlockWindow<'_>,
+    ) -> Result<Array> {
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "sdxl: a transformer window was planned for a Transformer2D with no re-openable \
+                 block stream; bounded transformer residency needs a DeferredMaterialization load \
+                 over a snapshot directory"
+                    .to_owned(),
+            )
+        })?;
+        if stream.n_blocks() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "sdxl: block stream covers {} blocks but the sub-stack holds {}",
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        // The plan is built HERE, against this sub-stack's own depth — SC-16355's "a plan per
+        // Transformer2D, not one per model". `BlockPlan::new` clamps the window to the depth, so the
+        // 2-deep sub-stacks degrade to fully-resident at a cadence wider than 2 rather than erroring.
+        let block_plan = mlx_gen::block_residency::BlockPlan::new(self.blocks.len(), window.size)?;
+        // The inner blocks keep the request's own attention plan (rung 4 must not smuggle rung 3 in
+        // with it, nor drop it), but never the window — a materialized block is a leaf.
+        let inner = plan.with_window(None);
+        mlx_gen::block_residency::run_windowed(
+            &block_plan,
+            window.cancel,
+            y,
+            || stream.open(),
+            |mut y, view, range| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    y = block.forward_ip(&y, encoder_x, ip, inner)?;
+                }
+                Ok(y)
+            },
+            |y| Ok(mlx_rs::transforms::eval([y])?),
+        )
     }
 
     /// Install IP-Adapter K/V projections into each block's cross-attention, consuming one
@@ -438,7 +636,38 @@ impl AdaptableHost for AttentionMHA {
     }
 }
 
+/// Every adapter target reachable inside ONE `TransformerBlock`, as block-local dotted paths.
+///
+/// This is the complete surface of [`AdaptableHost::adaptable_mut`] below, and it exists because
+/// ladder rung 4 needs to *enumerate* a block's installed adapters in order to replay them onto a
+/// re-materialized block ([`crate::block_stream::SdxlBlockStream::capture_from`]). Before SC-15525
+/// nothing enumerated at this level — SDXL's kohya surface is built at the U-Net level by
+/// `lora_target_paths`, which returns absolute paths — so the trait's `adaptable_paths` defaulted to
+/// empty here and a capture would have silently found nothing.
+///
+/// `block_adapter_paths_all_resolve` pins the list against the match arms, so the two cannot drift.
+pub(crate) const BLOCK_ADAPTER_PATHS: &[&str] = &[
+    "attn1.to_q",
+    "attn1.to_k",
+    "attn1.to_v",
+    "attn1.to_out.0",
+    "attn2.to_q",
+    "attn2.to_k",
+    "attn2.to_v",
+    "attn2.to_out.0",
+    "ff.linear1",
+    "ff.linear2",
+    "ff.linear3",
+];
+
 impl AdaptableHost for TransformerBlock {
+    fn adaptable_paths(&self) -> Vec<String> {
+        BLOCK_ADAPTER_PATHS
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect()
+    }
+
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
             ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),

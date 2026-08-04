@@ -120,10 +120,7 @@ impl Components {
         let sampler =
             AncestralEuler::new(&self.base_sampler, STEPS, self.base_sampler.max_time()).unwrap();
         let init = seeded_prior(&self.base_sampler, seed, WIDTH, HEIGHT).unwrap();
-        let denoiser = Denoiser {
-            unet: &self.unet,
-            sampler: &sampler,
-        };
+        let denoiser = Denoiser::new(&self.unet, &sampler);
         let latents = if direct_preview_api {
             denoise_with_preview(
                 &denoiser,
