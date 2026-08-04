@@ -145,7 +145,12 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
 /// strength knob behaves identically on the Mac (MLX) and Windows (candle) SD3.5 lanes. `floor` because
 /// Python `int(steps · strength)` truncates toward zero for `s ≥ 0`. Pure function so the
 /// cross-backend-parity law is unit-testable without a GPU.
-pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+///
+/// `pub` so the sc-16958 preview harness can derive an img2img run's **emitted frame count** —
+/// `steps − init_time_step(steps, strength)`, since the driver only ever sees the reduced
+/// `sigmas[start..]` tail — from the very function the fork uses, rather than restating that
+/// arithmetic beside it and drifting from it.
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
     match strength {
         Some(s) if s > 0.0 => {
             let s = s.clamp(0.0, 1.0);
@@ -456,6 +461,23 @@ impl Pipeline {
         // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
         let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
+        // Per-step latent preview (epic 16948, sc-16958). Opting in is the sc-16949 projector hook and
+        // nothing else: the driver owns frame numbering, the multi-eval dedup and the swallow-on-failure
+        // contract, so neither this loop nor `render_core` changes shape. The hook is built once and
+        // handed to each per-seed driver call, and the driver builds a fresh counter per call — so a
+        // batched request restarts each image's trajectory at frame 1 rather than continuing the
+        // previous one's numbering. Over an inert sink this costs one `is_active` check per evaluation
+        // and leaves the render seeded-byte-identical. See [`crate::preview`].
+        //
+        // `render_core` takes the hook **by reference, not as an `Option`** — deliberately. The
+        // catalog's route inventory classifies the argument one hop further in, at the
+        // `run_flow_sampler` call, so an `Option` here would let this lane be turned dark by changing
+        // one argument to `None` while `hooked: 1` and `supports_preview: true` kept advertising.
+        // Going dark now requires a type change; `crate::preview`'s
+        // `the_render_lane_builds_its_hook_from_the_requests_sink` covers the other half — that the
+        // sink the hook is built over is the request's.
+        let preview = crate::preview::hook(&req.preview);
+
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             render_core(
                 &components.transformer,
@@ -475,6 +497,7 @@ impl Pipeline {
                 start_step,
                 &req.cancel,
                 on_progress,
+                &preview,
             )
         })
     }
@@ -484,6 +507,19 @@ impl Pipeline {
 /// deterministic CPU-seeded noise, run the unified flow-match sampler (with CFG when `uncond` is
 /// `Some`, distilled-single-eval when `None`), and VAE-decode. Decoupled from snapshot I/O so a test
 /// can drive it with a random-weight transformer + VAE.
+///
+/// `preview` is the per-step latent preview hook (epic 16948, sc-16958) — the **single**
+/// shared-driver site every SD3.5 route and lane funnels through, so hooking it here wires all six
+/// user-reachable lanes at once. See [`crate::preview`] for the enumeration, the reused fit and why
+/// the latent needs no unpack.
+///
+/// It is **not** an `Option`, unlike the shared driver's own parameter. This crate has no
+/// deliberately dark lane to express — no trainer, no descriptor-less provider — so an `Option` here
+/// would buy nothing and cost the guarantee that matters: with `&PreviewHook` a caller cannot go
+/// preview-dark by editing one argument, which is invisible to the catalog's route inventory because
+/// that inventory classifies the driver argument one hop further in. A hook over an inert
+/// [`gen_core::PreviewSink`] is the way to run this without previews, and it is byte-identical to a
+/// run without one: the emitter returns before any tensor work when the sink is inert.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_core(
     transformer: &Sd3Transformer,
@@ -503,6 +539,7 @@ pub(crate) fn render_core(
     start_step: usize,
     cancel: &gen_core::CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Image> {
     let (lat_h, lat_w) = latent_hw;
 
@@ -544,7 +581,7 @@ pub(crate) fn render_core(
         seed,
         cancel,
         on_progress,
-        None,
+        Some(preview),
         |latents, sigma| -> Result<Tensor> {
             // SD3 feeds the DiT `t = σ·1000` (the timestep convention; the embedder scales the
             // sinusoid). f32 here is correct — the embedder upcasts internally.
@@ -593,6 +630,17 @@ fn decode_image(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inert preview hook every structural row below hands [`render_core`].
+    ///
+    /// `render_core` takes its hook by reference rather than as an `Option` (see its docs — that is
+    /// what makes the shipped lane un-blankable), so these rows opt out of previews by handing it a
+    /// hook over an inert [`gen_core::PreviewSink`] rather than by passing `None`. The two are
+    /// byte-identical: `candle_gen::preview::emit_preview` returns before any tensor work when the
+    /// sink is inert, and the counter never advances.
+    fn inert_sink() -> gen_core::PreviewSink {
+        gen_core::PreviewSink::default()
+    }
 
     #[test]
     fn variant_defaults_match_sd35() {
@@ -903,6 +951,9 @@ mod tests {
         let mut progress = |_p: Progress| steps_seen += 1;
         let lat = 4usize; // 32px image at /8
         let steps = variant.default_steps().min(4);
+        // This row measures the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let img = render_core(
             &transformer,
             &vae,
@@ -921,6 +972,7 @@ mod tests {
             0,    // start_step: full schedule
             &cancel,
             &mut progress,
+            &preview,
         )
         .unwrap();
         assert_eq!(img.width, (lat as u32) * SPATIAL_SCALE);
@@ -964,6 +1016,9 @@ mod tests {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
         let (transformer, vae, cond, _uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let render = |seed| {
             render_core(
@@ -984,6 +1039,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
@@ -1012,6 +1068,9 @@ mod tests {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
         let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let render = |uncond_ref: Option<&Sd3Conditioning>| {
             render_core(
@@ -1032,6 +1091,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
@@ -1071,6 +1131,9 @@ mod tests {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
         let (transformer, vae, cond, _uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let steps = 4usize;
         let lat = 4usize;
@@ -1095,6 +1158,7 @@ mod tests {
                 start,
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
@@ -1237,6 +1301,9 @@ mod tests {
         let device = Device::new_cuda(0).expect("CUDA device 0");
         let cfg = tiny_cfg();
         let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let render = |uncond_ref: Option<&Sd3Conditioning>, scale: f32| {
             render_core(
@@ -1257,6 +1324,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
