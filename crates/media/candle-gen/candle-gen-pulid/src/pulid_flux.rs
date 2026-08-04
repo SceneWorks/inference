@@ -385,17 +385,12 @@ impl PulidFlux {
                 "pulid_flux: request memory context changed after provider load".into(),
             ));
         }
-        if context.geometry.width != req.width
-            || context.geometry.height != req.height
-            || context.geometry.frames != 1
-            || context.geometry.reference_count != 1
-            || context.has_reference != (context.geometry.reference_count > 0)
-            || context.use_pid != req.use_pid
-        {
-            return Err(CandleError::Msg(
-                "pulid_flux: request route or geometry changed after memory admission".into(),
-            ));
-        }
+        validate_request_geometry(
+            &context.geometry,
+            context.has_reference,
+            context.use_pid,
+            req,
+        )?;
         crate::memory_strategy::validate_context_from_loaded(contract, context)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
         let result = self.generate_inner(req, reference, on_progress);
@@ -552,6 +547,27 @@ impl PulidFlux {
     }
 }
 
+fn validate_request_geometry(
+    geometry: &candle_gen::gen_core::MemoryGeometry,
+    has_reference: bool,
+    use_pid: bool,
+    req: &PulidFluxRequest,
+) -> Result<()> {
+    if geometry.width != req.width
+        || geometry.height != req.height
+        || geometry.batch != 1
+        || geometry.frames != 1
+        || geometry.reference_count != 1
+        || has_reference != (geometry.reference_count > 0)
+        || use_pid != req.use_pid
+    {
+        return Err(CandleError::Msg(
+            "pulid_flux: request route or geometry changed after memory admission".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +624,25 @@ mod tests {
         assert_eq!(r.guidance, DEFAULT_GUIDANCE);
         assert_eq!(r.id_weight, DEFAULT_ID_WEIGHT);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn admitted_generation_geometry_rejects_zero_or_multi_image_batches() {
+        let req = PulidFluxRequest::default();
+        let mut geometry = candle_gen::gen_core::MemoryGeometry {
+            width: req.width,
+            height: req.height,
+            batch: 1,
+            frames: 1,
+            reference_count: 1,
+        };
+
+        assert!(validate_request_geometry(&geometry, true, false, &req).is_ok());
+        for batch in [0, 2] {
+            geometry.batch = batch;
+            let error = validate_request_geometry(&geometry, true, false, &req).unwrap_err();
+            assert!(error.to_string().contains("geometry changed"), "{error}");
+        }
     }
 
     /// `l2_normalize_rows` returns unit-norm rows (and the FLUX block counts the schedule is built over

@@ -6,8 +6,7 @@
 
 use candle_gen::gen_core::{
     self, LoadShape, LoadSpec, MemoryComponentKind, MemoryMode, MemoryProviderContract,
-    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy, OffloadPolicy,
-    WeightsSource,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, OffloadPolicy, WeightsSource,
 };
 
 use crate::PulidFluxPaths;
@@ -25,9 +24,16 @@ fn base_spec(paths: &PulidFluxPaths) -> LoadSpec {
 fn resident_component(
     id: &str,
     path: &std::path::Path,
+    require_float_source: bool,
 ) -> gen_core::Result<MemoryResidentComponent> {
     let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     let resident_bytes = headers.into_iter().try_fold(0_u64, |total, tensor| {
+        if require_float_source && !tensor.is_float() {
+            return Err(gen_core::Error::Msg(format!(
+                "{PROVIDER_ID}: {id} tensor {} uses {:?}; PuLID/EVA admission requires float-only weights because the shared loader preserves non-float storage width",
+                tensor.name, tensor.dtype
+            )));
+        }
         let elements = tensor.shape.iter().try_fold(1_u64, |elements, &dimension| {
             let dimension = u64::try_from(dimension).map_err(|_| {
                 gen_core::Error::Msg(format!(
@@ -56,8 +62,8 @@ fn resident_component(
                 tensor.name, tensor.data_bytes
             )));
         }
-        // These five checkpoints are materialized as F32 by their owning PuLID/EVA/face loaders.
-        // Price the tensors after that cast rather than the potentially smaller BF16/F16 file.
+        // PuLID/EVA floats and every face-stack tensor are materialized as F32 by their owning
+        // loaders. Price tensors after that cast rather than the potentially smaller source file.
         let loaded_bytes = elements.checked_mul(4).ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{PROVIDER_ID}: {id} tensor {} F32 byte count overflowed",
@@ -86,19 +92,22 @@ fn resident_component(
 
 fn resident_components(paths: &PulidFluxPaths) -> gen_core::Result<Vec<MemoryResidentComponent>> {
     Ok(vec![
-        resident_component("pulid_idformer_ca", &paths.pulid_weights)?,
-        resident_component("pulid_eva_clip", &paths.eva_weights)?,
+        resident_component("pulid_idformer_ca", &paths.pulid_weights, true)?,
+        resident_component("pulid_eva_clip", &paths.eva_weights, true)?,
         resident_component(
             "pulid_face_scrfd",
             &paths.face_dir.join("scrfd_10g.safetensors"),
+            false,
         )?,
         resident_component(
             "pulid_face_arcface",
             &paths.face_dir.join("arcface_iresnet100.safetensors"),
+            false,
         )?,
         resident_component(
             "pulid_face_bisenet",
             &paths.face_dir.join("bisenet_parsing.safetensors"),
+            false,
         )?,
     ])
 }
@@ -140,6 +149,7 @@ pub fn safety_check(
     }
     if context.mode != MemoryMode::Other("character_image".to_owned())
         || !context.has_reference
+        || context.geometry.batch != 1
         || context.geometry.reference_count != 1
         || context.overlay.as_deref() != Some("identity")
     {
@@ -154,7 +164,7 @@ pub fn safety_check(
             reason: format!("{PROVIDER_ID}: multi-phase denoise is not covered"),
         };
     }
-    if context.use_pid && context.selection.strategy != MemoryStrategy::Resident {
+    if context.use_pid {
         return MemorySafetyDecision::Reject {
             reason: format!("{PROVIDER_ID}: PiD has no admitted native-VAE memory ladder"),
         };
@@ -182,10 +192,11 @@ pub fn validate_context_from_loaded(
     if contract.provider_id != PROVIDER_ID
         || context.mode != MemoryMode::Other("character_image".to_owned())
         || !context.has_reference
+        || context.geometry.batch != 1
         || context.geometry.reference_count != 1
         || context.overlay.as_deref() != Some("identity")
         || context.has_phases
-        || (context.use_pid && context.selection.strategy != MemoryStrategy::Resident)
+        || context.use_pid
     {
         return Err(gen_core::Error::Unsupported(format!(
             "{PROVIDER_ID}: loaded memory context no longer matches the admitted identity route"
@@ -197,7 +208,9 @@ pub fn validate_context_from_loaded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryStrategySupport, TransformerComponent};
+    use candle_gen::gen_core::{
+        MemoryBehaviorRoute, MemoryStrategy, MemoryStrategySupport, TransformerComponent,
+    };
 
     fn write_safetensors(path: &std::path::Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -298,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_identity_route_is_accepted_but_base_or_pid_overlay_reuse_fails_closed() {
+    fn exact_identity_route_is_accepted_but_base_overlay_reuse_fails_closed() {
         let paths = paths();
         let contract = provider_contract(&paths).unwrap();
         let tier = resolved_numeric_tier(&paths).unwrap();
@@ -324,12 +337,76 @@ mod tests {
             safety_check(&paths, &contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
-        context.overlay = Some("identity".to_owned());
-        context.use_pid = true;
-        assert!(matches!(
+    }
+
+    #[test]
+    fn pid_is_rejected_for_every_strategy_including_resident() {
+        let paths = paths();
+        let contract = provider_contract(&paths).unwrap();
+        let tier = resolved_numeric_tier(&paths).unwrap();
+        for strategy in MemoryStrategy::ALL {
+            let mut context = gen_core::standard_memory_behavior_context(
+                &contract,
+                strategy,
+                tier,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("character_image".to_owned()),
+                    reference_count: 1,
+                    use_pid: true,
+                    has_phases: false,
+                    overlay: Some("identity".to_owned()),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                safety_check(&paths, &contract, &context),
+                MemorySafetyDecision::Reject { .. }
+            ));
+            assert!(validate_context_from_loaded(&contract, &context).is_err());
+
+            // The same exact route without PiD remains admitted at every implemented rung.
+            context.use_pid = false;
+            assert_eq!(
+                safety_check(&paths, &contract, &context),
+                MemorySafetyDecision::Accept
+            );
+            assert!(validate_context_from_loaded(&contract, &context).is_ok());
+        }
+    }
+
+    #[test]
+    fn batch_must_be_exactly_one_at_admission_and_loaded_context_validation() {
+        let paths = paths();
+        let contract = provider_contract(&paths).unwrap();
+        let tier = resolved_numeric_tier(&paths).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::Resident,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Other("character_image".to_owned()),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: Some("identity".to_owned()),
+            },
+        )
+        .unwrap();
+
+        for batch in [0, 2] {
+            context.geometry.batch = batch;
+            assert!(matches!(
+                safety_check(&paths, &contract, &context),
+                MemorySafetyDecision::Reject { .. }
+            ));
+            assert!(validate_context_from_loaded(&contract, &context).is_err());
+        }
+        context.geometry.batch = 1;
+        assert_eq!(
             safety_check(&paths, &contract, &context),
-            MemorySafetyDecision::Reject { .. }
-        ));
+            MemorySafetyDecision::Accept
+        );
+        assert!(validate_context_from_loaded(&contract, &context).is_ok());
     }
 
     #[test]
@@ -342,11 +419,33 @@ mod tests {
         ] {
             let path = root.join(name);
             write_typed_safetensors(&path, dtype, elements, stored_bytes);
-            let component = resident_component(name, &path).unwrap();
+            let component = resident_component(name, &path, true).unwrap();
             assert_eq!(
                 component.resident_bytes, expected_resident,
                 "{dtype} must be priced at its actual F32 materialization"
             );
         }
+    }
+
+    #[test]
+    fn pulid_and_eva_non_float_tensors_fail_closed_instead_of_being_underpriced() {
+        let root =
+            std::env::temp_dir().join(format!("pulid-memory-non-float-{}", std::process::id()));
+        let path = root.join("i64.safetensors");
+        write_typed_safetensors(&path, "I64", 3, 24);
+
+        let error = resident_component("pulid_idformer_ca", &path, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("float-only weights"), "{error}");
+
+        // The face loader differs intentionally: it casts every tensor, including integer sources,
+        // so the same three elements really do occupy three F32 values after load.
+        assert_eq!(
+            resident_component("pulid_face_scrfd", &path, false)
+                .unwrap()
+                .resident_bytes,
+            12
+        );
     }
 }
