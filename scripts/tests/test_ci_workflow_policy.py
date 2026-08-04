@@ -385,8 +385,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs (22 before).
-        MACOS_HUB_LOCK: 24,
+        # 25 since sc-17276 split the Krea S18 coherence sweep into its own dispatch-only job
+        # (24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs; 22 before).
+        MACOS_HUB_LOCK: 25,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -552,7 +553,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 24)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 25)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1259,6 +1260,66 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("z-image-turbo-model-inventory.json", job)
         self.assertIn("verifier-result.txt", job)
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
+
+    def test_krea_s18_sweep_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
+        """sc-17276: the S18 coherence sweep is a measurement lane, not a regression gate.
+
+        Three properties are load-bearing and each was a live defect at some point in this job's
+        history, so each is pinned here rather than left to review. It must stay OFF the weekly
+        schedule (~4.3 h on a box that runs four `rw-*` label pools one at a time is the sc-16981
+        head-of-line block); it must carry the seeds WITHOUT WHICH THE TEST CANNOT PASS AT ALL, since
+        the verdict rule refuses to rank configs with no between-seed variance estimate; and it must
+        surrender its per-cell evidence even when the run fails, because an unresolvable verdict is
+        exactly the outcome whose 21 cells someone needs to read and re-running costs another
+        4.3 hours.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  mlx-krea-realtime-s18-sweep:")
+        job = workflow[start : workflow.index("\n  candle-audio-kokoro:", start)]
+
+        self.assertIn("krea-s18-sweep", workflow.split("jobs:", 1)[0])
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'krea-s18-sweep'",
+            job,
+        )
+        # Dispatch-only is only half of it: `schedule` must not reach this job by any other route.
+        self.assertNotIn("github.event_name == 'schedule'", job)
+        self.assertIn("runs-on: [self-hosted, macOS, ARM64, rw-krea]", job)
+        # Over GitHub's 360-minute default, which killed a long macOS lane mid-run in sc-16981.
+        self.assertIn("timeout-minutes: 480", job)
+        # Rows AND seeds: the run-count assertion below is their product, so the job owns both.
+        self.assertIn('KREA_S18_ROWS: ABCDFEZ', job)
+        self.assertIn('KREA_S18_SEEDS: "7,11,23"', job)
+        # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
+        self.assertIn("set -o pipefail", job)
+        self.assertIn("-- --exact --ignored --nocapture", job)
+        self.assertIn('grep -qE "test result: ok\\. 1 passed"', job)
+        self.assertIn('"$cells" -ne 21', job)
+        # The evidence must outlive a failing sweep: teed to a file inside the run step, then
+        # extracted and uploaded from steps that run whatever the sweep did.
+        self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
+        self.assertEqual(job.count("if: always()"), 2)
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("krea-s18-sweep-${{ github.sha }}", job)
+
+    def test_krea_e2e_step_pins_its_run_count_and_excludes_the_s18_sweep(self) -> None:
+        """sc-17276: the e2e step selects by `--ignored`, which is a blanket.
+
+        Every `#[ignore]` test in `generate_smoke.rs` is conscripted into it, which is how an
+        85-minute research sweep ended up inside a 20-minute regression lane. The run-count assertion
+        is what makes the next such addition loud instead of silent.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("      - name: Run Krea Realtime real-weight e2e (Q4 tier)")
+        step = workflow[
+            start : workflow.index("      - name: Run Krea Realtime KV-cache residency", start)
+        ]
+
+        self.assertIn("set -o pipefail", step)
+        self.assertIn("--skip kv_cache_residency_at_the_production_geometry", step)
+        self.assertIn("--skip long_clip_coherence_under_the_bounded_window", step)
+        self.assertIn('grep -qE "test result: ok\\. 6 passed"', step)
 
     def test_windows_cuda_check_rejects_fork_prs_but_preserves_trusted_events(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
