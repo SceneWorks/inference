@@ -872,6 +872,18 @@ mod tests {
         panic!("{declaration}'s parameter list must end at its return type");
     }
 
+    /// The exact declaration every hop between the request's sink and a driver must carry.
+    const WANT: &str = "preview: &candle_gen::preview::PreviewHook<'_>,";
+
+    /// Count `WANT` by **whole trimmed line**, not by substring.
+    ///
+    /// A substring tally (`source.matches(WANT).count()`) is satisfied by the same declaration
+    /// renamed `_preview:` — the spelling a hop takes the moment it stops *using* its hook — so it
+    /// would let a hop become an ignored parameter and still count toward the total.
+    fn hook_parameters(source: &str) -> usize {
+        source.lines().filter(|line| line.trim() == WANT).count()
+    }
+
     /// **Both** registered lanes build their hook over the **request's** sink, each with its own
     /// constructor, and every hop between that sink and the driver carries the hook as a
     /// **non-`Option` reference**.
@@ -883,10 +895,42 @@ mod tests {
     /// every lane of that family dark while `hooked` counts, `PREVIEW_ROUTE_IDS` and
     /// `supports_preview: true` all went on advertising and the whole CPU suite stayed green.
     ///
-    /// A `&PreviewHook` parameter makes going dark a **type error**. This row pins every parameter on
-    /// the path so that immunity cannot be undone by quietly widening one back, and pins the sinks so
-    /// a hook cannot be built over an inert one instead — the one way left to go dark without changing
-    /// a type.
+    /// A `&PreviewHook` parameter is what makes *widening the seam* — passing `None`, or `Option`-ing
+    /// a hop — a **type error**. This row pins every parameter on the path so that property cannot be
+    /// undone by quietly widening one back.
+    ///
+    /// ## Exactly what is and is not mechanically enforced (sc-16959 review)
+    ///
+    /// The non-`Option` typing is **not** an absolute immunity, and the earlier wording here claimed
+    /// it was. sc-16959's reviewer took both lanes dark with **zero** type errors and the full CPU and
+    /// catalog suites green, two different ways, both inside `model.rs`:
+    ///
+    /// * `impl BaseBatchPipeline for SanaPipeline`'s `render_seed` accepted the forwarded hook,
+    ///   **ignored** it, and built a fresh `candle_gen::preview::PreviewHook::new(&inert, …)`. Every
+    ///   parameter on the path still read `&PreviewHook`; the `_hook(` count still read 2, because
+    ///   `PreviewHook::new(` does not contain the substring `_hook(`.
+    /// * `SanaGenerator::generate` rebound `let req = &GenerationRequest { preview:
+    ///   PreviewSink::default(), ..req.clone() };` ahead of `preview::base_hook(&req.preview)`. The
+    ///   literal the scan looks for was still there, exactly once — over a sink that had been emptied.
+    ///
+    /// Neither is reachable by the CPU suite: `tests/preview_wiring.rs` enters at `denoise_cfg` /
+    /// `denoise_sprint`, because everything above them needs a loaded snapshot. So the whole `model.rs`
+    /// adapter layer is guarded by **text**, and this row states that plainly rather than implying the
+    /// types cover it. What the text now pins, and why each is the mutation's only cheap spelling:
+    ///
+    /// * **zero `PreviewHook::new`** in shipped `model.rs` *and* shipped `pipeline.rs` — the sinks are
+    ///   reached only through `preview::base_hook` / `preview::sprint_hook`, whose call sites are
+    ///   counted. Building a hook the other spelling instead (`base_hook(&inert)` in `model.rs`) trips
+    ///   the `_hook(` count of 2.
+    /// * **zero `GenerationRequest {`** in shipped `model.rs` — the adapters read the caller's request
+    ///   and never construct one, so a rebind that swaps `preview` out cannot hide behind the
+    ///   still-correct `base_hook(&req.preview)` literal.
+    ///
+    /// What is *not* caught: an edit that reaches the same end by some third construction — a helper
+    /// that returns an emptied request, a `GenerationRequest{` with no space. Closing that needs a
+    /// render through the registered `Generator` seam with a live sink, which needs weights; the
+    /// real-weight lane in `tests/preview_real_weights.rs` does exactly that, on CUDA, and is the only
+    /// place this crate proves the seam end to end.
     #[test]
     fn both_render_lanes_build_their_hook_from_the_requests_sink() {
         let model = shipped_model();
@@ -927,8 +971,33 @@ mod tests {
             "the Sprint adapter must build the SPRINT hook"
         );
 
+        // The two darkening edits the reviewer demonstrated, each with the type system fully
+        // satisfied and every count above still reading exactly what it expects. See this row's
+        // rustdoc for why text is the only instrument available here.
+        assert_eq!(
+            model.matches("PreviewHook::new").count(),
+            0,
+            "shipped model.rs must never CONSTRUCT a hook — it may only call `preview::base_hook` / \
+             `preview::sprint_hook` over the request's own sink. A `PreviewHook::new(&inert, …)` \
+             inside a `render_seed` that accepts and then ignores its forwarded hook takes the lane \
+             dark with no type error, and `PreviewHook::new(` does not contain `_hook(`, so the \
+             count of two above cannot see it"
+        );
+        assert_eq!(
+            model.matches("GenerationRequest {").count(),
+            0,
+            "shipped model.rs must never CONSTRUCT a GenerationRequest — the adapters read the \
+             caller's. `let req = &GenerationRequest {{ preview: PreviewSink::default(), \
+             ..req.clone() }};` ahead of `preview::base_hook(&req.preview)` empties the sink while \
+             leaving that literal intact, exactly once, which is all the scan above checks"
+        );
+
         // Every hop, in both files, takes the hook by non-`Option` reference.
-        const WANT: &str = "preview: &candle_gen::preview::PreviewHook<'_>,";
+        //
+        // Counted by WHOLE trimmed line rather than by substring: `model.matches(WANT)` is satisfied
+        // by `_preview: &candle_gen::preview::PreviewHook<'_>,`, so a hop renamed to the ignore-me
+        // spelling — the first half of the `render_seed` mutation above — would still count toward
+        // the six.
         for (source, declaration) in [
             (model, "fn generate_base_images("),
             (model, "fn generate_sprint_images("),
@@ -944,11 +1013,14 @@ mod tests {
             );
         }
         // `render_seed` is declared on two traits and implemented on two pipelines; every one of the
-        // four must carry the same non-`Option` parameter.
+        // four must carry the same non-`Option` parameter. `preview_parameter` above reads only the
+        // FIRST `fn render_seed(` — the trait declaration — so this line-exact tally is what holds
+        // the other three.
         assert_eq!(
-            model.matches(WANT).count(),
+            hook_parameters(model),
             6,
-            "both adapters plus all four `render_seed` declarations/impls must take `&PreviewHook`"
+            "both adapters plus all four `render_seed` declarations/impls must take `&PreviewHook` \
+             under that exact name — a hop renamed `_preview:` is one that no longer uses it"
         );
 
         let pipeline = shipped_pipeline();
@@ -965,8 +1037,9 @@ mod tests {
             );
         }
         // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint) plus the two
-        // free denoise functions: six declarations in shipped `pipeline.rs`.
-        assert_eq!(pipeline.matches(WANT).count(), 6);
+        // free denoise functions: six declarations in shipped `pipeline.rs`, line-exact for the same
+        // reason as `model.rs` above.
+        assert_eq!(hook_parameters(pipeline), 6);
 
         // The only hooks shipped `pipeline.rs` builds are the two documented INERT ones in the
         // `generate` convenience wrappers. A hook over anything else there would be a second wiring
@@ -978,6 +1051,14 @@ mod tests {
             2,
             "shipped pipeline.rs must build exactly the two inert convenience hooks — the request's \
              sink is reached only through model.rs"
+        );
+        assert_eq!(
+            pipeline.matches("PreviewHook::new").count(),
+            0,
+            "shipped pipeline.rs must not CONSTRUCT a hook either — the two inert ones go through \
+             `preview::base_hook` / `preview::sprint_hook`, which the count above sees. A third, \
+             built directly over some other sink between `generate_with_conditioning` and the driver \
+             call, would be invisible to every count in this row"
         );
     }
 

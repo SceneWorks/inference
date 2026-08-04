@@ -485,56 +485,74 @@ fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
 /// Per-lane development criteria, each carrying **its own** measured numbers.
 ///
 /// Every bound below is derived from that exact lane's own run, and the headroom is uniform and
-/// stated: **0.03 under a measured correlation, 0.06 over a measured distance ratio.** No bound is
-/// justified by a neighbouring lane's measurement, and there is no unexplained slack — this is the
-/// story where a base bound carried over onto Sprint would be the very confusion it exists to avoid.
+/// stated: **0.03 under a measured correlation, 0.06 under a measured rise** (a rise differences two
+/// correlations, so it carries the 0.03 allowance of each), **0.06 over a measured distance ratio.**
+/// No bound is justified by a neighbouring lane's measurement, and there is no unexplained slack —
+/// this is the story where a base bound carried over onto Sprint would be the very confusion it
+/// exists to avoid.
 ///
-/// `max_r_first` / `min_rise` are the shared loose "developed from pure noise" pair for every lane
-/// here: both routes are txt2img-only, so every strip starts at the flow / SCM prior. They are
-/// deliberately loose because a tight `r_first` bound would read a fit's own warm intercept as if it
-/// were resemblance.
+/// `min_rise` used to be the one exception: a single shared `0.30` for all three lanes. It was never
+/// unsound — every lane clears it — but it hid how differently the three lanes are placed against it.
+/// The `heun` lane rises **+0.360**, against **+0.481** on Euler and **+0.695** on Sprint, so one
+/// shared floor gives the three of them 0.06, 0.181 and 0.395 of margin respectively, none of it
+/// stated. Each lane now derives its own from its own rise, so the margin is a uniform 0.06 across
+/// all three, and the number that used to be shared falls out as `heun`'s: **0.360 − 0.06 = 0.300**.
+/// `heun`'s rise is the shallowest of the three by construction — a second-order solver's first frame
+/// is already further along — and that is now visible in its bound rather than being an accident of a
+/// shared constant. The change is strictly tightening: Euler 0.30 → 0.421, Sprint 0.30 → 0.635,
+/// `heun` unchanged.
+///
+/// `max_r_first` genuinely is shared, and stays shared: both routes are txt2img-only, so every strip
+/// starts at the flow / SCM prior. It is deliberately loose because a tight `r_first` bound would read
+/// a fit's own warm intercept as if it were resemblance.
 struct Develops {
     /// Floor under the measured final-frame correlation with the finished render.
     min_r_last: f64,
     /// Ceiling over the measured first-frame correlation — "it did not start as the render".
     max_r_first: f64,
-    /// Floor under the measured `r_last − r_first` rise.
+    /// Floor under the measured `r_last − r_first` rise, **per lane**.
     min_rise: f64,
     /// Ceiling over the measured `last / first` mean-|Δ|-to-final ratio — "it converged".
     max_distance_ratio: f64,
 }
 
-/// The shared "develops from pure noise" bounds. Both SANA routes are txt2img-only.
-const FROM_NOISE: (f64, f64) = (0.75, 0.30);
+/// The shared "did not start as the render" ceiling. Both SANA routes are txt2img-only.
+const MAX_R_FIRST: f64 = 0.75;
 
 /// `sana_1600m` txt2img, 12 steps at 1024², true CFG 4.5, native flow-Euler over the static shift-3.0
-/// schedule — measured r **+0.477 → +0.958**, mean |Δ| to final **49.76 → 19.81** (ratio 0.398).
+/// schedule — measured r **+0.477 → +0.958** (rise +0.481), mean |Δ| to final **49.76 → 19.81**
+/// (ratio 0.398).
 const BASE: Develops = Develops {
     // 0.958 − 0.03.
     min_r_last: 0.928,
-    max_r_first: FROM_NOISE.0,
-    min_rise: FROM_NOISE.1,
+    max_r_first: MAX_R_FIRST,
+    // 0.958 − 0.477 = 0.481; 0.481 − 0.06 = 0.421.
+    min_rise: 0.421,
     // 0.398 + 0.06 = 0.458, rounded up to two decimals.
     max_distance_ratio: 0.46,
 };
 
-/// `sana_1600m` txt2img under `heun`, 8 steps at 512² — measured r **+0.578 → +0.938**, mean |Δ| to
-/// final **48.20 → 21.54** (ratio 0.447), over **15** model evaluations deduped to 8 frames.
+/// `sana_1600m` txt2img under `heun`, 8 steps at 512² — measured r **+0.578 → +0.938** (rise +0.360,
+/// the shallowest of the three), mean |Δ| to final **48.20 → 21.54** (ratio 0.447), over **15** model
+/// evaluations deduped to 8 frames.
 ///
 /// Its own numbers, not the Euler lane's: `heun`'s second-order step lands the strip in a different
-/// place at both ends, and it runs at a different resolution.
+/// place at both ends, and it runs at a different resolution. The shallow rise is that same fact read
+/// from the other end — its *first* frame is already at +0.578, well ahead of Euler's +0.477, so it
+/// has less distance left to travel even though it finishes lower.
 const BASE_HEUN: Develops = Develops {
     // 0.938 − 0.03.
     min_r_last: 0.908,
-    max_r_first: FROM_NOISE.0,
-    min_rise: FROM_NOISE.1,
+    max_r_first: MAX_R_FIRST,
+    // 0.938 − 0.578 = 0.360; 0.360 − 0.06 = 0.300.
+    min_rise: 0.300,
     // 0.447 + 0.06 = 0.507, rounded up to two decimals.
     max_distance_ratio: 0.51,
 };
 
 /// `sana_sprint_1600m` txt2img, 4 SCM steps at 1024², embedded guidance 4.5 — measured
-/// r **+0.254 → +0.949**, mean |Δ| to final **61.64 → 14.42** (ratio 0.234, the tightest of the three
-/// lanes).
+/// r **+0.254 → +0.949** (rise +0.695, the steepest of the three), mean |Δ| to final
+/// **61.64 → 14.42** (ratio 0.234, the tightest of the three lanes).
 ///
 /// Its own numbers, over its own decoder and its own fit; nothing here is inherited from the base
 /// lane. The shape is what a four-step consistency schedule should look like beside a twelve-step
@@ -543,8 +561,9 @@ const BASE_HEUN: Develops = Develops {
 const SPRINT: Develops = Develops {
     // 0.949 − 0.03.
     min_r_last: 0.919,
-    max_r_first: FROM_NOISE.0,
-    min_rise: FROM_NOISE.1,
+    max_r_first: MAX_R_FIRST,
+    // 0.949 − 0.254 = 0.695; 0.695 − 0.06 = 0.635.
+    min_rise: 0.635,
     // 0.234 + 0.06 = 0.294, rounded up to two decimals.
     max_distance_ratio: 0.30,
 };

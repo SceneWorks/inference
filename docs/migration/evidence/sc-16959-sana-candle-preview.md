@@ -141,13 +141,19 @@ row) measures the consequence on each route's own prior:
 
 Both shipped projections are readable noise fields, far below sc-16954's uncorrected SDXL **0.894**.
 
-**A correction to the epic's own prediction, worth recording.** The `run_scm_sampler` rustdoc describes
+**A correction to the epic's own prediction, worth recording.** The `run_scm_sampler` rustdoc described
 the uncorrected Sprint preview as "2× too bright", and the rail-clipped fraction is *not* the statistic
 that catches it: `σ_data = 0.5` **shrinks** the running latent, so an uncorrected Sprint frame collapses
 *toward* the fit's intercept rather than toward the rails — its rail fraction is `0.0000`, lower than
 the corrected one. The statistic that discriminates is contrast about the intercept, and it is exactly
-2× as the arithmetic predicts (25.93 against 12.96). That is what the row asserts, alongside the exact
-identity `project_sprint_latents(x·σ_data, 1/σ_data) == project_sprint_latents(x, 1)`.
+2× as the arithmetic predicts (25.93 / 12.96 = 2.0008). That is what the row asserts, alongside the
+exact identity `project_sprint_latents(x·σ_data, 1/σ_data) == project_sprint_latents(x, 1)`.
+
+**That sentence is corrected in this PR**, in `candle-gen/src/sampler.rs` — not merely recorded here.
+It sat in the **shared** driver's rustdoc, which is exactly where the next family wiring an SCM route
+would read it, and this story owns the measurement that disproves it. The driver now says an
+uncorrected frame is *flatter*, not brighter, gives all three rail fractions, and names contrast about
+the intercept as the statistic that discriminates.
 
 ## Wiring, and the whole hook path guarded
 
@@ -163,7 +169,7 @@ The hook is built **once per route**, over the request's own sink, in `model.rs`
 `Option` anywhere on that path costs: blanking one caller argument took an entire family dark while the
 `hooked` counts, `PREVIEW_ROUTE_IDS` and `supports_preview: true` all went on advertising and the whole
 CPU suite stayed green — because `candle-gen-catalog`'s route inventory classifies only the argument at
-the *driver* call, several hops further in. Here going dark is a **type error**.
+the *driver* call, several hops further in. Here *widening the seam* is a **type error**.
 
 `preview::tests::both_render_lanes_build_their_hook_from_the_requests_sink` pins all of it against the
 crate's own sources: exactly one `preview::base_hook(&req.preview)` and one
@@ -173,6 +179,42 @@ a swap is a diff; and the exact `preview: &candle_gen::preview::PreviewHook<'_>,
 six declarations in `model.rs` and six in `pipeline.rs`. Shipped `pipeline.rs` builds exactly two
 hooks, both the documented **inert** ones in the `generate` convenience wrappers, pinned by count so a
 request-sink hook cannot appear there instead.
+
+### What the types do *not* cover — and how far the text goes (sc-16959 review)
+
+The first draft of this section, and of that test's rustdoc, claimed the sinks were the "one way left
+to go dark without changing a type". That was **false**, and sc-16959's reviewer demonstrated it by
+taking both lanes dark with **zero** type errors and the full CPU + catalog suites green:
+
+- `impl BaseBatchPipeline for SanaPipeline`'s `render_seed` accepted the forwarded hook, **ignored**
+  it, and built a fresh `candle_gen::preview::PreviewHook::new(&inert, …)`. The `_hook(` count of two
+  could not see it, because `PreviewHook::new(` does not contain the substring `_hook(`.
+- `SanaGenerator::generate` rebound `let req = &GenerationRequest { preview: PreviewSink::default(),
+  ..req.clone() };` ahead of `preview::base_hook(&req.preview)`. The literal the scan counts was still
+  there, exactly once — over a sink that had been emptied.
+
+The root cause is coverage, not typing: nothing on the CPU lane renders through the registered
+`Generator` seam with a live sink (`tests/preview_wiring.rs` enters at `denoise_cfg` / `denoise_sprint`,
+because everything above them needs a loaded snapshot), so the whole `model.rs` adapter layer is
+guarded by text. This PR therefore does two things:
+
+1. **Names the boundary honestly.** The non-`Option` typing is what makes *widening* the seam — an
+   `Option` hop, a `None` at the driver — impossible without a diff to a signature. It is not, and was
+   never, an absolute immunity against a body that ignores what it was handed.
+2. **Closes both demonstrated spellings by count.** Shipped `model.rs` must contain **zero**
+   `PreviewHook::new` and **zero** `GenerationRequest {`; shipped `pipeline.rs` must contain **zero**
+   `PreviewHook::new` (all three are 0 today). The other spelling of the first mutation —
+   `preview::base_hook(&inert)` inside `model.rs` — was already caught, by the `_hook(` count of two.
+
+The same review found the `WANT` parameter tally was a **substring** match, so a hop renamed
+`_preview:` — precisely what a hop looks like once it stops using its hook — still counted toward the
+six. Both tallies now compare whole trimmed lines instead. `preview_parameter` reads only the *first*
+`fn render_seed(` (the trait declaration), so that line-exact count is what holds the other three.
+
+What remains uncaught is an edit that reaches the same end by a third construction (a helper returning
+an emptied request; `GenerationRequest{` with no space). Closing that needs a render through the
+registered `Generator` seam with a live sink, which needs weights — which is exactly what the
+real-weight lane below does, on CUDA, and it is the only place this crate proves the seam end to end.
 
 `both_sampler_calls_pass_the_hook_at_the_drivers_preview_position` pins the two driver arguments
 **positionally, including the index**: argument 7 of 9 for `run_flow_sampler` and argument 5 of 7 for
@@ -184,20 +226,43 @@ an argument inserted ahead of the hook fails here rather than shifting what the 
 1. **`supports_preview` flipped** on both `candle-gen-sana` descriptors (`model.rs`), each with a
    comment naming *its own* fit.
 2. **`PREVIEW_ROUTE_IDS` gains `sana_1600m` and `sana_sprint_1600m`**, and — the point of this story —
-   they are asserted **individually** by the new
-   `preview_advertising::sana_base_and_sprint_are_two_independent_rows`. The pre-existing guards do not
-   catch a collapse: the bidirectional row is a set comparison satisfied by the pair collectively, and
-   `source_level_wiring_and_advertised_capability_agree_for_every_provider_crate` only needs *one* id of
-   a crate to advertise. The new row checks each id on its own terms (in the allowlist, registered by
-   `candle-gen-sana` itself, advertising) and additionally requires the crate's hooked sites to be
-   exactly `["run_flow_sampler", "run_scm_sampler"]` — so one route going dark while the other keeps
-   both ids advertising is a failure.
+   they are asserted **individually**. The pre-existing guards did not catch a collapse: the
+   bidirectional row is a set comparison satisfied by the pair collectively, and
+   `source_level_wiring_and_advertised_capability_agree_for_every_provider_crate` only needed *one* id
+   of a crate to advertise. See the next section — that hole is not SANA's, and it is now closed for
+   every crate.
 3. **Route inventory row added**: `candle-gen-sana` → `pipeline.rs` `hooked: 2, direct: 0, dark: []`.
    The only row in that table whose two hooked sites are two *different* drivers.
+   `sana_base_and_sprint_are_two_independent_rows` binds that to the two drivers by name: the crate's
+   hooked sites must be exactly `["run_flow_sampler", "run_scm_sampler"]`, so one route going dark
+   while the other keeps both ids advertising is a failure. That assertion is genuinely SANA-specific
+   — no other candle family in this epic drives two shared samplers — and nothing else asserts it.
 
 **Advertised-`supports_preview` set is now exactly 27** — the 25 before this story plus the two SANA
 routes. `preview_capability_matches_every_wired_shipped_route_bidirectionally` asserts the registry's
 advertising set equals `PREVIEW_ROUTE_IDS` exactly, in both directions, so nothing else moved.
+
+### The per-id hole was never SANA's — generalised (sc-16959 review)
+
+sc-16959's reviewer took the observation above and showed it live **on already-merged code**. Because
+the bidirectional row is a set equality and the source-level row only asked for a non-empty
+`advertised`, dropping one id from *both* sides of a multi-id crate left everything green. Reproduced
+on merged `candle-gen-sd3`: change `supports_preview` to `!matches!(variant, Variant::Medium)` and
+delete `"sd3_5_medium"` from `PREVIEW_ROUTE_IDS`, and the whole catalog suite exits **0 with zero
+failures** — while `sd3_5_medium`, which reaches the same hooked `run_flow_sampler` site as its two
+siblings, silently stops advertising a capability it demonstrably has.
+
+Ten crates ship more than one id and were all exposed: krea ×3, anima ×3, chroma ×3, sd3_5 ×3, flux ×2,
+flux2 ×2, lens ×2, ideogram ×2, z-image ×2, sana ×2.
+
+So the per-id half is now **generalised** rather than SANA-shaped: the wired branch of
+`source_level_wiring_and_advertised_capability_agree_for_every_provider_crate` loops over every id
+`ids_of(provider)` reports and requires each, on its own, to be in `PREVIEW_ROUTE_IDS` *and*
+advertising. Thirteen wired crates register **27** ids between them, which is exactly
+`PREVIEW_ROUTE_IDS.len()` — the declared and derived halves meet with nothing left over. No
+already-merged crate fails the generalised guard. `sana_base_and_sprint_are_two_independent_rows`
+keeps only what is SANA's: the two-driver pair, plus binding the two ids to `candle-gen-sana` as their
+registrant, which the generalised row cannot do because it reads its ids back out of the registry.
 
 ## Real-weight run (CUDA)
 
@@ -223,17 +288,28 @@ test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; fini
 shared strip is exactly what would have hidden the mistake this story exists to avoid.
 
 Every floor carries **that lane's own** measured number, with uniform stated headroom — 0.03 under a
-measured correlation, 0.06 over a measured distance ratio, rounded to two decimals:
+measured correlation, **0.06 under a measured rise** (a rise differences two correlations, so it
+carries the 0.03 allowance of each), 0.06 over a measured distance ratio, rounded to two decimals:
 
-| lane | `min_r_last` | derivation | `max_distance_ratio` | derivation |
-| --- | --- | --- | --- | --- |
-| `sana_1600m` | 0.928 | 0.958 − 0.03 | 0.46 | 0.398 + 0.06 = 0.458 |
-| `sana_1600m` `heun` | 0.908 | 0.938 − 0.03 | 0.51 | 0.447 + 0.06 = 0.507 |
-| `sana_sprint_1600m` | 0.919 | 0.949 − 0.03 | 0.30 | 0.234 + 0.06 = 0.294 |
+| lane | `min_r_last` | derivation | `min_rise` | derivation | `max_distance_ratio` | derivation |
+| --- | --- | --- | --- | --- | --- | --- |
+| `sana_1600m` | 0.928 | 0.958 − 0.03 | 0.421 | (0.958 − 0.477) − 0.06 = 0.481 − 0.06 | 0.46 | 0.398 + 0.06 = 0.458 |
+| `sana_1600m` `heun` | 0.908 | 0.938 − 0.03 | 0.300 | (0.938 − 0.578) − 0.06 = 0.360 − 0.06 | 0.51 | 0.447 + 0.06 = 0.507 |
+| `sana_sprint_1600m` | 0.919 | 0.949 − 0.03 | 0.635 | (0.949 − 0.254) − 0.06 = 0.695 − 0.06 | 0.30 | 0.234 + 0.06 = 0.294 |
 
-`max_r_first = 0.75` and `min_rise = 0.30` are the shared "developed from pure noise" pair — both
-routes are txt2img-only, so every strip starts at its prior. Loose deliberately: a tight `r_first`
-bound would read a fit's own warm intercept as if it were resemblance.
+`min_rise` was a single shared `0.30` in the first draft, and sc-16959's reviewer flagged it: never
+unsound — all three lanes clear it — but it hid how differently the three sit against it. The measured
+rises are **+0.481** (Euler), **+0.360** (`heun`) and **+0.695** (Sprint), so one shared floor handed
+them 0.181, **0.06** and 0.395 of margin, none of it stated. Each lane now derives its own, and the
+shared number falls out as `heun`'s: `0.360 − 0.06 = 0.300`. `heun` is the shallowest by construction —
+its *first* frame already sits at +0.578, ahead of Euler's +0.477, so it has less distance left to
+travel even though it finishes lower — and that is now visible in the bound rather than being an
+accident of a shared constant. The change is strictly tightening: Euler 0.30 → 0.421, Sprint
+0.30 → 0.635, `heun` unchanged.
+
+`max_r_first = 0.75` genuinely is shared and stays shared — both routes are txt2img-only, so every
+strip starts at its prior. Loose deliberately: a tight `r_first` bound would read a fit's own warm
+intercept as if it were resemblance.
 
 Both series are strictly monotone on every lane, every frame differs from its predecessor by more than
 the movement floor, and every frame arrives at DC-AE latent resolution `H/32 × W/32` — which is itself

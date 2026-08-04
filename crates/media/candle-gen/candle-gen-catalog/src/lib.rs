@@ -380,8 +380,10 @@ mod preview_advertising {
     /// — Sprint's DC-AE 1.1 is a decoder-tail fine-tune of base's DC-AE 1.0. So this is **one latent
     /// space with two decoders**, and since an RGB preview fit maps a latent to *decoded* pixels, one
     /// fit still cannot serve both routes. Shipping one for both is the specific mistake sc-16959 was
-    /// written to avoid; `candle-gen-sana/src/preview.rs` pins that three ways and
-    /// `sana_base_and_sprint_are_two_independent_rows` pins it here.
+    /// written to avoid; `candle-gen-sana/src/preview.rs` pins that three ways, and here
+    /// `sana_base_and_sprint_are_two_independent_rows` pins that the crate hooks **both** shared
+    /// drivers while `source_level_wiring_and_advertised_capability_agree_for_every_provider_crate`
+    /// pins each of the two ids on its own.
     ///
     /// Sprint additionally needs a `1/σ_data` correction the flow cohort does not: `run_scm_sampler`
     /// pre-scales its running latent by `σ_data` and hands the hook the scaled tensor. That is the
@@ -427,9 +429,11 @@ mod preview_advertising {
         "sana_sprint_1600m",
     ];
 
-    /// The two SANA rows above are asserted **individually** by
-    /// `sana_base_and_sprint_are_two_independent_rows`, because they are the one pair in this table
-    /// that must never be treated as one. See that test and `candle-gen-sana/src/preview.rs`.
+    /// The two SANA rows above, named so `sana_base_and_sprint_are_two_independent_rows` can bind
+    /// them to `candle-gen-sana` specifically — the generalised per-id check reads its ids back out
+    /// of the registry and so cannot say *which* crate registered one. Every row in this table is
+    /// asserted individually, by that generalised check; this pair additionally carries the
+    /// two-driver assertion. See that test and `candle-gen-sana/src/preview.rs`.
     const SANA_ROUTE_IDS: [&str; 2] = ["sana_1600m", "sana_sprint_1600m"];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
@@ -2157,20 +2161,29 @@ mod preview_advertising {
         );
     }
 
-    /// **The two SANA routes are two independent rows, asserted one at a time** (sc-16959).
+    /// **The two SANA routes drive two different sampler drivers, and both must be hooked**
+    /// (sc-16959).
     ///
-    /// The bidirectional guard above is a set comparison, so it is satisfied by `sana_1600m` and
-    /// `sana_sprint_1600m` collectively; and `source_level_wiring_and_advertised_capability_agree…`
-    /// is satisfied by **either** id advertising, because both live in one crate — `advertised` only
-    /// has to be non-empty. Neither would notice one SANA route being dropped while the other kept
-    /// advertising, and that is precisely the mistake this story exists to avoid: the two routes run
-    /// different sampler drivers over different DC-AE autoencoders and carry different committed
+    /// The per-id half of what this row originally carried has been **generalised** into
+    /// `source_level_wiring_and_advertised_capability_agree_for_every_provider_crate`, because the
+    /// hole it patched was never SANA's: the bidirectional guard above is a set comparison, and the
+    /// source-level guard only required *some* id of a wired crate to advertise, so on any of the ten
+    /// multi-id crates one route could be dropped from both sides while its siblings covered for it.
+    /// That is now checked for every registered id of every wired crate. See that row for the sd3
+    /// mutation that proved it live on merged code.
+    ///
+    /// What stays here is the part that is genuinely SANA's and that nothing else asserts: this is
+    /// the only candle family in the epic that drives **two** shared sampler drivers, so the crate
+    /// must hook `run_flow_sampler` (base, true-CFG flow-match over DC-AE 1.0) *and*
+    /// `run_scm_sampler` (Sprint, CFG-free SCM over DC-AE 1.1) — one site each, no dark site. A
+    /// single hooked site would leave one route emitting nothing while both ids kept advertising,
+    /// and that is the mistake this story exists to avoid: the two routes carry different committed
     /// fits, so one can never stand in for the other.
     ///
-    /// So each is checked on its own terms here: present in the allowlist, present in the registry,
-    /// advertising, and registered by `candle-gen-sana` itself rather than by some other crate that
-    /// happened to claim the id. The crate's two hooked sites — one per driver — are pinned by the
-    /// route inventory above and by `candle-gen-sana/src/preview.rs`'s own source scan.
+    /// The two ids are still checked on their own terms below — registered by `candle-gen-sana`
+    /// itself rather than by some other crate that happened to claim the id, and exactly two of
+    /// them — because the generalised row derives its id list from the registry and so cannot pin
+    /// *which* crate a given id belongs to.
     #[test]
     fn sana_base_and_sprint_are_two_independent_rows() {
         let sana = PROVIDER_CRATES
@@ -2230,9 +2243,30 @@ mod preview_advertising {
     ///
     /// For every registered provider crate, whether it emits is derived from its own code — a
     /// sampler call site that passes a hook, or a bespoke loop making a direct emission call — and
-    /// that fact must agree with whether any of its ids advertise. Both directions fail: a
+    /// that fact must agree with whether **every one of** its ids advertises. Both directions fail: a
     /// descriptor flipped ahead of the wiring, and a family wired without flipping its descriptors.
     /// The second is what makes sc-16952…sc-16960 self-enforcing.
+    ///
+    /// ## Why the wired branch is per id rather than "any id" (sc-16959 review)
+    ///
+    /// This row originally asserted only that a wired crate had *some* advertising id, and
+    /// `preview_capability_matches_every_wired_shipped_route_bidirectionally` is a **set** equality —
+    /// so dropping one id from `PREVIEW_ROUTE_IDS` *and* from its descriptor left both green, with
+    /// that route's siblings covering for it. That is not hypothetical: on merged code, flipping
+    /// `candle-gen-sd3`'s `supports_preview` to `!matches!(variant, Variant::Medium)` and deleting
+    /// `"sd3_5_medium"` from the allowlist took this whole suite through with **zero** failures,
+    /// while `sd3_5_medium` — which reaches the same hooked `run_flow_sampler` site as its two
+    /// siblings — silently stopped advertising a capability it has.
+    ///
+    /// Ten crates ship more than one id and were all exposed: krea ×3, anima ×3, chroma ×3, sd3_5 ×3,
+    /// flux ×2, flux2 ×2, lens ×2, ideogram ×2, z-image ×2, sana ×2. So the check is now **per
+    /// registered id**: every id of a crate whose sources emit must be in the allowlist *and*
+    /// advertising, on its own. Thirteen wired crates register 27 ids between them, which is exactly
+    /// `PREVIEW_ROUTE_IDS.len()` — the two halves meet with nothing left over.
+    ///
+    /// `sana_base_and_sprint_are_two_independent_rows` is kept alongside this, not subsumed by it:
+    /// its load-bearing half is the driver **pair** (`run_flow_sampler` *and* `run_scm_sampler` from
+    /// one crate), which is SANA-specific and which nothing else in this module asserts.
     #[test]
     fn source_level_wiring_and_advertised_capability_agree_for_every_provider_crate() {
         let advertising = advertising_ids();
@@ -2261,6 +2295,28 @@ mod preview_advertising {
                      and add the ids to PREVIEW_ROUTE_IDS in the same PR",
                     provider.dir
                 );
+                // Per id, so a sibling cannot cover for a route that quietly stopped advertising.
+                for id in &ids {
+                    let siblings: Vec<&String> = ids.iter().filter(|other| *other != id).collect();
+                    assert!(
+                        PREVIEW_ROUTE_IDS.contains(&id.as_str()),
+                        "{} emits previews (hooked sites: {hooked:?}, direct emission: {direct:?}) \
+                         but its route {id} is missing from PREVIEW_ROUTE_IDS — every id a wired \
+                         crate registers is its OWN row, and its siblings {siblings:?} do not cover \
+                         for it. If this route genuinely cannot preview, it does not belong in a \
+                         wired crate's registration; say so in a story rather than dropping the row",
+                        provider.dir
+                    );
+                    assert!(
+                        advertising.contains(id),
+                        "{} emits previews (hooked sites: {hooked:?}, direct emission: {direct:?}) \
+                         but its route {id} does not advertise supports_preview on its own \
+                         descriptor — the bidirectional row above is a SET comparison, so its \
+                         siblings {siblings:?} satisfy it while this route goes dark to every UI \
+                         that reads the capability",
+                        provider.dir
+                    );
+                }
             } else {
                 assert!(
                     advertised.is_empty(),
