@@ -29,12 +29,27 @@ pub fn decode(
     latent_h: usize,
     latent_w: usize,
 ) -> Result<Tensor> {
+    decode_with_tiling(vae, dit_out, latent_h, latent_w, None)
+}
+
+/// Decode through the shared FLUX.2 head-once/tail-tiled path when a production tile candidate is
+/// selected. `None` preserves the original monolithic output contract exactly.
+pub fn decode_with_tiling(
+    vae: &Flux2Vae,
+    dit_out: &Tensor,
+    latent_h: usize,
+    latent_w: usize,
+    tile: Option<(u32, u32)>,
+) -> Result<Tensor> {
     let (b, _, c) = dit_out.dims3()?; // [B, h·w, 128]
     let packed = dit_out
         .reshape((b, latent_h, latent_w, c))?
         .permute((0, 3, 1, 2))? // [B, h, w, 128] → [B, 128, h, w] (NCHW)
         .contiguous()?;
-    vae.decode_packed(&packed)
+    match tile {
+        Some((edge, overlap)) => vae.decode_packed_tiled(&packed, edge, overlap),
+        None => vae.decode_packed(&packed),
+    }
 }
 
 /// Convert a decoded image `[B, 3, H, W]` in `[−1, 1]` to `u8` `[0, 255]` (`(x.clamp(−1,1)+1)·127.5`),

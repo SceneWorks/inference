@@ -37,6 +37,14 @@ struct Behavior {
     typed_cancel: bool,
     /// Output pixels depend only on the seed (vs. drifting per call).
     deterministic: bool,
+    /// sc-17418: at `guidance = 1.0` (CFG off) the negative prompt is inert — the correct behaviour,
+    /// since the combine `uncond + 1·(cond − uncond)` reduces to `cond`. The broken variant folds the
+    /// negative into the output, which is exactly what an engine that narrows its conditioning to the
+    /// WRONG row does: it renders the negative prompt instead of the prompt.
+    cfg_off_ignores_negative: bool,
+    /// sc-17418: `generate` succeeds at `guidance = 1.0`. The broken variant is the literal sc-14195
+    /// shape — `validate` waves the request through and the engine then dies mid-denoise.
+    cfg_off_generates: bool,
 }
 
 impl Behavior {
@@ -50,6 +58,8 @@ impl Behavior {
             honor_cancel: true,
             typed_cancel: true,
             deterministic: true,
+            cfg_off_ignores_negative: true,
+            cfg_off_generates: true,
         }
     }
 }
@@ -72,6 +82,24 @@ fn stub_caps() -> Capabilities {
         max_size: 512,
         max_count: 4,
         ..Default::default()
+    }
+}
+
+/// Capabilities for a **CFG-capable** stub (sc-17418): advertises the guidance + negative-prompt
+/// axes, which is what puts a model under [`check_cfg_off_render`]'s contract at all. The plain
+/// [`stub_caps`] leaves both `false`, so that stub is (correctly) skipped by the check.
+fn guided_stub_caps() -> Capabilities {
+    Capabilities {
+        supports_guidance: true,
+        supports_negative_prompt: true,
+        ..stub_caps()
+    }
+}
+
+fn guided_stub_desc(id: &'static str) -> ModelDescriptor {
+    ModelDescriptor {
+        capabilities: guided_stub_caps(),
+        ..stub_desc(id)
     }
 }
 
@@ -124,6 +152,17 @@ impl Stub {
 
     fn boxed(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
         Box::new(Self::new(id, behavior))
+    }
+
+    /// A **CFG-capable** stub (sc-17418): advertises guidance + negative prompt, so
+    /// [`check_cfg_off_render`] actually engages instead of skipping.
+    fn guided(id: &'static str, behavior: Behavior) -> Self {
+        Self {
+            desc: guided_stub_desc(id),
+            behavior,
+            skip_size: false,
+            runs: Cell::new(0),
+        }
     }
 
     /// An **audio-lane** stub (sc-13705): `Modality::Audio`, no size bound (`max_size` 0), validating
@@ -209,11 +248,29 @@ impl Generator for Stub {
         for _ in 0..self.behavior.decoding_events {
             on_progress(Progress::Decoding);
         }
-        let fill = if self.behavior.deterministic {
+        // sc-17418, the CFG-off contract. `cfg_off` is "this request has classifier-free guidance
+        // switched off" — the fork every engine hand-writes, and the one sc-14195 got wrong.
+        let cfg_off = req.guidance.is_some_and(|g| g <= 1.0);
+        if cfg_off && !self.behavior.cfg_off_generates {
+            // The literal sc-14195 shape: validate() waved it through, the engine dies mid-denoise.
+            return Err(Error::Msg(
+                "shape mismatch in matmul, lhs: [10, 4096, 64], rhs: [20, 64, 77]".into(),
+            ));
+        }
+        let mut fill = if self.behavior.deterministic {
             req.seed.unwrap_or(0) as u8
         } else {
             run as u8
         };
+        // The wrong-row narrow: at CFG-off the negative branch is gone, so a correct engine cannot
+        // let the negative prompt reach the output. This variant does, and must be caught.
+        if cfg_off && !self.behavior.cfg_off_ignores_negative {
+            let neg = req.negative_prompt.as_deref().unwrap_or("");
+            fill = fill.wrapping_add(neg.len() as u8).wrapping_add(
+                neg.bytes()
+                    .fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(b)),
+            );
+        }
         let img = Image {
             width: req.width,
             height: req.height,
@@ -441,6 +498,105 @@ fn nondeterministic_fails_seed_check() {
 fn unregistered_id_fails_registry_check() {
     let g = Stub::new(UNREG_ID, Behavior::good());
     assert!(check_registry_roundtrip(&registry(), &g).is_err());
+}
+
+/// sc-17418: a CFG-capable model that serves `guidance = 1.0` correctly — renders, and leaves the
+/// negative prompt inert — passes.
+#[test]
+fn correct_cfg_off_passes() {
+    let g = Stub::guided(STUB_ID, Behavior::good());
+    assert!(check_cfg_off_render(&g, &cheap()).is_ok());
+}
+
+/// sc-17418, the literal sc-14195 shape: `validate` accepts `guidance = 1.0` and the engine then
+/// dies mid-denoise on a batch mismatch. The check must fire, and must say so in terms that point
+/// at the CFG batch contract rather than just "generate failed".
+#[test]
+fn cfg_off_that_explodes_fails_check() {
+    let g = Stub::guided(
+        STUB_ID,
+        Behavior {
+            cfg_off_generates: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_cfg_off_render(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("validate() accepted guidance = 1.0"),
+        "got: {err}"
+    );
+    assert!(err.contains("shape mismatch"), "got: {err}");
+}
+
+/// sc-17418, the mutation a liveness-only check CANNOT catch: the engine narrows its conditioning to
+/// the WRONG row, so CFG-off renders the negative prompt. It still returns an image — nothing
+/// errors — so only the negative-inertness assertion catches it.
+#[test]
+fn cfg_off_that_consumes_the_negative_fails_check() {
+    let g = Stub::guided(
+        STUB_ID,
+        Behavior {
+            cfg_off_ignores_negative: false,
+            ..Behavior::good()
+        },
+    );
+    // It really does render — this is not an error path.
+    let mut req = crate::base_request(&cheap());
+    req.guidance = Some(1.0);
+    req.negative_prompt = Some("anything".into());
+    assert!(g.generate(&req, &mut |_| {}).is_ok());
+
+    let err = check_cfg_off_render(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("the negative prompt changed the output"),
+        "got: {err}"
+    );
+    assert!(err.contains("WRONG row"), "got: {err}");
+}
+
+/// sc-17418: a model with no guidance axis (the distilled/CFG-free families) is out of scope — the
+/// check skips rather than inventing a contract the descriptor never advertised. The plain stub
+/// leaves `supports_guidance` false, and would FAIL the broken behaviours above if it were graded.
+#[test]
+fn cfg_free_model_is_skipped_not_graded() {
+    let broken = Behavior {
+        cfg_off_generates: false,
+        cfg_off_ignores_negative: false,
+        ..Behavior::good()
+    };
+    let g = Stub::new(STUB_ID, broken);
+    assert!(!g.descriptor().capabilities.supports_guidance);
+    assert!(check_cfg_off_render(&g, &cheap()).is_ok());
+    // Mutation guard for the skip itself: the SAME broken behaviour on a guidance-advertising
+    // descriptor does fail, so the skip is driven by the capability, not by the check being inert.
+    assert!(check_cfg_off_render(&Stub::guided(STUB_ID, broken), &cheap()).is_err());
+}
+
+/// sc-17418: honest rejection is a legitimate stance. A model whose `validate` refuses
+/// `guidance = 1.0` is not obliged to render it — the check passes without calling `generate`.
+#[test]
+fn honest_rejection_of_cfg_off_passes() {
+    struct Rejecting(ModelDescriptor);
+    impl Generator for Rejecting {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+        fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+            if req.guidance.is_some_and(|g| g <= 1.0) {
+                return Err(Error::Msg("this model requires guidance > 1".into()));
+            }
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            panic!("generate() must not be called once validate() has rejected the request");
+        }
+    }
+    let g = Rejecting(guided_stub_desc(STUB_ID));
+    assert!(check_cfg_off_render(&g, &cheap()).is_ok());
 }
 
 /// The weights-free descriptor sweep (sc-9098, F-009) is clean over the explicit fixture registry.
