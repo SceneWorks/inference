@@ -741,3 +741,70 @@ fn every_catalog_entry_executes_the_full_ladder_on_its_own_checkpoint() {
         );
     }
 }
+
+// =================================================================================================
+// 6. The batch loop across the new phase split.
+// =================================================================================================
+
+/// Rung 1 restructured the count loop: it used to denoise-and-decode each image in turn, and now
+/// denoises **every** image while the DiT is alive, sheds the DiT, then decodes them all. That is the
+/// change that makes the phase split real, and it is also the one that could silently reorder or
+/// alias a batch. Two images, compared per index against the unbounded warm render.
+#[test]
+#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+fn batch_count_survives_the_denoise_decode_phase_split() {
+    let render = |shape: LoadShape, memory: GenerationMemory| {
+        let generator = mlx_gen_anima::provider_registry()
+            .expect("anima registry")
+            .load(PROVIDER, &spec(shape))
+            .expect("load anima_base");
+        clear_cache();
+        reset_peak_memory();
+        let request = GenerationRequest {
+            count: 2,
+            ..request(memory)
+        };
+        let GenerationOutput::Images(images) = generator
+            .generate(&request, &mut |_| {})
+            .expect("generate an anima batch")
+        else {
+            panic!("expected image output");
+        };
+        let peak = get_peak_memory();
+        drop(generator);
+        clear_cache();
+        (images, peak)
+    };
+
+    let (warm, warm_peak) = render(LoadShape::EagerMaterialization, GenerationMemory::default());
+    let (bounded, bounded_peak) = render(LoadShape::DeferredMaterialization, full_ladder());
+    assert_eq!(warm.len(), 2, "the warm batch must return both images");
+    assert_eq!(
+        bounded.len(),
+        2,
+        "the bounded batch must return both images"
+    );
+
+    // Per INDEX: seeds are base_seed + n, so image 0 and image 1 are different renders. A phase split
+    // that dropped, duplicated or reordered a latent would show up here and nowhere else.
+    for (index, (left, right)) in warm.iter().zip(&bounded).enumerate() {
+        let (max, mean) = delta(left, right);
+        println!("BATCH index={index} max_delta={max} mean_delta={mean:.6}");
+        assert!(
+            max <= 64 && mean < 0.25,
+            "batch image {index} changed beyond the admitted decode bound: max={max} mean={mean}"
+        );
+    }
+    let (across, _) = delta(&warm[0], &warm[1]);
+    assert!(
+        across > 8,
+        "the two batch seeds must produce genuinely different images, else the per-index check is \
+         vacuous (got max delta {across})"
+    );
+    println!(
+        "RESULT status=pass check=batch provider={PROVIDER} count=2 warm_peak_gib={:.3} \
+         full_ladder_peak_gib={:.3}",
+        gib(warm_peak),
+        gib(bounded_peak)
+    );
+}
