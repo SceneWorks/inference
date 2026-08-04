@@ -632,21 +632,27 @@ fn read_codes_csv(path: &str) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// Resolve one half of the encode reference-parity fixture, `env` overriding the committed file.
+/// Resolve a committed fixture under `tests/fixtures/`, with `env` as an override.
 ///
-/// sc-17270: this pair used to be env-only, so an unset variable silently dropped the whole
-/// reference cross-check while libtest still reported the test as passing. The fixture under
-/// `tests/fixtures/` is committed — a deterministic synthetic clip plus the codes the upstream
-/// PyTorch `codec.encode` emits for it at the revision `release/real-weight-models.toml` pins —
-/// so the cross-check now runs wherever the codec weights are, with no operator provisioning.
-/// The environment variables remain as an override for pointing the same comparison at another
-/// clip; what they can no longer do is turn the assertion off.
-/// Regenerate with `scripts/reference/moss_audio_codec_reference.py`.
+/// Two fixture sets ride on this, both for the same reason — an env-only path meant an unset
+/// variable silently removed real-weight coverage that nothing else replaced:
+///
+/// - **Encode reference parity (sc-17270)** — `MOSS_CODEC_CLIP` / `MOSS_CODEC_REF_CODES`. The
+///   cross-check used to sit behind `if let Ok(..)`, so an unset variable dropped it entirely while
+///   libtest still reported the test as passing. Regenerate with
+///   `scripts/reference/moss_audio_codec_reference.py`.
+/// - **Voice cloning (sc-17264)** — `MOSS_VOICECLONE_REF`. These two tests *did* fail loudly on an
+///   unset variable, so the coverage was lost a rung earlier: both were left out of the real-weight
+///   lane altogether because the clip existed nowhere. Regenerate with
+///   `cargo run -p candle-audio-moss-tts-realtime --example voiceclone_ref_clip`.
+///
+/// The variables survive as an override for pointing the same gate at different audio; what they
+/// can no longer do is decide whether the gate runs at all.
 ///
 /// An empty or whitespace-only value counts as unset. An unconfigured `${{ vars.X }}` expands to
 /// the empty string in a workflow, so treating it as an override would turn a mis-wired lane into
 /// a confusing read failure instead of simply using the fixture that ships with the test.
-fn codec_ref_fixture(env: &str, file: &str) -> String {
+fn fixture_path(env: &str, file: &str) -> String {
     match std::env::var(env) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -678,8 +684,8 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
         "set MOSS_CODEC_CLIP and MOSS_CODEC_REF_CODES together or not at all — the codes are only \
          valid for the clip they were generated from"
     );
-    let clip_p = codec_ref_fixture("MOSS_CODEC_CLIP", "moss_codec_ref_clip.f32");
-    let ref_p = codec_ref_fixture("MOSS_CODEC_REF_CODES", "moss_codec_ref_codes.csv");
+    let clip_p = fixture_path("MOSS_CODEC_CLIP", "moss_codec_ref_clip.f32");
+    let ref_p = fixture_path("MOSS_CODEC_REF_CODES", "moss_codec_ref_codes.csv");
     let clip = read_f32le(&clip_p);
     let port = codec.encode(&clip, 24_000).expect("encode reference clip");
     let refc = read_codes_csv(&ref_p);
@@ -962,8 +968,9 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
 // ---------------------------------------------------------------------------------------------
 // sc-14149 — voice cloning: generate the same text with the default voice and with a reference
 // clip; both must be intelligible (ASR CER) and the cloned output must DIFFER from the default
-// (the reference timbre conditioning takes effect). `MOSS_VOICECLONE_REF` = a 24 kHz f32-LE mono
-// reference clip. The speaker-identity (x-vector similarity) gate lands with the CAMPPlus harness.
+// (the reference timbre conditioning takes effect). The reference speaker is a committed fixture
+// (sc-17264) rendered by Kokoro — `MOSS_VOICECLONE_REF` overrides it with another 24 kHz f32-LE
+// mono clip, but no longer decides whether this test can run at all.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -984,10 +991,10 @@ fn moss_tts_realtime_voice_clone() {
         .expect("whisper registry")
         .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
         .expect("whisper_base loads");
-    let ref_clip = read_f32le(
-        &std::env::var("MOSS_VOICECLONE_REF")
-            .expect("set MOSS_VOICECLONE_REF to a 24 kHz f32-LE mono reference clip"),
-    );
+    let ref_clip = read_f32le(&fixture_path(
+        "MOSS_VOICECLONE_REF",
+        "moss_voiceclone_ref_clip.f32",
+    ));
 
     let text = "The quick brown fox jumps over the lazy dog.";
     let req = |conditioning: Vec<Conditioning>| GenerationRequest {
@@ -1511,16 +1518,16 @@ fn moss_tts_realtime_multi_turn_user_context() {
 /// the reference speaker more than the default (no-clone) voice does (so the clone threads into the
 /// later turn, not only turn 0), and the turns are mutually the same speaker.
 #[test]
-#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base + Chatterbox CAMPPlus + MOSS_VOICECLONE_REF; run with --ignored --nocapture"]
+#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base + Chatterbox CAMPPlus; run with --ignored --nocapture"]
 fn moss_tts_realtime_multi_turn_voice_clone() {
     use moss::gen_core::{AudioTrack, Conditioning, ConversationRole, ConversationTurn};
 
     let generator = load();
     let transcribe = whisper_transcriber();
-    let ref_clip = read_f32le(
-        &std::env::var("MOSS_VOICECLONE_REF")
-            .expect("set MOSS_VOICECLONE_REF to a 24 kHz f32-LE mono reference clip"),
-    );
+    let ref_clip = read_f32le(&fixture_path(
+        "MOSS_VOICECLONE_REF",
+        "moss_voiceclone_ref_clip.f32",
+    ));
     let ref_track = AudioTrack {
         samples: ref_clip.clone(),
         sample_rate: 24_000,
