@@ -1351,9 +1351,84 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
-        self.assertEqual(job.count("if: always()"), 2)
+        # Three, not two: sc-17355's GPU/memory evidence report is the third `always()` step, and it
+        # is counted here rather than exempted — the point of a count is that a fourth has to be
+        # argued for.
+        self.assertEqual(job.count("if: always()"), 3)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("krea-s18-sweep-${{ github.sha }}", job)
+        # The sampler's CSV rides along with the cells: on a 4.3-hour run the summary this job
+        # prints is a fraction of what the trajectory holds, and re-running to get it costs 4.3 hours.
+        self.assertIn("${{ runner.temp }}/gpu-fault-evidence/memory.csv", job)
+
+    def test_krea_lanes_record_gpu_fault_evidence_with_a_predicate_that_matches(self) -> None:
+        """sc-17355: a Metal command-buffer cascade names no cause, so the record must pre-exist.
+
+        Run 30869410054 failed the LoRA gate with `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`
+        — "ignored for causing prior/excessive GPU errors", i.e. an EARLIER submission faulted and
+        this one was dropped. That earlier fault is the only thing that names a cause, and it is not
+        in the run log. Nor can it be recovered afterwards: the re-dispatch that passed destroyed the
+        machine state that would have explained it. So the collection has to be in place BEFORE the
+        recurrence, on both lanes that drive this crate on `rw-krea`.
+
+        The predicate is pinned because the obvious one is inert. `subsystem == "com.apple.gpu"` —
+        which sc-17355 itself proposed — matches ZERO events on macOS 25.5.0: IOGPU faults carry an
+        empty `subsystem` and are identifiable only by `senderImagePath`. Measured both ways on
+        nax-macos over the same 3-day window: sender-based matching returns real IOGPU faults, the
+        subsystem form returns nothing at all. A capture that silently matches nothing is worse than
+        no capture, because an empty file reads as evidence of absence.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        bounds = {
+            "  mlx-krea-realtime:": "\n  mlx-krea-realtime-s18-sweep:",
+            "  mlx-krea-realtime-s18-sweep:": "\n  candle-audio-kokoro:",
+        }
+        for header, terminator in bounds.items():
+            start = workflow.index(header)
+            job = workflow[start : workflow.index(terminator, start)]
+            with self.subTest(job=header.strip()):
+                self.assertIn("scripts/ci/gpu_fault_evidence.sh start", job)
+                self.assertIn("scripts/ci/gpu_fault_evidence.sh report", job)
+                # The report exists to explain a FAILING run, so it must not be skipped by one.
+                report = job[job.index("- name: Report GPU fault evidence") :]
+                self.assertIn("if: always()", report[: report.index("run:")])
+                # Neither half may kill a multi-hour lane: a step whose only product is a record can
+                # still fail for reasons the script never sees (a lost exec bit, a wrong cwd). Three
+                # per job = the two evidence steps plus the pre-existing disk-headroom report.
+                self.assertEqual(job.count("continue-on-error: true"), 3)
+
+        script_path = REAL_WEIGHTS_WORKFLOW.parents[2] / "scripts" / "ci" / "gpu_fault_evidence.sh"
+        script = script_path.read_text(encoding="utf-8")
+        # Comments stripped first: the header explains the inert predicate in prose, and that
+        # explanation is precisely why it must not silently reappear in the command itself.
+        code = "\n".join(
+            line for line in script.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn('subsystem == "com.apple.gpu"', code)
+        self.assertIn('senderImagePath CONTAINS "IOGPU"', code)
+        # `log stream` drops messages under load, and load is the only condition of interest: a
+        # local run that ended in a memory kill produced 20+ "Messages dropped during live
+        # streaming" markers and none of the events, while `log show` over the same window
+        # returned them. The reader must stay post-hoc.
+        self.assertIn("/usr/bin/log show", code)
+        self.assertNotIn("log stream", code)
+        # The hypothesis under test is memory pressure, and the kernel names the mechanism outright
+        # (`killing due to "vm-compressor-space-shortage"`). None of those lines contain "IOGPU" or
+        # "command buffer", so a GPU-only predicate throws away the most direct evidence there is.
+        self.assertIn('eventMessage CONTAINS[c] "memorystatus"', code)
+        # `log` records its own argument vector, which contains "IOGPU" — without this exclusion
+        # every run matches itself and reports a spurious hit, which is as useless as reporting none.
+        self.assertIn('processImagePath != "/usr/bin/log"', code)
+        # The sibling `report_runner_disk_headroom.sh` names a lost exec bit as the one failure it
+        # cannot see; git tracks the mode, so pin it here instead of discovering it on a real box.
+        mode = subprocess.run(
+            ["git", "ls-files", "-s", "--", "scripts/ci/gpu_fault_evidence.sh"],
+            capture_output=True,
+            text=True,
+            cwd=script_path.parents[2],
+            check=False,
+        ).stdout.split(" ", 1)[0]
+        self.assertEqual(mode, "100755")
 
     def test_krea_e2e_step_pins_its_run_count_and_excludes_the_s18_sweep(self) -> None:
         """sc-17276: the e2e step selects by `--ignored`, which is a blanket.
