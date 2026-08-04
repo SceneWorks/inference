@@ -36,7 +36,7 @@ mod vae;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use candle_gen::candle_core::Device;
+use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, PidWeights,
     Progress, WeightsSource,
@@ -45,6 +45,22 @@ use candle_gen::gen_core::{
 pub use config::{ChromaVariant, CHROMA1_BASE_ID, CHROMA1_FLASH_ID, CHROMA1_HD_ID, SIZE_MULTIPLE};
 
 use pipeline::{Components, Pipeline};
+
+/// Dense Chroma components that retain their checkpoint-native width.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativeComponent {
+    T5,
+    Vae,
+}
+
+/// Chroma publishes its dense T5-XXL and FLUX.1 VAE tensors as BF16. Keeping the selections explicit
+/// makes either loader's precision policy independently testable.
+pub(crate) fn native_component_dtype(component: NativeComponent) -> DType {
+    match component {
+        NativeComponent::T5 => DType::BF16,
+        NativeComponent::Vae => DType::BF16,
+    }
+}
 
 /// A loaded candle Chroma generator (one per variant). Loading is **lazy**: `load` does no file I/O,
 /// and the heavy components (T5 + DiT + VAE) are built on the first [`generate`](Generator::generate)
@@ -211,6 +227,20 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    use candle_gen::candle_core::DType;
+
+    #[test]
+    fn dense_t5_and_vae_stay_at_their_native_bf16_width() {
+        assert_eq!(
+            super::native_component_dtype(super::NativeComponent::T5),
+            DType::BF16
+        );
+        assert_eq!(
+            super::native_component_dtype(super::NativeComponent::Vae),
+            DType::BF16
+        );
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();

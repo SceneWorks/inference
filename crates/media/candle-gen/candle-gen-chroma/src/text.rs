@@ -34,7 +34,7 @@ pub fn load_tokenizer() -> Result<Tokenizer> {
 }
 
 /// Load the T5-XXL encoder from the Chroma snapshot's `text_encoder/` (config.json + sharded
-/// safetensors), at f32 on `device`.
+/// safetensors), at its native BF16 width on `device`.
 pub fn load_t5(root: &Path, device: &Device) -> Result<T5EncoderModel> {
     let dir = root.join("text_encoder");
     let cfg_str = std::fs::read_to_string(dir.join("config.json"))
@@ -42,13 +42,14 @@ pub fn load_t5(root: &Path, device: &Device) -> Result<T5EncoderModel> {
     let cfg: T5Config = serde_json::from_str(&cfg_str)
         .map_err(|e| CandleError::Msg(format!("chroma: parse T5 config.json: {e}")))?;
     let files = safetensors_in(&dir)?;
-    // f32: the Chroma DiT runs f32 activations and `context_embedder` requires an f32 input; loading
-    // the bf16 checkpoint as f32 keeps the weight values (bf16) in f32 containers (mlx parity).
-    let vb = candle_gen::mmap_var_builder(&files, candle_gen::candle_core::DType::F32, device)?;
+    // The T5 runs at the checkpoint's native BF16 width. Its sequence embedding is promoted at the
+    // existing `context_embedder` call site, where the F32 Chroma DiT actually requires it.
+    let dtype = crate::native_component_dtype(crate::NativeComponent::T5);
+    let vb = candle_gen::mmap_var_builder(&files, dtype, device)?;
     T5EncoderModel::load(vb, &cfg).map_err(Into::into)
 }
 
-/// Encode `prompt` → the T5 sequence embedding `[1, L, 4096]` (f32), at natural length (the `</s>`
+/// Encode `prompt` → the T5 sequence embedding `[1, L, 4096]` (BF16), at natural length (the `</s>`
 /// eos is appended by the tokenizer; no padding). `t5` is `&mut` because its `forward` carries a
 /// relative-position-bias cache.
 pub fn encode_prompt(
