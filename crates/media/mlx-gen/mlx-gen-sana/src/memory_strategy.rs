@@ -7,11 +7,11 @@
 
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryDecodeRouteDomain,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryPidDecodeRoutes, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
+    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, ResidentRequestMemory,
+    Result as CoreResult,
 };
 #[cfg(test)]
 use mlx_gen::LoadShape;
@@ -126,25 +126,23 @@ fn contract_with_asset_facts(
             .iter_mut()
             .find(|capability| capability.strategy == strategy)
             .expect("compatibility contract declares every rung");
-        capability.support = MemoryStrategySupport::Implemented;
+        capability.support = match strategy {
+            MemoryStrategy::StagedResidency
+                if matches!(spec.offload_policy, OffloadPolicy::Sequential) =>
+            {
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedDecode => MemoryStrategySupport::Implemented,
+            _ => MemoryStrategySupport::Missing,
+        };
         if strategy == MemoryStrategy::BoundedDecode {
             capability.parameters = MemoryParameterRanges {
-                decode_tile_edges: routes.published_edges(),
-                decode_overlaps: routes.published_overlaps(),
+                decode_tile_edges: routes.native_edges().to_vec(),
+                decode_overlaps: vec![DECODE_OVERLAP as u32],
                 ..Default::default()
             };
         }
     }
-    contract.pid_decode_routes = Some(MemoryPidDecodeRoutes {
-        native: MemoryDecodeRouteDomain {
-            tile_edges: routes.native_edges().to_vec(),
-            tile_overlap: DECODE_OVERLAP as u32,
-        },
-        pid: MemoryDecodeRouteDomain {
-            tile_edges: mlx_gen_pid::DecodeRoutes::pid_edges(),
-            tile_overlap: mlx_gen_pid::DecodeRoutes::pid_overlap(),
-        },
-    });
     // The compatibility constructor supplies the required empty engagement-exclusion surface.
     debug_assert!(contract.default_engagement_exclusions.is_empty());
     Ok(contract)
@@ -360,5 +358,21 @@ mod tests {
         )
         .unwrap();
         assert_ne!(resident.calibration, sequential.calibration);
+        assert_eq!(
+            resident
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        assert_eq!(
+            sequential
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(resident.pid_decode_routes.is_none());
+        assert!(sequential.pid_decode_routes.is_none());
     }
 }
