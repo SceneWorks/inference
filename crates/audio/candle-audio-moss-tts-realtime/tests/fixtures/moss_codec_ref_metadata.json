@@ -1,0 +1,38 @@
+{
+  "clip": {
+    "format": "raw f32 little-endian, mono",
+    "frames": 100,
+    "origin": "synthesized by this script's `synth-clip`; no third-party audio",
+    "peak": 0.9,
+    "sample_rate": 24000,
+    "samples": 192000,
+    "sha256": "dae384c6b0d57599a7311837372784ccd52c6587740bfe552994810e37de5a39"
+  },
+  "codes": {
+    "format": "CSV, one row per frame, frames[T][nq]",
+    "frames": 100,
+    "num_quantizers": 16,
+    "sha256": "d0b10d3d0cbb8596de7e5738f2776a6ad36d95a47cb62a41438295c40626a93a"
+  },
+  "generator": "scripts/reference/moss_audio_codec_reference.py",
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float32",
+    "python": "3.14.6",
+    "torch": "2.13.0",
+    "transformers": "5.14.1"
+  },
+  "story": "sc-17270",
+  "upstream": {
+    "license": "Apache-2.0",
+    "repository": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+    "revision": "3cd226ba2947efa357ef453bcad111b6eafba782",
+    "snapshot_inventory_sha256": "f289f5563e2c15626db435976c770c55e5236936bda1184e602a401bdf458157",
+    "sources": {
+      "__init__.py": "ed0b4910a5e53b1dfc3234cfcf96e2c6890d339f9134a3dfed8481d01b3768fd",
+      "configuration_moss_audio_tokenizer.py": "349b7ff7e1b3f160f9c80df9a0311672b326b8b73e90459122fb39e6878962bf",
+      "modeling_moss_audio_tokenizer.py": "65cae7744845f1b8ac65957e918cea508efe331a38e87b882b7530b6c8d7caa5"
+    },
+    "vendored": false
+  }
+}
