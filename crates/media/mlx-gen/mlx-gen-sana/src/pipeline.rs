@@ -45,11 +45,13 @@
 //! `[1, H, W, 3]`; [`mlx_gen::image::decoded_to_image`] expects NCHW, so the output is transposed back
 //! to NCHW before the `clip(x·0.5 + 0.5)` → RGB8 conversion.
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::{
     run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, Image, PreviewSink,
-    Progress, Result, TimestepConvention,
+    Progress, Result, StagedHeavy, TimestepConvention,
 };
 use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array};
@@ -192,11 +194,131 @@ pub fn decode_to_image(
     latents: &Array,
     cancel: &CancelFlag,
 ) -> Result<Image> {
+    decode_to_image_with_tiling(decoder, cfg, latents, cancel, None)
+}
+
+fn decode_to_image_with_tiling(
+    decoder: &DcAeDecoder,
+    cfg: &DcAeConfig,
+    latents: &Array,
+    cancel: &CancelFlag,
+    tiling: Option<&TilingConfig>,
+) -> Result<Image> {
     let scale = Array::from_slice(&[cfg.scaling_factor], &[1]);
     let unscaled = divide(latents, &scale)?; // diffusers: latents / scaling_factor
-    let decoded_nhwc = decoder.decode(&unscaled, cancel)?; // [1, H, W, 3] NHWC, f32
+    let decoded_nhwc = match tiling {
+        Some(tiling) => decode_tiled(decoder, &unscaled, tiling, cancel)?,
+        None => decoder.decode(&unscaled, cancel)?,
+    }; // [1, H, W, 3] NHWC, f32
     let decoded_nchw = decoded_nhwc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for decoded_to_image
     decoded_to_image(&decoded_nchw)
+}
+
+/// Measured production DC-AE tile domain. All edges use one fixed 48-pixel overlap; edges below
+/// 192 reached the same 3294-MiB request floor while degrading output and remain a rejection set.
+pub const DECODE_TILE_EDGE: i32 = 192;
+pub const DECODE_OVERLAP: i32 = 48;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeTilingSource {
+    EnvOverride,
+    Request,
+    SequentialDefault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeTilingPlan {
+    pub edge: i32,
+    pub overlap: i32,
+    pub source: DecodeTilingSource,
+}
+
+/// Resolve the actual DC-AE geometry with total precedence: request-scoped shared-contract signal,
+/// admitted measurement override, then the Sequential shipping default. The calibration harness
+/// cannot supersede an admitted request or run unpublished geometry. Resident stays whole-image
+/// unless the caller explicitly selects bounded decode.
+pub fn resolved_decode_plan(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<DecodeTilingPlan> {
+    if let Some(memory) = memory {
+        if !memory.tile_vae_decode {
+            return None;
+        }
+        return Some(DecodeTilingPlan {
+            edge: memory
+                .decode_tile_edge
+                .map_or(DECODE_TILE_EDGE, |edge| edge as i32),
+            overlap: memory
+                .decode_overlap
+                .map_or(DECODE_OVERLAP, |overlap| overlap as i32),
+            source: DecodeTilingSource::Request,
+        });
+    }
+    if let Some(edge) = std::env::var("MLX_GEN_SANA_DECODE_TILE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        if edge == 0 {
+            return None;
+        }
+        if edge > 0 && crate::memory_strategy::DECODE_TILE_EDGES.contains(&(edge as u32)) {
+            return Some(DecodeTilingPlan {
+                edge,
+                overlap: DECODE_OVERLAP,
+                source: DecodeTilingSource::EnvOverride,
+            });
+        }
+    }
+    is_sequential.then_some(DecodeTilingPlan {
+        edge: DECODE_TILE_EDGE,
+        overlap: DECODE_OVERLAP,
+        source: DecodeTilingSource::SequentialDefault,
+    })
+}
+
+pub fn resolve_decode_tiling(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<TilingConfig> {
+    resolved_decode_plan(memory, is_sequential)
+        .map(|plan| TilingConfig::spatial_only(plan.edge, plan.overlap))
+}
+
+const DC_AE_TILING: VaeTiling = VaeTiling {
+    spatial_scale: 32,
+    temporal_scale: 1,
+    causal_temporal: false,
+    full_res_channels: 3,
+};
+
+/// Decode one NCHW DC-AE latent through the shared 5-D tiled-VAE seam. SANA's decoder emits NHWC,
+/// so a dummy temporal axis keeps the latent and decoded tile spatial axes aligned for blending.
+fn decode_tiled(
+    decoder: &DcAeDecoder,
+    latent: &Array,
+    tiling: &TilingConfig,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let shape = latent.shape();
+    let (height, width) = (shape[2], shape[3]);
+    let plan = tiling.plan(DC_AE_TILING, 1, height, width);
+    let denorm =
+        latent
+            .transpose_axes(&[0, 2, 3, 1])?
+            .reshape(&[1, 1, height, width, LATENT_CHANNELS])?;
+    let out = mlx_gen::vae_tiling::tiled_decode(&denorm, &plan, [1, 2, 3], Some(cancel), |tile| {
+        let shape = tile.shape();
+        let (height, width) = (shape[2], shape[3]);
+        let tile = tile
+            .reshape(&[1, height, width, LATENT_CHANNELS])?
+            .transpose_axes(&[0, 3, 1, 2])?;
+        let decoded = decoder.decode(&tile, cancel)?;
+        let shape = decoded.shape();
+        Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
+    })?;
+    let shape = out.shape();
+    Ok(out.reshape(&[1, shape[2], shape[3], shape[4]])?)
 }
 
 // =================================================================================================
@@ -496,7 +618,7 @@ pub struct SanaHeavy {
     transformer: SanaTransformer,
     /// DC-AE **encoder** — the img2img reference→latent path (sc-10190). Loaded from the SAME
     /// `vae/` snapshot as the decoder (the checkpoint ships both `encoder.*` and `decoder.*` keys).
-    encoder: DcAeEncoder,
+    encoder: Option<DcAeEncoder>,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
     sprint: bool,
@@ -590,7 +712,22 @@ impl SanaHeavy {
     ) -> Self {
         Self {
             transformer,
-            encoder,
+            encoder: Some(encoder),
+            decoder,
+            dc_ae_cfg,
+            sprint: false,
+            guidance_embeds_scale: 0.0,
+        }
+    }
+
+    pub fn new_text_to_image(
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+    ) -> Self {
+        Self {
+            transformer,
+            encoder: None,
             decoder,
             dc_ae_cfg,
             sprint: false,
@@ -612,7 +749,23 @@ impl SanaHeavy {
     ) -> Self {
         Self {
             transformer,
-            encoder,
+            encoder: Some(encoder),
+            decoder,
+            dc_ae_cfg,
+            sprint: true,
+            guidance_embeds_scale,
+        }
+    }
+
+    pub fn new_sprint_text_to_image(
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+        guidance_embeds_scale: f32,
+    ) -> Self {
+        Self {
+            transformer,
+            encoder: None,
             decoder,
             dc_ae_cfg,
             sprint: true,
@@ -669,15 +822,19 @@ impl SanaHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
     ) -> Result<Image> {
-        if self.sprint {
-            self.render_sprint(cond, req, guidance, cancel, on_progress, preview)
-        } else {
-            self.render_cfg(cond, req, guidance, cancel, on_progress, preview)
-        }
+        self.render_one_with_preview_and_tiling(
+            cond,
+            req,
+            guidance,
+            cancel,
+            on_progress,
+            preview,
+            None,
+        )
     }
 
-    /// The base SANA-1.6B true-CFG flow-match render for one image (the pre-seam `generate_with` tail).
-    fn render_cfg(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_one_with_preview_and_tiling(
         &self,
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
@@ -685,7 +842,41 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        tiling: Option<&TilingConfig>,
     ) -> Result<Image> {
+        let latents =
+            self.denoise_one_with_preview(cond, req, guidance, cancel, on_progress, preview)?;
+        mlx_rs::transforms::eval([&latents])?;
+        on_progress(Progress::Decoding);
+        self.decode_view().decode_one(&latents, cancel, tiling)
+    }
+
+    pub(crate) fn denoise_one_with_preview(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+    ) -> Result<Array> {
+        if self.sprint {
+            self.denoise_sprint(cond, req, guidance, cancel, on_progress, preview)
+        } else {
+            self.denoise_cfg(cond, req, guidance, cancel, on_progress, preview)
+        }
+    }
+
+    /// The base SANA-1.6B true-CFG flow-match denoise for one image.
+    fn denoise_cfg(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+    ) -> Result<Array> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
@@ -710,8 +901,11 @@ impl SanaHeavy {
             let image = req
                 .init_image
                 .expect("start_step > 0 implies an init image");
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+            })?;
             Some(encode_init_latents(
-                &self.encoder,
+                encoder,
                 &self.dc_ae_cfg,
                 image,
                 req.width,
@@ -755,8 +949,7 @@ impl SanaHeavy {
             on_progress,
             preview,
         )?;
-        on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+        Ok(latents)
     }
 
     /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) render for one image (the pre-seam
@@ -768,7 +961,7 @@ impl SanaHeavy {
     /// DC-AE-encoded init to that angle: `x_t = cos(t)·x0 + sin(t)·noise·σ_data` with `x0 =
     /// encode·scaling_factor·σ_data` and `t = timesteps[start]`. Distilled/consistency, so the strength
     /// window is narrow — validate the band on-device. `start = 0` is the byte-identical txt2img path.
-    fn render_sprint(
+    fn denoise_sprint(
         &self,
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
@@ -776,7 +969,7 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
-    ) -> Result<Image> {
+    ) -> Result<Array> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
@@ -794,8 +987,11 @@ impl SanaHeavy {
             let image = req
                 .init_image
                 .expect("start_step > 0 implies an init image");
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+            })?;
             let clean = encode_init_latents(
-                &self.encoder,
+                encoder,
                 &self.dc_ae_cfg,
                 image,
                 req.width,
@@ -828,8 +1024,54 @@ impl SanaHeavy {
             on_progress,
             preview,
         )?;
-        on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+        Ok(latents)
+    }
+}
+
+pub struct SanaLight {
+    decoder: DcAeDecoder,
+    dc_ae_cfg: DcAeConfig,
+}
+
+pub struct SanaDecodeView<'a> {
+    decoder: &'a DcAeDecoder,
+    dc_ae_cfg: &'a DcAeConfig,
+}
+
+impl SanaDecodeView<'_> {
+    pub fn decode_one(
+        &self,
+        latents: &Array,
+        cancel: &CancelFlag,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        decode_to_image_with_tiling(self.decoder, self.dc_ae_cfg, latents, cancel, tiling)
+    }
+}
+
+impl mlx_gen::StagedHeavy for SanaHeavy {
+    type Light = SanaLight;
+    type DecodeView<'a> = SanaDecodeView<'a>;
+
+    fn shed_dit(self) -> SanaLight {
+        SanaLight {
+            decoder: self.decoder,
+            dc_ae_cfg: self.dc_ae_cfg,
+        }
+    }
+
+    fn decode_view(&self) -> SanaDecodeView<'_> {
+        SanaDecodeView {
+            decoder: &self.decoder,
+            dc_ae_cfg: &self.dc_ae_cfg,
+        }
+    }
+
+    fn light_view(light: &SanaLight) -> SanaDecodeView<'_> {
+        SanaDecodeView {
+            decoder: &light.decoder,
+            dc_ae_cfg: &light.dc_ae_cfg,
+        }
     }
 }
 
@@ -927,6 +1169,77 @@ impl SanaPipeline {
 mod tests {
     use super::*;
     use mlx_rs::transforms::eval;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn decode_default_is_the_measured_192_at_fixed_48_overlap() {
+        let _lock = env_lock();
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        assert!(resolved_decode_plan(None, false).is_none());
+        assert_eq!(
+            resolved_decode_plan(None, true),
+            Some(DecodeTilingPlan {
+                edge: 192,
+                overlap: 48,
+                source: DecodeTilingSource::SequentialDefault,
+            })
+        );
+        assert!(resolved_decode_plan(Some(GenerationMemory::default()), true).is_none());
+    }
+
+    #[test]
+    fn request_geometry_uses_the_single_published_overlap() {
+        let _lock = env_lock();
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        let plan = resolved_decode_plan(
+            Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                ..Default::default()
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!((plan.edge, plan.overlap), (512, 48));
+        assert_eq!(plan.source, DecodeTilingSource::Request);
+    }
+
+    #[test]
+    fn admitted_measurement_override_never_supersedes_a_contract_request() {
+        let _lock = env_lock();
+        let request = Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(256),
+            ..Default::default()
+        });
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "512");
+        let plan = resolved_decode_plan(request, true).unwrap();
+        assert_eq!(plan.source, DecodeTilingSource::Request);
+        assert_eq!((plan.edge, plan.overlap), (256, 48));
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+        assert_eq!(
+            resolved_decode_plan(request, true).unwrap().source,
+            DecodeTilingSource::Request
+        );
+
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "512");
+        let plan = resolved_decode_plan(None, true).unwrap();
+        assert_eq!(plan.source, DecodeTilingSource::EnvOverride);
+        assert_eq!((plan.edge, plan.overlap), (512, 48));
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "128");
+        assert_eq!(
+            resolved_decode_plan(None, true).unwrap().source,
+            DecodeTilingSource::SequentialDefault
+        );
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+        assert!(resolved_decode_plan(None, true).is_none());
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+    }
 
     #[test]
     fn noise_shape_is_batch1_32ch() {
