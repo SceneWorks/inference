@@ -11,10 +11,16 @@
 //! byte-identical here, so any pixel difference is attributable to the auxiliaries alone.
 //!
 //! It deliberately does NOT assert a pixel-identity threshold against the bf16-auxiliary render.
-//! Packing a text encoder to the selected tier is *supposed* to move the conditioning — that is what
-//! the user bought when they chose q4. A pixel-identity gate would only ever be satisfiable by NOT
-//! doing the thing the story asks for. What is asserted is that each candidate renders coherently
-//! (the packed-surface completeness check) and that its auxiliaries actually shrink.
+//! Packing a text encoder to the selected tier is *supposed* to move the conditioning — a q4 render
+//! is a q4 render end to end, which is exactly what the user asked for when they chose the tier. A
+//! pixel-identity gate against a bf16-conditioned reference would only ever be satisfiable by NOT
+//! doing the thing the story asks for; that is the trap sc-16462 spent two days in. What IS asserted
+//! is that the render stays coherent (the packed-surface completeness check) and that the
+//! auxiliaries actually shrink.
+//!
+//! The candidate width is not selectable here either — `repack_auxiliaries` derives it from the
+//! baseline's own transformer — so pointing this at the q4 tier compares bf16 vs Q4 auxiliaries, and
+//! pointing it at the q8 tier compares bf16 vs Q8.
 //!
 //! Run (≈15 GB baseline tier, Apple Silicon + Metal):
 //!   SC16462_BASELINE=<shipped q4 tier dir> SC16462_OUT=<scratch dir> \
@@ -160,13 +166,16 @@ fn compare_auxiliary_widths() {
     }
 
     let transformer_rel = Path::new("transformer").join("diffusion_pytorch_model.safetensors");
-    for auxiliary_bits in [8, 4] {
-        let candidate = out.join(format!("tier-aux-q{auxiliary_bits}"));
+    {
+        let candidate = out.join("tier-aux-at-tier");
         if candidate.exists() {
             std::fs::remove_dir_all(&candidate).expect("clear stale candidate");
         }
-        mlx_gen_chroma::convert::repack_auxiliaries(&baseline, &candidate, auxiliary_bits)
+        mlx_gen_chroma::convert::repack_auxiliaries(&baseline, &candidate)
             .expect("repack auxiliaries");
+        let auxiliary_bits = mlx_gen::quant::packed_quant_bits_at(&candidate.join("text_encoder"))
+            .expect("read packed width")
+            .expect("auxiliaries are packed");
 
         // The whole comparison rests on this: only the auxiliaries moved.
         assert_eq!(

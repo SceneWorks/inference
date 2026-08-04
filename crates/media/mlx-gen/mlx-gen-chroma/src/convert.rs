@@ -157,40 +157,21 @@ fn quantize_component(
 
 /// Assemble a full pre-quantized turnkey Chroma snapshot in `dst_root`: pack the DiT `transformer/`
 /// block Linears into one `transformer/diffusion_pytorch_model.safetensors` (+ annotated
-/// `config.json`), mirror the dense T5 `text_encoder/` and FLUX.1 `vae/`, and copy the tokenizer /
-/// scheduler / `model_index.json` / license verbatim (deref symlinks). The result loads via
-/// [`crate::model::load_chroma`] (packed weights auto-detect) with no dense transient. `bits` = 4 (Q4
-/// tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion — mirror it; see
-/// the tier builder in `tests/prequantize_real_weights.rs`).
-pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
-    prequantize_turnkey_with_auxiliary_bits(src_root, dst_root, bits, bits)
-}
-
-/// As [`prequantize_turnkey`], with the T5/VAE width chosen independently of the transformer tier.
+/// `config.json`), pack the T5-XXL `text_encoder/` and FLUX.1 `vae/` **at the same width**, and copy
+/// the tokenizer / scheduler / `model_index.json` / license verbatim (deref symlinks). The result
+/// loads via [`crate::model::load_chroma`] (packed weights auto-detect) with no dense transient.
+/// `bits` = 4 (Q4 tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion —
+/// mirror it; see the tier builder in `tests/prequantize_real_weights.rs`).
 ///
-/// Production ships `auxiliary_bits == bits` — the auxiliaries sit AT the selected tier, which is what
-/// removes the `chroma1_*` `textEncoder`/`vae` rows from `config/tier-integrity.jsonc`. The parameter
-/// exists because a q8 auxiliary on the q4 route is a legitimate, precedented fallback (`mage_flow*`
-/// declares exactly that shape: `residentTier: "q8"`, `appliesToTiers: ["q4"]`) if measured q4 T5
-/// quality is not acceptable. It is a declared tier decision either way, never an unmeasured default.
-pub fn prequantize_turnkey_with_auxiliary_bits(
-    src_root: &Path,
-    dst_root: &Path,
-    bits: i32,
-    auxiliary_bits: i32,
-) -> Result<()> {
-    if !matches!(auxiliary_bits, 4 | 8) {
-        return Err(Error::Msg(format!(
-            "chroma convert: auxiliary bits must be 4 or 8, got {auxiliary_bits}"
-        )));
-    }
-    if auxiliary_bits < bits {
-        return Err(Error::Msg(format!(
-            "chroma convert: auxiliary width Q{auxiliary_bits} is BELOW the transformer tier Q{bits}; \
-             that spends quality for no tier-integrity gain"
-        )));
-    }
+/// EVERY component is packed at `bits`. There is deliberately no per-component width override: the
+/// tier a user selects is a statement about the whole render, not a memory budget to be spent
+/// wherever it is cheapest. Running any segment above the selected tier sidesteps that choice — a
+/// user who wants a better text encoder chooses q8, they do not get one silently smuggled into q4.
+/// This is why `chroma1_*` accumulated six `config/tier-integrity.jsonc` exception rows while
+/// `flux1_*`, which packs the same T5-XXL at its route width, has none.
+pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
     std::fs::create_dir_all(dst_root)?;
+    let auxiliary_bits = bits;
 
     // Transformer: pack the block Linears into one flat file + annotate config.
     let tr_src = src_root.join("transformer");
@@ -247,16 +228,20 @@ pub fn prequantize_turnkey_with_auxiliary_bits(
 /// NOT reproduce the shipped transformer byte stream (shard merge order differs even though the
 /// quantized VALUES are deterministic), so copying is the only sound way to hold it fixed.
 ///
-/// `auxiliary_bits` is the width the auxiliaries are packed at — see
-/// [`prequantize_turnkey_with_auxiliary_bits`] for why it is explicit.
-pub fn repack_auxiliaries(
-    baseline_root: &Path,
-    dst_root: &Path,
-    auxiliary_bits: i32,
-) -> Result<()> {
+/// The width is DERIVED from the baseline's own packed transformer, never passed in, so this cannot
+/// mint a tier whose text encoder sits above the tier the user selected.
+pub fn repack_auxiliaries(baseline_root: &Path, dst_root: &Path) -> Result<()> {
+    let auxiliary_bits = mlx_gen::quant::packed_quant_bits_at(&baseline_root.join("transformer"))?
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "chroma repack: baseline tier {} has no packed transformer, so there is no selected \
+                 tier to match the auxiliaries to",
+                baseline_root.display()
+            ))
+        })?;
     if !matches!(auxiliary_bits, 4 | 8) {
         return Err(Error::Msg(format!(
-            "chroma repack: auxiliary bits must be 4 or 8, got {auxiliary_bits}"
+            "chroma repack: baseline transformer declares Q{auxiliary_bits}; expected Q4 or Q8"
         )));
     }
     for required in ["transformer", "text_encoder", "vae"] {
