@@ -490,6 +490,12 @@ impl Pipeline {
     /// `[uncond, cond]` on the batch axis, and concatenate the two encoders on the feature axis —
     /// shape `[2, tokens, 2048]`, cast to the compute dtype. Mirrors the spike's `text_embeddings`.
     ///
+    /// **Caller obligation (sc-14195):** this is **always** batch 2, regardless of the request's
+    /// guidance — the uncond row is encoded unconditionally. So every denoise lane that runs
+    /// CFG-**off** (a single conditioned forward over a batch-1 latent: `lightning`, or any sampler
+    /// at `guidance ≤ 1.0`) must narrow to the cond row (index 1) before the UNet forward, or the
+    /// batch-1 query meets batch-2 cross-attention K/V and the UNet dies in the attention matmul.
+    ///
     /// sc-4987: each encoder is loaded, run, and dropped **inside** [`encode_one`] before the next is
     /// loaded — so the two CLIP encoders are never co-resident, and both are gone when this returns.
     /// sc-5037: the generator calls this **before** acquiring the (possibly cached-resident) UNet/VAE,
@@ -1031,6 +1037,19 @@ impl Pipeline {
         // `crate::preview` for why that needs the `1/√(σ²+1)` renormalization the fit was measured in.
         // Built per image: the driver starts a fresh counter per call.
         let preview = crate::preview::ve_hook(&req.preview);
+        // sc-14195: the conditioning must be batched to match the UNet input. `text_embeddings` is
+        // ALWAYS the `[uncond, cond]` stack (uncond-first — `text_embeddings()` encodes both rows
+        // unconditionally, since the uncond row is what CFG needs and it is cheap to carry), but
+        // CFG-off (`guidance ≤ 1.0`, an advertised request value) runs a **single conditioned**
+        // forward over a batch-1 latent. Feeding it the batch-2 stack put a batch-1 query against
+        // batch-2 cross-attention K/V and killed the UNet inside the attention matmul
+        // ("shape mismatch in matmul, lhs: [10, 4096, 64], rhs: [20, 64, 77]"). So narrow to the
+        // cond row (index 1) exactly as the Lightning path already does — CFG-on is untouched.
+        let ehs = if use_guide {
+            text_embeddings.clone()
+        } else {
+            text_embeddings.narrow(0, 1, 1)?.contiguous()?
+        };
         let out = candle_gen::run_curated_sampler(
             Some(sampler),
             &ms,
@@ -1049,7 +1068,7 @@ impl Pipeline {
                     x_in.clone()
                 };
                 let model_in = model_in.to_dtype(self.dtype)?;
-                let noise_pred = unet.forward(&model_in, t as f64, text_embeddings)?;
+                let noise_pred = unet.forward(&model_in, t as f64, &ehs)?;
                 let eps = if use_guide {
                     let chunks = noise_pred.chunk(2, 0)?;
                     let (uncond, cond) = (&chunks[0], &chunks[1]);
@@ -1619,6 +1638,176 @@ mod tests {
         assert!(
             gate(true, 128, 128),
             "1024² output ⇒ tiled (bounded peak) on both lanes"
+        );
+    }
+
+    /// A tiny SDXL-shaped UNet config (one basic + one cross-attn down block, cross-attn mid,
+    /// mirrored up) so the whole [`Pipeline::render`] seam runs on CPU in milliseconds. The only
+    /// dimension that matters to the CFG-batch contract is `cross_attention_dim` — the conditioning
+    /// this UNet consumes is `[B, tokens, 16]`, the shape-analogue of the real `[B, 77, 2048]`.
+    fn tiny_unet_cfg() -> crate::unet::UNet2DConditionModelConfig {
+        crate::unet::UNet2DConditionModelConfig {
+            center_input_sample: false,
+            flip_sin_to_cos: true,
+            freq_shift: 0.,
+            blocks: vec![
+                crate::unet::BlockConfig {
+                    out_channels: 32,
+                    use_cross_attn: None,
+                    attention_head_dim: 8,
+                },
+                crate::unet::BlockConfig {
+                    out_channels: 64,
+                    use_cross_attn: Some(1),
+                    attention_head_dim: 8,
+                },
+            ],
+            layers_per_block: 1,
+            downsample_padding: 1,
+            mid_block_scale_factor: 1.,
+            norm_num_groups: 32,
+            norm_eps: 1e-5,
+            cross_attention_dim: 16,
+            use_linear_projection: false,
+        }
+    }
+
+    /// sc-14195 — the CFG-off render seam. Drives [`Pipeline::render`] end to end (request →
+    /// `use_guide` → curated denoise → decode) against a tiny CPU UNet + VAE, with the conditioning
+    /// batched exactly the way the production [`Pipeline::text_embeddings`] always batches it: the
+    /// `[uncond, cond]` stack, **regardless of guidance**.
+    ///
+    /// `guidance = 1.0` is an advertised, accepted request value (`validate` passes it; the whole
+    /// `use_guide = guidance > 1.0` fork exists to serve it) and means *CFG off* — one conditioned
+    /// UNet forward per step over a batch-1 latent. Before the fix, `render` narrowed nothing, so
+    /// that batch-1 latent met the batch-2 cross-attention K/V and the UNet died inside the
+    /// attention matmul: `shape mismatch in matmul, lhs: [10, 4096, 64], rhs: [20, 64, 77]` (the
+    /// story's Linux/CUDA repro at 1024²). This test reproduces that on CPU at 128².
+    ///
+    /// Three things are pinned, because "it no longer errors" is far too weak a bar — a narrow to
+    /// the WRONG row also stops erroring, and would silently render the **negative** prompt:
+    ///
+    /// 1. **It runs.** guidance 1.0 renders instead of shape-mismatching (the regression).
+    /// 2. **It picks the cond row, not the uncond row.** Rendered with a `[A, B]` stack, CFG-off
+    ///    must produce byte-identical pixels to a `[B, B]` stack and *different* pixels from an
+    ///    `[A, A]` stack — which is only true if the narrow selects index 1. This is the assertion
+    ///    that kills `narrow(0, 0, 1)`; the shape check alone does not.
+    /// 3. **CFG-on is untouched.** guidance 7.0 still runs the batch-2 forward.
+    ///
+    /// Mutation-checked, all three killed: dropping the narrow fails (1), `narrow(0, 0, 1)` fails
+    /// (2), and narrowing unconditionally fails (3).
+    #[test]
+    fn render_at_guidance_one_runs_cfg_off_without_batch_mismatch() {
+        use candle_gen::candle_nn::VarMap;
+        use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let unet_vm = VarMap::new();
+        let unet = SdxlUnet::Vendored(Arc::new(
+            VendoredUNet::new(
+                VarBuilder::from_varmap(&unet_vm, dtype, &device),
+                4,
+                4,
+                false,
+                tiny_unet_cfg(),
+            )
+            .unwrap(),
+        ));
+        let vae_vm = VarMap::new();
+        let vae = AutoEncoderKL::new(
+            VarBuilder::from_varmap(&vae_vm, dtype, &device),
+            4,
+            3,
+            AutoEncoderKLConfig::default(),
+        )
+        .unwrap();
+
+        // 128² ⇒ a 16² latent: below the VAE tiling threshold, so the decode stays monolithic.
+        let pipe = Pipeline {
+            config: StableDiffusionConfig::sdxl(None, Some(128), Some(128)),
+            root: PathBuf::from("/nonexistent"),
+            device: device.clone(),
+            dtype,
+            adapters: vec![],
+            pid_spec: None,
+            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            ldm: None,
+        };
+
+        // Two DISTINCT conditioning rows so the selected row is observable in the pixels: `row_a`
+        // stands in for the uncond (negative) encoding, `row_b` for the cond (prompt) encoding.
+        // `text_embeddings()` always hands `render` the `[uncond, cond]` stack — here `[A, B]`.
+        let row_a = Tensor::full(0.35f32, (1, 5, 16), &device).unwrap();
+        let row_b = Tensor::full(-0.80f32, (1, 5, 16), &device).unwrap();
+        let stack = |top: &Tensor, bottom: &Tensor| Tensor::cat(&[top, bottom], 0).unwrap();
+        let ab = stack(&row_a, &row_b); // the real layout: uncond row 0, cond row 1
+        let bb = stack(&row_b, &row_b); // cond in BOTH rows
+        let aa = stack(&row_a, &row_a); // uncond in BOTH rows
+
+        let req_at = |guidance: f32, count: u32| GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            width: 128,
+            height: 128,
+            count,
+            seed: Some(7),
+            steps: Some(2),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let render = |guidance: f32, ehs: &Tensor| {
+            pipe.render(&req_at(guidance, 1), ehs, &unet, &vae, None, &mut |_| {})
+        };
+
+        // (1) CFG off (the sc-14195 repro): guidance 1.0 ⇒ one conditioned branch, batch-1 latent.
+        let off = render(1.0, &ab)
+            .expect("guidance 1.0 must run the CFG-off single-branch path, not shape-mismatch");
+        assert_eq!(off.len(), 1);
+        // 16×16 is the *fixture's* output size, not a latent dim: `AutoEncoderKLConfig::default()`
+        // has a single `block_out_channels` entry, so this toy decoder does no upsampling and emits
+        // the latent's 16² directly (a real SDXL VAE would emit 128² here).
+        assert_eq!((off[0].width, off[0].height), (16, 16));
+
+        // (2) The row identity — the assertion that distinguishes "narrows" from "narrows to the
+        // RIGHT row". Rendering `[A, B]` must equal rendering `[B, B]` (both carry B at index 1)
+        // and must differ from `[A, A]`. `narrow(0, 0, 1)` flips both and fails here.
+        let off_bb = render(1.0, &bb).expect("CFG-off render with the cond row duplicated");
+        assert_eq!(
+            off[0].pixels, off_bb[0].pixels,
+            "CFG-off must consume the COND row (index 1) — [A,B] and [B,B] agree there"
+        );
+        let off_aa = render(1.0, &aa).expect("CFG-off render with the uncond row duplicated");
+        assert_ne!(
+            off[0].pixels, off_aa[0].pixels,
+            "CFG-off must NOT consume the uncond row — that would render the negative prompt"
+        );
+
+        // (3) CFG on (the default path, unchanged): guidance 7.0 ⇒ the batched uncond+cond forward.
+        let on = render(7.0, &ab).expect("the default CFG path must be unaffected");
+        assert_eq!(on.len(), 1);
+        // A real CFG combine at 7.0 extrapolates well past the cond-only prediction, so the two
+        // arms diverge. (This does NOT catch a duplicate-everything "fix": at guidance 1.0 the
+        // combine collapses to `uncond + 1·(cond − uncond) = cond`, the same pixels as the narrow.
+        // Assertion (2) plus the shape mismatch are what cover that direction.)
+        assert_ne!(
+            off[0].pixels, on[0].pixels,
+            "CFG-off and CFG-on must produce different images from the same seed"
+        );
+
+        // `count > 1` at CFG-off: the narrow is rebuilt per image inside `denoise_curated`, so pin
+        // that the batch loop stays consistent and each seed still yields its own image.
+        let multi = pipe
+            .render(&req_at(1.0, 2), &ab, &unet, &vae, None, &mut |_| {})
+            .expect("CFG-off must also serve count > 1");
+        assert_eq!(multi.len(), 2);
+        assert_eq!(
+            multi[0].pixels, off[0].pixels,
+            "image 0 uses the base seed ⇒ identical to the count=1 render"
+        );
+        assert_ne!(
+            multi[0].pixels, multi[1].pixels,
+            "image 1 uses base_seed+1 ⇒ a different image"
         );
     }
 }

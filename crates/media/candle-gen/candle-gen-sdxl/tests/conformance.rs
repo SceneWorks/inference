@@ -179,3 +179,106 @@ fn realvisxl_lightning_render() {
         "lightning render looks degenerate (flat): min={min} max={max}"
     );
 }
+
+/// sc-14195 acceptance, real weights: `guidanceScale = 1.0` on the **default** (curated `ddim`)
+/// sampler renders a non-degenerate image instead of dying in the UNet's cross-attention matmul
+/// (`shape mismatch in matmul, lhs: [10, 4096, 64], rhs: [20, 64, 77]`).
+///
+/// This is the story's own repro on a real checkpoint. It differs from
+/// [`realvisxl_lightning_render`] in the axis that actually broke: Lightning has always taken its
+/// own CFG-off path (it narrows the conditioning to the cond row itself), so it never exercised the
+/// curated sampler's CFG-off fork — which is the one every non-`lightning` request at guidance ≤ 1
+/// lands on, and the one that had no matching narrow.
+///
+/// It renders the CFG-off case on **both** routes the story's job could have taken — the explicit
+/// `euler` the request named and the omitted-sampler default — plus a CFG-on arm, asserting the
+/// default path still works and yields a *different* image ("default CFG behaviour unchanged").
+///
+/// Note this is the real-hardware **liveness** gate; it deliberately does not try to prove which
+/// conditioning row was consumed, because a 4-step render gives no cheap oracle for that. The
+/// row-identity pin (cond row, not the negative) is the CPU test
+/// `pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch`, which can compare
+/// pixels against a controlled `[B, B]` / `[A, A]` conditioning stack.
+///
+/// `vars.SDXL_SNAPSHOT` in CI points at the **dense** `sdxl-base-1.0` tier; the story hit the packed
+/// q4 `SceneWorks/sdxl-base-mlx` tier. The batch contract is tier-independent (the packed/dense fork
+/// is inside the UNet's Linear surface, not its batch axis) and this was validated locally against
+/// the q4 tier, so either snapshot exercises the regression:
+///
+/// ```text
+/// set SDXL_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--sdxl-base-mlx\snapshots\<hash>\q4
+/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored sdxl_cfg_off
+/// ```
+#[test]
+#[ignore = "needs SDXL_SNAPSHOT (a diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
+fn sdxl_cfg_off_guidance_one_render() {
+    let snap = std::env::var("SDXL_SNAPSHOT")
+        .expect("set SDXL_SNAPSHOT to an SDXL-family diffusers snapshot dir");
+    let spec = with_sdxl_components(LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap))));
+    let gen = candle_gen_sdxl::load(&spec).unwrap();
+
+    // The story's request shape, minus its 1024² (512²/4 steps keeps the GPU cost down; the batch
+    // contract is resolution-independent).
+    let render = |guidance: f32, sampler: Option<&str>| {
+        let req = GenerationRequest {
+            prompt: "a photo of a rusty robot holding a lit candle, cinematic lighting".into(),
+            width: 512,
+            height: 512,
+            count: 1,
+            seed: Some(124),
+            steps: Some(4),
+            guidance: Some(guidance),
+            sampler: sampler.map(str::to_string),
+            ..Default::default()
+        };
+        let mut last_step = (0u32, 0u32);
+        let mut on_progress = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                last_step = (current, total);
+            }
+        };
+        let out = gen.generate(&req, &mut on_progress).unwrap_or_else(|e| {
+            panic!("render at guidance {guidance} (sampler {sampler:?}) failed: {e}")
+        });
+        let images = match out {
+            GenerationOutput::Images(imgs) => imgs,
+            _ => panic!("expected images, got video"),
+        };
+        assert_eq!(images.len(), 1, "count=1 ⇒ one image");
+        assert_eq!(last_step, (4, 4), "Step progress should end at 4/4");
+        images.into_iter().next().unwrap()
+    };
+
+    // CFG OFF via the **omitted** sampler (resolves to the curated `ddim`) — the broadest route,
+    // and the one every request that names no sampler takes.
+    let off = render(1.0, None);
+    assert_eq!((off.width, off.height), (512, 512), "output dims = request");
+    assert_eq!(off.pixels.len(), 512 * 512 * 3, "RGB8 buffer = W·H·3");
+    let (min, max) = (
+        *off.pixels.iter().min().unwrap(),
+        *off.pixels.iter().max().unwrap(),
+    );
+    assert!(
+        max - min > 16,
+        "CFG-off render looks degenerate (flat): min={min} max={max}"
+    );
+
+    // CFG OFF via the explicit `euler` the failing job actually sent (`advanced.sampler=euler`).
+    // Both names land in `denoise_curated`, but this is the literal repro.
+    let off_euler = render(1.0, Some("euler"));
+    let (emin, emax) = (
+        *off_euler.pixels.iter().min().unwrap(),
+        *off_euler.pixels.iter().max().unwrap(),
+    );
+    assert!(
+        emax - emin > 16,
+        "CFG-off euler render looks degenerate (flat): min={emin} max={emax}"
+    );
+
+    // CFG ON — the default path, unchanged, and genuinely a different denoise.
+    let on = render(7.0, None);
+    assert_ne!(
+        off.pixels, on.pixels,
+        "CFG-off must not silently render the CFG-on image"
+    );
+}
