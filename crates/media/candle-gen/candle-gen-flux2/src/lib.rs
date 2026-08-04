@@ -829,6 +829,25 @@ pub(crate) fn to_image(decoded: &Tensor) -> CResult<Image> {
     })
 }
 
+/// Serialize one bespoke-provider request and always synchronize its device before releasing the
+/// lifecycle lock. The request error wins when both execution and synchronization fail: callers
+/// must see cancellation/model failures, while a successful request still fails closed when its
+/// final device fence does not complete.
+pub(crate) fn run_bespoke_request<T>(
+    lifecycle: &std::sync::Mutex<()>,
+    run: impl FnOnce() -> CResult<T>,
+    synchronize: impl FnOnce() -> candle_gen::candle_core::Result<()>,
+) -> CResult<T> {
+    let _lifecycle = candle_gen::lock_recover(lifecycle);
+    let result = run();
+    let synchronized = synchronize().map_err(CandleError::Candle);
+    match (result, synchronized) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
 /// A loaded candle FLUX.2 generator. The shared residency owner holds either the warm phase pair or
 /// the deferred per-request loaders.
 pub struct Flux2Generator {
@@ -1037,7 +1056,7 @@ pub fn descriptor_dev() -> ModelDescriptor {
 
 fn generator_from_pipeline(
     pipe: Pipeline,
-    _memory_spec: Option<&LoadSpec>,
+    memory_spec: Option<&LoadSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let variant = pipe.variant;
     let resident_pipe = pipe.clone();
@@ -1072,10 +1091,17 @@ fn generator_from_pipeline(
             )))
         },
     );
-    let loaded_quant = pipe.quant;
+    let loaded_quant = if pipe.variant.is_dev() {
+        match memory_spec {
+            Some(spec) => memory_strategy::resolved_quant(spec)?,
+            None => pipe.quant,
+        }
+    } else {
+        pipe.quant
+    };
     #[cfg(any(feature = "cuda", test))]
     let memory_strategy = if pipe.variant.is_dev() {
-        _memory_spec
+        memory_spec
             .map(memory_strategy::provider_contract)
             .transpose()?
     } else {
@@ -1123,7 +1149,11 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
     // Both variants honor Q4/Q8 on-the-fly (CPU-stage dense → quantize-onto-GPU): dev folds the 32B DiT
     // + the ~24B Mistral TE (neither fits the GPU dense), klein (sc-11031) folds ONLY the 9B DiT and
     // keeps the 8B Qwen3 TE DENSE bf16 in every tier (epic 8506 DENSE_TE — see `Pipeline::te_quant`).
-    let quant = spec.quantize;
+    let quant = if variant.is_dev() {
+        memory_strategy::resolved_quant(spec)?
+    } else {
+        spec.quantize
+    };
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
@@ -1225,6 +1255,128 @@ mod tests {
     use super::*;
     use crate::config::{FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
     use candle_gen::gen_core::ConditioningKind;
+
+    #[test]
+    fn bespoke_request_finalizes_success_cancellation_and_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lifecycle = std::sync::Mutex::new(());
+        let syncs = AtomicUsize::new(0);
+        let success = run_bespoke_request(
+            &lifecycle,
+            || Ok(7),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(success, 7);
+
+        let canceled: CResult<()> = run_bespoke_request(
+            &lifecycle,
+            || Err(CandleError::Canceled),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(matches!(canceled, Err(CandleError::Canceled)));
+
+        let failed: CResult<()> = run_bespoke_request(
+            &lifecycle,
+            || Err(CandleError::Msg("fixture failure".to_owned())),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(matches!(failed, Err(CandleError::Msg(_))));
+        assert_eq!(syncs.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn bespoke_request_lifecycle_serializes_concurrent_generate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let lifecycle = Arc::new(std::sync::Mutex::new(()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let lifecycle = lifecycle.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            threads.push(std::thread::spawn(move || {
+                run_bespoke_request(
+                    &lifecycle,
+                    || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn auto_detected_packed_tier_is_the_generators_loaded_tier() {
+        for (bits, expected) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "sc15833_flux2_auto_tier_{}_{}_{}",
+                bits,
+                std::process::id(),
+                nonce
+            ));
+            let transformer = root.join("transformer");
+            std::fs::create_dir_all(&transformer).unwrap();
+            std::fs::write(
+                transformer.join("config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+            assert_eq!(
+                memory_strategy::resolved_quant(&spec).unwrap(),
+                Some(expected)
+            );
+            let generator = load_dev(&spec).expect("lazy dev generator");
+            let contract = generator.memory_strategy_contract().unwrap();
+            let context = gen_core::standard_memory_behavior_context(
+                contract,
+                gen_core::MemoryStrategy::Resident,
+                memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+                gen_core::MemoryBehaviorRoute {
+                    mode: gen_core::MemoryMode::TextToImage,
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: None,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                generator.memory_strategy_safety_check(&context),
+                gen_core::MemorySafetyDecision::Accept
+            ));
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,
     /// so a `Sequential` generate that never asked for PiD does not pay for it — per generate, resident
@@ -1704,7 +1856,7 @@ mod tests {
             .expect("FLUX.2-dev memory contract");
         let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric tier");
         let context = gen_core::standard_memory_behavior_context(
-            &contract,
+            contract,
             strategy,
             tier,
             gen_core::MemoryBehaviorRoute {
@@ -1754,11 +1906,8 @@ mod tests {
                         spec.load_shape,
                     ),
                     observed_calibration: contract.calibration.clone().expect("calibration"),
-                    tier: gen_core::MemoryNumericTier {
-                        precision: spec.precision,
-                        quant: spec.quantize,
-                        component_precision_floors: &[],
-                    },
+                    tier: memory_strategy::resolved_numeric_tier(&spec)
+                        .expect("resolved numeric tier"),
                     load_shape: spec.load_shape,
                     mode: gen_core::MemoryMode::TextToImage,
                     overlay: None,
