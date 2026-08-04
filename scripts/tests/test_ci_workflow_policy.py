@@ -732,7 +732,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # An empty or truncated capture would make `bash -n` pass vacuously, so pin the extraction
         # to the payload this gate exists to check. Runs even on a host with no bash at all.
         self.assertIn("for bits in 4 8; do", script)
-        self.assertIn('SC8777_BITS="$bits"', script)
+        self.assertIn('export SC16462_BASELINE="$CHROMA_SNAPSHOT/q$bits"', script)
 
         result = bash_syntax_check(self.require_posix_shell(), script)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -760,18 +760,36 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 f"resolved a Windows system stub as a POSIX shell: {candidate}",
             )
 
-    def test_chroma_shipping_policy_cannot_dispatch_unsupported_t5_geometry(self) -> None:
+    def test_chroma_auxiliaries_cannot_be_dispatched_above_the_selected_tier(self) -> None:
+        """sc-16462: the auxiliary width must FOLLOW the tier, and nothing may override it.
+
+        The defect this guards is the one the story exists to remove: a "q4" tier whose text
+        encoder is secretly wider. The width is derived in Rust from the tier's own packed
+        transformer, so the workflow must expose no knob that could reintroduce a divergence,
+        and must verify the published artifact declares exactly its tier's width.
+        """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        self.assertNotIn("chroma_t5_group_size:", workflow)
-        self.assertNotIn("SC16462_AUX_BITS", workflow)
-        self.assertNotIn("SC8777_BITS=8", workflow)
-        self.assertEqual(workflow.count('SC8777_BITS="$bits"'), 3)
-        self.assertEqual(workflow.count('SC16462_T5_GROUP_SIZE: "32"'), 2)
-        self.assertGreaterEqual(
-            workflow.count('test "$SC16462_T5_GROUP_SIZE" = "32"'), 2
-        )
-        self.assertEqual(workflow.count('"bits": 8,'), 2)
-        self.assertEqual(workflow.count('"group_size": 32,'), 2)
+        # No dispatch input or env var may select an auxiliary width or T5 geometry.
+        for forbidden in (
+            "chroma_t5_group_size:",
+            "SC16462_AUX_BITS",
+            "SC16462_T5_GROUP_SIZE",
+            "SC8777_BITS",
+            "auxiliary_bits",
+        ):
+            self.assertNotIn(
+                forbidden,
+                workflow,
+                f"{forbidden} would let a dispatch put Chroma's auxiliaries above the selected tier",
+            )
+        # Both lanes must build through the derived-width seam, never a hand-rolled width.
+        self.assertEqual(workflow.count("packed_auxiliaries_match_load_time_quantization"), 2)
+        # The published artifact is verified to declare exactly its own tier's width.
+        self.assertIn('if quantization.get("bits") != expected_bits:', workflow)
+        self.assertIn('expected_bits = int(tier[1:])', workflow)
+        self.assertIn('if quantization.get("group_size") != 32:', workflow)
+        # A stale residual-era artifact must be rejected rather than silently published.
+        self.assertIn('if "residual_bits" in quantization:', workflow)
 
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
