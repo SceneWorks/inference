@@ -167,6 +167,10 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
             self.metadata(name=name, depends_on_pid=depends_on_pid), self.root
         )
 
+    def assert_gate_passes(self, body: str) -> None:
+        self.write_provider(body)
+        self.run_gate()
+
     def assert_gate_fails(self, body: str, *, because: str) -> None:
         self.write_provider(body)
         with self.assertRaises(AssertionError) as caught:
@@ -445,14 +449,54 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
     def test_every_rung_two_trigger_spelling_arms_the_gate(self) -> None:
         """The trigger set is deliberately wide (fail-closed). Pin each spelling, so narrowing it
         back to `decode_tile_edges` alone — which is what review defeat (c) exploited — is a test
-        failure rather than a silent regression."""
+        failure rather than a silent regression.
+
+        SC-15525 refined *what the markers are evaluated against*, not the set: a provider that
+        publishes a decode DOMAIN still trips on any marker, while one that publishes none cannot
+        emit a native tile into the PiD seam and is exempt (see the gate's own comment). Both halves
+        are pinned here, so the exemption cannot widen into "any crate that mentions rung 2".
+        """
         for marker in self.gate.PID_RUNG_TWO_MARKERS:
+            with self.subTest(marker=marker, domain="published"):
+                # A published domain is the hazard: every marker must still trip alongside it.
+                self.assert_gate_fails(
+                    "pub fn registry() { register_memory_strategy(REG); }\n"
+                    f"pub fn r() {{ let _ = {marker}; }}\n"
+                    "pub fn d() { let _ = MemoryParameterRanges { decode_tile_edges: v, "
+                    "decode_overlaps: w }; }\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_the_domain_markers_alone_still_trip_the_gate(self) -> None:
+        """The two markers that ARE the hazard need no corroboration: publishing a native ladder is
+        exactly what reaches `GenerationMemory::decode_tile_edge`."""
+        for marker in ("decode_tile_edges", "decode_overlaps"):
             with self.subTest(marker=marker):
                 self.assert_gate_fails(
                     "pub fn registry() { register_memory_strategy(REG); }\n"
-                    f"pub fn r() {{ let _ = {marker}; }}\n",
+                    f"pub fn r() {{ let _ = MemoryParameterRanges {{ {marker}: v }}; }}\n",
                     because="never calls the checked constructor",
                 )
+
+    def test_a_provider_that_declares_rung_two_missing_is_exempt(self) -> None:
+        """SC-15525: naming `BoundedDecode` to declare it Missing, and `MemoryParameterRanges` to
+        populate rung 4's window ranges, is not adoption — such a provider publishes no decode
+        domain, so there is no native ladder for the PiD seam to reject."""
+        self.assert_gate_passes(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT, "
+            "_ => MemoryParameterRanges::default() }; }\n"
+        )
+
+    def test_the_exemption_does_not_cover_a_live_configure_decode_hook(self) -> None:
+        """The exemption requires that any `configure_decode` hook be an unconditional rejection: a
+        hook that can succeed could admit a geometry even with no published domain."""
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub fn c() { let _ = MemoryStrategy::BoundedDecode; }\n"
+            "fn configure_decode(&mut self, e: u32, o: u32) -> Result<()> { self.plan(e, o) }\n",
+            because="never calls the checked constructor",
+        )
 
 
 if __name__ == "__main__":

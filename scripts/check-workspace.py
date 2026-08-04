@@ -890,12 +890,16 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         # `configure_decode` hook it does define must still be an unconditional rejection, so the
         # request-scope seam cannot admit a geometry either. A provider that publishes a domain —
         # even one edge — falls straight through to the route checks below, unchanged.
+        # Evaluated on TRIGGERS, not evidence, for the reason the trigger stream exists: evidence is
+        # cfg(test)-blanked, so a `#![cfg(test)]` file would erase the very domain that arms the gate
+        # and the exemption would disarm it. Reading the unblanked stream can only over-arm, which
+        # fails closed.
         publishes_decode_domain = any(
-            marker in evidence for marker in ("decode_tile_edges", "decode_overlaps")
+            marker in triggers for marker in ("decode_tile_edges", "decode_overlaps")
         )
         if not publishes_decode_domain and (
-            "fn configure_decode" not in evidence
-            or _configure_decode_hooks_are_unconditional_rejections(evidence)
+            "fn configure_decode" not in triggers
+            or _configure_decode_hooks_are_unconditional_rejections(triggers)
         ):
             continue
         missing: list[str] = []
