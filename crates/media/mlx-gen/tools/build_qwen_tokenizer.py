@@ -8,7 +8,7 @@ tokenizer the fork uses — same vocab, merges, NFC + ByteLevel pipeline, and sp
 
 Run (fork venv, which has `transformers`):
     cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/build_qwen_tokenizer.py
-Override the snapshot with QWEN_IMAGE_SNAPSHOT.
+Override the snapshot with MLX_GEN_QWEN_SNAPSHOT.
 """
 
 import glob
@@ -18,14 +18,14 @@ from transformers import AutoTokenizer
 
 
 def snapshot_dir() -> str:
-    if env := os.environ.get("QWEN_IMAGE_SNAPSHOT"):
+    if env := os.environ.get("MLX_GEN_QWEN_SNAPSHOT"):
         return env
     home = os.path.expanduser("~")
     snaps = sorted(
         glob.glob(f"{home}/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/*/")
     )
     if not snaps:
-        raise SystemExit("no Qwen-Image snapshot found; set QWEN_IMAGE_SNAPSHOT")
+        raise SystemExit("no Qwen-Image snapshot found; set MLX_GEN_QWEN_SNAPSHOT")
     return snaps[0]
 
 

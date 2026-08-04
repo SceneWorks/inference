@@ -9,6 +9,14 @@
 //! weights (`max|Δ| == 0`). The Edit path additionally exercises the `zero_cond_t` dual-latent
 //! `modulate_index` route (cond_grids non-empty).
 //!
+//! **That bit-identity assertion currently FAILS on real weights, and always has** — sc-17284 ran
+//! this file for the first time and measured `max|Δ|` of 1.897e-3 / 1.475e-3 / 9.739e-3 at 256² /
+//! 512² / 1024² T2I and 1.345e-3 on Edit. The in-crate `sc2963` gates that DID pass prove bit-
+//! identity of the glue *primitives*, not of a 60-layer forward; nothing had ever checked the
+//! extrapolation. sc-17513 owns deciding what this should assert instead, which is why these two
+//! tests are deliberately not in the `mlx-qwen-image` CI lane. Do not loosen the bound here without
+//! the sweep that story asks for.
+//!
 //! Qwen runs mixed precision: f32 latents, bf16 text embeds (`model.rs`). Timing is value-independent.
 //!
 //! Run it:
@@ -24,17 +32,29 @@ use mlx_gen_qwen_image::loader::{load_transformer, load_transformer_edit};
 use mlx_gen_qwen_image::transformer::{set_compile_glue, QwenTransformer};
 use mlx_rs::{random, Array, Dtype};
 
-fn snapshot(env: &str, repo: &str) -> Option<PathBuf> {
+/// sc-17284: this used to return `Option`, and both tests below turned `None` into an
+/// `eprintln!("skip: …")` + `return`. That is a FALSE GREEN, not a skip: libtest reports
+/// `test result: ok. 1 passed` in 0.00s, so neither a `--exact` selection nor a run-count
+/// assertion — the two things that catch a renamed or filtered-out test — can see that the gate
+/// never ran. Every sibling real-weight test in this crate panics instead, with the epic-13657
+/// message; this one is now the same. If you want to skip it, do not run it.
+fn snapshot(env: &str, repo: &str) -> PathBuf {
     if let Ok(p) = std::env::var(env) {
-        return Some(PathBuf::from(p));
+        return PathBuf::from(p);
     }
-    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").unwrap_or_else(|_| panic!("set {env} to the required snapshot dir, or MLX_GEN_MODELS_ROOT to the explicit models root; inference never self-fetches or derives a cache location (epic 13657)"));
     let snaps = PathBuf::from(home).join(repo).join("snapshots");
     std::fs::read_dir(&snaps)
-        .ok()?
+        .unwrap_or_else(|e| panic!("read {}: {e}; set {env} instead", snaps.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.is_dir())
+        .unwrap_or_else(|| {
+            panic!(
+                "no snapshot directory under {}; set {env} instead",
+                snaps.display()
+            )
+        })
 }
 
 fn env_i32(var: &str, default: i32) -> i32 {
@@ -124,15 +144,12 @@ fn inputs(img_seq: i32, txt_seq: i32) -> (Array, Array) {
 }
 
 #[test]
-#[ignore = "needs real Qwen-Image weights (QWEN_IMAGE_SNAPSHOT or HF cache)"]
+#[ignore = "needs real Qwen-Image weights (MLX_GEN_QWEN_SNAPSHOT or HF cache)"]
 fn qwen_t2i_per_step_compiled_vs_eager() {
-    let snap = match snapshot("QWEN_IMAGE_SNAPSHOT", "models--Qwen--Qwen-Image") {
-        Some(p) => p,
-        None => {
-            eprintln!("skip: set QWEN_IMAGE_SNAPSHOT or populate the HF cache for Qwen-Image");
-            return;
-        }
-    };
+    let snap = snapshot(
+        "MLX_GEN_QWEN_SNAPSHOT",
+        "models--SceneWorks--qwen-image-mlx",
+    );
     let size = env_i32("QWEN_PERF_SIZE", 1024);
     let txt_seq = env_i32("QWEN_PERF_TXT", 128);
     let lat = size / 16; // patched grid (VAE/8 then 2×2 patch)
@@ -153,16 +170,10 @@ fn qwen_t2i_per_step_compiled_vs_eager() {
 #[test]
 #[ignore = "needs real Qwen-Image-Edit-2511 weights (QWEN_IMAGE_EDIT_SNAPSHOT or HF cache)"]
 fn qwen_edit_per_step_compiled_vs_eager() {
-    let snap = match snapshot(
+    let snap = snapshot(
         "QWEN_IMAGE_EDIT_SNAPSHOT",
-        "models--Qwen--Qwen-Image-Edit-2511",
-    ) {
-        Some(p) => p,
-        None => {
-            eprintln!("skip: set QWEN_IMAGE_EDIT_SNAPSHOT or populate the HF cache for Qwen-Image-Edit-2511");
-            return;
-        }
-    };
+        "models--SceneWorks--qwen-image-edit-2511-mlx",
+    );
     let size = env_i32("QWEN_PERF_SIZE", 1024);
     let txt_seq = env_i32("QWEN_PERF_TXT", 128);
     let lat = (size / 16) as usize; // noise grid; one same-size reference (cond_grids=[(lat,lat)])

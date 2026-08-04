@@ -8,7 +8,7 @@
 //! - **N2 (named sampler coherent):** `sampler: "dpmpp_2m"` renders a coherent natural image that
 //!   genuinely differs from Euler (the 2nd-order multistep solver is now selectable per generation).
 //!
-//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `QWEN_IMAGE_SNAPSHOT` or the HF
+//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `MLX_GEN_QWEN_SNAPSHOT` or the HF
 //! cache):
 //!   cargo test -p mlx-gen-qwen-image --release --test unified_sampler_smoke -- --ignored --nocapture
 
@@ -24,7 +24,7 @@ const SEED: u64 = 42;
 const PROMPT: &str = "a fox sitting in a forest, photorealistic";
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 

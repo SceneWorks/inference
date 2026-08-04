@@ -24,7 +24,7 @@ use crate::pipeline::unpack_latents;
 /// **Refit whenever the VAE lineage changes**, with `tests/fit_preview_rgb.rs`:
 ///
 /// ```sh
-/// QWEN_IMAGE_SNAPSHOT=… cargo test -p mlx-gen-qwen-image --release \
+/// MLX_GEN_QWEN_SNAPSHOT=… cargo test -p mlx-gen-qwen-image --release \
 ///   --test fit_preview_rgb -- --ignored --nocapture
 /// ```
 ///

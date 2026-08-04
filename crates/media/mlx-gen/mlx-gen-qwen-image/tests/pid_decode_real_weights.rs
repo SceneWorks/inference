@@ -4,7 +4,7 @@
 //! into a 4× super-resolved PiD image. This is the wiring this story adds; the PiD decode itself was
 //! already real-weight validated against the CUDA reference in sc-7843 (`from_clean`/`from_ldm`).
 //!
-//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `QWEN_IMAGE_SNAPSHOT`, else the HF
+//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `MLX_GEN_QWEN_SNAPSHOT`, else the HF
 //! cache), the converted PiD checkpoint (env `PID_QWEN_SAFETENSORS`, else
 //! `tools/golden/pid/qwenimage_2kto4k.safetensors`), and a `gemma-2-2b-it` snapshot dir (env
 //! `PID_GEMMA_DIR`, else the HF cache). Loads the full Qwen model **plus** PiD net + Gemma, so it is
@@ -25,7 +25,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn qwen_snapshot() -> PathBuf {
-    env_path("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
+    env_path("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 fn pid_checkpoint() -> PathBuf {

@@ -385,9 +385,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 25 since sc-17276 split the Krea S18 coherence sweep into its own dispatch-only job
+        # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
+        # `mlx-qwen-image-producers` jobs
         # (24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 24,
+        MACOS_HUB_LOCK: 27,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -553,7 +554,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 24)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 27)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1086,10 +1087,43 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(all(line.endswith(" \\") for line in requirement_lines))
 
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        """The CUDA residency A/B stays operator-run — gated directly, not by variable name.
+
+        This used to assert the strings QWEN_IMAGE_SNAPSHOT and FLUX_DEV_DIR never appear in
+        real-weights.yml. That proxy held only while the A/B was the sole consumer of both names,
+        and sc-17284 found it was not: 45 mlx-gen-qwen-image and 2 mlx-gen-flux `#[ignore]` tests
+        read the same two names on the Mac, so the ban was blocking a lane for a *different*
+        backend rather than protecting this decision. The A/B is now gated by what it actually is.
+
+        FLUX_DEV_DIR is therefore allowed in the workflow — the macOS PiD lane sets it, and
+        `flux-1-dev` names one artifact both consumers want. QWEN_IMAGE_SNAPSHOT is still banned:
+        it names the ~60 GB torch original, whose only consumers are this A/B and the candle CUDA
+        tests, and the MLX half was renamed off it (MLX_GEN_QWEN_SNAPSHOT) precisely because the
+        re-host it was being fed is a different repository at a different revision.
+        """
+        # Over CODE, not prose: `mlx-qwen-image`'s header comment has to name QWEN_IMAGE_SNAPSHOT to
+        # explain why the MLX half was renamed off it. Same reason `workflow_code` exists for the
+        # wiring gate — a comment can document a variable but can never wire one.
+        workflow = workflow_code(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
         self.assertNotIn("residency-ab", workflow)
         self.assertNotIn("QWEN_IMAGE_SNAPSHOT", workflow)
-        self.assertNotIn("FLUX_DEV_DIR", workflow)
+
+        # The A/B's own two tests are what must never be invoked from CI. This is the assertion the
+        # name ban was standing in for, and unlike the ban it cannot be satisfied by a rename.
+        self.assertNotIn("qwen_image_probed_generate_for_offload_ab", workflow)
+        self.assertNotIn("flux_dev_probed_generate_for_offload_ab", workflow)
+
+        # The operator repository variables hold nax-windows paths (`E:\huggingface\hub\...`,
+        # `C:\Users\...`). A macOS lane that read one would resolve to a path that cannot exist on
+        # a Mac, so no workflow may consume them; the macOS PiD lane maps its own variable onto
+        # FLUX_DEV_DIR instead.
+        self.assertNotIn("vars.FLUX_DEV_DIR", workflow)
+        self.assertNotIn("vars.QWEN_IMAGE_SNAPSHOT", workflow)
+
+        # Every assertion above is negative and would stay true if the macOS PiD lane were deleted.
+        # The positive counterpart is not duplicated here because it already exists and is stronger:
+        # `test_manifest_environment_keys_are_wired_or_explicitly_exempt` fails the moment
+        # FLUX_DEV_DIR stops being referenced, because `flux-1-dev` no longer carries an exemption.
 
         script = RESIDENCY_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("qwen_image_probed_generate_for_offload_ab", script)
