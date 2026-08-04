@@ -288,6 +288,18 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
         full.peak() <= staged.peak(),
         "the full ladder must not exceed the staged baseline"
     );
+    // **Rung 3's magnitude gate.** Without this the arm asserts nothing a disabled rung would fail:
+    // the image-equality check passes MORE easily when attention never chunks, and
+    // `full.denoise < chunked.denoise` only widens. Turning bounded attention off (planning
+    // `AttentionPlan::UNBOUNDED` unconditionally) leaves the denoise where rung 2 left it, so THIS is
+    // the assertion that reddens — a rung whose only evidence is "the picture did not change" is not
+    // evidence of a rung at all.
+    assert!(
+        chunked.denoise < tiled.denoise,
+        "rung 3 must bound the denoise phase against the rung-2 top: {:.3} vs {:.3} GiB",
+        gib(chunked.denoise),
+        gib(tiled.denoise)
+    );
     assert!(
         full.denoise < chunked.denoise,
         "rung 4 must bound the denoise phase: {:.3} vs {:.3} GiB",
@@ -296,7 +308,7 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
     );
     println!(
         "RESULT status=pass provider={PROVIDER} backend=mlx size={} steps={} fingerprint={} \
-         resident_peak_gib={:.3} staged_peak_gib={:.3} full_peak_gib={:.3} \
+         resident_peak_gib={:.3} staged_peak_gib={:.3} full_peak_gib={:.3} tiled_denoise_gib={:.3} \
          chunked_denoise_gib={:.3} windowed_denoise_gib={:.3} decode_max_delta={decode_max} \
          decode_mean_delta={decode_mean:.6}",
         size(),
@@ -305,6 +317,7 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
         gib(resident.peak()),
         gib(staged.peak()),
         gib(full.peak()),
+        gib(tiled.denoise),
         gib(chunked.denoise),
         gib(full.denoise),
     );
@@ -491,9 +504,33 @@ fn decode_tile_sweep_bounds_the_admitted_ladder() {
 /// A window of 28 is ONE all-covering window that bounds nothing. It is the control that decides
 /// whether `TRANSFORMER_WINDOW_SIZES` is a ladder or a single exact value: if the peak does not move
 /// between 1 and 28, the bound comes from the per-block materialize/drop, not from the window.
+///
+/// **The unpublished cadences are reached through the MECHANISM, never through a request** — the
+/// production path now refuses anything outside `TRANSFORMER_WINDOW_SIZES`, and this test asserts
+/// that refusal as part of the sweep. That is the same split rung 2 already has: the decode sweep
+/// measures every candidate through `QwenVae::decode_tiled` directly and separately proves the
+/// rejected edges are refused by `generate`. The seam here is
+/// `AnimaHeavy::calibration_denoise_one`, which takes a raw window and is unreachable from a
+/// `GenerationRequest`.
+///
+/// So the denoise column is measured on the heavy bundle rung 1 leaves alive during the denoise
+/// (DiT + conditioner + VAE, Qwen3 TE already dropped) — the same components the in-request denoise
+/// phase holds — while the request column comes from the production envelope and exists only for
+/// the cadences a request may actually name.
 #[test]
 #[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn transformer_window_sweep_shows_the_published_domain_is_exact() {
+    use mlx_gen_anima::pipeline::{AnimaHeavy, AnimaText};
+    use mlx_gen_anima::{config::Variant, DEFAULT_SAMPLER};
+
+    const PROMPT: &str =
+        "an anime girl with silver hair on a rooftop at dusk, detailed, masterpiece";
+    const NEGATIVE: &str = "blurry, low quality";
+    /// Every cadence the domain was chosen from: the published 1, three intermediate ones, and the
+    /// all-covering control that walks the identical driver and bounds nothing.
+    const SWEPT: [u32; 5] = [1, 2, 4, 14, 28];
+
+    // ── Part A — the production envelope, for the cadences a request may name.
     let resident = run(
         LoadShape::DeferredMaterialization,
         GenerationMemory {
@@ -507,13 +544,40 @@ fn transformer_window_sweep_shows_the_published_domain_is_exact() {
         },
     );
     println!(
-        "WINDOW size=resident denoise_gib={:.3} request_gib={:.3}",
+        "WINDOW-REQUEST size=resident denoise_gib={:.3} request_gib={:.3}",
         gib(resident.denoise),
         gib(resident.peak())
     );
 
-    let mut measured = Vec::new();
-    for window in [1_u32, 2, 4, 14, 28] {
+    let registry = mlx_gen_anima::provider_registry().expect("anima registry");
+    let mut request_peaks = Vec::new();
+    for window in SWEPT {
+        if !ladder::TRANSFORMER_WINDOW_SIZES.contains(&window) {
+            // An unpublished cadence is not merely undocumented — the production path REFUSES it,
+            // which is what keeps this sweep's conclusion from decaying into a comment beside a
+            // parameter the generator executes anyway. Executing at a wider cadence while declaring
+            // 1 UNDER-predicts peak, and that is the direction that breaks a render.
+            let generator = registry
+                .load(PROVIDER, &spec(LoadShape::DeferredMaterialization))
+                .expect("load anima_base deferred");
+            let error = generator
+                .generate(
+                    &request(GenerationMemory {
+                        transformer_window_size: Some(window),
+                        ..full_ladder()
+                    }),
+                    &mut |_| {},
+                )
+                .expect_err("an unpublished transformer window must be refused");
+            println!("WINDOW-REQUEST size={window} admitted=false refused=true");
+            assert!(
+                error.to_string().contains("calibrated domain"),
+                "expected the window-domain rejection for {window}, got: {error}"
+            );
+            drop(generator);
+            clear_cache();
+            continue;
+        }
         let run = run(
             LoadShape::DeferredMaterialization,
             GenerationMemory {
@@ -522,7 +586,8 @@ fn transformer_window_sweep_shows_the_published_domain_is_exact() {
             },
         );
         println!(
-            "WINDOW size={window} denoise_gib={:.3} request_gib={:.3} max_delta={}",
+            "WINDOW-REQUEST size={window} admitted=true denoise_gib={:.3} request_gib={:.3} \
+             max_delta={}",
             gib(run.denoise),
             gib(run.peak()),
             delta(&resident.image, &run.image).0
@@ -535,28 +600,137 @@ fn transformer_window_sweep_shows_the_published_domain_is_exact() {
             delta(&resident.image, &run.image).0 <= 1,
             "window {window} changed the output"
         );
-        measured.push((window, run.denoise));
+        request_peaks.push((window, run.denoise, run.peak()));
+    }
+    assert!(
+        !request_peaks.is_empty(),
+        "the published domain must contain at least one swept cadence, else the request column is \
+         empty and the domain is unmeasured"
+    );
+
+    // ── Part B — the attribution control, on the mechanism. One staged schedule by hand: encode
+    // with the Qwen3 TE, drop it, then denoise the heavy bundle at every candidate cadence.
+    let source = WeightsSource::Dir(snapshot());
+    let text = AnimaText::load(&source, Variant::Base).expect("load the qwen3 text phase");
+    let cond_inputs = text.encode_inputs(PROMPT).expect("encode the prompt");
+    let uncond_inputs = text.encode_inputs(NEGATIVE).expect("encode the negative");
+    mlx_rs::transforms::eval([
+        &cond_inputs.source,
+        &cond_inputs.t5_ids,
+        &uncond_inputs.source,
+        &uncond_inputs.t5_ids,
+    ])
+    .expect("materialize the conditioner inputs before the TE is dropped");
+    drop(text);
+    clear_cache();
+
+    // **One heavy bundle per row, and that is load-bearing rather than tidy.** A deferred load keeps
+    // the resident `blocks` as unevaluated lazy handles, so a windowed denoise never materializes
+    // them — but a RESIDENT denoise does, and they then stay alive for anything that runs after it
+    // on the same bundle. Reusing one bundle across the sweep measured the resident stack's ~3.4 GiB
+    // in every later row (window 1 read 4.719 instead of 1.309) and flattened the very difference
+    // the sweep exists to attribute. Reloading is ~5 s a row and removes the ordering dependence
+    // entirely.
+    let cancel = mlx_gen::CancelFlag::default();
+    let denoise_at = |window: Option<usize>| {
+        let heavy = AnimaHeavy::load_with_stream(&source, Variant::Base, true)
+            .expect("load the heavy bundle in its streamable form");
+        assert!(
+            heavy.can_stream_blocks(),
+            "the mechanism sweep needs the re-openable checkpoint form"
+        );
+        let cond = heavy
+            .conditioner_forward(&cond_inputs)
+            .expect("conditioner forward");
+        let uncond = heavy
+            .conditioner_forward(&uncond_inputs)
+            .expect("uncond conditioner forward");
+        mlx_rs::transforms::eval([&cond, &uncond]).expect("materialize the conditioner outputs");
+        // Reset AFTER the conditioning, exactly where the in-request measurement resets it (the
+        // first sampler `Step`), so this column is comparable to the request column above.
+        clear_cache();
+        reset_peak_memory();
+        let latent = heavy
+            .calibration_denoise_one(
+                &cond,
+                Some(&uncond),
+                size(),
+                size(),
+                steps() as usize,
+                4.5,
+                DEFAULT_SAMPLER,
+                1234,
+                true,
+                window,
+                &cancel,
+            )
+            .unwrap_or_else(|error| panic!("calibration denoise at window {window:?}: {error}"));
+        mlx_rs::transforms::eval([&latent]).expect("materialize the latent");
+        let peak = get_peak_memory();
+        drop(latent);
+        drop(heavy);
+        clear_cache();
+        peak
+    };
+
+    let mut measured = Vec::new();
+    for window in SWEPT {
+        let peak = denoise_at(Some(window as usize));
+        println!("WINDOW size={window} denoise_gib={:.3}", gib(peak));
+        measured.push((window, peak));
+    }
+    // The resident control runs LAST for the same reason each row gets its own bundle: it is the one
+    // configuration that materializes the stack.
+    let mechanism_resident = denoise_at(None);
+    println!(
+        "WINDOW size=resident denoise_gib={:.3}",
+        gib(mechanism_resident)
+    );
+    for (window, peak) in &measured {
+        assert!(
+            *peak < mechanism_resident,
+            "window {window} did not bound the denoise against the resident stack ({:.3} vs {:.3} \
+             GiB)",
+            gib(*peak),
+            gib(mechanism_resident)
+        );
     }
 
-    let at_one = measured[0].1;
-    assert_eq!(measured[0].0, 1);
-    for (window, denoise) in &measured[1..] {
+    // The published cadence must be the TIGHTEST measured one. If a wider window ever bounded
+    // harder, publishing 1 would over-predict and the domain would have to move — and if a wider one
+    // bounded LOOSER than the published value by more than the measurement's own spread, the domain
+    // would need to widen into a real ladder rather than stay a single exact value.
+    let at_one = measured
+        .iter()
+        .find(|(window, _)| *window == ladder::TRANSFORMER_WINDOW_SIZE)
+        .map(|(_, peak)| *peak)
+        .expect("the published window is swept");
+    for (window, peak) in &measured {
         assert!(
-            *denoise >= at_one,
-            "window {window} bounded tighter than the published window 1 ({:.3} vs {:.3} GiB) — \
-             the published domain would then under-predict peak",
-            gib(*denoise),
+            *peak >= at_one,
+            "window {window} bounded tighter than the published window \
+             {} ({:.3} vs {:.3} GiB) — the published domain would then under-predict peak",
+            ladder::TRANSFORMER_WINDOW_SIZE,
+            gib(*peak),
             gib(at_one)
         );
     }
     println!(
         "RESULT status=pass sweep=window provider={PROVIDER} published={:?} \
-         resident_denoise_gib={:.3} measured={:?}",
+         mechanism_resident_denoise_gib={:.3} mechanism={:?} request={:?}",
         ladder::TRANSFORMER_WINDOW_SIZES,
-        gib(resident.denoise),
+        gib(mechanism_resident),
         measured
             .iter()
-            .map(|(window, denoise)| (*window, format!("{:.3}", gib(*denoise))))
+            .map(|(window, peak)| (*window, format!("{:.3}", gib(*peak))))
+            .collect::<Vec<_>>(),
+        request_peaks
+            .iter()
+            .map(|(window, denoise, peak)| (
+                *window,
+                format!("{:.3}", gib(*denoise)),
+                format!("{:.3}", gib(*peak))
+            ))
             .collect::<Vec<_>>()
     );
 }
@@ -631,6 +805,28 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
     assert!(
         error.to_string().contains("calibrated domain"),
         "expected the decode-domain rejection, got: {error}"
+    );
+
+    // ...and so is an out-of-domain transformer WINDOW — the same shape of failure, on the same
+    // layer, closing the direction `TRANSFORMER_WINDOW_SIZES` names as the dangerous one: executing
+    // at a wider cadence than the declared 1 under-predicts peak.
+    let unpublished = 1 + ladder::TRANSFORMER_WINDOW_SIZES
+        .iter()
+        .copied()
+        .max()
+        .unwrap();
+    let error = deferred
+        .generate(
+            &request(GenerationMemory {
+                transformer_window_size: Some(unpublished),
+                ..full_ladder()
+            }),
+            &mut |_| {},
+        )
+        .expect_err("an out-of-domain transformer window must be refused");
+    assert!(
+        error.to_string().contains("calibrated domain"),
+        "expected the window-domain rejection, got: {error}"
     );
     drop(deferred);
     clear_cache();
@@ -806,5 +1002,131 @@ fn batch_count_survives_the_denoise_decode_phase_split() {
          full_ladder_peak_gib={:.3}",
         gib(warm_peak),
         gib(bounded_peak)
+    );
+}
+
+// =================================================================================================
+// 7. Terminal behavior: the decode phase is cancellable, and the calibration fault hook is honored.
+// =================================================================================================
+
+/// Rung 1 moved every decode out of the denoise loop into a trailing batch, so a `count = N` request
+/// now runs N decodes back to back — worst-case cancel latency for the phase went from about one
+/// decode to N. This pins that the phase is still interruptible on **both** decode arms, and that
+/// SC-15449's authorized fault hook fires at each of Anima's three phase boundaries with a clean
+/// follow-up render afterwards.
+///
+/// **The untiled arm is the one that needed fixing, so it is the one that has to be covered.** Rung
+/// 2's tiled decode has per-tile boundaries and `QwenVae::decode_tiled` already polled the flag at
+/// each of them; the untiled decode is a single lazy graph forced by one readback, with no interior
+/// boundary at all, so the only place it can observe a cancel is before it starts. That arm is what
+/// a request carrying **no `GenerationMemory`** takes — i.e. every request until the SceneWorks pin
+/// lands — and covering only the tiled arm would therefore have been a false green. (It was: the
+/// first version of this test cancelled a full-ladder render and passed with the fix reverted.)
+///
+/// The cancel is tripped **deterministically from the progress callback**, not on a timer: the
+/// generator announces `Progress::Decoding` at the top of phase C, so cancelling there lands the
+/// flag exactly between the denoise and the first decode. A timer would make the test's own
+/// coverage depend on machine speed.
+#[test]
+#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+fn the_decode_phase_is_cancellable_and_the_calibration_fault_hook_is_honored() {
+    use mlx_gen::gen_core::MemoryPhase;
+
+    let registry = mlx_gen_anima::provider_registry().expect("anima registry");
+
+    // ── Cancellation at the denoise → decode boundary, on BOTH decode arms, at count = 2.
+    for (label, shape, memory) in [
+        // No memory block at all: the historical request shape, staged off the load-time
+        // `OffloadPolicy`, decoding through the UNTILED arm.
+        (
+            "untiled-no-memory-block",
+            LoadShape::EagerMaterialization,
+            None,
+        ),
+        // ...and the tiled arm, so the coverage is the whole phase rather than one branch of it.
+        (
+            "tiled-full-ladder",
+            LoadShape::DeferredMaterialization,
+            Some(full_ladder()),
+        ),
+    ] {
+        let generator = registry
+            .load(PROVIDER, &spec(shape))
+            .unwrap_or_else(|error| panic!("load anima_base for {label}: {error}"));
+        let batch = GenerationRequest {
+            count: 2,
+            memory,
+            ..request(GenerationMemory::default())
+        };
+        let cancel = batch.cancel.clone();
+        let mut tripped = false;
+        let error = generator
+            .generate(&batch, &mut |event| {
+                if matches!(event, Progress::Decoding) && !tripped {
+                    tripped = true;
+                    cancel.cancel();
+                }
+            })
+            .err()
+            .unwrap_or_else(|| {
+                panic!("{label}: a cancel at the decode boundary must abort the render")
+            });
+        assert!(tripped, "{label}: the decode phase never announced itself");
+        assert!(
+            matches!(error, mlx_gen::gen_core::Error::Canceled),
+            "{label}: a cancelled render must surface the TYPED cancellation, not a stringified \
+             failure — a string here reports a cancelled job as a failed one (sc-4481). Got: \
+             {error:?}"
+        );
+        println!("TERMINAL kind=decode_cancel arm={label} typed=true");
+        drop(generator);
+        clear_cache();
+    }
+
+    let generator = registry
+        .load(PROVIDER, &spec(LoadShape::DeferredMaterialization))
+        .expect("load anima_base deferred");
+
+    // ── The authorized fault hook, at every one of the three boundaries.
+    for phase in [
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ] {
+        let mut memory = full_ladder();
+        memory.authorize_calibration_fault(phase);
+        let error = generator
+            .generate(&request(memory), &mut |_| {})
+            .err()
+            .unwrap_or_else(|| panic!("an authorized {phase:?} fault must surface"))
+            .to_string();
+        assert!(
+            error.contains("calibration fault") && error.contains(&format!("{phase:?}")),
+            "the fault must name the boundary it stopped at, got: {error}"
+        );
+        println!("TERMINAL kind=fault phase={phase:?} surfaced=true error={error}");
+        clear_cache();
+    }
+
+    // ── ...and the generator is clean afterwards: a warm follow-up render on the SAME cached
+    // generator must still produce the full-ladder image. That is what the fault hook exists to
+    // verify — cleanup on error, not the error itself.
+    let recovery = generator
+        .generate(&request(full_ladder()), &mut |_| {})
+        .expect("the generator must recover after a cancelled render and three faulted ones");
+    let GenerationOutput::Images(images) = recovery else {
+        panic!("expected image output");
+    };
+    let image = images.first().expect("one image");
+    let mean = image.pixels.iter().map(|v| f64::from(*v)).sum::<f64>() / image.pixels.len() as f64;
+    assert!(
+        mean > 2.0 && mean < 253.0,
+        "degenerate recovery render (mean {mean:.3}) — a generator that lost its weights to the \
+         fault path would look like this rather than error"
+    );
+    drop(generator);
+    clear_cache();
+    println!(
+        "RESULT status=pass check=terminal provider={PROVIDER} recovery_output_mean={mean:.3}"
     );
 }

@@ -309,6 +309,7 @@ impl Anima {
             // preserving the pre-seam behavior of running the uncond forward even at guidance 1.0). When
             // staged, the shared seam materializes these + DROPS the Qwen3 TE before the heavy load.
             |text: &AnimaText| {
+                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
                 let cond = text.encode_inputs(&req.prompt)?;
                 let uncond = if variant.uses_cfg() {
                     Some(text.encode_inputs(&negative)?)
@@ -336,6 +337,7 @@ impl Anima {
             // loop of denoise. Identical body for every residency and rung, so a staged or windowed job
             // is numerically identical to a warm unbounded one.
             |heavy: &AnimaHeavy, (cond, uncond), on_progress: &mut dyn FnMut(Progress)| {
+                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Denoise)?;
                 let window = heavy.block_window(window_size, &req.cancel)?;
                 let cond_enc = heavy.conditioner_forward(&cond)?;
                 let uncond_enc = match &uncond {
@@ -375,15 +377,50 @@ impl Anima {
             |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
             // ── Phase C: decode from whichever VAE survived — the warm bundle's or the shed one's.
             |view: AnimaDecodeView<'_>, latents, on_progress: &mut dyn FnMut(Progress)| {
+                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode)?;
                 on_progress(Progress::Decoding);
                 let mut images = Vec::with_capacity(latents.len());
                 for latent in &latents {
+                    // Rung 1 moved the decodes out of the denoise loop into this trailing batch, so
+                    // a `count = 8` request runs eight decodes back to back and the phase needs a
+                    // per-IMAGE cancel check rather than one per phase. That check is the first
+                    // thing `decode_one` does — deliberately there and not duplicated here, because
+                    // it is the point where the tiled and untiled arms converge and it covers the
+                    // resident `render_one` path too. Each decode is one lazy graph forced by its
+                    // own readback, so this loop is synchronous per image and the check lands
+                    // between them.
                     images.push(view.decode_one(latent, &req.cancel, decode_tiling.as_ref())?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
         )
     }
+}
+
+/// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's
+/// [`GenerationMemory::calibration_error_phase`](mlx_gen::gen_core::GenerationMemory)).
+///
+/// This is what lets a conformance/calibration harness verify the ladder's **cleanup on error**
+/// requirement the same way it verifies cancellation: fail deterministically at a named boundary,
+/// then assert the next request on the same cached generator is unaffected. Anima's three
+/// boundaries are real ones — rung 1 shed the Qwen3 TE before the denoise and the DiT + conditioner
+/// before the decode — so a fault at each of them exercises a different set of live components.
+///
+/// **Both fields are required, and the authorization is not decoration.** The shared request floor
+/// ([`mlx_gen::Capabilities::validate_request`]) already rejects a phase without authorization and
+/// an authorization without a phase, so by the time this runs the pair is coherent; checking the
+/// flag here as well means a provider-internal failure seam can never be reached by a request that
+/// merely set a field. Production selectors leave both at their defaults, so every ordinary request
+/// takes one `is_some_and` and nothing else.
+fn calibration_fault(req: &GenerationRequest, phase: mlx_gen::gen_core::MemoryPhase) -> Result<()> {
+    if req.memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    }) {
+        return Err(Error::Msg(format!(
+            "anima: authorized calibration fault at {phase:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Capability-driven request validation (testable without loaded weights): non-empty prompt, size a
@@ -644,6 +681,89 @@ mod tests {
             !msg.contains("precision override"),
             "expected an eager-load failure, not the up-front precision guard: {msg}"
         );
+    }
+
+    /// SC-15449's calibration fault hook is honored at every one of Anima's three phase boundaries,
+    /// and only when the harness authorization accompanies the phase.
+    ///
+    /// Weight-free: the hook is a pure request predicate, so the interesting cases (which phase
+    /// fires, and what an *un*authorized request does) do not need the 4.18 GB checkpoint. The
+    /// real-weight suite then proves the same hook fires inside a live staged render and that the
+    /// generator recovers.
+    #[test]
+    fn the_calibration_fault_hook_fires_only_at_the_authorized_phase() {
+        use mlx_gen::gen_core::{GenerationMemory, MemoryPhase};
+
+        const PHASES: [MemoryPhase; 3] = [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ];
+
+        // A request with no memory block at all is untouched at every boundary.
+        let plain = req(1024, 1024);
+        for phase in PHASES {
+            assert!(calibration_fault(&plain, phase).is_ok());
+        }
+
+        for named in PHASES {
+            let mut memory = GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            };
+            memory.authorize_calibration_fault(named);
+            let request = GenerationRequest {
+                memory: Some(memory),
+                ..req(1024, 1024)
+            };
+            // Exactly the named boundary fails, and it names itself so a harness can tell WHICH
+            // boundary it stopped at rather than inferring it from timing.
+            for phase in PHASES {
+                let result = calibration_fault(&request, phase);
+                if phase == named {
+                    let error = result.expect_err("the named phase must fault").to_string();
+                    assert!(
+                        error.contains("calibration fault")
+                            && error.contains(&format!("{phase:?}")),
+                        "the fault must name its phase, got: {error}"
+                    );
+                } else {
+                    assert!(
+                        result.is_ok(),
+                        "{phase:?} must not fault for a {named:?} fault"
+                    );
+                }
+            }
+            // The authorized pair still passes the shared request floor — an advertised knob a
+            // provider honors must not be rejected before it reaches the provider.
+            assert!(validate_request(&descriptor_base(), &request).is_ok());
+        }
+
+        // A phase WITHOUT authorization never reaches the seam: the shared floor rejects the
+        // request outright, and the hook itself refuses to fire on the field alone.
+        let unauthorized = GenerationRequest {
+            memory: Some(GenerationMemory {
+                calibration_error_phase: Some(MemoryPhase::Decode),
+                ..Default::default()
+            }),
+            ..req(1024, 1024)
+        };
+        assert!(validate_request(&descriptor_base(), &unauthorized).is_err());
+        for phase in PHASES {
+            assert!(
+                calibration_fault(&unauthorized, phase).is_ok(),
+                "an unauthorized phase must not reach the failure seam"
+            );
+        }
+        // ...and authorization without a phase is rejected by the floor as well.
+        let dangling = GenerationRequest {
+            memory: Some(GenerationMemory {
+                calibration_fault_harness_authorized: true,
+                ..Default::default()
+            }),
+            ..req(1024, 1024)
+        };
+        assert!(validate_request(&descriptor_base(), &dangling).is_err());
     }
 
     #[test]

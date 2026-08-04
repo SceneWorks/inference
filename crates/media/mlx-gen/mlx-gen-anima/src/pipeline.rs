@@ -729,6 +729,61 @@ impl AnimaHeavy {
         self.decode_view().decode_one(&latent, cancel, None)
     }
 
+    /// Calibration seam (SC-15524): [`denoise_one`](Self::denoise_one) at an explicit rung-3/rung-4
+    /// execution shape, with the block window taken **raw** rather than through the published
+    /// domain.
+    ///
+    /// The split is deliberate and is the same one rung 2 already has:
+    /// [`crate::memory_strategy::transformer_window_size`] owns the *policy* (which cadences this
+    /// family measured and will execute) and the production path refuses everything outside it,
+    /// while this is the *mechanism* — the exact analogue of `QwenVae::decode_tiled` accepting any
+    /// `TilingConfig` so the decode sweep can measure the edges it then rejects.
+    ///
+    /// It exists so `transformer_window_sweep_shows_the_published_domain_is_exact` can MEASURE the
+    /// unpublished cadences (including the all-covering control that bounds nothing) instead of
+    /// asserting the domain it is supposed to be deriving. Nothing in production calls it: a request
+    /// cannot reach it, because it takes a `usize` and not a `GenerationRequest`.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn calibration_denoise_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        seed: u64,
+        chunk_attention: bool,
+        window_size: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let attention = if chunk_attention {
+            AttentionPlan::budgeted(mlx_gen::attention::AttentionBudget::CONSTRAINED)
+                .with_cancel(cancel)
+        } else {
+            AttentionPlan::UNBOUNDED
+        };
+        let window = self.block_window(window_size, cancel)?;
+        self.denoise_one(
+            cond,
+            uncond,
+            width,
+            height,
+            steps,
+            guidance,
+            sampler,
+            None,
+            seed,
+            &PreviewSink::default(),
+            cancel,
+            &mut |_| {},
+            attention,
+            window,
+        )
+    }
+
     /// The denoise half of [`render_one`] — seed → noise → flow denoise (`dit`, bf16) → latent.
     ///
     /// Split out for ladder rung 1: the staged schedule materializes every latent while the DiT is
@@ -790,12 +845,24 @@ impl AnimaDecodeView<'_> {
     /// path — ladder rung 2. The tiled decode preserves the exact output geometry: the shared
     /// `mlx_gen::vae_tiling` accumulator blends `scale×` tile slabs into the same `H×W` buffer the
     /// single-pass decode writes.
+    ///
+    /// **Both arms honor `cancel`, and the untiled one has exactly one place it can.** MLX is lazy:
+    /// `vae.decode` only *builds* the graph, and `decoded_to_image`'s `as_slice` readback is what
+    /// forces the whole single-pass decode — the most expensive uninterruptible span in the request.
+    /// There is no interior boundary to poll inside it (that is what rung 2's per-tile check buys),
+    /// so the honest guarantee is per-latent: a cancel observed before this decode starts aborts
+    /// here rather than after the readback. Rung 1 made that matter — decodes moved from
+    /// interleaved-with-denoise to a trailing batch, so a `count = 8` render has eight of these in a
+    /// row and the phase-C loop re-checks before each one.
     pub fn decode_one(
         &self,
         latent: &Array,
         cancel: &CancelFlag,
         tiling: Option<&TilingConfig>,
     ) -> Result<Image> {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let decoded = match tiling {
             Some(tiling) => self.vae.decode_tiled(latent, tiling, Some(cancel))?,
             None => self.vae.decode(latent)?,

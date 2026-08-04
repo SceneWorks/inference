@@ -71,6 +71,28 @@
 //! Rungs 3 and 4 reach every advertised denoise route: the Turbo CFG-free single forward, and BOTH
 //! the cond and uncond forwards of the Base/Aesthetic CFG pair.
 //!
+//! ## Fail closed — the complete list
+//!
+//! Every one of these is asserted on real weights by
+//! `tests/shared_memory_ladder_real_weights.rs::rung_four_preconditions_fail_closed_on_real_weights`,
+//! and each rejection is a typed error rather than a silently narrowed execution:
+//!
+//! * a PiD selection — this family has no PiD student at all (`safety_check`);
+//! * any mode other than text-to-image, or a non-zero reference count (`safety_check`);
+//! * rung 4 on an eager load, and rung 4 without rung 1 engaged in the same request;
+//! * a transformer window **component** this family does not implement (`TextEncoder` / `Both`) —
+//!   never narrowed to `Dit`;
+//! * a transformer window **size** outside [`TRANSFORMER_WINDOW_SIZES`] (`validate_window`);
+//! * a decode tile edge or overlap outside [`DECODE_TILE_EDGES`] / [`DECODE_OVERLAP`]
+//!   (`validate_decode`) — never re-planned onto the default.
+//!
+//! The last two are the same shape and are enforced on the same two layers on purpose: the
+//! admission gate (`safety_check`) *and* the request-side resolver
+//! (`transformer_window_size` / `decode_tiling`). A selector that reached the generator by
+//! another path — which is exactly what every calibration harness does when it hand-builds a
+//! [`GenerationMemory`](mlx_gen::gen_core::GenerationMemory) and calls `generate` — still cannot
+//! execute an unmeasured geometry.
+//!
 //! ## Ownership
 //!
 //! This file declares *structure and parameter domains only*. Measured coefficients, envelopes and
@@ -174,6 +196,14 @@ pub const DECODE_TILE_EDGES_REJECTED: &[u32] = &[160, 128, 96];
 /// [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`] (64 Mi score elements per attention call).
 /// Reusing the exact knob every other adopting family measured is what makes a cross-family or
 /// cross-backend comparison of rung 3 meaningful. The request scope re-validates it.
+///
+/// **What it is worth here, measured against this family's own rung-2 top** (`anima_base` bf16,
+/// 1024², staged + tiled at 640, `full_shared_ladder_reduces_peak_and_preserves_output`): the
+/// denoise phase goes **5.378 → 5.229 GiB**, and the output is unchanged (max Δ 0). Reproducible to
+/// the milli-GiB across runs. That is a modest 2.8%, and it is stated rather than left implicit
+/// because it is small enough to be mistaken for noise if nobody wrote it down — the ladder arm
+/// asserts on exactly this inequality, so a rung that stopped engaging reddens instead of quietly
+/// costing the selector a rung it thinks it has.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 
 /// The production transformer-window domain for rung 4: how many of the 28 Cosmos blocks are held
@@ -184,33 +214,50 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// Swept on real `anima_base` bf16 weights at 1024², staged, over the rung-3 top
 /// (`tests/shared_memory_ladder_real_weights.rs::transformer_window_sweep_shows_the_published_domain_is_exact`):
 ///
-/// | window | denoise peak | request peak |
-/// |---:|---:|---:|
-/// | resident (no rung 4) | 5.229 GiB | 5.229 |
-/// | **1** | **1.309** | 4.259 |
-/// | 2 | 1.537 | 4.259 |
-/// | 4 | 1.520 | 4.259 |
-/// | 14 | 1.517 | 4.259 |
-/// | 28 — one all-covering window, bounds nothing | 1.513 | 4.259 |
+/// | window | denoise peak | production path |
+/// |---:|---:|---|
+/// | resident (no rung 4) | 5.229 GiB | admitted — request peak **5.229** |
+/// | **1** (published) | **1.110** | admitted — request peak **4.151** |
+/// | 2 | 1.497 | **refused** (outside the published domain) |
+/// | 4 | 1.497 | refused |
+/// | 14 | 1.497 | refused |
+/// | 28 — one all-covering window, bounds nothing | 1.497 | refused |
 ///
-/// (Reproducible: a second full run of the identical suite returned 1.309 / 1.570 / 1.520 / 1.517 /
-/// 1.513 — window 1 to the milli-GiB, the rest inside the ~0.06 GiB spread that already separates
-/// none of them.)
+/// **Read the two columns as two different measurements, because they are.** The denoise column is
+/// the *mechanism* — one staged schedule by hand, a fresh heavy bundle per row, denoising through
+/// `AnimaHeavy::calibration_denoise_one`, which takes the window raw. That is the only way to
+/// measure a cadence this provider refuses to execute, and it is the same split rung 2 already has
+/// (the decode sweep measures every candidate through `QwenVae::decode_tiled` and separately proves
+/// the rejected edges are refused). The production column is the full request envelope, and it
+/// exists only for the cadences a request may actually name; in it the published window 1 measures
+/// **1.304 GiB** of denoise inside a **4.151 GiB** request, the small offset from 1.110 being the
+/// residency machinery and the count-loop latent the mechanism harness does not hold.
+///
+/// The request peak is 4.151 at *every* admitted configuration and does not move with the window at
+/// all: rung 4 already pushed the binding phase off the denoise onto the decode, so above rung 3 the
+/// tile edge is the lever and this parameter is not.
+///
+/// (Reproducible: a second full run returned all six denoise rows and both request rows **bit for
+/// bit** — 1.110 / 1.497 / 1.497 / 1.497 / 1.497 / 5.229, and 1.304 / 4.151.)
 ///
 /// The last row is the load-bearing control: a window of 28 walks the identical driver and bounds
-/// *nothing*, and it lands within noise of windows 2, 4 and 14. So above 1 the window is not what
-/// sets the peak — the per-block materialize/drop is, because the loop materializes one block, runs
-/// it, and releases it before advancing, and the shared driver's `materialize` callback forces the
+/// *nothing*, and it lands on windows 2, 4 and 14 exactly. So above 1 the window is not what sets
+/// the peak — the per-block materialize/drop is, because the loop materializes one block, runs it,
+/// and releases it before advancing, and the shared driver's `materialize` callback forces the
 /// carried activation first (without which the drop would free nothing, silently).
 ///
-/// Window 1 is the one row that differs, and it differs by a real 14% (1.309 vs ~1.52). That is the
+/// Window 1 is the one row that differs, and it differs by a real 26% (1.110 vs 1.497). That is the
 /// whole reason the domain has exactly one element rather than either four indistinguishable rows or
-/// none: 2/4/14/28 would be a calibration sweep recording noise, and dropping 1 would give up the
-/// only measured saving the parameter has.
+/// none: 2/4/14/28 are not four candidates, they are one number repeated, and dropping 1 would give
+/// up the only measured saving the parameter has.
 ///
 /// Declaring a wider window while executing at 1 would *over*-predict peak and make the selector
 /// refuse fits it could have taken; executing at a wider cadence while declaring 1 would
-/// *under*-predict, which is the direction that actually breaks a render.
+/// *under*-predict, which is the direction that actually breaks a render. That second direction is
+/// closed by `validate_window`, on the same two layers the decode tile edge is closed on — the
+/// sweep above reaches the unpublished cadences through the mechanism seam
+/// ([`AnimaHeavy::calibration_denoise_one`](crate::pipeline::AnimaHeavy::calibration_denoise_one)),
+/// never through the production request path.
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 
 /// The transformer window rung 4 executes at — the single published candidate.
@@ -417,6 +464,27 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
     Ok(())
 }
 
+/// Validate a rung-4 transformer window against the published domain — the window-size twin of
+/// [`validate_decode`], on the same layers, for the same reason.
+///
+/// The shared `validate_selection` already refuses an out-of-domain window at admission, so this is
+/// defense in depth. It is not redundant: the direction it closes is the one
+/// [`TRANSFORMER_WINDOW_SIZES`]' own doc names as the dangerous one — *executing* at a wider cadence
+/// than the declared 1 **under**-predicts peak, and a selector that sized a fit off the published
+/// domain would then be handed a render that does not fit. Every calibration and real-weight harness
+/// reaches `generate` with a hand-built [`GenerationMemory`](mlx_gen::gen_core::GenerationMemory)
+/// rather than through a validated `MemorySelection`, which is precisely the path admission does not
+/// see.
+fn validate_window(size: u32) -> CoreResult<()> {
+    if !TRANSFORMER_WINDOW_SIZES.contains(&size) {
+        return Err(CoreError::Unsupported(format!(
+            "anima transformer window {size} is outside the calibrated domain \
+             {TRANSFORMER_WINDOW_SIZES:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// The provider safety check every Anima variant shares: the calibration handshake and tier match,
 /// then the shared contract's own selection validation, then this provider's route gate, then the
 /// budget. Defense in depth only — it can reject, never swap in a different strategy or tier.
@@ -462,15 +530,18 @@ pub(crate) fn safety_check(
                     contract.provider_id
                 )));
             }
-            // The scope is checked here as well as by the shared parameter validator, so a request
-            // that reached the provider by another path still cannot ask for a scope this family
-            // does not implement.
+            // The scope AND the size are checked here as well as by the shared parameter validator,
+            // so a request that reached the provider by another path still cannot ask for a scope
+            // this family does not implement or a cadence it never measured.
             let component = context.selection.parameters.window_component();
             if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
                 return Err(CoreError::Unsupported(format!(
                     "{}: transformer window component {component:?} is not implemented",
                     contract.provider_id
                 )));
+            }
+            if let Some(size) = context.selection.parameters.transformer_window_size {
+                validate_window(size)?;
             }
         }
         Ok(())
@@ -610,7 +681,8 @@ pub(crate) fn attention_plan(req: &GenerationRequest) -> mlx_gen::attention::Att
 }
 
 /// Rung 4: the requested window size, or `None` for the resident stack. A scope this family does not
-/// implement is a typed rejection rather than a silently narrowed execution.
+/// implement — or a cadence outside the measured [`TRANSFORMER_WINDOW_SIZES`] — is a typed rejection
+/// rather than a silently narrowed (or silently *widened*) execution.
 pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
     let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
         return Ok(None);
@@ -624,11 +696,13 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
              component, got {component:?}"
         )));
     }
-    Ok(Some(
-        memory
-            .transformer_window_size
-            .unwrap_or(TRANSFORMER_WINDOW_SIZE) as usize,
-    ))
+    let size = memory
+        .transformer_window_size
+        .unwrap_or(TRANSFORMER_WINDOW_SIZE);
+    validate_window(size).map_err(|error| {
+        mlx_gen::Error::Unsupported(format!("anima transformer window rejected: {error}"))
+    })?;
+    Ok(Some(size as usize))
 }
 
 /// Rung 2: the decode tiling for this request, or `None` for the single-pass decode.
@@ -889,6 +963,155 @@ mod tests {
             transformer_window_size(&dit).unwrap(),
             Some(TRANSFORMER_WINDOW_SIZE as usize)
         );
+    }
+
+    /// **Rung 3's only unit-level gate.** Without it the rung is unfalsifiable in this crate:
+    /// replacing this function's body with [`AttentionPlan::UNBOUNDED`] silently turns bounded
+    /// attention off, and every other assertion in the crate — including the real-weight ladder's
+    /// image-equality checks and its `full.denoise < chunked.denoise` — passes *more easily* with the
+    /// rung disabled. So assert the two halves that actually distinguish them: the selected request
+    /// gets the CONSTRAINED budget **and** a cancel (the per-chunk `eval` is what makes a cancel
+    /// observable inside a step), and the unselected one gets *exactly* `UNBOUNDED` with no cancel
+    /// attached at all.
+    ///
+    /// Request-local is the other half: rung 3 is a per-request choice on a cached generator, so a
+    /// plain follow-up request must come back unbounded rather than inherit the previous plan.
+    /// (Mirrors `mlx_gen_flux`'s `attention_plan_is_request_local_and_unselected_is_exactly_unbounded`.)
+    #[test]
+    fn attention_plan_is_request_local_and_unselected_is_exactly_unbounded() {
+        use mlx_gen::attention::AttentionBudget;
+
+        let plain = GenerationRequest {
+            prompt: "x".into(),
+            ..Default::default()
+        };
+        let plan = attention_plan(&plain);
+        assert_eq!(
+            plan.budget,
+            AttentionBudget::UNBOUNDED,
+            "a request that did not select rung 3 must run the byte-identical unbounded forward"
+        );
+        assert!(
+            plan.cancel.is_none(),
+            "the unbounded fast path has no chunk boundary, so it must not carry a cancel"
+        );
+
+        let selected = GenerationRequest {
+            prompt: "x".into(),
+            memory: Some(GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = attention_plan(&selected);
+        assert_eq!(
+            plan.budget,
+            AttentionBudget::CONSTRAINED,
+            "rung 3 must plan the single published {ATTENTION_CHUNK_SIZE}-element budget"
+        );
+        assert!(
+            plan.cancel.is_some(),
+            "the chunked plan must carry the request's cancel so a per-chunk eval observes it"
+        );
+
+        // The published domain and the planned budget are the SAME value — a contract that
+        // advertised one budget while the pipeline ran another would make rung-3 evidence
+        // unattributable.
+        assert_eq!(
+            ATTENTION_CHUNK_SIZE,
+            mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32
+        );
+
+        // Request-local: the next plain request on the same generator is unbounded again.
+        let follow_up = GenerationRequest {
+            prompt: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            attention_plan(&follow_up).budget,
+            AttentionBudget::UNBOUNDED
+        );
+        assert!(attention_plan(&follow_up).cancel.is_none());
+
+        // Every other rung selected, rung 3 NOT selected, is still exactly unbounded: the flag is
+        // the signal, not "this request carries a memory block".
+        let other_rungs = GenerationRequest {
+            prompt: "x".into(),
+            memory: Some(GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                stream_transformer_blocks: true,
+                decode_tile_edge: Some(DECODE_TILE_EDGE),
+                decode_overlap: Some(DECODE_OVERLAP),
+                transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            attention_plan(&other_rungs).budget,
+            AttentionBudget::UNBOUNDED
+        );
+        assert!(attention_plan(&other_rungs).cancel.is_none());
+    }
+
+    /// The window domain is enforced, not merely published. Without this the sweep's own finding —
+    /// that 2/4/14/28 bound nothing the per-block materialize/drop does not already bound — would be
+    /// a comment beside a parameter the production path executes anyway, and executing at a wider
+    /// cadence while declaring 1 UNDER-predicts peak.
+    #[test]
+    fn an_out_of_domain_transformer_window_is_rejected() {
+        let request = |size: Option<u32>| GenerationRequest {
+            prompt: "x".into(),
+            memory: Some(GenerationMemory {
+                stream_transformer_blocks: true,
+                transformer_window_size: size,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Every published size is admitted...
+        for size in TRANSFORMER_WINDOW_SIZES {
+            assert_eq!(
+                transformer_window_size(&request(Some(*size))).unwrap(),
+                Some(*size as usize),
+                "the published window {size} must be admitted"
+            );
+        }
+        // ...and the sweep's own unpublished cadences are refused, including the all-covering
+        // control that bounds nothing and the 0 that is not a window at all.
+        for size in [
+            0_u32,
+            2,
+            4,
+            14,
+            28,
+            DitConfig::anima().num_layers as u32 + 1,
+        ] {
+            let error = transformer_window_size(&request(Some(size)))
+                .expect_err("an unpublished window must be refused");
+            assert!(
+                error.to_string().contains("calibrated domain"),
+                "expected the window-domain rejection for {size}, got: {error}"
+            );
+        }
+        // Omitting the size still resolves to the published default rather than rejecting: `None`
+        // means "the provider's own constant", which is in-domain by construction.
+        assert_eq!(
+            transformer_window_size(&request(None)).unwrap(),
+            Some(TRANSFORMER_WINDOW_SIZE as usize)
+        );
+        assert!(TRANSFORMER_WINDOW_SIZES.contains(&TRANSFORMER_WINDOW_SIZE));
+        // Every published window must bound something: a window covering the whole stack walks the
+        // identical driver and bounds nothing, so publishing one would record a zero saving.
+        for size in TRANSFORMER_WINDOW_SIZES {
+            assert!(
+                *size >= 1 && (*size as usize) < DitConfig::anima().num_layers,
+                "window {size} must bound something"
+            );
+        }
     }
 
     #[test]

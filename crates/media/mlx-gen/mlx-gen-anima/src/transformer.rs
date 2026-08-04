@@ -1202,3 +1202,205 @@ pub(crate) mod synthetic {
         }
     }
 }
+
+// -------------------------------------------------------------------------------------------------
+// Ladder rung 3 — bounded attention, weight-free (SC-15524)
+// -------------------------------------------------------------------------------------------------
+
+/// The MLX twin of `mlx_gen_z_image`'s `tests/attention_budget_dit.rs`, on the synthetic DiT so it
+/// runs in ordinary CI rather than only on a Mac holding the licensed 4.18 GB checkpoint.
+///
+/// ## Why a tripped cancel flag is the assertion
+///
+/// An equivalence check alone — "chunked output == unbounded output" — is a **false green**: it
+/// passes trivially if the plan never reaches an attention, or if the budget never chunks. Deleting
+/// the whole rung leaves it green, and that is exactly the hole this module closes.
+///
+/// So each equivalence check is paired with a plan whose cancel flag is **already tripped**. Between
+/// chunks, [`mlx_gen::attention::sdpa_budgeted_bhsd`] consults that flag and returns
+/// [`mlx_gen::Error::Canceled`]; the unbounded fast path has no chunk boundary and never looks at
+/// it. A forward that returns `Ok` under a tripped-cancel *chunking* plan therefore proves one of:
+/// the plan was dropped somewhere in the call chain, or the budget did not chunk.
+///
+/// ## Why two budgets rather than one
+///
+/// Every Anima block runs **two** attentions — self-attn over the image tokens and cross-attn into
+/// the conditioner output — and `Block::forward` hands the same plan to both. One tripped-cancel
+/// case cannot distinguish "the plan reached both" from "the plan reached whichever one runs first".
+/// The budget is a score-element cap, and the two attentions have different key lengths, so a budget
+/// can be sized to chunk exactly one of them: with 2 heads, `Sq = 16` image tokens and an encoder of
+/// `Sk` tokens, self-attn chunks iff `budget < 2·16·16 = 512` and cross-attn iff `budget < 2·16·Sk`.
+/// A short encoder (`Sk = 4`) isolates the self-attn; a long one (`Sk = 64`) isolates the cross.
+#[cfg(test)]
+mod bounded_attention_tests {
+    use super::*;
+    use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+    use mlx_gen::{CancelFlag, Error};
+    use mlx_rs::random;
+
+    /// 2 heads × 8 = hidden 16, 2 blocks. `max_size` is post-`patch_size` (1,2,2), so an 8×8 latent
+    /// grid patchifies to 4×4 = **16 image tokens** — the `Sq` both attentions see.
+    fn cfg() -> DitConfig {
+        DitConfig {
+            in_channels: 4,
+            out_channels: 4,
+            num_attention_heads: 2,
+            attention_head_dim: 8,
+            num_layers: 2,
+            mlp_ratio: 2.0,
+            text_embed_dim: 16,
+            adaln_lora_dim: 8,
+            max_size: (4, 16, 16),
+            patch_size: (1, 2, 2),
+            rope_scale: (1.0, 4.0, 4.0),
+            concat_padding_mask: true,
+        }
+    }
+
+    const IMAGE_TOKENS: i32 = 16;
+    const HEADS: u64 = 2;
+
+    /// `[1, C, 1, 8, 8]` latents, a `[1]` sigma and a `[1, encoder_tokens, 16]` conditioner output.
+    fn inputs(cfg: &DitConfig, encoder_tokens: i32) -> (Array, Array, Array) {
+        let key = random::key(7).unwrap();
+        let latents = random::normal::<f32>(
+            &[1, cfg.in_channels as i32, 1, 8, 8][..],
+            None,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+        let sigma = Array::from_slice(&[0.7f32], &[1]);
+        let key = random::key(9).unwrap();
+        let encoder = random::normal::<f32>(
+            &[1, encoder_tokens, cfg.text_embed_dim as i32][..],
+            None,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+        (latents, sigma, encoder)
+    }
+
+    /// The largest budget that still chunks a `[1, HEADS, IMAGE_TOKENS, D] × [.., sk, D]` call is
+    /// `HEADS · sk · (IMAGE_TOKENS - 1)`; one element above `HEADS · sk · IMAGE_TOKENS` never does.
+    /// Derived rather than hardcoded so a config change cannot silently turn a chunking case into a
+    /// single-call one and leave the tripped-cancel assertion unreachable.
+    fn chunks_at(sk: i32) -> u64 {
+        HEADS * sk as u64 * (IMAGE_TOKENS as u64 - 1)
+    }
+    fn single_call_at(sk: i32) -> u64 {
+        HEADS * sk as u64 * IMAGE_TOKENS as u64
+    }
+
+    fn peak_relative_delta(a: &Array, b: &Array) -> f32 {
+        let n: i32 = b.shape().iter().product();
+        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
+        let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
+        let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
+        let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
+        xs.iter()
+            .zip(ys)
+            .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
+            / peak
+    }
+
+    /// Chunking changes the query GEMM's `M` dimension, so the two forwards are tolerance-equivalent
+    /// rather than bit-identical (the same 1e-3 bound the sibling families use over a whole forward).
+    const TOLERANCE: f32 = 1e-3;
+
+    /// The plan reaches BOTH DiT attentions, and it really chunks at each of them.
+    #[test]
+    fn the_attention_plan_reaches_both_dit_attentions_and_chunks() {
+        let cfg = cfg();
+        let model = CosmosDiT::synthetic(cfg, 11);
+        let cancel = CancelFlag::default();
+        cancel.cancel();
+
+        for (label, encoder_tokens, budget) in [
+            // A short encoder: cross-attn already fits, so ONLY the self-attn can chunk. An abort
+            // therefore proves the plan reached the self-attention.
+            ("self-attn", 4, chunks_at(IMAGE_TOKENS)),
+            // A long encoder: the budget is above the self-attn's whole score matrix, so only the
+            // cross-attn chunks. An abort proves the plan reached the cross-attention.
+            ("cross-attn", 64, single_call_at(IMAGE_TOKENS)),
+        ] {
+            let (latents, sigma, encoder) = inputs(&cfg, encoder_tokens);
+            // The isolation this case claims, asserted rather than assumed: exactly one of the two
+            // attentions is over its budget at this (budget, encoder) pair.
+            let self_chunks = budget < single_call_at(IMAGE_TOKENS);
+            let cross_chunks = budget < single_call_at(encoder_tokens);
+            assert!(
+                self_chunks ^ cross_chunks,
+                "{label}: the budget must isolate ONE attention (self={self_chunks}, \
+                 cross={cross_chunks}), else an abort cannot attribute the plan to it"
+            );
+
+            let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, true))
+                .with_cancel(&cancel);
+            match model.forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None) {
+                Err(Error::Canceled) => {}
+                other => panic!(
+                    "{label}: a tripped cancel under a plan that chunks the {label} must abort the \
+                     forward between chunks — got {:?}. Either the plan is not threaded to that \
+                     attention, or the budget did not chunk there, which would make rung 3 \
+                     unfalsifiable on this route.",
+                    other.map(|v| v.shape().to_vec())
+                ),
+            }
+
+            // ...and the unbounded fast path has no chunk boundary, so the same tripped flag cannot
+            // affect it. This is what makes the abort above attributable to CHUNKING.
+            let plan = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+            assert!(
+                model
+                    .forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None)
+                    .is_ok(),
+                "{label}: a tripped cancel must not affect the unbounded (default) forward"
+            );
+        }
+    }
+
+    /// Bounded attention is a memory-shape choice, not a numeric one: a plan that chunks BOTH
+    /// attentions must reproduce the unbounded velocity, and the default `forward` must be
+    /// **exactly** the explicitly-unbounded one.
+    #[test]
+    fn the_chunked_forward_matches_the_unbounded_forward() {
+        let cfg = cfg();
+        let model = CosmosDiT::synthetic(cfg, 11);
+        let encoder_tokens = 16;
+        let (latents, sigma, encoder) = inputs(&cfg, encoder_tokens);
+
+        // Under the smaller of the two ceilings, both attentions chunk.
+        let budget = chunks_at(IMAGE_TOKENS).min(chunks_at(encoder_tokens));
+        assert!(budget < single_call_at(IMAGE_TOKENS) && budget < single_call_at(encoder_tokens));
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, true));
+
+        let unbounded = model
+            .forward(&latents, &sigma, &encoder, Dtype::Float32)
+            .unwrap();
+        let chunked = model
+            .forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None)
+            .unwrap();
+        assert_eq!(chunked.shape(), unbounded.shape(), "output shape");
+        let delta = peak_relative_delta(&chunked, &unbounded);
+        assert!(
+            delta < TOLERANCE,
+            "bounded attention changed the DiT velocity: peak-relative delta {delta:e}"
+        );
+
+        // The historical path is untouched: `forward` and an explicitly UNBOUNDED `forward_bounded`
+        // agree EXACTLY, not within a tolerance.
+        let explicit = model
+            .forward_bounded(
+                &latents,
+                &sigma,
+                &encoder,
+                Dtype::Float32,
+                AttentionPlan::UNBOUNDED,
+                None,
+            )
+            .unwrap();
+        assert_eq!(peak_relative_delta(&unbounded, &explicit), 0.0);
+    }
+}
