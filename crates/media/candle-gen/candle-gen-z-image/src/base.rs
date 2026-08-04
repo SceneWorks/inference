@@ -277,7 +277,12 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
-            supports_preview: false,
+            // Per-step latent previews (epic 16948, sc-16957). Both base render lanes — the resident
+            // `render_base` and the staged `render_base_sequential` — hand `run_flow_sampler` a
+            // projector hook, as does the base half of the name-driven Fun-ControlNet provider. The
+            // CFG blend happens inside the predict closure, so the previewed latent is always the
+            // single conditional trajectory. Reuses the epic-16624 Z-Image fit ([`crate::preview`]).
+            supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

@@ -316,6 +316,29 @@ mod preview_advertising {
     ///   `register_providers`, yet it owns a `run_flow_sampler` site of its own. Before sc-16956 no
     ///   table in this module could see it: `PROVIDER_CRATES` is keyed on a registration function.
     ///
+    /// Z-Image (sc-16957) contributes two rows — `z_image_turbo` and `z_image`, one crate, two
+    /// descriptors — while wiring **nine** lanes across three files, and it adds two things no earlier
+    /// family showed:
+    ///
+    /// * **Both wiring layers on the same registered pair.** `pipeline.rs` holds four hooked driver
+    ///   sites (each descriptor's resident route plus its staged-residency twin, which a
+    ///   `stage_residency` request reaches instead), while `control.rs` mixes two hooked sites with two
+    ///   direct emissions: the *base* control lanes drive the shared sampler and the *distilled Turbo*
+    ///   ones own bespoke Euler loops. The same crate is `Denoise::Shared` and emits directly, which is
+    ///   why both counts appear on one file's row below.
+    /// * **The `_control` route ids in this crate are memory strategies, not descriptors.**
+    ///   `z_image_turbo_control` / `z_image_control` register a `MemoryRegistration` and nothing else,
+    ///   so they have no id to advertise here — exactly the `candle-gen-flux` control/IP shape, and the
+    ///   reason the two ids above cover nine lanes. `edit.rs`'s img2img provider is the same: a
+    ///   name-driven worker stream carrying a `preview` field on its own request type.
+    ///
+    /// Z-Image also settles a question sc-16955 raised and sc-16956 half-answered. Its VAE is
+    /// **byte-identical to FLUX.1-dev's** — the same `f5b59a26…40a3` container, whose `vae/config.json`
+    /// names `flux-dev` as its origin — so epic 16624 committed two fits over one latent space. Both
+    /// are kept: `candle-gen-z-image/src/preview.rs` uses the Z-Image-measured one for MLX parity, and
+    /// consolidating them is a cross-engine decision, not a candle one. See
+    /// `docs/migration/evidence/sc-16957-z-image-candle-preview.md`.
+    ///
     /// `instantid` is deliberately absent from *this* list and cannot be added: it registers no
     /// descriptor at all (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Three shipped tests
     /// hold that in place — the second half of
@@ -347,6 +370,8 @@ mod preview_advertising {
         "chroma1_hd",
         "chroma1_base",
         "chroma1_flash",
+        "z_image_turbo",
+        "z_image",
     ];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
@@ -831,7 +856,57 @@ mod preview_advertising {
             dir: "candle-gen-z-image",
             register: candle_gen_z_image::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16957's inventory — nine emitting lanes across three files, plus one deliberately
+            // dark trainer site, and the first crate to mix both wiring layers on a *registered* pair:
+            //   * `control.rs` — the name-driven Fun-ControlNet provider's FOUR lanes. Its base halves
+            //     (staged `denoise_base_with`, resident `generate_base`) drive the shared sampler with
+            //     a hook; its distilled Turbo halves (staged `denoise_turbo_with`, resident
+            //     `generate_turbo`) own bespoke flow-Euler loops and emit directly.
+            //   * `edit.rs` — the name-driven img2img / masked-edit provider's bespoke loop, which
+            //     emits over the REDUCED `start..steps` tail its strength selects.
+            //   * `pipeline.rs` — the two registered descriptors' four hooked driver sites: each of
+            //     `z_image_turbo` and `z_image` has a resident route (`render` / `render_base`) and a
+            //     staged-residency twin (`denoise_sequential` / `denoise_base_sequential`) that a
+            //     `stage_residency` request reaches instead. txt2img and img2img share a site; the
+            //     reference only changes the start step.
+            //   * `training.rs` — the trainer's periodic sample render, dark on purpose.
+            // `preview.rs` gets no row: it carries only the reused 16-channel fit and the frame-axis
+            // drop that reaches it, so it neither drives a sampler nor emits.
+            routes: &[
+                FileRoutes {
+                    file: "control.rs",
+                    hooked: 2,
+                    direct: 2,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "edit.rs",
+                    hooked: 0,
+                    direct: 1,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "pipeline.rs",
+                    hooked: 4,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "training.rs",
+                    hooked: 0,
+                    direct: 0,
+                    dark: &[DarkSite {
+                        driver: "run_flow_sampler",
+                        index: 0,
+                        reason: "the trainer's periodic sample render drives the sampler from a \
+                                 synthetic request that carries no PreviewSink — its result is \
+                                 delivered as a finished TrainingProgress::Sample image, not as a \
+                                 live denoise stream — so it passes `None` on purpose (the same \
+                                 decision sc-16950 recorded for Krea's trainer, sc-16954 for SDXL's \
+                                 and sc-16955 for Lens's)",
+                    }],
+                },
+            ],
         },
     ];
 

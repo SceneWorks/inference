@@ -100,6 +100,9 @@ fn run_control_validation(
         use_pid: false,
         memory: Default::default(),
         cancel: CancelFlag::new(),
+        // Inert: this harness validates the pose-control pipeline. The per-step preview stream
+        // (epic 16948, sc-16957) has its own real-weight harness, `tests/preview_real_weights.rs`.
+        preview: candle_gen::gen_core::PreviewSink::default(),
     };
 
     let mut noop = |_p: Progress| {};

@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, PreviewSink, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::scheduler::{
@@ -91,6 +91,16 @@ pub struct ZImageEditRequest {
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16957) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot use because the worker drives it by name rather than through the
+    /// registry. [`PreviewSink::default`] is inert and byte-identical to a render with no preview at
+    /// all.
+    ///
+    /// This lane owns its denoise loop, so it emits against the sink directly rather than handing a
+    /// hook to a driver. Frames cover the **reduced** `start..steps` tail the strength selects, which
+    /// is also the range the lane reports as `Progress::Step`.
+    pub preview: PreviewSink,
 }
 
 impl Default for ZImageEditRequest {
@@ -103,6 +113,7 @@ impl Default for ZImageEditRequest {
             strength: DEFAULT_EDIT_STRENGTH,
             seed: 0,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -228,10 +239,24 @@ impl ZImageEdit {
         // pub) and doing the Euler step inline is byte-identical to the txt2img loop's
         // `current_timestep_normalized()` + `step()` — it just starts at `start` instead of 0.
         let total = (steps - start) as u32;
+        // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
+        // against the shared step-keyed counter — built over `total`, the REDUCED step count this lane
+        // reports as `Progress::Step { total }`, and fed the loop-local `step_i - start`. Using the
+        // absolute index would number the first frame `start + 1` and emit nothing at all once
+        // `start >= total`. Emitted at the TOP of the iteration, on the latent ENTERING the step, which
+        // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The VAE-encoded source is
+        // already folded into `x_t` before the loop, so there is one trajectory and it is the target's.
+        let preview_counter = crate::preview::bespoke_counter(total as usize);
         for step_i in start..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            candle_gen::preview::emit_preview_at(
+                &req.preview,
+                &preview_counter,
+                step_i - start,
+                || crate::preview::project_frame_latents(&latents),
+            );
             // The DiT timestep convention is 1−σ (the scheduler's `current_timestep_normalized`).
             let t_norm = (1000.0 - scheduler.timesteps[step_i]) / 1000.0;
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
