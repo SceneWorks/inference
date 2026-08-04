@@ -124,6 +124,42 @@ pub struct TurboOptions {
     pub scheduler: Option<String>,
     /// MLX DiT blocks held at once. `None` keeps the resident straight-through path.
     pub transformer_window_size: Option<usize>,
+    /// Request-scoped shared-ladder levers. The default preserves the historical unbounded paths.
+    pub memory: mlx_gen::gen_core::GenerationMemory,
+}
+
+impl TurboOptions {
+    fn attention_plan<'a>(&self, cancel: &'a CancelFlag) -> mlx_gen::attention::AttentionPlan<'a> {
+        if self.memory.chunk_attention {
+            mlx_gen::attention::AttentionPlan::budgeted(
+                mlx_gen::attention::AttentionBudget::from_score_elements(
+                    self.memory
+                        .attention_chunk_size
+                        .unwrap_or(mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32)
+                        as u64,
+                    true,
+                ),
+            )
+            .with_cancel(cancel)
+        } else {
+            mlx_gen::attention::AttentionPlan::UNBOUNDED
+        }
+    }
+
+    fn decode_tiling(&self) -> Result<Option<TilingConfig>> {
+        if self.memory.tile_vae_decode {
+            Ok(Some(TilingConfig::spatial_only(
+                self.memory.decode_tile_edge.ok_or_else(|| {
+                    Error::Unsupported("krea: bounded decode requires a selected tile edge".into())
+                })? as i32,
+                self.memory.decode_overlap.ok_or_else(|| {
+                    Error::Unsupported("krea: bounded decode requires a selected overlap".into())
+                })? as i32,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// The **text-encode phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): tokenizer +
@@ -273,6 +309,7 @@ pub struct ControlPlan {
 }
 
 impl KreaHeavy {
+    #[allow(clippy::too_many_arguments)]
     fn prepared_cfg_velocity(
         dit: &Krea2Transformer,
         latent: &Array,
@@ -281,17 +318,21 @@ impl KreaHeavy {
         negative: Option<&JointPrep>,
         guidance: f32,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
         match negative {
             Some(negative) => {
-                let (positive, negative) = dit
-                    .forward_prepared_pair_windowed(latent, timestep, positive, negative, window)?;
+                let (positive, negative) = dit.forward_prepared_pair_windowed_budgeted(
+                    latent, timestep, positive, negative, window, attention,
+                )?;
                 krea_cfg_combine(&positive, &negative, guidance)
             }
-            None => dit.forward_prepared_windowed(latent, timestep, positive, window),
+            None => dit
+                .forward_prepared_windowed_budgeted(latent, timestep, positive, window, attention),
         }
     }
 
+    #[cfg(test)]
     fn base_t2i_velocity(
         dit: &Krea2Transformer,
         latent: &Array,
@@ -299,6 +340,26 @@ impl KreaHeavy {
         plan: &T2iPlan,
         guidance: f32,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::base_t2i_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn base_t2i_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
         Self::prepared_cfg_velocity(
             dit,
@@ -308,9 +369,11 @@ impl KreaHeavy {
             plan.prep_neg.as_ref(),
             guidance,
             window,
+            attention,
         )
     }
 
+    #[cfg(test)]
     fn multiphase_velocity(
         dit: &Krea2Transformer,
         latent: &Array,
@@ -318,6 +381,26 @@ impl KreaHeavy {
         plan: &T2iPlan,
         guidance: f32,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::multiphase_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn multiphase_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
         let negative = if guidance > 0.0 {
             Some(plan.prep_neg.as_ref().ok_or_else(|| {
@@ -338,9 +421,11 @@ impl KreaHeavy {
             negative,
             guidance,
             window,
+            attention,
         )
     }
 
+    #[cfg(test)]
     fn base_img2img_velocity(
         dit: &Krea2Transformer,
         latent: &Array,
@@ -348,6 +433,26 @@ impl KreaHeavy {
         plan: &Img2ImgPlan,
         guidance: f32,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::base_img2img_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn base_img2img_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &Img2ImgPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
         Self::prepared_cfg_velocity(
             dit,
@@ -357,9 +462,11 @@ impl KreaHeavy {
             plan.prep_neg.as_ref(),
             guidance,
             window,
+            attention,
         )
     }
 
+    #[cfg(test)]
     fn edit_velocity(
         dit: &Krea2Transformer,
         latent: &Array,
@@ -368,18 +475,45 @@ impl KreaHeavy {
         guidance: f32,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        Self::edit_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn edit_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &EditPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
         match &plan.prep_neg {
             Some(negative) => {
-                let (positive, negative) = dit.forward_prepared_edit_pair_windowed(
+                let (positive, negative) = dit.forward_prepared_edit_pair_windowed_budgeted(
                     latent,
                     timestep,
                     &plan.prep_pos,
                     negative,
                     window,
+                    attention,
                 )?;
                 krea_cfg_combine(&positive, &negative, guidance)
             }
-            None => dit.forward_prepared_edit_windowed(latent, timestep, &plan.prep_pos, window),
+            None => dit.forward_prepared_edit_windowed_budgeted(
+                latent,
+                timestep,
+                &plan.prep_pos,
+                window,
+                attention,
+            ),
         }
     }
 
@@ -486,6 +620,7 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -497,14 +632,18 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self
-                    .dit
-                    .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
+                let v = self.dit.forward_prepared_windowed_budgeted(
+                    x,
+                    &t,
+                    &plan.prep_pos,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Turbo t2i render** — the denoise/decode body of [`KreaPipeline::generate_turbo_with_progress`]
@@ -619,6 +758,10 @@ impl KreaHeavy {
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
         let previews = KreaPreview::new(preview, &sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -637,6 +780,8 @@ impl KreaHeavy {
                     &plan.prep,
                     &plan.ctrl_tokens,
                     control_scale,
+                    block_window,
+                    attention,
                 )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
@@ -750,6 +895,7 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -761,15 +907,19 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self
-                    .dit
-                    .forward_prepared_windowed(x, &t, &plan.prep_pos, block_window)?;
+                let v = self.dit.forward_prepared_windowed_budgeted(
+                    x,
+                    &t,
+                    &plan.prep_pos,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Raw true-CFG t2i render** (`krea_2_raw`) — the denoise/decode body of
@@ -835,6 +985,7 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -846,13 +997,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = Self::base_t2i_velocity(&self.dit, x, &t, plan, guidance, block_window)?;
+                let v = Self::base_t2i_velocity_budgeted(
+                    &self.dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Denoise ONE phase** of a multi-phase trajectory (epic 13879, sc-13884) — the reusable
@@ -875,6 +1034,7 @@ impl KreaHeavy {
         sub_sigmas: &[f32],
         sampler: Option<&str>,
         transformer_window_size: Option<usize>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
         latent: Array,
         seed: u64,
         cancel: &CancelFlag,
@@ -892,7 +1052,15 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = Self::multiphase_velocity(dit, x, &t, plan, guidance, block_window)?;
+                let v = Self::multiphase_velocity_budgeted(
+                    dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )
@@ -985,6 +1153,7 @@ impl KreaHeavy {
         // prior phase's output latent at the SHARED boundary sigma.
         let mut latent = init_noise(opts.height, opts.width, opts.seed)?;
         let previews = KreaPreview::new(preview, full);
+        let attention = opts.attention_plan(cancel);
         for mp in plans {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
@@ -996,6 +1165,7 @@ impl KreaHeavy {
                 sub,
                 opts.sampler.as_deref(),
                 opts.transformer_window_size,
+                attention,
                 latent,
                 opts.seed,
                 cancel,
@@ -1004,7 +1174,7 @@ impl KreaHeavy {
             )?;
         }
         on_progress(Progress::Decoding);
-        self.decode_latents(&latent, decoder)
+        self.decode_latents(&latent, decoder, opts, cancel)
     }
 
     /// **img2img latent-init Raw true-CFG render** (`krea_2_raw`, epic 8588 slice A / sc-10224) — the
@@ -1081,6 +1251,7 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
 
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
@@ -1093,14 +1264,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v =
-                    Self::base_img2img_velocity(&self.dit, x, &t, plan, guidance, block_window)?;
+                let v = Self::base_img2img_velocity_budgeted(
+                    &self.dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Kontext-style edit render** on the Krea 2 (true-CFG Raw or CFG-free Turbo) path (epic 10871,
@@ -1226,6 +1404,7 @@ impl KreaHeavy {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1237,22 +1416,44 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = Self::edit_velocity(&self.dit, x, &t, plan, guidance, block_window)?;
+                let v = Self::edit_velocity_budgeted(
+                    &self.dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// Decode a latent to an RGB image through the seam. `decoded_to_image` applies
     /// `clip(x·0.5 + 0.5, 0, 1)` — the algebraic equal of the reference `img.clamp(-1,1)·0.5 + 0.5` —
     /// and drops the singleton temporal axis when present (`QwenVae::decode` is NCTHW with T=1; PiD
     /// returns NCHW at 4× resolution). `decoder` is the native VAE when `None`.
-    fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
-        let dec: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
-        let decoded = dec.decode(lat)?.as_dtype(Dtype::Float32)?;
+    fn decode_latents(
+        &self,
+        lat: &Array,
+        decoder: Option<&dyn LatentDecoder>,
+        opts: &TurboOptions,
+        cancel: &CancelFlag,
+    ) -> Result<Image> {
+        let decoded = match decoder {
+            // PiD binds its request-selected 2048/256 tile plan when the decoder is minted. The
+            // native 512/64 TilingConfig is therefore constructed only for the native Qwen VAE.
+            Some(decoder) => decoder.decode(lat)?,
+            None => match opts.decode_tiling()?.as_ref() {
+                Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
+                None => self.vae.decode(lat)?,
+            },
+        }
+        .as_dtype(Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
 
@@ -1732,25 +1933,25 @@ mod tests {
                 "base t2i",
                 "    pub fn render_base_from(",
                 "    fn denoise_phase_from(",
-                "Self::base_t2i_velocity(",
+                "Self::base_t2i_velocity_budgeted(",
             ),
             (
                 "multi-phase CFG",
                 "    fn denoise_phase_from(",
                 "    pub fn prepare_multiphase(",
-                "Self::multiphase_velocity(",
+                "Self::multiphase_velocity_budgeted(",
             ),
             (
                 "base img2img",
                 "    pub fn render_base_img2img_from(",
                 "    pub fn render_edit(",
-                "Self::base_img2img_velocity(",
+                "Self::base_img2img_velocity_budgeted(",
             ),
             (
                 "edit",
                 "    pub fn render_edit_from(",
                 "    fn decode_latents(",
-                "Self::edit_velocity(",
+                "Self::edit_velocity_budgeted(",
             ),
         ];
 
@@ -1978,6 +2179,121 @@ mod tests {
             &expected_edit_positive,
             KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, None),
             KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, window)
+        );
+
+        let cancelled = CancelFlag::new();
+        cancelled.cancel();
+        let bounded_attention = || {
+            mlx_gen::attention::AttentionPlan::budgeted(
+                mlx_gen::attention::AttentionBudget::from_score_elements(1, false),
+            )
+            .with_cancel(&cancelled)
+        };
+        macro_rules! assert_bounded_route_cancels {
+            ($label:literal, $route:expr) => {
+                assert!(
+                    matches!($route, Err(mlx_gen::Error::Canceled)),
+                    "{} must propagate the request-scoped bounded-attention cancellation boundary",
+                    $label
+                );
+            };
+        }
+
+        assert_bounded_route_cancels!(
+            "base t2i CFG",
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "base t2i non-CFG",
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_t2i,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "multi-phase CFG",
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "multi-phase non-CFG",
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_t2i,
+                0.0,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "base img2img CFG",
+            KreaHeavy::base_img2img_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_img2img,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "base img2img non-CFG",
+            KreaHeavy::base_img2img_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_img2img,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "edit CFG",
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_edit,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "edit non-CFG",
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_edit,
+                guidance,
+                None,
+                bounded_attention(),
+            )
         );
     }
 

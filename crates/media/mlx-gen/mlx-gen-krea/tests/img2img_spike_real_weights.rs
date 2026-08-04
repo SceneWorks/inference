@@ -118,6 +118,7 @@ fn opts(seed: u64) -> TurboOptions {
         sampler: None,
         scheduler: None,
         transformer_window_size: None,
+        memory: Default::default(),
     }
 }
 
