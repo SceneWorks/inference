@@ -15,14 +15,17 @@ running a producer here would be the misread the story names in its own non-goal
 ## 1. What epic 16624 measured, and what it did not
 
 The bar is **holdout R² ≥ 0.88**. Three temporal / high-channel latent spaces were measured on real
-weights against it and **rejected**. A fourth was closed without measurement.
+weights against it and **rejected**. The remaining spaces were closed without measurement.
 
 | Latent space | Fit R² | Holdout R² | Bar | Outcome |
 | --- | --- | --- | --- | --- |
 | **LTX** (128 ch) | `0.984291` | **`0.618575`** | 0.88 | **no-go** — sc-16638 |
 | **Mage** (128 ch, spatial) | `0.938091` | **`0.806216`** | 0.88 | **no-go** — sc-16639 |
 | **Mochi** (12 ch) | `0.846932` | **`0.807202`** | 0.88 | **no-go** — sc-16640 |
-| **Wan** (z16) | *not measured* | *not measured* | 0.88 | **closed under the temporal program gate** — sc-16637 |
+| **Wan z16** (`vae16::WanVae16`) | *not measured* | *not measured* | 0.88 | **closed under the temporal program gate** — sc-16637 |
+| **Wan z48** (`vae::WanVae`) | *not measured* | *not measured* | 0.88 | **closed under the temporal program gate** — sc-16637 |
+| **SVD** (temporal 4 ch) | *not measured* | *not measured* | 0.88 | **closed under the temporal program gate** — sc-16636; routed to Tier 3 by sc-16633; candle-side sc-16954 |
+| **SeedVR2** | — | — | — | **excluded on shape**, not on a number — no story measured it |
 
 **Read the two R² columns as different things, because they are.** The fit column is in-sample: it is
 what the least-squares solution scores on the very renders it was solved over, and it is *always*
@@ -65,16 +68,45 @@ assumption; the table below is grounded in what each crate actually loads.
 
 | Route id(s) | Crate | Settled by | Basis | Lineage evidence |
 | --- | --- | --- | --- | --- |
-| `wan2_2_ti2v_5b`, `wan2_2_t2v_14b`, `wan2_2_i2v_14b`, `wan_vace` | `candle-gen-wan` | sc-16637 | **not measured** — Wan z16, closed under the temporal program gate | owns `vae16::WanVae16` |
-| `bernini_renderer`, `bernini` | `candle-gen-bernini` | sc-16637 | **not measured** — same Wan z16 space | `src/components.rs` builds `WanVae16::new_with_encoder(&Vae16Config::wan21(), …)`; `Cargo.toml` takes `candle-gen-wan` as a path dependency |
-| `scail2_14b` | `candle-gen-scail2` | sc-16637 | **not measured** — same Wan z16 space | `src/pipeline.rs` builds `WanVae16::new_with_encoder(…)`; `src/generate.rs` holds a `WanVae16` field |
+| `wan2_2_ti2v_5b` | `candle-gen-wan` | sc-16637 | **not measured** — Wan **z48**, closed under the temporal program gate | `src/lib.rs` builds `VaeConfig::ti2v_5b()` → `vae::WanVae`; `src/config.rs` gives that config `z_dim: 48`, `base_dim: 256`, `patch_size: 2` |
+| `wan2_2_t2v_14b`, `wan2_2_i2v_14b`, `wan_vace` | `candle-gen-wan` | sc-16637 | **not measured** — Wan **z16**, same program gate | `src/wan14b.rs` and `src/model_vace.rs` build `Vae16Config::wan21()` → `vae16::WanVae16`; that config is `z_dim: 16`, `base_dim: 96` |
+| `bernini_renderer`, `bernini` | `candle-gen-bernini` | sc-16637 | **not measured** — same Wan **z16** space | `src/components.rs` builds `WanVae16::new_with_encoder(&Vae16Config::wan21(), …)`; `Cargo.toml` takes `candle-gen-wan` as a path dependency |
+| `scail2_14b` | `candle-gen-scail2` | sc-16637 | **not measured** — same Wan **z16** space | `src/pipeline.rs` builds `WanVae16::new_with_encoder(&Vae16Config::wan21(), …)`; `src/generate.rs` holds a `WanVae16` field |
 | `ltx_2_3_distilled` | `candle-gen-ltx` | sc-16638 | **measured** — fit `0.984291` / holdout `0.618575` | LTX 128-channel space |
 | `mochi_1` | `candle-gen-mochi` | sc-16640 | **measured** — fit `0.846932` / holdout `0.807202` | Mochi 12-channel space |
 | `mage_flow`, `mage_flow_base`, `mage_flow_turbo`, `mage_flow_edit`, `mage_flow_edit_base`, `mage_flow_edit_turbo` | `candle-gen-mage` | sc-16639 | **measured** — fit `0.938091` / holdout `0.806216` | Mage 128-channel spatial space |
-| `svd_xt` | `candle-gen-svd` | sc-16637 | **not measured** — temporal video space, same program gate | `AutoencoderKLTemporalDecoder`, `latent_channels: 4` with a **temporal** decoder |
+| `svd_xt` | `candle-gen-svd` | sc-16636 (gate); sc-16633 (routed); sc-16954 (candle) | **not measured** — temporal video space, closed under the program gate | `AutoencoderKLTemporalDecoder`, `latent_channels: 4` with a **temporal** decoder |
 | `seedvr2`, `seedvr2_3b`, `seedvr2_7b` | `candle-gen-seedvr2` | — | **not measured, and not measurable in this shape** — one-step super-resolution, not a txt2img denoise | crate docs: "**One-step Euler**"; the input is a low-resolution image or clip, not noise |
 
-### Bernini and Scail2 inherit Wan — the *unmeasured* row, not a measured one
+### `candle-gen-wan` is two latent spaces, not one — z16 and z48
+
+The single crate registers routes in **two structurally different VAE latent spaces**, and collapsing
+them would erase the finding sc-16637 was careful to preserve. Its closure comment reads: "the
+registered family spans z16 `WanVae` IDs … and the distinct z48 `Wan22Vae` `wan2_2_ti2v_5b`; a single
+fit would never have covered the full surface."
+
+* **z48 — `wan2_2_ti2v_5b` alone.** `candle-gen-wan/src/lib.rs` sets `vae_cfg: VaeConfig::ti2v_5b()`
+  and loads `vae::WanVae` (`AutoencoderKLWan`). `src/config.rs` gives that config `z_dim: 48`,
+  `base_dim: 256`, `num_res_blocks: 2`, `patch_size: 2`, `conv_out_channels: 12`, and the decoder is
+  residual.
+* **z16 — the A14B pair and VACE.** `src/wan14b.rs` (`wan2_2_t2v_14b` / `wan2_2_i2v_14b`) and
+  `src/model_vace.rs` (`wan_vace`) both set `Vae16Config::wan21()` and load `vae16::WanVae16`:
+  `z_dim: 16`, `base_dim: 96`, `dim_mult [1,2,4,4]`.
+
+`vae16.rs`'s own module docs enumerate the differences and are the primary source here: `WanVae16` is
+"the temporal VAE used by **both** A14B MoE variants (`wan2_2_t2v_14b` / `wan2_2_i2v_14b`)", and is
+"Distinct from the 5B's z48 `crate::vae` `AutoencoderKLWan` on three structural axes" — z16/base 96 vs
+z48/base 256, non-residual vs `is_residual`, and no spatial patchify vs a 2×2 unpatchify, giving 8×
+rather than 16× spatial scale.
+
+Neither space was measured, so the disposition is the same either way. What differs is the recorded
+lineage, and that is exactly why nothing else would have caught it being wrong: a future author who
+trips the no-go assertion on `wan2_2_ti2v_5b` must be told about `vae::WanVae`, not about a VAE that
+route never loads. `the_wan_routes_are_recorded_in_the_latent_space_their_provider_builds` asserts the
+id→space assignment **and** re-checks it against those provider files, so the record cannot drift from
+the sources it cites.
+
+### Bernini and Scail2 inherit Wan **z16** — the *unmeasured* row, not a measured one
 
 Both are in the Wan orbit, and it would be easy to wave at "temporal, therefore rejected like LTX".
 That would attach them to a number that was never measured for their space. What the sources say:
@@ -91,9 +123,24 @@ So both occupy **literally the Wan z16 latent space** — the same VAE code over
 measuring it**. Neither inherits LTX's `0.618575`, Mage's `0.806216`, or Mochi's `0.807202`. Quoting
 one of those for Bernini or Scail2 would be a fabricated provenance, which is the failure mode this
 row exists to prevent. Their status is "closed, unmeasured", and if a future story wants a number for
-the Wan z16 space it must go and get one.
+the Wan z16 space it must go and get one — and a z16 number would still say nothing about z48.
 
-### SVD is excluded on its latent space, not on a holdout number
+### SVD is excluded on its latent space, not on a holdout number — and not by sc-16637
+
+**Which story closed SVD, stated precisely, because the obvious guess is wrong.** sc-16637 is "Tier 3:
+fit the Wan latent space and wire wan — check bernini, scail2, krea-realtime". Neither its description
+nor either of its comments mentions SVD at all; citing it here would send a reader to a story with
+nothing about SVD in it. The actual chain is:
+
+* **sc-16633** routed it there — "Route svd to Tier 3" in its scope, and its preflight comment records
+  "`mlx-gen-svd` is registered video with temporal latents and remains false pending sc-16636's
+  temporal contract".
+* **sc-16636** is the program gate that closed it: its final decision declares "NO-GO for the remaining
+  Tier 3 rollout stories" on the strength of the LTX 128-channel measurement, having first settled what
+  a `PreviewFrame` could even mean for a temporal latent.
+* **sc-16954** is the candle-side adjudication — it enumerated SVD alongside kolors and instantid and
+  left it inert without re-measuring anything.
+
 
 `svd_xt` runs a genuine multi-step EDM denoise (it advertises the curated sampler menu), so it is not
 excluded structurally the way SeedVR2 is. It is excluded because its latent space is a temporal video
@@ -172,13 +219,32 @@ the `preview_advertising` module:
 | --- | --- |
 | `temporal_and_super_resolution_routes_stay_outside_preview_advertising` | a no-go id starting to advertise `supports_preview`, or appearing in the wired allowlist — and it now names the settling story and the reason in the failure message, rather than failing on a bare boolean |
 | `the_no_go_set_and_the_wired_set_partition_every_shipped_route` | a newly registered route that is in none of the three classes, a route that quietly changes class, and the no-go set going stale as the catalog grows |
-| `no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` | an `RGB_FACTORS` / `RGB_BIAS` constant, a `PreviewHook` / `project_latents` / `emit_preview` reference, a `src/preview.rs`, or a `tests/fit_preview_rgb.rs` producer appearing in any of the eight no-go crates — i.e. someone starting the work this document says not to start |
-| `the_recorded_no_go_measurements_stay_labelled_fit_versus_holdout` | the numbers above being edited into an unlabelled or swapped form |
+| `no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` | an `RGB_FACTORS` / `RGB_BIAS` / `LATENT_RGB` / `LATENT_TO_RGB` constant, **any `[[f32; 3]; N]` fit table whatever it is named**, a `PreviewHook` / `PreviewSink` / `project_latents` / `emit_preview` reference, a `src/preview.rs`, or a producer under `tests/` named `fit_*.rs` or `*preview*.rs`, appearing in any of the eight no-go crates — i.e. someone starting the work this document says not to start |
+| `the_recorded_no_go_measurements_stay_labelled_fit_versus_holdout` | the numbers above being edited into an unlabelled or swapped form, **and any variant other than LTX/Mage/Mochi acquiring a `(fit, holdout)` pair at all** |
+| `the_wan_routes_are_recorded_in_the_latent_space_their_provider_builds` | the z16/z48 assignment being edited or drifting from the provider sources it cites |
 
-The third one carries **positive controls**: the same marker scan is run against `candle-gen-flux`
-(which has a committed fit) and the same producer-filename scan against `candle-gen-sensenova` (which
-has `tests/fit_preview_rgb.rs`), and both must trip. A detector that silently stopped matching would
-otherwise read as "no no-go crate has a fit" forever.
+`no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` carries **positive controls**: the marker
+scan is run against `candle-gen-flux` (which has a committed fit) and must trip on **both** the name
+`RGB_FACTORS` and the shape `[[f32; 3]; 16]`; the producer scan is run against `candle-gen-sensenova`
+(which has `tests/fit_preview_rgb.rs`) and must trip too. A detector that silently stopped matching
+would otherwise read as "no no-go crate has a fit" forever.
+
+**Honest limits of that scan.** The marker list is exact substrings, so on its own it is a *name*
+heuristic — `tests/fit_ltx_rgb.rs` holding a `LATENT_TO_RGB` table, `src/rgb_projection.rs` holding a
+`LATENT_RGB` one, and `tests/preview_fit.rs` all slipped past the original four filenames and eight
+names. Two things close that: the **shape** check matches `[[f32; 3]; N]` regardless of the constant's
+name (excluding `N == 3`, which is an ordinary 3×3 kernel — `candle-gen-seedvr2/src/color.rs` ships
+one, and no no-go space has three latent channels), and the loosened producer patterns under `tests/`.
+All three evasions above were planted and confirmed caught. What is still **not** caught is a fit
+stored in some other representation entirely — a `Vec<Vec<f32>>`, or coefficients read from a data
+file. That is well past "someone has started the work", and anything that actually *emits* still has
+to touch `PreviewHook` / `PreviewSink` / `project_latents`, which are matched by name.
+
+The bare word `preview` is deliberately not a marker: **seven of the eight no-go crates contain the
+token today** — all but `candle-gen-mage`, whose `Capabilities` literal ends `..Default::default()`
+and so never writes a `supports_preview` line. The other seven do, plus training preview samples
+(sc-8650) and Mochi's repo id `genmo/mochi-1-preview`. A substring match on it could never have been
+written.
 
 ## 7. The three classes, at `dbb435e8`
 

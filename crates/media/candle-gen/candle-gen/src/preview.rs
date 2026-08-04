@@ -10,7 +10,7 @@
 //! ## The carried-over no-go set — do NOT re-measure these (sc-16961)
 //!
 //! The same backend-neutrality runs the other way. Epic 16624 measured three temporal / high-channel
-//! latent spaces against a **holdout R² ≥ 0.88** bar and **rejected** all three; a fourth was closed
+//! latent spaces against a **holdout R² ≥ 0.88** bar and **rejected** all three; the rest were closed
 //! without measurement. Because a fit is a property of the latent space and not of the tensor library,
 //! those rejections carry over to candle unchanged:
 //!
@@ -19,18 +19,28 @@
 //! | LTX (128 ch) | `0.984291` | **`0.618575`** | no-go — sc-16638 |
 //! | Mage (128 ch, spatial) | `0.938091` | **`0.806216`** | no-go — sc-16639 |
 //! | Mochi (12 ch) | `0.846932` | **`0.807202`** | no-go — sc-16640 |
-//! | Wan (z16) | *not measured* | *not measured* | closed under the temporal program gate — sc-16637 |
+//! | Wan **z16** (`vae16::WanVae16`) | *not measured* | *not measured* | closed under the temporal program gate — sc-16637 |
+//! | Wan **z48** (`vae::WanVae`) | *not measured* | *not measured* | closed under the temporal program gate — sc-16637 |
+//! | SVD (temporal 4 ch) | *not measured* | *not measured* | closed under the temporal program gate — sc-16636, routed there by sc-16633, candle-side sc-16954 |
+//! | SeedVR2 | — | — | excluded on shape: one-step super-resolution, no progression to preview |
 //!
 //! **The two R² columns are different statistics and are never interchangeable.** The fit column is
 //! scored on the very renders the least-squares solution was solved over and always flatters; only the
 //! holdout column is compared to the bar. LTX is the whole argument: `0.984291` in-sample collapsing to
 //! `0.618575` out-of-sample.
 //!
-//! Nineteen registered candle routes ride these findings and stay preview-inert — Wan, LTX, Mochi,
-//! Mage, Bernini, Scail2, SVD and SeedVR2. **Bernini and Scail2 both load `WanVae16`**, so they occupy
-//! the Wan z16 space and inherit the *unmeasured* sc-16637 closure, not any of the three measured
-//! numbers. **SeedVR2 is a one-step super-resolution upscaler**, so it has no multi-step progression to
-//! preview at all; no holdout number was ever measured for it and none may be quoted.
+//! **`candle-gen-wan` registers routes in two different latent spaces, and the record keeps them
+//! apart.** `wan2_2_ti2v_5b` builds `VaeConfig::ti2v_5b()` → `vae::WanVae` (`AutoencoderKLWan`,
+//! `z_dim: 48`, `base_dim: 256`, residual, spatial patchify). `wan2_2_t2v_14b`, `wan2_2_i2v_14b` and
+//! `wan_vace` build `Vae16Config::wan21()` → `vae16::WanVae16` (`z_dim: 16`, `base_dim: 96`,
+//! non-residual, no patchify) — as do **Bernini and Scail2**, which take `candle-gen-wan` as a path
+//! dependency. sc-16637 closed on exactly this distinction: a single fit would never have covered
+//! both. Neither space was measured, so neither inherits any of the three numbers above.
+//!
+//! Nineteen registered candle routes ride these findings and stay preview-inert — Wan (both spaces),
+//! LTX, Mochi, Mage, Bernini, Scail2, SVD and SeedVR2. **SeedVR2 is a one-step super-resolution
+//! upscaler**, so it has no multi-step progression to preview at all; no holdout number was ever
+//! measured for it and none may be quoted.
 //!
 //! Do not add an `RGB_FACTORS` table, a fit corpus, a producer, or a GPU harness for any of them. If a
 //! future method makes one viable it reopens as a **new** story with a **new** measurement — none of
