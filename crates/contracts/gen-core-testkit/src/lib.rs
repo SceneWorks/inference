@@ -606,6 +606,106 @@ pub fn check_seed_determinism(g: &dyn Generator, profile: &Profile) -> Result<()
     Ok(())
 }
 
+/// **CFG-off render (sc-17418).** For a model that advertises `supports_guidance`, `guidance = 1.0`
+/// — classifier-free guidance **off**, a single conditioned branch — must be either honestly
+/// rejected by `validate` or actually served by `generate`. What it must never be is *accepted and
+/// then fatal*, which is what sc-14195 was: candle SDXL passed `guidance = 1.0` through `validate`
+/// and then died mid-denoise on `shape mismatch in matmul, lhs: [10, 4096, 64], rhs: [20, 64, 77]`,
+/// because the conditioning stayed CFG-batched while the latent did not.
+///
+/// [`Profile`] never sets `guidance`, so before this check **no family on either backend had ever
+/// run a CFG-off render under conformance** — which is precisely why sc-14195 stayed green in CI
+/// for the whole time the lane was broken. The CFG on/off fork is hand-written per family, so this
+/// is a regression guard against the next family repeating it, not a claim about today's tree.
+///
+/// Two things are asserted, and the second is the one with teeth:
+///
+/// 1. **Accepted ⇒ renders.** If `validate` takes it, `generate` must not fail. A model that cannot
+///    serve CFG-off is expected to say so in `validate` (the honest-rejection stance the shared
+///    validate-honesty check already rewards); an `Err` from `validate` skips the rest.
+/// 2. **The negative prompt is inert at exactly 1.0.** Two renders that differ *only* in their
+///    negative prompt must be byte-identical. This is not a stylistic claim — at `g = 1.0` the CFG
+///    combine `uncond + g·(cond − uncond)` reduces algebraically to `cond`, so the unconditional
+///    branch cannot influence the result under *any* correct implementation, whether the engine
+///    folds to a single forward or literally runs the combine. An engine that narrowed its
+///    conditioning to the **wrong row** would render the negative prompt instead of the prompt, and
+///    would fail here — which a "does it still error?" check cannot catch, since narrowing to the
+///    wrong row stops erroring just as well as narrowing to the right one.
+///
+/// Costs at most two `generate` calls, and none at all for a CFG-free model.
+pub fn check_cfg_off_render(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    let d = g.descriptor();
+    let id = d.id;
+    // CFG-free families (distilled/guidance-embedded: chroma, krea, ltx, seedvr2, the turbo tiers)
+    // advertise no guidance axis, so there is no CFG-off contract to hold them to.
+    if !d.capabilities.supports_guidance {
+        return Ok(());
+    }
+    let has_negative = d.capabilities.supports_negative_prompt;
+    let cfg_off = |negative: Option<&str>| {
+        let mut req = base_request(profile);
+        req.guidance = Some(1.0);
+        req.negative_prompt = negative.map(str::to_owned);
+        req
+    };
+
+    // Probe with the first negative prompt when the model takes one, so the two-render comparison
+    // below reuses this render rather than paying for a third.
+    let first = cfg_off(has_negative.then_some(CFG_OFF_NEGATIVE_A));
+    // An honest rejection is a legitimate stance; only silent acceptance obliges a working render.
+    if g.validate(&first).is_err() {
+        return Ok(());
+    }
+    let out_a = g.generate(&first, &mut |_| {}).map_err(|e| {
+        format!(
+            "cfg_off[{id}]: validate() accepted guidance = 1.0 but generate() failed: {e} — a model \
+             that cannot serve the CFG-off single-branch path must reject it in validate() with an \
+             actionable error, not fail mid-denoise (sc-14195). If this is a batch/shape error, the \
+             conditioning is still CFG-batched while the latent is not."
+        )
+    })?;
+
+    if !has_negative {
+        return Ok(());
+    }
+    let second = cfg_off(Some(CFG_OFF_NEGATIVE_B));
+    if g.validate(&second).is_err() {
+        return Ok(());
+    }
+    let out_b = g.generate(&second, &mut |_| {}).map_err(|e| {
+        format!("cfg_off[{id}]: generate() with a second negative prompt failed: {e}")
+    })?;
+
+    let (ba, bb) = (output_bytes(&out_a), output_bytes(&out_b));
+    if ba.len() != bb.len() {
+        return Err(format!(
+            "cfg_off[{id}]: changing only the negative prompt at guidance = 1.0 changed the output \
+             SIZE ({} vs {} bytes) — at CFG-off the negative branch must not be consumed at all",
+            ba.len(),
+            bb.len()
+        ));
+    }
+    if let Some(i) = ba.iter().zip(&bb).position(|(x, y)| x != y) {
+        return Err(format!(
+            "cfg_off[{id}]: at guidance = 1.0 the negative prompt changed the output (first diff at \
+             byte {i}: {} vs {}, of {} bytes). At g = 1.0 the CFG combine reduces to the conditional \
+             prediction, so the unconditional/negative branch must be inert. The usual cause is a \
+             CFG-off path that narrows its conditioning to the WRONG row — rendering the negative \
+             prompt instead of the prompt (sc-14195).",
+            ba[i],
+            bb[i],
+            ba.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The two negative prompts [`check_cfg_off_render`] swaps between. Deliberately describing very
+/// different images, so an engine that wrongly consumes the negative branch produces a visibly
+/// different render rather than two near-identical ones that might collide byte-for-byte.
+const CFG_OFF_NEGATIVE_A: &str = "a red circle on a plain white background";
+const CFG_OFF_NEGATIVE_B: &str = "a dense city street at night, neon signs, heavy rain";
+
 /// **Registry round-trip.** The provider's descriptor `id` is present in the explicit registry
 /// supplied by the caller (a missing catalog entry is the runtime "engine not found" trap).
 pub fn check_registry_roundtrip(
@@ -727,13 +827,14 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &Profile) -> Result<(), String>;
-    let checks: [Check; 6] = [
+    let checks: [Check; 7] = [
         check_validate_honesty,
         check_progress,
         check_progress_contract,
         check_cancellation,
         check_precancellation,
         check_seed_determinism,
+        check_cfg_off_render,
     ];
 
     let failures: Vec<String> = checks
