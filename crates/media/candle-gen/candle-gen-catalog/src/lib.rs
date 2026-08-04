@@ -242,6 +242,25 @@ pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
 /// fails until they do. Step (3) is what keeps a **wired** family honest afterwards — without an
 /// exact per-file count, blanking one route of an already-inventoried file changes nothing any
 /// assertion can see.
+///
+/// ## Three classes, and a route is in exactly one (sc-16961)
+///
+/// A route that does not advertise previews is **not** thereby a rejected one, and the difference is
+/// the difference between "someone should wire this" and "do not spend GPU time on this":
+///
+/// * `PREVIEW_ROUTE_IDS` — **wired**. Emits, and advertises `supports_preview: true`.
+/// * `PREVIEW_INERT_ROUTE_IDS` — **no-go**, carried over from epic 16624 rather than re-measured. A
+///   fit is a property of the VAE latent space, not of the backend, so a linear approximation that
+///   misses the holdout bar on MLX misses it on candle too. **Do not re-run these fits**; the
+///   `NoGo` basis on each row says whether it rides a measurement or a deliberate non-measurement.
+/// * `PREVIEW_DEFERRED_ROUTE_IDS` — **viable but unwired**. Boogu's latent space already has a
+///   committed fit clearing the bar (sc-17218 is the wiring).
+///
+/// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` makes those three total over the
+/// registered surface, so a newly registered route must be classified rather than defaulting into
+/// silence, and the no-go set cannot go stale as the catalog grows. The full record —
+/// numbers, per-family lineage, and the four VAE-relation shapes this epic observed — is
+/// `docs/migration/evidence/sc-16961-preview-no-go-carry-over.md`.
 #[cfg(test)]
 mod preview_advertising {
     use std::collections::{BTreeMap, BTreeSet};
@@ -468,33 +487,157 @@ mod preview_advertising {
     /// two-driver assertion. See that test and `candle-gen-sana/src/preview.rs`.
     const SANA_ROUTE_IDS: [&str; 2] = ["sana_1600m", "sana_sprint_1600m"];
 
-    /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
-    /// re-measured: an RGB fit is a property of a VAE latent space, not of a backend.
+    /// Why one route is preview-inert — which epic-16624 finding it rides, and whether that finding
+    /// is a **measurement** or the deliberate absence of one.
     ///
-    /// The temporal latent spaces missed the .88 holdout bar — LTX fit .984 / holdout .619, Mage
-    /// .938 / .806, Mochi .847 / .807 — and Wan, Bernini, Scail2, SVD and SeedVR2 ride the same
-    /// rejection. These are settled measurements, not open questions; sc-16961 records the full
-    /// evidence and this list is its executable half. Candle must not re-run those fits.
-    const PREVIEW_INERT_ROUTE_IDS: &[&str] = &[
-        "wan2_2_ti2v_5b",
-        "wan2_2_t2v_14b",
-        "wan2_2_i2v_14b",
-        "wan_vace",
-        "ltx_2_3_distilled",
-        "mochi_1",
-        "mage_flow",
-        "mage_flow_base",
-        "mage_flow_turbo",
-        "mage_flow_edit",
-        "mage_flow_edit_base",
-        "mage_flow_edit_turbo",
-        "bernini_renderer",
-        "bernini",
-        "scail2_14b",
-        "svd_xt",
-        "seedvr2",
-        "seedvr2_3b",
-        "seedvr2_7b",
+    /// The distinction is the whole point of sc-16961. Epic 16624 measured three latent spaces against
+    /// a **holdout R² ≥ 0.88** bar and rejected them; it closed a fourth *without* measuring it. A row
+    /// that quotes a holdout number for a space nobody measured is a fabricated provenance, and a row
+    /// that quotes a **fit** (in-sample) number where a **holdout** (out-of-sample) one belongs is the
+    /// specific confusion sc-16954 was bounced for. Both are unrepresentable here: a variant either
+    /// carries a `(fit, holdout)` pair through [`NoGo::measured`] or carries `None`.
+    ///
+    /// Full record, including the lineage evidence behind each variant:
+    /// `docs/migration/evidence/sc-16961-preview-no-go-carry-over.md`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum NoGo {
+        /// LTX's 128-channel space. Measured and rejected.
+        Ltx,
+        /// Mage's 128-channel spatial space. Measured and rejected.
+        Mage,
+        /// Mochi's 12-channel space. Measured and rejected.
+        Mochi,
+        /// The Wan z16 space — `candle_gen_wan::vae16::WanVae16`. **Never measured**; closed under
+        /// the temporal program gate. Bernini and Scail2 build the same VAE from the same crate, so
+        /// they ride this row rather than any of the measured three.
+        WanZ16,
+        /// SVD's temporal video space — `AutoencoderKLTemporalDecoder`, four latent channels behind a
+        /// **temporal** decoder. **Never measured**; same program gate. Its four channels are not
+        /// SDXL's four channels, and a per-frame linear map is not an approximation of a decode that
+        /// mixes frames.
+        SvdTemporal,
+        /// SeedVR2. Excluded on its **shape**, not on a number: a one-step super-resolution upscaler
+        /// over a low-resolution input has no multi-step progression to preview. No holdout R² was
+        /// ever measured for it and none is quoted.
+        Seedvr2SuperResolution,
+    }
+
+    impl NoGo {
+        /// The epic-16624 story that settled this latent space, or `None` for the one row epic 16624
+        /// never had to consider because it is excluded structurally.
+        fn settled_by(self) -> Option<&'static str> {
+            match self {
+                NoGo::Ltx => Some("sc-16638"),
+                NoGo::Mage => Some("sc-16639"),
+                NoGo::Mochi => Some("sc-16640"),
+                NoGo::WanZ16 | NoGo::SvdTemporal => Some("sc-16637"),
+                NoGo::Seedvr2SuperResolution => None,
+            }
+        }
+
+        /// `Some((fit, holdout))` for a space epic 16624 actually measured; `None` for one it closed
+        /// without measuring. Ordered fit-then-holdout and labelled at every use site.
+        fn measured(self) -> Option<(&'static str, &'static str)> {
+            match self {
+                NoGo::Ltx => Some(("0.984291", "0.618575")),
+                NoGo::Mage => Some(("0.938091", "0.806216")),
+                NoGo::Mochi => Some(("0.846932", "0.807202")),
+                NoGo::WanZ16 | NoGo::SvdTemporal | NoGo::Seedvr2SuperResolution => None,
+            }
+        }
+
+        /// The one-line reason, reproduced verbatim in every assertion message so a failure states
+        /// *why* rather than reporting a bare boolean.
+        fn reason(self) -> String {
+            let basis = match self.measured() {
+                Some((fit, holdout)) => format!(
+                    "measured and REJECTED against the 0.88 holdout bar: fit R² (in-sample) {fit}, \
+                     holdout R² (out-of-sample) {holdout}"
+                ),
+                None => match self {
+                    NoGo::WanZ16 => {
+                        "the Wan z16 space (WanVae16) — NEVER measured, closed under the temporal \
+                         program gate; Bernini and Scail2 build the same VAE from candle-gen-wan and \
+                         ride this row, not a measured one"
+                    }
+                    NoGo::SvdTemporal => {
+                        "a temporal video space (AutoencoderKLTemporalDecoder, four channels behind a \
+                         temporal decoder) — NEVER measured, same program gate; not SDXL's \
+                         four-channel space"
+                    }
+                    NoGo::Seedvr2SuperResolution => {
+                        "a one-step super-resolution upscaler over a low-resolution input — no \
+                         multi-step progression exists to preview, and NO holdout number was ever \
+                         measured for it"
+                    }
+                    NoGo::Ltx | NoGo::Mage | NoGo::Mochi => {
+                        unreachable!("a measured row takes the Some branch above")
+                    }
+                }
+                .to_string(),
+            };
+            match self.settled_by() {
+                Some(story) => format!("{basis} ({story})"),
+                None => basis,
+            }
+        }
+    }
+
+    /// The routes that stay preview-inert, carried over from epic 16624 rather than re-measured: an
+    /// RGB fit is a property of a VAE latent space, not of a backend, so a linear approximation that
+    /// misses the holdout bar on MLX misses it on candle too.
+    ///
+    /// **Candle must not re-run these fits.** This is a settled negative, not an open question — see
+    /// [`NoGo`] for which finding each row rides and
+    /// `docs/migration/evidence/sc-16961-preview-no-go-carry-over.md` for the evidence. If a future
+    /// method makes one viable it reopens as a **new** story with a **new** measurement; nothing here
+    /// is "to be decided".
+    ///
+    /// Nineteen ids across eight crates. The crate set is *derived* from these ids by
+    /// `no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` rather than restated, so a new
+    /// registration in one of those crates joins the scan automatically.
+    const PREVIEW_INERT_ROUTE_IDS: &[(&str, NoGo)] = &[
+        ("wan2_2_ti2v_5b", NoGo::WanZ16),
+        ("wan2_2_t2v_14b", NoGo::WanZ16),
+        ("wan2_2_i2v_14b", NoGo::WanZ16),
+        ("wan_vace", NoGo::WanZ16),
+        ("ltx_2_3_distilled", NoGo::Ltx),
+        ("mochi_1", NoGo::Mochi),
+        ("mage_flow", NoGo::Mage),
+        ("mage_flow_base", NoGo::Mage),
+        ("mage_flow_turbo", NoGo::Mage),
+        ("mage_flow_edit", NoGo::Mage),
+        ("mage_flow_edit_base", NoGo::Mage),
+        ("mage_flow_edit_turbo", NoGo::Mage),
+        // Bernini's renderer IS Wan2.2-T2V-A14B finetuned: `candle-gen-bernini` takes
+        // `candle-gen-wan` as a path dependency and `Components::load` builds
+        // `WanVae16::new_with_encoder(&Vae16Config::wan21(), …)`. Same latent space, same closure.
+        ("bernini_renderer", NoGo::WanZ16),
+        ("bernini", NoGo::WanZ16),
+        // SCAIL-2 is Wan2.1-14B I2V; `Scail2Pipeline` and its `Components` both hold a `WanVae16`.
+        ("scail2_14b", NoGo::WanZ16),
+        ("svd_xt", NoGo::SvdTemporal),
+        ("seedvr2", NoGo::Seedvr2SuperResolution),
+        ("seedvr2_3b", NoGo::Seedvr2SuperResolution),
+        ("seedvr2_7b", NoGo::Seedvr2SuperResolution),
+    ];
+
+    /// The third class: registered routes that neither emit previews **nor** are no-gos.
+    ///
+    /// Without this list "preview-inert" and "rejected" would collapse into each other, and the no-go
+    /// set would silently absorb every family that simply has not been wired yet. Boogu is exactly
+    /// that case and it is the opposite of a rejection: sc-16956 proved its VAE **is** FLUX.1's — a
+    /// different f32 container whose 244 tensors round exactly onto FLUX.1's bf16 bits — so its latent
+    /// space already has a committed fit that clears the bar. It is unwired only because the wiring has
+    /// not been done, tracked as **sc-17218**.
+    ///
+    /// Keeping it named here is what lets
+    /// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` be a **total** partition, which
+    /// is the assertion that stops the no-go set going stale as the catalog grows.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[
+        ("boogu_image", "sc-17218"),
+        ("boogu_image_turbo", "sc-17218"),
+        ("boogu_image_edit", "sc-17218"),
     ];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
@@ -2842,8 +2985,15 @@ mod preview_advertising {
     }
 
     /// The carried-over no-go set stays outside advertising, by exact id, and stays out of the
-    /// allowlist. The reason is a settled measurement (see `PREVIEW_INERT_ROUTE_IDS`), not an open
-    /// question — candle must not re-run those fits.
+    /// allowlist. The reason is a settled finding (see [`NoGo`]), not an open question — candle must
+    /// not re-run those fits.
+    ///
+    /// **The failure message names the finding rather than reporting a bare boolean** (sc-16961).
+    /// "`wan_vace` must not advertise previews" tells the next author nothing about *why*, and the
+    /// most likely next move after reading it is to go and measure — which is the one thing this set
+    /// exists to prevent. Each message now carries the settling story and whether the basis is a
+    /// measurement (`fit` vs `holdout` R², labelled, never interchanged) or a deliberate
+    /// non-measurement.
     ///
     /// The second half mirrors the MLX guard's InstantID assertion: on candle, InstantID **and**
     /// PuLID are bespoke composition APIs rather than registered generators, so neither may acquire
@@ -2856,14 +3006,19 @@ mod preview_advertising {
             .map(|registration| (registration.descriptor)())
             .collect();
 
-        for id in PREVIEW_INERT_ROUTE_IDS {
+        for (id, basis) in PREVIEW_INERT_ROUTE_IDS {
             let descriptor = descriptors
                 .iter()
                 .find(|descriptor| descriptor.id == *id)
                 .unwrap_or_else(|| panic!("{id} must remain a registered candle generator"));
             assert!(
                 !descriptor.capabilities.supports_preview,
-                "{id} is in the epic-16624 holdout rejection set and must not advertise previews"
+                "{id} must not advertise previews — {}. Carried over from epic 16624 rather than \
+                 re-measured, because an RGB fit is a property of the VAE latent space and not of the \
+                 backend. Do NOT re-run the fit: if a new method makes this viable it reopens as a \
+                 NEW story with a NEW measurement. Record: \
+                 docs/migration/evidence/sc-16961-preview-no-go-carry-over.md",
+                basis.reason()
             );
             assert!(
                 !PREVIEW_ROUTE_IDS.contains(id),
@@ -2877,6 +3032,373 @@ mod preview_advertising {
                 "{id} is a bespoke candle composition API and must not gain an invented registration"
             );
         }
+    }
+
+    /// **Every registered route is in exactly one of three classes** — wired, no-go, or deferred —
+    /// and the three cover the shipped surface with nothing left over (sc-16961).
+    ///
+    /// This is what stops the no-go record going stale. sc-16951 first pinned the inert ids and the
+    /// rest of the epic landed on top of it; without a total partition, a route registered in that
+    /// window would simply be absent from every list, and "the no-go set is complete" would be a claim
+    /// nobody could check. With it, a new registration fails the build until an author *decides* which
+    /// class it belongs to — which is the decision this whole epic is about, made once, in writing.
+    ///
+    /// The third class is load-bearing and is not a synonym for "not wired yet". Boogu does not
+    /// advertise previews and is emphatically **not** a rejection: sc-16956 proved its VAE is FLUX.1's,
+    /// so a fit that clears the bar already exists for its space (sc-17218 is the wiring). Collapsing
+    /// the two would either lose a viable family into the rejected pile or force the no-go set to mean
+    /// "everything that does not advertise", which is not a record of anything.
+    ///
+    /// The counts are asserted, not merely the partition: moving a route between classes is a
+    /// decision, and a decision should have to be written down here rather than absorbed silently by a
+    /// set that happens to still add up.
+    #[test]
+    fn the_no_go_set_and_the_wired_set_partition_every_shipped_route() {
+        let registered: BTreeSet<String> = super::provider_registry()
+            .expect("catalog")
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+
+        let wired: BTreeSet<String> = PREVIEW_ROUTE_IDS.iter().map(|id| id.to_string()).collect();
+        let no_go: BTreeSet<String> = PREVIEW_INERT_ROUTE_IDS
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        let deferred: BTreeSet<String> = PREVIEW_DEFERRED_ROUTE_IDS
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+
+        // A deferred route is only distinguishable from a no-go one by the story that will wire it.
+        // Without a named story the third class degenerates into "unclassified, but quietly".
+        for (id, story) in PREVIEW_DEFERRED_ROUTE_IDS {
+            assert!(
+                story.starts_with("sc-") && story.len() > 3,
+                "{id} is deferred rather than rejected, so it must name the story that wires it — \
+                 got {story:?}"
+            );
+        }
+
+        for (label, class, declared) in [
+            ("wired", &wired, PREVIEW_ROUTE_IDS.len()),
+            ("no-go", &no_go, PREVIEW_INERT_ROUTE_IDS.len()),
+            ("deferred", &deferred, PREVIEW_DEFERRED_ROUTE_IDS.len()),
+        ] {
+            assert_eq!(
+                class.len(),
+                declared,
+                "the {label} class must not repeat an id"
+            );
+        }
+        assert!(
+            wired.is_disjoint(&no_go)
+                && wired.is_disjoint(&deferred)
+                && no_go.is_disjoint(&deferred),
+            "a route belongs to exactly one class; overlaps: wired/no-go {:?}, wired/deferred {:?}, \
+             no-go/deferred {:?}",
+            wired.intersection(&no_go).collect::<Vec<_>>(),
+            wired.intersection(&deferred).collect::<Vec<_>>(),
+            no_go.intersection(&deferred).collect::<Vec<_>>()
+        );
+
+        let mut classified: BTreeSet<String> = wired.clone();
+        classified.extend(no_go.iter().cloned());
+        classified.extend(deferred.iter().cloned());
+        assert_eq!(
+            classified,
+            registered,
+            "every registered generator must be classified exactly once. Unclassified (registered but \
+             in no list) — decide whether it is wired, a no-go carried over from epic 16624, or \
+             deferred-but-viable, and say so: {:?}. Phantom (listed but not registered): {:?}",
+            registered.difference(&classified).collect::<Vec<_>>(),
+            classified.difference(&registered).collect::<Vec<_>>()
+        );
+
+        // The shape at sc-16961: 51 registered generators = 29 wired + 19 no-go + 3 deferred. This
+        // story moves the wired count by ZERO — it measures nothing and wires nothing.
+        assert_eq!(
+            (registered.len(), wired.len(), no_go.len(), deferred.len()),
+            (51, 29, 19, 3),
+            "moving a route between preview classes is a decision that must be written down here"
+        );
+    }
+
+    /// **No no-go family may acquire a preview fit, a fit producer, or an emission call** (sc-16961).
+    ///
+    /// The advertising guard above catches a descriptor that starts claiming previews. It does *not*
+    /// catch the expensive half: an author who never reaches a descriptor because they are still on
+    /// the CUDA box deriving `RGB_FACTORS` for a space epic 16624 already rejected. That work is the
+    /// waste this story exists to prevent, and it is visible in the sources long before it is visible
+    /// in a capability.
+    ///
+    /// The eight crate directories are **derived from the inert ids** — a crate is a no-go crate iff
+    /// every id it registers is inert — and then pinned. The derivation is what makes a new
+    /// registration inside one of them join this scan automatically; the pin is what makes an id
+    /// silently changing crates, or a crate acquiring a route nobody classified, a failure rather than
+    /// a quietly shorter scan.
+    ///
+    /// Deliberately a raw-text scan over the crate's whole tree — `src/`, `tests/`, everything —
+    /// rather than the comment-stripped shipped-module scan the wiring assertions use. A fit parked
+    /// under `#[cfg(test)]`, or in a `tests/` producer that never ships, is exactly the thing being
+    /// forbidden. The cost is that *mentioning* a marker in one of these crates also fails; that is
+    /// intended, and the message says where the discussion belongs instead.
+    ///
+    /// **Positive controls make it non-vacuous.** A marker list that silently stopped matching — a
+    /// renamed constant, a moved module — would read as "no no-go crate has a fit" forever and pass.
+    /// So the same scan is run against `candle-gen-flux`, which carries a committed fit, and the same
+    /// producer-filename scan against `candle-gen-sensenova`, which carries `tests/fit_preview_rgb.rs`,
+    /// and both must trip.
+    #[test]
+    fn no_no_go_family_acquires_a_preview_fit_or_a_fit_producer() {
+        let no_go_ids: BTreeSet<&str> = PREVIEW_INERT_ROUTE_IDS.iter().map(|(id, _)| *id).collect();
+        let mut crates: Vec<&str> = PROVIDER_CRATES
+            .iter()
+            .filter(|provider| {
+                let ids = ids_of(provider);
+                !ids.is_empty() && ids.iter().all(|id| no_go_ids.contains(id.as_str()))
+            })
+            .map(|provider| provider.dir)
+            .collect();
+        crates.sort_unstable();
+        assert_eq!(
+            crates,
+            [
+                "candle-gen-bernini",
+                "candle-gen-ltx",
+                "candle-gen-mage",
+                "candle-gen-mochi",
+                "candle-gen-scail2",
+                "candle-gen-seedvr2",
+                "candle-gen-svd",
+                "candle-gen-wan",
+            ],
+            "the 19 no-go ids must resolve to exactly these eight crates — a mismatch means an id \
+             moved crates or a crate acquired a route that is not accounted for"
+        );
+
+        for dir in &crates {
+            let (markers, producers) = fit_evidence(dir);
+            assert!(
+                markers.is_empty(),
+                "{dir} is in the epic-16624 no-go set and must not acquire a preview fit. Found \
+                 {markers:?}. The rejection is a property of the latent space, not of the backend, so \
+                 there is nothing here to re-derive — see \
+                 docs/migration/evidence/sc-16961-preview-no-go-carry-over.md, and if a new method \
+                 makes this family viable, open a NEW story with a NEW measurement rather than \
+                 landing a fit here. (Discussing a marker also trips this scan; that discussion \
+                 belongs in the evidence doc.)"
+            );
+            assert!(
+                producers.is_empty(),
+                "{dir} must not gain a preview fit producer or harness: {producers:?}. Deriving \
+                 coefficients for a rejected latent space is the CUDA-box time sc-16961 exists to save."
+            );
+
+            // And it still emits nothing — the source-level statement of the same fact.
+            let wiring = scan(dir);
+            assert!(
+                !wiring.emits(),
+                "{dir} must not emit previews: {:?}",
+                wiring
+                    .sites
+                    .iter()
+                    .filter(|site| site.hooked)
+                    .map(|site| (&site.file, site.driver, site.index))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Positive controls: the detectors must be capable of firing on a crate that really does
+        // carry a fit, and on one that really does carry a producer.
+        let (flux_markers, _) = fit_evidence("candle-gen-flux");
+        assert!(
+            flux_markers
+                .iter()
+                .any(|found| found.ends_with(": RGB_FACTORS")),
+            "the marker scan no longer detects candle-gen-flux's committed fit, so its silence on \
+             the no-go crates proves nothing: {flux_markers:?}"
+        );
+        let (_, sensenova_producers) = fit_evidence("candle-gen-sensenova");
+        assert!(
+            sensenova_producers
+                .iter()
+                .any(|path| path.ends_with("fit_preview_rgb.rs")),
+            "the producer scan no longer detects candle-gen-sensenova's fit_preview_rgb.rs: \
+             {sensenova_producers:?}"
+        );
+    }
+
+    /// The recorded epic-16624 numbers stay **labelled** and stay in the right column (sc-16961).
+    ///
+    /// sc-16954 was bounced for comparing an in-sample statistic against an out-of-sample one, and
+    /// this record is where that confusion would do the most damage: a future author reading LTX's
+    /// `0.984291` as the holdout number would conclude the space is fine and go and re-derive it. So
+    /// each measured row is checked to carry both values, labelled, in fit-then-holdout order, with
+    /// the holdout below the 0.88 bar and never above the fit.
+    ///
+    /// The **relationship between the rows** is pinned too, because it is the argument. At least one
+    /// row must have a fit comfortably *above* the bar while its holdout is below it — that is the
+    /// counter-intuitive shape (LTX: `0.984291` → `0.618575`) that makes an in-sample number
+    /// dangerous to quote. And at least one row must have a fit that is **itself** below the bar
+    /// (Mochi, `0.846932`), which says the linear model does not describe that space even in-sample,
+    /// so no larger corpus rescues it. Losing either shape would leave the record looking like three
+    /// near-misses.
+    ///
+    /// The unmeasured rows are checked the other way: they must carry **no** number at all, so a later
+    /// edit cannot quietly attach a borrowed holdout figure to a space nobody measured.
+    #[test]
+    fn the_recorded_no_go_measurements_stay_labelled_fit_versus_holdout() {
+        const BAR: f64 = 0.88;
+        let parse = |value: &str| value.parse::<f64>().expect("a decimal R²");
+
+        for basis in [
+            NoGo::Ltx,
+            NoGo::Mage,
+            NoGo::Mochi,
+            NoGo::WanZ16,
+            NoGo::SvdTemporal,
+            NoGo::Seedvr2SuperResolution,
+        ] {
+            let reason = basis.reason();
+            match basis.measured() {
+                Some((fit, holdout)) => {
+                    assert!(
+                        parse(fit) >= parse(holdout),
+                        "{basis:?}: the fit (in-sample) R² {fit} cannot be below the holdout \
+                         (out-of-sample) R² {holdout} — the two are the wrong way round"
+                    );
+                    assert!(
+                        parse(holdout) < BAR,
+                        "{basis:?}: the holdout (out-of-sample) R² {holdout} must be below the {BAR} \
+                         bar, or this is not a rejection"
+                    );
+                    assert!(
+                        reason.contains("fit R² (in-sample)")
+                            && reason.contains("holdout R² (out-of-sample)"),
+                        "{basis:?}: both statistics must be labelled where they are quoted, never \
+                         left as bare numbers: {reason}"
+                    );
+                    let (fit_at, holdout_at) = (
+                        reason.find(fit).expect("the fit value appears"),
+                        reason.find(holdout).expect("the holdout value appears"),
+                    );
+                    assert!(
+                        fit_at < holdout_at,
+                        "{basis:?}: fit before holdout, so the two are never read swapped: {reason}"
+                    );
+                }
+                None => {
+                    assert!(
+                        reason.contains("NEVER measured") || reason.contains("NO holdout number"),
+                        "{basis:?}: an unmeasured row must say so plainly: {reason}"
+                    );
+                    for measured in [NoGo::Ltx, NoGo::Mage, NoGo::Mochi] {
+                        let (fit, holdout) = measured.measured().expect("a measured row");
+                        assert!(
+                            !reason.contains(fit) && !reason.contains(holdout),
+                            "{basis:?} must not borrow {measured:?}'s numbers — its latent space was \
+                             never measured: {reason}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The two shapes that carry the argument, kept from collapsing into "three near-misses".
+        let measured: Vec<(&str, &str)> = [NoGo::Ltx, NoGo::Mage, NoGo::Mochi]
+            .into_iter()
+            .filter_map(NoGo::measured)
+            .collect();
+        assert_eq!(
+            measured.len(),
+            3,
+            "epic 16624 measured exactly three spaces"
+        );
+        assert!(
+            measured
+                .iter()
+                .any(|(fit, holdout)| parse(fit) > BAR && parse(holdout) < BAR),
+            "at least one row must show a fit ABOVE the bar collapsing to a holdout BELOW it — that \
+             is why an in-sample number must never be quoted as if it settled anything: {measured:?}"
+        );
+        assert!(
+            measured.iter().any(|(fit, _)| parse(fit) < BAR),
+            "at least one row must show a fit that is itself below the bar — the linear model does \
+             not describe that space even in-sample, so no larger corpus rescues it: {measured:?}"
+        );
+    }
+
+    /// Every `.rs` file under one candle-gen crate, whether or not it ships.
+    ///
+    /// Deliberately not `module_tree`: this scan is looking for work that has *started*, and work
+    /// starts in `tests/` and under `#[cfg(test)]` before it reaches a shipped module.
+    fn all_rust_files(dir: &str) -> Vec<PathBuf> {
+        let root = candle_gen_root().join(dir);
+        assert!(
+            root.is_dir(),
+            "{}: no such crate directory — an empty scan reads as `no fit here` and would make the \
+             no-go assertions vacuous",
+            root.display()
+        );
+        rust_sources(&root)
+    }
+
+    /// Source tokens that mean a crate has acquired a preview fit or the machinery to emit one.
+    ///
+    /// Chosen to be unambiguous. The bare word `preview` is not usable: `candle-gen-wan` and
+    /// `candle-gen-ltx` both ship training *preview samples* (sc-8650) and `candle-gen-mochi` is
+    /// literally `genmo/mochi-1-preview`, so a substring match on it would fire on three no-go crates
+    /// today and the assertion could never have been written.
+    const FIT_MARKERS: &[&str] = &[
+        "RGB_FACTORS",
+        "RGB_BIAS",
+        "project_latents",
+        "PreviewHook",
+        "PreviewCounter",
+        "PreviewFrame",
+        "PreviewSink",
+        "emit_preview",
+    ];
+
+    /// File names that only ever exist to derive or validate a preview fit.
+    const FIT_PRODUCER_FILES: &[&str] = &[
+        "fit_preview_rgb.rs",
+        "preview_real_weights.rs",
+        "preview_wiring.rs",
+        "preview.rs",
+    ];
+
+    /// `(markers found, producer files found)` for one crate — the raw evidence both no-go assertions
+    /// and their positive controls read.
+    fn fit_evidence(dir: &str) -> (Vec<String>, Vec<String>) {
+        let root = candle_gen_root().join(dir);
+        let mut markers = BTreeSet::new();
+        let mut producers = BTreeSet::new();
+        for path in all_rust_files(dir) {
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if FIT_PRODUCER_FILES
+                .iter()
+                .any(|name| relative.rsplit('/').next() == Some(*name))
+            {
+                producers.insert(relative.clone());
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            for marker in FIT_MARKERS {
+                if source.contains(marker) {
+                    markers.insert(format!("{relative}: {marker}"));
+                }
+            }
+        }
+        (
+            markers.into_iter().collect(),
+            producers.into_iter().collect(),
+        )
     }
 }
 
