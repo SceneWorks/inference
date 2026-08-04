@@ -25,7 +25,7 @@
     "einops": "0.8.2",
     "huggingface-hub": "1.26.0",
     "librosa": "0.11.0",
-    "numpy": "2.4.6",
+    "numpy": "2.4.3",
     "omegaconf": "2.3.1",
     "open_clip_torch": "3.3.0",
     "requests": "2.34.2",
@@ -37,22 +37,22 @@
     "tqdm": "4.70.0"
   },
   "deterministicInputs": {
-    "clip_frames_u8": "f02f5884e00d147ab7e8283928a5d83d9ebb368eeee520365df7a9a7bb5edcd0",
+    "clip_frames_u8": "c16b046b61b386eed72fd13fd68565200d2778b5fc9c72c4224d178d5d4f59da",
     "sync_frames_u8": "dfce11b69a81352fd5ad8c5cab971d752b2e7e10643567e54496d031f43366be",
     "fixed_latent_16k": "4ec39c7cf7849f35b2aea8f01e6b7d06afd69660abc8a76956b2f7fdc2cddbb6"
   },
   "files": {
     "mmaudio_parity_reference.safetensors": {
       "bytes": 2015312,
-      "sha256": "3b18b2db58e89432d67e1557f921543cf3aceec552827d69db08679a140e00cb"
+      "sha256": "63ceb29e17deafa86a976ff4fd230a7545fe520f74e30f23d2dcd57c0054a113"
     },
     "mmaudio_parity_reference_44k.safetensors": {
       "bytes": 2951632,
-      "sha256": "b10132b0840383022bb8539a08800fb9860d703fdc06a7bb7458ae9fd270abda"
+      "sha256": "848a45b990d88586b99ae578807cff2250cc8865da7be016e7e80775c0f5e51e"
     },
     "mmaudio_parity_reference_44k_decoder.safetensors": {
       "bytes": 1821840,
-      "sha256": "f61a08e2a43b19d75b97dd2517368eea4cafbad41c57b5fcb6a47b36ac9a2370"
+      "sha256": "0e4d441893db99aefd3cd7ef39d32fc6a642ae27a7297fa33dcf324f552fcae4"
     },
     "mmaudio_parity_output_16k.safetensors": {
       "bytes": 133096,
@@ -60,7 +60,7 @@
     },
     "mmaudio_parity_mmdit.safetensors": {
       "bytes": 1247964,
-      "sha256": "cf942ac38d455ae0433cd55e29f0c957753212cfe6c2a6062bf959f9a9f3445d"
+      "sha256": "9114c8ef0645e2a1802b145d2f429e1347341a7029e8a0f5fbd81230b91d52c2"
     }
   }
 }

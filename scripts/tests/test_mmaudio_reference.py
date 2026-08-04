@@ -20,11 +20,44 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 from scripts.reference import mmaudio_reference as ref
 from scripts.reference import mmaudio_reference_environment as environment
 
 LOCK_IN = ref.VENDOR / "requirements-oracles.in"
 LOCK_TXT = ref.VENDOR / "requirements-oracles.txt"
+
+
+def _minimum_midpoint_margin(nudge: float) -> float:
+    """Smallest distance to a `.5` rounding midpoint across both synthetic streams.
+
+    Mirrors `synthetic_frames`' arithmetic rather than calling it, because the quantity of interest
+    is the value *before* rounding — which the uint8 output has already discarded.
+    """
+    worst = float("inf")
+    for count, fps, size in (
+        (int(ref.DURATION * ref.CLIP_FPS), ref.CLIP_FPS, ref.CLIP_SIZE),
+        (int(ref.DURATION * ref.SYNC_FPS), ref.SYNC_FPS, ref.SYNC_SIZE),
+    ):
+        t = (np.arange(count, dtype=np.float64) / fps)[:, None, None]
+        axis = (np.arange(size, dtype=np.float64) + 0.5) / size
+        u, v = axis[None, None, :], axis[None, :, None]
+        tau = 2.0 * np.pi
+        channels = (
+            0.5 + 0.5 * np.sin(tau * (u + 0.25 * t)),
+            0.5 + 0.5 * np.sin(tau * (v - 0.15 * t) + tau / 3.0),
+            0.5 + 0.5 * np.sin(tau * (0.5 * (u + v) + 0.35 * t) + 2.0 * tau / 3.0),
+        )
+        stacked = np.stack(
+            [np.broadcast_to(c, (count, size, size)) for c in channels], axis=-1
+        )
+        bar = np.mod(0.12 * t, 1.0)
+        on = (np.abs(u - bar) < 0.02)[..., None]
+        stacked = np.where(on, np.minimum(stacked + 0.6, 1.0), stacked)
+        scaled = stacked * 255.0 + nudge
+        worst = min(worst, float(np.abs(scaled - np.floor(scaled) - 0.5).min()))
+    return worst
 
 
 class MMAudioReferenceFixtureTests(unittest.TestCase):
@@ -68,6 +101,28 @@ class MMAudioReferenceFixtureTests(unittest.TestCase):
         latent = ref.fixed_latent_16k()
         self.assertEqual(latent.shape, (1, 20, 48))
         self.assertGreater(float(latent.std()), 0.05, "the latent must not be near-constant")
+
+    def test_synthetic_clip_quantization_is_libm_portable(self) -> None:
+        """No sample may sit near a rounding midpoint — the fixtures cross libms.
+
+        The fixtures are produced on macOS; this gate re-derives their digests on Linux CI. The raw
+        sinusoids put thousands of samples within ~1 f64 ULP of a `.5` midpoint (their zero
+        crossings align with the grid systematically), so without `QUANTIZER_NUDGE` a single
+        differing ULP of `sin` between libms flips a uint8, changes the digest, and reds this gate
+        for a reason that has nothing to do with MMAudio. Asserting the *margin* rather than the
+        digest is what makes that non-reintroducible.
+        """
+        self.assertGreater(ref.QUANTIZER_NUDGE, 0.0)
+        margin = _minimum_midpoint_margin(ref.QUANTIZER_NUDGE)
+        self.assertGreater(
+            margin,
+            1e-9,
+            f"a sample sits {margin:.3e} from a rounding midpoint — its uint8 depends on the "
+            "host libm's last bit of sin, so the fixtures are not reproducible across platforms",
+        )
+        # And the nudge is what buys that: without it the same measurement is ~1 ULP. Pinning the
+        # margin alone would pass on a generator that had merely been reshuffled.
+        self.assertLess(_minimum_midpoint_margin(0.0), 1e-13)
 
     def test_metadata_records_a_cpu_float32_run_of_the_pinned_reference(self) -> None:
         metadata = ref.read_metadata()
@@ -125,6 +180,27 @@ class MMAudioReferenceFixtureTests(unittest.TestCase):
         with self.assertRaises(ref.ReferenceError):
             environment.validate_python_version((3, 9, 0), ref.ReferenceError)
 
+    def test_vendored_digest_table_matches_the_vendored_tree(self) -> None:
+        """`VENDORED.md`'s per-file SHA-256 table must describe the tree that is actually here.
+
+        `vendorTreeSha256` already fails the fixtures when the tree moves, but it is one combined
+        digest: it says *something* changed, not what. This table is the human-readable record that
+        answers that, and an unenforced table is just a comment that rots — the Mage precedent's
+        equivalent table has no gate at all.
+        """
+        table = (ref.VENDOR / "VENDORED.md").read_text(encoding="utf-8")
+        recorded = dict(
+            (path, digest)
+            for digest, path in re.findall(r"(?m)^([0-9a-f]{64})  (mmaudio/\S+)$", table)
+        )
+        actual = {
+            path.relative_to(ref.VENDOR).as_posix(): ref.sha256_file(path)
+            for path in sorted((ref.VENDOR / "mmaudio").rglob("*"))
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        self.assertEqual(len(actual), 102, "the vendored file count changed")
+        self.assertEqual(recorded, actual)
+
     def test_manifest_keys_cover_every_component_the_gates_load(self) -> None:
         # Read through `verify_model_snapshot.load_model`, never a hand-rolled TOML scan: a key that
         # disappears from the manifest must be an error here, not a silently missing revision.
@@ -161,13 +237,16 @@ class MMAudioReferenceVerifierDiscriminationTests(unittest.TestCase):
     def test_rejects_a_corrupted_fixture(self) -> None:
         target = ref.FIXTURE_DIR / "mmaudio_parity_output_16k.safetensors"
         payload = bytearray(target.read_bytes())
-        payload[-1] ^= 0xFF  # one flipped bit in the last sample
+        payload[-1] ^= 0xFF  # flip the last sample's low byte
         target.write_bytes(bytes(payload))
         self.assertTrue(any("SHA-256" in error for error in ref.verify_fixtures()))
 
     def test_rejects_a_missing_fixture(self) -> None:
         (ref.FIXTURE_DIR / "mmaudio_parity_mmdit.safetensors").unlink()
-        self.assertTrue(ref.verify_fixtures())
+        self.assertTrue(
+            any("fixture is missing" in error for error in ref.verify_fixtures()),
+            "a deleted fixture must be reported as missing, not as some incidental failure",
+        )
 
     def test_rejects_a_stale_snapshot_pin(self) -> None:
         revisions = dict(ref.manifest_revisions())
@@ -197,12 +276,16 @@ class MMAudioReferenceVerifierDiscriminationTests(unittest.TestCase):
     def test_rejects_a_changed_generation_configuration(self) -> None:
         for field, value in (
             ("prompt", "something else"),
+            ("negativePrompt", "something else"),
             ("seed", 43),
             ("cfgStrength", 3.0),
             ("numSteps", 10),
             ("duration", 4.0),
             ("device", "cuda"),
             ("dtype", "bfloat16"),
+            ("upstreamRepository", "someone/else"),
+            ("upstreamRevision", "0" * 40),
+            ("producerEnvironment", {"torch": "0.0.0"}),
         ):
             with self.subTest(field=field):
                 self._rewrite_metadata(**{field: value})

@@ -26,7 +26,7 @@ The reason to take that option here rather than fetch-at-regeneration is that th
 **package**, not a file. `mmaudio_reference.py` drives `MMAudio`, `FlowMatching`, `FeaturesUtils`,
 `AutoEncoderModule`, `Synchformer` and both BigVGAN generations across 102 files; checksum-asserting
 a fetch of that surface (the `moss_audio_codec_reference.py` pattern, which covers three files) is
-strictly worse than committing it. It is also 584 KB, so the cost is negligible.
+strictly worse than committing it. It is also 364 KB across 102 files, so the cost is negligible.
 
 ## What was and was not copied
 

@@ -24,7 +24,7 @@ REFERENCE_PACKAGES = {
     "einops": "0.8.2",
     "huggingface-hub": "1.26.0",
     "librosa": "0.11.0",
-    "numpy": "2.4.6",
+    "numpy": "2.4.3",
     "omegaconf": "2.3.1",
     "open_clip_torch": "3.3.0",
     "requests": "2.34.2",

@@ -20,15 +20,27 @@
 
 mod common;
 
-use candle_audio_mmaudio::candle_audio;
+use candle_audio_mmaudio::candle_audio::candle_core::Device;
 use candle_audio_mmaudio::MmAudio44kPipeline;
 
 const FIXTURE: &str = "mmaudio_parity_reference_44k.safetensors";
 
+/// Largest tolerated `max_abs_diff / abs_max(reference)` — the magnitude half of the gate, since
+/// cosine is scale-invariant and would pass a uniformly mis-scaled waveform.
+///
+/// Looser than the other gates at 1e-1, and deliberately so: this is the only path where 25
+/// Euler/CFG steps of the 1.3B `large_44k_v2` accumulate before the decoder, and it measures
+/// 2.5e-2 on CPU/f32 while its own decoder scores 1.0e-3 in isolation
+/// (`parity_reference_44k_decoder`). That accumulation is the cross-framework floor, not a defect,
+/// so the bound is set to catch a gross mis-scaling (>10%) rather than to chase the floor.
+const MAX_RELATIVE_DIFF: f64 = 1e-1;
+
 #[test]
 #[ignore = "real weights: needs the five MMAudio 44k component snapshots; run with --ignored"]
 fn assembly_44k_matches_reference_waveform() {
-    let device = candle_audio::default_device().expect("device");
+    // Pinned to CPU rather than `default_device()`, which returns CUDA under the lane's
+    // `--features cuda`; see `parity_reference.rs` for the full reasoning.
+    let device = Device::Cpu;
     let tensors = common::load_fixture(FIXTURE, &device);
     let get = |k: &str| common::fixture_tensor(&tensors, FIXTURE, k);
     let clip_f = get("clip_f");
@@ -74,20 +86,27 @@ fn assembly_44k_matches_reference_waveform() {
 
     let cos = common::cosine(&wave, &ref_wave);
     let mad = common::max_abs_diff(&wave, &ref_wave);
+    let rel = mad / common::abs_max(&ref_wave);
     println!(
         "candle 44k wave: {} samples; reference: {} samples",
         wave.len(),
         ref_wave.len()
     );
-    println!("E2E PARITY (44k): cosine={cos:.6}  max_abs_diff={mad:.6}");
-    assert!(
-        (wave.len() as i64 - ref_wave.len() as i64).abs() <= 1024,
-        "waveform length {} differs from reference {} by more than a vocoder frame",
+    println!("E2E PARITY (44k): cosine={cos:.6}  max_abs_diff={mad:.6}  relative={rel:.2e}");
+    // Exact: the length is fixed by the fixture's duration, and the comparisons above only cover
+    // the overlapping prefix, so a truncated waveform would otherwise score ~1.0 and pass.
+    assert_eq!(
         wave.len(),
-        ref_wave.len()
+        ref_wave.len(),
+        "waveform length differs from reference"
     );
     assert!(
         cos > 0.99,
         "assembled candle 44k pipeline waveform cosine {cos:.6} vs reference is below 0.99",
+    );
+    assert!(
+        rel < MAX_RELATIVE_DIFF,
+        "assembled candle 44k pipeline waveform relative max-abs-diff {rel:.2e} exceeds \
+         {MAX_RELATIVE_DIFF:.0e} — the waveform is mis-scaled even if its shape matches"
     );
 }

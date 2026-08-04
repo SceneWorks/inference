@@ -74,7 +74,10 @@ fn fixed(shape: &[usize], seed: u64) -> Tensor {
     Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
 }
 
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+/// f32 variant used by the weight-free determinism check below. The parity test uses
+/// [`common::max_abs_diff`], which accumulates in f64 like the other gates; the two are named
+/// apart so it is obvious at each call site which one is in play.
+fn max_abs_diff_f32(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
@@ -135,7 +138,7 @@ fn mmdit_sample_shape_finite_deterministic() {
     let b = vecof(&net.sample_default(&x0, &cond).unwrap());
     assert_eq!(a, b, "sample must be deterministic run-to-run");
     // materially different from the input noise
-    let diff = max_abs_diff(&a, &vecof(&x0));
+    let diff = max_abs_diff_f32(&a, &vecof(&x0));
     assert!(
         diff > 1e-2,
         "output must differ from the input prior (Δ={diff})"

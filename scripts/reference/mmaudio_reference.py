@@ -155,6 +155,22 @@ OUTPUT_16K_LENGTH = 48
 #: endpoint can make a broken time embedding look correct.
 MMDIT_T = 0.37
 
+#: Nudge applied before quantizing the synthetic clip to uint8, and the reason this generator is
+#: portable at all.
+#:
+#: The colour fields are sinusoids over an exactly-representable grid, so their zero crossings land
+#: on grid points *systematically*: 4802 of the 28.3 M CLIP samples land within 1e-9 of a `.5`
+#: rounding midpoint, the closest ~2.8e-14 away — about one f64 ULP at that magnitude. Whether each
+#: of those rounds to 127 or 128 therefore rides on the last bit of `sin`, which is not guaranteed
+#: identical between libms. The fixtures are produced on macOS and `test_mmaudio_reference.py`
+#: re-derives their digests on Linux CI, so a single differing ULP there would fail the gate with
+#: "the deterministic inputs no longer reproduce" — a red about libc, not about MMAudio.
+#:
+#: 1e-6 is chosen against the measured distribution: every at-risk sample is within 1e-9 of a
+#: midpoint and *nothing* lies between 1e-9 and 1e-6 of one, so this moves exactly that class
+#: decisively up and can push nothing else across. The margin is ~10^8 ULP.
+QUANTIZER_NUDGE = 1e-6
+
 FIXTURES = (
     "mmaudio_parity_reference.safetensors",
     "mmaudio_parity_reference_44k.safetensors",
@@ -243,7 +259,9 @@ def synthetic_frames(count: int, fps: int, size: int) -> np.ndarray:
     bar = np.mod(0.12 * t, 1.0)
     on = (np.abs(u - bar) < 0.02)[..., None]
     stacked = np.where(on, np.minimum(stacked + 0.6, 1.0), stacked)
-    return np.rint(stacked * 255.0).astype(np.uint8)
+    # See QUANTIZER_NUDGE: without it, thousands of samples sit ~1 ULP from a rounding midpoint and
+    # the uint8 they quantize to depends on the host libm's last bit of `sin`.
+    return np.rint(stacked * 255.0 + QUANTIZER_NUDGE).astype(np.uint8)
 
 
 @functools.lru_cache(maxsize=1)
@@ -883,6 +901,17 @@ def _write_metadata(revisions: dict[str, str]) -> None:
     # Re-validated rather than remembered from `_load_reference`, so the recorded versions are the
     # ones that were live for the whole run.
     packages = validate_reference_environment(ReferenceError)
+
+    # The metadata describes the whole set, so a partial `--only` run can only refresh it if the
+    # siblings it did not regenerate are already present. Say that, rather than dying on a bare
+    # FileNotFoundError from the stat() below.
+    missing = [name for name in FIXTURES if not (FIXTURE_DIR / name).is_file()]
+    if missing:
+        raise ReferenceError(
+            f"cannot write fixture metadata: {', '.join(missing)} absent. The metadata covers all "
+            "five fixtures, so the first run (and any run after a fixture is deleted) must be a "
+            "full `dump` rather than `--only`."
+        )
 
     document = {
         "schema": 1,

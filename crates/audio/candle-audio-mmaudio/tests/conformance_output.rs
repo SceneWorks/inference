@@ -44,6 +44,11 @@ use candle_audio_mmaudio::gen_core::WeightsSource;
 const LATENT_LEN: usize = 48;
 const FIXTURE: &str = "mmaudio_parity_output_16k.safetensors";
 
+/// Largest tolerated `max_abs_diff / abs_max(reference)` at each parity stage — the magnitude half
+/// of the gate, since cosine is scale-invariant and a wrong vocoder output gain would otherwise
+/// pass. Measured 2.2e-6 (mel) and 1.0e-5 (waveform) on CPU/f32, so this leaves ≥100x headroom.
+const MAX_RELATIVE_DIFF: f64 = 1e-3;
+
 /// Deterministic closed-form latent `(1, 20, L)` — computed identically in the torch parity harness
 /// so both sides decode the *same* input without transferring a file.
 fn fixed_latent(dev: &Device) -> Tensor {
@@ -60,9 +65,9 @@ fn fixed_latent(dev: &Device) -> Tensor {
     Tensor::from_vec(data, (1, c, l), dev).expect("latent tensor")
 }
 
-fn resolve_source(env: &str, file: &str, nested: &str) -> WeightsSource {
-    // Required env path — inference never self-fetches or derives a cache location (epic 13657).
-    let _ = (file, nested);
+/// Resolve a component from the **required** `env` path — inference never self-fetches or derives a
+/// cache location (epic 13657). `file` names the expected checkpoint, for the panic message.
+fn resolve_source(env: &str, file: &str) -> WeightsSource {
     let p = std::env::var(env)
         .unwrap_or_else(|_| panic!("set {env} to the {file} weights file or its snapshot dir"));
     let path = std::path::PathBuf::from(&p);
@@ -75,16 +80,8 @@ fn resolve_source(env: &str, file: &str, nested: &str) -> WeightsSource {
 
 fn load_decoder() -> mm::AudioDecoder16k {
     let dev = Device::Cpu;
-    let vae = resolve_source(
-        "MMAUDIO_VAE_SNAPSHOT",
-        "v1-16.pth",
-        mm::output::VAE_WEIGHTS_PATH,
-    );
-    let bigvgan = resolve_source(
-        "MMAUDIO_BIGVGAN_SNAPSHOT",
-        "best_netG.pt",
-        mm::output::BIGVGAN_WEIGHTS_PATH,
-    );
+    let vae = resolve_source("MMAUDIO_VAE_SNAPSHOT", "v1-16.pth");
+    let bigvgan = resolve_source("MMAUDIO_BIGVGAN_SNAPSHOT", "best_netG.pt");
     mm::AudioDecoder16k::load(&vae, &bigvgan, &dev).expect("load MMAudio 16k output decoder")
 }
 
@@ -225,4 +222,19 @@ fn output_16k_matches_reference() {
         e2e_cos > 0.999,
         "assembled 16k decoder waveform cosine {e2e_cos:.6} vs reference is below 0.999"
     );
+    // Magnitude, per stage. Without these a uniform gain error anywhere in the VAE or the vocoder
+    // reproduces the reference's shape exactly and passes all three cosines above.
+    let mel_scale = common::abs_max(&ref_mel_v);
+    let wave_scale = common::abs_max(&ref_wave);
+    for (stage, rel) in [
+        ("v1-16 mel-VAE decode", mel_mad / mel_scale),
+        ("16k BigVGAN vocode", voc_mad / wave_scale),
+        ("assembled 16k decoder", e2e_mad / wave_scale),
+    ] {
+        assert!(
+            rel < MAX_RELATIVE_DIFF,
+            "{stage} relative max-abs-diff {rel:.2e} exceeds {MAX_RELATIVE_DIFF:.0e} — the output \
+             is mis-scaled even if its shape matches"
+        );
+    }
 }

@@ -1,6 +1,8 @@
 //! Shared test scaffolding (sc-13666): build the named-component [`LoadSpec`] the shipping MMAudio
-//! generators now consume, from **env-pointed per-repo snapshot paths** with an F-029 hub-cache
-//! fallback. There is no assembled snapshot directory anymore — each of the five components
+//! generators now consume, from **env-pointed per-repo snapshot paths**. There is no hub-cache
+//! fallback — every variable below is required and [`from_env_repo`] panics when one is unset,
+//! because inference never self-fetches and never derives a cache location (epic 13657). There is
+//! no assembled snapshot directory anymore either — each of the five components
 //! (`clip` / `synchformer` / `dit` / `vae` / `vocoder`) is staged individually via
 //! [`LoadSpec::with_component`].
 //!
@@ -103,6 +105,16 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Largest `|value|` in a reference signal, for scaling a max-abs-diff into a relative bound.
+///
+/// Cosine alone cannot gate a port: it is **scale-invariant**, so a uniform gain error — a wrong
+/// `latent_std`/`latent_mean`, a dropped normalization, a wrong final-layer gain in either vocoder
+/// — reproduces the reference's shape exactly and scores cos ≈ 1.0. Every parity gate here pairs
+/// its cosine with `max_abs_diff / abs_max(reference)` for that reason.
+pub fn abs_max(v: &[f32]) -> f64 {
+    v.iter().fold(0f64, |acc, x| acc.max(x.abs() as f64))
+}
+
 /// `hkchengrex/MMAudio` repo snapshot dir (synchformer + dit + vae + 16k vocoder).
 pub const MMAUDIO_SNAPSHOT_ENV: &str = "MMAUDIO_MMAUDIO_SNAPSHOT";
 /// `apple/DFN5B-CLIP-ViT-H-14-384` repo snapshot dir (clip).
@@ -158,7 +170,7 @@ fn placeholder_weights() -> WeightsSource {
     WeightsSource::Dir(std::env::temp_dir().join("mmaudio-unused-base"))
 }
 
-/// The `mmaudio_small_16k` [`LoadSpec`] with all five components staged from env / hub.
+/// The `mmaudio_small_16k` [`LoadSpec`] with all five components staged from the required env vars.
 pub fn spec_16k() -> LoadSpec {
     LoadSpec::new(placeholder_weights())
         .with_component("clip", clip_source())
@@ -168,7 +180,7 @@ pub fn spec_16k() -> LoadSpec {
         .with_component("vocoder", vocoder_16k_source())
 }
 
-/// The `mmaudio_large_44k` [`LoadSpec`] with all five components staged from env / hub.
+/// The `mmaudio_large_44k` [`LoadSpec`] with all five components staged from the required env vars.
 pub fn spec_44k() -> LoadSpec {
     LoadSpec::new(placeholder_weights())
         .with_component("clip", clip_source())

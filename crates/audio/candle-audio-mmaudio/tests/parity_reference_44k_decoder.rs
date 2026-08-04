@@ -28,11 +28,16 @@
 
 mod common;
 
-use candle_audio_mmaudio::candle_audio;
+use candle_audio_mmaudio::candle_audio::candle_core::Device;
 use candle_audio_mmaudio::candle_audio::gen_core::WeightsSource;
 use candle_audio_mmaudio::AudioDecoder44k;
 
 const FIXTURE: &str = "mmaudio_parity_reference_44k_decoder.safetensors";
+
+/// Largest tolerated `max_abs_diff / abs_max(reference)` at each stage — the magnitude half of the
+/// gate, since cosine is scale-invariant and a wrong vocoder output gain would otherwise pass.
+/// Measured 2.1e-6 (mel) and 4.7e-5 (waveform) on CPU/f32, so this leaves ≥20x headroom.
+const MAX_RELATIVE_DIFF: f64 = 1e-3;
 
 /// Resolve a component from the required `env` path — inference never self-fetches or derives a
 /// cache location (epic 13657).
@@ -50,7 +55,11 @@ fn env_source(env: &str) -> WeightsSource {
 #[test]
 #[ignore = "real weights: needs the v1-44 mel-VAE and NVIDIA BigVGAN v2 snapshots; run with --ignored"]
 fn decoder_44k_matches_reference_mel_and_waveform() {
-    let device = candle_audio::default_device().expect("device");
+    // Pinned to CPU rather than `default_device()`, which returns CUDA under the lane's
+    // `--features cuda`; see `parity_reference.rs` for the full reasoning. It matters most here:
+    // these are the tightest thresholds in the crate (0.999 across a ~112-layer BigVGAN v2 stack),
+    // and gating them on CUDA-vs-torch-CPU rounding would be a red nobody can reproduce.
+    let device = Device::Cpu;
     let tensors = common::load_fixture(FIXTURE, &device);
     let get = |k: &str| common::fixture_tensor(&tensors, FIXTURE, k);
     let z = get("z"); // (1, 40, 345) — the VAE-input latent
@@ -104,11 +113,12 @@ fn decoder_44k_matches_reference_mel_and_waveform() {
         ref_wave.len()
     );
 
-    assert!(
-        (wave_v.len() as i64 - ref_wave.len() as i64).abs() <= 1024,
-        "waveform length {} differs from reference {} by more than a vocoder frame",
+    // Exact: the length follows deterministically from `z`'s shape, and the comparisons above only
+    // cover the overlapping prefix, so a truncated waveform would otherwise score ~1.0 and pass.
+    assert_eq!(
         wave_v.len(),
-        ref_wave.len()
+        ref_wave.len(),
+        "waveform length differs from reference"
     );
     assert!(
         mel_cos > 0.999,
@@ -122,4 +132,19 @@ fn decoder_44k_matches_reference_mel_and_waveform() {
         e2e_cos > 0.999,
         "assembled 44k decoder waveform cosine {e2e_cos:.6} vs reference is below 0.999"
     );
+    // Magnitude, per stage. Without these a uniform gain error anywhere in the VAE or the vocoder
+    // reproduces the reference's shape exactly and passes all three cosines above.
+    let mel_scale = common::abs_max(&ref_mel_v);
+    let wave_scale = common::abs_max(&ref_wave);
+    for (stage, rel) in [
+        ("v1-44 mel-VAE decode", mel_mad / mel_scale),
+        ("NVIDIA BigVGAN v2 vocode", voc_mad / wave_scale),
+        ("assembled 44k decoder", e2e_mad / wave_scale),
+    ] {
+        assert!(
+            rel < MAX_RELATIVE_DIFF,
+            "{stage} relative max-abs-diff {rel:.2e} exceeds {MAX_RELATIVE_DIFF:.0e} — the output \
+             is mis-scaled even if its shape matches"
+        );
+    }
 }
