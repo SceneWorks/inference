@@ -2000,7 +2000,7 @@ mod tests {
             .memory_strategy_contract()
             .expect("FLUX.2-dev memory contract");
         let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric tier");
-        let context = gen_core::standard_memory_behavior_context(
+        let mut context = gen_core::standard_memory_behavior_context(
             contract,
             strategy,
             tier,
@@ -2013,6 +2013,22 @@ mod tests {
             },
         )
         .expect("memory context");
+        if strategy >= gen_core::MemoryStrategy::BoundedDecode {
+            if let Ok(value) = std::env::var("FLUX2_DECODE_TILE_EDGE") {
+                context.selection.parameters.decode_tile_edge = Some(
+                    value
+                        .parse::<u32>()
+                        .expect("FLUX2_DECODE_TILE_EDGE must be an unsigned integer"),
+                );
+            }
+            if let Ok(value) = std::env::var("FLUX2_DECODE_OVERLAP") {
+                context.selection.parameters.decode_overlap = Some(
+                    value
+                        .parse::<u32>()
+                        .expect("FLUX2_DECODE_OVERLAP must be an unsigned integer"),
+                );
+            }
+        }
         assert!(matches!(
             g.memory_strategy_safety_check(&context),
             gen_core::MemorySafetyDecision::Accept
