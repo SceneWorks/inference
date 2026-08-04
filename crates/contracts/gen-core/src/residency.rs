@@ -210,6 +210,36 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         }
     }
 
+    /// [`from_policy`](Self::from_policy) for a provider whose components have a **materialization
+    /// shape** as well as a phase schedule (SC-15524).
+    ///
+    /// The two axes are independent and this is the constructor that keeps them so. `policy` still
+    /// supplies the *default* phase staging — `Resident` eager-loads the warm pair now and defaults
+    /// to unstaged, `Sequential` defers and defaults to staged — which a request-scoped selection may
+    /// then override per request. The extra `streamable` argument threaded into both loaders is the
+    /// other axis: whether this request wants components built in a re-materializable form (ladder
+    /// rung 4). `from_policy` cannot express it, because its loaders take no such argument, so a
+    /// provider adopting rung 4 while keeping the legacy policy default had no seam to use.
+    ///
+    /// The eager warm pair is built in the NON-streamable form, matching `from_policy`; a later
+    /// streamable request evicts and rebuilds it, which `ensure_warm_locked` already owns.
+    pub fn request_scoped_from_policy(
+        policy: OffloadPolicy,
+        load_text: impl Fn(bool) -> RuntimeResult<R, Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool, bool) -> RuntimeResult<R, Heavy> + Send + Sync + 'static,
+    ) -> RuntimeResult<R, Self> {
+        let mut residency = Self::request_scoped(load_text, load_heavy);
+        match policy {
+            OffloadPolicy::Resident => {
+                let mut warm = residency.warm()?;
+                residency.ensure_warm_locked(&mut warm, false, &mut |_| {})?;
+                drop(warm);
+            }
+            OffloadPolicy::Sequential => residency.default_stage_residency = true,
+        }
+        Ok(residency)
+    }
+
     /// Compatibility dispatch for a distinct, lazily loaded warm aggregate.
     pub fn from_policy_with_resident(
         policy: OffloadPolicy,
