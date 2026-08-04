@@ -118,14 +118,25 @@ fn denoise_over_sigmas(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
 ) -> Result<Array> {
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the MMDiT embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
-        let pred_cond = transformer.forward(x, &cond.context, &cond.pooled, &t)?;
+        let window = transformer_window.map(|size| (size, cancel));
+        let pred_cond =
+            transformer.forward_inference(x, &cond.context, &cond.pooled, &t, attention, window)?;
         match uncond {
             Some(uc) if guidance_scale != 1.0 => {
-                let pred_uncond = transformer.forward(x, &uc.context, &uc.pooled, &t)?;
+                let pred_uncond = transformer.forward_inference(
+                    x,
+                    &uc.context,
+                    &uc.pooled,
+                    &t,
+                    attention,
+                    window,
+                )?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = subtract(&pred_cond, &pred_uncond)?;
                 Ok(add(
@@ -198,6 +209,39 @@ pub fn denoise_cfg_with_preview(
     on_progress: &mut dyn FnMut(Progress),
     preview: &PreviewSink,
 ) -> Result<Array> {
+    denoise_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas,
@@ -210,6 +254,8 @@ pub fn denoise_cfg_with_preview(
         cancel,
         on_progress,
         preview,
+        attention,
+        transformer_window,
     )
 }
 
@@ -282,6 +328,49 @@ pub fn denoise_img2img_cfg_with_preview(
     on_progress: &mut dyn FnMut(Progress),
     preview: &PreviewSink,
 ) -> Result<Array> {
+    denoise_img2img_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        vae,
+        init,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_img2img_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    vae: &Vae,
+    init: &Image,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
     // Reference → clean latent [1, 16, H/8, W/8]. `Vae::encode` returns the normalized `(mean−shift)·
     // scale` latent (the same space as `create_noise`); SD3.5's MMDiT patchifies internally, so keep it
     // unpacked.
@@ -305,6 +394,8 @@ pub fn denoise_img2img_cfg_with_preview(
         cancel,
         on_progress,
         preview,
+        attention,
+        transformer_window,
     )
 }
 
@@ -313,6 +404,20 @@ pub fn denoise_img2img_cfg_with_preview(
 /// is handed straight through.
 pub fn decode_to_image(vae: &Vae, latents: &Array) -> Result<Image> {
     let decoded = vae.decode(latents)?.as_dtype(Dtype::Float32)?;
+    mlx_gen::image::decoded_to_image(&decoded)
+}
+
+pub(crate) fn decode_to_image_tiled(
+    vae: &Vae,
+    latents: &Array,
+    tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: &CancelFlag,
+) -> Result<Image> {
+    let decoded = match tiling {
+        Some(config) => vae.decode_tiled(latents, config, Some(cancel))?,
+        None => vae.decode(latents)?,
+    }
+    .as_dtype(Dtype::Float32)?;
     mlx_gen::image::decoded_to_image(&decoded)
 }
 
