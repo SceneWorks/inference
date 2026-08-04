@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import tomllib
 import unittest
@@ -1397,13 +1398,43 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(job=header.strip()):
                 self.assertIn(expected_start[header], job)
                 self.assertIn("scripts/ci/gpu_fault_evidence.sh report", job)
-                # The report exists to explain a FAILING run, so it must not be skipped by one.
-                report = job[job.index("- name: Report GPU fault evidence") :]
-                self.assertIn("if: always()", report[: report.index("run:")])
-                # Neither half may kill a multi-hour lane: a step whose only product is a record can
-                # still fail for reasons the script never sees (a lost exec bit, a wrong cwd). Three
-                # per job = the two evidence steps plus the pre-existing disk-headroom report.
-                self.assertEqual(job.count("continue-on-error: true"), 3)
+                # SCOPED TO EACH STEP, not counted across the job. A `job.count(...)` of
+                # `continue-on-error: true` is a false green: both evidence steps could lose the
+                # key and the count would still be satisfied by unrelated steps elsewhere in the
+                # job. The properties asserted here are per-step, so the slice must be per-step.
+                for step_name, must_have in (
+                    ("- name: Start GPU fault evidence", ("continue-on-error: true",)),
+                    (
+                        "- name: Report GPU fault evidence",
+                        # The report explains a FAILING run, so it must not be skipped by one.
+                        ("continue-on-error: true", "if: always()"),
+                    ),
+                ):
+                    body = job[job.index(step_name) :]
+                    body = body[: body.index("run:")]
+                    for key in must_have:
+                        self.assertIn(key, body, f"{step_name}: missing {key}")
+
+                # THE RAW RECORD MUST OUTLIVE `$RUNNER_TEMP`, on BOTH lanes. The `report` step
+                # prints a summary — a peak line, a 30-row tail, a histogram — and a diagnosis
+                # needs the 1 Hz CSV and the full event list, which the runner deletes when the
+                # job ends. The regression lane is the one that actually failed (30869410054), so
+                # shipping retention only on the operator-dispatch sweep would have put the record
+                # everywhere except where the fault was seen.
+                self.assertIn("actions/upload-artifact@", job)
+                self.assertIn("gpu-fault-evidence/memory.csv", job)
+                self.assertIn("gpu-fault-evidence/gpu-events.txt", job)
+
+        # ONE TEST PER PROCESS in the LoRA step, and this is a correctness constraint rather than a
+        # style one. sc-17355 made `render()` call `reset_peak_memory()`, which is a process-global
+        # MLX mutation. The step is safe only because `run_one` invokes cargo once per test with
+        # `--exact`; collapsing both names into a single invocation would let libtest's default
+        # thread pool run them concurrently, and each would rebase the other's high-water mid-render
+        # — silently corrupting the per-arm figures this lane now reports.
+        lora_step = workflow[workflow.index("- name: Run Krea Realtime real Wan LoRA gates") :]
+        lora_step = lora_step[: lora_step.index("- name: Report GPU fault evidence")]
+        self.assertIn('"$name" -- --exact --ignored --nocapture', lora_step)
+        self.assertEqual(lora_step.count("run_one real_wan_"), 2)
 
         script_path = REAL_WEIGHTS_WORKFLOW.parents[2] / "scripts" / "ci" / "gpu_fault_evidence.sh"
         script = script_path.read_text(encoding="utf-8")
@@ -1437,6 +1468,27 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             check=False,
         ).stdout.split(" ", 1)[0]
         self.assertEqual(mode, "100755")
+
+        # THE NAME OF THIS TEST HAS TO BE EARNED. Everything above is substring matching, which
+        # cannot tell a working predicate from a malformed one — and a malformed predicate fails
+        # the same silent way the story's inert one did: `log show` exits non-zero, the script's
+        # `else` branch prints "log show failed", the lane stays green, and the capture records
+        # nothing. So actually run it. macOS-only, and skipped rather than failed elsewhere: this
+        # suite also runs on the Linux and Windows lanes, where there is no unified log at all.
+        if sys.platform != "darwin":
+            self.skipTest("`log show` is macOS-only; predicate is validated on the macOS lanes")
+        predicate = re.search(r"--predicate '(.+?)' \\\n", code, re.DOTALL)
+        self.assertIsNotNone(predicate, "could not extract the predicate from the script")
+        probe = subprocess.run(
+            ["/usr/bin/log", "show", "--last", "1s", "--style", "compact",
+             "--predicate", predicate.group(1)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            probe.returncode, 0, f"the shipped predicate does not parse: {probe.stderr.strip()}"
+        )
 
     def test_krea_e2e_step_pins_its_run_count_and_excludes_the_s18_sweep(self) -> None:
         """sc-17276: the e2e step selects by `--ignored`, which is a blanket.

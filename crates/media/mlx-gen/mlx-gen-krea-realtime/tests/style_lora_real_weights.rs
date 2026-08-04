@@ -218,6 +218,13 @@ fn registry_t2v_i2v_v2v_routes_publish_the_real_adapter_report() {
 /// "the box was simply busy", and it is the number nobody has. It is printed rather than asserted
 /// on purpose: a threshold here would be an invented constant, and sc-17355 is explicit that one
 /// failure in two runs does not yet justify changing anything.
+///
+/// `reset_peak_memory()` is a PROCESS-GLOBAL MLX mutation, not a per-test one, so this is only
+/// sound while each test here owns its process. The real-weight lane guarantees that by invoking
+/// `cargo test … "$name" -- --exact` once per test rather than selecting both in one run — if that
+/// ever collapses into a single invocation, libtest's default thread pool would run the two tests
+/// concurrently and each would rebase the other's high-water mid-render. `test_ci_workflow_policy`
+/// pins the per-test invocation for exactly this reason.
 fn render(adapters: Vec<AdapterSpec>, req: &GenerationRequest, label: &str) -> Vec<Image> {
     use mlx_rs::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
 

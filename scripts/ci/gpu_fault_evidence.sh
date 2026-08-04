@@ -61,6 +61,13 @@ set -u
 
 STATE_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gpu-fault-evidence"
 SAMPLER_PID_FILE="$STATE_DIR/sampler.pid"
+# A SECOND copy of the pid outside `$RUNNER_TEMP`, and it is not redundant. `$RUNNER_TEMP` is
+# wiped between jobs, so a job cancelled before `report` leaves a sampler reparented to init with
+# its only pid record deleted -- unkillable by the next job, sampling for the rest of its bound on
+# a box whose whole hypothesis is resource pressure. Raising the bound for the sweep lane widens
+# that window, so the reaper is a precondition for the longer bound, not a nicety. `/tmp` survives
+# the job boundary and is per-machine, which is exactly the scope a cross-job reaper needs.
+ORPHAN_PID_FILE="/tmp/sceneworks-gpu-fault-evidence-sampler.pid"
 MEM_CSV="$STATE_DIR/memory.csv"
 START_FILE="$STATE_DIR/started-at"
 
@@ -79,10 +86,12 @@ start() {
   # Idempotent: a re-run of this step (a retried job reuses `$RUNNER_TEMP`) would otherwise leave
   # the first sampler running and orphaned -- two writers on one CSV, and only one of them killable
   # by `report`.
-  if [ -f "$SAMPLER_PID_FILE" ]; then
-    kill "$(cat "$SAMPLER_PID_FILE" 2>/dev/null)" 2>/dev/null
-    rm -f "$SAMPLER_PID_FILE"
-  fi
+  for stale in "$SAMPLER_PID_FILE" "$ORPHAN_PID_FILE"; do
+    if [ -f "$stale" ]; then
+      kill "$(cat "$stale" 2>/dev/null)" 2>/dev/null
+      rm -f "$stale"
+    fi
+  done
   now_local > "$START_FILE" 2>/dev/null || return 0
 
   # 1 Hz `vm_stat` is ~nothing next to a 14B render, and it is the only record of the machine
@@ -109,10 +118,15 @@ start() {
   # compressor filling and swap being written. Measured on nax-macos while a real-weight lane ran:
   # 62 GiB compressed and 29 GiB of 30 GiB swap in use. A record without those two columns cannot
   # distinguish a box with headroom from one that is out of it.
+  #
+  # A WALL-CLOCK DEADLINE, not an iteration count. The loop body is `vm_stat` + `ps` + `sysctl` +
+  # `awk` + `sleep 1`, which measures ~1.03 s, so counting iterations would silently overrun the
+  # intended bound by ~3% -- and under the memory pressure this exists to observe, the body slows
+  # down and the drift grows exactly when the number matters. `max_seconds` has to mean seconds.
+  deadline=$(( $(date +%s) + max_seconds ))
   (
     echo "iso,active_gib,wired_gib,compressed_gib,free_gib,swap_used_gib,max_rss_gib"
-    i=0
-    while [ "$i" -lt "$max_seconds" ]; do
+    while [ "$(date +%s)" -lt "$deadline" ]; do
       vm_stat | awk -v stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
                     -v rss="$(ps -Ao rss= | sort -rn | head -1)" \
                     -v swap="$(sysctl -n vm.swapusage 2>/dev/null)" -F: '
@@ -140,21 +154,23 @@ start() {
           printf "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
             stamp, active * gib, wired * gib, comp * gib, free * gib, used_gib, (rss + 0) / 1048576
         }'
-      i=$((i + 1))
       sleep 1
     done
   ) > "$MEM_CSV" 2>/dev/null < /dev/null &
   echo $! > "$SAMPLER_PID_FILE" 2>/dev/null
+  echo $! > "$ORPHAN_PID_FILE" 2>/dev/null
 
   echo "gpu-fault evidence: sampling from $(cat "$START_FILE" 2>/dev/null) for up to ${max_seconds}s (pid $(cat "$SAMPLER_PID_FILE" 2>/dev/null))"
   return 0
 }
 
 report() {
-  if [ -f "$SAMPLER_PID_FILE" ]; then
-    kill "$(cat "$SAMPLER_PID_FILE")" 2>/dev/null
-    rm -f "$SAMPLER_PID_FILE"
-  fi
+  for pidfile in "$SAMPLER_PID_FILE" "$ORPHAN_PID_FILE"; do
+    if [ -f "$pidfile" ]; then
+      kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
+      rm -f "$pidfile"
+    fi
+  done
 
   echo "== memory trajectory =="
   if [ -s "$MEM_CSV" ]; then
@@ -172,7 +188,34 @@ report() {
         if (n) printf "samples %d  peak active %.2f GiB  peak wired %.2f GiB  peak compressed %.2f GiB  peak swap-used %.2f GiB  peak single-process RSS %.2f GiB\n", n, pa, pw, pc, ps, pr
         else print "no samples recorded"
       }' "$MEM_CSV"
-    echo "-- last 30 samples --"
+    # HOW OLD IS THE TAIL. The sampler is bounded, so on a lane that outruns its bound the last
+    # sample predates the failure by hours -- and 30 rows of calm numbers under the heading
+    # "memory trajectory" would then read as the state AT the failure. Silence about the gap is
+    # the same defect as an empty capture reading as evidence of absence, so state the age.
+    #
+    # `date -j -f`, NOT awk. macOS ships BWK awk, which has no `systime`/`mktime` — those are gawk
+    # extensions, and calling them here failed with "calling undefined function systime", swallowed
+    # by the `2>/dev/null` that guards the parse. The warning would then never fire: exactly the
+    # silently-inert instrument this whole change exists to stop shipping.
+    last_stamp="$(tail -1 "$MEM_CSV" | cut -d, -f1)"
+    last_epoch="$(TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%SZ' "$last_stamp" '+%s' 2>/dev/null)"
+    if [ -n "$last_epoch" ]; then
+      age=$(( $(date +%s) - last_epoch ))
+    else
+      age=""
+    fi
+    case "$age" in
+      "" | *[!0-9-]*) echo "-- last 30 samples (last at $last_stamp) --" ;;
+      *)
+        if [ "$age" -gt 120 ]; then
+          echo "-- last 30 samples — WARNING: sampling STOPPED ${age}s ago, before this report."
+          echo "   The rows below are NOT the state at the end of this job; the sampler hit its"
+          echo "   bound (see 'start <max_seconds>'). Raise the bound for this lane. --"
+        else
+          echo "-- last 30 samples (last at $last_stamp, ${age}s ago) --"
+        fi
+        ;;
+    esac
     tail -30 "$MEM_CSV"
   else
     echo "no memory samples — 'start' did not run, or the sampler could not write to $MEM_CSV"
@@ -191,6 +234,10 @@ report() {
     # "IOGPU" -- so without this clause the query matches itself and every run reports one
     # spurious hit. A reader scanning for "did anything GPU-ish happen" would find something
     # every time, which is the same as finding nothing.
+    # COST. `log show` scans the archive for the whole window: measured on nax-macos, ~81 s for a
+    # 1-hour window and ~134 s for 5 hours. That is charged once, at the end, to a lane that runs
+    # 28 min to 4.3 h -- acceptable, and the reason this is not run repeatedly or per-step. No
+    # `--end` is passed: the window must reach the failure, which is at the end by definition.
     events="$STATE_DIR/gpu-events.txt"
     if /usr/bin/log show \
       --start "$(cat "$START_FILE")" \
@@ -199,19 +246,69 @@ report() {
       > "$events" 2>/dev/null
     then
       total="$(wc -l < "$events" | tr -d ' ')"
-      echo "$total matching event line(s)"
-      # BOTH ends, never `head` alone. `log show` prints chronologically, and the two things worth
-      # reading sit at opposite ends: the FIRST fault (which is the whole point -- the cascade names
-      # no cause) is early, while the failure being explained is at the very end of a ~28-minute
-      # job. Truncating from the top would keep the earliest events and discard the failure; from
-      # the bottom, the reverse. This box logs unrelated IOGPU device-open faults from system
-      # daemons several times a day, so overflowing a cap is realistic, not theoretical.
-      if [ "$total" -le 300 ]; then
-        cat "$events"
+      echo "$total matching event line(s) — full list in the uploaded artifact"
+
+      # PARTITIONED, NOT TRUNCATED, and this is the whole difference between a useful record and
+      # a decorative one. A positional head/tail split does not survive this predicate: measured
+      # over a 5-hour window on nax-macos it matched 5,976 lines, of which a single kill event
+      # contributes hundreds of `killing_idle_process` rows -- while the GPU lines that are the
+      # actual subject numbered THREE. Any head/tail window lands entirely inside the memorystatus
+      # burst and elides all three. The classes therefore get different treatment: the GPU class
+      # is small and always printed in full, the memory class is summarised down to the lines that
+      # name a mechanism.
+      gpu="$STATE_DIR/gpu-class.txt"
+      grep -E 'IOGPU|kIOGPU|[Cc]ommand [Bb]uffer|[Gg]pu [Rr]estart|AGX' "$events" > "$gpu" 2>/dev/null
+      gpu_n="$(wc -l < "$gpu" | tr -d ' ')"
+      echo
+      echo "-- GPU / command-buffer class: $gpu_n line(s) (printed in full — this is the subject) --"
+      if [ "$gpu_n" -gt 0 ]; then cat "$gpu"; else echo "(none)"; fi
+
+      # The memory class is the CONTEXT for a GPU fault, not the fault, so it is summarised: the
+      # decisive lines are the ones naming a mechanism (`System is unhealthy`, `compressor_...`,
+      # `killing due to`), and the per-victim `killing_idle_process` rows are a count.
+      mem="$STATE_DIR/mem-class.txt"
+      grep -E 'memorystatus|jetsam' "$events" > "$mem" 2>/dev/null
+      mem_n="$(wc -l < "$mem" | tr -d ' ')"
+      echo
+      echo "-- kernel memory-pressure class: $mem_n line(s) --"
+      if [ "$mem_n" -gt 0 ]; then
+        echo "   victims killed: $(grep -c 'killing_idle_process\|killing_specific_process' "$mem" | tr -d ' ')"
+        # PRINTED UNCONDITIONALLY, ahead of the histogram. These are the lines that name a
+        # mechanism -- `System is unhealthy`, `{"compressor_exhausted": 1, ...}`, `swap_exhausted`
+        # -- and they are RARE (one per pressure episode), so in a count-ordered top-25 they lose
+        # to hundreds of routine `skipping idle but not idle-exitable` rows and fall off the end.
+        # Rarity is the opposite of unimportance here: this is the kernel stating the cause.
+        echo "   mechanism:"
+        grep -hE 'System is unhealthy|compressor_exhausted|swap_exhausted|zone_map_is_exhausted' "$mem" \
+          | sed 's/^\([0-9-]* [0-9:.]*\).*\(memorystatus[^ ]*:.*\)$/     \1  \2/' \
+          | sort -u | head -12
+        echo "   most frequent:"
+        # A HISTOGRAM OVER DIGIT-NORMALISED MESSAGES, and both halves of that are needed.
+        #
+        # `sort -u` does not deduplicate these at all: every line carries its own timestamp, so a
+        # whole-line uniq keeps all 605 copies of the identical `killing due to
+        # "vm-compressor-space-shortage"`. Stripping the `TIME Ty process[pid:tid]` prefix fixes
+        # that one, but not the per-victim rows -- `killing_idle_process pid 21150 [CoreSpeechXPC]
+        # … 3120KB` is unique per victim, so several hundred of them each count 1 and bury the
+        # aggregate. Collapsing digit runs makes one class of "the kernel killed a daemon", which
+        # is the fact worth reading; one representative line is kept so the shape stays legible.
+        #
+        # Sorted by COUNT, not by time: at 4,875 lines the question is "what dominated", and the
+        # first-seen stamp carried alongside preserves the ordering that matters for a cascade.
+        awk '{
+            msg = ""
+            for (i = 5; i <= NF; i++) msg = msg (i > 5 ? " " : "") $i
+            key = msg
+            gsub(/[0-9]+/, "N", key)
+            if (!(key in count)) { first[key] = $1 " " $2; sample[key] = msg }
+            count[key]++
+          }
+          END {
+            for (k in count)
+              printf "%6d x  first %s  %s\n", count[k], first[k], substr(sample[k], 1, 140)
+          }' "$mem" | sort -rn | head -25
       else
-        head -120 "$events"
-        echo "... $((total - 240)) line(s) elided ..."
-        tail -120 "$events"
+        echo "(none)"
       fi
     else
       echo "log show failed — no GPU event record for this run"

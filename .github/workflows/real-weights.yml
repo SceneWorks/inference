@@ -1756,6 +1756,24 @@ jobs:
         if: always()
         continue-on-error: true
         run: scripts/ci/gpu_fault_evidence.sh report
+      # THIS is the lane that failed (run 30869410054), so it is the lane whose raw record has to
+      # survive. The step above prints a summary; the full event list and the whole 1 Hz CSV are
+      # what a diagnosis actually needs, and `$RUNNER_TEMP` is wiped when the job ends.
+      #
+      # `if-no-files-found: warn`, NOT `error`: these files are produced by a `continue-on-error`
+      # step by design, so their absence is already a tolerated outcome — failing the upload on it
+      # would hand a record-keeping path the power to red a real-weight lane, which is the one
+      # thing this whole mechanism must not do.
+      - name: Upload GPU fault evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: krea-realtime-gpu-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/gpu-fault-evidence/memory.csv
+            ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
 
   # sc-17276 — the sc-15127/sc-15571 S18 coherence sweep, split out of the regression lane above.
   #
@@ -1887,6 +1905,7 @@ jobs:
             ${{ runner.temp }}/s18-cells.tsv
             ${{ runner.temp }}/s18-sweep.log
             ${{ runner.temp }}/gpu-fault-evidence/memory.csv
+            ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
 
   # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
