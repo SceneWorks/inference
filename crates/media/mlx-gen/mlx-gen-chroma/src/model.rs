@@ -132,8 +132,8 @@ fn resolve_root(variant: ChromaVariant, spec: &LoadSpec) -> Result<&Path> {
 fn load_text_only(variant: ChromaVariant, spec: &LoadSpec) -> Result<ChromaTextOwned> {
     let root = resolve_root(variant, spec)?;
     let mut t5 = loader::load_t5_encoder(root)?;
-    if spec.quantize.is_some() {
-        loader::quantize_t5_for_dense_source(&mut t5)?;
+    if let Some(q) = spec.quantize {
+        loader::quantize_t5_for_dense_source(&mut t5, q.bits())?;
     }
     Ok(ChromaTextOwned {
         tokenizer: loader::load_tokenizer()?,
@@ -164,7 +164,7 @@ fn load_heavy(variant: ChromaVariant, spec: &LoadSpec, load_pid: bool) -> Result
     // with `spec.quantize` is packed in place for byte-identical converter/load-time behavior.
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
-        loader::quantize_vae_for_dense_source(&mut vae)?;
+        loader::quantize_vae_for_dense_source(&mut vae, q.bits())?;
     }
     // Install LoRA/LoKr adapters AFTER quantization (forward-time residual over the quantized base;
     // sc-3842). No-op when empty; any unmatched target errors loudly (never silently dropped).

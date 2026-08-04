@@ -8,9 +8,7 @@ use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
-use mlx_rs::ops::{
-    add, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis, subtract,
-};
+use mlx_rs::ops::{add, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis};
 use mlx_rs::{Array, Dtype};
 
 pub struct FluxTextEncoders {
@@ -38,28 +36,7 @@ enum TokenEmbedding {
         biases: Array,
         group_size: i32,
         bits: i32,
-        residual: Option<PackedTerm>,
     },
-}
-
-struct PackedTerm {
-    wq: Array,
-    scales: Array,
-    biases: Array,
-    group_size: i32,
-    bits: i32,
-}
-
-fn validate_t5_group_size(group_size: i32) -> Result<()> {
-    // T5's relative-attention-bias table has logical width 64. Group 128 is valid for MLX affine
-    // quantization generally, but cannot pack that table and would violate complete-surface parity.
-    if matches!(group_size, 32 | 64) {
-        Ok(())
-    } else {
-        Err(Error::Msg(format!(
-            "T5 quantization group size must be 32 or 64, got {group_size}"
-        )))
-    }
 }
 
 impl TokenEmbedding {
@@ -80,7 +57,6 @@ impl TokenEmbedding {
                 biases: w.require(&format!("{base}.biases"))?.clone(),
                 group_size,
                 bits,
-                residual: load_packed_term(w, &format!("{base}.residual"), group_size)?,
             });
         }
         Ok(Self::Dense(w.require(&format!("{base}.weight"))?.clone()))
@@ -95,24 +71,11 @@ impl TokenEmbedding {
                 biases,
                 group_size,
                 bits,
-                residual,
             } => {
                 let pw = wq.take_axis(ids, 0)?;
                 let sc = scales.take_axis(ids, 0)?;
                 let bi = biases.take_axis(ids, 0)?;
-                let primary = dequantize(&pw, &sc, &bi, *group_size, *bits)?;
-                match residual {
-                    Some(residual) => {
-                        let rw = residual.wq.take_axis(ids, 0)?;
-                        let rs = residual.scales.take_axis(ids, 0)?;
-                        let rb = residual.biases.take_axis(ids, 0)?;
-                        add(
-                            &primary,
-                            &dequantize(&rw, &rs, &rb, residual.group_size, residual.bits)?,
-                        )?
-                    }
-                    None => primary,
-                }
+                dequantize(&pw, &sc, &bi, *group_size, *bits)?
             }
         };
         // Return the native (bf16) embedding to match the mflux reference (sc-2787). CLIP genuinely
@@ -138,57 +101,10 @@ impl TokenEmbedding {
                 biases,
                 group_size,
                 bits,
-                residual: None,
             };
         }
         Ok(())
     }
-
-    fn quantize_progressive(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        group_size: i32,
-    ) -> Result<()> {
-        if let Self::Dense(w) = self {
-            let wbf16 = w.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-            let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
-            let residual = subtract(&wbf16, &restored)?;
-            let (residual_wq, residual_scales, residual_biases) =
-                quantize(&residual, group_size, residual_bits)?;
-            *self = Self::Quantized {
-                wq,
-                scales,
-                biases,
-                group_size,
-                bits,
-                residual: Some(PackedTerm {
-                    wq: residual_wq,
-                    scales: residual_scales,
-                    biases: residual_biases,
-                    group_size,
-                    bits: residual_bits,
-                }),
-            };
-        }
-        Ok(())
-    }
-}
-
-fn load_packed_term(w: &Weights, base: &str, group_size: i32) -> Result<Option<PackedTerm>> {
-    let Some(scales) = w.get(&format!("{base}.scales")) else {
-        return Ok(None);
-    };
-    let wq = w.require(&format!("{base}.weight"))?.clone();
-    let bits = mlx_gen::quant::packed_bits(&wq, scales, group_size)?;
-    Ok(Some(PackedTerm {
-        wq,
-        scales: scales.clone(),
-        biases: w.require(&format!("{base}.biases"))?.clone(),
-        group_size,
-        bits,
-    }))
 }
 
 pub struct ClipTextEncoder {
@@ -394,90 +310,23 @@ impl ClipMlp {
     }
 }
 
-struct T5Linear {
-    primary: AdaptableLinear,
-    residual: Option<AdaptableLinear>,
-}
-
-impl T5Linear {
-    fn from_weights(w: &Weights, base: &str, group_size: i32) -> Result<Self> {
-        let primary = mlx_gen::quant::lin(w, base, false, group_size)?;
-        let residual = load_packed_term(w, &format!("{base}.residual"), group_size)?.map(|term| {
-            AdaptableLinear::from_quantized_parts(
-                term.wq,
-                term.scales,
-                term.biases,
-                None,
-                term.group_size,
-                term.bits,
-            )
-        });
-        Ok(Self { primary, residual })
-    }
-
-    fn forward(&self, hidden: &Array) -> Result<Array> {
-        let primary = self.primary.forward(hidden)?;
-        match &self.residual {
-            Some(residual) => Ok(add(&primary, &residual.forward(hidden)?)?),
-            None => Ok(primary),
-        }
-    }
-
-    fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
-        self.primary.quantize(bits, Some(group_size))
-    }
-
-    fn quantize_progressive(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        group_size: i32,
-    ) -> Result<()> {
-        if self.residual.is_some() {
-            return Ok(());
-        }
-        let Some((weight, bias)) = self.primary.dense_weight() else {
-            return Err(Error::Msg(
-                "T5 progressive quantization requires a dense source weight".into(),
-            ));
-        };
-        if bias.is_some() {
-            return Err(Error::Msg(
-                "T5 progressive quantization does not support biased linears".into(),
-            ));
-        }
-        let wbf16 = weight.as_dtype(Dtype::Bfloat16)?;
-        let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-        let restored = dequantize(&wq, &scales, &biases, group_size, bits)?;
-        let residual = subtract(&wbf16, &restored)?;
-        let (residual_wq, residual_scales, residual_biases) =
-            quantize(&residual, group_size, residual_bits)?;
-        self.primary =
-            AdaptableLinear::from_quantized_parts(wq, scales, biases, None, group_size, bits);
-        self.residual = Some(AdaptableLinear::from_quantized_parts(
-            residual_wq,
-            residual_scales,
-            residual_biases,
-            None,
-            group_size,
-            residual_bits,
-        ));
-        Ok(())
-    }
-}
-
 pub struct T5TextEncoder {
     shared: TokenEmbedding,
     blocks: Vec<T5Block>,
     final_ln_w: Array,
 }
 
-/// A residual sublayer that may remain at source precision while the rest of T5's Linear surface
-/// is quantized. Chroma uses this to calibrate the smallest quality-preserving packed policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum T5Sublayer {
-    Attention,
-    FeedForward,
+/// T5's relative-attention-bias table has logical width 64, so group 128 — valid for MLX affine
+/// quantization in general — cannot pack it and would leave a hole in the packed surface. Only 32
+/// and 64 are admissible here.
+pub(crate) fn validate_t5_group_size(group_size: i32) -> Result<()> {
+    if matches!(group_size, 32 | 64) {
+        Ok(())
+    } else {
+        Err(Error::Msg(format!(
+            "T5 quantization group size must be 32 or 64, got {group_size}"
+        )))
+    }
 }
 
 impl T5TextEncoder {
@@ -485,9 +334,9 @@ impl T5TextEncoder {
         Self::from_weights_with_group_size(w, prefix, GROUP_SIZE)
     }
 
-    /// Load T5 with the group size declared by its packed component manifest. Dense FLUX callers
-    /// retain the default group size; Chroma uses this seam for its independently calibrated T5
-    /// artifacts.
+    /// Load T5 at the affine group size its packed component declares. FLUX keeps the codebase
+    /// default; Chroma publishes group 32, which measurably halves packed-T5 render error versus 64
+    /// at the same Q8 width, so its artifacts are self-describing rather than assumed.
     pub fn from_weights_with_group_size(
         w: &Weights,
         prefix: &str,
@@ -514,162 +363,13 @@ impl T5TextEncoder {
         self.quantize_with_group_size(bits, GROUP_SIZE)
     }
 
-    /// Quantize the complete packable T5 surface at an explicit MLX affine group size.
+    /// Pack the complete quantizable T5 surface at an explicit affine group size. Byte-identical to
+    /// what the offline converter writes at the same `(bits, group_size)`.
     pub fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
         validate_t5_group_size(group_size)?;
         self.shared.quantize_with_group_size(bits, group_size)?;
         for block in &mut self.blocks {
             block.quantize(bits, group_size)?;
-        }
-        Ok(())
-    }
-
-    /// Quantize the complete packable T5 surface as a primary affine pack plus a packed residual.
-    /// Both terms remain quantized at runtime; the second term improves fidelity without restoring
-    /// any dense T5 weight or load-time dense transient.
-    pub fn quantize_progressive(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        group_size: i32,
-    ) -> Result<()> {
-        self.quantize_progressive_with_sensitive_residuals(
-            bits,
-            residual_bits,
-            residual_bits,
-            group_size,
-        )
-    }
-
-    /// Progressively quantize the complete packable T5 surface while giving the shared token
-    /// embedding and relative-position bias an independently selected residual width. Those two
-    /// boundary tables are reused across the full residual stream, so providers can spend a small
-    /// Q8 correction there while retaining Q4 residuals for the large attention/FFN projections.
-    pub fn quantize_progressive_with_sensitive_residuals(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        group_size: i32,
-    ) -> Result<()> {
-        self.quantize_progressive_with_sensitive_sublayer_residuals(
-            bits,
-            residual_bits,
-            sensitive_residual_bits,
-            group_size,
-            None,
-        )
-    }
-
-    /// Progressively quantize T5 while additionally giving one attention or feed-forward block
-    /// the sensitive residual width. This keeps every source weight packed and provides a narrow
-    /// calibration seam for providers whose strict end-to-end quality gate needs more precision
-    /// than the shared embedding and relative-position bias alone.
-    pub fn quantize_progressive_with_sensitive_sublayer_residuals(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        group_size: i32,
-        sensitive_sublayer: Option<(usize, T5Sublayer)>,
-    ) -> Result<()> {
-        match sensitive_sublayer {
-            Some(selected) => self.quantize_progressive_with_sensitive_sublayers_residuals(
-                bits,
-                residual_bits,
-                sensitive_residual_bits,
-                group_size,
-                &[selected],
-            ),
-            None => self.quantize_progressive_with_sensitive_sublayers_residuals(
-                bits,
-                residual_bits,
-                sensitive_residual_bits,
-                group_size,
-                &[],
-            ),
-        }
-    }
-
-    /// Progressively quantize T5 while giving a calibrated set of attention or feed-forward
-    /// sublayers the sensitive residual width. Selections change only packed residual widths; they
-    /// never retain a dense source projection.
-    pub fn quantize_progressive_with_sensitive_sublayers_residuals(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        group_size: i32,
-        sensitive_sublayers: &[(usize, T5Sublayer)],
-    ) -> Result<()> {
-        validate_t5_group_size(group_size)?;
-        if !matches!(bits, 4 | 8)
-            || !matches!(residual_bits, 4 | 8)
-            || !matches!(sensitive_residual_bits, 4 | 8)
-        {
-            return Err(Error::Msg(format!(
-                "T5 progressive quantization widths must be Q4 or Q8, got Q{bits} + Q{residual_bits}/Q{sensitive_residual_bits} residuals"
-            )));
-        }
-        for &(block, _) in sensitive_sublayers {
-            if block >= self.blocks.len() {
-                return Err(Error::Msg(format!(
-                    "T5 sensitive-residual block {block} is outside 0..{}",
-                    self.blocks.len()
-                )));
-            }
-        }
-        self.shared
-            .quantize_progressive(bits, sensitive_residual_bits, group_size)?;
-        for (index, block) in self.blocks.iter_mut().enumerate() {
-            let attention_is_sensitive =
-                sensitive_sublayers.contains(&(index, T5Sublayer::Attention));
-            let feed_forward_is_sensitive =
-                sensitive_sublayers.contains(&(index, T5Sublayer::FeedForward));
-            block.quantize_progressive(
-                bits,
-                residual_bits,
-                sensitive_residual_bits,
-                group_size,
-                attention_is_sensitive,
-                feed_forward_is_sensitive,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Quantize the large attention/FFN Linear surface while retaining the token-embedding and
-    /// relative-position-bias tables at their source precision. Chroma uses this sensitivity-
-    /// calibration policy for its packed auxiliary artifacts; hosted evidence determines whether
-    /// retaining those two boundary tables sufficiently reduces perturbation through the 24-layer
-    /// residual stream while the packed Linear surface removes the full dense-T5 residency.
-    pub fn quantize_linears(&mut self, bits: i32) -> Result<()> {
-        for block in &mut self.blocks {
-            block.quantize_linears(bits)?;
-        }
-        Ok(())
-    }
-
-    /// Quantize every attention/FFN Linear except one explicitly selected residual sublayer.
-    ///
-    /// This is the narrow calibration seam used by Chroma's real-weight sensitivity sweep. The
-    /// caller must mirror the selected dense sublayer in any packed artifact predicate before the
-    /// policy can ship.
-    pub fn quantize_linears_except(
-        &mut self,
-        bits: i32,
-        dense_block: usize,
-        dense_sublayer: T5Sublayer,
-    ) -> Result<()> {
-        if dense_block >= self.blocks.len() {
-            return Err(Error::Msg(format!(
-                "T5 dense carve-out block {dense_block} is outside 0..{}",
-                self.blocks.len()
-            )));
-        }
-        for (index, block) in self.blocks.iter_mut().enumerate() {
-            block
-                .quantize_linears_except(bits, (index == dense_block).then_some(dense_sublayer))?;
         }
         Ok(())
     }
@@ -717,67 +417,18 @@ impl T5Block {
     }
 
     fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
-        self.attn.quantize_with_group_size(bits, group_size)?;
-        self.ff.quantize_with_group_size(bits, group_size)?;
-        Ok(())
-    }
-
-    fn quantize_progressive(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        sensitive_residual_bits: i32,
-        group_size: i32,
-        attention_is_sensitive: bool,
-        feed_forward_is_sensitive: bool,
-    ) -> Result<()> {
-        let attention_residual_bits = if attention_is_sensitive {
-            sensitive_residual_bits
-        } else {
-            residual_bits
-        };
-        let feed_forward_residual_bits = if feed_forward_is_sensitive {
-            sensitive_residual_bits
-        } else {
-            residual_bits
-        };
-        self.attn.quantize_progressive(
-            bits,
-            attention_residual_bits,
-            sensitive_residual_bits,
-            group_size,
-        )?;
-        self.ff
-            .quantize_progressive(bits, feed_forward_residual_bits, group_size)
-    }
-
-    fn quantize_linears(&mut self, bits: i32) -> Result<()> {
-        self.attn.quantize_linears(bits)?;
-        self.ff.quantize(bits)?;
-        Ok(())
-    }
-
-    fn quantize_linears_except(
-        &mut self,
-        bits: i32,
-        dense_sublayer: Option<T5Sublayer>,
-    ) -> Result<()> {
-        if dense_sublayer != Some(T5Sublayer::Attention) {
-            self.attn.quantize_linears(bits)?;
-        }
-        if dense_sublayer != Some(T5Sublayer::FeedForward) {
-            self.ff.quantize(bits)?;
-        }
+        self.attn.quantize(bits, group_size)?;
+        self.ff.quantize(bits, group_size)?;
         Ok(())
     }
 }
 
 struct T5Attention {
     ln_w: Array,
-    q: T5Linear,
-    k: T5Linear,
-    v: T5Linear,
-    o: T5Linear,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     rel_bias: TokenEmbedding,
 }
 
@@ -785,9 +436,10 @@ impl T5Attention {
     fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
         let linear = |name: &str| {
-            T5Linear::from_weights(
+            mlx_gen::quant::lin(
                 w,
                 &join(prefix, &format!("SelfAttention.{name}")),
+                false,
                 group_size,
             )
         };
@@ -837,57 +489,31 @@ impl T5Attention {
         Ok(values.transpose_axes(&[2, 0, 1])?.expand_dims(0)?)
     }
 
-    fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
-        self.q.quantize(bits, group_size)?;
-        self.k.quantize(bits, group_size)?;
-        self.v.quantize(bits, group_size)?;
-        self.o.quantize(bits, group_size)?;
+    fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.q.quantize(bits, Some(group_size))?;
+        self.k.quantize(bits, Some(group_size))?;
+        self.v.quantize(bits, Some(group_size))?;
+        self.o.quantize(bits, Some(group_size))?;
         self.rel_bias.quantize_with_group_size(bits, group_size)?;
-        Ok(())
-    }
-
-    fn quantize_progressive(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        relative_bias_residual_bits: i32,
-        group_size: i32,
-    ) -> Result<()> {
-        self.q
-            .quantize_progressive(bits, residual_bits, group_size)?;
-        self.k
-            .quantize_progressive(bits, residual_bits, group_size)?;
-        self.v
-            .quantize_progressive(bits, residual_bits, group_size)?;
-        self.o
-            .quantize_progressive(bits, residual_bits, group_size)?;
-        self.rel_bias
-            .quantize_progressive(bits, relative_bias_residual_bits, group_size)
-    }
-
-    fn quantize_linears(&mut self, bits: i32) -> Result<()> {
-        self.q.quantize(bits, GROUP_SIZE)?;
-        self.k.quantize(bits, GROUP_SIZE)?;
-        self.v.quantize(bits, GROUP_SIZE)?;
-        self.o.quantize(bits, GROUP_SIZE)?;
         Ok(())
     }
 }
 
 struct T5FeedForward {
     ln_w: Array,
-    wi0: T5Linear,
-    wi1: T5Linear,
-    wo: T5Linear,
+    wi0: AdaptableLinear,
+    wi1: AdaptableLinear,
+    wo: AdaptableLinear,
 }
 
 impl T5FeedForward {
     fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
         let linear = |name: &str| {
-            T5Linear::from_weights(
+            mlx_gen::quant::lin(
                 w,
                 &join(prefix, &format!("DenseReluDense.{name}")),
+                false,
                 group_size,
             )
         };
@@ -910,29 +536,11 @@ impl T5FeedForward {
         Ok(add(hidden, &ff)?)
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_with_group_size(bits, GROUP_SIZE)
-    }
-
-    fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
-        self.wi0.quantize(bits, group_size)?;
-        self.wi1.quantize(bits, group_size)?;
-        self.wo.quantize(bits, group_size)?;
+    fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.wi0.quantize(bits, Some(group_size))?;
+        self.wi1.quantize(bits, Some(group_size))?;
+        self.wo.quantize(bits, Some(group_size))?;
         Ok(())
-    }
-
-    fn quantize_progressive(
-        &mut self,
-        bits: i32,
-        residual_bits: i32,
-        group_size: i32,
-    ) -> Result<()> {
-        self.wi0
-            .quantize_progressive(bits, residual_bits, group_size)?;
-        self.wi1
-            .quantize_progressive(bits, residual_bits, group_size)?;
-        self.wo
-            .quantize_progressive(bits, residual_bits, group_size)
     }
 }
 
@@ -1012,15 +620,5 @@ mod tests {
         assert_eq!(relative_position_bucket(-1), 1);
         assert_eq!(relative_position_bucket(128), 31);
         assert_eq!(relative_position_bucket(-128), 15);
-    }
-
-    #[test]
-    fn t5_group_size_matches_mlx_affine_quantization_contract() {
-        for group_size in [32, 64] {
-            assert!(validate_t5_group_size(group_size).is_ok());
-        }
-        for group_size in [0, 16, 128, 256] {
-            assert!(validate_t5_group_size(group_size).is_err());
-        }
     }
 }

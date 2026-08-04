@@ -46,8 +46,27 @@ struct ArtifactFileIdentity {
     changed_nanoseconds: i64,
 }
 
+/// The pinned SNAPSHOT ENTRY, captured by `lstat` so a symlink is described as a symlink rather
+/// than silently followed. This is the path runtime loaders open ([`PinnedArtifact::loader_path`]);
+/// [`ArtifactFileIdentity`] describes what it resolves to. Mirrors `mlx-gen-flux`'s
+/// `artifact_inventory::SourceEntryIdentity`, which pins the same two-level shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceEntryIdentity {
+    absolute_path: PathBuf,
+    is_symlink: bool,
+    symlink_target: Option<PathBuf>,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct PinnedArtifact {
+    source: SourceEntryIdentity,
     identity: ArtifactFileIdentity,
     digest: String,
 }
@@ -59,8 +78,22 @@ impl PinnedArtifact {
         pinned_artifact(path.as_ref())
     }
 
-    pub(crate) fn canonical_path(&self) -> &Path {
-        &self.identity.canonical_path
+    /// Snapshot entry consumed by format-dispatching runtime loaders.
+    ///
+    /// mlx-rs selects the safetensors loader from the path EXTENSION: `SafeTensors::load_device`
+    /// rejects any path whose final component is not literally `*.safetensors` with
+    /// `IoError::UnsupportedFormat` ("Unsupported file format"). A Hugging Face cache stores each
+    /// file as an extensionless `blobs/<sha>` object and exposes it as a
+    /// `snapshots/<rev>/…/model.safetensors` SYMLINK, so canonicalizing the entry — which pinning
+    /// does, to resolve the identity — strips the extension. Opening that canonical blob is how
+    /// every HF-cached SenseNova load died with `backend op failed: Unsupported file format`.
+    ///
+    /// Runtime opens therefore use this pinned entry, never the canonical blob. That does not
+    /// weaken the pin: the entry, its symlink target, and the canonical file it resolves to are all
+    /// re-checked by [`ensure_unchanged`](Self::ensure_unchanged) on both sides of every open, so a
+    /// repointed symlink is rejected rather than followed.
+    pub(crate) fn loader_path(&self) -> &Path {
+        &self.source.absolute_path
     }
 
     pub(crate) fn digest(&self) -> &str {
@@ -68,6 +101,10 @@ impl PinnedArtifact {
     }
 
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
+        // Canonical-target check FIRST so an in-place replacement of a regular file keeps reporting
+        // "replaced or mutated" (the established message for that lane). The two entry-level checks
+        // below are what the canonical stat cannot see: when the entry is an HF symlink, re-statting
+        // the already-resolved blob describes the OLD target no matter where the link now points.
         let current = file_identity(&self.identity.canonical_path).map_err(|error| {
             CoreError::Msg(format!(
                 "sensenova: verified checkpoint is no longer readable: {error}"
@@ -78,17 +115,59 @@ impl PinnedArtifact {
                 "sensenova: verified checkpoint was replaced or mutated after load".to_owned(),
             ));
         }
+        let source = source_entry_identity(&self.source.absolute_path).map_err(|error| {
+            CoreError::Msg(format!(
+                "sensenova: pinned snapshot entry is no longer readable: {error}"
+            ))
+        })?;
+        if source != self.source {
+            return Err(CoreError::Msg(
+                "sensenova: pinned snapshot entry or symlink target changed after verification"
+                    .to_owned(),
+            ));
+        }
+        let resolved = file_identity(&self.source.absolute_path).map_err(|error| {
+            CoreError::Msg(format!(
+                "sensenova: pinned snapshot entry no longer resolves: {error}"
+            ))
+        })?;
+        if resolved != self.identity {
+            return Err(CoreError::Msg(
+                "sensenova: pinned snapshot entry resolves to a different canonical target"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
     pub(crate) fn open_weights(&self) -> mlx_gen::Result<mlx_gen::weights::Weights> {
         self.ensure_unchanged()
             .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
-        let weights = mlx_gen::weights::Weights::from_file(self.canonical_path())?;
+        let weights = mlx_gen::weights::Weights::from_file(self.loader_path())?;
         self.ensure_unchanged()
             .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
         Ok(weights)
     }
+}
+
+fn source_entry_identity(path: &Path) -> std::io::Result<SourceEntryIdentity> {
+    let absolute_path = std::path::absolute(path)?;
+    let metadata = std::fs::symlink_metadata(&absolute_path)?;
+    let is_symlink = metadata.file_type().is_symlink();
+    Ok(SourceEntryIdentity {
+        symlink_target: is_symlink
+            .then(|| std::fs::read_link(&absolute_path))
+            .transpose()?,
+        absolute_path,
+        is_symlink,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
@@ -160,16 +239,27 @@ fn hash_exact_file(identity: &ArtifactFileIdentity) -> Option<String> {
 
 fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
     loop {
-        let identity = file_identity(path).ok()?;
+        // Pin the ENTRY (lstat) and the object it resolves to (canonicalize) as one observation.
+        // The digest cache stays keyed on the resolved identity, so two snapshot entries backed by
+        // the same HF blob still coalesce onto one content hash.
+        let source = source_entry_identity(path).ok()?;
+        let identity = file_identity(&source.absolute_path).ok()?;
         let cache = digest_cache();
         let mut entries = cache.entries.lock().ok()?;
         match entries.get(&identity).cloned() {
             Some(DigestState::Ready(digest)) => {
                 drop(entries);
-                // A cache hit is useful only if the path still resolves to the exact same object.
-                // This closes the replacement race between the first stat and cache lookup.
-                if file_identity(path).ok()? == identity {
-                    return Some(PinnedArtifact { identity, digest });
+                // A cache hit is useful only if the entry AND the object it resolves to are still
+                // the ones just observed. This closes the replacement race between the first stat
+                // and the cache lookup.
+                if source_entry_identity(&source.absolute_path).ok().as_ref() == Some(&source)
+                    && file_identity(&source.absolute_path).ok()? == identity
+                {
+                    return Some(PinnedArtifact {
+                        source,
+                        identity,
+                        digest,
+                    });
                 }
             }
             Some(DigestState::Hashing) => {
@@ -180,7 +270,9 @@ fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
                 entries.insert(identity.clone(), DigestState::Hashing);
                 drop(entries);
                 let digest = hash_exact_file(&identity);
-                let unchanged = file_identity(path).ok().as_ref() == Some(&identity);
+                let unchanged = source_entry_identity(&source.absolute_path).ok().as_ref()
+                    == Some(&source)
+                    && file_identity(&source.absolute_path).ok().as_ref() == Some(&identity);
                 let mut entries = cache.entries.lock().ok()?;
                 entries.remove(&identity);
                 let result = if unchanged {
@@ -188,7 +280,11 @@ fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
                         entries
                             .retain(|cached, _| cached.canonical_path != identity.canonical_path);
                         entries.insert(identity.clone(), DigestState::Ready(digest.clone()));
-                        PinnedArtifact { identity, digest }
+                        PinnedArtifact {
+                            source,
+                            identity,
+                            digest,
+                        }
                     })
                 } else {
                     None
@@ -791,6 +887,114 @@ mod tests {
             .unwrap()
             .calibration
             .is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Write a minimal but VALID safetensors file (one 2-element F32 tensor). The fixtures above
+    /// write arbitrary bytes, which is enough for identity/digest assertions but cannot tell
+    /// "the loader rejected the PATH" apart from "the loader rejected the CONTENTS" — and the path
+    /// rejection is exactly what the two tests below pin.
+    fn write_minimal_safetensors(path: &Path) {
+        let mut header = br#"{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#.to_vec();
+        // safetensors keeps the tensor payload 8-byte aligned; pad the header with spaces (JSON
+        // insignificant whitespace) until the 8-byte length prefix plus header lands on a boundary.
+        while !(8 + header.len()).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&[0_u8; 8]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Build the Hugging Face cache shape: content in an extensionless `blobs/<sha>` object, exposed
+    /// as a `model.safetensors` symlink in a snapshot directory. Returns `(snapshot_dir, entry)`.
+    fn hf_cache_shape(root: &Path, blob_name: &str) -> (PathBuf, PathBuf) {
+        let blobs = root.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        write_minimal_safetensors(&blobs.join(blob_name));
+        let snapshot = root.join("snapshots/rev");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let entry = snapshot.join("model.safetensors");
+        std::os::unix::fs::symlink(Path::new("../../blobs").join(blob_name), &entry).unwrap();
+        (snapshot, entry)
+    }
+
+    /// An HF-cached checkpoint must LOAD, not merely verify.
+    ///
+    /// mlx-rs dispatches the safetensors loader on the path EXTENSION (`SafeTensors::load_device`
+    /// → `IoError::UnsupportedFormat`), and pinning canonicalizes, so the pinned canonical path is
+    /// the extensionless `blobs/<sha>` object. Opening THAT broke every HF-cached SenseNova load
+    /// with `backend op failed: Unsupported file format`, while every identity/digest assertion in
+    /// this module kept passing — raw byte hashing never reads an extension, which is precisely why
+    /// the existing coverage could not see it. `open_weights` must go through `loader_path`.
+    #[test]
+    fn hf_cached_blob_symlink_loads_through_the_extension_bearing_entry() {
+        let root = unique_root("hf-blob-symlink");
+        let (snapshot, entry) = hf_cache_shape(&root, FAST_Q8_ARTIFACT);
+
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot)).with_quant(Quant::Q8);
+        let artifact =
+            verified_artifact(&spec).expect("an HF blob symlink is still an exact single artifact");
+
+        assert_eq!(artifact.loader_path(), std::path::absolute(&entry).unwrap());
+        assert_eq!(
+            artifact
+                .loader_path()
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("safetensors"),
+            "mlx-rs dispatches the file format from this extension"
+        );
+        assert!(
+            artifact.identity.canonical_path.extension().is_none(),
+            "the canonical HF blob is extensionless — opening IT is the regression"
+        );
+
+        let weights = artifact
+            .open_weights()
+            .expect("an HF-cached checkpoint must load");
+        assert!(weights.keys().any(|key| key == "weight"));
+        artifact.ensure_unchanged().unwrap();
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Opening the ENTRY instead of the resolved blob must not weaken the pin.
+    ///
+    /// Re-statting the already-resolved canonical path cannot see a repointed symlink — the old
+    /// target is still there, unchanged — so pinning the entry is what keeps `loader_path` honest.
+    /// Both blobs stay on disk here precisely so the canonical check passes and the entry-level
+    /// check is the only thing standing between a repointed link and a different set of weights.
+    #[test]
+    fn repointed_snapshot_symlink_is_rejected_before_it_can_be_opened() {
+        let root = unique_root("hf-blob-repoint");
+        let (snapshot, entry) = hf_cache_shape(&root, FAST_Q8_ARTIFACT);
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot)).with_quant(Quant::Q8);
+        let artifact = verified_artifact(&spec).expect("initial pin");
+        artifact
+            .ensure_unchanged()
+            .expect("pin is valid before the repoint");
+
+        // A second, DIFFERENT blob; the originally-pinned one is deliberately left in place.
+        write_minimal_safetensors(&root.join("blobs").join(QUALITY_Q8_ARTIFACT));
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(Path::new("../../blobs").join(QUALITY_Q8_ARTIFACT), &entry)
+            .unwrap();
+
+        let error = artifact
+            .ensure_unchanged()
+            .expect_err("a repointed snapshot entry must fail closed");
+        assert!(
+            error.to_string().contains("symlink target changed")
+                || error.to_string().contains("different canonical target"),
+            "{error}"
+        );
+        assert!(
+            artifact.open_weights().is_err(),
+            "no load may proceed through a repointed entry"
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 
