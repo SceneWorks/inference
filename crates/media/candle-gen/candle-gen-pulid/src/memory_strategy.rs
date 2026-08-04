@@ -26,7 +26,50 @@ fn resident_component(
     id: &str,
     path: &std::path::Path,
 ) -> gen_core::Result<MemoryResidentComponent> {
-    let resident_bytes = gen_core::weightsmeta::safetensors_path_bytes(path);
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let resident_bytes = headers.into_iter().try_fold(0_u64, |total, tensor| {
+        let elements = tensor.shape.iter().try_fold(1_u64, |elements, &dimension| {
+            let dimension = u64::try_from(dimension).map_err(|_| {
+                gen_core::Error::Msg(format!(
+                    "{PROVIDER_ID}: {id} tensor {} has an unrepresentable shape",
+                    tensor.name
+                ))
+            })?;
+            elements.checked_mul(dimension).ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{PROVIDER_ID}: {id} tensor {} element count overflowed",
+                    tensor.name
+                ))
+            })
+        })?;
+        let stored_bytes = elements
+            .checked_mul(tensor.dtype.size() as u64)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{PROVIDER_ID}: {id} tensor {} stored byte count overflowed",
+                    tensor.name
+                ))
+            })?;
+        if stored_bytes != tensor.data_bytes {
+            return Err(gen_core::Error::Msg(format!(
+                "{PROVIDER_ID}: {id} tensor {} declares {} bytes but dtype/shape require {stored_bytes}",
+                tensor.name, tensor.data_bytes
+            )));
+        }
+        // These five checkpoints are materialized as F32 by their owning PuLID/EVA/face loaders.
+        // Price the tensors after that cast rather than the potentially smaller BF16/F16 file.
+        let loaded_bytes = elements.checked_mul(4).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{PROVIDER_ID}: {id} tensor {} F32 byte count overflowed",
+                tensor.name
+            ))
+        })?;
+        total.checked_add(loaded_bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{PROVIDER_ID}: {id} resident byte count overflowed"
+            ))
+        })
+    })?;
     if resident_bytes == 0 {
         return Err(gen_core::Error::Msg(format!(
             "{PROVIDER_ID}: resident identity component {id} has no loadable safetensors bytes at {}",
@@ -168,6 +211,26 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_typed_safetensors(
+        path: &std::path::Path,
+        dtype: &str,
+        elements: usize,
+        stored_bytes: usize,
+    ) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = format!(
+            r#"{{"weight":{{"dtype":"{dtype}","shape":[{elements}],"data_offsets":[0,{stored_bytes}]}}}}"#
+        )
+        .into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(vec![0_u8; stored_bytes]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn paths() -> PulidFluxPaths {
         let root = std::env::temp_dir().join(format!("pulid-memory-{}", std::process::id()));
         for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
@@ -267,5 +330,23 @@ mod tests {
             safety_check(&paths, &contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn resident_accounting_prices_loaded_f32_tensors_not_serialized_file_bytes() {
+        let root = std::env::temp_dir().join(format!("pulid-memory-dtypes-{}", std::process::id()));
+        for (name, dtype, elements, stored_bytes, expected_resident) in [
+            ("bf16.safetensors", "BF16", 3, 6, 12),
+            ("f16.safetensors", "F16", 5, 10, 20),
+            ("f32.safetensors", "F32", 7, 28, 28),
+        ] {
+            let path = root.join(name);
+            write_typed_safetensors(&path, dtype, elements, stored_bytes);
+            let component = resident_component(name, &path).unwrap();
+            assert_eq!(
+                component.resident_bytes, expected_resident,
+                "{dtype} must be priced at its actual F32 materialization"
+            );
+        }
     }
 }
