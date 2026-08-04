@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, PidWeights, PreviewSink, Progress, Quant};
+use candle_gen::gen_core::{GenerationMemory, Image, PidWeights, PreviewSink, Progress, Quant};
 // `LatentDecoder` brings the `PidDecoder::decode` trait method into scope (sc-8044).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -100,12 +101,15 @@ impl Default for Flux2ControlRequest {
 /// `generate` takes `&self` (no per-call mutation), so one load serves many renders.
 pub struct Flux2Control {
     pipe: Pipeline,
-    te: Flux2PromptEncoder,
+    te: Option<Flux2PromptEncoder>,
     /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
-    transformer: Flux2ControlTransformer,
-    vae: Flux2Vae,
+    transformer: Option<Flux2ControlTransformer>,
+    vae: Option<Flux2Vae>,
+    control_path: PathBuf,
+    quant: Option<Quant>,
+    memory: GenerationMemory,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
     /// FLUX.2 control composes the FLUX.2 VAE, so it loads the SAME `flux2` student ([`PID_BACKBONE`]) as
     /// the registered FLUX.2 provider.
@@ -118,6 +122,21 @@ impl Flux2Control {
     /// → quantized in place), and the VAE with its encoder. `quant` (Q4/Q8) is required in practice for
     /// the real 32B weights.
     pub fn load(paths: &Flux2ControlPaths, quant: Option<Quant>) -> Result<Self> {
+        Self::load_with_memory(paths, quant, GenerationMemory::default())
+    }
+
+    pub fn load_with_memory(
+        paths: &Flux2ControlPaths,
+        quant: Option<Quant>,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        let optimized =
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks;
+        if optimized && !memory.stage_residency {
+            return Err(CandleError::Msg(
+                "flux2 control: optimized memory rungs require staged residency".into(),
+            ));
+        }
         let device = candle_gen::default_device()?;
         // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
         // sc-7853); the control provider passes `None`.
@@ -127,18 +146,23 @@ impl Flux2Control {
         // (sc-9087, no ~105 GB dense CPU staging); dense tier → stage dense in CPU RAM and quantize each
         // projection onto the GPU. Shared TE+DiT loader with txt2img / edit (F-024, sc-9004); the control
         // branch overlay below (`Flux2ControlBranch` → `Flux2ControlTransformer`) is the per-site addition.
-        let (te, base) = pipe.load_te_and_dit()?;
+        let (te, transformer, vae) = if memory.stage_residency {
+            (None, None, None)
+        } else {
+            let (te, base) = pipe.load_te_and_dit()?;
 
-        // The control overlay is small (~8 GB bf16) and fits on the GPU; load it dense on-device and
-        // quantize in place (the 260-ch `control_img_in` stays dense — 260 ∤ 32).
-        let control_vb = control_var_builder(&paths.control, pipe.dtype, &device)?;
-        let mut branch = Flux2ControlBranch::new(&pipe.cfg, control_vb)?;
-        if let Some(q) = quant {
-            branch.quantize(q, &device)?;
-        }
-        let transformer = Flux2ControlTransformer::new(base, branch);
+            // The control overlay is small (~8 GB bf16) and fits on the GPU; load it dense on-device and
+            // quantize in place (the 260-ch `control_img_in` stays dense — 260 ∤ 32).
+            let control_vb = control_var_builder(&paths.control, pipe.dtype, &device)?;
+            let mut branch = Flux2ControlBranch::new(&pipe.cfg, control_vb)?;
+            if let Some(q) = quant {
+                branch.quantize(q, &device)?;
+            }
+            let transformer = Flux2ControlTransformer::new(base, branch);
 
-        let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
+            let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
+            (Some(te), Some(transformer), Some(vae))
+        };
         let tokenizer = pipe.build_tokenizer()?;
         Ok(Self {
             pipe,
@@ -146,8 +170,27 @@ impl Flux2Control {
             tokenizer,
             transformer,
             vae,
+            control_path: paths.control.clone(),
+            quant,
+            memory,
             pid: None,
         })
+    }
+
+    pub fn load_with_memory_context(
+        paths: &Flux2ControlPaths,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract(spec)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_context(&contract, context, quant)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let memory = contract
+            .generation_memory(&context.selection)
+            .unwrap_or_default();
+        Self::load_with_memory(paths, quant, memory)
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
@@ -193,13 +236,75 @@ impl Flux2Control {
         }
         validate_request(req)?;
 
+        if self.memory.stage_residency && req.use_pid {
+            return Err(CandleError::Msg(
+                "flux2 control: optimized native-VAE memory rungs do not support PiD".into(),
+            ));
+        }
+
         let device = &self.pipe.device;
         let cfg = &self.pipe.cfg;
 
         // Prompt embeds (text-only Mistral) + the packed 260-ch control context are seed-independent:
         // encode once.
-        let prompt_embeds = self.pipe.encode(&self.te, &self.tokenizer, &req.prompt)?;
-        let control_context = self.encode_control_context(control_image, req.width, req.height)?;
+        let prompt_embeds = if let Some(te) = self.te.as_ref() {
+            self.pipe.encode(te, &self.tokenizer, &req.prompt)?
+        } else {
+            candle_gen::check_cancel(&req.cancel)?;
+            let te = self.pipe.load_te_seq()?;
+            let result = self.pipe.encode(&te, &self.tokenizer, &req.prompt);
+            let result = candle_gen::synchronize_result(&self.pipe.device, result);
+            drop(te);
+            result?
+        };
+        let control_context = if let Some(vae) = self.vae.as_ref() {
+            self.encode_control_context(vae, control_image, req.width, req.height)?
+        } else {
+            candle_gen::check_cancel(&req.cancel)?;
+            let vae = Flux2Vae::new_with_encoder(self.pipe.component_vb("vae")?)?;
+            let result = self.encode_control_context(&vae, control_image, req.width, req.height);
+            let result = candle_gen::synchronize_result(&self.pipe.device, result);
+            drop(vae);
+            result?
+        };
+
+        let staged_transformer = if self.transformer.is_none() {
+            candle_gen::check_cancel(&req.cancel)?;
+            let base = self
+                .pipe
+                .load_dit_seq_with_memory(self.memory.stream_transformer_blocks)?;
+            let control_vb =
+                control_var_builder(&self.control_path, self.pipe.dtype, &self.pipe.device)?;
+            let mut branch = Flux2ControlBranch::new(&self.pipe.cfg, control_vb)?;
+            if let Some(quant) = self.quant {
+                branch.quantize(quant, &self.pipe.device)?;
+            }
+            Some(Flux2ControlTransformer::new(base, branch))
+        } else {
+            None
+        };
+        let staged_vae = if self.vae.is_none() {
+            let vae_device = if self.memory.tile_vae_decode {
+                Device::Cpu
+            } else {
+                self.pipe.device.clone()
+            };
+            Some(Flux2Vae::new(
+                self.pipe.component_vb_on("vae", &vae_device)?,
+            )?)
+        } else {
+            None
+        };
+        let transformer = self
+            .transformer
+            .as_ref()
+            .or(staged_transformer.as_ref())
+            .expect("resident or staged transformer");
+        let vae = self
+            .vae
+            .as_ref()
+            .or(staged_vae.as_ref())
+            .expect("resident or staged vae");
 
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
@@ -216,7 +321,28 @@ impl Flux2Control {
         // Per-step latent preview (epic 16948, sc-16955), bound to the same `(lat_h, lat_w)` the decode
         // tail below unpacks against. `control_context` is a closure capture, constant across steps and
         // never part of the running latent, so the control hint cannot reach a frame.
-        let preview = crate::preview::hook(&req.preview, &self.vae, lat_h, lat_w);
+        let preview = crate::preview::hook(&req.preview, vae, lat_h, lat_w);
+        let attention_budget = if self.memory.chunk_attention {
+            self.memory
+                .attention_chunk_size
+                .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE) as u64
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET as u64
+        };
+        let attention_plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            attention_budget,
+            false,
+        ));
+        let attention_plan = if self.memory.chunk_attention {
+            attention_plan.with_cancel(&req.cancel)
+        } else {
+            attention_plan
+        };
+        let transformer_window = self
+            .memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         // The driver does cancel + progress + the integrator step. The control forward lives inside the
         // predict closure so a multi-eval solver re-runs it. dev is guidance-distilled: a single forward
         // feeding the embedded guidance scalar (no negative pass). FLUX.2 embeds σ×1000.
@@ -231,16 +357,21 @@ impl Flux2Control {
             Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
-                Ok(self.transformer.forward(
-                    latents,
-                    &prompt_embeds,
-                    &img_ids,
-                    &txt_ids,
-                    ts,
-                    Some(req.guidance),
-                    &control_context,
-                    req.control_scale,
-                )?)
+                Ok(transformer
+                    .forward_with_memory(
+                        latents,
+                        &prompt_embeds,
+                        &img_ids,
+                        &txt_ids,
+                        ts,
+                        Some(req.guidance),
+                        &control_context,
+                        req.control_scale,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
+                    )
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?)
             },
         )?;
 
@@ -251,8 +382,17 @@ impl Flux2Control {
         // unpacked latent and emit `[-1, 1]` pixels (PiD at 4×); `to_image` reads the size from the tensor.
         let pid_decoder = self.pid_decoder_for(req)?;
         let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&packed)?,        // [1,3,4H,4W]
-            None => self.vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
+            Some(pid) => pid.decode(&packed)?, // [1,3,4H,4W]
+            None if self.memory.tile_vae_decode => vae.decode_packed_tiled(
+                &packed,
+                self.memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                self.memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+            )?,
+            None => vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
         };
         to_image(&decoded)
     }
@@ -263,11 +403,17 @@ impl Flux2Control {
     /// pose (no inpaint image / mask) the fork's mask + inpaint latent are all-zero. `seq` equals the
     /// target latent sequence (built at the same `width`/`height`), so the control context aligns 1:1
     /// with the base image tokens.
-    fn encode_control_context(&self, image: &Image, width: u32, height: u32) -> Result<Tensor> {
+    fn encode_control_context(
+        &self,
+        vae: &Flux2Vae,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
         let cfg = &self.pipe.cfg;
         let device = &self.pipe.device;
         let nchw = preprocess_ref(image, width, height, device, self.pipe.dtype)?;
-        let packed = self.vae.encode_packed(&nchw)?; // [1, 128, H/16, W/16]
+        let packed = vae.encode_packed(&nchw)?; // [1, 128, H/16, W/16]
         let control_packed = pipeline::pack_nchw(&packed)?; // [1, seq, 128]
         let (_, seq, _) = control_packed.dims3()?;
         // Union pose-only layout: zero mask (in_channels / num_latent_channels = 128/32 = 4, the 2×2

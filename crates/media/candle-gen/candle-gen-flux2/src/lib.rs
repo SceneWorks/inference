@@ -41,6 +41,8 @@ pub mod config;
 pub mod control_provider;
 pub mod convert;
 pub mod edit_provider;
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod pos_embed;
 pub mod preview;
@@ -67,6 +69,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
@@ -359,6 +362,59 @@ impl Pipeline {
         })
     }
 
+    pub(crate) fn load_dit_seq_with_memory(
+        &self,
+        stream_transformer_blocks: bool,
+    ) -> CResult<Flux2Transformer> {
+        if !stream_transformer_blocks {
+            return self.load_dit_seq();
+        }
+        if self.comfyui_dit.is_some() {
+            return Err(CandleError::Msg(
+                "flux2_dev: streamed blocks require a directory-backed transformer tier".to_owned(),
+            ));
+        }
+        let packed = self.component_is_packed("transformer")?;
+        let source_device = if self.quant.is_some() && !packed {
+            Device::Cpu
+        } else {
+            self.device.clone()
+        };
+        Ok(Flux2Transformer::new_block_streamed(
+            &self.cfg,
+            self.component_vb_on("transformer", &source_device)?,
+            self.quant,
+            self.device.clone(),
+        )?)
+    }
+
+    fn load_heavy_seq_with_memory(
+        &self,
+        use_pid: bool,
+        stream_transformer_blocks: bool,
+        bounded_host_decode: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<SeqHeavy> {
+        if !stream_transformer_blocks && !bounded_host_decode {
+            return self.load_heavy_seq(use_pid);
+        }
+        candle_gen::check_cancel(cancel)?;
+        let transformer = self.load_dit_seq_with_memory(stream_transformer_blocks)?;
+        candle_gen::check_cancel(cancel)?;
+        let vae_device = if bounded_host_decode {
+            Device::Cpu
+        } else {
+            self.device.clone()
+        };
+        let vae = Flux2Vae::new(self.component_vb_on("vae", &vae_device)?)?;
+        candle_gen::check_cancel(cancel)?;
+        Ok(SeqHeavy {
+            transformer,
+            vae,
+            pid: self.load_pid(use_pid)?,
+        })
+    }
+
     /// Load the TE + DiT, routing each through the **packed** path (build straight from an MLX-packed
     /// tier on the GPU — sc-9087, no ~105 GB dense CPU staging) or the legacy **dense** path (stage
     /// dense in system RAM, then quantize each projection onto the GPU) per [`Self::component_is_packed`]
@@ -368,8 +424,8 @@ impl Pipeline {
     /// (`Flux2PromptEncoder::new` / `Flux2Transformer::new`).
     pub(crate) fn load_quantizable(
         &self,
-        mk_te: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2PromptEncoder>,
-        mk_dit: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2Transformer>,
+        mk_te: impl Fn(&Flux2Config, VarBuilder<'static>) -> CResult<Flux2PromptEncoder>,
+        mk_dit: impl Fn(&Flux2Config, VarBuilder<'static>) -> CResult<Flux2Transformer>,
     ) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
         let te = self.load_one_quantizable(
             "text_encoder",
@@ -401,7 +457,7 @@ impl Pipeline {
         &self,
         sub: &str,
         quant: Option<Quant>,
-        build: impl FnOnce(VarBuilder) -> CResult<M>,
+        build: impl FnOnce(VarBuilder<'static>) -> CResult<M>,
         quantize: impl FnOnce(&mut M, Quant, &Device) -> CResult<()>,
     ) -> CResult<M> {
         match quant {
@@ -625,6 +681,28 @@ impl Pipeline {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
         let txt_ids = pipeline::prepare_text_ids(self.cfg.max_sequence_length);
+        let chunk_attention = req.memory.is_some_and(|memory| memory.chunk_attention);
+        let attention_budget = if chunk_attention {
+            req.memory
+                .and_then(|memory| memory.attention_chunk_size)
+                .unwrap_or(memory_strategy::ATTENTION_CHUNK_SIZE) as u64
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET as u64
+        };
+        let attention_plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            attention_budget,
+            false,
+        ));
+        let attention_plan = if chunk_attention {
+            attention_plan.with_cancel(&req.cancel)
+        } else {
+            attention_plan
+        };
+        let transformer_window = req
+            .memory
+            .and_then(|memory| memory.transformer_window_size)
+            .map(|window| window as usize)
+            .unwrap_or(memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
 
         // Curated sampler/scheduler routing (epic 7114 P4, sc-7123). The NATIVE schedule is the legacy
         // empirical-mu flow-match sigmas (descending, trailing 0.0); the same `mu` feeds the curated
@@ -663,27 +741,42 @@ impl Pipeline {
                     let ts = sigma * 1000.0;
                     let out = if embedded_guidance {
                         // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        transformer.forward(
+                        transformer.forward_with_memory(
                             latents,
                             prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             Some(guidance),
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
                         )?
                     } else {
-                        let v = transformer.forward(
+                        let v = transformer.forward_with_memory(
                             latents,
                             prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             None,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
                         )?;
                         match negative {
                             Some(neg) => {
-                                let vn = transformer
-                                    .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
+                                let vn = transformer.forward_with_memory(
+                                    latents,
+                                    neg,
+                                    &img_ids,
+                                    &txt_ids,
+                                    ts,
+                                    None,
+                                    attention_plan,
+                                    transformer_window,
+                                    &req.cancel,
+                                )?;
                                 // vn + guidance·(v − vn)
                                 (&vn + ((&v - &vn)? * guidance as f64)?)?
                             }
@@ -700,6 +793,18 @@ impl Pipeline {
                 // PiD consumes the packed BN-normalized [1,128,H/16,W/16] latent directly (the same
                 // tensor decode_packed BN-de-normalizes); returns [1,3,4H,4W].
                 Some(pid) => pid.decode(&packed)?,
+                None if req.memory.is_some_and(|memory| memory.tile_vae_decode) => {
+                    let memory = req.memory.expect("guarded above");
+                    vae.decode_packed_tiled(
+                        &packed,
+                        memory
+                            .decode_tile_edge
+                            .unwrap_or(memory_strategy::DECODE_TILE_EDGE),
+                        memory
+                            .decode_overlap
+                            .unwrap_or(memory_strategy::DECODE_OVERLAP),
+                    )?
+                }
                 None => vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
             };
             to_image(&decoded)
@@ -730,11 +835,45 @@ pub struct Flux2Generator {
     descriptor: ModelDescriptor,
     pipe: Pipeline,
     residency: Flux2Residency,
+    lifecycle: std::sync::Mutex<()>,
+    stream_cancel: Arc<std::sync::Mutex<gen_core::CancelFlag>>,
+    bounded_host_decode: Arc<std::sync::Mutex<bool>>,
+    loaded_quant: Option<Quant>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
 impl Generator for Flux2Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        memory_strategy::admission_safety_check(contract, context, self.loaded_quant)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(contract, context, self.loaded_quant)?;
+        Ok(Some(Box::new(memory_strategy::Flux2MemoryScope::new(
+            self.pipe.device.clone(),
+            contract,
+            context,
+        ))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -765,13 +904,46 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let stage_residency = req
             .memory
             .as_ref()
             .is_some_and(|memory| memory.stage_residency);
+        let stream_transformer_blocks = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stream_transformer_blocks);
+        if req.memory.as_ref().is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        }) && !stage_residency
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: constrained strategies require request-scoped staged residency",
+                self.descriptor.id
+            )));
+        }
+        if req.use_pid
+            && req.memory.is_some_and(|memory| {
+                memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+            })
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: optimized native-VAE strategies do not support PiD decode",
+                self.descriptor.id
+            )));
+        }
+        if stream_transformer_blocks && self.memory_strategy.is_none() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: streamed blocks require the CUDA memory contract",
+                self.descriptor.id
+            )));
+        }
+        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+        *candle_gen::lock_recover(&self.bounded_host_decode) =
+            req.memory.is_some_and(|memory| memory.tile_vae_decode);
         let images = self.residency.run_request_scoped(
             stage_residency,
-            false,
+            stream_transformer_blocks,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -781,7 +953,10 @@ impl Generator for Flux2Generator {
                 let result = self.pipe.render_phase(heavy, req, encoded, on_progress);
                 candle_gen::synchronize_result(&self.pipe.device, result)
             },
-        )?;
+        );
+        *candle_gen::lock_recover(&self.bounded_host_decode) = false;
+        *candle_gen::lock_recover(&self.stream_cancel) = gen_core::CancelFlag::default();
+        let images = images?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -860,11 +1035,18 @@ pub fn descriptor_dev() -> ModelDescriptor {
     descriptor(Flux2Variant::Dev)
 }
 
-fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator>> {
+fn generator_from_pipeline(
+    pipe: Pipeline,
+    _memory_spec: Option<&LoadSpec>,
+) -> gen_core::Result<Box<dyn Generator>> {
     let variant = pipe.variant;
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
+    let stream_cancel = Arc::new(std::sync::Mutex::new(gen_core::CancelFlag::default()));
+    let heavy_cancel = stream_cancel.clone();
+    let bounded_host_decode = Arc::new(std::sync::Mutex::new(false));
+    let heavy_bounded_host_decode = bounded_host_decode.clone();
     let residency = Flux2Residency::request_scoped_with_resident(
         move |_| {
             let comps = resident_pipe.load_components()?;
@@ -879,16 +1061,37 @@ fn generator_from_pipeline(pipe: Pipeline) -> gen_core::Result<Box<dyn Generator
                 text_pipe.build_tokenizer()?,
             ))))
         },
-        move |use_pid, _| {
+        move |use_pid, stream_transformer_blocks| {
             Ok(HeavyPhase::Sequential(Box::new(
-                heavy_pipe.load_heavy_seq(use_pid)?,
+                heavy_pipe.load_heavy_seq_with_memory(
+                    use_pid,
+                    stream_transformer_blocks,
+                    *candle_gen::lock_recover(&heavy_bounded_host_decode),
+                    &candle_gen::lock_recover(&heavy_cancel),
+                )?,
             )))
         },
     );
+    let loaded_quant = pipe.quant;
+    #[cfg(any(feature = "cuda", test))]
+    let memory_strategy = if pipe.variant.is_dev() {
+        _memory_spec
+            .map(memory_strategy::provider_contract)
+            .transpose()?
+    } else {
+        None
+    };
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_strategy = None;
     Ok(Box::new(Flux2Generator {
         descriptor: descriptor(variant),
         pipe,
         residency,
+        lifecycle: std::sync::Mutex::new(()),
+        stream_cancel,
+        bounded_host_decode,
+        loaded_quant,
+        memory_strategy,
     }))
 }
 
@@ -928,7 +1131,7 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
     }
     let device = candle_gen::default_device()?;
     let pipe = Pipeline::load(variant, quant, &root, &device, spec.pid.clone());
-    generator_from_pipeline(pipe)
+    generator_from_pipeline(pipe, Some(spec))
 }
 
 /// Construct a lazy candle FLUX.2-**dev** generator that reads its **DiT** in place from an existing
@@ -948,7 +1151,7 @@ pub fn load_from_comfyui_dit(
     let device = candle_gen::default_device()?;
     let root = snapshot_dir.into();
     let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
-    generator_from_pipeline(pipe)
+    generator_from_pipeline(pipe, None)
 }
 
 /// Registry load hook for `flux2_klein_9b`.
@@ -973,10 +1176,30 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(KLEIN_REGISTRATION)
-        .register_generator(DEV_REGISTRATION)
+        .register_generator(DEV_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
+    registry
 }
+
+#[cfg(feature = "cuda")]
+const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::FLUX2_DEV_ID,
+    contract: memory_strategy::provider_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: config::FLUX2_DEV_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
 
 /// Build the complete explicit Candle FLUX.2 provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
@@ -1443,19 +1666,29 @@ mod tests {
                 _ => spec,
             };
         }
-        let stage_residency =
-            std::env::var("FLUX2_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
-        let req = GenerationRequest {
+        spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+        let rung = std::env::var("FLUX2_MEMORY_RUNG").unwrap_or_else(|_| {
+            if std::env::var("FLUX2_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged") {
+                "staged".to_owned()
+            } else {
+                "resident".to_owned()
+            }
+        });
+        let strategy = match rung.as_str() {
+            "resident" => gen_core::MemoryStrategy::Resident,
+            "staged" => gen_core::MemoryStrategy::StagedResidency,
+            "decode" => gen_core::MemoryStrategy::BoundedDecode,
+            "attention" => gen_core::MemoryStrategy::BoundedAttention,
+            "blocks" => gen_core::MemoryStrategy::BoundedTransformerResidency,
+            value => panic!("unsupported FLUX2_MEMORY_RUNG={value}"),
+        };
+        let mut req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
             height: 1024,
             steps: Some(steps),
             seed: Some(42),
             count: 1,
-            memory: Some(gen_core::GenerationMemory {
-                stage_residency,
-                ..Default::default()
-            }),
             ..Default::default()
         };
         assert!(
@@ -1466,9 +1699,40 @@ mod tests {
         let load_phase = probe.phase();
         let g = load(&spec).unwrap_or_else(|e| panic!("load {label}: {e}"));
         probe.end_load(load_phase);
+        let contract = g
+            .memory_strategy_contract()
+            .expect("FLUX.2-dev memory contract");
+        let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric tier");
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            strategy,
+            tier,
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("memory context");
+        assert!(matches!(
+            g.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        let mut scope = g
+            .begin_memory_strategy_request(&context)
+            .expect("begin memory request")
+            .expect("memory request scope");
+        scope
+            .configure_request(&mut req)
+            .expect("configure memory request");
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(generate_phase);
+        scope
+            .finish(gen_core::MemoryRunOutcome::Complete)
+            .expect("finish memory request");
         let report = probe.report().assert_trustworthy(1.0);
         let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
             .expect("read CUDA live-allocation high-water");
@@ -1481,11 +1745,6 @@ mod tests {
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let strategy = if stage_residency {
-            gen_core::MemoryStrategy::StagedResidency
-        } else {
-            gen_core::MemoryStrategy::Resident
-        };
         eprintln!(
             "{}",
             candle_gen::testkit::memory_evidence_v1_line(
@@ -1494,10 +1753,7 @@ mod tests {
                     declared_calibration: candle_gen::testkit::expected_memory_calibration(
                         spec.load_shape,
                     ),
-                    observed_calibration: gen_core::MemoryCalibrationIdentity::new(
-                        RESIDENCY_CALIBRATION_FINGERPRINT,
-                        spec.load_shape,
-                    ),
+                    observed_calibration: contract.calibration.clone().expect("calibration"),
                     tier: gen_core::MemoryNumericTier {
                         precision: spec.precision,
                         quant: spec.quantize,
@@ -1514,17 +1770,10 @@ mod tests {
                         reference_count: 0,
                     },
                     strategy,
-                    engaged_composition: if stage_residency {
-                        vec![
-                            gen_core::MemoryStrategy::Resident,
-                            gen_core::MemoryStrategy::StagedResidency,
-                        ]
-                    } else {
-                        vec![gen_core::MemoryStrategy::Resident]
-                    },
-                    parameters: gen_core::MemoryStrategyParameters::default(),
+                    engaged_composition: contract.engaged_composition(strategy),
+                    parameters: context.selection.parameters,
                     observed_peak_bytes: live_peak_bytes,
-                    harness_version: "candle-flux2-residency-v1",
+                    harness_version: "candle-flux2-memory-ladder-v1",
                     output_bytes: &img.pixels,
                 }
             )
