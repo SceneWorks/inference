@@ -67,7 +67,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, chroma-auxiliary, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -126,7 +126,6 @@ jobs:
       CHROMA_MODEL: ${{ matrix.model }}
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
-      SC16462_T5_GROUP_SIZE: "32"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -138,7 +137,6 @@ jobs:
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
-          test "$SC16462_T5_GROUP_SIZE" = "32"
       - name: Materialize the exact shipped bf16 source
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
@@ -166,117 +164,50 @@ jobs:
       - name: Build and validate packed q4/q8 tiers
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
-          SC8777_SRC: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}/bf16
-          SC8777_MODEL: ${{ matrix.model }}
-          SC8777_KEEP: "1"
+          SC16462_MODEL: ${{ matrix.model }}
+          SC16462_OUT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PACKED_ROOT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PAYLOAD_MANIFEST: ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
-          CHROMA_RESIDENCY_RAW: ${{ runner.temp }}/chroma-sc16462-residency.jsonl
-          CHROMA_RESIDENCY_SUMMARY: ${{ runner.temp }}/chroma-sc16462-residency-summary.jsonl
+          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462
         run: |
           set -o pipefail
-          : > "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl"
-          : > "$RUNNER_TEMP/chroma-sc16462-component.jsonl"
-          : > "$CHROMA_RESIDENCY_RAW"
-          : > "$CHROMA_RESIDENCY_SUMMARY"
+          : > "$RUNNER_TEMP/chroma-sc16462-identity.jsonl"
+          : > "$RUNNER_TEMP/chroma-sc16462-comparison.jsonl"
           for bits in 4 8; do
-            export SC8777_BITS="$bits"
-            export SC8777_OUT="$CHROMA_PACKED_ROOT/q$bits"
-            export SC16462_BUILT="$CHROMA_PACKED_ROOT/.built-q$bits"
-            export SC16462_BASELINE="$SC8777_SRC/../q$bits"
-            SC8777_BITS="$bits" SC8777_OUT="$SC16462_BUILT" \
-              cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
-              build_tier_only -- --ignored --exact --nocapture --test-threads=1
-            # Compose from the exact shipped tier and replace only the two auxiliary directories.
-            # This preserves transformer/config/tokenizer/scheduler/top-level bytes verbatim.
-            cp -R "$SC16462_BASELINE" "$SC8777_OUT"
-            rm -rf "$SC8777_OUT/text_encoder" "$SC8777_OUT/vae"
-            cp -R "$SC16462_BUILT/text_encoder" "$SC8777_OUT/text_encoder"
-            cp -R "$SC16462_BUILT/vae" "$SC8777_OUT/vae"
-            diff -qr -x text_encoder -x vae "$SC16462_BASELINE" "$SC8777_OUT"
-            cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
-              packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
-              --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits.log"
-            sed -n 's/^.*SC16462_COMPONENT //p' "$RUNNER_TEMP/chroma-q$bits.log" \
-              >> "$RUNNER_TEMP/chroma-sc16462-component.jsonl"
-            : > "$RUNNER_TEMP/chroma-q$bits-residency.log"
-            for component in t5 vae; do
-              for mode in dense load-time packed; do
-                for repetition in 1 2 3; do
-                  SC16462_RESIDENCY_COMPONENT="$component" \
-                  SC16462_RESIDENCY_MODE="$mode" \
-                  SC16462_RESIDENCY_REPETITION="$repetition" \
-                    cargo test --locked --release -p mlx-gen-chroma \
-                      --test prequantize_real_weights component_residency_probe -- --ignored \
-                      --exact --nocapture --test-threads=1 \
-                      | tee -a "$RUNNER_TEMP/chroma-q$bits-residency.log"
-                done
-              done
-            done
-            sed -n 's/^.*SC16462_RESIDENCY //p' "$RUNNER_TEMP/chroma-q$bits-residency.log" \
-              >> "$CHROMA_RESIDENCY_RAW"
-            python3.12 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          from statistics import median
+            # The shipped tier IS the baseline: it already carries the exact packed transformer plus
+            # the dense bf16 auxiliaries. `repack_auxiliaries` derives the auxiliary width from that
+            # transformer, so a tier can never be built whose text encoder sits above its own tier.
+            export SC16462_BASELINE="$CHROMA_SNAPSHOT/q$bits"
+            test -d "$SC16462_BASELINE/transformer"
+            test -d "$SC16462_BASELINE/text_encoder"
 
-          tier = f"q{os.environ['SC8777_BITS']}"
-          rows = [
-              json.loads(line)
-              for line in Path(os.environ["CHROMA_RESIDENCY_RAW"]).read_text().splitlines()
-          ]
-          rows = [row for row in rows if row["tier"] == tier]
-          if len(rows) != 18:
-              raise SystemExit(f"{tier}: expected 18 fresh-process residency rows, got {len(rows)}")
-          peaks = {}
-          for component in ("t5", "vae"):
-              peaks[component] = {}
-              for mode in ("dense", "load-time", "packed"):
-                  values = [
-                      row["peakBytes"]
-                      for row in rows
-                      if row["component"] == component and row["mode"] == mode
-                  ]
-                  if len(values) != 3:
-                      raise SystemExit(
-                          f"{tier}/{component}/{mode}: expected 3 measurements, got {len(values)}"
-                      )
-                  peaks[component][mode] = {
-                      "median": int(median(values)),
-                      "samples": values,
-                  }
-              packed = peaks[component]["packed"]["median"]
-              load_time = peaks[component]["load-time"]["median"]
-              if packed >= load_time:
-                  raise SystemExit(
-                      f"{tier}/{component}: packed median {packed} must be below load-time {load_time}"
-                  )
-          summary = {
-              "model": os.environ["CHROMA_MODEL"],
-              "tier": tier,
-              "auxiliaryBits": 8,
-              "groupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
-              "freshProcessMedianPeakBytes": peaks,
-          }
-          with Path(os.environ["CHROMA_RESIDENCY_SUMMARY"]).open("a", encoding="utf-8") as handle:
-              handle.write(json.dumps(summary, sort_keys=True) + "\n")
-          print("SC16462_RESIDENCY_SUMMARY " + json.dumps(summary, sort_keys=True))
-          PY
-            cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
-              packed_auxiliaries_preserve_full_pipeline_quality_and_reduce_peak -- --ignored \
-              --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-calibration.log"
-            sed -n 's/^.*SC16462_CALIBRATION //p' "$RUNNER_TEMP/chroma-q$bits-calibration.log" \
-              >> "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl"
-            cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
-              prequantize_turnkey_loads_packed_and_renders -- --ignored --exact --nocapture \
-              --test-threads=1
+            # Gate 1 — conversion faithfulness: the published pack must be BIT-identical to the
+            # in-app load-time pack, or the shipped tier and a dense-source render diverge.
+            cargo test --locked --release -p mlx-gen-chroma --test auxiliary_pack_identity \
+              packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+              --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-identity.log"
+            sed -n 's/^.*SC16462_IDENTITY //p' "$RUNNER_TEMP/chroma-q$bits-identity.log" \
+              >> "$RUNNER_TEMP/chroma-sc16462-identity.jsonl"
+
+            # Gate 2 — the shipped-vs-at-tier comparison: transformer bytes byte-identical, render
+            # coherent (a missed packed site reads codes as floats and collapses), auxiliaries
+            # actually smaller. Deliberately NO pixel-identity threshold against the bf16-auxiliary
+            # render: packing the text encoder to the selected tier is supposed to move the
+            # conditioning, and gating on identity would only pass by not doing the work.
+            cargo test --locked --release -p mlx-gen-chroma --test auxiliary_tier_comparison \
+              compare_auxiliary_widths -- --ignored --exact --nocapture --test-threads=1 \
+              | tee "$RUNNER_TEMP/chroma-q$bits-comparison.log"
+            sed -n 's/^.*auxiliaries @ //p' "$RUNNER_TEMP/chroma-q$bits-comparison.log" \
+              >> "$RUNNER_TEMP/chroma-sc16462-comparison.jsonl"
+
+            # Stage the tier that will actually be published, from the same derived-width path.
+            rm -rf "$CHROMA_PACKED_ROOT/q$bits"
+            mkdir -p "$CHROMA_PACKED_ROOT"
+            cp -R "$SC16462_OUT/tier-aux-at-tier" "$CHROMA_PACKED_ROOT/q$bits"
+            diff -qr -x text_encoder -x vae "$SC16462_BASELINE" "$CHROMA_PACKED_ROOT/q$bits"
           done
-          test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-calibration.jsonl" | tr -d ' ')" = 2
-          test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-component.jsonl" | tr -d ' ')" = 2
-          test "$(wc -l < "$CHROMA_RESIDENCY_RAW" | tr -d ' ')" = 36
-          test "$(wc -l < "$CHROMA_RESIDENCY_SUMMARY" | tr -d ' ')" = 2
+          test "$(wc -l < "$RUNNER_TEMP/chroma-sc16462-identity.jsonl" | tr -d ' ')" = 2
           python3.12 - <<'PY'
           import hashlib
           import json
@@ -284,39 +215,26 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["CHROMA_PACKED_ROOT"])
-          t5_quantization = json.loads(
-              (root / "q4/text_encoder/config.json").read_text(encoding="utf-8")
-          )["quantization"]
-          q8_t5_quantization = json.loads(
-              (root / "q8/text_encoder/config.json").read_text(encoding="utf-8")
-          )["quantization"]
-          if q8_t5_quantization != t5_quantization:
-              raise SystemExit("q4/q8 T5 quantization policies differ")
-          expected_t5_policy = {
-              "bits": 8,
-              "group_size": 32,
-              "residual_bits": 4,
-              "sensitive_residual_bits": 8,
-              "sensitive_residual_bases": [
-                  "shared",
-                  "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
-                  "encoder.block.4.layer.0.SelfAttention.q",
-                  "encoder.block.4.layer.0.SelfAttention.k",
-                  "encoder.block.4.layer.0.SelfAttention.v",
-                  "encoder.block.4.layer.0.SelfAttention.o",
-                  "encoder.block.1.layer.1.DenseReluDense.wi_0",
-                  "encoder.block.1.layer.1.DenseReluDense.wi_1",
-                  "encoder.block.1.layer.1.DenseReluDense.wo",
-              ],
-          }
-          for key, value in expected_t5_policy.items():
-              if t5_quantization.get(key) != value:
-                  raise SystemExit(
-                      f"unsupported T5 quantization {key}: {t5_quantization.get(key)!r} != {value!r}"
-                  )
           files = {}
+          t5_quantization = {}
           for tier in ("q4", "q8"):
               tier_root = root / tier
+              expected_bits = int(tier[1:])
+              quantization = json.loads(
+                  (tier_root / "text_encoder/config.json").read_text(encoding="utf-8")
+              )["quantization"]
+              t5_quantization[tier] = quantization
+              # The invariant this whole story exists to restore: the auxiliaries sit AT the tier the
+              # user selected, never above it.
+              if quantization.get("bits") != expected_bits:
+                  raise SystemExit(
+                      f"{tier}: text encoder declares Q{quantization.get('bits')}, expected "
+                      f"Q{expected_bits} -- an auxiliary above the selected tier is the defect"
+                  )
+              if quantization.get("group_size") != 32:
+                  raise SystemExit(f"{tier}: T5 group_size {quantization.get('group_size')} != 32")
+              if "residual_bits" in quantization:
+                  raise SystemExit(f"{tier}: residual packing was removed; artifact is stale")
               for path in sorted(tier_root.rglob("*")):
                   if path.is_file() and ".cache" not in path.parts:
                       digest = hashlib.sha256()
@@ -332,7 +250,6 @@ jobs:
               "model": os.environ["CHROMA_MODEL"],
               "inferenceRevision": os.environ["GITHUB_SHA"],
               "sourceRevision": os.environ["CHROMA_SOURCE_REVISION"],
-              "t5GroupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
               "t5Quantization": t5_quantization,
               "files": files,
           }
@@ -340,6 +257,7 @@ jobs:
               json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           PY
+
       - name: Upload Chroma calibration evidence
         if: always() && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -347,64 +265,9 @@ jobs:
           name: chroma-sc16462-${{ matrix.model }}
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/chroma-sc16462-calibration.jsonl
-            ${{ runner.temp }}/chroma-sc16462-component.jsonl
+            ${{ runner.temp }}/chroma-sc16462-identity.jsonl
+            ${{ runner.temp }}/chroma-sc16462-comparison.jsonl
             ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
-            ${{ runner.temp }}/chroma-sc16462-residency.jsonl
-            ${{ runner.temp }}/chroma-sc16462-residency-summary.jsonl
-
-  # SC-16462 diagnostic lane: rank fully packed progressive precision policies at Chroma's
-  # production sequence length before spending another Base or Base/HD/Flash render matrix. This
-  # lane never publishes and deliberately materializes only Base's immutable bf16 text encoder.
-  mlx-chroma-t5-sensitivity:
-    name: Chroma T5 precision sensitivity
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-t5-sensitivity'
-    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
-    timeout-minutes: 120
-    env:
-      CHROMA_REPOSITORY: SceneWorks/chroma1-base-mlx
-      CHROMA_SOURCE_REVISION: e7330dda29d00ffdeeb719b28e92ee74cff0884c
-      SC8777_MODEL: chroma1_base
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Toolchain versions
-        run: rustc --version && cargo --version
-      - name: Materialize the immutable Base T5 source
-        env:
-          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-t5-sensitivity-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          python3.12 - <<'PY'
-          import os
-          from huggingface_hub import snapshot_download
-
-          snapshot_download(
-              repo_id=os.environ["CHROMA_REPOSITORY"],
-              revision=os.environ["CHROMA_SOURCE_REVISION"],
-              allow_patterns=["bf16/text_encoder/**"],
-              local_dir=os.environ["CHROMA_SNAPSHOT"],
-              token=False,
-          )
-          PY
-          test -d "$CHROMA_SNAPSHOT/bf16/text_encoder"
-          echo "SC8777_SRC=$CHROMA_SNAPSHOT/bf16" >> "$GITHUB_ENV"
-      - name: Rank fully packed T5 precision policies
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462-t5-sensitivity
-        run: |
-          set -o pipefail
-          cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
-            t5_precision_sensitivity_sweep -- --ignored --exact --nocapture --test-threads=1 \
-            | tee "$RUNNER_TEMP/chroma-sc16462-t5-sensitivity.log"
-          grep 'SC16462_T5_SENSITIVITY ' "$RUNNER_TEMP/chroma-sc16462-t5-sensitivity.log"
-      - name: Upload T5 sensitivity evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: chroma-sc16462-t5-sensitivity
-          if-no-files-found: error
-          path: ${{ runner.temp }}/chroma-sc16462-t5-sensitivity.log
 
   # Publication cannot begin until every Base/HD/Flash validation leg above is green. Each repo
   # receives q4+q8 in one parent-guarded commit. A retry explicitly verifies an already-published
@@ -433,7 +296,6 @@ jobs:
       CHROMA_MODEL: ${{ matrix.model }}
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
-      SC16462_T5_GROUP_SIZE: "32"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate publication authorization
@@ -442,7 +304,6 @@ jobs:
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
-          test "$SC16462_T5_GROUP_SIZE" = "32"
       - name: Download the validated payload manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -472,16 +333,18 @@ jobs:
           PY
           mkdir -p "$CHROMA_PACKED"
           for bits in 4 8; do
-            SC8777_SRC="$CHROMA_SNAPSHOT/bf16" \
-            SC8777_MODEL="$CHROMA_MODEL" \
-            SC8777_BITS="$bits" \
-            SC8777_OUT="$CHROMA_BUILT/q$bits" \
-              cargo test --locked --release -p mlx-gen-chroma --test prequantize_real_weights \
-                build_tier_only -- --ignored --exact --nocapture --test-threads=1
-            cp -R "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
-            rm -rf "$CHROMA_PACKED/q$bits/text_encoder" "$CHROMA_PACKED/q$bits/vae"
-            cp -R "$CHROMA_BUILT/q$bits/text_encoder" "$CHROMA_PACKED/q$bits/text_encoder"
-            cp -R "$CHROMA_BUILT/q$bits/vae" "$CHROMA_PACKED/q$bits/vae"
+            # `repack_auxiliaries` copies transformer/tokenizer/scheduler/top-level bytes verbatim and
+            # rewrites ONLY text_encoder/ + vae/, at the width it derives from the tier's own packed
+            # transformer. The publish path therefore cannot move transformer bytes, and cannot mint
+            # an auxiliary above the tier the user selected. The `diff` below re-proves the first
+            # property independently of the Rust code that promised it.
+            SC16462_BASELINE="$CHROMA_SNAPSHOT/q$bits" \
+            SC16462_OUT="$CHROMA_BUILT/q$bits" \
+            SC16462_MODEL="$CHROMA_MODEL" \
+              cargo test --locked --release -p mlx-gen-chroma --test auxiliary_pack_identity \
+                packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+                --test-threads=1
+            cp -R "$CHROMA_BUILT/q$bits/identity-q$bits" "$CHROMA_PACKED/q$bits"
             diff -qr -x text_encoder -x vae "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
           done
           python3.12 - <<'PY'
@@ -492,41 +355,30 @@ jobs:
 
           root = Path(os.environ["CHROMA_PACKED"])
           expected = json.loads(Path(os.environ["CHROMA_VALIDATED_MANIFEST"]).read_text())
-          t5_quantization = json.loads(
-              (root / "q4/text_encoder/config.json").read_text(encoding="utf-8")
-          )["quantization"]
-          q8_t5_quantization = json.loads(
-              (root / "q8/text_encoder/config.json").read_text(encoding="utf-8")
-          )["quantization"]
-          if q8_t5_quantization != t5_quantization:
-              raise SystemExit("rebuilt q4/q8 T5 quantization policies differ")
-          expected_t5_policy = {
-              "bits": 8,
-              "group_size": 32,
-              "residual_bits": 4,
-              "sensitive_residual_bits": 8,
-              "sensitive_residual_bases": [
-                  "shared",
-                  "encoder.block.0.layer.0.SelfAttention.relative_attention_bias",
-                  "encoder.block.4.layer.0.SelfAttention.q",
-                  "encoder.block.4.layer.0.SelfAttention.k",
-                  "encoder.block.4.layer.0.SelfAttention.v",
-                  "encoder.block.4.layer.0.SelfAttention.o",
-                  "encoder.block.1.layer.1.DenseReluDense.wi_0",
-                  "encoder.block.1.layer.1.DenseReluDense.wi_1",
-                  "encoder.block.1.layer.1.DenseReluDense.wo",
-              ],
-          }
-          for key, value in expected_t5_policy.items():
-              if t5_quantization.get(key) != value:
+          # Each tier's auxiliaries must declare that tier's own width. q4 and q8 therefore DIFFER
+          # here by construction: equal policies across tiers is precisely the above-tier defect
+          # sc-16462 removes (the old lane asserted they were equal, which is how a uniform Q8
+          # auxiliary rode along on the q4 route).
+          t5_quantization = {}
+          for tier in ("q4", "q8"):
+              quantization = json.loads(
+                  (root / tier / "text_encoder/config.json").read_text(encoding="utf-8")
+              )["quantization"]
+              expected_bits = int(tier[1:])
+              if quantization.get("bits") != expected_bits:
                   raise SystemExit(
-                      f"unsupported rebuilt T5 quantization {key}: {t5_quantization.get(key)!r} != {value!r}"
+                      f"{tier}: rebuilt text encoder declares Q{quantization.get('bits')}, expected "
+                      f"Q{expected_bits} -- an auxiliary above the selected tier is the defect"
                   )
+              if quantization.get("group_size") != 32:
+                  raise SystemExit(f"{tier}: T5 group_size {quantization.get('group_size')} != 32")
+              if "residual_bits" in quantization:
+                  raise SystemExit(f"{tier}: residual packing was removed; artifact is stale")
+              t5_quantization[tier] = quantization
           identity = {
               "model": os.environ["CHROMA_MODEL"],
               "inferenceRevision": os.environ["GITHUB_SHA"],
               "sourceRevision": os.environ["CHROMA_SOURCE_REVISION"],
-              "t5GroupSize": int(os.environ["SC16462_T5_GROUP_SIZE"]),
               "t5Quantization": t5_quantization,
           }
           for key, value in identity.items():
