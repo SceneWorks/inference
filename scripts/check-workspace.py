@@ -876,6 +876,28 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
             "configure_decode"
         ] and _configure_decode_hooks_are_unconditional_rejections(evidence):
             continue
+        # SC-15525: the same exemption, for the provider shape that declares rung 2 **Missing** after
+        # measuring it. Such a provider must still NAME `BoundedDecode` (to declare the support) and
+        # `MemoryParameterRanges` (the field's type, which it populates for rung 4), so the trigger
+        # set alone cannot distinguish it from an adopter — but the hazard this gate exists for is a
+        # provider emitting its NATIVE ladder into `GenerationMemory::decode_tile_edge`, and a
+        # provider that publishes no domain has no ladder to emit.
+        #
+        # The exemption is therefore keyed on the two domain-publishing markers rather than on the
+        # type names: a contract with neither `decode_tile_edges` nor `decode_overlaps` anywhere in
+        # its production sources cannot construct a non-empty `MemoryParameterRanges::decode_*`, so
+        # `MemorySelection::decode_tile_edge` can never carry a value this provider produced. Any
+        # `configure_decode` hook it does define must still be an unconditional rejection, so the
+        # request-scope seam cannot admit a geometry either. A provider that publishes a domain —
+        # even one edge — falls straight through to the route checks below, unchanged.
+        publishes_decode_domain = any(
+            marker in evidence for marker in ("decode_tile_edges", "decode_overlaps")
+        )
+        if not publishes_decode_domain and (
+            "fn configure_decode" not in evidence
+            or _configure_decode_hooks_are_unconditional_rejections(evidence)
+        ):
+            continue
         missing: list[str] = []
         if not any(marker in evidence for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS):
             spellings = " or ".join(

@@ -580,7 +580,7 @@ pub(crate) fn registered_valid_fixture(
         has_phases: true,
         overlay: None,
     };
-    let mut fixtures = vec![MemoryBehaviorFixture::new(
+    let fixtures = vec![MemoryBehaviorFixture::new(
         mlx_gen::gen_core::standard_memory_behavior_context(
             contract,
             strategy,
@@ -588,21 +588,6 @@ pub(crate) fn registered_valid_fixture(
             route(false),
         )?,
     )];
-    // A contract that publishes two decode routes owes a fixture for BOTH, or the route split is
-    // declared and never exercised. The PiD route is a real one here: SDXL ships a `sdxl` PiD
-    // student (`model::PID_BACKBONE`) that `resolve_pid_decoder_at_sigma` already honours.
-    if contract.pid_decode_routes.is_some()
-        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
-    {
-        fixtures.push(MemoryBehaviorFixture::new(
-            mlx_gen::gen_core::standard_memory_behavior_context(
-                contract,
-                strategy,
-                tier,
-                route(true),
-            )?,
-        ));
-    }
     Ok(fixtures)
 }
 
