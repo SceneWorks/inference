@@ -423,6 +423,22 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
+            //
+            // sc-14195 — the `guidance ≤ 1.0` contract, stated once here because it governs BOTH of
+            // these flags. `guidance > 1.0` engages CFG; anything at or below 1.0 is **accepted and
+            // runs the CFG-off single-branch path** (one conditioned forward per step) rather than
+            // being rejected. That is diffusers' own rule (`do_classifier_free_guidance =
+            // guidance_scale > 1`), and at exactly 1.0 it is provably the same result — the combine
+            // `uncond + 1.0·(cond − uncond)` reduces to `cond` — for half the compute. Sub-1.0 and
+            // non-positive values fold into the same branch rather than interpolating toward the
+            // uncond prediction; they are not rejected, since the request is still satisfiable.
+            //
+            // Consequence, deliberate: with CFG off there is no uncond branch, so a supplied
+            // `negative_prompt` has nothing to act on and is dropped. This matches diffusers and the
+            // `lightning` lane (also CFG-free, also drops it). It is NOT the F-004 "reject a
+            // silently-dropped axis" shape — that rule fires when a request names an axis the engine
+            // cannot honor at all (e.g. `lightning` + a curated scheduler); here the user chose the
+            // guidance value that switches the negative off, so honoring it literally IS the drop.
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
@@ -881,12 +897,71 @@ mod tests {
         assert!(g.descriptor().capabilities.supports_lokr);
     }
 
+    /// sc-14195, the **request** half of the seam: `validate` must ACCEPT `guidance = 1.0` (and the
+    /// rest of the CFG-off range) rather than reject it with a 4xx. The story allowed either
+    /// outcome — accept-and-run-CFG-off or reject — and this pins which one shipped, so a later
+    /// "just validate it away" change has to break a test that says so out loud.
+    ///
+    /// The engine half (that accepting it actually renders, on the cond row) is
+    /// `pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch`; together they
+    /// span request → engine. GPU-free (lazy generator, no weights touched).
+    #[test]
+    fn validate_accepts_cfg_off_guidance() {
+        let spec = sdxl_spec(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .unwrap();
+
+        // The story's exact value, plus the rest of the range that resolves to the same CFG-off
+        // branch (`use_guide = guidance > 1.0`). None of these is an error.
+        for guidance in [1.0f32, 0.5, 0.0, -1.0] {
+            let req = GenerationRequest {
+                prompt: "a rusty robot holding a lit candle".into(),
+                guidance: Some(guidance),
+                ..Default::default()
+            };
+            assert!(
+                g.validate(&req).is_ok(),
+                "guidance {guidance} must be accepted and run CFG-off, not rejected"
+            );
+        }
+
+        // A negative prompt alongside CFG-off is accepted too (it is dropped, by the contract
+        // documented on `Capabilities` above — not a rejection, and not a hard error).
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                negative_prompt: Some("blurry".into()),
+                guidance: Some(1.0),
+                ..Default::default()
+            })
+            .is_ok());
+
+        // Mutation guard: a NON-finite guidance is still rejected (the F-053 check), so this test
+        // cannot pass by `validate` having become a blanket accept-everything.
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                guidance: Some(f32::NAN),
+                ..Default::default()
+            })
+            .is_err());
+    }
+
     #[test]
     fn load_reports_missing_single_file_source() {
         let spec = sdxl_spec(WeightsSource::File("/tmp/sdxl.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
+        // The message is the OS's, so it is platform-specific: POSIX says "No such file or
+        // directory", Windows says "The system cannot find the file specified. (os error 2)".
+        // Accept either phrasing — what is under test is that the missing file is *reported*, not
+        // how libc spells it. (Drive-by: the POSIX-only assertion made this test fail on every
+        // Windows run of `cargo test -p candle-gen-sdxl`.)
         assert!(
-            err.contains("No such file") || err.contains("not found"),
+            err.contains("No such file")
+                || err.contains("not found")
+                || err.contains("cannot find the file"),
             "got: {err}"
         );
     }
