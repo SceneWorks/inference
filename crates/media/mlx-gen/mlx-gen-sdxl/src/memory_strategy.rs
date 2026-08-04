@@ -17,19 +17,99 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) exists and bounds 19.003 → 15.866 GiB, but is not output-preserving |
-//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak 0.00%, and is not output-preserving |
+//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) exists and bounds the decode 14.360 → 11.237 GiB, but no fixed tile edge holds its quality across the advertised output range |
+//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the request peak 0.00% (and the U-Net seam +5.08%), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
 //! ## What this family actually buys, measured (`realvisxl`, Apple/Metal, 1024², 6 steps)
 //!
-//! | composition | tier | request peak | vs baseline | output |
+//! | composition | tier | request peak | vs baseline | ms/step | output |
+//! |---|---|---:|---:|---:|---|
+//! | resident | bf16 | 20.513 GiB | — | — | — |
+//! | + rung 1 | bf16 | **19.003** | **−7.4%** | 780 | byte-identical |
+//! | staged (control) | q8 | 17.693 | — | 767-913 | — |
+//! | + rung 4, window 1 | q8 | **15.516** | **−12.31%** | **3698-3790** | byte-identical |
+//!
+//! ## Rung 4 costs 4-5× the wall clock, and that is published rather than discovered
+//!
+//! SC-16355 carried re-materialization latency as an explicit hazard — *"70 blocks across 11
+//! re-opens could be a severe regression on exactly the small Macs this rung exists for"* — and it
+//! was right. Nothing had measured it. Two full runs of the suite on this Mac:
+//!
+//! | run | control | window 1 | ratio |
+//! |---|---:|---:|---:|
+//! | A | 767 ms/step | 3790 | **4.94×** |
+//! | B | 913 ms/step | 3698 | **4.05×** |
+//!
+//! Quoted as a range rather than a point because it is a wall clock and it moves with thermal state
+//! and machine load; the *peak* rows either run agrees to the millibyte. Call it **4-5×**.
+//!
+//! That does not make the rung a bad trade, and it is emphatically not a reason to withhold it: on a
+//! host where the unwindowed composition does not fit, 4-5× slower is the difference between a render
+//! and no render (`the_full_ladder_renders_under_a_memory_cap` runs the whole ladder under an 8 GiB
+//! cap). But it is a first-class cost, the selector cannot weigh a cost nobody published, and a rung
+//! that quietly quintupled render time would be discovered by users rather than by us. So it is
+//! measured on every rung-4 row and printed beside the peak, and the sweep asserts a loose 10×
+//! ceiling — loose on purpose, so that a re-open path which starts *thrashing* reddens while thermal
+//! noise does not.
+//!
+//! For contrast, and this is the comparison that makes the number worth publishing: the rung-2
+//! geometry this family **withholds** would have bought −16.51% of the peak for ~7% wall clock. Rung
+//! 4 buys −12.31% for 300-400%. They are not the same kind of lever.
+//!
+//! The obvious lever against it is a **wider cadence** — the re-open count per sub-stack falls as the
+//! window widens — which is the one thing this domain does not currently offer. That is tracked
+//! rather than guessed at: publishing a second cadence requires its own measurement on every entry,
+//! and this story measured one.
+//!
+//! Rung 4's published domain is the **single tightest cadence** ([`TRANSFORMER_WINDOW_SIZES`] is
+//! `[1]`), so there is one rung-4 row and not a sweep of them. An earlier draft of this table carried
+//! a second "window 2" row at the same peak; it was never measured and could not have been — the
+//! sweep iterates this constant, and `validate_window` refuses every cadence outside it. A wider
+//! cadence is also the wrong direction to explore first:
+//! [`BlockPlan::new`](mlx_gen::block_residency::BlockPlan::new) clamps a window to its stack's
+//! depth, so any cadence ≥ 2 degrades **five of the eleven** sub-stacks (the 2-deep ones) to fully
+//! resident while bounding the other six less tightly. If a future story wants that trade it owes
+//! its own measurement.
+//!
+//! ## Per-entry coverage is NOT uniform — measured, per entry, per tier
+//!
+//! | entry | tier | staged peak (4 steps) | ms/step | rung 4 |
 //! |---|---|---:|---:|---|
-//! | resident | bf16 | 20.513 GiB | — | — |
-//! | + rung 1 | bf16 | **19.003** | **−7.4%** | byte-identical |
-//! | staged (control) | q8 | 17.693 | — | — |
-//! | + rung 4, window 1 | q8 | **15.516** | **−12.3%** | byte-identical |
-//! | + rung 4, window 2 | q8 | 15.516 | −12.3% | byte-identical |
+//! | `sdxl` | bf16 | 19.005 GiB | 909 | Implemented |
+//! | `realvisxl` | bf16 | 19.003 | 780 | Implemented |
+//! | `realvisxl` | q4 | 16.654 | 1115 | Implemented |
+//! | `realvisxl` | q8 | 17.693 | 1120 | Implemented |
+//! | `realvisxl_lightning` | q4 | 16.654 | 1146 | Implemented |
+//! | `illustrious_xl_v1` | q8 | 17.693 | 1169 | **Missing** |
+//! | `illustrious_xl_v2` | q8 | 17.693 | 1164 | **Missing** |
+//!
+//! `realvisxl`/bf16 reads 19.003 GiB at **four** steps and also at six, because under rung 1 the
+//! request peak is the phase envelope `max(CLIP-L + bigG, U-Net + VAE)` — a residency bound, not an
+//! accumulation — so step count does not move it. Quoting the same figure for both is correct; what
+//! would be wrong is quoting it without saying which row it came from.
+//!
+//! **Rung 4 is `Missing` on `illustrious_xl_v1`/q8 and `illustrious_xl_v2`/q8** — which is, today,
+//! those two entries' only advertised tier, so it is `Missing` for those entries outright. The first
+//! revision of this ladder's evidence did not say so, because its per-entry test recorded a peak and
+//! never checked which ladder each entry published. It does now
+//! (`every_catalog_entry_loads_and_publishes_the_ladder`, and the `EXPECTED_RUNG_FOUR` table beside
+//! it).
+//!
+//! The cause is the **snapshot**, not the architecture. Both entries' `unet/` weights are genuinely
+//! packed — u32 codes with `.scales`/`.biases`, 3.46 GiB, byte-for-byte the same shape as
+//! `realvisxl`'s q8, and their measured 17.693 GiB peak is `realvisxl` q8's to the millibyte — but
+//! their `unet/config.json` ships **without the `quantization` marker**. `mlx_gen::quant::packed_quant_bits`
+//! reads that marker and only that marker, so [`load_leaves_blocks_lazy`] cannot distinguish this
+//! load from one that would quantize at load time and materialize the trunk, and [`streamable`]
+//! refuses. (The same missing marker also makes `warn_sequential_requantize` fire on every load of
+//! these two — a visible symptom of the same root cause.)
+//!
+//! **The rung fails closed, which is correct, and the repair is a republished snapshot rather than a
+//! looser predicate here** (tracked as sc-17522). Sniffing the tensors instead would put this
+//! predicate and the F-144 requested-vs-packed tier guard on two different definitions of "packed",
+//! and rung 4 replays the *recorded tier* into every re-materialized block — so the two must not be
+//! allowed to disagree about what tier that is.
 //!
 //! **Two of the five rungs are `Missing`, and both verdicts are measurements rather than gaps.**
 //! Their mechanisms are implemented, reach every advertised route, and are exercised by
@@ -132,7 +212,13 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// runs the globally-scoped decoder head (denormalize → `post_quant_conv` → `conv_in` → mid resnets →
 /// mid **self-attention**) once on the full latent and tiles only the full-resolution upsample tail,
 /// which is the same head/tail split `mlx_gen_qwen_image` uses. It bounds real memory: at 1024² bf16
-/// the request peak falls **19.003 → 15.866 GiB (−16.5%)** at edge 896.
+/// the isolated decode peak falls **14.360 → 11.237 GiB (−21.7%)** at edge 896, and the whole request
+/// falls by the margin `the_withheld_decode_geometry_is_priced_at_the_request_level` measures.
+///
+/// Both scopes are quoted because they answer different questions and an earlier revision of this
+/// file quoted a request-level figure no test in this crate produced. The mechanism sweep measures
+/// the decode in isolation — the right scope for the drift; the request row measures what a caller
+/// would actually have paid — the right scope for the saving.
 ///
 /// It is not published, because it does not preserve the output. Swept against the **exact untiled
 /// decode of the same latent** — a real 1024² render re-encoded through the same VAE — on
@@ -150,9 +236,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// | 256 | 132 | 132 | 129 | 103 |
 ///
 /// (max Δ per channel, out of 255. Mean Δ ranges 0.89 → 4.12.) The **best** geometry in the whole
-/// grid still moves a channel by 38/255, and every other one is worse.
+/// grid moves a channel by 38/255, and every other one at this output size is worse.
 ///
-/// **Two controls establish that this is the architecture and not the implementation.**
+/// **Two controls establish that the drift is the architecture and not the implementation.**
 ///
 /// 1. *It is not a ragged-split artifact.* Re-run at 1536², where 768 / 512 / 384 all divide the
 ///    output evenly, the drift gets **worse**, not better: 160, 170, 183 at overlap 64.
@@ -163,12 +249,64 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// The mechanism is the **GroupNorms in the tail**: every `ResnetBlock2D` in `up_blocks` and the
 /// final `conv_norm_out` computes statistics over the spatial extent it is handed, so a tile
-/// normalizes against its own crop rather than the image. Z-Image hit the same wall and drew its
-/// floor at 512 (max Δ 64→83 below it); SDXL's decoder is past that wall at **every** tile size.
+/// normalizes against its own crop rather than the image.
 ///
-/// Publishing this as a memory lever would be substituting quality for memory without saying so —
-/// the same refusal the catalog already makes for precision (tier integrity) and geometry
-/// (SC-15807). So it is declared `Missing` with its numbers, not shipped selectable.
+/// ## Why 38/255 is nevertheless not publishable — the bar, and the range
+///
+/// **The bar is 48/255**, and it is inherited rather than invented: it is the worst drift a sibling
+/// MLX provider on this same shared tiling machinery *admits* into a shipped ladder
+/// (`mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGES` tops out at 48 on its 768 px tile; its
+/// rejected set starts at 64). Z-Image's decoder is the same diffusers `AutoencoderKL` with the same
+/// spatial-extent GroupNorms and the same head/tail split, so it is the closest precedent that
+/// exists. By that bar the 1024² sweep datum **passes**: 38 < 48, buying a measured
+/// **19.0032 → 15.8660 GiB (−16.51%)** request peak at only ~7% wall clock (876 → 936 ms/step). On
+/// the 1024² sweep alone this candidate should ship, and an earlier revision of this file was wrong
+/// to claim otherwise — it asserted SDXL was "past that wall at every tile size", which its own
+/// table above contradicts.
+///
+/// **Two independent measurements withhold it anyway**, and both were missing from that revision.
+///
+/// ### 1. On the latent a real render produces, 1024² does not clear the bar either
+///
+/// The 38/255 above is measured against a latent obtained by **re-encoding a finished image** — its
+/// statistics have already been through the VAE round trip. Decode what the denoiser actually hands
+/// the decode phase and the same geometry drifts **84/255**
+/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). The production latent is the one
+/// a user would get, so the one output size where the candidate looked admissible does not survive
+/// contact with a production request. Nothing about the sweep was wrong — it is the right instrument
+/// for comparing geometries against each other, and the wrong one for deciding an absolute bar.
+///
+/// ### 2. And the datum is a property of the geometry, not of the tile edge
+///
+/// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
+/// publishing 896 publishes it at everything `crate::model::descriptor` advertises — and that is
+/// `max_size: 2048`. Re-swept across that range at the best overlap
+/// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
+///
+/// | output | tiles | tile covers | max Δ | vs the 48/255 bar |
+/// |---:|---:|---:|---:|---|
+/// | 1024² | 4 | 87.5% | **38** | clears (but see 1 — 84 on the production latent) |
+/// | 1280² | 4 | 70.0% | 64 | fails |
+/// | 1536² | 4 | 58.3% | 120 | fails |
+/// | 2048² | 9 | 43.75% | 77 | fails |
+///
+/// The GroupNorm mechanism predicts exactly this shape: what governs the drift is the tile's
+/// **fraction of the image**, because that is what sets how far a tile's statistics can sit from the
+/// global ones. Edge 896 covers 87.5% of a 1024² output and 43.75% of a 2048² one. No fixed pixel
+/// edge holds a constant fraction across a 4× range, so no fixed pixel edge is admissible across
+/// this provider's advertised range — and a domain admissible at exactly one output size is not
+/// something `decode_tile_edges` can express. A selector would size a fit off `[896]`, choose it at
+/// 1536², and get either a hard admission rejection or a visibly seamed image.
+///
+/// So the rung is withheld — but the reason is now stated correctly and each half is asserted by a
+/// test, and the prize is recorded with a number rather than dismissed: **−16.51% of the request
+/// peak for ~7% wall clock**, which is a better memory/latency trade than rung 4's. What would
+/// unlock it is a geometry-relative tile parameter (a fraction of the output rather than a pixel
+/// edge), or a decoder whose tail normalizes over the full extent. Both are contract-level changes,
+/// and neither is this story's.
+///
+/// Publishing it as-is would be substituting quality for memory without saying so — the same refusal
+/// the catalog already makes for precision (tier integrity) and geometry (SC-15807).
 pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The attention chunk size the rung-3 sweep exercised.
@@ -180,12 +318,21 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// cross-attention of all 70 `TransformerBlock`s, plus the IP-Adapter decoupled branch, route
 /// through [`mlx_gen::attention::sdpa_budgeted_bhsd`] on every advertised denoise route.
 ///
-/// It is not published for two reasons, either of which is sufficient
-/// (`attention_chunking_is_measured_against_the_rung_two_top`, `realvisxl` bf16, 1024²):
+/// It is not published for two reasons, either of which is sufficient. Both are measured on
+/// `realvisxl` bf16 at 1024², and each has its own test because they are measured at different
+/// scopes and the scopes are not interchangeable:
 ///
-/// 1. **It does not move the request peak — it moves it the WRONG WAY.** End to end: 19.003 GiB
-///    unchunked → 19.003 GiB chunked, **0.00%**, at both 1 and 6 steps. Measured at the U-Net seam,
-///    where the effect is not diluted by the rest of the request
+/// 1. **It does not move the REQUEST peak at all**, and at the seam it moves it the wrong way.
+///    End to end (`attention_chunking_is_measured_against_the_rung_two_top`, which re-assembles the
+///    staged request from the public pipeline entry points because the production resolver refuses a
+///    bounded-attention selection):
+///
+///    | steps | unchunked | chunked | Δ peak | max Δ px | mean Δ px |
+///    |---:|---:|---:|---:|---:|---:|
+///    | 1 | 19.0032 GiB | 19.0032 GiB | **−0.00%** | 57/255 | 1.53 |
+///    | 6 | 19.0032 GiB | 19.0032 GiB | **−0.00%** | 255/255 | 4.55 |
+///
+///    Measured instead at the U-Net seam, where the effect is not diluted by the rest of the request
 ///    (`attention_chunking_is_measured_at_the_unet_seam`), one CFG-batched 1024² forward goes
 ///    **6.2685 → 6.5868 GiB, +5.08%**: chunking *adds* transients here rather than bounding
 ///    anything. That is the hazard `mlx_gen::attention`'s own docs name — when q/k/v are already
@@ -193,18 +340,38 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 ///    the conv/resnet trunk between every attention has already broken the lazy graph that
 ///    `eval_per_chunk` exists to cut. The epic is explicit that a rung which does not move the
 ///    request peak is not a saving; one that raises it is worse than absent.
-/// 2. **It is not output-preserving on this family.** Chunking is *mathematically* identity — every
-///    query row's softmax is over the complete key set either way — but MLX dispatches a different
-///    fused kernel at a different query-block size, and SDXL runs **fp16** with a chaos-sensitive
-///    Euler-Ancestral schedule. Measured at **one** step, where the sampler cannot amplify anything:
-///    max Δ **89/255**, mean Δ 3.36. At six steps it is a different image (max Δ 255). At the U-Net
-///    seam the raw divergence is `max|Δeps| = 5.25e-3` on a single fp16 forward — small per call,
-///    and then amplified by 140 attention sites and a chaos-sensitive schedule.
+/// 2. **The output moves — and that is a property of the CHOSEN AXIS, not of SDXL.** Be precise
+///    here, because an earlier revision of this file was not: it said chunking "is not
+///    output-preserving on this family", which overstates what was measured and points the next
+///    reader at the wrong suspect.
 ///
-/// The one-step control is what separates these two claims from a wiring bug, and it is why the
-/// verdict is stated as a property of this family rather than of the shared helper: Z-Image measures
-/// −1.7% on its denoise phase with a bit-identical image on the same primitive. A rung's magnitude
-/// and its output-preservation are both per family per backend, and neither transferred here.
+///    The arithmetic is exactly preserved. [`sdpa_budgeted_bhsd`](mlx_gen::attention::sdpa_budgeted_bhsd)
+///    chunks the **query axis only**: each chunk is a complete fused SDPA over the full k/v, so there
+///    is no accumulator and no running max, and the class of bug that would make chunked softmax
+///    genuinely wrong is structurally unwritable. What changes is *which reduced-precision Metal
+///    matmul specialization MLX dispatches* for the `[.., block, Sk]` product — the sc-2338 parity
+///    class — which `mlx_gen::attention` documents as exactly `0` at some block sizes and ~1e-3
+///    peak-relative at others, with no monotonic relationship to block size.
+///
+///    `gen_core::attention_budget` carries a **second** axis for exactly this reason:
+///    `AttentionBudget::head_chunks` narrows complete heads and *preserves bit identity*, and its
+///    docs say outright that the two axes "share a score budget, but not a numerical contract" and
+///    must not be treated as interchangeable. `sdpa_budgeted_bhsd` never uses it. So the honest
+///    statement is: **the query-row axis is not bit-exact on Metal, and SDXL is unusually exposed to
+///    that** — it runs fp16 through a chaos-sensitive Euler-Ancestral schedule across 140 attention
+///    sites. Measured at **one** step, where the sampler cannot amplify anything, the raw per-forward
+///    divergence is `max|Δeps| = 5.25e-3` and the image moves by 57/255; by six steps it is a
+///    different image.
+///
+///    This is a real reason to withhold *this* rung as implemented, and it is **not** a reason to
+///    conclude the family cannot support bounded attention. A head-axis implementation would be
+///    bit-exact by construction; what it would still have to beat is reason 1, which is the binding
+///    one.
+///
+/// The one-step control is what separates both claims from a wiring bug. It is also why the verdict
+/// is stated per family per backend: Z-Image measures −1.7% on its denoise phase with a bit-identical
+/// image on the same primitive. A rung's magnitude and its output-preservation are both per family
+/// per backend, and neither transferred here.
 pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The production transformer-window domain for rung 4: how many consecutive `TransformerBlock`s of
@@ -460,10 +627,13 @@ fn contract_with_asset_facts(
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
         "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and rejected: its best geometry still moves a \
-         channel by 38/255 against the untiled decode, because the upsample tail's GroupNorms \
-         normalize per tile. Requested edge {edge:?} overlap {overlap:?}; see \
-         memory_strategy::DECODE_SUPPORT for the full sweep."
+         Missing). The tiled decode was measured and withheld: its best geometry (edge \
+         {DECODE_TILE_EDGE} overlap 192) clears the 48/255 sibling bar at 1024² with 38/255, but the \
+         same edge drifts 64 at 1280², 120 at 1536² and 77 at 2048² — the upsample tail's GroupNorms \
+         normalize over each tile's own crop, so what bounds the drift is the tile's FRACTION of the \
+         output, and a fixed pixel edge cannot hold that across an advertised range up to 2048². \
+         Requested edge {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the \
+         full sweep."
     ))
 }
 
@@ -516,8 +686,10 @@ pub(crate) fn safety_check(
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
             return Err(CoreError::Unsupported(format!(
                 "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the request peak 0.00% here and is not output-preserving on \
-                 this fp16 chaos-sensitive path — see memory_strategy::ATTENTION_SUPPORT",
+                 Missing): it moves the request peak 0.00% here (and +5.08% at the U-Net seam), and \
+                 the query-row chunking axis is not bit-exact on Metal, which an fp16 \
+                 chaos-sensitive schedule amplifies to a different image — see \
+                 memory_strategy::ATTENTION_SUPPORT",
                 contract.provider_id
             )));
         }
@@ -729,8 +901,9 @@ pub(crate) fn attention_plan(
     if req.memory.is_some_and(|memory| memory.chunk_attention) {
         return Err(mlx_gen::Error::Unsupported(
             "sdxl: bounded attention is not selectable on this provider (rung 3 is declared \
-             Missing): it moves the request peak 0.00% here and is not output-preserving on this \
-             fp16 chaos-sensitive path — see memory_strategy::ATTENTION_SUPPORT"
+             Missing): it moves the request peak 0.00% here (and +5.08% at the U-Net seam), and the \
+             query-row chunking axis is not bit-exact on Metal, which an fp16 chaos-sensitive \
+             schedule amplifies to a different image — see memory_strategy::ATTENTION_SUPPORT"
                 .to_owned(),
         ));
     }
@@ -1040,6 +1213,61 @@ mod tests {
         assert!(
             (TRANSFORMER_WINDOW_SIZES[0] as usize) < 2,
             "the tightest published cadence must bound the 2-deep sub-stacks"
+        );
+    }
+
+    /// **The `transformer_layers_per_block[0]`-is-never-read trap**, pinned — this is the defect
+    /// SC-16355 was filed over, and it bit this PR's own documentation once already.
+    ///
+    /// SDXL's level-0 down block is a plain `DownBlock2D` with no attention, so the `1` sitting at
+    /// `transformer_layers_per_block[0]` describes nothing that exists. Two things follow, and both
+    /// were stated wrongly at some point:
+    ///
+    /// * `widest_transformer_stack` must filter on `down_block_types` rather than taking a bare
+    ///   `max` — that is what this asserts by mutation-resistant construction below;
+    /// * the shallowest **attention-bearing** level is level 1, one downsample in, so at 1024² the
+    ///   self-attention key axis tops out at 64·64 = **4096** and not at the latent's 128·128 =
+    ///   16384. `crate::unet::transformer` cites that number.
+    #[test]
+    fn the_level_zero_transformer_layer_count_describes_no_attention() {
+        let cfg = crate::config::UNetConfig::sdxl_base();
+        assert!(
+            !cfg.down_block_types[0].contains("CrossAttn"),
+            "level 0 is {} — if it ever gains attention, both the window domain and the 4096 key-axis \
+             claim in crate::unet::transformer must be re-derived",
+            cfg.down_block_types[0]
+        );
+        assert_eq!(
+            cfg.transformer_layers_per_block[0], 1,
+            "the inert level-0 entry is still 1; it is never read"
+        );
+        // The bare `max` a reader reaches for first would also be 10 here, so that alone proves
+        // nothing. What separates the correct filter from the naive one is that the *sum* over
+        // attention-bearing levels excludes level 0 entirely.
+        let attention_levels: Vec<i32> = cfg
+            .transformer_layers_per_block
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| cfg.down_block_types[*i].contains("CrossAttn"))
+            .map(|(_, layers)| *layers)
+            .collect();
+        assert_eq!(
+            attention_levels,
+            vec![2, 10],
+            "only levels 1 and 2 own Transformer2D sub-stacks"
+        );
+        // At 1024² the latent is 128², halved once before the first attention-bearing level.
+        let shallowest_attention_level = cfg
+            .down_block_types
+            .iter()
+            .position(|kind| kind.contains("CrossAttn"))
+            .expect("SDXL has cross-attention down blocks");
+        let latent_edge = 1024 / 8;
+        let key_axis = (latent_edge >> shallowest_attention_level) as u32;
+        assert_eq!(
+            key_axis * key_axis,
+            4096,
+            "the largest self-attention key axis at 1024² is 4096, not the full-resolution 16384"
         );
     }
 }

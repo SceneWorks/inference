@@ -343,9 +343,16 @@ impl TransformerBlock {
         plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // Self-attention. Rung 3 reaches this one too: it is the LARGER of the two by far — its key
-        // axis is the latent grid (16384 at 1024² in the shallowest sub-stacks) against the text
-        // memory's fixed 77·2, so a bounded-attention rung that skipped it would bound the smaller
-        // half and report a saving it did not make.
+        // axis is the latent grid against the text memory's fixed 77, so a bounded-attention rung
+        // that skipped it would bound the smaller half and report a saving it did not make.
+        //
+        // At 1024² that axis tops out at **4096**, not at the 128·128 = 16384 the full-resolution
+        // latent would suggest: SDXL's `down_block_types[0]` is a plain `DownBlock2D` with **no**
+        // attention, so the shallowest sub-stack that owns a `TransformerBlock` already runs one
+        // downsample in, at 64·64. (That the level-0 entry is inert is exactly the
+        // `transformer_layers_per_block[0]`-is-never-read trap SC-16355 was filed over: the config
+        // carries a `1` there that nothing reads. `memory_strategy::widest_transformer_stack`
+        // filters on `down_block_types` for the same reason.)
         let y = layer_norm(x, Some(&self.norm1_w), Some(&self.norm1_b), LN_EPS)?;
         let x = add(x, &self.attn1.forward_ip(&y, &y, None, plan)?)?;
         // Cross-attention to the text memory (+ optional IP-Adapter branch).

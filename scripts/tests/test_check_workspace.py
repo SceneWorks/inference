@@ -478,23 +478,111 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
                     because="never calls the checked constructor",
                 )
 
+    # ── SC-15525's rung-2-Missing exemption, and the three shapes it must NOT cover ──────────────
+    #
+    # The first revision keyed the exemption on the ABSENCE of the two domain literals and pinned only
+    # the `fn configure_decode` hook shape. Adversarial review defeated both halves: no MLX provider
+    # writes that method (shape C below), and a provider can declare rung 2 *Implemented* while
+    # keeping every domain literal in another crate (shape B). Each defeat is a named test here.
+
+    # The real production shape: `BoundedDecode` declared Missing through a named `const`, plus the
+    # refusing decode closure every MLX family hands the shared request scope.
+    REFUSES_RUNG_TWO = (
+        "pub fn registry() { register_memory_strategy(REG); }\n"
+        "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+        "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+        "    _ => MemoryParameterRanges::default() }; }\n"
+        "fn begin(id: &'static str) -> Result<()> {\n"
+        "    let cfg = MlxRequestScopeConfig::new(id, g, m, use_pid, blocks,\n"
+        "        move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),\n"
+        "    )?;\n"
+        "    Ok(())\n"
+        "}\n"
+    )
+
     def test_a_provider_that_declares_rung_two_missing_is_exempt(self) -> None:
-        """SC-15525: naming `BoundedDecode` to declare it Missing, and `MemoryParameterRanges` to
-        populate rung 4's window ranges, is not adoption — such a provider publishes no decode
-        domain, so there is no native ladder for the PiD seam to reject."""
-        self.assert_gate_passes(
+        """SC-15525: declaring `BoundedDecode` **Missing** — and refusing at both decode seams — is
+        not adoption. Such a provider publishes no native ladder, so there is nothing for the PiD
+        seam to receive. This is the shape `mlx-gen-sdxl` actually ships."""
+        self.assert_gate_passes(self.REFUSES_RUNG_TWO)
+
+    def test_the_exemption_needs_the_missing_declaration_not_just_a_bare_mention(self) -> None:
+        """The exemption is keyed on the POSITIVE claim. Naming `BoundedDecode` without a support
+        expression this reader can resolve to `Missing` proves nothing, so it must not buy an exit —
+        absence of a published domain is corroboration, never the key."""
+        self.assert_gate_fails(
             "pub fn registry() { register_memory_strategy(REG); }\n"
-            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT, "
-            "_ => MemoryParameterRanges::default() }; }\n"
+            "pub fn c() { let _ = MemoryStrategy::BoundedDecode; }\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_the_exemption_does_not_cover_a_declared_implemented_rung_two(self) -> None:
+        """**Review defeat (B).** A provider whose `MemoryParameterRanges` are built by a helper in
+        another crate writes neither domain literal in its own source — while declaring rung 2
+        **Implemented**. The first revision exempted exactly that. Both the inline and the
+        via-`const` spellings of `Implemented` must arm the gate."""
+        for support in (
+            "MemoryStrategySupport::Implemented",
+            "DECODE_SUPPORT",
+        ):
+            with self.subTest(support=support):
+                self.assert_gate_fails(
+                    "pub fn registry() { register_memory_strategy(REG); }\n"
+                    "pub const DECODE_SUPPORT: MemoryStrategySupport = "
+                    "MemoryStrategySupport::Implemented;\n"
+                    f"pub fn c() {{ match s {{ MemoryStrategy::BoundedDecode => {support},\n"
+                    "    _ => MemoryParameterRanges::default() }; }\n"
+                    "pub fn r() -> MemoryParameterRanges { shared::decode_ranges(EDGES) }\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_the_exemption_does_not_cover_a_live_mlx_decode_closure(self) -> None:
+        """**Review defeat (C) — the serious one.** No MLX provider writes `fn configure_decode`;
+        that method lives once on `MlxRequestScopeCore`, and each family hands the constructor a
+        closure instead. A closure that can SUCCEED admits a native geometry into the PiD seam, so
+        the exemption must not cover it however rung 2 is declared."""
+        for body in ("Ok(())", "self.plan(edge, overlap)", "routes.pick(edge)"):
+            with self.subTest(body=body):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO.replace(
+                        "Err(refuse_decode(id, Some(edge), Some(overlap)))", body
+                    ),
+                    because="never calls the checked constructor",
+                )
+
+    def test_the_exemption_does_not_cover_a_named_decode_validator(self) -> None:
+        """A validator passed by name is not a shape this reader can prove refuses, so it fails
+        closed rather than being taken on trust."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO.replace(
+                "move |_use_pid, edge, overlap| "
+                "Err(refuse_decode(id, Some(edge), Some(overlap)))",
+                "self.decode_validator",
+            ),
+            because="never calls the checked constructor",
         )
 
     def test_the_exemption_does_not_cover_a_live_configure_decode_hook(self) -> None:
-        """The exemption requires that any `configure_decode` hook be an unconditional rejection: a
-        hook that can succeed could admit a geometry even with no published domain."""
+        """The trait-method half of the same rule. It is the shape a NON-MLX adopter would write, so
+        it stays pinned even though no MLX family uses it."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO
+            + "fn configure_decode(&mut self, e: u32, o: u32) -> Result<()> { self.plan(e, o) }\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_a_cfg_test_missing_declaration_cannot_buy_the_exemption(self) -> None:
+        """The support declaration is read off the cfg(test)-blanked stream, so a test fixture that
+        writes `BoundedDecode => Missing` cannot exempt a production contract that never does."""
         self.assert_gate_fails(
             "pub fn registry() { register_memory_strategy(REG); }\n"
-            "pub fn c() { let _ = MemoryStrategy::BoundedDecode; }\n"
-            "fn configure_decode(&mut self, e: u32, o: u32) -> Result<()> { self.plan(e, o) }\n",
+            "pub fn r() -> MemoryParameterRanges { shared::decode_ranges(EDGES) }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+            "    fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "        _ => MemoryParameterRanges::default() }; }\n"
+            "}\n",
             because="never calls the checked constructor",
         )
 

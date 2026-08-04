@@ -697,12 +697,148 @@ def _configure_decode_hooks_are_unconditional_rejections(text: str) -> bool:
         if open_index < 0:
             return False
         end = _match_brace(text, open_index)
-        body = text[open_index + 1 : end - 1].strip()
-        prefix = re.match(r"Err\s*\(", body)
-        if prefix is None:
+        if not _is_single_err_expression(text[open_index + 1 : end - 1]):
             return False
-        outer_open = body.find("(", prefix.start())
-        if _match_paren(body, outer_open) != len(body):
+    return True
+
+
+def _is_single_err_expression(body: str) -> bool:
+    """Whether ``body`` is exactly one ``Err(...)`` expression and nothing else.
+
+    Shared by the two decode-hook shapes a provider can write, so "unconditional rejection" has one
+    definition rather than one per seam.
+    """
+    body = body.strip()
+    prefix = re.match(r"Err\s*\(", body)
+    if prefix is None:
+        return False
+    outer_open = body.find("(", prefix.start())
+    return _match_paren(body, outer_open) == len(body)
+
+
+# The shared MLX request-scope constructor. Its LAST positional argument is the provider's decode
+# validator — the closure the runtime drives to apply (or refuse) a bounded-decode selection.
+#
+# SC-15525 review: this is the shape that actually matters, and the first revision of the rung-2
+# exemption missed it entirely. **No MLX provider writes `fn configure_decode`** — that method lives
+# once, on `mlx_gen::request_scope::MlxRequestScopeCore`, and every family reaches it by handing this
+# constructor a closure. So an exemption that only inspected the trait-method form was vacuous for the
+# entire MLX provider family: flip the closure's `Err` to `Ok` and a native geometry reaches the PiD
+# seam with the gate silent.
+MLX_REQUEST_SCOPE_CONSTRUCTOR = "MlxRequestScopeConfig::new"
+
+
+def _split_top_level_args(text: str) -> list[str]:
+    """Split a Rust argument list on top-level commas, ignoring nesting and string literals.
+
+    A Rust trailing comma is idiomatic and `rustfmt` inserts one, so the empty tail it produces is
+    dropped — otherwise every well-formatted call site would look like it passed nothing last.
+    """
+    args: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(text[start:i])
+            start = i + 1
+        elif char == '"':
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 1
+                elif text[i] == '"':
+                    break
+                i += 1
+        elif char == "|" and depth == 0:
+            # A closure parameter list at argument level. Skip to its closing `|` so a `,` between
+            # closure parameters is not mistaken for an argument separator.
+            close = text.find("|", i + 1)
+            if close != -1:
+                i = close
+        i += 1
+    args.append(text[start:])
+    while len(args) > 1 and not args[-1].strip():
+        args.pop()
+    return args
+
+
+def _decode_validators_are_unconditional_rejections(text: str) -> bool:
+    """Whether every decode validator handed to [`MLX_REQUEST_SCOPE_CONSTRUCTOR`] refuses outright.
+
+    The closure twin of :func:`_configure_decode_hooks_are_unconditional_rejections`, and the one an
+    MLX family actually writes. Deliberately narrow, in the same way: only a literal closure whose
+    entire body is one ``Err(...)`` counts. A named function, a delegation, a ``match``, or any
+    closure with a success arm is an adoption signal and must go through ``DecodeRoutes``.
+
+    Returns ``False`` — never a silent pass — when the constructor is called in a shape this reader
+    cannot resolve, so an unparseable call arms the gate instead of disarming it.
+    """
+    for start in re.finditer(re.escape(MLX_REQUEST_SCOPE_CONSTRUCTOR), text):
+        open_index = text.find("(", start.end())
+        if open_index < 0:
+            return False
+        end = _match_paren(text, open_index)
+        if end > len(text):
+            return False
+        args = _split_top_level_args(text[open_index + 1 : end - 1])
+        validator = args[-1].strip().rstrip(",").strip()
+        closure = re.match(r"(?:move\s+)?\|[^|]*\|", validator)
+        if closure is None:
+            return False
+        if not _is_single_err_expression(validator[closure.end() :]):
+            return False
+    return True
+
+
+# `MemoryStrategy::BoundedDecode => <expr>,` — the contract arm that states this provider's rung-2
+# support. The arm is the semantic fact the SC-15525 exemption is keyed on; `<expr>` is captured so a
+# declaration made through a named `const` can be followed one hop.
+_BOUNDED_DECODE_SUPPORT_ARM = re.compile(
+    r"BoundedDecode\s*(?:if\s+[^=]*?)?=>\s*([^,\n]+?)\s*[,\n]"
+)
+_MISSING_SUPPORT_EXPR = re.compile(r"^(?:MemoryStrategySupport::)?Missing$")
+
+
+def _declares_bounded_decode_missing(text: str) -> bool:
+    """Whether this provider's contract textually declares ``BoundedDecode`` support **Missing**.
+
+    SC-15525 review defeat (B): the first revision keyed its exemption on the *absence* of the
+    ``decode_tile_edges`` / ``decode_overlaps`` literals, which is a proxy for "publishes no domain"
+    that a provider defeats simply by building its ``MemoryParameterRanges`` in another crate — while
+    declaring ``BoundedDecode`` **Implemented**. Absence of evidence was doing the work of evidence.
+
+    So the exemption is now keyed on the positive claim instead: the crate must *say* rung 2 is
+    Missing. Two spellings are accepted, because both ship today — the support expression written
+    inline, and the same expression behind a named ``const`` this module follows exactly one hop
+    (SDXL's ``DECODE_SUPPORT``). Anything else — a computed support, a second hop, an arm this reader
+    cannot parse — is not a declaration it can verify, and the provider falls through to the route
+    checks.
+
+    At least one arm must be found: a crate with no ``BoundedDecode`` arm at all has declared nothing
+    and is not exempt.
+    """
+    arms = _BOUNDED_DECODE_SUPPORT_ARM.findall(text)
+    if not arms:
+        return False
+    for expr in arms:
+        expr = expr.strip()
+        if _MISSING_SUPPORT_EXPR.match(expr):
+            continue
+        # One hop through a named const: `const NAME: MemoryStrategySupport = ...::Missing;`
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", expr):
+            return False
+        const_decl = re.search(
+            r"\bconst\s+" + re.escape(expr) + r"\s*:\s*MemoryStrategySupport\s*=\s*"
+            r"(?:MemoryStrategySupport::)?Missing\s*;",
+            text,
+        )
+        if const_decl is None:
             return False
     return True
 
@@ -830,6 +966,13 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
        rung 2 — the ranges, the strategy name, and its ``configure_decode`` hook — to another crate. The
        registry walk covers the semantic declaration; the trigger set remains deliberately wide
        (fail-closed) as an earlier diagnostic.
+    3. The two *exemptions* below are narrower than the trigger set, and each is keyed on a positive,
+       checkable claim rather than on an absence — because SC-15525's review showed an
+       absence-keyed exemption is defeated by moving the absent text into another crate. Every
+       exemption additionally requires that **both** decode seams a provider can write refuse
+       unconditionally: the ``configure_decode`` trait method *and* the closure handed to
+       ``MlxRequestScopeConfig::new``. The latter is the one that matters in practice — no MLX
+       provider writes the former.
 
     String/character literals and constructs that cannot compile without the Rust ``test`` cfg are
     excluded from evidence matching. Trigger matching uses a separate cfg-unblanked syntax stream,
@@ -872,34 +1015,49 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         # A single-expression typed rejection cannot emit a native tile into the PiD seam, so do not
         # mistake that trait-completeness method for a bounded-decode implementation. Every broader
         # hook shape still fails closed through the route checks below.
-        if rung_two_markers == [
-            "configure_decode"
-        ] and _configure_decode_hooks_are_unconditional_rejections(evidence):
+        #
+        # Both exemptions below share one precondition, and it is the one the SC-15525 review found
+        # missing: **every** decode hook the crate writes — the trait method AND the closure handed to
+        # the shared MLX request scope — must be an unconditional rejection. See
+        # `_decode_validators_are_unconditional_rejections` for why the closure is the load-bearing
+        # half on MLX.
+        hooks_all_refuse = (
+            "fn configure_decode" not in triggers
+            or _configure_decode_hooks_are_unconditional_rejections(triggers)
+        ) and _decode_validators_are_unconditional_rejections(triggers)
+        if (
+            rung_two_markers == ["configure_decode"]
+            and _configure_decode_hooks_are_unconditional_rejections(evidence)
+            and hooks_all_refuse
+        ):
             continue
         # SC-15525: the same exemption, for the provider shape that declares rung 2 **Missing** after
         # measuring it. Such a provider must still NAME `BoundedDecode` (to declare the support) and
         # `MemoryParameterRanges` (the field's type, which it populates for rung 4), so the trigger
-        # set alone cannot distinguish it from an adopter — but the hazard this gate exists for is a
-        # provider emitting its NATIVE ladder into `GenerationMemory::decode_tile_edge`, and a
-        # provider that publishes no domain has no ladder to emit.
+        # set alone cannot distinguish it from an adopter.
         #
-        # The exemption is therefore keyed on the two domain-publishing markers rather than on the
-        # type names: a contract with neither `decode_tile_edges` nor `decode_overlaps` anywhere in
-        # its production sources cannot construct a non-empty `MemoryParameterRanges::decode_*`, so
-        # `MemorySelection::decode_tile_edge` can never carry a value this provider produced. Any
-        # `configure_decode` hook it does define must still be an unconditional rejection, so the
-        # request-scope seam cannot admit a geometry either. A provider that publishes a domain —
-        # even one edge — falls straight through to the route checks below, unchanged.
-        # Evaluated on TRIGGERS, not evidence, for the reason the trigger stream exists: evidence is
-        # cfg(test)-blanked, so a `#![cfg(test)]` file would erase the very domain that arms the gate
-        # and the exemption would disarm it. Reading the unblanked stream can only over-arm, which
-        # fails closed.
+        # It is keyed on the **positive claim**, not on the absence of one. The first revision keyed it
+        # on the *absence* of the `decode_tile_edges` / `decode_overlaps` literals — a proxy for
+        # "publishes no domain" that review defeat (B) broke by building `MemoryParameterRanges` in
+        # another crate while declaring `BoundedDecode` **Implemented**: absence of evidence was doing
+        # the work of evidence. Now the crate must SAY rung 2 is Missing
+        # (`_declares_bounded_decode_missing`), and a provider that says so cannot also be publishing a
+        # domain — so the two domain markers stay as a corroborating, fail-closed necessary condition
+        # rather than as the key.
+        #
+        # The support declaration is read off EVIDENCE (cfg(test)-blanked): a `#[cfg(test)]` fixture
+        # asserting `BoundedDecode => Missing` must not be able to buy a production exemption. The
+        # domain and hook checks are read off TRIGGERS (unblanked) for the mirror-image reason — a
+        # `#![cfg(test)]` file would otherwise erase the very domain (or the very accepting closure)
+        # that arms the gate. Each stream is chosen so that a parser slip over-arms rather than
+        # disarms.
         publishes_decode_domain = any(
             marker in triggers for marker in ("decode_tile_edges", "decode_overlaps")
         )
-        if not publishes_decode_domain and (
-            "fn configure_decode" not in triggers
-            or _configure_decode_hooks_are_unconditional_rejections(triggers)
+        if (
+            _declares_bounded_decode_missing(evidence)
+            and not publishes_decode_domain
+            and hooks_all_refuse
         ):
             continue
         missing: list[str] = []

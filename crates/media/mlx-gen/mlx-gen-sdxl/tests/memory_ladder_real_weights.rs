@@ -105,10 +105,20 @@ fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> Generatio
     }
 }
 
-/// One measured row: the request's ACTIVE-bytes peak and its pixels.
+/// One measured row: the request's ACTIVE-bytes peak, its pixels, and its wall clock.
+///
+/// `wall` exists because SC-16355 carried re-materialization latency as an explicit hazard — "70
+/// blocks across 11 re-opens could be a severe regression on exactly the small Macs this rung exists
+/// for" — and a peak-only row cannot answer it. A memory rung that halves the peak and triples the
+/// render is not obviously a win, and the selector cannot weigh a cost nobody measured.
+///
+/// It is a wall clock, so it is the softest number in this file: it moves with thermal state and with
+/// whatever else the machine is doing. It is therefore *reported* and bounded loosely, never asserted
+/// to a tight figure.
 struct Row {
     peak_gib: f64,
     pixels: Vec<u8>,
+    wall: std::time::Duration,
 }
 
 /// Render one row on a **fresh** generator and return its request peak.
@@ -125,10 +135,14 @@ fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &Generation
         .expect("load sdxl");
     clear_cache();
     reset_peak_memory();
+    let started = std::time::Instant::now();
     let out = model
         .generate(req, &mut |_: Progress| {})
         .expect("generate must succeed");
     let peak = get_peak_memory();
+    // Timed inside the reset/read window, so the row's clock covers exactly the request its peak
+    // covers — the load is excluded from both.
+    let wall = started.elapsed();
     let pixels = match out {
         GenerationOutput::Images(images) => images.first().expect("one image").pixels.clone(),
         other => panic!("expected images, got {other:?}"),
@@ -138,7 +152,15 @@ fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &Generation
     Row {
         peak_gib: peak as f64 / GIB,
         pixels,
+        wall,
     }
+}
+
+/// Milliseconds per denoise step for a row, which is the unit rung 4's re-materialization cost is
+/// actually paid in: the window re-opens the snapshot once per sub-stack per step, so the overhead
+/// scales with steps rather than with the request.
+fn ms_per_step(row: &Row, steps: u32) -> f64 {
+    row.wall.as_secs_f64() * 1000.0 / f64::from(steps)
 }
 
 fn max_delta(a: &[u8], b: &[u8]) -> u32 {
@@ -334,13 +356,20 @@ fn decode_tile_mechanism_sweep() {
     let vae = mlx_gen_sdxl::load_vae(&dir).expect("load vae");
     let nhwc = mlx_gen_sdxl::preprocess_init_image(&image, size, size).expect("preprocess");
     let latent = vae.encode_mean(&nhwc).expect("encode");
+    // The untiled decode is both the drift reference AND the peak this mechanism is measured
+    // against. Recording only the tiled peaks left the "what does tiling buy" half of the evidence
+    // with no denominator from this test.
+    clear_cache();
+    reset_peak_memory();
     let reference = vae.decode(&latent).expect("untiled decode");
     reference.eval().expect("eval reference");
+    let untiled_peak = get_peak_memory() as f64 / GIB;
     let ref_px = mlx_gen_sdxl::decoded_to_image(&reference)
         .expect("reference image")
         .pixels;
 
     println!("[sc-15525 rung2 mechanism] latent {:?}", latent.shape());
+    println!("[sc-15525 rung2 mechanism] untiled decode peak {untiled_peak:.3} GiB at {size}²");
     println!("| edge | overlap | tiles | isolated peak (GiB) | max Δ | mean Δ |");
     println!("|---:|---:|---:|---:|---:|---:|");
     for overlap in &overlaps {
@@ -375,7 +404,358 @@ fn decode_tile_mechanism_sweep() {
     }
 }
 
+/// **The measurement that decides rung 2**, and the one the SC-15525 review's "publish `[896]`@192"
+/// proposal turns on.
+///
+/// The review was right about the datum and right about the bar. At 1024² the best geometry in the
+/// whole sweep — edge [`ms::DECODE_TILE_EDGE`] at overlap [`BEST_DECODE_OVERLAP`] — drifts **38/255**,
+/// which clears [`SIBLING_DRIFT_BAR`], the worst drift Z-Image *admits* into its shipped ladder. On
+/// that evidence alone the candidate should be published.
+///
+/// What the 1024²-only sweep could not see is that **the datum is not a property of the tile edge**.
+/// A contract's `decode_tile_edges` is an absolute pixel domain with no geometry axis, so publishing
+/// 896 publishes it across everything this provider advertises — and `descriptor()` advertises
+/// `max_size: 2048`. Re-measured across that range, the same geometry walks straight through the bar:
+///
+/// | output | tiles | max Δ | verdict |
+/// |---:|---:|---:|---|
+/// | 1024² | 4 | **38** | clears 48 |
+/// | 1280² | 4 | 64 | fails |
+/// | 1536² | 4 | 120 | fails |
+/// | 2048² | 9 | 77 | fails |
+///
+/// The mechanism explains the shape and predicts it: the tail's GroupNorms normalize over the spatial
+/// extent each tile is handed, so what governs the drift is the tile's **fraction of the image**, not
+/// its pixel size. 896 covers 87.5% of a 1024² output and 43.75% of a 2048² one. No fixed pixel edge
+/// can hold a constant fraction across a 4× range, so no fixed edge is admissible across it — which
+/// is a different and much stronger statement than the one this module used to make, and unlike that
+/// one it is consistent with the table above.
+///
+/// So the rung stays `Missing`, and this test is why: it fails if 1024² ever stops clearing the bar
+/// (the candidate was never real) **and** it fails if the larger outputs ever start clearing it (the
+/// candidate is now publishable and the declaration is stale). Either way the verdict gets revisited
+/// instead of inherited.
+#[test]
+#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range() {
+    let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
+    };
+    let registry = mlx_gen_sdxl::provider_registry().expect("provider registry");
+    let vae = mlx_gen_sdxl::load_vae(&dir).expect("load vae");
+
+    let mut rows: Vec<(u32, u32, f64)> = Vec::new();
+    for size in [1024_u32, 1280, 1536] {
+        // Fresh generator per size: the latent must be a real image's, and a reused bundle would
+        // carry the previous size's materialization into this one's isolated decode peak.
+        let model = registry
+            .load("sdxl", &spec(&dir, "bf16", LoadShape::EagerMaterialization))
+            .expect("load sdxl");
+        let out = model
+            .generate(&request(Some(staged()), size, 6), &mut |_| {})
+            .expect("render the sweep latent");
+        let image = match out {
+            GenerationOutput::Images(mut images) => images.swap_remove(0),
+            other => panic!("expected images, got {other:?}"),
+        };
+        drop(model);
+        clear_cache();
+
+        let nhwc = mlx_gen_sdxl::preprocess_init_image(&image, size, size).expect("preprocess");
+        let latent = vae.encode_mean(&nhwc).expect("encode");
+        let reference = vae.decode(&latent).expect("untiled decode");
+        reference.eval().expect("eval reference");
+        let ref_px = mlx_gen_sdxl::decoded_to_image(&reference)
+            .expect("reference image")
+            .pixels;
+
+        let cfg = mlx_gen::tiling::TilingConfig::spatial_only(
+            ms::DECODE_TILE_EDGE as i32,
+            BEST_DECODE_OVERLAP as i32,
+        );
+        clear_cache();
+        let tiled = vae.decode_tiled(&latent, &cfg, None).expect("tiled decode");
+        tiled.eval().expect("eval tiled");
+        let px = mlx_gen_sdxl::decoded_to_image(&tiled)
+            .expect("tiled image")
+            .pixels;
+        let drift = max_delta(&ref_px, &px);
+        let coverage = f64::from(ms::DECODE_TILE_EDGE) / f64::from(size);
+        println!(
+            "[sc-15525 rung2 range] {size}² edge {} overlap {BEST_DECODE_OVERLAP}: max Δ \
+             {drift}/255 (tile covers {:.1}% of the output)",
+            ms::DECODE_TILE_EDGE,
+            100.0 * coverage,
+        );
+        rows.push((size, drift, coverage));
+    }
+
+    let at = |size: u32| rows.iter().find(|(s, _, _)| *s == size).expect("row").1;
+    // Half one: the candidate is REAL at the size it was swept. Without this the test would pass on a
+    // decoder that drifts everywhere, and the withholding reason would be unfalsifiable.
+    assert!(
+        at(1024) <= SIBLING_DRIFT_BAR,
+        "edge {} overlap {BEST_DECODE_OVERLAP} no longer clears the sibling bar at 1024² ({} > \
+         {SIBLING_DRIFT_BAR}) — the whole premise of the rung-2 write-up is stale",
+        ms::DECODE_TILE_EDGE,
+        at(1024),
+    );
+    // Half two: and it is NOT admissible across the advertised range, which is why it is withheld.
+    for size in [1280_u32, 1536] {
+        assert!(
+            at(size) > SIBLING_DRIFT_BAR,
+            "edge {} overlap {BEST_DECODE_OVERLAP} now clears {SIBLING_DRIFT_BAR}/255 at {size}² \
+             ({}) — a fixed edge may have become admissible across the advertised range, so rung 2 \
+             must be re-decided rather than left Missing on a superseded measurement",
+            ms::DECODE_TILE_EDGE,
+            at(size),
+        );
+    }
+}
+
+/// **What rung 2 would have bought at the REQUEST level, and what it costs on the latent a real
+/// render actually produces.** Both are numbers the mechanism sweep cannot supply.
+///
+/// [`decode_tile_mechanism_sweep`] measures the *isolated* decode — the right scope for a drift
+/// comparison, the wrong scope for the saving, because a selector admits against the whole request.
+/// `generate` cannot supply this row either (`memory_strategy::decode_tiling` refuses every
+/// bounded-decode request), so it is assembled from the same public entry points as the rung-3 row,
+/// under the same staged schedule, with the tiled decode substituted for the single-pass one.
+///
+/// **The saving is real and it is the one this ladder claims**: 19.0032 → 15.8660 GiB, **−16.51%**,
+/// at 876 → 936 ms/step (tiling costs ~7% wall clock, not a multiple). An earlier revision published
+/// that figure with no test behind it; this is the test.
+///
+/// **And the drift is worse here than the sweep suggested — 84/255, not 38.** That is not a
+/// contradiction, it is the sweep's latent being the friendlier one. The sweep decodes a latent
+/// obtained by *re-encoding a finished image*, whose statistics have already been through the VAE
+/// round trip; this row decodes what the denoiser actually hands the decode phase. The production
+/// latent is the one a user would get, and at 1024² — the single output size where the swept
+/// candidate cleared [`SIBLING_DRIFT_BAR`] — it does **not** clear it.
+///
+/// So this test carries the second, independent half of rung 2's `Missing` verdict:
+/// `no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range` shows the candidate
+/// fails everywhere except 1024²; this shows it fails at 1024² too, once the latent is the real one.
+#[test]
+#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
+    let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
+    };
+    let untiled = measure_end_to_end(&dir, 6, false, None);
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(
+        ms::DECODE_TILE_EDGE as i32,
+        BEST_DECODE_OVERLAP as i32,
+    );
+    let tiled = measure_end_to_end(&dir, 6, false, Some(&cfg));
+    let saving = 100.0 * (tiled.peak_gib - untiled.peak_gib) / untiled.peak_gib;
+    println!(
+        "[sc-15525 rung2 request bf16 1024² 6 steps] untiled {:.4} GiB -> edge {} overlap \
+         {BEST_DECODE_OVERLAP} {:.4} GiB ({saving:+.2}%), max Δ {}/255, {:.0} -> {:.0} ms/step",
+        untiled.peak_gib,
+        ms::DECODE_TILE_EDGE,
+        tiled.peak_gib,
+        max_delta(&untiled.pixels, &tiled.pixels),
+        ms_per_step(&untiled, 6),
+        ms_per_step(&tiled, 6),
+    );
+    // Half one: the mechanism must genuinely bound the request, by the same 3% margin an implemented
+    // rung has to clear. If it ever stops doing so, the withholding note's "near miss with a real
+    // prize" framing is wrong and the candidate is not a near miss at all.
+    assert!(
+        tiled.peak_gib < untiled.peak_gib * 0.97,
+        "the tiled decode no longer bounds the request peak ({:.4} vs {:.4} GiB) — rung 2's \
+         withholding note claims a real saving it would be giving up",
+        tiled.peak_gib,
+        untiled.peak_gib
+    );
+    // Half two, and the one that decides the rung: on the PRODUCTION latent the best swept geometry
+    // does not clear the sibling bar even at 1024². Asserted rather than only printed, because this
+    // is the load-bearing fact — if a future VAE or blend change brought it under the bar, the whole
+    // `Missing` verdict would be resting on the range argument alone and would need re-deciding.
+    let drift = max_delta(&untiled.pixels, &tiled.pixels);
+    assert!(
+        drift > SIBLING_DRIFT_BAR,
+        "edge {} overlap {BEST_DECODE_OVERLAP} now drifts only {drift}/255 on the production latent \
+         at 1024², which clears the {SIBLING_DRIFT_BAR}/255 sibling bar — rung 2's verdict is no \
+         longer supported at this output size and must be re-decided on the range argument alone",
+        ms::DECODE_TILE_EDGE,
+    );
+}
+
+/// The drift bar this family is judged against, in 8-bit levels out of 255.
+///
+/// It is not invented here. It is the worst max-Δ that a **sibling MLX provider on the same shared
+/// tiling machinery** admits into a shipped ladder: `mlx_gen_z_image`'s `DECODE_TILE_EDGES` tops out
+/// at 48/255 (its 768 px tile), and its rejected set starts at 64. Z-Image's VAE is the same diffusers
+/// `AutoencoderKL` with the same spatial-extent GroupNorms and the same head/tail split, so it is the
+/// closest thing to a precedent that exists — using anything looser here would be inventing a bar to
+/// clear, and using anything tighter would be inventing one to fail.
+const SIBLING_DRIFT_BAR: u32 = 48;
+
+/// The overlap that minimises drift at [`ms::DECODE_TILE_EDGE`] — the sweep's best cell.
+const BEST_DECODE_OVERLAP: u32 = 192;
+
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
+
+/// One end-to-end row for a rung the production path **refuses**, measured over the whole request
+/// rather than at one U-Net forward.
+///
+/// `generate` cannot produce this row: `memory_strategy::attention_plan` rejects a bounded-attention
+/// selection on every layer, which is the point of rung 3 being `Missing`. So the request is
+/// re-assembled here from the same public pipeline entry points `Sdxl::generate_impl` calls, in the
+/// same order, under the same **rung-1 staged schedule** — encode with both CLIP towers alive, `eval`
+/// the conditioning, drop the towers, *then* load the heavy pair and denoise + decode. That schedule
+/// is what makes the peak comparable to the rung-1 row: it is bounded by
+/// `max(CLIP-L + bigG, U-Net + VAE)` rather than by their sum.
+///
+/// Everything is rebuilt per row (`#[track_caller]`, same discipline as [`measure`]): the U-Net is a
+/// lazy MLX handle until something forces it, so a bundle shared between the chunked and unchunked
+/// arms would charge the first arm for the materialization and hand the second a free ride.
+///
+/// One deliberate difference from [`measure`]: the peak window opens **before** the loads rather
+/// than after. That is not sloppiness, it is what a staged schedule *is* — the claim rung 1 makes is
+/// that the encoder load and the heavy load never coexist, and a window that opened after both would
+/// measure the thing the schedule exists to avoid. The reconstruction is checked by its own result:
+/// it reads 19.0032 GiB, which is `generate`'s staged 19.003 to the millibyte.
+#[track_caller]
+fn measure_end_to_end(
+    dir: &std::path::Path,
+    steps: usize,
+    chunked: bool,
+    decode_tiling: Option<&mlx_gen::tiling::TilingConfig>,
+) -> Row {
+    use mlx_rs::Dtype::{Float16, Float32};
+
+    let prompt = "a red fox in a snowy forest, photograph";
+    let negative = "blurry, lowres";
+
+    clear_cache();
+    reset_peak_memory();
+    let started = std::time::Instant::now();
+
+    // Conditioning phase: both towers alive, then released.
+    let tokenizer = mlx_gen_sdxl::load_tokenizer(dir).expect("tokenizer");
+    let te1 = mlx_gen_sdxl::load_text_encoder_1_dtype(dir, Float16).expect("clip-l");
+    let te2 = mlx_gen_sdxl::load_text_encoder_2_dtype(dir, Float16).expect("bigg");
+    let tokens = tokenizer
+        .tokenize_batch(prompt, Some(negative))
+        .expect("tokenize");
+    let (conditioning, pooled) =
+        mlx_gen_sdxl::encode_conditioning(&te1, &te2, &tokens).expect("encode");
+    // Force the encode before dropping the towers — an unevaluated output keeps them referenced
+    // through the lazy graph, so the drop would free nothing.
+    mlx_rs::transforms::eval([&conditioning, &pooled]).expect("eval conditioning");
+    drop((te1, te2, tokenizer));
+    clear_cache();
+
+    // Denoise + decode phase.
+    let unet = mlx_gen_sdxl::load_unet_dtype(dir, Float16).expect("unet");
+    let vae = mlx_gen_sdxl::load_vae(dir).expect("vae");
+    let euler = mlx_gen_sdxl::EulerSampler::new_with_dtype(
+        &mlx_gen_sdxl::config::DiffusionConfig::sdxl_base(),
+        true,
+        Float32,
+    )
+    .expect("sampler");
+    let latents = mlx_gen_sdxl::seeded_prior(&euler, 1234, 1024, 1024).expect("prior");
+    let sampler = mlx_gen_sdxl::sampler::AncestralEuler::new(&euler, steps, euler.max_time())
+        .expect("ancestral");
+    let plan = if chunked {
+        mlx_gen_sdxl::SdxlForwardPlan::with_attention(mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::CONSTRAINED,
+        ))
+    } else {
+        mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED
+    };
+    let denoiser = mlx_gen_sdxl::pipeline::Denoiser::with_plan(&unet, &sampler, plan);
+    let time_ids = mlx_gen_sdxl::text_time_ids(pooled.shape()[0]);
+    let cancel = mlx_gen::gen_core::CancelFlag::default();
+    let out = mlx_gen_sdxl::denoise(
+        &denoiser,
+        latents,
+        &conditioning,
+        &pooled,
+        &time_ids,
+        7.0,
+        &cancel,
+        &mut |_: Progress| {},
+    )
+    .expect("denoise");
+    let image = mlx_gen_sdxl::pipeline::decode_image_tiled(&vae, &out, None, decode_tiling, None)
+        .expect("decode");
+
+    let peak = get_peak_memory();
+    let wall = started.elapsed();
+    drop((unet, vae));
+    clear_cache();
+    Row {
+        peak_gib: peak as f64 / GIB,
+        pixels: image.pixels,
+        wall,
+    }
+}
+
+/// **The rung-3 REQUEST-level measurement** — the first of the two independent reasons rung 3 is
+/// declared `Missing`, and the one [`attention_chunking_is_measured_at_the_unet_seam`] cannot supply.
+///
+/// The seam test answers "does chunking bound one U-Net forward?". This one answers the question the
+/// contract actually turns on: **does it move the number a selector admits against, and does the
+/// image survive?** Those are different measurements, and publishing the second while only running
+/// the first is what the SC-15525 review caught.
+///
+/// Both step counts are load-bearing and neither is redundant:
+///
+/// * **one step** is the control that separates kernel rounding from a wiring bug — the ancestral
+///   schedule cannot amplify anything across a single step, so whatever Δ appears there is the raw
+///   per-forward divergence;
+/// * **six steps** is the production schedule, and shows what that per-forward divergence becomes
+///   once a chaos-sensitive sampler has fed it back into itself.
+#[test]
+#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+fn attention_chunking_is_measured_against_the_rung_two_top() {
+    let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
+    };
+    let mut rows = Vec::new();
+    for steps in [1_usize, 6] {
+        let plain = measure_end_to_end(&dir, steps, false, None);
+        let chunked = measure_end_to_end(&dir, steps, true, None);
+        let delta_pct = 100.0 * (chunked.peak_gib - plain.peak_gib) / plain.peak_gib;
+        println!(
+            "[sc-15525 rung3 end-to-end bf16 1024² {steps} step(s)] unchunked {:.4} GiB -> chunked \
+             {:.4} GiB ({delta_pct:+.2}%)  max Δ {}/255  mean Δ {:.2}",
+            plain.peak_gib,
+            chunked.peak_gib,
+            max_delta(&plain.pixels, &chunked.pixels),
+            mean_delta(&plain.pixels, &chunked.pixels),
+        );
+        rows.push((steps, plain, chunked, delta_pct));
+    }
+
+    // Claim 1: the rung does not pay for itself at the request level. Asserted with the SAME 3%
+    // margin the implemented rungs must CLEAR, in the opposite direction — so a future change that
+    // makes chunking actually bound a request reddens here and forces the `Missing` declaration to be
+    // revisited, rather than letting it calcify.
+    for (steps, plain, chunked, _) in &rows {
+        assert!(
+            chunked.peak_gib > plain.peak_gib * 0.97,
+            "bounded attention now bounds the REQUEST peak at {steps} step(s) ({:.4} vs {:.4} GiB) \
+             — re-open memory_strategy::ATTENTION_SUPPORT",
+            chunked.peak_gib,
+            plain.peak_gib
+        );
+    }
+    // Claim 2: it is not output-preserving on this path. The one-step row carries the claim, because
+    // it is the one the sampler cannot have amplified.
+    let (_, plain, chunked, _) = &rows[0];
+    assert!(
+        max_delta(&plain.pixels, &chunked.pixels) > 0,
+        "chunked and unchunked agreed exactly at one step — if MLX now dispatches the same kernel at \
+         every query-block size, the output-preservation half of ATTENTION_SUPPORT no longer holds \
+         and the rung must be re-measured, not left Missing on a stale reason"
+    );
+}
 
 /// **The rung-3 mechanism measurement**, which is why rung 3 is declared `Missing`.
 ///
@@ -460,22 +840,33 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let deferred = LoadShape::DeferredMaterialization;
     // The attribution control: the same composition WITHOUT rung 4, on a deferred load, so the only
     // difference between the two rows is the window itself.
-    let control = measure(&dir, "q8", deferred, &request(Some(staged()), 1024, 6));
+    const STEPS: u32 = 6;
+    let control = measure(&dir, "q8", deferred, &request(Some(staged()), 1024, STEPS));
     println!(
-        "[sc-15525 rung4 q8 1024²] staged, no window (attribution control) {:.3} GiB",
-        control.peak_gib
+        "[sc-15525 rung4 q8 1024²] staged, no window (attribution control) {:.3} GiB, \
+         {:.0} ms/step",
+        control.peak_gib,
+        ms_per_step(&control, STEPS)
     );
     for window in ms::TRANSFORMER_WINDOW_SIZES {
         let row = measure(
             &dir,
             "q8",
             deferred,
-            &request(Some(full_ladder(*window)), 1024, 6),
+            &request(Some(full_ladder(*window)), 1024, STEPS),
         );
+        // SC-16355 named re-materialization latency as an explicit hazard, so it is reported beside
+        // the peak rather than left for a user to discover. The window re-opens the U-Net snapshot
+        // once per `Transformer2D` per step — eleven re-opens covering 70 blocks — and what that
+        // costs is a fact about this rung, not an implementation detail.
         println!(
-            "[sc-15525 rung4 window {window}] request peak {:.3} GiB  ({:+.2}% vs control)",
+            "[sc-15525 rung4 window {window}] request peak {:.3} GiB ({:+.2}% vs control), \
+             {:.0} ms/step ({:+.1}% vs control)",
             row.peak_gib,
-            100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib
+            100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
+            ms_per_step(&row, STEPS),
+            100.0 * (ms_per_step(&row, STEPS) - ms_per_step(&control, STEPS))
+                / ms_per_step(&control, STEPS),
         );
         assert_eq!(
             max_delta(&control.pixels, &row.pixels),
@@ -494,6 +885,19 @@ fn transformer_window_sweep_and_streamed_output_identity() {
              block stream is not actually replacing the resident stack",
             row.peak_gib,
             control.peak_gib
+        );
+        // A LOOSE latency ceiling, and deliberately loose. The measured cost is 4.9x
+        // (767 -> 3790 ms/step), which is the number the ladder publishes; a wall clock moves with
+        // thermal state and with whatever else the machine is doing, so asserting anything near the
+        // measurement would be asserting the weather. 10x still leaves a doubling of the current
+        // regression detectable, which is the failure worth catching — a re-open path that starts
+        // thrashing rather than one that drifts 15%.
+        let slowdown = ms_per_step(&row, STEPS) / ms_per_step(&control, STEPS);
+        assert!(
+            slowdown < 10.0,
+            "window {window} re-materialization cost {slowdown:.1}x the control's ms/step — \
+             SC-16355 flagged exactly this as a severe-regression risk, and past 10x the rung stops \
+             being a trade a selector could reasonably make"
         );
     }
 }
@@ -603,13 +1007,58 @@ fn the_unet_has_eleven_windowable_sub_stacks_at_two_depths() {
 
 // ── Per-entry coverage ───────────────────────────────────────────────────────────────────────────
 
-/// **Every catalog entry** resolves to this provider, loads, and publishes the same ladder — and
-/// each one's *own* peak is recorded, because sharing code is not what makes an entry Verified.
+/// The rung-4 support each catalog entry/tier is **expected** to publish, and why.
+///
+/// This is the table the SC-15525 review forced into existence. The first revision of
+/// [`every_catalog_entry_loads_and_publishes_the_ladder`] recorded a staged peak per entry and never
+/// looked at *which ladder the entry published* — so "every catalog entry publishes the ladder" was
+/// asserted by its own name and by nothing else, while rung 4 was in fact `Missing` on two of the
+/// five. The declaration is per (entry, tier) because `streamable` is a fact about the **snapshot**,
+/// not about the family.
+///
+/// `illustrious_xl_v1` / `illustrious_xl_v2` at q8 are the two that do not stream, and the cause is
+/// not the architecture — it is their published snapshot. Their `unet/` weights are genuinely packed
+/// (u32 codes plus `.scales`/`.biases`, byte-for-byte the same shape as `realvisxl`'s q8), but their
+/// `unet/config.json` carries **no `quantization` marker**. `mlx_gen::quant::packed_quant_bits` reads
+/// that marker and only that marker, so `needs_load_time_quant` answers "yes", `load_leaves_blocks_lazy`
+/// answers "no", and `streamable` refuses the rung.
+///
+/// That refusal is **correct as a fail-closed**, and it is deliberately not papered over here by
+/// sniffing the tensors instead: the same marker is what `model.rs`'s F-144 tier guard reads to reject
+/// a requested-vs-packed mismatch, so a provider that trusted the tensors while the guard trusted the
+/// marker would disagree with itself about what tier is loaded — and rung 4 replays *the recorded
+/// tier* into every re-materialized block. The fix belongs in the published snapshot (add the marker
+/// these two are missing), not in a second, looser definition of "packed" on this side.
+const EXPECTED_RUNG_FOUR: &[(&str, &str, bool)] = &[
+    ("sdxl", "bf16", true),
+    ("realvisxl", "bf16", true),
+    ("realvisxl", "q4", true),
+    ("realvisxl", "q8", true),
+    ("realvisxl_lightning", "q4", true),
+    // Packed on disk, but the `quantization` marker is absent from `unet/config.json`.
+    ("illustrious_xl_v1", "q8", false),
+    ("illustrious_xl_v2", "q8", false),
+];
+
+/// **Every catalog entry** resolves to this provider, loads, and publishes a ladder — and this test
+/// asserts **which** ladder, per entry and per tier, not merely that a render happened.
+///
+/// Each entry's own staged peak is still recorded, because sharing this provider's code is explicitly
+/// not what makes a catalog entry Verified. What is new is that the published rung-4 capability is
+/// checked against [`EXPECTED_RUNG_FOUR`] in **both** directions: an entry that silently stops
+/// streaming reddens, and so does one that silently starts. The second direction is the one that
+/// matters for the two `illustrious` entries — the day their snapshot grows its `quantization`
+/// marker, this test fails and says so, instead of leaving the evidence overstating coverage for
+/// another cycle.
 #[test]
 #[ignore = "needs the real SDXL-family snapshots (see the module docs for the env vars)"]
 fn every_catalog_entry_loads_and_publishes_the_ladder() {
+    use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
     let mut covered = Vec::new();
     let mut absent = Vec::new();
+    let mut streaming = Vec::new();
+    let mut not_streaming = Vec::new();
     for (entry, var) in ENTRIES {
         let mut tiers = Vec::new();
         for tier in ["bf16", "q4", "q8"] {
@@ -617,11 +1066,47 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
                 continue;
             };
             let shape = LoadShape::DeferredMaterialization;
+            let load_spec = spec(&dir, tier, shape);
+
+            // What THIS entry/tier publishes, read off the contract the provider actually builds for
+            // its own `LoadSpec` — not off the family's representative entry.
+            let contract = ms::memory_strategy_contract(mlx_gen_sdxl::MODEL_ID, &load_spec)
+                .expect("contract must build for a cached snapshot");
+            let streams = ms::streamable(&load_spec);
+            let rung_four = &contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .expect("rung 4 capability")
+                .support;
+            assert_eq!(
+                streams,
+                matches!(rung_four, MemoryStrategySupport::Implemented),
+                "{entry}/{tier}: `streamable` and the published rung-4 support disagree — the \
+                 contract must never advertise a rung this load cannot execute"
+            );
+            if let Some((_, _, expected)) = EXPECTED_RUNG_FOUR
+                .iter()
+                .find(|(e, t, _)| *e == *entry && *t == tier)
+            {
+                assert_eq!(
+                    streams, *expected,
+                    "{entry}/{tier}: rung-4 availability changed. EXPECTED_RUNG_FOUR (and the \
+                     contract evidence, and the SceneWorks matrix cell) must be updated together — \
+                     see that table for why these two entries differ"
+                );
+            }
+
             let row = measure(&dir, tier, shape, &request(Some(staged()), 1024, 4));
             println!(
-                "[sc-15525 entry {entry} tier {tier}] staged request peak {:.3} GiB",
-                row.peak_gib
+                "[sc-15525 entry {entry} tier {tier}] staged request peak {:.3} GiB, {:.0} ms/step, \
+                 rung 4 {rung_four:?}",
+                row.peak_gib,
+                ms_per_step(&row, 4),
             );
+            if streams {
+                streaming.push(format!("{entry}/{tier}"));
+            } else {
+                not_streaming.push(format!("{entry}/{tier}"));
+            }
             tiers.push(tier);
         }
         if tiers.is_empty() {
@@ -632,9 +1117,19 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
     }
     println!("[sc-15525] entries measured: {covered:?}");
     println!("[sc-15525] entries with NO cached tier: {absent:?}");
+    println!("[sc-15525] rung 4 IMPLEMENTED on: {streaming:?}");
+    println!("[sc-15525] rung 4 MISSING on:     {not_streaming:?}");
     assert!(
         !covered.is_empty(),
         "at least one catalog entry must be cached; set the env vars in the module docs"
+    );
+    // The control that keeps this test honest in the direction that matters: at least one measured
+    // entry/tier must actually be on each side. A run that saw only streaming loads would pass every
+    // assertion above while proving nothing about the refusal, and vice versa.
+    assert!(
+        !streaming.is_empty() && !not_streaming.is_empty(),
+        "this test's per-entry claim needs both a streaming and a non-streaming snapshot cached; \
+         got streaming={streaming:?} not_streaming={not_streaming:?}"
     );
 }
 
@@ -657,8 +1152,22 @@ fn the_full_ladder_renders_under_a_memory_cap() {
     );
     unsafe { std::env::remove_var(MEMORY_CAP_ENV) };
     println!(
-        "[sc-15525 capped 8 GiB q8 1024²] full-ladder request peak {:.3} GiB",
-        row.peak_gib
+        "[sc-15525 capped 8 GiB q8 1024²] full-ladder request peak {:.3} GiB, {:.0} ms/step",
+        row.peak_gib,
+        ms_per_step(&row, 4)
     );
-    assert!(!row.pixels.is_empty());
+    // `!pixels.is_empty()` was the whole assertion in the first revision, which a decode returning a
+    // single black pixel would satisfy. Bind the two facts a capped render actually has to deliver:
+    // the requested geometry, and an image with content in it. Neither is satisfiable by a no-op.
+    assert_eq!(
+        row.pixels.len(),
+        1024 * 1024 * 3,
+        "a capped full-ladder render must still produce the requested 1024² RGB image"
+    );
+    let first = row.pixels[0];
+    assert!(
+        row.pixels.iter().any(|p| *p != first),
+        "the capped render produced a uniform image — the window streamed blocks that decoded to \
+         nothing rather than reproducing the resident stack"
+    );
 }

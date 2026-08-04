@@ -854,13 +854,17 @@ impl Sdxl {
         // `GenerationMemory` must still cross — it never went through `safety_check`.
         if window_size.is_some() && !self.streamable {
             return Err(Error::Unsupported(
-                "sdxl: bounded transformer residency needs a DeferredMaterialization load over a                  snapshot directory whose U-Net stays lazy and whose adapters (if any) are                  replayable; this generator cannot stream its blocks"
+                "sdxl: bounded transformer residency needs a DeferredMaterialization load over a \
+                 snapshot directory whose U-Net stays lazy and whose adapters (if any) are \
+                 replayable; this generator cannot stream its blocks"
                     .into(),
             ));
         }
         if window_size.is_some() && !stage_residency {
             return Err(Error::Unsupported(
-                "sdxl: bounded transformer residency requires staged residency engaged in the same                  request — without the phase release both CLIP towers stay resident through the                  denoise and the request peak does not move"
+                "sdxl: bounded transformer residency requires staged residency engaged in the same \
+                 request — without the phase release both CLIP towers stay resident through the \
+                 denoise and the request peak does not move"
                     .into(),
             ));
         }
