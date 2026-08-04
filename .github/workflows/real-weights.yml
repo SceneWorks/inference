@@ -62,7 +62,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, memory-evidence-v1, krea-realtime, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-t5-sensitivity, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -1291,16 +1291,36 @@ jobs:
       # 832x480 (the sweep asserts this itself and would fail at 81). `KREA_SMOKE_FRAMES` is set PER
       # STEP so the one test that genuinely needs the production geometry -- the KV-cache residency,
       # whose 6-latent-frame window must fill -- can run at 81 in its own step below.
+      #
+      # `long_clip_coherence_under_the_bounded_window` is EXCLUDED here and runs in the dispatch-only
+      # `mlx-krea-realtime-s18-sweep` job below (sc-17276). It is not a regression gate: it is the
+      # sc-15127/sc-15571 research sweep — seven KV-window rows, six of them a full 45-latent-frame
+      # clip — and it was 85.3 min of this step's 105 (81%) in run 30787887176, leaving ~20 min for
+      # the six tests that ARE the regression gates and never got a verdict behind it. It also
+      # cannot pass here: its verdict rule refuses to rank configs without a between-seed variance
+      # estimate, and `KREA_S18_SEEDS` defaults to one seed, so every run ends UNDERPOWERED. Seeding
+      # it does not fit either — n=2 is ~186 min against this job's 120-minute cap.
+      #
+      # Selection here is by `--ignored`, a BLANKET: every `#[ignore]` test in the file is conscripted
+      # into this step, which is how an hours-long sweep joined a regression lane unannounced. The
+      # run-count assertion pins the six that belong here, so the next such addition fails loudly
+      # instead of silently spending the budget. Adding an e2e test means bumping the count.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
         env:
           KREA_SMOKE_W: "832"
           KREA_SMOKE_H: "480"
           KREA_SMOKE_FRAMES: "33"
-        run: >-
-          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
-          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
-          -- --ignored --nocapture --test-threads 1
-          --skip kv_cache_residency_at_the_production_geometry
+        run: |
+          set -o pipefail
+          out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
+            -- --ignored --nocapture --test-threads 1 \
+            --skip kv_cache_residency_at_the_production_geometry \
+            --skip long_clip_coherence_under_the_bounded_window 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 6 passed" <<<"$out"; then
+            echo "::error::the Q4 e2e step did not run exactly six passing tests — a rename, a new #[ignore] test, or a skipped arm would otherwise change this lane's coverage silently" >&2
+            exit 1
+          fi
       # The KV-cache residency IS a production-geometry measurement (the 6-latent-frame window must be
       # full), so it runs at the real 81-frame clip.
       #
@@ -1358,6 +1378,86 @@ jobs:
           }
           run_one real_wan_style_lora_loads_and_changes_the_render
           run_one real_wan_step_distill_lora_installs_over_the_widened_globals
+
+  # sc-17276 — the sc-15127/sc-15571 S18 coherence sweep, split out of the regression lane above.
+  #
+  # OPERATOR-DISPATCH ONLY, and deliberately not on the weekly schedule. Seven rows x three seeds is
+  # twenty-one 832x480 clips, eighteen of them 45 latent frames; at the n=1 wall clock measured in run
+  # 30787887176 (85.3 min for one seed of all seven rows) that is ~4.3 hours, and `rw-krea` shares nax-macos-2
+  # with `rw-audio`, `rw-llm` and `rw-chroma`, which run one at a time. Putting this on the schedule
+  # would head-of-line-block twelve jobs for half a night — the sc-16981 failure, again.
+  #
+  # THREE SEEDS IS THE POINT, not a tuning knob. The sweep's verdict rule refuses to rank configs
+  # without a between-seed variance estimate, so at the default single seed it can only ever return
+  # UNDERPOWERED. 7,11,23 are the seeds the recorded sc-15127 sweep used, so a run here is directly
+  # comparable to the evidence pinned in `generate_smoke.rs`.
+  #
+  # This is a MEASUREMENT, not a regression gate. Its verdict is a narrative — "drift is real, and
+  # here is the within-regime attribution" is a passing outcome, because the drift itself is
+  # sc-15571's open question, not this lane's. What it does gate is that the sweep still runs, still
+  # produces a resolvable verdict, and that no row freezes or blows highlights.
+  mlx-krea-realtime-s18-sweep:
+    name: MLX Krea Realtime S18 coherence sweep (operator dispatch)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'krea-s18-sweep'
+    runs-on: [self-hosted, macOS, ARM64, rw-krea]
+    # ~4.3 h of sweep plus the incremental `--release` build and the 19 GB snapshot verification.
+    # Sized with headroom rather than to the estimate: the cap is what stops a hung row holding the
+    # box until GitHub's 360-minute default kills it with no verdict (sc-16981).
+    timeout-minutes: 480
+    env:
+      KREA_REALTIME_SNAPSHOT: ${{ vars.KREA_REALTIME_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Resolve runner-local snapshot paths
+        run: python3.12 scripts/release/resolve_snapshot_paths.py KREA_REALTIME_SNAPSHOT
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Require the operator-provisioned snapshot path
+        run: |
+          if [[ -z "$KREA_REALTIME_SNAPSHOT" ]]; then
+            echo "Repository variable KREA_REALTIME_SNAPSHOT is unset; this lane cannot resolve its snapshot path" >&2
+            exit 1
+          fi
+          if [[ "$KREA_REALTIME_SNAPSHOT" != /* ]]; then
+            echo "KREA_REALTIME_SNAPSHOT must be an absolute path, got: $KREA_REALTIME_SNAPSHOT" >&2
+            exit 1
+          fi
+      - name: Materialize and verify the immutable snapshot
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
+      # `--exact` after the `--` (cargo rejects it in its own argument position, exit 1) plus the
+      # run-count assertion: name-selection alone turns a rename into "0 passed; N filtered out" and
+      # a green step, which on a four-hour job would be an expensive way to gate nothing (sc-17250).
+      - name: Run the S18 coherence sweep (three seeds)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_S18_SEEDS: "7,11,23"
+        run: |
+          set -o pipefail
+          name=long_clip_coherence_under_the_bounded_window
+          out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
+            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
+          # The sweep's product is its per-cell evidence, not the green check. Every (row, seed) emits
+          # one `S18CELL` TSV line precisely so a run can be re-aggregated without the log.
+          grep -E "^(S18CELL|  VERDICT:)" <<<"$out" > "$RUNNER_TEMP/s18-cells.tsv" || true
+          cells="$(grep -c '^S18CELL' "$RUNNER_TEMP/s18-cells.tsv" || true)"
+          if [[ "$cells" -ne 21 ]]; then
+            echo "::error::expected 21 S18CELL rows (the default ABCDFEZ rows x the three seeds above), captured $cells — the sweep did not measure what this job claims" >&2
+            exit 1
+          fi
+      - name: Upload the S18 cell evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: krea-s18-sweep-${{ github.sha }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/s18-cells.tsv
 
   # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since

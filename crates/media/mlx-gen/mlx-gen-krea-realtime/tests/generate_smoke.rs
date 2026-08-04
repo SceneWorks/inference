@@ -21,6 +21,12 @@
 //!   cargo test -p mlx-gen-krea-realtime --test generate_smoke -- --ignored --nocapture
 //! ```
 //!
+//! ⚠️ **`--ignored` is a blanket, and one of the tests it selects is not a smoke.**
+//! [`long_clip_coherence_under_the_bounded_window`] is the sc-15127/sc-15571 research sweep: 85 min at
+//! its default single seed, and the seeds it needs to return a verdict at all put it over four hours.
+//! The real-weight lane therefore `--skip`s it and dispatches it as its own job (sc-17276); add
+//! `--skip long_clip_coherence_under_the_bounded_window` when you want the ~20-minute smoke set.
+//!
 //! Env: `KREA_REALTIME_SNAPSHOT_DIR` (snapshot root; default `~/.cache/krea-realtime-mlx-convert`),
 //! `KREA_SMOKE_W`/`_H` (default 832×480, the reference bucket), `KREA_SMOKE_FRAMES` (default 81),
 //! `KREA_SMOKE_STEPS` (default: the config's Self-Forcing schedule), `KREA_SMOKE_SEED`,
@@ -795,9 +801,12 @@ fn i2v_single_frame_anchor_is_coherent() {
 ///     the size of that draw, measured, not assumed.
 ///   * `C` — mode round-trip → v2v@0. What is left once the VAE mode round-trip is accounted for.
 ///
-/// The finding this encodes: `C` is the VAE's *sampled* encode, not the denoise. So v2v@0 is identity
-/// **in the latents**, and its pixel deviation is entirely the `.sample()` draw the source encode makes
-/// by design — which is why the gate is `C` against the measured sampling scale `A'`, not against zero.
+/// The finding this encodes: v2v@0 is identity **in the latents** — the decisive form of that is
+/// [`v2v_strength_zero_is_latent_identity`], which drives the AR loop on encoded latents with no VAE
+/// between the source and the answer and measures the residual directly. What is left in `C` is that
+/// residual carried through the decode, not the `.sample()` draw: `A'` measures the draw at ~0.01/255,
+/// two orders of magnitude under `C`, so sampling cannot be the explanation. See the MEASURED block on
+/// the assertions for the numbers and for what `C` is gated against.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
 fn v2v_strength_zero_preserves_the_source() {
@@ -808,6 +817,17 @@ fn v2v_strength_zero_preserves_the_source() {
     let w = env_usize("KREA_SMOKE_W", 832);
     let h = env_usize("KREA_SMOKE_H", 480);
     let frames = env_usize("KREA_SMOKE_FRAMES", 33);
+
+    // Pin the decode budget across BOTH the product render and the control below (sc-17276).
+    // `decode_tiling` is free-aware — `free x 0.85`, `free = MLX limit - resident` — so with no pin the
+    // plan is a function of whatever happened to be free at each call, and the two calls are made at
+    // very different residencies: the product decodes inside `run` with the DiT and TE resident, the
+    // control decodes afterwards with them dropped. A host big enough to fit a single-pass decode also
+    // takes the `None` branch for both, which silently changes what `A` measures. That free variable is
+    // literally the second cause the `C` assertion names, and it must not be one of this test's inputs.
+    // Same pin, same reason, as `long_clip_coherence_under_the_bounded_window`; 20 GiB is the operating
+    // point `decode_tiling`'s own docs derive at 832x480.
+    std::env::set_var("WAN_VAE_BUDGET_GIB", "20");
 
     let source: Vec<Image> = (0..frames).map(|i| smooth_frame(w, h, i)).collect();
     let req = GenerationRequest {
@@ -893,6 +913,10 @@ fn v2v_strength_zero_preserves_the_source() {
             .expect("VAE encode (sampled)"),
     );
     let sample_rt = decode(&z_sample);
+    // Both decodes are done, so the pin has served its purpose. Dropped HERE rather than at the end of
+    // the test so a failing assertion below cannot leak a 20 GiB budget into whatever runs next in this
+    // process — these tests share one process under `--test-threads 1`.
+    std::env::remove_var("WAN_VAE_BUDGET_GIB");
     dump_frames(&mode_rt, "v2v_vae_roundtrip_mode");
 
     let a = mean_abs_delta(&source, &mode_rt);
@@ -904,24 +928,51 @@ fn v2v_strength_zero_preserves_the_source() {
          A' VAE(mode)->VAE(sample) = {a_prime:.2}, B source->v2v@0 = {b:.2}, \
          C VAE(mode)->v2v@0 = {c:.2}"
     );
-    // MEASURED (832x480, 33 frames, Q4): A ~= 27.6, A' ~= 0.01, B ~= 27.5, **C ~= 0.4**.
+    // MEASURED (832x480, 33 frames, Q4, budget pinned to 20 GiB ⇒ spatial 256/64, no temporal tiling):
+    // A = 2.98, A' = 0.01, B = 2.94, **C = 0.37**.
     //
-    // So: v2v at strength 0 IS identity — the output sits 0.4/255 from a pure VAE round-trip of its own
-    // source, while the VAE round-trip itself sits 27.6/255 from the source. The naive number `B` is
-    // ~27.5 and means nothing on its own; essentially all of it is the **tiled** decode. (`A'` ~ 0 also
-    // rules out the `.sample()` draw: this VAE's log-variance is small enough that sampling and the mode
-    // agree.) Two things had to be right for `C` to be meaningful, and both are gated below: the control
-    // must decode through the *same* tiling as the product path — a single-pass control puts A at ~3.0
-    // and C at ~26 — and the VAE must actually be doing something.
+    // So: v2v at strength 0 IS identity — the output sits ~0.4/255 from a plain VAE round-trip of its
+    // own source, and `B` tracks `A` to well under a tenth of `A`, i.e. the whole distance from the
+    // source to the v2v@0 clip is the VAE's own round-trip and nothing else moved the picture.
+    //
+    // WHERE THE REMAINING ~0.4 COMES FROM, and why it is not gated against `A'`: it is the AR loop's
+    // numerical residual, which `v2v_strength_zero_is_latent_identity` measures directly in the latents
+    // at 0.9% of the source scale (mean |d| 0.0104 against a source mean |x| of 1.153, real weights,
+    // Q4). Carried through the decode that is the ~0.4/255 seen here. It is NOT the `.sample()` draw:
+    // `A'` measures that draw at ~0.01/255, ~40x smaller.
+    //
+    // WHY THIS IS AN ABSOLUTE BUDGET AND NOT `C < A * 0.1` (sc-17276). That relative form was
+    // calibrated in #287 when `A` was ~27.6 — the tiled decode of the day, which #292 (sc-15325) then
+    // fixed. Post-fix the tiled decode reaches single-pass quality (2.05/255 against single-pass at
+    // this bucket), so `A` collapsed ~9x to ~3.0 while `C`, an AR-loop residual, did not scale with it
+    // at all; 0.1*A became 0.30 against a 0.37-0.38 measurement and the gate has been latently red ever
+    // since. `C` is not a fraction of the VAE's error, so it must not be gated as one.
+    //
+    // THE BUDGET'S HEADROOM, both sides, MEASURED — a budget nobody has driven to red is a budget
+    // nobody knows the width of. Below: 0.37, with the AR residual it is made of pinned independently
+    // by the latent test. Above: the same test body re-run against a strength-0.25 render of the same
+    // source, everything else held (sc-17276), measures A = 2.98, B = 13.81, **C = 13.77** — 37x the
+    // strength-0 value and 13.8x this budget, and it trips this assertion. So the budget sits between a
+    // measured pass at 0.37 and a measured fail at 13.77 rather than between a measurement and a guess.
+    // That arm also moves `B` off `A` (13.81 vs 2.98), which is what the second assertion below gates:
+    // it is the same claim in its positive form and fails on any pipeline that renders rather than
+    // preserves.
+    const V2V0_IDENTITY_BUDGET: f64 = 1.0;
     assert!(
         a > 1.0,
         "the VAE round-trip control is a near no-op (A={a:.2}) — C cannot be interpreted against it"
     );
     assert!(
-        c < a * 0.1,
-        "v2v@0 is {c:.2}/255 from a VAE round-trip of its own source, more than a tenth of the VAE's \
-         own error (A={a:.2}) — either the strength=0 denoise is not an identity, or the control \
-         decode no longer matches the product decode path"
+        c < V2V0_IDENTITY_BUDGET,
+        "v2v@0 is {c:.2}/255 from a VAE round-trip of its own source, over the \
+         {V2V0_IDENTITY_BUDGET:.2}/255 identity budget — either the strength=0 denoise is not an \
+         identity, or the control decode no longer matches the product decode path (A={a:.2}, \
+         A'={a_prime:.2})"
+    );
+    assert!(
+        (b - a).abs() < a * 0.1,
+        "source->v2v@0 is {b:.2}/255 against a {a:.2}/255 VAE round-trip of the same source — a \
+         strength-0 render must be its source's round-trip and nothing more, so these two must agree"
     );
     assert!(b > 0.0, "B is exactly zero — the clips are the same object");
     assert_coherent(&r.frames, w, h, "v2v/strength=0");
