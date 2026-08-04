@@ -35,6 +35,12 @@
 *.pt          binary
 *.pth         binary
 *.bin         binary
+# Raw little-endian f32 PCM (the MOSS codec reference-parity clip, sc-17270). Today's fixture
+# opens on silence, so the 8000-byte window is all NUL and detection happens to guess right — but
+# a regenerated clip that starts on audio could leave that window NUL-free, and `eol=lf` would
+# then rewrite every CR LF byte pair inside the sample stream. The two encoders it feeds must see
+# identical bytes, so this cannot ride on a guess.
+*.f32         binary
 
 # Media and archives.
 *.png  binary

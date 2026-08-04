@@ -16,8 +16,13 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
+use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
+use mlx_gen::{
+    GenerationOutput, GenerationRequest, Image, LoadShape, LoadSpec, OffloadPolicy, Progress,
+    WeightsSource,
+};
 use mlx_gen_krea::load;
+use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var(name).ok().map(PathBuf::from)
@@ -133,5 +138,144 @@ fn krea_turbo_pid_decode_vs_vae() {
         vae_img.width,
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
+    );
+}
+
+struct LadderRun {
+    conditioning: usize,
+    denoise: usize,
+    decode: usize,
+    image: Image,
+}
+
+impl LadderRun {
+    fn peak(&self) -> usize {
+        self.conditioning.max(self.denoise).max(self.decode)
+    }
+}
+
+fn run_pid_ladder(model: &dyn mlx_gen::Generator, size: u32, full: bool) -> LadderRun {
+    let request = GenerationRequest {
+        prompt: "a red fox sitting in a snowy pine forest at dawn, photorealistic".into(),
+        width: size,
+        height: size,
+        count: 1,
+        steps: Some(1),
+        seed: Some(7),
+        use_pid: true,
+        memory: Some(GenerationMemory {
+            stage_residency: true,
+            tile_vae_decode: true,
+            chunk_attention: full,
+            stream_transformer_blocks: full,
+            decode_tile_edge: Some(mlx_gen_pid::DecodeRoutes::pid_edges()[0]),
+            decode_overlap: Some(mlx_gen_pid::DecodeRoutes::pid_overlap()),
+            attention_chunk_size: full
+                .then_some(mlx_gen_krea::block_memory_strategy::ATTENTION_CHUNK_SIZE),
+            transformer_window_size: full
+                .then_some(mlx_gen_krea::block_memory_strategy::TRANSFORMER_WINDOW_SIZE),
+            transformer_window_component: full.then_some(TransformerComponent::Dit),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    clear_cache();
+    reset_peak_memory();
+    let mut conditioning = 0;
+    let mut denoise = 0;
+    let output = model
+        .generate(&request, &mut |progress| match progress {
+            Progress::Step { current: 1, .. } => {
+                conditioning = get_peak_memory();
+                reset_peak_memory();
+            }
+            Progress::Decoding if denoise == 0 => {
+                denoise = get_peak_memory();
+                reset_peak_memory();
+            }
+            _ => {}
+        })
+        .expect("generate Krea PiD ladder image");
+    let decode = get_peak_memory();
+    let image = match output {
+        GenerationOutput::Images(mut images) => images.pop().expect("one image"),
+        other => panic!("expected images, got {other:?}"),
+    };
+    clear_cache();
+    LadderRun {
+        conditioning,
+        denoise,
+        decode,
+        image,
+    }
+}
+
+fn image_delta(left: &Image, right: &Image) -> (u8, f64) {
+    assert_eq!((left.width, left.height), (right.width, right.height));
+    let mut max = 0_u8;
+    let mut total = 0_u64;
+    for (left, right) in left.pixels.iter().zip(&right.pixels) {
+        let delta = left.abs_diff(*right);
+        max = max.max(delta);
+        total += u64::from(delta);
+    }
+    (max, total as f64 / left.pixels.len() as f64)
+}
+
+#[test]
+#[ignore = "needs cached q4 Krea, Qwen PiD, Gemma weights, and Apple/Metal"]
+fn krea_pid_full_ladder_exercises_multitile_decode_attention_and_window() {
+    let size: u32 = std::env::var("KREA_PID_LADDER_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(768);
+    assert!(
+        size * 4 > mlx_gen_pid::DecodeRoutes::pid_edges()[0],
+        "PiD output must exceed the selected tile edge"
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(krea_snapshot()))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(LoadShape::DeferredMaterialization)
+        .with_pid(
+            WeightsSource::File(pid_checkpoint()),
+            WeightsSource::Dir(gemma_dir()),
+        );
+    let model = load(&spec).expect("load streamable Krea + PiD");
+    let baseline = run_pid_ladder(model.as_ref(), size, false);
+    let full = run_pid_ladder(model.as_ref(), size, true);
+    let (max_delta, mean_delta) = image_delta(&baseline.image, &full.image);
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    eprintln!(
+        "PID_LADDER baseline conditioning={:.3} denoise={:.3} decode={:.3} request={:.3}",
+        baseline.conditioning as f64 / GIB,
+        baseline.denoise as f64 / GIB,
+        baseline.decode as f64 / GIB,
+        baseline.peak() as f64 / GIB,
+    );
+    eprintln!(
+        "PID_LADDER full conditioning={:.3} denoise={:.3} decode={:.3} request={:.3}",
+        full.conditioning as f64 / GIB,
+        full.denoise as f64 / GIB,
+        full.decode as f64 / GIB,
+        full.peak() as f64 / GIB,
+    );
+    assert!(
+        max_delta <= 1,
+        "PiD attention/window changed output: max {max_delta}, mean {mean_delta:.6}"
+    );
+    assert!(
+        full.peak() <= baseline.peak(),
+        "the full PiD composition raised request peak"
+    );
+    eprintln!(
+        "RESULT status=pass provider=krea_2_turbo route=pid native_size={} pid_size={} decode_edge={} decode_overlap={} baseline_peak_gib={:.3} full_peak_gib={:.3} max_channel_delta={} mean_channel_delta={:.6}",
+        size,
+        size * 4,
+        mlx_gen_pid::DecodeRoutes::pid_edges()[0],
+        mlx_gen_pid::DecodeRoutes::pid_overlap(),
+        baseline.peak() as f64 / GIB,
+        full.peak() as f64 / GIB,
+        max_delta,
+        mean_delta,
     );
 }

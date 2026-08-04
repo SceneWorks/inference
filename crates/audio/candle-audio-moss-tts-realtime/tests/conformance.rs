@@ -613,7 +613,14 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn read_f32le(path: &str) -> Vec<f32> {
-    let bytes = std::fs::read(path).expect("read clip.f32");
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read f32-LE clip {path}: {e}"));
+    // A trailing partial sample means the file is truncated, not that the last sample is optional;
+    // `chunks_exact` would drop it and hand back a quietly shorter waveform.
+    assert!(
+        !bytes.is_empty() && bytes.len().is_multiple_of(4),
+        "f32-LE clip {path} is {} bytes — empty or not a whole number of f32 samples",
+        bytes.len()
+    );
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -630,65 +637,119 @@ fn read_codes_csv(path: &str) -> Vec<Vec<u32>> {
         .collect()
 }
 
+/// Resolve one half of the encode reference-parity fixture, `env` overriding the committed file.
+///
+/// sc-17270: this pair used to be env-only, so an unset variable silently dropped the whole
+/// reference cross-check while libtest still reported the test as passing. The fixture under
+/// `tests/fixtures/` is committed — a deterministic synthetic clip plus the codes the upstream
+/// PyTorch `codec.encode` emits for it at the revision `release/real-weight-models.toml` pins —
+/// so the cross-check now runs wherever the codec weights are, with no operator provisioning.
+/// The environment variables remain as an override for pointing the same comparison at another
+/// clip; what they can no longer do is turn the assertion off.
+/// Regenerate with `scripts/reference/moss_audio_codec_reference.py`.
+///
+/// An empty or whitespace-only value counts as unset. An unconfigured `${{ vars.X }}` expands to
+/// the empty string in a workflow, so treating it as an override would turn a mis-wired lane into
+/// a confusing read failure instead of simply using the fixture that ships with the test.
+fn codec_ref_fixture(env: &str, file: &str) -> String {
+    match std::env::var(env) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(file)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
 #[test]
 #[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture"]
 fn moss_audio_codec_encode_roundtrip_and_reference() {
     use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
     let codec = MossAudioCodec::load(&codec_dir(), 16).expect("load codec");
 
-    // Strong cross-check (when provisioned): the port's encode codebook-0 must match the reference
-    // PyTorch `codec.encode` on a byte-identical clip. `MOSS_CODEC_CLIP` = raw f32-LE mono samples at
-    // 24 kHz; `MOSS_CODEC_REF_CODES` = the reference codes CSV (`frames[T][16]`).
-    if let (Ok(clip_p), Ok(ref_p)) = (
-        std::env::var("MOSS_CODEC_CLIP"),
-        std::env::var("MOSS_CODEC_REF_CODES"),
-    ) {
-        let clip = read_f32le(&clip_p);
-        let port = codec.encode(&clip, 24_000).expect("encode reference clip");
-        let refc = read_codes_csv(&ref_p);
-        let n = port.len().min(refc.len());
-        assert!(n > 0, "no frames to compare");
-        let (mut cb0, mut allm, mut tot) = (0usize, 0usize, 0usize);
-        for f in 0..n {
-            if port[f][0] == refc[f][0] {
-                cb0 += 1;
-            }
-            for q in 0..16 {
-                tot += 1;
-                if port[f].get(q) == refc[f].get(q) {
-                    allm += 1;
-                }
-            }
-        }
-        let cb0_rate = cb0 as f32 / n as f32;
-        let all_rate = allm as f32 / tot as f32;
-        println!(
-            "codec ref cross-check: port {} vs ref {} frames (cmp {n}); cb0 agree {cb0_rate:.3}, \
-             all-cb agree {all_rate:.3}",
-            port.len(),
-            refc.len()
+    // Strong cross-check: the port's encode must match the reference PyTorch `codec.encode` on a
+    // byte-identical clip. `MOSS_CODEC_CLIP` = raw f32-LE mono samples at 24 kHz;
+    // `MOSS_CODEC_REF_CODES` = the reference codes CSV (`frames[T][16]`). Both default to the
+    // committed fixture (sc-17270), so this arm ALWAYS runs — it is the half of this test that
+    // actually gates the port against the reference encoder, and it used to be skippable by simply
+    // not setting two variables that nothing in the repository set.
+    // Both or neither: half an override pairs a custom clip against the committed codes, which
+    // fails with a frame-count or agreement message that says nothing about the real mistake.
+    assert_eq!(
+        std::env::var("MOSS_CODEC_CLIP").is_ok(),
+        std::env::var("MOSS_CODEC_REF_CODES").is_ok(),
+        "set MOSS_CODEC_CLIP and MOSS_CODEC_REF_CODES together or not at all — the codes are only \
+         valid for the clip they were generated from"
+    );
+    let clip_p = codec_ref_fixture("MOSS_CODEC_CLIP", "moss_codec_ref_clip.f32");
+    let ref_p = codec_ref_fixture("MOSS_CODEC_REF_CODES", "moss_codec_ref_codes.csv");
+    let clip = read_f32le(&clip_p);
+    let port = codec.encode(&clip, 24_000).expect("encode reference clip");
+    let refc = read_codes_csv(&ref_p);
+    let n = port.len().min(refc.len());
+    assert!(n > 0, "no frames to compare");
+    assert_eq!(
+        port.len(),
+        refc.len(),
+        "frame count must match the reference"
+    );
+    // Per-quantizer, not just pooled. A pooled rate over 16 codebooks hides its own worst case: at
+    // the 0.98 bound below, one deep quantizer may disagree on 32 of 100 frames and still pass,
+    // because the other fifteen are perfect. Count each codebook separately so a regression
+    // confined to one of them cannot hide in the average.
+    let mut agree_per_q = [0usize; 16];
+    for f in 0..n {
+        assert_eq!(
+            port[f].len(),
+            16,
+            "port frame {f} has {} codebooks, expected 16",
+            port[f].len()
         );
         assert_eq!(
-            port.len(),
-            refc.len(),
-            "frame count must match the reference"
+            refc[f].len(),
+            16,
+            "reference frame {f} has {} codebooks, expected 16",
+            refc[f].len()
         );
-        // The port matches the reference codec.encode exactly (measured 1.000 across all 16
-        // codebooks); the bounds sit just under that to allow only cross-platform argmax tie noise, so
-        // a real regression on codebook-0 OR any higher quantizer fails here.
-        assert!(
-            cb0_rate >= 0.99,
-            "port encode codebook-0 must match the reference encoder (agree {cb0_rate:.3})"
-        );
-        assert!(
-            all_rate >= 0.98,
-            "port encode must match the reference across all 16 codebooks (agree {all_rate:.3})"
-        );
-    } else {
-        println!(
-            "codec ref cross-check SKIPPED (set MOSS_CODEC_CLIP + MOSS_CODEC_REF_CODES to enable)"
-        );
+        for q in 0..16 {
+            if port[f][q] == refc[f][q] {
+                agree_per_q[q] += 1;
+            }
+        }
     }
+    let cb0_rate = agree_per_q[0] as f32 / n as f32;
+    let all_rate = agree_per_q.iter().sum::<usize>() as f32 / (n * 16) as f32;
+    let (worst_q, worst_agree) = agree_per_q
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, agree)| **agree)
+        .map(|(q, agree)| (q, *agree))
+        .expect("16 quantizers");
+    let worst_rate = worst_agree as f32 / n as f32;
+    println!(
+        "codec ref cross-check: port {} vs ref {} frames (cmp {n}); cb0 agree {cb0_rate:.3}, \
+         all-cb agree {all_rate:.3}, worst codebook {worst_q} agree {worst_rate:.3}",
+        port.len(),
+        refc.len()
+    );
+    // The port matches the reference codec.encode exactly — measured 1.000 on every one of the 16
+    // codebooks against the committed fixture. The bounds sit just under that to allow only
+    // cross-platform argmax tie noise, so a real regression on codebook-0, on the pooled rate, or
+    // on any single higher quantizer fails here.
+    assert!(
+        cb0_rate >= 0.99,
+        "port encode codebook-0 must match the reference encoder (agree {cb0_rate:.3})"
+    );
+    assert!(
+        all_rate >= 0.98,
+        "port encode must match the reference across all 16 codebooks (agree {all_rate:.3})"
+    );
+    assert!(
+        worst_rate >= 0.95,
+        "every codebook must match the reference; codebook {worst_q} agrees only {worst_rate:.3}"
+    );
 
     // Self-contained round-trip: a real codec waveform (decode a fixed pseudo-random 40-frame pattern)
     // → encode → decode must reconstruct it — the encoder emits decodable, faithful codes.

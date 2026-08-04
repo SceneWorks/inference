@@ -13,7 +13,13 @@
 //! |---------|---------|------------------------|
 //! | `MMAUDIO_MMAUDIO_SNAPSHOT` | `hkchengrex/MMAudio` | `synchformer`, `dit`, `vae`, 16k `vocoder` |
 //! | `MMAUDIO_CLIP_SNAPSHOT`    | `apple/DFN5B-CLIP-ViT-H-14-384` | `clip` |
-//! | `MMAUDIO_BIGVGAN_SNAPSHOT` | `nvidia/bigvgan_v2_44khz_128band_512x` | 44k `vocoder` |
+//! | `MMAUDIO_BIGVGAN_V2_SNAPSHOT` | `nvidia/bigvgan_v2_44khz_128band_512x` | 44k `vocoder` |
+//!
+//! The 44k vocoder var is `MMAUDIO_BIGVGAN_V2_SNAPSHOT`, NOT `MMAUDIO_BIGVGAN_SNAPSHOT` (sc-17266).
+//! Those are two different HF repos: `MMAUDIO_BIGVGAN_SNAPSHOT` names hkchengrex/MMAudio's *16k*
+//! `ext_weights/best_netG.pt` — the meaning `release/real-weight-models.toml` and
+//! `tests/conformance_output.rs` both give it. This file used to bind that same name to the nvidia
+//! repo, so pointing one variable at the dir the other expected loaded the wrong vocoder.
 //!
 //! Each env var is **required**: inference never self-fetches or derives a cache location
 //! (epic 13657), so the real-weight harness must point every component at a pre-materialized
@@ -27,8 +33,9 @@ use mm::candle_audio::gen_core::{LoadSpec, WeightsSource};
 pub const MMAUDIO_SNAPSHOT_ENV: &str = "MMAUDIO_MMAUDIO_SNAPSHOT";
 /// `apple/DFN5B-CLIP-ViT-H-14-384` repo snapshot dir (clip).
 pub const CLIP_SNAPSHOT_ENV: &str = "MMAUDIO_CLIP_SNAPSHOT";
-/// `nvidia/bigvgan_v2_44khz_128band_512x` repo snapshot dir (44k vocoder).
-pub const BIGVGAN_SNAPSHOT_ENV: &str = "MMAUDIO_BIGVGAN_SNAPSHOT";
+/// `nvidia/bigvgan_v2_44khz_128band_512x` repo snapshot dir (44k vocoder). Distinct from
+/// `MMAUDIO_BIGVGAN_SNAPSHOT`, which names hkchengrex/MMAudio's 16k BigVGAN (sc-17266).
+pub const BIGVGAN_V2_SNAPSHOT_ENV: &str = "MMAUDIO_BIGVGAN_V2_SNAPSHOT";
 
 /// Read the **required** repo-snapshot dir from `env`, join `rel` (the in-repo relative checkpoint
 /// path) onto it, and return a [`WeightsSource::File`]. Panics with an actionable message when unset
@@ -68,7 +75,7 @@ pub fn vae_44k_source() -> WeightsSource {
 }
 
 pub fn vocoder_44k_source() -> WeightsSource {
-    from_env_repo(BIGVGAN_SNAPSHOT_ENV, mm::output::BIGVGAN_V2_WEIGHTS_PATH)
+    from_env_repo(BIGVGAN_V2_SNAPSHOT_ENV, mm::output::BIGVGAN_V2_WEIGHTS_PATH)
 }
 
 /// A placeholder base `weights` for the spec. mmaudio consumes only the five named components and

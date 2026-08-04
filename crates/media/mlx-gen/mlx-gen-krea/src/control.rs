@@ -28,6 +28,7 @@ use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::runtime::WeightsSource;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -167,6 +168,7 @@ impl Krea2ControlBranch {
     ///
     /// `control_scale == 0.0` short-circuits to the straight-through base forward (bit-exact base
     /// passthrough — the zero branch is never run), matching the candle guarantee.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
         dit: &Krea2Transformer,
@@ -175,9 +177,12 @@ impl Krea2ControlBranch {
         prep: &JointPrep,
         ctrl_tokens: &Array,
         control_scale: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         if control_scale == 0.0 {
-            return dit.forward_prepared(latent, timestep, prep);
+            return dit
+                .forward_prepared_windowed_budgeted(latent, timestep, prep, window, attention);
         }
 
         let j = dit.joint_inputs(latent, timestep, prep)?;
@@ -188,31 +193,36 @@ impl Krea2ControlBranch {
             &j.tvec,
             &j.rcos,
             &j.rsin,
+            attention,
         )?;
 
-        // Run the frozen 28-block stack ourselves, adding residual `k` to the image tokens BEFORE main
-        // block `k + inject_offset` runs (candle's injection order; text tokens pass through untouched).
-        let mut x = j.combined.clone();
-        for (idx, blk) in dit.blocks().iter().enumerate() {
-            if let Some(k) = self.residual_index_for_main_block(idx) {
-                let parts = split_axis1(&x, j.cap_len)?;
-                let txt = &parts[0];
-                let img = &parts[1];
-                // Scale, then RMS-clamp against the current main image slice, then cast back to the
-                // stream dtype (candle scales in f64, clamps, then `to_dtype(x.dtype())`).
-                let scaled = multiply(&residuals[k], scalar(control_scale))?;
-                let scaled = self.apply_clamp(&scaled, img)?.as_dtype(x.dtype())?;
-                let img = add(img, &scaled)?;
-                x = concatenate_axis(&[txt, &img], 1)?;
-            }
-            x = blk.forward(&x, &j.tvec, &j.rcos, &j.rsin)?;
-        }
-        dit.finalize(&x, &j.t, &j)
+        dit.forward_prepared_injected_windowed(
+            latent,
+            timestep,
+            prep,
+            window,
+            attention,
+            |idx, x, cap_len| {
+                if let Some(k) = self.residual_index_for_main_block(idx) {
+                    let parts = split_axis1(&x, cap_len)?;
+                    let txt = &parts[0];
+                    let img = &parts[1];
+                    // Scale, then RMS-clamp against the current main image slice, then cast back to the
+                    // stream dtype (candle scales in f64, clamps, then `to_dtype(x.dtype())`).
+                    let scaled = multiply(&residuals[k], scalar(control_scale))?;
+                    let scaled = self.apply_clamp(&scaled, img)?.as_dtype(x.dtype())?;
+                    let img = add(img, &scaled)?;
+                    return concatenate_axis(&[txt, &img], 1).map_err(Error::from);
+                }
+                Ok(x)
+            },
+        )
     }
 
     /// Run the branch over the joint hidden state to produce one image-token residual per branch block.
     /// The pose `ctrl_tokens` are added onto the image-token slice of the branch input (candle
     /// `residuals_mode`), then each block's output image tokens are passed through its `proj_out`.
+    #[allow(clippy::too_many_arguments)]
     fn residuals(
         &self,
         combined: &Array,
@@ -221,6 +231,7 @@ impl Krea2ControlBranch {
         tvec: &Array,
         cos: &Array,
         sin: &Array,
+        attention: AttentionPlan<'_>,
     ) -> Result<Vec<Array>> {
         let parts = split_axis1(combined, cap_len)?;
         let txt = &parts[0];
@@ -229,7 +240,7 @@ impl Krea2ControlBranch {
 
         let mut out = Vec::with_capacity(self.blocks.len());
         for cb in &self.blocks {
-            h = cb.block.forward(&h, tvec, cos, sin)?;
+            h = cb.block.forward_budgeted(&h, tvec, cos, sin, attention)?;
             let h_img = split_axis1(&h, cap_len)?.swap_remove(1);
             out.push(cb.proj_out.forward(&h_img)?);
         }

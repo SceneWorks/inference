@@ -18,9 +18,32 @@
 //! Every windowed image was byte-identical to its resident control. Low-rank adapters are captured
 //! and replayed per materialized block. A dense `.diff`/`.diff_b` patch is excluded at contract build
 //! time because it mutates the resident base and cannot be reconstructed from the pristine snapshot.
-//! The calibrated rung-4 key includes `engaged_composition=[Resident, StagedResidency,
-//! BoundedTransformerResidency]`: this loader reopens components between phases, so block streaming
-//! is valid only when staged residency is active in the same request.
+//! The full-ladder rung-4 key includes `engaged_composition=[Resident, StagedResidency,
+//! BoundedDecode, BoundedAttention, BoundedTransformerResidency]`: this loader reopens components
+//! between phases, so block streaming is valid only when staged residency is active in the same
+//! request.
+//!
+//! SC-15517 re-ran the complete q4 ladder at 1024²/1 step on the exact Turbo cache revision
+//! `d009674080cc1bccf2b629d834c34bf5eccdb723`:
+//!
+//! | engaged composition | conditioning | denoise | decode | request |
+//! |---|---:|---:|---:|---:|
+//! | staged | 3.105 GiB | 9.668 GiB | 15.674 GiB | 15.674 GiB |
+//! | + 512/64 bounded decode | 3.044 GiB | 9.668 GiB | 12.013 GiB | 12.013 GiB |
+//! | + 64 Mi-score attention | 3.380 GiB | 9.409 GiB | 12.013 GiB | 12.013 GiB |
+//! | + DiT window 1 | 3.400 GiB | 3.316 GiB | 5.640 GiB | **5.640 GiB** |
+//!
+//! The attention and block-window arms were pixel-identical to the tiled-decode arm. The independent
+//! real-Qwen-VAE 512/64 seam test measured max float delta `1.0857e-2`, mean `2.8614e-4` against the
+//! untiled decoder. The final ladder therefore reduces request peak by 64.0% without changing denoise
+//! numerics; the bounded-decode comparison retains the existing Qwen spatial blend tolerance.
+//!
+//! The optional Qwen PiD route uses the student's separately measured 2048/256 output-pixel tiling
+//! domain. On exact PiD revision `39d7b0a9003a3fc934d36d8b5658b2d8ea9c1231`, Gemma revision
+//! `684c553b5b41a1c835989d89f62f585e6269a7de`, and the same q4 Krea revision, a 768→3072 multitile
+//! A/B measured staged+tiled request peak 21.848 GiB and full decode+attention+window peak 15.475 GiB
+//! (29.2% lower), with max/mean pixel delta zero. Native and PiD decode domains remain disjoint and
+//! are validated against `use_pid` at both admission and request-scope configuration.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 #[cfg(test)]
@@ -34,8 +57,15 @@ use mlx_gen::gen_core::{
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
+pub const DECODE_TILE_EDGE: u32 = 512;
+pub const DECODE_OVERLAP: u32 = 64;
+pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "krea-2-mlx-request-peak-block-residency-2026-08-01-v1";
+    "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
+
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new_core(provider_id, [DECODE_TILE_EDGE], DECODE_OVERLAP)
+}
 
 #[cfg(test)]
 pub(crate) fn is_streamable_spec(provider_id: &str, spec: &LoadSpec) -> CoreResult<bool> {
@@ -113,7 +143,7 @@ pub(crate) fn memory_strategy_contract_with_plan(
             spec,
             components,
             plan.streamable_transformer,
-        ),
+        )?,
         plan,
     ))
 }
@@ -124,12 +154,12 @@ pub(crate) fn weights_free_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
     let plan = resolved_load_plan(provider_id, spec)?;
-    Ok(memory_strategy_contract_with_components(
+    memory_strategy_contract_with_components(
         provider_id,
         spec,
         Default::default(),
         plan.streamable_transformer,
-    ))
+    )
 }
 
 fn memory_strategy_contract_with_components(
@@ -137,7 +167,8 @@ fn memory_strategy_contract_with_components(
     spec: &LoadSpec,
     components: mlx_gen::PerComponentBytes,
     streamable: bool,
-) -> MemoryProviderContract {
+) -> CoreResult<MemoryProviderContract> {
+    let routes = decode_routes(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -159,6 +190,8 @@ fn memory_strategy_contract_with_components(
             MemoryFormulaVariable::PixelCount,
             MemoryFormulaVariable::BatchCount,
             MemoryFormulaVariable::ConditioningTokenCount,
+            MemoryFormulaVariable::DecodeTileArea,
+            MemoryFormulaVariable::AttentionChunkSize,
             MemoryFormulaVariable::TransformerWindowSize,
         ],
     };
@@ -191,6 +224,34 @@ fn memory_strategy_contract_with_components(
             .expect("compatibility contract contains every strategy")
             .support = MemoryStrategySupport::Implemented;
     }
+    let bounded_decode = contract
+        .strategies
+        .iter_mut()
+        .find(|capability| capability.strategy == MemoryStrategy::BoundedDecode)
+        .expect("compatibility contract contains every strategy");
+    bounded_decode.support = MemoryStrategySupport::Implemented;
+    bounded_decode.parameters.decode_tile_edges = routes.published_edges();
+    bounded_decode.parameters.decode_overlaps = routes.published_overlaps();
+
+    let bounded_attention = contract
+        .strategies
+        .iter_mut()
+        .find(|capability| capability.strategy == MemoryStrategy::BoundedAttention)
+        .expect("compatibility contract contains every strategy");
+    bounded_attention.support = MemoryStrategySupport::Implemented;
+    bounded_attention.parameters.attention_chunk_sizes = vec![ATTENTION_CHUNK_SIZE];
+    contract.lifecycle.decode_tiling = true;
+    contract.lifecycle.attention_chunking = true;
+    contract.pid_decode_routes = Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
+        native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+            tile_edges: routes.native_edges().to_vec(),
+            tile_overlap: DECODE_OVERLAP,
+        },
+        pid: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+            tile_edges: mlx_gen_pid::DecodeRoutes::pid_edges(),
+            tile_overlap: mlx_gen_pid::DecodeRoutes::pid_overlap(),
+        },
+    });
     if streamable {
         contract.additional_prerequisites.push((
             MemoryStrategy::BoundedTransformerResidency,
@@ -208,7 +269,7 @@ fn memory_strategy_contract_with_components(
         capability.parameters.transformer_window_sizes = vec![TRANSFORMER_WINDOW_SIZE];
         capability.parameters.transformer_window_components = vec![TransformerComponent::Dit];
     }
-    contract
+    Ok(contract)
 }
 
 /// Exact contract for the supported community single-file DiT composition. The native I8 format is
@@ -258,11 +319,14 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Krea rung 4 is calibrated for native VAE decode, not the PiD overlay",
-                contract.provider_id
-            )));
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+            decode_routes(contract.provider_id.as_str())?
+                .validate(
+                    context.use_pid,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                )
+                .map_err(CoreError::Unsupported)?;
         }
         Ok(())
     };
@@ -301,27 +365,43 @@ pub(crate) fn registered_valid_fixture(
     }
     let quant = crate::model::effective_base_quant_tier(spec, &contract.provider_id)?;
     let is_edit = contract.provider_id.contains("edit");
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant,
-            component_precision_floors: &[],
+    let tier = MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    };
+    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
+        mode: if is_edit {
+            mlx_gen::gen_core::MemoryMode::Edit
+        } else {
+            mlx_gen::gen_core::MemoryMode::TextToImage
         },
-        mlx_gen::gen_core::MemoryBehaviorRoute {
-            mode: if is_edit {
-                mlx_gen::gen_core::MemoryMode::Edit
-            } else {
-                mlx_gen::gen_core::MemoryMode::TextToImage
-            },
-            reference_count: u32::from(is_edit),
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+        reference_count: u32::from(is_edit),
+        use_pid,
+        has_phases: false,
+        overlay: None,
+    };
+    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
+        mlx_gen::gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            tier,
+            route(false),
+        )?,
+    )];
+    if contract.pid_decode_routes.is_some()
+        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
+    {
+        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
+            mlx_gen::gen_core::standard_memory_behavior_context(
+                contract,
+                strategy,
+                tier,
+                route(true),
+            )?,
+        ));
+    }
+    Ok(fixtures)
 }
 
 pub(crate) fn registered_begin_request(
@@ -370,18 +450,20 @@ fn begin_request_with_cleanup(
     {
         return Err(CoreError::Unsupported(reason));
     }
+    let routes = decode_routes(provider_id)?;
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
         crate::config::Krea2Config::turbo().num_layers,
-        |_use_pid, _edge, _overlap| {
-            Err(CoreError::Unsupported(
-                "krea: bounded decode is not implemented by the base provider".into(),
-            ))
+        move |use_pid, edge, overlap| {
+            routes
+                .validate(use_pid, Some(edge), Some(overlap))
+                .map_err(CoreError::Unsupported)
         },
     )?;
+    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
     config.transformer_window = contract
         .engages(
             context.selection.strategy,
@@ -561,8 +643,96 @@ mod tests {
             vec![
                 MemoryStrategy::Resident,
                 MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
                 MemoryStrategy::BoundedTransformerResidency,
             ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base_family_declares_route_exact_decode_attention_domains() {
+        let (root, spec) = fixture();
+        let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        let routes = decode_routes("krea_2_turbo").unwrap();
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
+        assert_eq!(decode.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            decode.parameters.decode_tile_edges,
+            routes.published_edges()
+        );
+        assert_eq!(
+            decode.parameters.decode_overlaps,
+            routes.published_overlaps()
+        );
+        let attention = contract
+            .capability(MemoryStrategy::BoundedAttention)
+            .unwrap();
+        assert_eq!(attention.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            attention.parameters.attention_chunk_sizes,
+            vec![ATTENTION_CHUNK_SIZE]
+        );
+
+        let pid_spec = spec.clone().with_pid(
+            WeightsSource::File(root.join("pid.safetensors")),
+            WeightsSource::Dir(root.clone()),
+        );
+        let pid_contract = memory_strategy_contract("krea_2_turbo", &pid_spec).unwrap();
+        assert!(pid_contract.engages(
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedDecode
+        ));
+
+        let mut native_attention = resident_context(&pid_contract, Some(Quant::Q4));
+        native_attention.selection.strategy = MemoryStrategy::BoundedAttention;
+        native_attention.selection.parameters = MemoryStrategyParameters {
+            decode_tile_edge: Some(DECODE_TILE_EDGE),
+            decode_overlap: Some(DECODE_OVERLAP),
+            attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+            ..Default::default()
+        };
+        assert_eq!(
+            safety_check(
+                &pid_contract,
+                Precision::Bf16,
+                Some(Quant::Q4),
+                &native_attention
+            ),
+            MemorySafetyDecision::Accept,
+            "loading PiD must not strip cumulative native Qwen bounded decode from use_pid=false"
+        );
+
+        let mut pid_attention = resident_context(&pid_contract, Some(Quant::Q4));
+        pid_attention.use_pid = true;
+        pid_attention.selection.strategy = MemoryStrategy::BoundedAttention;
+        pid_attention.selection.parameters = MemoryStrategyParameters {
+            decode_tile_edge: Some(mlx_gen_pid::DecodeRoutes::pid_edges()[0]),
+            decode_overlap: Some(mlx_gen_pid::DecodeRoutes::pid_overlap()),
+            attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+            ..Default::default()
+        };
+        assert_eq!(
+            safety_check(
+                &pid_contract,
+                Precision::Bf16,
+                Some(Quant::Q4),
+                &pid_attention
+            ),
+            MemorySafetyDecision::Accept,
+            "PiD must combine its own measured decode domain with bounded DiT attention"
+        );
+
+        let mut pid_window = pid_attention.clone();
+        pid_window.selection.strategy = MemoryStrategy::BoundedTransformerResidency;
+        pid_window.selection.parameters.transformer_window_size = Some(TRANSFORMER_WINDOW_SIZE);
+        pid_window.selection.parameters.transformer_window_component =
+            Some(TransformerComponent::Dit);
+        assert_eq!(
+            safety_check(&pid_contract, Precision::Bf16, Some(Quant::Q4), &pid_window),
+            MemorySafetyDecision::Accept,
+            "PiD decode tiling, bounded DiT attention, and block residency are independently verified request-scoped mechanisms"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -750,6 +920,27 @@ mod tests {
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
         assert_eq!(contract.asset_facts.base_bytes, 260);
+        for strategy in [
+            MemoryStrategy::Resident,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+        ] {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Implemented,
+                "native ConvRot materialization must retain the execution-only {strategy:?} rung"
+            );
+        }
+        for strategy in [
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedTransformerResidency,
+        ] {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Missing,
+                "the single-file ConvRot composition has no reopenable per-phase/per-block source"
+            );
+        }
         assert!(contract.conformance_errors().is_empty());
         std::fs::remove_dir_all(root).ok();
     }

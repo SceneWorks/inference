@@ -8,12 +8,17 @@ name: Real-weight validation
 # keep moving, and it should not cost a workflow PR each time.
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~95 GB    nax-macos
-#   rw-sa3      Stable Audio 3 / SAME                                ~0 GB     nax-macos
-#   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GB    nax-macos-2
-#   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~45 GB    nax-macos-2
-#   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GB    nax-macos-2
-#   rw-chroma   none stored; materializes from the Hub per run       ~0 GB     nax-macos-2
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos
+#   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
+#   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
+#   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
+#   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB   nax-macos-2
+#   rw-chroma   none stored; materializes from the Hub per run       ~0        nax-macos-2
+#
+# ON DISK is GiB as `du -sh` reports it, summed over each set's `models--*` repo directories.
+# MEASURED 2026-08-03 (sc-17271); previously these were arithmetic, and rw-audio was carrying a
+# ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
+# measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
 #
 # `rw-mage` is pinned to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB
 # frozen-Torch oracle bundle behind `MAGE_ORACLE_SEED_DIR`, which exists on no Hub and which this
@@ -942,6 +947,33 @@ jobs:
               exit 1
             fi
           done
+      # sc-17271: the first run of this lane on a box that does not already hold the snapshot pays
+      # a 16 GB Hub transfer into the shared `~/.cache/huggingface` every other rw-* lane on that
+      # runner reads from, and an ENOSPC partway through leaves partial blobs behind. Nobody has a
+      # shell on these runners, so this is the only view of their disk anyone gets after the fact.
+      #
+      # This is a RECORD, not a pre-dispatch gate — by the time it runs the runner is already
+      # claimed. It also cannot become a fail-closed floor without new data: release/
+      # real-weight-models.toml records `size_class`, never byte sizes, so any numeric threshold
+      # would be an invented per-model constant rather than something the manifest already knows.
+      - name: Report runner disk headroom
+        run: |
+          df -h "$HOME" "${RUNNER_TEMP:-$HOME}" | awk 'NR == 1 || !seen[$0]++'
+          for v in MLX_LLM_JOYCAPTION_SNAPSHOT; do
+            path="${!v}"
+            if [[ ! -d "$path" ]]; then
+              echo "$v: ABSENT — this run materializes it from the Hub"
+            elif [[ "$(basename "$(dirname "$path")")" == snapshots ]]; then
+              # Size the whole `models--*` repo dir, not `snapshots/<rev>`: revisions share
+              # `blobs/`, so a per-revision figure understates what the cache costs on disk.
+              # Plain `du` here — `-L` would follow the snapshot symlinks back down into
+              # `blobs/` and count every blob a second time.
+              repo="$(dirname "$(dirname "$path")")"
+              echo "$v: resident, $(du -sh "$repo" | awk '{print $1}') ($(basename "$repo"))"
+            else
+              echo "$v: resident, $(du -shL "$path" | awk '{print $1}')"
+            fi
+          done
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1713,6 +1745,7 @@ jobs:
   # exists in no repo, on no Hub, and in no provisioning script (sc-17264). The chunked-encode test
   # was the third exclusion until sc-17263 fixed its machine-sensitive memory probe; it is wired
   # below. Nothing here is wired to a path that would not resolve or to an assertion known to be red.
+  # sc-17270 closed the one remaining HALF-gated invocation — see the codec cross-check below.
   #
   # `MOSS_AUDIO_TOKENIZER_SNAPSHOT` is new with this job: the codec became a passed-in component in
   # sc-13662, so the provider no longer self-fetches it and every test here fails without it.
@@ -1763,6 +1796,24 @@ jobs:
               exit 1
             fi
           done
+      # sc-17271: same as the JoyCaption lane — the MOSS-TTS-Realtime AR stack and the MOSS-Audio
+      # codec are an 11 GB transfer on a box that does not already hold them, into a cache shared
+      # with every other rw-audio lane. A record rather than a gate, for the reasons spelled out
+      # at the JoyCaption copy.
+      - name: Report runner disk headroom
+        run: |
+          df -h "$HOME" "${RUNNER_TEMP:-$HOME}" | awk 'NR == 1 || !seen[$0]++'
+          for v in MOSS_TTS_REALTIME_SNAPSHOT MOSS_AUDIO_TOKENIZER_SNAPSHOT WHISPER_SNAPSHOT CHATTERBOX_SNAPSHOT; do
+            path="${!v}"
+            if [[ ! -d "$path" ]]; then
+              echo "$v: ABSENT — this run materializes it from the Hub"
+            elif [[ "$(basename "$(dirname "$path")")" == snapshots ]]; then
+              repo="$(dirname "$(dirname "$path")")"
+              echo "$v: resident, $(du -sh "$repo" | awk '{print $1}') ($(basename "$repo"))"
+            else
+              echo "$v: resident, $(du -shL "$path" | awk '{print $1}')"
+            fi
+          done
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1792,13 +1843,17 @@ jobs:
           # Codec-only (no AR): the RLFQ decode path turns synthetic in-range codes into a non-silent
           # 1920-samples-per-frame waveform. Isolates a codec-decode bug from an AR->codec mapping bug.
           run_one codec_only_decodes_synthetic_frames
-          # HALF-GATED HERE (sc-17270). What runs: the self-contained decode -> encode -> decode
-          # round-trip (reconstruction correlation, non-silent). What does NOT: the reference-parity
-          # arm comparing this port's encode against the reference PyTorch `codec.encode` across all
-          # 16 codebooks — it sits behind `if let Ok(MOSS_CODEC_CLIP), Ok(MOSS_CODEC_REF_CODES)`, and
-          # neither is provisioned anywhere in this repo, so it takes the `else` branch, prints
-          # "SKIPPED", and still reports `1 passed`. The run-count assertion CANNOT see that; it is
-          # the same false-green shape sc-17250 fixed in joycaption.rs, one level further in.
+          # FULLY GATED as of sc-17270. Both halves run with no provisioning: the self-contained
+          # decode -> encode -> decode round-trip (reconstruction correlation, non-silent) AND the
+          # reference-parity arm comparing this port's encode against the reference PyTorch
+          # `codec.encode` across all 16 codebooks. That arm used to sit behind
+          # `if let Ok(MOSS_CODEC_CLIP), Ok(MOSS_CODEC_REF_CODES)` with neither variable set
+          # anywhere in the repo, so it took the `else` branch, printed "SKIPPED", and still
+          # reported `1 passed` — a false green the run-count assertion could not see, the same
+          # shape sc-17250 fixed in joycaption.rs one level further out. Both now default to a
+          # committed fixture (`crates/audio/candle-audio-moss-tts-realtime/tests/fixtures/`,
+          # regenerated by `scripts/reference/moss_audio_codec_reference.py`); the variables
+          # survive only as an override for a different clip. Nothing to provision here.
           run_one moss_audio_codec_encode_roundtrip_and_reference
           # The sc-14181 DoD: chunked/streaming encode reproduces single-shot codes exactly (0/6400
           # differing at both chunk durations) AND bounds the first stage's quadratic attention.
@@ -3330,7 +3385,11 @@ jobs:
       # vocoder), apple/DFN5B-CLIP (clip), nvidia/bigvgan (44k vocoder).
       MMAUDIO_MMAUDIO_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       MMAUDIO_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
-      MMAUDIO_BIGVGAN_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}
+      # The nvidia 44k vocoder repo. The repository VARIABLE is still named MMAUDIO_BIGVGAN_SNAPSHOT
+      # (renaming it is an out-of-band action on the box); the env var the crate reads is
+      # MMAUDIO_BIGVGAN_V2_SNAPSHOT, because MMAUDIO_BIGVGAN_SNAPSHOT means hkchengrex/MMAudio's
+      # *16k* best_netG.pt everywhere else (manifest + conformance_output.rs) — sc-17266.
+      MMAUDIO_BIGVGAN_V2_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}
       # Standalone encoder conformance (sc-13474): the Synchformer + DFN5B-CLIP encoder tests read
       # their OWN env vars. Point them at the SAME snapshots the video->audio provider tests already
       # materialize above (no extra materialize step needed): synchformer resolves under
@@ -3338,6 +3397,16 @@ jobs:
       # tower at <MMAUDIO_CLIP_SNAPSHOT>/open_clip_pytorch_model.bin (clip.rs::load).
       SYNCHFORMER_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       DFN_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
+      # Standalone component conformance (sc-17266): the MM-DiT / 16k-decoder / 44k-decoder tests
+      # each read their own per-component var, all four of which resolve INSIDE the hkchengrex
+      # snapshot already materialized above (vae 16k -> ext_weights/v1-16.pth, 16k vocoder ->
+      # ext_weights/best_netG.pt, vae 44k -> ext_weights/v1-44.pth, dit 16k ->
+      # weights/mmaudio_small_16k.pth). These were declared in release/real-weight-models.toml but
+      # exported by no job, so the three test binaries below had never run anywhere.
+      MMAUDIO_DIT_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_VAE_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_BIGVGAN_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_VAE_44K_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -3373,7 +3442,7 @@ jobs:
           python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
       - name: Run mmaudio real-weight renders
         shell: cmd
         run: |
@@ -3384,3 +3453,34 @@ jobs:
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test clip_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio_44k -- --ignored --nocapture || exit /b 1
+      # Standalone component conformance (sc-17266). These three binaries were never invoked by any
+      # lane, so the MM-DiT flow/sampler and both decoder stages had ZERO automated coverage even
+      # though the manifest declared and pinned their checkpoints.
+      #
+      # Selected by name with `--exact` + a run-count assertion, NOT by whole test binary: an
+      # `#[ignore]` test that stops matching reports "0 passed; N filtered out" and cargo exits 0, so
+      # a rename would silently delete the only coverage these have. `--exact` must come AFTER `--`;
+      # before it, cargo rejects the argument outright and the step never runs at all.
+      #
+      # Two `#[ignore]` tests in these binaries are deliberately NOT selected, because each
+      # early-`return`s to a passing result when its side-channel env var is unset — a run-count
+      # assertion cannot tell that apart from real work:
+      #   - conformance_output::output_parity_dump    — MMAUDIO_DUMP_DIR, a torch-harness dump helper
+      #   - mmdit_conformance::mmdit_matches_reference — MMAUDIO_DIT_PARITY_DIR, a ref_dump.py
+      #     directory that is provisioned by no script and lives in no repo
+      - name: Run mmaudio standalone component conformance
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          call :run_one conformance_output output_latent_to_waveform_finite_deterministic || exit /b 1
+          call :run_one conformance_output_44k output_44k_latent_to_waveform_finite_deterministic || exit /b 1
+          call :run_one mmdit_conformance mmdit_flow_shape_finite_deterministic || exit /b 1
+          call :run_one mmdit_conformance mmdit_sample_shape_finite_deterministic || exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%RUNNER_TEMP%\mmaudio-%~2.log"
+          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test %~1 %~2 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
