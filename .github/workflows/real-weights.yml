@@ -1500,6 +1500,17 @@ jobs:
             echo "KREA_REALTIME_SNAPSHOT must be an absolute path, got: $KREA_REALTIME_SNAPSHOT" >&2
             exit 1
           fi
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. A 4.3 h sweep that finds no room after hour three is the
+      # worst way to learn the box was full. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KREA_REALTIME_SNAPSHOT
       - name: Materialize and verify the immutable snapshot
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
