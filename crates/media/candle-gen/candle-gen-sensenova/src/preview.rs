@@ -581,9 +581,13 @@ mod tests {
     /// rather than silently changing what "shipped" means.
     fn shipped(source: &'static str, name: &str, markers: usize) -> &'static str {
         const MARKER: &str = "#[cfg(test)]";
-        // Anchored at line start rather than matched with surrounding newlines: these sources are
-        // checked out CRLF on Windows, and a `\n…\n` needle silently matches nothing there — which
-        // would hand every scan below an EMPTY shipped half and pass every count vacuously.
+        // Anchored at line start rather than matched with surrounding newlines. Defensive, not
+        // load-bearing: a `\n…\n` needle matches nothing in a CRLF checkout, and this split holds
+        // even if one occurred. One does NOT occur here — `.gitattributes` pins `* text=auto eol=lf`
+        // for the whole tree, set specifically to override `core.autocrlf=true` on Windows, so
+        // `git check-attr text eol` reports `eol: lf` for these paths and all of them hold zero CR
+        // bytes on disk. What rules a vacuous pass out is the `!shipped.is_empty()` assertion below,
+        // which fires whatever the line endings turn out to be.
         let starts: Vec<usize> = source
             .match_indices(MARKER)
             .filter(|(at, _)| *at == 0 || source[..*at].ends_with('\n'))
@@ -609,6 +613,23 @@ mod tests {
 
     fn shipped_t2i() -> &'static str {
         shipped(include_str!("t2i.rs"), "t2i.rs", 1)
+    }
+
+    /// A source with its whole-line comments dropped, so the pins below count **code** and the module
+    /// docs stay free to name the very spellings they forbid.
+    ///
+    /// Necessary rather than tidy: `t2i.rs` documents the seam as `` [`PreviewHook::emit_step`] `` and
+    /// `lib.rs` names `PreviewHook` in prose, so a raw scan could not pin either spelling to zero.
+    ///
+    /// Whole-line only — a comment parked at the END of a code line is still counted. That direction is
+    /// the safe one (it can only make a pin fire), and the fix is to move the comment to its own line
+    /// rather than to teach this helper about strings and block comments.
+    fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Read the `preview:` parameter out of a function's own declaration, so a pin cannot be satisfied
@@ -658,8 +679,45 @@ mod tests {
     ///   ..req.clone() };` ahead of the hook build — the literal a scan looks for is still there,
     ///   exactly once, over a sink that has been emptied.
     ///
-    /// So shipped `lib.rs` and shipped `t2i.rs` are pinned to **zero** `PreviewHook::new` and **zero**
-    /// `GenerationRequest {` between them, and the parameters are counted by whole line.
+    /// This story's own review found two more, both green against the first draft of this test:
+    ///
+    /// * a `_hook(` tally applied only to `lib.rs` leaves `t2i.rs` free to call
+    ///   `crate::preview::t2i_hook(&dark, cell)` a SECOND time inside `denoise` and shadow the
+    ///   forwarded hook — no `PreviewHook::new`, no `GenerationRequest {`, both parameter lines
+    ///   intact, the emission literal intact, and the catalog's inventory still reading
+    ///   `hooked: 0, direct: 1`;
+    /// * a `GenerationRequest {` count blocks only the **struct-literal** spelling of the emptied
+    ///   request. `gen_core::GenerationRequest` derives `Clone` and its `preview` field is `pub`, so
+    ///   `let mut owned = req.clone(); owned.preview = PreviewSink::default(); let req = &owned;`
+    ///   empties the sink with no literal at all.
+    ///
+    /// The pins are therefore per-file and over **code** ([`code_only`] drops whole-line comments so
+    /// the prose above may keep naming the forbidden spellings):
+    ///
+    /// | needle | shipped `lib.rs` | shipped `t2i.rs` |
+    /// | --- | --- | --- |
+    /// | `preview::t2i_hook(&req.preview, comps.model.cell())` | **1** | — |
+    /// | `_hook(` | **1** | **0** |
+    /// | `.preview` | **1** (that same site) | **0** |
+    /// | `PreviewSink` | **0** | **0** |
+    /// | `PreviewHook::` | **0** | **0** |
+    /// | `GenerationRequest {` | **0** | **0** |
+    /// | `let req` / `\|req` / `req =>` | **0** | — |
+    ///
+    /// The last row policies the **shadow** rather than what produced it: `req` reaches the hook site
+    /// only as `generate_impl`'s own parameter, so `let req = &…;` fails whatever built the right-hand
+    /// side — including a helper from another crate, which no needle above can see.
+    ///
+    /// `.preview` is the pin that closes the clone-and-assign spelling, and it is stronger than the
+    /// `req.clone()` one the review offered as an alternative: plain `clone()` is legitimate on this
+    /// path (once in shipped `lib.rs`, three times in shipped `t2i.rs`), so it cannot be pinned to
+    /// zero, whereas **reading the request's sink at all** is something this lane does exactly once.
+    /// `PreviewHook::` rather than `PreviewHook::new` because `with_sigma` and `over_schedule` are
+    /// constructors too.
+    ///
+    /// What is still open is stated at
+    /// [`no_sibling_module_in_this_crate_touches_the_requests_sink`], which closes the in-crate helper
+    /// and names the one class no scan of this crate can reach.
     #[test]
     fn the_registered_lane_builds_its_hook_from_the_requests_sink() {
         let lib = shipped_lib();
@@ -673,29 +731,65 @@ mod tests {
             "the registered lane must build exactly one hook, over the request's sink, with the \
              cell read from the very model whose denoise loop the frames come from"
         );
-        assert_eq!(
-            lib.matches("_hook(").count(),
-            1,
-            "shipped lib.rs must build exactly one preview hook — a second render lane must be named \
-             in this crate's inventory (and in the catalog's) rather than appearing here"
-        );
 
-        // Neither shipped file may CONSTRUCT a hook or a request: the two darkening edits above.
-        for (name, source) in [("lib.rs", lib), ("t2i.rs", t2i)] {
+        // Both shipped files, over code only. `hooks` and `sink_reads` differ per file; the rest are
+        // zero everywhere.
+        for (name, code, hooks, sink_reads) in [
+            ("lib.rs", code_only(lib), 1, 1),
+            ("t2i.rs", code_only(t2i), 0, 0),
+        ] {
             assert_eq!(
-                source.matches("PreviewHook::new").count(),
-                0,
-                "shipped {name} must never CONSTRUCT a hook — the sink is reached only through \
-                 `preview::t2i_hook`, whose single call site is counted above. A \
-                 `PreviewHook::new(&inert, …)` in a hop that accepts and then ignores its forwarded \
-                 hook takes the lane dark with no type error"
+                code.matches("_hook(").count(),
+                hooks,
+                "shipped {name} must hold exactly {hooks} `_hook(` call(s). The one build lives in \
+                 lib.rs; a SECOND call anywhere — `let quiet = crate::preview::t2i_hook(&dark, \
+                 cell);` inside `denoise`, shadowing the forwarded hook — takes the registered lane \
+                 dark with every other pin here intact"
             );
             assert_eq!(
-                source.matches("GenerationRequest {").count(),
+                code.matches(".preview").count(),
+                sink_reads,
+                "shipped {name} must read the request's sink exactly {sink_reads} time(s) — the one \
+                 `&req.preview` counted above. A second field access is how the sink gets emptied \
+                 without a struct literal: `owned.preview = …`, or `std::mem::take(&mut \
+                 owned.preview)` on a clone that is then rebound as `req`"
+            );
+            assert_eq!(
+                code.matches("PreviewSink").count(),
+                0,
+                "shipped {name} must never NAME the sink type — it only forwards the caller's. \
+                 `PreviewSink::default()` is the inert sink every darkening so far has been built \
+                 from, and `PreviewSink::new` would substitute a listener of this lane's choosing"
+            );
+            assert_eq!(
+                code.matches("PreviewHook::").count(),
+                0,
+                "shipped {name} must never CONSTRUCT a hook — the sink is reached only through \
+                 `preview::t2i_hook`, whose single call site is counted above. `::new` is not the \
+                 only constructor: `with_sigma` and `over_schedule` build one too, and a hop that \
+                 accepts and then ignores its forwarded hook can use any of them with no type error"
+            );
+            assert_eq!(
+                code.matches("GenerationRequest {").count(),
                 0,
                 "shipped {name} must never CONSTRUCT a GenerationRequest — it reads the caller's. A \
                  rebind that swaps `preview` for an inert sink empties it while leaving the \
                  `t2i_hook(&req.preview, …)` literal intact, which is all the count above checks"
+            );
+        }
+
+        // `req` is never REBOUND in lib.rs. The pins above police how a replacement request could be
+        // built inside this crate; this one policies the shadow itself, so `let req = &…;` fails
+        // whatever produced the right-hand side — including a helper from another crate, which no
+        // needle above can see. `req` reaches the hook site only as `generate_impl`'s own parameter.
+        // (t2i.rs is not scanned: it takes `&T2iOptions`, never a request.)
+        for form in ["let req", "|req", "req =>"] {
+            assert_eq!(
+                code_only(lib).matches(form).count(),
+                0,
+                "shipped lib.rs must never rebind `req` (`{form}`) — the sink the hook is built over \
+                 has to be the one the caller handed to `Generator::generate`, and a shadow is how \
+                 every darkening of this lane so far has swapped it"
             );
         }
 
@@ -715,6 +809,85 @@ mod tests {
             "`generate` and `denoise` must both take `&PreviewHook` under that exact name — a hop \
              renamed `_preview:` is one that no longer uses it"
         );
+    }
+
+    /// **The in-crate helper spelling, closed — and the one class that is not.**
+    ///
+    /// The pins in `the_registered_lane_builds_its_hook_from_the_requests_sink` are per-file, so on
+    /// their own they leave a third way to empty the sink: a helper in a SIBLING module that takes the
+    /// request and hands back one whose `preview` is inert, called from `lib.rs` as
+    /// `let req = &runtime::without_preview(req);` — neither `PreviewSink` nor `.preview` nor
+    /// `GenerationRequest {` then appears in either scanned file. Every module of this crate other
+    /// than `preview` (which owns the seam and is where all of the above is tested) is therefore
+    /// pinned to zero mentions of the sink type, zero `.preview` field access and zero hook
+    /// construction — over the WHOLE file, tests included, because none of them has any business
+    /// touching the seam.
+    ///
+    /// The module list is checked against `lib.rs`'s own `mod` declarations, so a new source file has
+    /// to be added here rather than arriving as an unscanned blind spot.
+    ///
+    /// **What no scan of this crate reaches, stated exactly.** Move the same helper into a DIFFERENT
+    /// crate and pass its result in ARGUMENT position instead of rebinding — the shape
+    /// `self.generate_impl(&candle_gen::preview::without_listener(req), on_progress)` in
+    /// `Generator::generate` — and every pin here is satisfied: no needle of the per-file table
+    /// appears, no module of this crate is touched, and `req` is never shadowed so the rebind pin has
+    /// nothing to fire on. That was built and run while writing this guard: **the registered lane went
+    /// fully dark with all 57 lib tests green.** Closing it would need a scan of every crate that can
+    /// produce a `GenerationRequest`, which is not a bound this file can hold.
+    ///
+    /// So the honest statement of the guard is: it pins **where the hook is built, what it is built
+    /// from, and that nothing on this crate's own path rebuilds or replaces either** — not that the
+    /// sink is unreachable. The only thing that observes frames actually arriving is
+    /// `tests/preview_real_weights.rs`, which renders through the registered `Generator` seam with a
+    /// live sink on CUDA.
+    #[test]
+    fn no_sibling_module_in_this_crate_touches_the_requests_sink() {
+        const OTHERS: [(&str, &str); 8] = [
+            ("config", include_str!("config.rs")),
+            ("distill", include_str!("distill.rs")),
+            ("fm", include_str!("fm.rs")),
+            ("quant", include_str!("quant.rs")),
+            ("qwen3", include_str!("qwen3.rs")),
+            ("runtime", include_str!("runtime.rs")),
+            ("text", include_str!("text.rs")),
+            ("vision", include_str!("vision.rs")),
+        ];
+
+        // Completeness: every module `lib.rs` declares is either scanned above or is one of the three
+        // the hook path deliberately runs through.
+        let mut declared: Vec<String> = code_only(shipped_lib())
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line
+                    .strip_prefix("pub mod ")
+                    .or_else(|| line.strip_prefix("mod "))?;
+                rest.strip_suffix(';').map(str::to_owned)
+            })
+            .collect();
+        declared.sort_unstable();
+        let mut covered: Vec<String> = OTHERS.iter().map(|(name, _)| (*name).to_owned()).collect();
+        covered.extend(["preview".to_owned(), "t2i".to_owned()]);
+        covered.sort_unstable();
+        assert_eq!(
+            declared, covered,
+            "this crate's module list has changed — add the new source to OTHERS (or, if it is on \
+             the hook path, pin it in the per-file table) rather than leaving it unscanned"
+        );
+
+        for (name, source) in OTHERS {
+            let code = code_only(source);
+            for needle in ["PreviewSink", ".preview", "PreviewHook", "_hook("] {
+                assert_eq!(
+                    code.matches(needle).count(),
+                    0,
+                    "{name}.rs mentions `{needle}` — only `lib.rs` (which forwards the request's \
+                     sink), `t2i.rs` (which emits) and `preview.rs` (which owns the seam) may. A \
+                     helper here that returns a request with an emptied `preview` takes the lane \
+                     dark without any needle appearing in the two files scanned per-file"
+                );
+            }
+        }
     }
 
     /// The bespoke loop emits **exactly once**, keyed on the loop's own 0-based step index, over a

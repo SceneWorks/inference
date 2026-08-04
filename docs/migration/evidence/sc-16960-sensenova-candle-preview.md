@@ -251,30 +251,81 @@ sufficient. Both reviewers took a family's lanes dark with **zero** type errors 
   ..req.clone() };` ahead of the hook build — the literal a scan counts is still there, exactly once,
   over an emptied sink.
 
-`preview::tests::the_registered_lane_builds_its_hook_from_the_requests_sink` closes both spellings by
-count, on the **shipped** half of each file (everything ahead of its first `#[cfg(test)]` item):
+This story's own review found **two more**, both green against the first draft of the guard, and both
+are the reason the table below is per-file rather than per-crate:
+
+* the `_hook(` tally was applied only to `lib.rs`, which left `t2i.rs` free to call
+  `crate::preview::t2i_hook(&dark, cell)` a **second** time inside `denoise` and shadow the forwarded
+  hook. No `PreviewHook::new`, no `GenerationRequest {`, both parameter lines intact, the `.emit_step`
+  literal intact, and the catalog inventory still reading `hooked: 0, direct: 1`;
+* the `GenerationRequest {` count blocks only the **struct-literal** spelling. `GenerationRequest`
+  derives `Clone` (`gen-core/src/generator.rs:268`) and its `preview` field is `pub` (`:471`), so
+  `let mut owned = req.clone(); owned.preview = PreviewSink::default(); let req = &owned;` empties the
+  sink with no literal at all.
+
+`preview::tests::the_registered_lane_builds_its_hook_from_the_requests_sink` counts on the **shipped**
+half of each file (everything ahead of its first `#[cfg(test)]` item) with whole-line comments dropped,
+so the needles count code and the module docs stay free to name the spellings they forbid:
 
 | pin | shipped `lib.rs` | shipped `t2i.rs` |
 | --- | --- | --- |
 | `preview::t2i_hook(&req.preview, comps.model.cell())` | exactly **1** | — |
-| `_hook(` | exactly **1** | — |
-| `PreviewHook::new` | **0** | **0** |
+| `_hook(` | exactly **1** | **0** |
+| `.preview` | exactly **1** (that same site) | **0** |
+| `PreviewSink` | **0** | **0** |
+| `PreviewHook::` | **0** | **0** |
 | `GenerationRequest {` | **0** | **0** |
+| `let req` / `\|req` / `req =>` | **0** | — |
 | `preview: &PreviewHook<'_>,` (whole trimmed line) | — | exactly **2** (`generate`, `denoise`) |
+
+Four of those rows are new in this revision. `_hook(` and `.preview` are now pinned **per file** rather
+than on `lib.rs` alone, which is what closes the shadowed-second-hook edit. `.preview` is what closes
+the clone-and-assign edit, and it is stronger than pinning `req.clone()`: plain `clone()` is legitimate
+on this path (once in shipped `lib.rs`, three times in shipped `t2i.rs`) so it cannot be pinned to zero,
+whereas *reading the request's sink at all* is something this lane does exactly once. `PreviewHook::`
+rather than `PreviewHook::new` because `with_sigma` and `over_schedule` are constructors too.
+
+The last row policies the **shadow** instead of what produced it, and it is the one that generalises:
+`req` reaches the hook site only as `generate_impl`'s own parameter, so `let req = &…;` fails whatever
+built the right-hand side — a type alias (`type Req = GenerationRequest; let owned = Req { preview:
+Default::default(), ..req.clone() };`, which evades all three construction needles) or a helper from
+another crate alike.
 
 Parameters are counted by **whole trimmed line**, never by substring: a substring tally is satisfied by
 the same declaration renamed `_preview:`, which is precisely what a hop looks like once it stops using
 its hook.
 
-The shipped-half split itself is anchored at line start rather than matched as `\n#[cfg(test)]\n`. That
-is not cosmetic: these sources are checked out CRLF on Windows, a newline-wrapped needle matches
-**nothing** there, and every count above would then run against an empty string and pass vacuously. The
-helper asserts the marker count *and* that the shipped half is non-empty.
+`preview::tests::no_sibling_module_in_this_crate_touches_the_requests_sink` closes the remaining
+in-crate spelling — a helper in a sibling module returning a request with an emptied `preview`, so that
+none of the needles above appears in either scanned file. Every module `lib.rs` declares other than
+`preview` (which owns the seam), `lib` and `t2i` is pinned to **0** `PreviewSink`, **0** `.preview`,
+**0** `PreviewHook` and **0** `_hook(`, over the whole file, and the module list is checked against
+`lib.rs`'s own `mod` declarations so a new source cannot arrive as an unscanned blind spot.
 
-What is still not caught by text is an edit that reaches the same end by a third construction (a helper
-returning an emptied request; `GenerationRequest{` with no space). Closing that needs a render through
-the registered `Generator` seam with a live sink, which needs weights — which is exactly what the
-real-weight lane does, on CUDA, and it is the only place this crate proves the seam end to end.
+The shipped-half split itself is anchored at line start rather than matched as `\n#[cfg(test)]\n`. That
+is **defensive, not load-bearing**: a newline-wrapped needle matches nothing in a CRLF checkout, and the
+split holds even if one occurred — but one does not occur here. `.gitattributes:22` pins
+`* text=auto eol=lf` for the whole tree, set specifically to override `core.autocrlf=true` on Windows;
+`git check-attr text eol` reports `text: auto, eol: lf` for all three sources; and `lib.rs`, `t2i.rs`
+and `preview.rs` hold **0** CR bytes on disk. What actually rules out a vacuous pass is the helper's
+`!shipped.is_empty()` assertion, which fires whatever the line endings turn out to be.
+
+### What is *not* enforced
+
+Stated precisely, because an earlier draft of this section claimed closure it did not have. Move the
+emptying helper into a **different crate** and pass its result in **argument position** rather than
+rebinding — `self.generate_impl(&candle_gen::preview::without_listener(req), on_progress)` inside
+`Generator::generate` — and every pin above is satisfied: no needle of the table appears, no module of
+this crate is touched, and `req` is never shadowed so the rebind row has nothing to fire on. That edit
+was built and run while writing this revision: **the registered lane went fully dark with all 57 lib
+tests green.** Closing it would need a scan of every crate that can produce a `GenerationRequest`, which
+is not a bound a test in this crate can hold.
+
+So: the guard pins **where the hook is built, what it is built from, and that nothing on this crate's
+own path rebuilds or replaces either.** It does not make the sink unreachable. The only thing that
+observes frames actually arriving is `tests/preview_real_weights.rs`, which renders through the
+registered `Generator` seam with a live sink — on CUDA, on real weights, and it is the only place this
+crate proves the seam end to end.
 
 ## Catalog guard — all three steps in this PR
 
