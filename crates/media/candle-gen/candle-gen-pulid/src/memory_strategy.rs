@@ -1,0 +1,271 @@
+//! Shared Candle/CUDA image-memory ladder for the bespoke PuLID-FLUX route (SC-15839).
+//!
+//! PuLID reuses FLUX.1-dev's staged/windowed reference backbone, but owns a distinct admission
+//! identity because EVA-CLIP, IDFormer, the face stack, and the 20 CA modules stay resident. Base
+//! FLUX evidence must therefore never authorize this route.
+
+use candle_gen::gen_core::{
+    self, LoadShape, LoadSpec, MemoryComponentKind, MemoryMode, MemoryProviderContract,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy, OffloadPolicy,
+    WeightsSource,
+};
+
+use crate::PulidFluxPaths;
+
+pub const PROVIDER_ID: &str = "pulid_flux";
+pub const CALIBRATION_FINGERPRINT: &str =
+    "pulid-flux-cuda-identity-stack-staged-decode-attention-block-window-v1";
+
+fn base_spec(paths: &PulidFluxPaths) -> LoadSpec {
+    LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(LoadShape::DeferredMaterialization)
+}
+
+fn resident_component(
+    id: &str,
+    path: &std::path::Path,
+) -> gen_core::Result<MemoryResidentComponent> {
+    let resident_bytes = gen_core::weightsmeta::safetensors_path_bytes(path);
+    if resident_bytes == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{PROVIDER_ID}: resident identity component {id} has no loadable safetensors bytes at {}",
+            path.display()
+        )));
+    }
+    Ok(MemoryResidentComponent {
+        id: id.to_owned(),
+        kind: MemoryComponentKind::IdentityEncoder,
+        resident_bytes,
+        bounded_by: None,
+    })
+}
+
+fn resident_components(paths: &PulidFluxPaths) -> gen_core::Result<Vec<MemoryResidentComponent>> {
+    Ok(vec![
+        resident_component("pulid_idformer_ca", &paths.pulid_weights)?,
+        resident_component("pulid_eva_clip", &paths.eva_weights)?,
+        resident_component(
+            "pulid_face_scrfd",
+            &paths.face_dir.join("scrfd_10g.safetensors"),
+        )?,
+        resident_component(
+            "pulid_face_arcface",
+            &paths.face_dir.join("arcface_iresnet100.safetensors"),
+        )?,
+        resident_component(
+            "pulid_face_bisenet",
+            &paths.face_dir.join("bisenet_parsing.safetensors"),
+        )?,
+    ])
+}
+
+/// Exact contract for the fully composed PuLID request route.
+pub fn provider_contract(paths: &PulidFluxPaths) -> gen_core::Result<MemoryProviderContract> {
+    candle_gen_flux::memory_strategy::reference_backbone_contract(
+        PROVIDER_ID,
+        &base_spec(paths),
+        resident_components(paths)?,
+        CALIBRATION_FINGERPRINT,
+    )
+}
+
+pub fn resolved_numeric_tier(
+    paths: &PulidFluxPaths,
+) -> gen_core::Result<gen_core::MemoryNumericTier> {
+    candle_gen_flux::memory_strategy::resolved_numeric_tier(&base_spec(paths), PROVIDER_ID)
+}
+
+/// Provider-owned safety check for the bespoke identity route.
+pub fn safety_check(
+    paths: &PulidFluxPaths,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    let tier = match resolved_numeric_tier(paths) {
+        Ok(tier) => tier,
+        Err(error) => {
+            return MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            }
+        }
+    };
+    if let MemorySafetyDecision::Reject { reason } =
+        gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None)
+    {
+        return MemorySafetyDecision::Reject { reason };
+    }
+    if context.mode != MemoryMode::Other("character_image".to_owned())
+        || !context.has_reference
+        || context.geometry.reference_count != 1
+        || context.overlay.as_deref() != Some("identity")
+    {
+        return MemorySafetyDecision::Reject {
+            reason: format!(
+                "{PROVIDER_ID}: memory admission is bound to one character_image identity reference"
+            ),
+        };
+    }
+    if context.has_phases {
+        return MemorySafetyDecision::Reject {
+            reason: format!("{PROVIDER_ID}: multi-phase denoise is not covered"),
+        };
+    }
+    if context.use_pid && context.selection.strategy != MemoryStrategy::Resident {
+        return MemorySafetyDecision::Reject {
+            reason: format!("{PROVIDER_ID}: PiD has no admitted native-VAE memory ladder"),
+        };
+    }
+    MemorySafetyDecision::Accept
+}
+
+pub fn validate_context(
+    paths: &PulidFluxPaths,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
+    match safety_check(paths, contract, context) {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
+    }
+}
+
+/// Revalidate the context without filesystem reads after the exact contract has been retained by a
+/// loaded provider. Path/tier validation already happened before materialization.
+pub fn validate_context_from_loaded(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
+    if contract.provider_id != PROVIDER_ID
+        || context.mode != MemoryMode::Other("character_image".to_owned())
+        || !context.has_reference
+        || context.geometry.reference_count != 1
+        || context.overlay.as_deref() != Some("identity")
+        || context.has_phases
+        || (context.use_pid && context.selection.strategy != MemoryStrategy::Resident)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{PROVIDER_ID}: loaded memory context no longer matches the admitted identity route"
+        )));
+    }
+    contract.validate_selection(&context.selection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryStrategySupport, TransformerComponent};
+
+    fn write_safetensors(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 4]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn paths() -> PulidFluxPaths {
+        let root = std::env::temp_dir().join(format!("pulid-memory-{}", std::process::id()));
+        for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
+            write_safetensors(&root.join("base").join(component).join("model.safetensors"));
+        }
+        std::fs::write(
+            root.join("base/transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        for name in [
+            "scrfd_10g.safetensors",
+            "arcface_iresnet100.safetensors",
+            "bisenet_parsing.safetensors",
+        ] {
+            write_safetensors(&root.join("face").join(name));
+        }
+        write_safetensors(&root.join("pulid.safetensors"));
+        write_safetensors(&root.join("eva.safetensors"));
+        PulidFluxPaths {
+            flux_base: root.join("base"),
+            pulid_weights: root.join("pulid.safetensors"),
+            eva_weights: root.join("eva.safetensors"),
+            face_dir: root.join("face"),
+        }
+    }
+
+    #[test]
+    fn contract_is_full_but_has_a_distinct_identity_and_prices_every_resident_network() {
+        let paths = paths();
+        let contract = provider_contract(&paths).unwrap();
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(contract.provider_id, PROVIDER_ID);
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            CALIBRATION_FINGERPRINT
+        );
+        assert_ne!(
+            CALIBRATION_FINGERPRINT,
+            candle_gen_flux::memory_strategy::CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(contract.resident_components().len(), 5);
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            contract
+                .resident_components()
+                .iter()
+                .map(|component| component.resident_bytes)
+                .sum::<u64>()
+        );
+        for strategy in MemoryStrategy::ALL {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Implemented
+            );
+        }
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .parameters
+                .transformer_window_components,
+            vec![TransformerComponent::Dit]
+        );
+    }
+
+    #[test]
+    fn exact_identity_route_is_accepted_but_base_or_pid_overlay_reuse_fails_closed() {
+        let paths = paths();
+        let contract = provider_contract(&paths).unwrap();
+        let tier = resolved_numeric_tier(&paths).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Other("character_image".to_owned()),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: Some("identity".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            safety_check(&paths, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        context.overlay = None;
+        assert!(matches!(
+            safety_check(&paths, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        context.overlay = Some("identity".to_owned());
+        context.use_pid = true;
+        assert!(matches!(
+            safety_check(&paths, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+    }
+}

@@ -27,7 +27,7 @@
 mod pipeline;
 
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
-mod memory_strategy;
+pub mod memory_strategy;
 
 // Per-step latent previews (epic 16948, sc-16956) — the 16-channel FLUX.1 fit reused verbatim from
 // epic 16624's `mlx-gen-flux`, plus the packed-token → native-latent recovery every route projects
