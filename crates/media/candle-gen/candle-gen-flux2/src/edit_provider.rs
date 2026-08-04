@@ -155,10 +155,32 @@ impl Flux2Edit {
         spec: &candle_gen::gen_core::LoadSpec,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
+        Self::load_with_memory_context(paths, Flux2Variant::Dev, quant, spec, context)
+    }
+
+    /// Klein counterpart to [`Self::load_dev_with_memory_context`]. All four worker route surfaces
+    /// (edit, character, reference, and style) enter this one provider primitive; their evidence and
+    /// catalog calibration remain distinct in SceneWorks.
+    pub fn load_klein_with_memory_context(
+        paths: &Flux2EditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
+        Self::load_with_memory_context(paths, Flux2Variant::Klein9b, None, spec, context)
+    }
+
+    fn load_with_memory_context(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
         validate_base_binding(paths, spec)?;
+        validate_memory_load_spec(variant, spec)?;
         let loaded_quant = crate::memory_strategy::resolved_quant(spec)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
-        let contract = crate::memory_strategy::provider_contract(spec)
+        let contract = crate::memory_strategy::contract_for_variant(variant, spec)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
         crate::memory_strategy::validate_context(&contract, context, loaded_quant)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
@@ -172,7 +194,7 @@ impl Flux2Edit {
             .unwrap_or_default();
         Self::load_variant_bound(
             paths,
-            Flux2Variant::Dev,
+            variant,
             loaded_quant,
             memory,
             Some(contract),
@@ -662,6 +684,46 @@ fn validate_base_binding(
     }
 }
 
+fn validate_memory_load_spec(
+    variant: Flux2Variant,
+    spec: &candle_gen::gen_core::LoadSpec,
+) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if !spec.adapters.is_empty() {
+        unsupported.push("adapters");
+    }
+    if spec.control.is_some() {
+        unsupported.push("control");
+    }
+    if !spec.extra_controls.is_empty() {
+        unsupported.push("extra_controls");
+    }
+    if spec.ip_adapter.is_some() {
+        unsupported.push("ip_adapter");
+    }
+    if spec.pid.is_some() {
+        unsupported.push("pid");
+    }
+    if spec.identity.is_some() {
+        unsupported.push("identity");
+    }
+    if spec.text_encoder.is_some() {
+        unsupported.push("text_encoder");
+    }
+    if !spec.components.is_empty() {
+        unsupported.push("components");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(CandleError::Msg(format!(
+            "{} edit memory route does not realize LoadSpec fields: {}",
+            variant.id(),
+            unsupported.join(", ")
+        )))
+    }
+}
+
 fn ensure_ordinary_generate_allowed(
     admitted_context: Option<&MemoryRunContext>,
     label: &str,
@@ -866,6 +928,62 @@ mod tests {
             candle_gen::gen_core::WeightsSource::Dir(PathBuf::from("/admitted")),
         );
         assert!(validate_base_binding(&paths, &mismatched).is_err());
+    }
+
+    #[test]
+    fn admitted_klein_edit_rejects_every_unrealized_load_spec_field() {
+        use candle_gen::gen_core::{
+            AdapterKind, AdapterSpec, IdentityWeights, PidWeights, WeightsSource,
+        };
+
+        let base =
+            || candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/klein")));
+        assert!(validate_memory_load_spec(Flux2Variant::Klein9b, &base()).is_ok());
+
+        let mut adapters = base();
+        adapters.adapters.push(AdapterSpec::new(
+            PathBuf::from("adapter.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        ));
+        let mut control = base();
+        control.control = Some(WeightsSource::File(PathBuf::from("control.safetensors")));
+        let mut extra_controls = base();
+        extra_controls
+            .extra_controls
+            .push(WeightsSource::File(PathBuf::from(
+                "extra-control.safetensors",
+            )));
+        let mut ip_adapter = base();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir(PathBuf::from("ip-adapter")));
+        let mut pid = base();
+        pid.pid = Some(PidWeights {
+            checkpoint: WeightsSource::File(PathBuf::from("pid.safetensors")),
+            gemma: WeightsSource::Dir(PathBuf::from("gemma")),
+        });
+        let mut identity = base();
+        identity.identity = Some(IdentityWeights::default());
+        let mut text_encoder = base();
+        text_encoder.text_encoder = Some(WeightsSource::Dir(PathBuf::from("external-te")));
+        let components = base().with_component(
+            "unwired_component",
+            WeightsSource::File(PathBuf::from("component.safetensors")),
+        );
+
+        for (field, spec) in [
+            ("adapters", adapters),
+            ("control", control),
+            ("extra_controls", extra_controls),
+            ("ip_adapter", ip_adapter),
+            ("pid", pid),
+            ("identity", identity),
+            ("text_encoder", text_encoder),
+            ("components", components),
+        ] {
+            let error = validate_memory_load_spec(Flux2Variant::Klein9b, &spec)
+                .expect_err("unrealized LoadSpec field must fail before weight load");
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
     }
 
     #[test]
