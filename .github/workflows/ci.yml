@@ -348,6 +348,15 @@ jobs:
           cargo --version
       - name: Cache Cargo and MLX native build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # This runner is a persistent Mac whose CARGO_HOME is the developer's real
+          # ~/.cargo. rust-cache's post step runs cleanBin(), which deletes every
+          # *regular file* in $CARGO_HOME/bin that cargo did not install (per
+          # .crates2.json) -- and `rustup` is the only regular file there. The 13
+          # rustup proxies (cargo, rustc, ...) are symlinks, so isFile() is false and
+          # they survive as dangling links, breaking every cargo/rustc call on the box
+          # until something reinstalls rustup. Harmless on ephemeral runners; not here.
+          cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
         run: cargo test --locked --lib -p mlx-llm -p runtime-macos
       - name: Exercise LLM-only runtime catalog on NAX
@@ -395,6 +404,12 @@ jobs:
           components: clippy
       - name: Cache Cargo and CUDA objects
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Persistent self-hosted box: rust-cache's post step deletes rustup.exe from
+          # %CARGO_HOME%\bin (see the macos-nax job for the full mechanism), leaving the
+          # proxies dangling. This is the real cause of the breakage that
+          # scripts/win/use-real-rust-toolchain.cmd works around in the app repo.
+          cache-bin: "false"
       - name: Compile Candle CUDA packages and test binaries (no GPU required)
         shell: cmd
         run: |
@@ -451,6 +466,12 @@ jobs:
           components: rustfmt, clippy
       - name: Cache Cargo and CUDA objects
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Persistent self-hosted box: rust-cache's post step deletes rustup.exe from
+          # %CARGO_HOME%\bin (see the macos-nax job for the full mechanism), leaving the
+          # proxies dangling. This is the real cause of the breakage that
+          # scripts/win/use-real-rust-toolchain.cmd works around in the app repo.
+          cache-bin: "false"
       - name: Build Candle CUDA packages
         shell: cmd
         run: |
