@@ -1464,6 +1464,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ["git", "ls-files", "-s", "--", "scripts/ci/gpu_fault_evidence.sh"],
             capture_output=True,
             text=True,
+            # `test_script_encoding` requires this explicitly: the locale default decodes these
+            # gates' output as something other than UTF-8 on Windows, where this suite also runs.
+            encoding="utf-8",
             cwd=script_path.parents[2],
             check=False,
         ).stdout.split(" ", 1)[0]
@@ -1493,6 +1496,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
              "--predicate", predicate.group(1)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
         )
         # Assert on the PARSE, not on the exit code. `log show` can fail for reasons that say
