@@ -28,7 +28,10 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, PidWeights, PreviewSink, Progress};
+use candle_gen::gen_core::{
+    GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, PidWeights, PreviewSink,
+    Progress,
+};
 use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
@@ -190,6 +193,11 @@ pub struct PulidFlux {
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
     /// PuLID composes the FLUX.1-dev VAE, so it loads the `flux` student (same tag as the base FLUX provider).
     pid: Option<PidEngine>,
+    /// Exact request-scoped contract/context selected for the bespoke route. Legacy callers that use
+    /// `load`/`load_with_memory` leave these empty; the SceneWorks route uses
+    /// `load_with_memory_context` and must then call `generate_with_memory_context`.
+    memory_contract: Option<MemoryProviderContract>,
+    admitted_context: Option<MemoryRunContext>,
 }
 
 impl PulidFlux {
@@ -203,6 +211,32 @@ impl PulidFlux {
     /// base backbone may stage text→DiT/VAE, stream its two block stacks, and CPU-decode through the
     /// calibrated bounded-host path.
     pub fn load_with_memory(paths: &PulidFluxPaths, memory: GenerationMemory) -> Result<Self> {
+        Self::load_internal(paths, memory, None, None)
+    }
+
+    /// Load under an exact shared-ladder admission context. The provider rebuilds and validates the
+    /// contract from the actual resolved paths, derives `GenerationMemory` from the admitted
+    /// selection, and retains the handshake for every subsequent bespoke request.
+    pub fn load_with_memory_context(
+        paths: &PulidFluxPaths,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract(paths)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_context(paths, &contract, &context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let memory = contract
+            .generation_memory(&context.selection)
+            .unwrap_or_default();
+        Self::load_internal(paths, memory, Some(contract), Some(context))
+    }
+
+    fn load_internal(
+        paths: &PulidFluxPaths,
+        memory: GenerationMemory,
+        memory_contract: Option<MemoryProviderContract>,
+        admitted_context: Option<MemoryRunContext>,
+    ) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
 
@@ -249,6 +283,8 @@ impl PulidFlux {
             pulid,
             face,
             pid: None,
+            memory_contract,
+            admitted_context,
         })
     }
 
@@ -314,6 +350,59 @@ impl PulidFlux {
     /// Reference-image identity T2I: condition the FLUX.1-dev generation on `reference`'s PuLID
     /// id_embedding at `req.id_weight` (a single distilled forward per step — no true-CFG).
     pub fn generate(
+        &self,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "pulid_flux: admitted model requires generate_with_memory_context".into(),
+            ));
+        }
+        self.generate_inner(req, reference, on_progress)
+    }
+
+    /// Execute one bespoke PuLID request under the exact admission handshake retained at load. The
+    /// route and geometry are revalidated at the last responsible moment and the CUDA device is
+    /// synchronized on both success and failure so request-scoped materializations cannot leak into
+    /// the next job's budget snapshot.
+    pub fn generate_with_memory_context(
+        &self,
+        context: &MemoryRunContext,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+            CandleError::Msg("pulid_flux: model was not loaded with a memory context".into())
+        })?;
+        let contract = self.memory_contract.as_ref().ok_or_else(|| {
+            CandleError::Msg("pulid_flux: admitted model lost its memory contract".into())
+        })?;
+        if admitted != context {
+            return Err(CandleError::Msg(
+                "pulid_flux: request memory context changed after provider load".into(),
+            ));
+        }
+        validate_request_geometry(
+            &context.geometry,
+            context.has_reference,
+            context.use_pid,
+            req,
+        )?;
+        crate::memory_strategy::validate_context_from_loaded(contract, context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let result = self.generate_inner(req, reference, on_progress);
+        let synchronized = self.device.synchronize().map_err(CandleError::Candle);
+        match (result, synchronized) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(image), Ok(())) => Ok(image),
+        }
+    }
+
+    fn generate_inner(
         &self,
         req: &PulidFluxRequest,
         reference: &Image,
@@ -458,6 +547,27 @@ impl PulidFlux {
     }
 }
 
+fn validate_request_geometry(
+    geometry: &candle_gen::gen_core::MemoryGeometry,
+    has_reference: bool,
+    use_pid: bool,
+    req: &PulidFluxRequest,
+) -> Result<()> {
+    if geometry.width != req.width
+        || geometry.height != req.height
+        || geometry.batch != 1
+        || geometry.frames != 1
+        || geometry.reference_count != 1
+        || has_reference != (geometry.reference_count > 0)
+        || use_pid != req.use_pid
+    {
+        return Err(CandleError::Msg(
+            "pulid_flux: request route or geometry changed after memory admission".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +624,25 @@ mod tests {
         assert_eq!(r.guidance, DEFAULT_GUIDANCE);
         assert_eq!(r.id_weight, DEFAULT_ID_WEIGHT);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn admitted_generation_geometry_rejects_zero_or_multi_image_batches() {
+        let req = PulidFluxRequest::default();
+        let mut geometry = candle_gen::gen_core::MemoryGeometry {
+            width: req.width,
+            height: req.height,
+            batch: 1,
+            frames: 1,
+            reference_count: 1,
+        };
+
+        assert!(validate_request_geometry(&geometry, true, false, &req).is_ok());
+        for batch in [0, 2] {
+            geometry.batch = batch;
+            let error = validate_request_geometry(&geometry, true, false, &req).unwrap_err();
+            assert!(error.to_string().contains("geometry changed"), "{error}");
+        }
     }
 
     /// `l2_normalize_rows` returns unit-norm rows (and the FLUX block counts the schedule is built over
