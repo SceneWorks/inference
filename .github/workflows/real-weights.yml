@@ -1872,10 +1872,11 @@ jobs:
           # `forward` (which the identity half alone does NOT catch). The bounds carry deliberate
           # headroom over those dev-box figures — this runner is not that box, and rayon scratch
           # scales with core count.
-          # KEEP THIS LANE FEATURELESS. The memory half counts HEAP, so it self-skips (printing a
-          # reason, but still `1 passed` — the run-count grep cannot see it) whenever the codec
-          # loads onto a non-CPU device. Adding `--features metal` here would keep this green while
-          # silently deleting the memory coverage entirely; the identity half would still run.
+          # KEEP THIS LANE FEATURELESS. The memory half counts HEAP, so it REFUSES to run when the
+          # codec loads onto a non-CPU device — it asserts rather than skipping, precisely so it
+          # cannot go green while measuring nothing (sc-17270's rule, gated by
+          # scripts/tests/test_moss_audio_codec_reference.py). Adding `--features metal` here turns
+          # this step RED with an explanatory message rather than silently dropping the coverage.
           run_one moss_audio_codec_chunked_encode_matches_single_shot
           # AR stage: a fixed text + seed emits >= 2 real 16-codebook RVQ frames, every token in
           # [0, 1027), deterministic run-to-run and non-degenerate. A broken backbone / weight mapping /

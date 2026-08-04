@@ -1059,20 +1059,24 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
     //   (d) growth across clip length — the streaming claim itself, measured rather than asserted.
     //
     // Heap-counted, so this arm needs the CPU device: on `metal`/`cuda` the stage tensors are device
-    // buffers the global allocator never sees and both paths would read as ~nothing. Keyed on the
+    // buffers the global allocator never sees, and both paths would read as ~nothing. Keyed on the
     // device the codec actually loaded onto (`candle_audio::default_device`, exactly what
     // `MossAudioCodec::load` calls) rather than on this crate's feature flags, which are only a
-    // proxy for it. The identity half above has already run either way.
-    let device_is_cpu = moss::candle_audio::default_device()
-        .expect("resolve the codec's device")
-        .is_cpu();
-    if !device_is_cpu {
-        println!(
-            "sc-14181 memory bound SKIPPED — the codec loaded onto a non-CPU device, whose stage \
-             tensors are device buffers, not heap; run this gate on the default (CPU) build"
-        );
-        return;
-    }
+    // proxy for it.
+    //
+    // This REFUSES rather than skips. A skip would pass while measuring nothing, and the weekly
+    // lane's `test result: ok. 1 passed` grep cannot see a branch that was not taken — the precise
+    // false green sc-17270 removed from this file and now gates against in
+    // `scripts/tests/test_moss_audio_codec_reference.py`. Failing on a build that cannot run this
+    // gate costs one clear error message; skipping costs the coverage, silently.
+    assert!(
+        moss::candle_audio::default_device()
+            .expect("resolve the codec's device")
+            .is_cpu(),
+        "this gate measures a HEAP high-water mark, but the codec loaded onto a non-CPU device \
+         whose stage tensors are device buffers the allocator never sees. Run it on the default \
+         (CPU) build — `-p candle-audio-moss-tts-realtime` with no metal/cuda feature.",
+    );
     println!(
         "sc-14181 transient heap high-water above resting: chunked(1.5s) +{:.0} MB, single-shot \
          +{:.0} MB (ratio {:.1}x); chunked on the half clip +{:.0} MB",
