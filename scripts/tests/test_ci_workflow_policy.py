@@ -1383,11 +1383,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "  mlx-krea-realtime:": "\n  mlx-krea-realtime-s18-sweep:",
             "  mlx-krea-realtime-s18-sweep:": "\n  candle-audio-kokoro:",
         }
+        # The sampler bound is per-caller because the two lanes are not the same length. The sweep
+        # is `timeout-minutes: 480` and really runs ~4.3 h; the 7200s default (the regression lane's
+        # `timeout-minutes: 120`) would stop recording less than halfway through it, silently, in
+        # the half where accumulated pressure is most likely. A shared constant cannot serve both.
+        expected_start = {
+            "  mlx-krea-realtime:": "scripts/ci/gpu_fault_evidence.sh start\n",
+            "  mlx-krea-realtime-s18-sweep:": "scripts/ci/gpu_fault_evidence.sh start 30000\n",
+        }
         for header, terminator in bounds.items():
             start = workflow.index(header)
             job = workflow[start : workflow.index(terminator, start)]
             with self.subTest(job=header.strip()):
-                self.assertIn("scripts/ci/gpu_fault_evidence.sh start", job)
+                self.assertIn(expected_start[header], job)
                 self.assertIn("scripts/ci/gpu_fault_evidence.sh report", job)
                 # The report exists to explain a FAILING run, so it must not be skipped by one.
                 report = job[job.index("- name: Report GPU fault evidence") :]

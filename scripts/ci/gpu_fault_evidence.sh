@@ -69,6 +69,12 @@ START_FILE="$STATE_DIR/started-at"
 now_local() { date '+%Y-%m-%d %H:%M:%S'; }
 
 start() {
+  # Seconds of coverage. Defaults to the shorter lane's cap; a longer job passes its own.
+  # `[0-9]` guard so a typo'd argument degrades to the default instead of `[: bad number`.
+  max_seconds="${1:-7200}"
+  case "$max_seconds" in
+    "" | *[!0-9]*) max_seconds=7200 ;;
+  esac
   mkdir -p "$STATE_DIR" 2>/dev/null || return 0
   # Idempotent: a re-run of this step (a retried job reuses `$RUNNER_TEMP`) would otherwise leave
   # the first sampler running and orphaned -- two writers on one CSV, and only one of them killable
@@ -83,14 +89,20 @@ start() {
   # state at the moment of a failure: `get_peak_memory()` inside a test dies with the test, and
   # a post-hoc reading is taken after the pressure has already drained away.
   #
-  # SELF-TERMINATING. `report` may never run -- the job can be cancelled, or the runner can lose
-  # the step -- and a sampler that outlives its job would still be writing during the NEXT lane
-  # on this box. 7200 iterations bounds it at ~2h, matching the job's own `timeout-minutes: 120`.
+  # SELF-TERMINATING, AND THE BOUND MUST MATCH THE CALLING JOB. `report` may never run -- the job
+  # can be cancelled, or the runner can lose the step -- and a sampler that outlives its job would
+  # still be writing during the NEXT lane on this box. So the loop is bounded. But the bound is a
+  # ceiling on COVERAGE as much as on leakage: the two callers are not the same length, and the
+  # regression lane's `timeout-minutes: 120` is the short one. The S18 sweep is `timeout-minutes:
+  # 480` and really does run ~4.3 hours, so a fixed 2h bound would have stopped recording less than
+  # halfway through the longer of the two lanes -- silently, and precisely in the job most likely
+  # to hit a pressure fault. Hence a per-caller argument rather than a constant.
   #
   # ALL THREE FDS REDIRECTED, and that is load-bearing rather than tidy. The Actions runner ends a
   # step when the step's stdout/stderr pipes close, so a background child that inherits them keeps
-  # the step open until it exits -- here, for two hours. A record-keeping step that can hang a lane
-  # is far worse than no record. stdin is closed for the same reason.
+  # the step open until it exits -- here, for the whole `max_seconds`. A record-keeping step that
+  # can hang a lane is far worse than no record. stdin is closed for the same reason.
+  #
   # `compressed` and `swap_used` are in here deliberately, not for completeness. Unified memory
   # means a 14B render's working set and the machine's page cache are the same pool, and the state
   # that precedes a resource death is not "free is low" -- free is always low on macOS -- it is the
@@ -100,7 +112,7 @@ start() {
   (
     echo "iso,active_gib,wired_gib,compressed_gib,free_gib,swap_used_gib,max_rss_gib"
     i=0
-    while [ "$i" -lt 7200 ]; do
+    while [ "$i" -lt "$max_seconds" ]; do
       vm_stat | awk -v stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
                     -v rss="$(ps -Ao rss= | sort -rn | head -1)" \
                     -v swap="$(sysctl -n vm.swapusage 2>/dev/null)" -F: '
@@ -134,7 +146,7 @@ start() {
   ) > "$MEM_CSV" 2>/dev/null < /dev/null &
   echo $! > "$SAMPLER_PID_FILE" 2>/dev/null
 
-  echo "gpu-fault evidence: sampling from $(cat "$START_FILE" 2>/dev/null) (pid $(cat "$SAMPLER_PID_FILE" 2>/dev/null))"
+  echo "gpu-fault evidence: sampling from $(cat "$START_FILE" 2>/dev/null) for up to ${max_seconds}s (pid $(cat "$SAMPLER_PID_FILE" 2>/dev/null))"
   return 0
 }
 
@@ -212,9 +224,9 @@ report() {
 }
 
 case "${1:-}" in
-  start) start ;;
+  start) start "${2:-}" ;;
   report) report ;;
-  *) echo "usage: $0 start|report" ;;
+  *) echo "usage: $0 start [max_seconds] | report" ;;
 esac
 
 exit 0

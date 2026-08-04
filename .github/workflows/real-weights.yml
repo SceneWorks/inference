@@ -1819,9 +1819,14 @@ jobs:
       # crate and the SAME box driven for ~4.3 hours instead of ~28 minutes, so if the cascade is
       # pressure-related this is where it is most likely to be seen; a four-hour run that dies
       # naming no cause is the most expensive possible place to have no record.
+      #
+      # 30000s, not the 7200s default: the default matches the regression lane's
+      # `timeout-minutes: 120`, and using it here would stop recording ~2h into a run this job is
+      # allowed 480 minutes for — silently, and in the half of the run where accumulated pressure
+      # is most likely. The figure is over this job's own cap so the sampler cannot expire first.
       - name: Start GPU fault evidence
         continue-on-error: true
-        run: scripts/ci/gpu_fault_evidence.sh start
+        run: scripts/ci/gpu_fault_evidence.sh start 30000
       # `--exact` after the `--` (cargo rejects it in its own argument position, exit 1) plus the
       # run-count assertion: name-selection alone turns a rename into "0 passed; N filtered out" and
       # a green step, which on a four-hour job would be an expensive way to gate nothing (sc-17250).
