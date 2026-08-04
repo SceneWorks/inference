@@ -339,6 +339,24 @@ mod preview_advertising {
     /// consolidating them is a cross-engine decision, not a candle one. See
     /// `docs/migration/evidence/sc-16957-z-image-candle-preview.md`.
     ///
+    /// SD3.5 (sc-16958) contributes three rows — `sd3_5_large`, `sd3_5_large_turbo` and
+    /// `sd3_5_medium` — while wiring **six** lanes through a single call site, and it is the first
+    /// entry that is plainly the *simple* shape after five families that were not: one crate, one
+    /// `run_flow_sampler` site, no bespoke loop, no name-driven provider, no trainer, no dark site.
+    /// The three descriptors differ only in the MMDiT checkpoint and whether CFG is enabled, and each
+    /// reaches that one site through both a txt2img and an img2img / `Reference` lane — the img2img
+    /// fork blends its VAE-encoded reference into `x_t` and shortens the σ schedule *before* the
+    /// driver call rather than opening a second one.
+    ///
+    /// SD3.5 also settles the 16-channel question the other direction from Z-Image and Boogu. Its VAE
+    /// is **not** FLUX.1-dev's: same architecture, same 167,666,902-byte container, same 244 bf16
+    /// keys and shapes, and **0 of 244 tensors byte-identical** (`8f53304a…c109dc` against
+    /// `f5b59a26…40a3`), with its own `1.5305` / `0.0609` normalization. So this is a genuinely
+    /// distinct latent space rather than a third fit over one — sc-17309, which tracks the
+    /// Z-Image / FLUX.1 duplication, must not gain an SD3.5 row. Sharing
+    /// `z_image::vae::AutoEncoderKL` as a Rust *type* is exactly the reasoning this table refuses to
+    /// ground a reuse in. See `docs/migration/evidence/sc-16958-sd3-candle-preview.md`.
+    ///
     /// `instantid` is deliberately absent from *this* list and cannot be added: it registers no
     /// descriptor at all (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Three shipped tests
     /// hold that in place — the second half of
@@ -372,6 +390,9 @@ mod preview_advertising {
         "chroma1_flash",
         "z_image_turbo",
         "z_image",
+        "sd3_5_large",
+        "sd3_5_large_turbo",
+        "sd3_5_medium",
     ];
 
     /// The routes epic 16624 **measured and rejected**, carried over into candle rather than
@@ -774,7 +795,22 @@ mod preview_advertising {
             dir: "candle-gen-sd3",
             register: candle_gen_sd3::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-16958's inventory, and the first in this table that is simply the plain shape: ONE
+            // hooked `run_flow_sampler` site, in `pipeline.rs`'s `render_core`, which is the only
+            // shared-driver call the whole crate contains. It carries all SIX user-reachable lanes —
+            // the three registered descriptors each reached through txt2img and through
+            // img2img / `Reference` — because the img2img fork blends its reference into `x_t` and
+            // shortens the σ schedule before the driver call rather than opening a second one.
+            // No dark site: `load_variant` refuses control / IP-adapter overlays, so this crate ships
+            // no descriptor-less render lane, and it has no trainer. No direct emission either —
+            // `preview.rs` holds only the reused epic-16624 16-channel fit and a layout check, since
+            // SD3.5's running latent is already the `[1, C, h, w]` contract with nothing to unpack.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 1,
+                direct: 0,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-sdxl",

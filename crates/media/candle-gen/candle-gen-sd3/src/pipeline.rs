@@ -145,7 +145,12 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
 /// strength knob behaves identically on the Mac (MLX) and Windows (candle) SD3.5 lanes. `floor` because
 /// Python `int(steps · strength)` truncates toward zero for `s ≥ 0`. Pure function so the
 /// cross-backend-parity law is unit-testable without a GPU.
-pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+///
+/// `pub` so the sc-16958 preview harness can derive an img2img run's **emitted frame count** —
+/// `steps − init_time_step(steps, strength)`, since the driver only ever sees the reduced
+/// `sigmas[start..]` tail — from the very function the fork uses, rather than restating that
+/// arithmetic beside it and drifting from it.
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
     match strength {
         Some(s) if s > 0.0 => {
             let s = s.clamp(0.0, 1.0);
@@ -456,6 +461,15 @@ impl Pipeline {
         // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
         let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
+        // Per-step latent preview (epic 16948, sc-16958). Opting in is the sc-16949 projector hook and
+        // nothing else: the driver owns frame numbering, the multi-eval dedup and the swallow-on-failure
+        // contract, so neither this loop nor `render_core` changes shape. The hook is built once and
+        // handed to each per-seed driver call, and the driver builds a fresh counter per call — so a
+        // batched request restarts each image's trajectory at frame 1 rather than continuing the
+        // previous one's numbering. Over an inert sink this costs one `is_active` check per evaluation
+        // and leaves the render seeded-byte-identical. See [`crate::preview`].
+        let preview = crate::preview::hook(&req.preview);
+
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             render_core(
                 &components.transformer,
@@ -475,6 +489,7 @@ impl Pipeline {
                 start_step,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
             )
         })
     }
@@ -484,6 +499,11 @@ impl Pipeline {
 /// deterministic CPU-seeded noise, run the unified flow-match sampler (with CFG when `uncond` is
 /// `Some`, distilled-single-eval when `None`), and VAE-decode. Decoupled from snapshot I/O so a test
 /// can drive it with a random-weight transformer + VAE.
+///
+/// `preview` is the optional per-step latent preview hook (epic 16948, sc-16958) — the **single**
+/// shared-driver site every SD3.5 route and lane funnels through, so hooking it here wires all six
+/// user-reachable lanes at once. `None` is byte-identical to a run without it; see [`crate::preview`]
+/// for the enumeration, the reused fit and why the latent needs no unpack.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_core(
     transformer: &Sd3Transformer,
@@ -503,6 +523,7 @@ pub(crate) fn render_core(
     start_step: usize,
     cancel: &gen_core::CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&candle_gen::preview::PreviewHook<'_>>,
 ) -> Result<Image> {
     let (lat_h, lat_w) = latent_hw;
 
@@ -544,7 +565,7 @@ pub(crate) fn render_core(
         seed,
         cancel,
         on_progress,
-        None,
+        preview,
         |latents, sigma| -> Result<Tensor> {
             // SD3 feeds the DiT `t = σ·1000` (the timestep convention; the embedder scales the
             // sinusoid). f32 here is correct — the embedder upcasts internally.
@@ -921,6 +942,7 @@ mod tests {
             0,    // start_step: full schedule
             &cancel,
             &mut progress,
+            None, // preview: this harness measures the render, not the decorative strip
         )
         .unwrap();
         assert_eq!(img.width, (lat as u32) * SPATIAL_SCALE);
@@ -984,6 +1006,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                None, // preview: these rows measure the render, not the decorative strip
             )
             .unwrap()
         };
@@ -1032,6 +1055,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                None, // preview: these rows measure the render, not the decorative strip
             )
             .unwrap()
         };
@@ -1095,6 +1119,7 @@ mod tests {
                 start,
                 &cancel,
                 &mut |_p: Progress| {},
+                None, // preview: these rows measure the render, not the decorative strip
             )
             .unwrap()
         };
@@ -1257,6 +1282,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                None, // preview: these rows measure the render, not the decorative strip
             )
             .unwrap()
         };
