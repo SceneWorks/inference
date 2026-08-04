@@ -60,6 +60,21 @@ pub struct MemoryEvidenceProbe<'a> {
 /// high-water is written to both peak fields. A later out-of-sample validation must construct
 /// [`MemoryEvidenceLogRecord`] directly with the previously promoted prediction.
 pub fn memory_evidence_v1_line(probe: MemoryEvidenceProbe<'_>) -> String {
+    memory_evidence_v1_line_with_parity(
+        probe,
+        MemoryParityContract::Exact,
+        MemoryParityResult::NotRun,
+    )
+}
+
+/// Emit one strict observation with the parity contract/result established by a provider-owned
+/// real-weight comparator. The ordinary helper above remains conservative (`Exact` / `NotRun`) for
+/// harnesses that only capture an output and leave comparison to a later verifier.
+pub fn memory_evidence_v1_line_with_parity(
+    probe: MemoryEvidenceProbe<'_>,
+    parity: MemoryParityContract,
+    parity_result: MemoryParityResult,
+) -> String {
     let output_sha256 = format!("{:x}", Sha256::digest(probe.output_bytes));
     MemoryEvidenceLogRecord {
         key: MemoryEvidenceKey {
@@ -84,8 +99,8 @@ pub fn memory_evidence_v1_line(probe: MemoryEvidenceProbe<'_>) -> String {
         model_inventory_sha256: required_sha256("MEMORY_MODEL_INVENTORY_SHA256"),
         harness_version: probe.harness_version.to_owned(),
         output_sha256,
-        parity: MemoryParityContract::Exact,
-        parity_result: MemoryParityResult::NotRun,
+        parity,
+        parity_result,
     }
     .to_json_line()
     .expect("real-weight probe must produce a valid MEMORY_EVIDENCE_V1 record")
