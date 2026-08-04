@@ -817,6 +817,9 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
         use_pid: false,
         memory: Default::default(),
         cancel: candle_gen::gen_core::CancelFlag::new(),
+        // Inert: this row validates the packed q4 tier, not the preview stream (epic 16948,
+        // sc-16957). The preview stream has its own harness, `tests/preview_real_weights.rs`.
+        preview: candle_gen::gen_core::PreviewSink::default(),
     };
     let render = |request: &ZImageControlRequest, control_image: &Image| {
         model

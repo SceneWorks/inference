@@ -1740,32 +1740,35 @@ jobs:
   # sc-13334 streaming-TTS AR brain (~4.4 GB) plus the sc-13392 MOSS-Audio-Tokenizer RLFQ codec
   # (~7.1 GB, the figure the crate and the model manifest both use; `du` reports it as 6.6 GiB).
   # Both snapshots sat on a runner for a year with NO workflow running the eleven
-  # `#[ignore]` tests they back. NINE of those eleven are wired below. The two that are not are the
-  # voice-clone pair, which hard-require `MOSS_VOICECLONE_REF` — a 24 kHz f32-LE reference clip that
-  # exists in no repo, on no Hub, and in no provisioning script (sc-17264). The chunked-encode test
-  # was the third exclusion until sc-17263 fixed its machine-sensitive memory probe; it is wired
-  # below. Nothing here is wired to a path that would not resolve or to an assertion known to be red.
-  # sc-17270 closed the one remaining HALF-gated invocation — see the codec cross-check below.
+  # `#[ignore]` tests they back. ALL ELEVEN are wired below; there is no exclusion left. sc-17250
+  # wired eight; sc-17270 closed the one HALF-gated invocation among them (the codec cross-check
+  # below); sc-17264 added the two voice-clone tests, which used to hard-require
+  # `MOSS_VOICECLONE_REF` — a 24 kHz f32-LE reference clip that existed in no repo, on no Hub and in
+  # no provisioning script, and is now a committed fixture rendered by Kokoro (the repo's sanctioned
+  # reference-audio path, as in candle-audio-chatterbox-ve's embed_demo), so there is nothing to
+  # provision. sc-17263 wired the eleventh, the chunked-encode gate: it failed on a machine-
+  # sensitive memory assertion because the probe sampled `ps -o rss=` on a 5 ms timer, and now
+  # measures an allocator high-water mark instead. Nothing here is wired to a path that would not
+  # resolve or to an assertion already known to be red.
   #
   # `MOSS_AUDIO_TOKENIZER_SNAPSHOT` is new with this job: the codec became a passed-in component in
   # sc-13662, so the provider no longer self-fetches it and every test here fails without it.
   #
-  # Budget: PROVISIONAL, like every other family that has not completed a weekly run. sc-17250
-  # measured eight invocations `--release` on an M5 Max dev box against these exact pinned
-  # revisions — 720 s of test time total, of which the three whisper/CAMPPlus round-trip gates are
-  # 630 s (asr_roundtrip 235 s, multi_turn_conversation 254 s, multi_turn_user_context 141 s); the
-  # five others were 3.99 / 6.04 / 18.1 / 23.3 / 38.6 s. sc-17263 adds a ninth (the chunked-encode
-  # gate: a 7.1 GB codec load, a single-shot `[1,20,3200,3200]` CPU attention, three chunked
-  # encodes) at 67-106 s over five runs — call the lane ~830 s.
+  # Budget: PROVISIONAL, like every other family that has not completed a weekly run. Ten
+  # invocations were measured `--release` on an M5 Max dev box against these exact pinned
+  # revisions — 1178 s of test time total, of which the five whisper/CAMPPlus round-trip gates are
+  # 1088 s (asr_roundtrip 235 s, multi_turn_conversation 254 s, multi_turn_user_context 141 s,
+  # voice_clone 207 s, multi_turn_voice_clone 250 s); the five others are 3.99 / 6.04 / 18.1 /
+  # 23.3 / 38.6 s. sc-17263's chunked-encode gate is the eleventh, at 67-106 s over five runs (a
+  # 7.1 GB codec load, a single-shot `[1,20,3200,3200]` CPU attention, three chunked encodes) —
+  # call the lane ~1280 s. 120 minutes is ~5.6x that, to absorb a slower runner plus the cold
+  # `--release` build of the candle tree that `clean: true` forces every week.
   #
-  # Two caveats on those numbers, both pointing the same way. The codec cross-check's figure
-  # predates sc-17270 widening it to actually run the reference-parity arm, so it is a floor, not a
-  # current reading. And re-timing the five cheap arms on a dev box busy with other work gave
-  # 12.5 / 26.2 / 29.4 / 62.8 / 101.2 s — uniformly ~2.6-3x the sc-17250 figures, from contention
-  # alone. That is the honest spread a "measured on a dev box" number carries, and the reason these
-  # stay PROVISIONAL rather than being rewritten each time someone re-runs them.
-  # 120 minutes is ~8.7x the total, to absorb a slower
-  # runner plus the cold `--release` build of the candle tree that `clean: true` forces every week.
+  # Treat every figure above as a floor, for two measured reasons. The codec cross-check's number
+  # predates sc-17270 widening it to actually run the reference-parity arm. And re-timing the five
+  # cheap arms on a dev box busy with other work gave 12.5 / 26.2 / 29.4 / 62.8 / 101.2 s —
+  # uniformly ~2.6-3x the quiet-box figures, from contention alone. That spread is why these stay
+  # PROVISIONAL instead of being rewritten every time someone re-runs them on a different load.
   # Re-size from the first weekly that executes this lane (sc-17057's scope).
   candle-audio-moss-tts-realtime:
     name: Candle audio real weights (MOSS-TTS-Realtime streaming)
@@ -1898,6 +1901,18 @@ jobs:
           # turn actually conditions on the earlier one.
           run_one moss_tts_realtime_multi_turn_conversation
           run_one moss_tts_realtime_multi_turn_user_context
+          # sc-14149/sc-14151 voice cloning, wired by sc-17264. Both condition on a committed
+          # reference clip (`tests/fixtures/moss_voiceclone_ref_clip.f32`, rendered by Kokoro),
+          # so `MOSS_VOICECLONE_REF` no longer has to be provisioned — it only overrides.
+          # Single-turn: the cloned and default renders are both intelligible (Whisper CER), differ
+          # from each other, and the clone's CAMPPlus x-vector resembles the reference MORE than the
+          # default voice does. Measured on an M5 Max: clone<->ref 0.912 vs default<->ref 0.719.
+          run_one moss_tts_realtime_voice_clone
+          # Multi-turn: the sc-14151 DoD that the clone is held across the WHOLE conversation, not
+          # just turn 0 — every turn must carry the reference speaker more than the default voice,
+          # and the turns must be mutually the same speaker. Measured: turn0 0.837 vs 0.555,
+          # turn1 0.883 vs 0.621, cross-turn 0.870.
+          run_one moss_tts_realtime_multi_turn_voice_clone
 
   same-l-metal:
     name: SAME-L real weights (Metal)

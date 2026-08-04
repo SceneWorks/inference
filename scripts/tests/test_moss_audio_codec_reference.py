@@ -53,6 +53,13 @@ CONFORMANCE_PATH = (
 WORKFLOW_PATH = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "real-weights.yml"
 GITATTRIBUTES_PATH = Path(__file__).resolve().parents[2] / ".gitattributes"
 
+#: The sc-17264 voice-clone reference speaker: a second, independent fixture in the same directory,
+#: rendered by Kokoro rather than synthesized (the gates it feeds need a real speaker identity).
+VOICECLONE_CLIP_PATH = CLIP_PATH.parent / "moss_voiceclone_ref_clip.f32"
+VOICECLONE_METADATA_PATH = CLIP_PATH.parent / "moss_voiceclone_ref_metadata.json"
+#: `CLIP_PATH` is <crate>/tests/fixtures/<file>, so the crate root is two levels up from `tests`.
+VOICECLONE_GENERATOR_PATH = CLIP_PATH.parents[2] / "examples" / "voiceclone_ref_clip.rs"
+
 #: `math.sin`/`math.cos` are libm calls, so a regenerated clip can differ from the committed one in
 #: the last ulp on a different platform. Compare with a tolerance far below anything that could
 #: change a code, and let the committed bytes stay the single source of truth for what the two
@@ -280,6 +287,84 @@ class ReferenceArmStaysWiredTests(unittest.TestCase):
             if line.strip().startswith("*.f32") and "binary" in line
         ]
         self.assertTrue(declared, "*.f32 is not declared binary in .gitattributes")
+
+
+class VoiceCloneFixtureTests(unittest.TestCase):
+    """The sc-17264 voice-clone reference speaker, and its wiring.
+
+    Same discipline as the codec fixture: the clip is real-weight output (Kokoro), so its *content*
+    can only be judged on a box with weights — but everything that can rot without them is gated
+    here. The two gates it feeds `.expect()` their clip rather than skipping, so the regression to
+    watch for is not a silent skip but the tests quietly dropping out of the lane again.
+    """
+
+    def setUp(self) -> None:
+        self.clip_bytes = VOICECLONE_CLIP_PATH.read_bytes()
+        self.metadata = json.loads(VOICECLONE_METADATA_PATH.read_text(encoding="utf-8"))
+        self.conformance = CONFORMANCE_PATH.read_text(encoding="utf-8")
+        self.workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    def test_clip_is_whole_f32_samples_at_the_codec_rate(self) -> None:
+        self.assertEqual(len(self.clip_bytes) % 4, 0)
+        samples = len(self.clip_bytes) // 4
+        self.assertEqual(samples, self.metadata["clip"]["samples"])
+        self.assertEqual(self.metadata["clip"]["sample_rate"], SAMPLE_RATE)
+        # An x-vector needs enough voiced material to characterize a speaker; a couple of seconds
+        # would make the similarity margin noise.
+        self.assertGreater(samples / SAMPLE_RATE, 5.0)
+
+    def test_clip_matches_its_recorded_digest(self) -> None:
+        self.assertEqual(self.metadata["clip"]["sha256"], sha256_hex(self.clip_bytes))
+
+    def test_clip_is_not_silent_and_is_normalized(self) -> None:
+        samples = bytes_to_clip(self.clip_bytes)
+        peak = max(abs(value) for value in samples)
+        self.assertAlmostEqual(peak, self.metadata["clip"]["peak"], places=4)
+        self.assertLess(peak, 1.0)
+        energy = sum(value * value for value in samples) / len(samples)
+        self.assertGreater(energy, 1e-4, "the reference speaker clip carries no energy")
+
+    def test_metadata_records_a_rendered_licence_clean_source(self) -> None:
+        source = self.metadata["source"]
+        self.assertEqual(source["model"], "hexgrad/Kokoro-82M")
+        self.assertEqual(source["license"], "Apache-2.0")
+        self.assertTrue(source["rendered"])
+        self.assertFalse(
+            source["third_party_audio"],
+            "the reference clip must stay a render, not a sampled recording",
+        )
+        self.assertTrue(source["voice"], "the voice id must be recorded")
+        self.assertTrue(source["text"], "the utterance must be recorded")
+
+    def test_conformance_defaults_to_the_committed_clip(self) -> None:
+        self.assertIn(VOICECLONE_CLIP_PATH.name, self.conformance)
+        self.assertNotIn(
+            'std::env::var("MOSS_VOICECLONE_REF")\n            .expect(',
+            self.conformance,
+            "MOSS_VOICECLONE_REF is a hard requirement again; it must default to the fixture",
+        )
+
+    def test_both_voice_clone_gates_are_wired_into_the_lane(self) -> None:
+        """The failure this story fixed was omission from the lane, so assert the lane runs them."""
+        for name in ("moss_tts_realtime_voice_clone", "moss_tts_realtime_multi_turn_voice_clone"):
+            self.assertIn(
+                f"run_one {name}\n",
+                self.workflow,
+                f"{name} is no longer wired into the real-weight lane",
+            )
+
+    def test_the_lane_no_longer_claims_the_clip_is_unprovisioned(self) -> None:
+        self.assertNotIn(
+            "exists in no repo, on no Hub, and in no provisioning script",
+            self.workflow,
+            "the lane still describes MOSS_VOICECLONE_REF as unprovisioned",
+        )
+
+    def test_the_generator_example_exists(self) -> None:
+        self.assertTrue(
+            VOICECLONE_GENERATOR_PATH.is_file(),
+            f"{VOICECLONE_GENERATOR_PATH} is gone — the clip would not be regenerable",
+        )
 
 
 if __name__ == "__main__":

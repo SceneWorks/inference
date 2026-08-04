@@ -1237,6 +1237,9 @@ impl Pipeline {
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The driver owns the counter.
+            let preview = crate::preview::hook(&req.preview);
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1245,7 +1248,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     Ok(transformer
@@ -1320,6 +1323,10 @@ impl Pipeline {
                 None => None,
             };
 
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
+            // the predict closure below, so the hook only ever sees the conditional trajectory.
+            let preview = crate::preview::hook(&req.preview);
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1328,7 +1335,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     let plan = request_attention_plan(req, attention_budget);
@@ -1459,6 +1466,10 @@ impl Pipeline {
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
 
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The driver owns the counter,
+            // so this route's numbering can only ever key off the schedule it is integrating.
+            let preview = crate::preview::hook(&req.preview);
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1467,7 +1478,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     // `t` is the 1−σ conditioning (OneMinusSigma) the DiT embeds — the same value the
                     // reference scheduler's `current_timestep_normalized` returns. The embedder upcasts
@@ -1605,6 +1616,10 @@ impl Pipeline {
                 None => None,
             };
 
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
+            // the predict closure below, so the hook only ever sees the conditional trajectory.
+            let preview = crate::preview::hook(&req.preview);
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1613,7 +1628,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     // Conditional velocity (Z-Image sign convention: the DiT output is negated before
