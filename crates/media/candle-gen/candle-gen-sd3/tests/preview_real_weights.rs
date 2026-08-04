@@ -23,7 +23,10 @@
 //!    [`a_multi_eval_solver_emits_one_frame_per_outer_step`] runs `heun` and proves the guard is
 //!    non-vacuous *first*: the shared driver calls `on_progress` once per **evaluation**, so counting
 //!    `Progress::Step` events is counting evaluations, and the row asserts there are more of them than
-//!    outer steps before it asserts the frame count collapsed to the outer steps.
+//!    outer steps before it asserts the frame count collapsed to the outer steps. That ordering is
+//!    structural — the count goes through `render_and_assert`'s `non_vacuity` callback, which runs
+//!    ahead of every assertion in that function, `assert_the_strip_converges` (where the frame
+//!    numbering is pinned) included.
 //!
 //! All three variants get a runtime row rather than one standing in for the others: `sd3_5_large` and
 //! `sd3_5_medium` run **true CFG** (two MMDiT forwards per evaluation, over different transformers)
@@ -53,11 +56,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink,
     Progress, WeightsSource,
 };
+use safetensors::{Dtype, SafeTensors};
 
 const PROMPT: &str =
     "A weathered brass astrolabe on a navigator's desk beside a cracked leather map, warm lamplight, \
@@ -90,9 +94,12 @@ const SD3_VAE_CONFIG_SHA256: &str =
 /// why the row below walks tensors instead of comparing sizes.
 const FLUX1_VAE_SHA256: &str = "f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3";
 
-/// The measured extent of the comparison, pinned so a partial walk cannot pass as a full one.
+/// The measured extent of the comparison, pinned so a partial walk cannot pass as a full one. The
+/// payload is the tensor region only — the 167,666,902-byte container less its safetensors header —
+/// and `83_819_683 × 2` is exactly it, the bf16 arithmetic that says every value was compared.
 const VAE_TENSORS: usize = 244;
 const VAE_VALUES: usize = 83_819_683;
+const VAE_PAYLOAD_BYTES: usize = 167_639_366;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var(name).ok().map(PathBuf::from)
@@ -200,6 +207,12 @@ fn the_three_sd3_snapshots_ship_one_identical_vae() {
 /// So this row asserts the strong form: every one of the 244 tensors **differs**. A single matching
 /// tensor would mean the two lineages overlap and the reasoning above would need revisiting.
 ///
+/// The comparison is over the tensors' **raw payload bytes**, read straight out of the two containers
+/// rather than through candle. A strong-form "none match" assertion is only as good as its notion of
+/// "match": widening to `Vec<f32>` and comparing values would report a genuinely identical pair as
+/// *differing* if either held a NaN, which is the one way this assertion could pass vacuously. Bytes
+/// have no such value, and they are also what "byte-identical" says everywhere else in this story.
+///
 /// Both inputs are required.
 #[test]
 #[ignore = "needs SD3_LARGE_SNAPSHOT + SD3_FLUX1_VAE"]
@@ -226,14 +239,25 @@ fn the_sd3_vae_is_not_the_flux1_latent_space() {
          should be revisited rather than silently kept"
     );
 
-    let load = |path: &Path| -> BTreeMap<String, Tensor> {
-        candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
-            .unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+    let (sd3_bytes, flux_bytes) = (
+        std::fs::read(&sd3_vae).unwrap_or_else(|e| panic!("read {sd3_vae:?}: {e}")),
+        std::fs::read(&flux_vae).unwrap_or_else(|e| panic!("read {flux_vae:?}: {e}")),
+    );
+    let parse = |name: &str, raw: &[u8]| -> BTreeMap<String, (Vec<usize>, Dtype, Vec<u8>)> {
+        SafeTensors::deserialize(raw)
+            .unwrap_or_else(|e| panic!("parse the {name} container: {e}"))
+            .tensors()
             .into_iter()
+            .map(|(key, view)| {
+                (
+                    key,
+                    (view.shape().to_vec(), view.dtype(), view.data().to_vec()),
+                )
+            })
             .collect()
     };
-    let sd3 = load(&sd3_vae);
-    let flux = load(&flux_vae);
+    let sd3 = parse("SD3.5", &sd3_bytes);
+    let flux = parse("FLUX.1-dev", &flux_bytes);
     assert_eq!(
         sd3.keys().collect::<Vec<_>>(),
         flux.keys().collect::<Vec<_>>(),
@@ -241,25 +265,27 @@ fn the_sd3_vae_is_not_the_flux1_latent_space() {
          channel count could not settle this"
     );
 
-    let values_of = |tensor: &Tensor| -> Vec<f32> {
-        tensor
-            .to_dtype(DType::F32)
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>())
-            .expect("widen a VAE tensor to f32")
-    };
-
-    let (mut values, mut identical) = (0usize, 0usize);
-    for (key, sd3_tensor) in &sd3 {
-        let flux_tensor = &flux[key];
-        assert_eq!(sd3_tensor.dims(), flux_tensor.dims(), "{key}: shapes");
-        assert_eq!(sd3_tensor.dtype(), flux_tensor.dtype(), "{key}: dtypes");
-        let (a, b) = (values_of(sd3_tensor), values_of(flux_tensor));
-        if a == b {
+    let (mut values, mut payload, mut identical) = (0usize, 0usize, 0usize);
+    for (key, (shape, dtype, sd3_payload)) in &sd3 {
+        let (flux_shape, flux_dtype, flux_payload) = &flux[key];
+        assert_eq!(shape, flux_shape, "{key}: shapes");
+        assert_eq!(dtype, flux_dtype, "{key}: dtypes");
+        assert_eq!(
+            *dtype,
+            Dtype::BF16,
+            "{key}: this walk expects the bf16 VAE both repos publish"
+        );
+        assert_eq!(
+            sd3_payload.len(),
+            flux_payload.len(),
+            "{key}: payload sizes"
+        );
+        if sd3_payload == flux_payload {
             identical += 1;
             eprintln!("  !! {key} is byte-identical between the two VAEs");
         }
-        values += a.len();
+        values += shape.iter().product::<usize>();
+        payload += sd3_payload.len();
     }
     eprintln!(
         "  walked {} tensors / {values} values: {identical} identical, {} differing",
@@ -268,6 +294,10 @@ fn the_sd3_vae_is_not_the_flux1_latent_space() {
     );
     assert_eq!(sd3.len(), VAE_TENSORS);
     assert_eq!(values, VAE_VALUES);
+    assert_eq!(
+        payload, VAE_PAYLOAD_BYTES,
+        "the walk must cover the whole tensor region of both containers"
+    );
     assert_eq!(
         identical, 0,
         "SD3.5's VAE shares its architecture with FLUX.1-dev's but must share none of its trained \
@@ -461,11 +491,15 @@ const MEDIUM: Develops = Develops {
 /// VAE-encoded source. `max_r_first` and `min_rise` are therefore its own, and the claim that the
 /// strip develops rests on `max_distance_ratio` plus the strict monotonicity of both series — the
 /// distance to the finished image still falls by a factor of three across five frames.
+///
+/// Because those two bounds were relaxed, `max_distance_ratio` carries this lane's discriminating
+/// weight, so it gets the stated headroom and no more: `0.336 + 0.06 = 0.396`, rounded to `0.40`.
+/// This is the lane where unexplained slack would cost the most.
 const IMG2IMG: Develops = Develops {
     min_r_last: 0.949,
     max_r_first: 0.97,
     min_rise: 0.015,
-    max_distance_ratio: 0.42,
+    max_distance_ratio: 0.40,
 };
 
 /// `sd3_5_large` txt2img under `heun`, 8 steps at 768² — measured r **+0.377 → +0.984**, mean |Δ| to
@@ -630,6 +664,11 @@ fn base_request(id: &str, steps: u32, size: u32, sampler: Option<&str>) -> Gener
 /// Render one lane twice on one warmed generator at the same seed — once with an inert sink, once with
 /// a live one — and hold the strip to [`assert_the_strip_converges`]. Returns the collected frames and
 /// the number of `Progress::Step` events the live render reported, which IS its evaluation count.
+///
+/// `non_vacuity` runs on that evaluation count **before any other assertion in this function**, which
+/// is what lets the `heun` row establish that its solver really does evaluate more than once per outer
+/// step ahead of the frame numbering that fact is what makes meaningful. Rows with nothing to
+/// establish first pass `&|_| {}`.
 #[allow(clippy::too_many_arguments)]
 fn render_and_assert(
     label: &str,
@@ -640,6 +679,7 @@ fn render_and_assert(
     sampler: Option<&str>,
     reference: Option<Image>,
     develops: &Develops,
+    non_vacuity: &dyn Fn(usize),
 ) -> (Vec<PreviewFrame>, usize) {
     let root = required_path(var);
     eprintln!("── {label}: {size}² × {steps} steps, sampler {sampler:?}");
@@ -689,6 +729,10 @@ fn render_and_assert(
             })
             .unwrap_or_else(|e| panic!("{label} active-sink render: {e}")),
     );
+
+    // First, ahead of every other assertion here — see this function's docs.
+    non_vacuity(evaluations);
+
     assert_eq!(
         inert.pixels, active.pixels,
         "{label}: an active preview sink must not change a single output byte at the same seed"
@@ -720,6 +764,7 @@ fn large_preview_frames_evolve_toward_the_final_image() {
         None,
         None,
         &LARGE,
+        &|_| {},
     );
 }
 
@@ -737,6 +782,7 @@ fn turbo_preview_frames_evolve_toward_the_final_image() {
         None,
         None,
         &TURBO,
+        &|_| {},
     );
 }
 
@@ -755,6 +801,7 @@ fn medium_preview_frames_evolve_toward_the_final_image() {
         None,
         None,
         &MEDIUM,
+        &|_| {},
     );
 }
 
@@ -806,6 +853,7 @@ fn img2img_preview_frames_evolve_from_the_forked_latent() {
         None,
         Some(source),
         &IMG2IMG,
+        &|_| {},
     );
 }
 
@@ -817,6 +865,10 @@ fn img2img_preview_frames_evolve_from_the_forked_latent() {
 /// evaluations than outer steps before asserting the frames collapsed to exactly the outer steps — a
 /// solver that turned out to evaluate once per step would make the frame-count assertion prove nothing
 /// about dedup, and that is the failure this ordering rules out.
+///
+/// The ordering is structural, not incidental: the count is checked through `render_and_assert`'s
+/// `non_vacuity` callback, which runs ahead of every assertion in that function — including
+/// `assert_the_strip_converges`, which is where the frame numbering is actually pinned.
 #[test]
 #[ignore = "needs SD3_LARGE_SNAPSHOT + a CUDA GPU; run with --features cuda --ignored"]
 fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
@@ -830,19 +882,23 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
         Some("heun"),
         None,
         &LARGE_HEUN,
+        &|evaluations| {
+            eprintln!("  heun: {evaluations} evaluations for {steps} outer steps");
+            assert!(
+                evaluations > steps as usize,
+                "heun must evaluate more than once per outer step or this row proves nothing about \
+                 dedup ({evaluations} evaluations for {steps} steps)"
+            );
+        },
     );
-    eprintln!("  heun: {evaluations} evaluations for {steps} outer steps");
-    assert!(
-        evaluations > steps as usize,
-        "heun must evaluate more than once per outer step or this row proves nothing about dedup \
-         ({evaluations} evaluations for {steps} steps)"
-    );
-    // `assert_the_strip_converges` already pinned the numbering to exactly 1..=steps, so the dedup
-    // collapsed the extra evaluations. Restated here because that is the point of this row.
+    // `assert_the_strip_converges` has now pinned the numbering to exactly 1..=steps, so the dedup
+    // collapsed the extra evaluations the callback above established there were. Restated here
+    // because that is the point of this row.
     assert_eq!(
         frames.len(),
         steps as usize,
-        "a multi-eval solver must still emit exactly one frame per outer step"
+        "a multi-eval solver must still emit exactly one frame per outer step ({evaluations} \
+         evaluations)"
     );
 }
 

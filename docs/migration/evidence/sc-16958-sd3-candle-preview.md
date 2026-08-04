@@ -13,10 +13,13 @@ frames develop, one per outer solver step, without changing a single output byte
 `candle-gen-sd3` contains **one** shared-driver call site and no bespoke denoise loop at all:
 
 ```
-$ git grep -n 'run_flow_sampler\|run_curated_sampler\|run_scm_sampler' -- crates/media/candle-gen/candle-gen-sd3/src
-crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs:13://! - **Sampler**: the repo's unified flow-match framework ([`candle_gen::run_flow_sampler`] +
-crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs:553:    let latents = candle_gen::run_flow_sampler(
+$ git grep -n 'run_flow_sampler(\|run_curated_sampler(\|run_scm_sampler(' -- crates/media/candle-gen/candle-gen-sd3/src
+crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs:576:    let latents = candle_gen::run_flow_sampler(
 ```
+
+Re-captured against the committed tree. The open paren is part of the pattern deliberately: without it the
+same grep also returns the prose mentions in `pipeline.rs`'s and `preview.rs`'s module docs, none of
+which is a call.
 
 That single site, in `pipeline::render_core`, is the **one-site / N-callers** shape: every
 user-reachable lane funnels through it.
@@ -99,10 +102,15 @@ schedule starts at `σ_max = 1.0`, and then measures the consequence sc-16954 na
 frame's rail-clipped fraction on this family's own unit-normal prior:
 
 ```
-  flow prior at sigma_max: rail-clipped fraction 0.0000
+  flow prior at sigma_max: rail-clipped fraction 0.0065
 ```
 
-**0.0000** against sc-16954's uncorrected SDXL **0.894**. This is the only non-`#[ignore]`d row in
+**0.0065** against sc-16954's uncorrected SDXL **0.894** — 137× less, and the difference between a
+readable noise field and a saturated binary one. It is not zero and should not be: on a unit-normal
+prior the projection's per-channel spread is `σ_(R,G,B) = (0.169, 0.135, 0.156)` about the fit's
+intercept `(0.646, 0.626, 0.615)`, which puts the upper rail 2.09 / 2.78 / 2.47 σ away, so ≈0.9% of
+pixels clip by construction. The row's own bound is `rails < 0.05`, chosen loose enough that a
+rounding change cannot flip it. This is the only non-`#[ignore]`d row in
 `tests/preview_real_weights.rs` and runs on the committed constants alone, so it appears in a plain
 `cargo test` of the file. sc-16954 shipped a red row that hid because the sole non-ignored row in its
 file was excluded by `-- --ignored`; both invocations are reported below.
@@ -166,6 +174,13 @@ about two different VAEs.
   flux1-dev vae/  f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3
   walked 244 tensors / 83819683 values: 0 identical, 244 differing
 ```
+
+The walk compares each tensor's **raw payload bytes**, read straight out of the two containers rather
+than widened to `f32` through candle. That distinction is load-bearing for a strong-form "none match"
+assertion: `Vec<f32>` equality reports a genuinely identical pair as *differing* if either holds a
+NaN, which is the one way the row could have passed vacuously. The row also pins the walked payload at
+167,639,366 bytes — `83,819,683 × 2`, the bf16 arithmetic that says every value in both containers was
+compared, and the same tensor region the independent header-level walk below hashes.
 
 An independent header-level walk over the same two files (payload SHA-256 over the identical
 167,639,366-byte tensor region):
@@ -237,6 +252,37 @@ loud failure, not a silent "no hook". sc-16957 shipped a guard that pinned an em
 but not its index argument; there is no direct emission call in this crate, so the only positional
 surface is the driver argument, and it is pinned.
 
+### The hop the catalog cannot see — closed here and in `candle-gen-sdxl`
+
+The paragraph above is about the driver argument *inside* `render_core`. The hook reaches it through
+a second hop — `Pipeline::render` → `render_core` — and the catalog never looks there. While that hop
+was an `Option`, changing one caller argument from `Some(&preview)` to `None` took **all six** SD3.5
+lanes preview-dark while `hooked: 1`, all three `PREVIEW_ROUTE_IDS` rows and `supports_preview: true`
+kept advertising and the full CPU suite stayed green (122 tests, 0 failures, including all twelve
+`preview_advertising` guards). The rows that would have caught it are `#[ignore]`d and CUDA-only, so
+CI never saw it.
+
+Two changes close it:
+
+* **`candle-gen-sd3`** — `render_core`'s parameter is now `&PreviewHook`, not `Option<&PreviewHook>`.
+  Going dark is a type error, the way `candle-gen-chroma` has always been immune. The crate has no
+  deliberately dark lane to express (no trainer, no descriptor-less provider), so the `Option` bought
+  nothing. `preview.rs`'s `the_render_lane_builds_its_hook_from_the_requests_sink` pins the parameter
+  against the declaration so the immunity cannot be quietly widened away, and pins that exactly one
+  hook is built in shipped code and built over `req.preview` — the one remaining way to go dark
+  without changing a type. Both halves were mutation-proven: restoring the `Option` and blanking the
+  caller fails the parameter assertion; building the hook over an inert sink fails the sink assertion.
+* **`candle-gen-sdxl`** — the same blankable shape exists in already-merged code:
+  `denoise::denoise_curated` takes `Option<&PreviewHook>` and forwards it, so the catalog's
+  `denoise.rs hooked: 1` is really about *its* argument, not its callers'. `ip_provider.rs` is the one
+  shipped caller and blanking its `Some(&preview)` is invisible everywhere. The type change is not
+  available there (`denoise_curated` is `pub`, `candle-gen-kolors` and `candle-gen-instantid` reach it
+  too, and InstantID passes `None` on purpose), so `candle-gen-sdxl/src/preview.rs` gains the
+  crate-local pin instead: every caller in the crate is classified positionally by the argument in the
+  preview slot, with the argument's index re-derived from `denoise_curated`'s own declaration.
+  Mutation-proven the same way — blanking `ip_provider.rs` fails the inventory with
+  `("ip_provider.rs", "None")` against `("ip_provider.rs", "Some(&preview)")`.
+
 ## Real-weight run (CUDA)
 
 2× RTX PRO 6000, CUDA compute cap 120, MSVC 14.44 (VS2022 BuildTools vcvars64), snapshots from
@@ -263,6 +309,15 @@ than the movement floor, and every frame arrives at VAE-latent resolution `H/8 �
 itself the runtime proof that no unpack or squeeze was needed. Strips and finals are in
 `docs/migration/evidence/sc-16958/`.
 
+The two rows the review round touched — img2img (`max_distance_ratio` tightened 0.42 → **0.40**) and
+`heun` (the evaluation count moved ahead of the strip assertions) — were **re-run on the same box**
+against the same seed and reproduce every figure above exactly: img2img 56.30 → 18.91 (ratio 0.336),
+`heun` 85.36 → 19.04 over 15 evaluations for 8 outer steps.
+
+```
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 178.19s
+```
+
 **Inert-sink byte-identity holds on all five lanes.** An extra confirmation fell out of the img2img
 row: its source image is a `sd3_5_large` txt2img render at the same seed, and it came out SHA-256
 `d835f768…6ee4` — byte-identical to the `sd3_5_large` final produced in a *different process run*.
@@ -281,6 +336,11 @@ evaluations. The row asserts `evaluations > steps` **first** (15 > 8), then that
 exactly `1..=8`. Without the first assertion a solver that happened to evaluate once per step would
 make the second prove nothing about dedup. 15 rather than 16 because Heun's final step degenerates to
 Euler at σ = 0.
+
+That ordering is structural rather than a description of intent: the count is checked through
+`render_and_assert`'s `non_vacuity` callback, which runs ahead of every assertion in that function —
+`assert_the_strip_converges`, where the frame numbering is actually pinned, included. The transcript
+above shows it: the evaluation line is the first thing the row prints, before any strip measurement.
 
 ### The img2img lane, and what it changed about the thresholds
 
@@ -316,8 +376,13 @@ measured correlation, 0.06 over a measured distance ratio**. No number is transf
 | `sd3_5_large` | 0.949 | 0.75 | 0.30 | 0.30 |
 | `sd3_5_large_turbo` | 0.957 | 0.75 | 0.30 | 0.27 |
 | `sd3_5_medium` | 0.955 | 0.75 | 0.30 | 0.18 |
-| `sd3_5_large` img2img | 0.949 | **0.97** | **0.015** | **0.42** |
+| `sd3_5_large` img2img | 0.949 | **0.97** | **0.015** | **0.40** |
 | `sd3_5_large` heun | 0.954 | 0.75 | 0.30 | 0.28 |
+
+The img2img row is the one place where that headroom rule has to hold tightest, because it is also the
+one lane whose `max_r_first` and `min_rise` were deliberately relaxed — `max_distance_ratio` carries
+the discriminating weight there. `0.336 + 0.06 = 0.396`, rounded to **0.40**; the other four sit at
+0.063 / 0.063 / 0.053 / 0.057 over their own measurements.
 
 `max_r_first = 0.75` and `min_rise = 0.30` are shared across the from-noise lanes deliberately: a
 tighter first-frame ceiling would read the fit's own warm intercept (0.646, 0.626, 0.615 — R > G > B,

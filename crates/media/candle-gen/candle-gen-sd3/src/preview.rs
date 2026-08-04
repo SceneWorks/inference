@@ -364,6 +364,79 @@ mod tests {
         assert_eq!(counter.next(&sigmas, sigmas[0]), Some(1));
     }
 
+    // ── The wiring, pinned against this crate's own source ────────────────────────────────────────
+
+    /// The shipped half of `pipeline.rs` — everything ahead of its single `#[cfg(test)] mod tests`.
+    ///
+    /// The structural rows in that module drive [`super::hook`] over inert sinks, so a scan that
+    /// counted them would read test code as shipped wiring.
+    fn shipped_pipeline() -> &'static str {
+        const SOURCE: &str = include_str!("pipeline.rs");
+        const MARKER: &str = "\n#[cfg(test)]\n";
+        assert_eq!(
+            SOURCE.matches(MARKER).count(),
+            1,
+            "pipeline.rs must hold exactly one `#[cfg(test)]` item for this split to be sound — \
+             teach this scan about the new one rather than letting it read test code as shipped code"
+        );
+        &SOURCE[..SOURCE.find(MARKER).expect("the marker was just counted")]
+    }
+
+    /// The shipped render lane builds its hook over the **request's** sink, and `render_core` takes
+    /// that hook **by reference** rather than as an `Option`.
+    ///
+    /// Both halves are load-bearing and neither implies the other, because the epic's cross-crate
+    /// guard cannot see either. `candle-gen-catalog`'s `preview_advertising` inventory classifies the
+    /// preview argument of the `run_flow_sampler` call *inside* `render_core` — one hop past
+    /// `Pipeline::render`. While that hop was an `Option`, changing the single caller argument to
+    /// `None` took all six SD3.5 lanes dark while `hooked: 1`, all three `PREVIEW_ROUTE_IDS` and
+    /// `supports_preview: true` went on advertising and the entire CPU suite stayed green; the only
+    /// rows that would have caught it are `#[ignore]`d and CUDA-only.
+    ///
+    /// The `&PreviewHook` parameter makes going dark a **type error**, which is the same immunity
+    /// `candle-gen-chroma` has. This row pins the parameter so that immunity cannot be undone by
+    /// quietly widening it back, and pins the sink so the hook cannot be built over an inert one
+    /// instead — the one way left to go dark without changing a type.
+    #[test]
+    fn the_render_lane_builds_its_hook_from_the_requests_sink() {
+        let shipped = shipped_pipeline();
+
+        // The sink: exactly one hook is built in shipped code, and it is built over the request's.
+        assert_eq!(
+            shipped.matches("preview::hook(").count(),
+            1,
+            "pipeline.rs must build exactly one preview hook in shipped code — a second render lane \
+             must be named in this crate's inventory (and in the catalog's) rather than appearing here"
+        );
+        assert_eq!(
+            shipped.matches("preview::hook(&req.preview)").count(),
+            1,
+            "the render lane must build its hook over the REQUEST's sink; a hook over any other sink \
+             is a dark lane that still passes every argument-shaped check"
+        );
+
+        // The parameter: read out of the declaration itself, so this cannot be satisfied by the
+        // spelling appearing anywhere else in the file.
+        let at = shipped
+            .find("pub(crate) fn render_core(")
+            .expect("render_core must be declared in pipeline.rs");
+        let declaration = &shipped[at..];
+        let end = declaration
+            .find("\n) -> Result<Image> {")
+            .expect("render_core's parameter list must end at its return type");
+        let parameter = declaration[..end]
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("preview:"))
+            .expect("render_core must take a preview parameter");
+        assert_eq!(
+            parameter, "preview: &candle_gen::preview::PreviewHook<'_>,",
+            "render_core must take its hook by reference. An `Option` here is blankable at the \
+             caller, and that mutation is invisible to the catalog's route inventory — it classifies \
+             the driver argument one hop further in, which would still read `Some(preview)`."
+        );
+    }
+
     // ── The σ convention ──────────────────────────────────────────────────────────────────────────
 
     /// SD3.5 drives `TimestepConvention::Sigma` over a `FlowModelSampling`, whose `input_scale` is
