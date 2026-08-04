@@ -1362,7 +1362,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # prints is a fraction of what the trajectory holds, and re-running to get it costs 4.3 hours.
         self.assertIn("${{ runner.temp }}/gpu-fault-evidence/memory.csv", job)
 
-    def test_krea_lanes_record_gpu_fault_evidence_with_a_predicate_that_matches(self) -> None:
+    def test_krea_lanes_record_gpu_fault_evidence_with_a_predicate_that_parses(self) -> None:
         """sc-17355: a Metal command-buffer cascade names no cause, so the record must pre-exist.
 
         Run 30869410054 failed the LoRA gate with `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`
@@ -1477,6 +1477,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # the same silent way the story's inert one did: `log show` exits non-zero, the script's
         # `else` branch prints "log show failed", the lane stays green, and the capture records
         # nothing. So actually run it.
+        #
+        # THE NAME SAYS "parses", NOT "matches", and the difference is the point. This probe catches
+        # a MALFORMED predicate; it cannot catch a well-formed one that matches nothing. Appending
+        # `AND subsystem == "com.apple.iokit.IOGPUFamily"` — i.e. reintroducing exactly the inert
+        # clause sc-17355 proposed — parses fine and would keep this green while collecting zero
+        # events. No assertion here can close that: "matches something" needs an event known to be
+        # in the archive at test time, and nothing is. The guard against inertness is the
+        # `assertNotIn('subsystem == "com.apple.gpu"')` above plus the report's own unclassified
+        # count, not this probe. Naming it `…_that_matches` claimed a check that does not exist.
         #
         # HONEST SCOPE, because this is the exact trap the change is about. `scripts/tests` runs on
         # `ubuntu-latest` in ci.yml and NOWHERE ELSE, so this assertion never executes in CI — it is

@@ -209,9 +209,10 @@ fn registry_t2v_i2v_v2v_routes_publish_the_real_adapter_report() {
 
 /// Render `req` with the given adapters and return the decoded frames.
 ///
-/// Each call loads a COMPLETE second copy of the 14B stack — this test drives four of them in one
-/// process (three renders plus [`install_count`]) — so the per-arm memory line below is not
-/// decoration. sc-17355's open question is whether the arms accumulate: run 30869410054 died in the
+/// Each call loads a COMPLETE copy of the 14B stack, and the callers drive several per process:
+/// `real_wan_style_lora_loads_and_changes_the_render` does four (three renders plus
+/// [`install_count`]), `real_wan_step_distill_lora_installs_over_the_widened_globals` three (two
+/// renders plus [`install_count`]). So the per-arm memory line below is not decoration. sc-17355's open question is whether the arms accumulate: run 30869410054 died in the
 /// `lora@1.0` arm on a Metal command-buffer cascade, and two local runs died in that same arm on a
 /// jetsam SIGKILL, which are two different deaths in one place. Whether the entering `active`
 /// figure climbs arm-over-arm is what separates "the second load starts from a dirty baseline" from

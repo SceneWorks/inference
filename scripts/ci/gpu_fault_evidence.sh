@@ -44,11 +44,16 @@
 #
 # WHAT IS PROVEN AND WHAT IS NOT. The memory half is measured: `vm_stat` sampling reproduced the
 # trajectory of a real resource death (compressed memory 1.6 -> 106 GiB across one render), and
-# the `memorystatus` clause is confirmed against a real kernel kill. What is UNPROVEN is whether
-# the driver logs anything for `kIOGPUCommandBufferCallbackError*` specifically -- nax-macos has
-# recorded no such event in the retained window, so there was no positive control, and MLX's own
-# `mlx_pmetal_test_inject_command_buffer_error` hook fakes the error above the driver and emits
-# no driver log line either. The predicate is deliberately wider than the target message for
+# the `memorystatus` clause is confirmed against a real kernel kill. The GPU half now has a
+# partial positive control too: a replay over a real window caught
+#
+#   kernel[0:...] (IOGPUFamily) Cmd queue <private> sleep port_name N value: ... timed out!
+#
+# so the driver DOES log GPU command-queue faults on this box and this predicate does collect
+# them. What remains UNPROVEN is the specific `kIOGPUCommandBufferCallbackError*` family --
+# nax-macos has recorded none in the retained window, and MLX's own
+# `mlx_pmetal_test_inject_command_buffer_error` hook fakes the error above the driver, so it
+# emits no driver log line to test against. The predicate is deliberately wider than the target message for
 # that reason: on a fault run the useful artefact may be the DIFF against a clean run's events,
 # not a single matching line. If a recurrence yields a memory trajectory and no GPU events, that
 # is itself an answer -- and only if this ran.
@@ -67,6 +72,12 @@ SAMPLER_PID_FILE="$STATE_DIR/sampler.pid"
 # a box whose whole hypothesis is resource pressure. Raising the bound for the sweep lane widens
 # that window, so the reaper is a precondition for the longer bound, not a nicety. `/tmp` survives
 # the job boundary and is per-machine, which is exactly the scope a cross-job reaper needs.
+#
+# The usual pidfile tradeoffs apply and are accepted rather than overlooked: a blind `kill` on a
+# recorded pid can in principle hit a reused pid, and `/tmp` is world-writable. Both are bounded by
+# what this can do -- terminate one process -- on a single-tenant CI box, and the alternative
+# (leaving a sampler running unkillably for the rest of its bound on a machine whose whole
+# hypothesis is resource pressure) is the worse failure.
 ORPHAN_PID_FILE="/tmp/sceneworks-gpu-fault-evidence-sampler.pid"
 MEM_CSV="$STATE_DIR/memory.csv"
 START_FILE="$STATE_DIR/started-at"
@@ -245,8 +256,12 @@ report() {
       --predicate '(senderImagePath CONTAINS "IOGPU" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "kIOGPU" OR eventMessage CONTAINS[c] "command buffer" OR eventMessage CONTAINS[c] "gpu restart" OR eventMessage CONTAINS[c] "memorystatus" OR eventMessage CONTAINS[c] "jetsam" OR (senderImagePath CONTAINS "AGX" AND messageType == "Error")) AND processImagePath != "/usr/bin/log"' \
       > "$events" 2>/dev/null
     then
+      # `log show` prints a `Timestamp Ty Process[PID:TID]` header, so the raw line count is one
+      # above the event count; subtracting it lets a reader check gpu + memory + other == events
+      # and notice classification gaps rather than trust that there are none.
       total="$(wc -l < "$events" | tr -d ' ')"
-      echo "$total matching event line(s) — full list in the uploaded artifact"
+      [ "$total" -gt 0 ] && total=$((total - 1))
+      echo "$total matching event(s) — full list in the uploaded artifact"
 
       # PARTITIONED, NOT TRUNCATED, and this is the whole difference between a useful record and
       # a decorative one. A positional head/tail split does not survive this predicate: measured
@@ -256,8 +271,17 @@ report() {
       # burst and elides all three. The classes therefore get different treatment: the GPU class
       # is small and always printed in full, the memory class is summarised down to the lines that
       # name a mechanism.
+      #
+      # `grep -i`, and that is not cosmetic. The predicate's message clauses are `CONTAINS[c]` --
+      # case-INSENSITIVE -- so a case-sensitive classifier is not a partition of what the predicate
+      # collected. Measured on a real 35-minute window: a case-sensitive pass left 417 of 5,245
+      # lines (8%) printed NOWHERE, all of them `JETSAM_REASON_MEMORY_VMCOMPRESSOR` runningboard
+      # rows -- the record of which processes were killed and why. `[Gg]pu [Rr]estart` folded only
+      # the first letter and so missed `GPU restart`, Apple's own spelling in
+      # "(AppleGPUWrangler) Received GPU restart notification". Both classes now fold the whole
+      # match, and the leftover bucket below makes any future gap visible instead of silent.
       gpu="$STATE_DIR/gpu-class.txt"
-      grep -E 'IOGPU|kIOGPU|[Cc]ommand [Bb]uffer|[Gg]pu [Rr]estart|AGX' "$events" > "$gpu" 2>/dev/null
+      grep -iE 'IOGPU|command buffer|gpu restart|AGX' "$events" > "$gpu" 2>/dev/null
       gpu_n="$(wc -l < "$gpu" | tr -d ' ')"
       echo
       echo "-- GPU / command-buffer class: $gpu_n line(s) (printed in full — this is the subject) --"
@@ -267,7 +291,7 @@ report() {
       # decisive lines are the ones naming a mechanism (`System is unhealthy`, `compressor_...`,
       # `killing due to`), and the per-victim `killing_idle_process` rows are a count.
       mem="$STATE_DIR/mem-class.txt"
-      grep -E 'memorystatus|jetsam' "$events" > "$mem" 2>/dev/null
+      grep -iE 'memorystatus|jetsam' "$events" > "$mem" 2>/dev/null
       mem_n="$(wc -l < "$mem" | tr -d ' ')"
       echo
       echo "-- kernel memory-pressure class: $mem_n line(s) --"
@@ -278,10 +302,34 @@ report() {
         # -- and they are RARE (one per pressure episode), so in a count-ordered top-25 they lose
         # to hundreds of routine `skipping idle but not idle-exitable` rows and fall off the end.
         # Rarity is the opposite of unimportance here: this is the kernel stating the cause.
+        # Prefix stripped BY FIELD POSITION, never by a backreference. The first cut used
+        # `sed 's/^\(TIME\).*\(memorystatus[^ ]*:.*\)$/.../'`, and `.*` is greedy: on
+        # `memorystatus: System is unhealthy. memorystatus_available_pages: N` the second group
+        # bound to the LAST `memorystatus…:`, so the output began at `memorystatus_available_pages`
+        # and `System is unhealthy` was deleted. Measured on a real window: 3 occurrences in the
+        # raw events, 0 in the printed report -- this script's header names that exact phrase first
+        # as the kernel stating the cause, and the code grepped for it and then threw it away.
+        # DEDUPED BY MESSAGE, not printed per occurrence, because a fixed cap cannot be trusted
+        # here. `sort -u | head -12` kept whole lines, and whole lines differ by timestamp and by
+        # the page/size counters, so seven `System is unhealthy` episodes were seven rows and the
+        # twelfth line cut one of them off -- measured, 7 in the raw events and 6 in the report.
+        # Grouping by the message (long digit runs folded, as in the histogram) makes the distinct
+        # mechanisms a handful of rows no matter how many episodes there were, and one real sample
+        # per row keeps the actual counters visible.
         echo "   mechanism:"
-        grep -hE 'System is unhealthy|compressor_exhausted|swap_exhausted|zone_map_is_exhausted' "$mem" \
-          | sed 's/^\([0-9-]* [0-9:.]*\).*\(memorystatus[^ ]*:.*\)$/     \1  \2/' \
-          | sort -u | head -12
+        grep -hiE 'System is unhealthy|compressor_exhausted|swap_exhausted|zone_map_is_exhausted' "$mem" \
+          | awk '{
+              msg = ""
+              for (i = 5; i <= NF; i++) msg = msg (i > 5 ? " " : "") $i
+              key = msg
+              gsub(/[0-9][0-9][0-9]+/, "N", key)
+              if (!(key in count)) { first[key] = $1 " " $2; sample[key] = msg }
+              count[key]++
+            }
+            END {
+              for (k in count)
+                printf "     %4d x  first %s  %s\n", count[k], first[k], substr(sample[k], 1, 130)
+            }' | sort -rn
         echo "   most frequent:"
         # A HISTOGRAM OVER DIGIT-NORMALISED MESSAGES, and both halves of that are needed.
         #
@@ -290,8 +338,13 @@ report() {
         # "vm-compressor-space-shortage"`. Stripping the `TIME Ty process[pid:tid]` prefix fixes
         # that one, but not the per-victim rows -- `killing_idle_process pid 21150 [CoreSpeechXPC]
         # … 3120KB` is unique per victim, so several hundred of them each count 1 and bury the
-        # aggregate. Collapsing digit runs makes one class of "the kernel killed a daemon", which
-        # is the fact worth reading; one representative line is kept so the shape stays legible.
+        # aggregate. Collapsing runs of THREE OR MORE digits folds pids, byte counts and page
+        # counts -- the fields that make otherwise-identical rows unique -- while leaving short
+        # values alone, because `{"compressor_exhausted": 1, ...}` and `... : 0` are the decisive
+        # and the benign variant of the same message and a blanket `[0-9]+` merged them into one
+        # row with an arbitrary representative. Victim NAMES are not digits and stay distinct by
+        # design: which daemons died is worth reading, so `killing_idle_process pid N [cfprefsd]`
+        # remains its own row. One representative line is kept so the shape stays legible.
         #
         # Sorted by COUNT, not by time: at 4,875 lines the question is "what dominated", and the
         # first-seen stamp carried alongside preserves the ordering that matters for a cascade.
@@ -299,7 +352,7 @@ report() {
             msg = ""
             for (i = 5; i <= NF; i++) msg = msg (i > 5 ? " " : "") $i
             key = msg
-            gsub(/[0-9]+/, "N", key)
+            gsub(/[0-9][0-9][0-9]+/, "N", key)
             if (!(key in count)) { first[key] = $1 " " $2; sample[key] = msg }
             count[key]++
           }
@@ -309,6 +362,29 @@ report() {
           }' "$mem" | sort -rn | head -25
       else
         echo "(none)"
+      fi
+
+      # THE LEFTOVER BUCKET, and it exists because the last defect here was silent. The predicate
+      # and the two classifiers are written separately, so they can drift apart -- and when they
+      # did, 8% of a real window was collected by `log show` and then printed by nothing, with no
+      # symptom a reader could see. Anything the classes miss lands here instead of vanishing, and
+      # a non-zero count is itself the signal that the classifiers need widening.
+      #
+      # Continuations are separated from real misses. `log show --style compact` wraps a multi-line
+      # event onto following lines that carry no timestamp and no keyword, so they can never match
+      # a classifier and would otherwise show up forever as permanent "drift" -- an alarm that is
+      # always on is an alarm nobody reads. Only timestamped lines count as unclassified.
+      other="$STATE_DIR/other-class.txt"
+      grep -ivE 'IOGPU|command buffer|gpu restart|AGX|memorystatus|jetsam' "$events" \
+        | grep -v '^Timestamp' \
+        | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' > "$other" 2>/dev/null
+      other_n="$(wc -l < "$other" | tr -d ' ')"
+      echo
+      if [ "$other_n" -gt 0 ]; then
+        echo "-- unclassified: $other_n timestamped line(s) — the classifiers have drifted from the predicate --"
+        head -25 "$other"
+      else
+        echo "-- unclassified: 0 timestamped line(s) (every event the predicate collected was printed or summarised above) --"
       fi
     else
       echo "log show failed — no GPU event record for this run"
