@@ -389,6 +389,36 @@ mod preview_advertising {
     /// pre-scales its running latent by `σ_data` and hands the hook the scaled tensor. That is the
     /// candle spelling of `mlx-gen-sana`'s `inverse_sigma_data` argument.
     ///
+    /// SenseNova-U1 (sc-16960) closes the epic's **Tier 2** and contributes two rows —
+    /// `sensenova_u1_8b` and `sensenova_u1_8b_fast`, one crate, two descriptors, one lane. It is the
+    /// only family here that needed a fit of its own, and the reason is not the one the epic
+    /// predicted:
+    ///
+    /// * **The epic's premise was wrong — SenseNova-U1 has no VAE at all.** It is a unified dual-path
+    ///   Qwen3 MoT backbone whose flow-matching head predicts `3·(patch·merge)²` values per token,
+    ///   which `unpatchify` folds straight back into `[1, 3, H, W]`. The model **denoises in pixel
+    ///   space**: the running state of the loop *is* the image in `[-1, 1]`, and the "decode" is the
+    ///   affine map `tensor_to_image` applies. So the measured fit is over **three** channels, which
+    ///   on its own rules it out of every epic-16624 reuse (4, 16 and 32-channel VAE latents) with no
+    ///   hash comparison needed. `tests/fit_preview_rgb.rs` measures it and
+    ///   `the_snapshot_ships_no_autoencoder` proves the absence structurally — snapshot layout,
+    ///   `config.json`, and the shard headers.
+    /// * **It is the second genuine `Denoise::Bespoke` wired crate**, after Ideogram. A `git grep` of
+    ///   the three shared drivers across `candle-gen-sensenova/src` returns nothing, and that is
+    ///   deliberate rather than incidental: the descriptor advertises an **empty** sampler menu
+    ///   because the AR backbone's per-step `KvCache` mutation makes any multi-eval curated solver
+    ///   unsound. So its wiring becomes visible below through a direct emission call — one, in
+    ///   `t2i.rs` — rather than through a hooked call site.
+    /// * **It has a second denoise loop that stays dark on purpose.** `it2i_denoise` is the
+    ///   off-registry understanding surface (VQA / Document-Studio interleave), reachable only
+    ///   through `interleave_gen`, advertised by no descriptor, and known-corrupted on the edit path.
+    ///   It is out of scope for sc-16960 and emits nothing, which is why the inventory below reads
+    ///   `direct: 1` rather than `2`.
+    ///
+    /// `supports_preview` does **not** collapse to a single shipped boolean when this epic completes,
+    /// and SenseNova is the permanent reason: it is candle-only, MLX never wired it, so at least one
+    /// route stays engine-split for good. See `docs/migration/evidence/sc-16960-sensenova-candle-preview.md`.
+    ///
     /// `instantid` is deliberately absent from *this* list and cannot be added: it registers no
     /// descriptor at all (`BESPOKE_UTILITY_CRATES`), so it has no id to advertise. Three shipped tests
     /// hold that in place — the second half of
@@ -427,6 +457,8 @@ mod preview_advertising {
         "sd3_5_medium",
         "sana_1600m",
         "sana_sprint_1600m",
+        "sensenova_u1_8b",
+        "sensenova_u1_8b_fast",
     ];
 
     /// The two SANA rows above, named so `sana_base_and_sprint_are_two_independent_rows` can bind
@@ -929,11 +961,26 @@ mod preview_advertising {
         },
         ProviderCrate {
             dir: "candle-gen-sensenova",
-            // The Tier 2 family: its own VAE and a bespoke flow-match loop in `t2i.rs`, so sc-16960
-            // becomes visible here through a direct emission call rather than a driver argument.
+            // The Tier 2 family, and the epic's one measured fit. Its bespoke flow-match loop in
+            // `t2i.rs` drives no shared sampler at all, so sc-16960 becomes visible here through a
+            // direct emission call rather than a driver argument.
             register: candle_gen_sensenova::register_providers,
             denoise: Denoise::Bespoke,
-            routes: &[],
+            // sc-16960's inventory: ONE direct emission, in the registered T2I denoise loop that both
+            // ids reach through `T2iModel::generate`. No hooked site anywhere — there is no shared
+            // sampler call in this crate to hook, which is what `Denoise::Bespoke` above declares —
+            // and therefore no dark site either. `preview.rs` gets no row: it carries only the
+            // measured three-channel pixel-space fit and the pool to the token grid, so it neither
+            // drives a sampler nor emits. The crate's OTHER denoise loop, `it2i_denoise`, is the
+            // off-registry understanding surface (VQA / interleave), is advertised by no descriptor,
+            // and is deliberately unwired — `candle-gen-sensenova/src/preview.rs` pins that it holds
+            // no emission, which is what keeps this count at 1.
+            routes: &[FileRoutes {
+                file: "t2i.rs",
+                hooked: 0,
+                direct: 1,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-svd",
@@ -2258,11 +2305,11 @@ mod preview_advertising {
     /// while `sd3_5_medium` — which reaches the same hooked `run_flow_sampler` site as its two
     /// siblings — silently stopped advertising a capability it has.
     ///
-    /// Ten crates ship more than one id and were all exposed: krea ×3, anima ×3, chroma ×3, sd3_5 ×3,
-    /// flux ×2, flux2 ×2, lens ×2, ideogram ×2, z-image ×2, sana ×2. So the check is now **per
-    /// registered id**: every id of a crate whose sources emit must be in the allowlist *and*
-    /// advertising, on its own. Thirteen wired crates register 27 ids between them, which is exactly
-    /// `PREVIEW_ROUTE_IDS.len()` — the two halves meet with nothing left over.
+    /// Eleven crates ship more than one id and were all exposed: krea ×3, anima ×3, chroma ×3,
+    /// sd3_5 ×3, flux ×2, flux2 ×2, lens ×2, ideogram ×2, z-image ×2, sana ×2, sensenova ×2. So the
+    /// check is now **per registered id**: every id of a crate whose sources emit must be in the
+    /// allowlist *and* advertising, on its own. Fourteen wired crates register 29 ids between them,
+    /// which is exactly `PREVIEW_ROUTE_IDS.len()` — the two halves meet with nothing left over.
     ///
     /// `sana_base_and_sprint_are_two_independent_rows` is kept alongside this, not subsumed by it:
     /// its load-bearing half is the driver **pair** (`run_flow_sampler` *and* `run_scm_sampler` from
