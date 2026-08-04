@@ -13,13 +13,21 @@
 pub mod ca;
 pub mod eva_clip;
 pub mod idformer;
+pub mod memory_strategy;
 pub mod pulid_flux;
 
 /// Add the MLX PuLID-FLUX generator to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pulid_flux::REGISTRATION)
+    registry
+        .register_generator(pulid_flux::REGISTRATION)
+        .register_memory_strategy(pulid_flux::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: pulid_flux::MODEL_ID,
+            contract: memory_strategy::weights_free_contract,
+        })
+        .register_memory_behavior(pulid_flux::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX PuLID provider catalog.

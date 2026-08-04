@@ -287,7 +287,8 @@ pub(crate) fn memory_strategy_contract_with_inventory(
 }
 
 /// Declaration-equivalent, zero-filesystem contract used only by registry conformance.
-pub(crate) fn weights_free_memory_strategy_contract(
+#[doc(hidden)]
+pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {

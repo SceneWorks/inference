@@ -479,9 +479,10 @@ impl FluxTransformer {
                 }
             }
             Some(window) => {
-                if injector.is_some() || scaled_control.is_some() {
+                if scaled_control.is_some() {
                     return Err(mlx_gen::Error::Unsupported(
-                        "flux1: block streaming is clean-base only".to_owned(),
+                        "flux1: block streaming does not support control residual stacks"
+                            .to_owned(),
                     ));
                 }
                 if !self.blocks.is_empty() || !self.single_blocks.is_empty() {
@@ -521,7 +522,7 @@ impl FluxTransformer {
                                 &encoder,
                                 &text_embeddings,
                                 &rope,
-                                None,
+                                injector.map(|inj| (inj, i)),
                                 attention,
                             )
                             .map_err(|error| {
@@ -529,6 +530,11 @@ impl FluxTransformer {
                                     "flux1 block stream: joint window {start}..{end} block {i} forward: {error}"
                                 ))
                             })?;
+                            if let Some(inj) = injector {
+                                if let Some(r) = inj.after_double(i, &hidden)? {
+                                    hidden = add(&hidden, &r)?;
+                                }
+                            }
                         }
                         Ok((encoder, hidden))
                     },
@@ -602,6 +608,15 @@ impl FluxTransformer {
                                         "flux1 block stream: single window {start}..{end} block {i} forward: {error}"
                                     ))
                                 })?;
+                            if let Some(inj) = injector {
+                                if inj.injects_after_single(i) {
+                                    let img = joint.take_axis(&img_idx, 1)?;
+                                    if let Some(r) = inj.after_single(i, &img)? {
+                                        let txt = joint.take_axis(&txt_idx, 1)?;
+                                        joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
+                                    }
+                                }
+                            }
                         }
                         Ok(joint)
                     },

@@ -2380,10 +2380,12 @@ dependencies = [
 name = "mlx-gen-pulid"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-face",
  "mlx-gen-flux",
  "pmetal-mlx-rs",
+ "sha2",
 ]
 
 [[package]]
