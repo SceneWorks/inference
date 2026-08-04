@@ -191,8 +191,9 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
-        memory_strategy: crate::memory_strategy::contract_for_variant(variant),
+        memory_strategy: crate::memory_strategy::contract_for_variant(variant, spec)?,
         memory_numeric_tier: Some(memory_numeric_tier),
+        loaded_spec: spec.clone(),
         tokenizer: Some(tokenizer),
         residency: build_residency(variant, spec)?,
     }))
@@ -299,6 +300,21 @@ fn load_flux2_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_flux2_adapters(&mut transformer, &spec.adapters)?;
     }
+    if matches!(variant, Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit)
+        && spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
+        && spec.offload_policy == OffloadPolicy::Sequential
+        && spec.quantize.is_none()
+        && spec.adapters.is_empty()
+    {
+        let inventory = crate::artifact_inventory::KleinArtifactInventory::verify(spec)?
+            .ok_or_else(|| Error::Unsupported(
+                "flux2 Klein deferred materialization requires the exact calibrated BF16 HF artifact"
+                    .to_owned(),
+            ))?;
+        let quant = crate::loader::read_component_quant(&root.join("transformer"))?;
+        transformer = transformer.with_block_stream(inventory, variant.config(), quant);
+        transformer.finalize_block_stream()?;
+    }
     // PiD decoder overlay (epic 7840, sc-7847): load the `flux2` student + Gemma caption encoder once
     // when the spec carries it AND this generate uses it (`load_pid`, F-177). The student is shared
     // across the whole FLUX.2 family (klein + dev).
@@ -344,6 +360,7 @@ pub struct Flux2 {
     /// Exact load-time tier used by provider-owned route validation. Test-only instances have no
     /// load artifact, so their tier remains unknown.
     memory_numeric_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
+    loaded_spec: LoadSpec,
     /// The (small, always-warm) tokenizer. `None` only for the weightless `new_for_tests` instances;
     /// the production load path always populates it.
     tokenizer: Option<TextTokenizer>,
@@ -359,12 +376,15 @@ pub struct Flux2 {
 impl Flux2 {
     /// Construct a weightless instance for validation tests (no tokenizer, loader closures that error).
     pub fn new_for_tests(variant: Flux2Variant) -> Self {
+        let loaded_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         Self {
             descriptor: variant.descriptor(),
             variant,
             config: variant.config(),
-            memory_strategy: crate::memory_strategy::contract_for_variant(variant),
+            memory_strategy: (variant == Flux2Variant::DevEdit)
+                .then(|| crate::memory_strategy::registered_dev_contract(&loaded_spec).unwrap()),
             memory_numeric_tier: None,
+            loaded_spec,
             tokenizer: None,
             residency: Residency::sequential(
                 || {
@@ -700,9 +720,27 @@ impl Generator for Flux2 {
                         ),
                     };
                 };
-                crate::memory_strategy::safety_check(contract, context, expected_tier)
+                if self.variant == Flux2Variant::DevEdit {
+                    crate::memory_strategy::safety_check(contract, context, expected_tier)
+                } else {
+                    crate::memory_strategy::klein_safety_check(&self.loaded_spec, contract, context)
+                }
             },
         )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        if self.variant == Flux2Variant::DevEdit {
+            return Ok(None);
+        }
+        crate::memory_strategy::begin_klein_request(&self.loaded_spec, contract, context)
     }
 }
 
@@ -908,6 +946,17 @@ impl Flux2 {
                         },
                         cache,
                         &mem,
+                        if self.variant.is_dev() {
+                            mlx_gen::attention::AttentionPlan::UNBOUNDED
+                        } else {
+                            crate::memory_strategy::attention_plan(req)
+                        },
+                        if self.variant.is_dev() {
+                            None
+                        } else {
+                            crate::memory_strategy::transformer_window(req)?
+                                .map(|size| (size, &req.cancel))
+                        },
                     )?;
                     let idx =
                         Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
@@ -1074,9 +1123,18 @@ impl Flux2 {
                         // (sc-7847). Hand it over as NCHW [1,128,h,w]; the student returns [1,3,4H,4W].
                         Some(d) => d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?,
                         // Native VAE: BN-de-normalize + 2×2-unpatchify + decode → NHWC [1,H,W,3] → NCHW.
-                        None => vae
-                            .decode_packed_latents(&packed)?
-                            .transpose_axes(&[0, 3, 1, 2])?,
+                        None => match (!self.variant.is_dev())
+                            .then(|| crate::memory_strategy::decode_tiling(req))
+                            .transpose()?
+                            .flatten()
+                        {
+                            Some(tiling) => vae
+                                .decode_packed_latents_tiled(&packed, &tiling, Some(&req.cancel))?
+                                .transpose_axes(&[0, 3, 1, 2])?,
+                            None => vae
+                                .decode_packed_latents(&packed)?
+                                .transpose_axes(&[0, 3, 1, 2])?,
+                        },
                     };
                     images.push(decoded_to_image(&nchw)?);
                 }
@@ -1210,8 +1268,38 @@ mlx_gen::register_generators! {
 pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: crate::config::FLUX2_DEV_EDIT_ID,
-        contract: crate::memory_strategy::registered_contract,
-        safety_check: crate::memory_strategy::registered_safety_check,
+        contract: crate::memory_strategy::registered_dev_contract,
+        safety_check: crate::memory_strategy::registered_dev_safety_check,
+    };
+
+pub(crate) const KLEIN_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: crate::config::FLUX2_KLEIN_9B_ID,
+        contract: crate::memory_strategy::klein_contract,
+        safety_check: crate::memory_strategy::registered_klein_safety_check,
+    };
+
+pub(crate) const KLEIN_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+        contract: |spec| {
+            crate::memory_strategy::klein_contract_for(crate::config::FLUX2_KLEIN_9B_EDIT_ID, spec)
+        },
+        safety_check: crate::memory_strategy::registered_klein_safety_check,
+    };
+
+pub(crate) const KLEIN_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::config::FLUX2_KLEIN_9B_ID,
+        valid_fixtures: crate::memory_strategy::registered_klein_fixture,
+        begin_request: crate::memory_strategy::registered_klein_begin_request,
+    };
+
+pub(crate) const KLEIN_EDIT_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+        valid_fixtures: crate::memory_strategy::registered_klein_fixture,
+        begin_request: crate::memory_strategy::registered_klein_begin_request,
     };
 
 #[cfg(test)]

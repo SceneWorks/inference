@@ -87,6 +87,8 @@ fn forward_mem(t: &Flux2Transformer, w: &Weights, mem: &MemoryConfig) -> Array {
         },
         None,
         mem,
+        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        None,
     )
     .unwrap()
 }
