@@ -859,6 +859,7 @@ pub struct Flux2Generator {
     bounded_host_decode: Arc<std::sync::Mutex<bool>>,
     loaded_quant: Option<Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_admission: memory_strategy::Flux2AdmissionRegistry,
 }
 
 impl Generator for Flux2Generator {
@@ -877,7 +878,26 @@ impl Generator for Flux2Generator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return gen_core::MemorySafetyDecision::Accept;
         };
-        memory_strategy::admission_safety_check(contract, context, self.loaded_quant)
+        if let Err(error) = memory_strategy::validate_registered_generator_context(context) {
+            self.memory_admission.clear_approval();
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            };
+        }
+        match memory_strategy::admission_safety_check(contract, context, self.loaded_quant) {
+            gen_core::MemorySafetyDecision::Accept => {
+                match self.memory_admission.approve(context) {
+                    Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                    Err(error) => gen_core::MemorySafetyDecision::Reject {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            rejected @ gen_core::MemorySafetyDecision::Reject { .. } => {
+                self.memory_admission.clear_approval();
+                rejected
+            }
+        }
     }
 
     fn begin_memory_strategy_request(
@@ -888,11 +908,15 @@ impl Generator for Flux2Generator {
             return Ok(None);
         };
         memory_strategy::validate_context(contract, context, self.loaded_quant)?;
-        Ok(Some(Box::new(memory_strategy::Flux2MemoryScope::new(
-            self.pipe.device.clone(),
-            contract,
-            context,
-        ))))
+        memory_strategy::validate_registered_generator_context(context)?;
+        Ok(Some(Box::new(
+            memory_strategy::Flux2MemoryScope::new_bound(
+                self.pipe.device.clone(),
+                contract,
+                context,
+                self.memory_admission.clone(),
+            )?,
+        )))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -924,6 +948,7 @@ impl Generator for Flux2Generator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req
             .memory
             .as_ref()
@@ -1118,6 +1143,7 @@ fn generator_from_pipeline(
         bounded_host_decode,
         loaded_quant,
         memory_strategy,
+        memory_admission: memory_strategy::Flux2AdmissionRegistry::new(config::FLUX2_DEV_ID),
     }))
 }
 
@@ -1376,6 +1402,125 @@ mod tests {
             ));
             std::fs::remove_dir_all(root).ok();
         }
+    }
+
+    #[test]
+    fn registered_generator_requires_exact_safety_begin_configure_handshake() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/missing-flux2-dev")))
+            .with_quant(Quant::Q4);
+        spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+        let generator = load_dev(&spec).expect("lazy dev generator");
+        let contract = generator.memory_strategy_contract().unwrap().clone();
+        let route = gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        };
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::BoundedDecode,
+            memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+            route,
+        )
+        .unwrap();
+        let manual = GenerationRequest {
+            prompt: "manual".to_owned(),
+            memory: contract.generation_memory(&context.selection),
+            ..Default::default()
+        };
+        assert!(generator.generate(&manual, &mut |_| {}).is_err());
+        assert!(generator.begin_memory_strategy_request(&context).is_err());
+
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        let mut unconfigured = generator
+            .begin_memory_strategy_request(&context)
+            .unwrap()
+            .unwrap();
+        assert!(generator
+            .generate(
+                &GenerationRequest {
+                    prompt: "unconfigured".to_owned(),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .is_err());
+        unconfigured
+            .finish(gen_core::MemoryRunOutcome::Canceled)
+            .unwrap();
+
+        let mut mutations = Vec::new();
+        let mut abi = context.clone();
+        abi.calibration_abi += 1;
+        mutations.push(abi);
+        let mut fingerprint = context.clone();
+        fingerprint.calibration_fingerprint.push_str("-stale");
+        mutations.push(fingerprint);
+        let mut phases = context.clone();
+        phases.has_phases = true;
+        mutations.push(phases);
+        let mut mode = context.clone();
+        mode.mode = gen_core::MemoryMode::Edit;
+        mode.geometry.reference_count = 1;
+        mode.has_reference = true;
+        mutations.push(mode);
+        let mut overlay = context.clone();
+        overlay.overlay = Some(memory_strategy::CONTROL_OVERLAY.to_owned());
+        mutations.push(overlay);
+        for mutated in mutations {
+            assert!(matches!(
+                generator.memory_strategy_safety_check(&context),
+                gen_core::MemorySafetyDecision::Accept
+            ));
+            assert!(generator.begin_memory_strategy_request(&mutated).is_err());
+        }
+
+        let alternate = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::BoundedAttention,
+            memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        assert!(generator.begin_memory_strategy_request(&alternate).is_err());
+
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .unwrap()
+            .unwrap();
+        let mut configured = GenerationRequest {
+            prompt: "configured".to_owned(),
+            ..Default::default()
+        };
+        scope.configure_request(&mut configured).unwrap();
+        let copied = configured.clone();
+        assert!(generator.generate(&copied, &mut |_| {}).is_err());
+        configured.width /= 2;
+        assert!(generator.generate(&configured, &mut |_| {}).is_err());
+        scope
+            .finish(gen_core::MemoryRunOutcome::Error {
+                message: "adversarial rejection".to_owned(),
+            })
+            .unwrap();
     }
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,

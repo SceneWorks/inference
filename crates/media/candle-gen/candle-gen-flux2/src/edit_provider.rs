@@ -218,6 +218,7 @@ impl Flux2Edit {
         memory_contract: Option<MemoryProviderContract>,
         admitted_context: Option<MemoryRunContext>,
     ) -> Result<Self> {
+        validate_memory_authority(memory, admitted_context.as_ref(), "flux2 edit")?;
         let optimized =
             memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks;
         if optimized && !memory.stage_residency {
@@ -299,6 +300,11 @@ impl Flux2Edit {
             &self.lifecycle,
             || {
                 ensure_ordinary_generate_allowed(self.admitted_context.as_ref(), "flux2 edit")?;
+                validate_memory_authority(
+                    self.memory,
+                    self.admitted_context.as_ref(),
+                    "flux2 edit",
+                )?;
                 self.generate_inner(req, references, on_progress)
             },
             || self.pipe.device.synchronize(),
@@ -669,6 +675,20 @@ fn ensure_ordinary_generate_allowed(
     }
 }
 
+fn validate_memory_authority(
+    memory: GenerationMemory,
+    admitted_context: Option<&MemoryRunContext>,
+    label: &str,
+) -> Result<()> {
+    if memory != GenerationMemory::default() && admitted_context.is_none() {
+        Err(CandleError::Msg(format!(
+            "{label}: constrained memory requires an exact admitted context"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_admitted_context(
     admitted: &MemoryRunContext,
     runtime: &MemoryRunContext,
@@ -808,6 +828,13 @@ mod tests {
         mutated.mode = candle_gen::gen_core::MemoryMode::Other("style_variations".to_owned());
         assert!(validate_admitted_context(&admitted, &mutated, "flux2 edit").is_err());
         assert!(validate_admitted_context(&admitted, &admitted, "flux2 edit").is_ok());
+        let constrained = GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        };
+        assert!(validate_memory_authority(constrained, None, "flux2 edit").is_err());
+        assert!(validate_memory_authority(constrained, Some(&admitted), "flux2 edit").is_ok());
+        assert!(validate_memory_authority(GenerationMemory::default(), None, "flux2 edit").is_ok());
     }
 
     #[test]
@@ -839,6 +866,24 @@ mod tests {
             candle_gen::gen_core::WeightsSource::Dir(PathBuf::from("/admitted")),
         );
         assert!(validate_base_binding(&paths, &mismatched).is_err());
+    }
+
+    #[test]
+    fn legacy_edit_constructor_rejects_constrained_memory_without_context() {
+        let paths = Flux2EditPaths {
+            root: PathBuf::from("/missing-flux2-dev"),
+        };
+        let error = Flux2Edit::load_dev_with_memory(
+            &paths,
+            Some(Quant::Q4),
+            GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("legacy constrained edit load must fail");
+        assert!(error.to_string().contains("exact admitted context"));
     }
 
     /// The request defaults match the klein edit production knobs (1024², 4 distilled steps, CFG-free).

@@ -17,6 +17,7 @@ use candle_gen::gen_core::{
     MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
     PerComponentBytes, Precision, Quant, TransformerComponent, WeightsSource,
 };
+use std::sync::{Arc, Mutex};
 
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE];
@@ -314,12 +315,247 @@ pub fn admission_safety_check(
     }
 }
 
+pub(crate) fn validate_registered_generator_context(
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
+    if context.mode != MemoryMode::TextToImage
+        || context.geometry.reference_count != 0
+        || context.has_reference
+        || context.overlay.is_some()
+    {
+        return Err(gen_core::Error::Unsupported(
+            "flux2_dev: registered generator admits text-to-image without references or overlays only"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Flux2RequestBinding {
+    request_address: usize,
+    geometry: MemoryGeometry,
+    use_pid: bool,
+    has_phases: bool,
+    memory: Option<GenerationMemory>,
+}
+
+impl Flux2RequestBinding {
+    fn from_request(request: &GenerationRequest) -> Self {
+        Self {
+            request_address: std::ptr::from_ref(request).addr(),
+            geometry: MemoryGeometry {
+                width: request.width,
+                height: request.height,
+                batch: request.count,
+                frames: request.frames.unwrap_or(1),
+                reference_count: request.image_reference_count(),
+            },
+            use_pid: request.use_pid,
+            has_phases: request
+                .phases
+                .as_ref()
+                .is_some_and(|phases| !phases.is_empty()),
+            memory: request.memory,
+        }
+    }
+}
+
+struct Flux2ActiveAdmission {
+    token: u64,
+    context: MemoryRunContext,
+    expected_memory: Option<GenerationMemory>,
+    binding: Option<Flux2RequestBinding>,
+    consumed: bool,
+}
+
+#[derive(Default)]
+struct Flux2AdmissionState {
+    next_token: u64,
+    approved_context: Option<MemoryRunContext>,
+    active: Option<Flux2ActiveAdmission>,
+}
+
+/// Provider-local, one-shot authorization joining `begin`/`configure` to the exact request object
+/// later passed to `generate`. The opaque token never enters `GenerationRequest`, so cloning or
+/// copying its memory knobs cannot transfer authorization to another request.
+#[derive(Clone)]
+pub(crate) struct Flux2AdmissionRegistry {
+    provider_id: &'static str,
+    inner: Arc<Mutex<Flux2AdmissionState>>,
+}
+
+impl Flux2AdmissionRegistry {
+    pub(crate) fn new(provider_id: &'static str) -> Self {
+        Self {
+            provider_id,
+            inner: Arc::new(Mutex::new(Flux2AdmissionState::default())),
+        }
+    }
+
+    pub(crate) fn approve(&self, context: &MemoryRunContext) -> gen_core::Result<()> {
+        let mut state = candle_gen::lock_recover(&self.inner);
+        if state.active.is_some() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: cannot replace safety approval while a request scope is active",
+                self.provider_id
+            )));
+        }
+        state.approved_context = Some(context.clone());
+        Ok(())
+    }
+
+    pub(crate) fn clear_approval(&self) {
+        candle_gen::lock_recover(&self.inner).approved_context = None;
+    }
+
+    fn begin(
+        &self,
+        contract: &MemoryProviderContract,
+        context: &MemoryRunContext,
+        expected_memory: Option<GenerationMemory>,
+    ) -> gen_core::Result<u64> {
+        if contract.provider_id != self.provider_id {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: memory contract belongs to {}",
+                self.provider_id, contract.provider_id
+            )));
+        }
+        let mut state = candle_gen::lock_recover(&self.inner);
+        if state.active.is_some() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: another memory request scope is already active",
+                self.provider_id
+            )));
+        }
+        let approved = state.approved_context.take().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{}: memory request begin skipped the safety handshake",
+                self.provider_id
+            ))
+        })?;
+        if approved != *context {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: memory context changed after safety approval",
+                self.provider_id
+            )));
+        }
+        state.next_token = state.next_token.wrapping_add(1).max(1);
+        let token = state.next_token;
+        state.active = Some(Flux2ActiveAdmission {
+            token,
+            context: context.clone(),
+            expected_memory,
+            binding: None,
+            consumed: false,
+        });
+        Ok(token)
+    }
+
+    fn configure(&self, token: u64, request: &GenerationRequest) -> gen_core::Result<()> {
+        let mut state = candle_gen::lock_recover(&self.inner);
+        let active = state.active.as_mut().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{}: memory request scope is no longer active",
+                self.provider_id
+            ))
+        })?;
+        if active.token != token || active.binding.is_some() || active.consumed {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: stale, reused, or already-configured memory token",
+                self.provider_id
+            )));
+        }
+        let binding = Flux2RequestBinding::from_request(request);
+        if binding.geometry != active.context.geometry
+            || binding.use_pid != active.context.use_pid
+            || binding.has_phases != active.context.has_phases
+            || binding.memory != active.expected_memory
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: request changed while configuring memory admission",
+                self.provider_id
+            )));
+        }
+        active.binding = Some(binding);
+        Ok(())
+    }
+
+    pub(crate) fn consume_for_generate(&self, request: &GenerationRequest) -> gen_core::Result<()> {
+        let mut state = candle_gen::lock_recover(&self.inner);
+        let constrained = request
+            .memory
+            .is_some_and(|memory| memory != GenerationMemory::default());
+        let Some(active) = state.active.as_mut() else {
+            return if constrained {
+                Err(gen_core::Error::Unsupported(format!(
+                    "{}: constrained memory request has no active admission token",
+                    self.provider_id
+                )))
+            } else {
+                Ok(())
+            };
+        };
+        let binding = active.binding.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{}: active memory request was not configured",
+                self.provider_id
+            ))
+        })?;
+        if binding != &Flux2RequestBinding::from_request(request) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: request or memory strategy changed after admission",
+                self.provider_id
+            )));
+        }
+        if active.consumed {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: memory admission token was already consumed",
+                self.provider_id
+            )));
+        }
+        active.consumed = true;
+        Ok(())
+    }
+
+    fn finish(&self, token: u64) -> gen_core::Result<()> {
+        let mut state = candle_gen::lock_recover(&self.inner);
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.token == token)
+        {
+            state.active = None;
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "{}: stale memory token cannot finish",
+                self.provider_id
+            )))
+        }
+    }
+
+    fn abandon(&self, token: u64) {
+        let mut state = candle_gen::lock_recover(&self.inner);
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.token == token)
+        {
+            state.active = None;
+        }
+    }
+}
+
 pub struct Flux2MemoryScope {
     device: Device,
     geometry: MemoryGeometry,
     memory: Option<GenerationMemory>,
     transformer_window: Option<u32>,
     use_pid: bool,
+    has_phases: bool,
+    admission: Option<Flux2AdmissionRegistry>,
+    token: Option<u64>,
     finished: bool,
 }
 
@@ -341,8 +577,28 @@ impl Flux2MemoryScope {
                 .then_some(context.selection.parameters.transformer_window_size)
                 .flatten(),
             use_pid: context.use_pid,
+            has_phases: context.has_phases,
+            admission: None,
+            token: None,
             finished: false,
         }
+    }
+
+    pub(crate) fn new_bound(
+        device: Device,
+        contract: &MemoryProviderContract,
+        context: &MemoryRunContext,
+        admission: Flux2AdmissionRegistry,
+    ) -> gen_core::Result<Self> {
+        let token = admission.begin(
+            contract,
+            context,
+            contract.generation_memory(&context.selection),
+        )?;
+        let mut scope = Self::new(device, contract, context);
+        scope.admission = Some(admission);
+        scope.token = Some(token);
+        Ok(scope)
     }
 
     fn active(&self) -> gen_core::Result<()> {
@@ -364,12 +620,21 @@ impl MemoryRequestScope for Flux2MemoryScope {
             || request.height != self.geometry.height
             || request.count != self.geometry.batch
             || request.image_reference_count() != self.geometry.reference_count
+            || request.frames.unwrap_or(1) != self.geometry.frames
+            || request
+                .phases
+                .as_ref()
+                .is_some_and(|phases| !phases.is_empty())
+                != self.has_phases
         {
             return Err(gen_core::Error::Unsupported(
                 "flux2_dev: request route or geometry changed after admission".to_owned(),
             ));
         }
         request.memory = self.memory;
+        if let (Some(admission), Some(token)) = (&self.admission, self.token) {
+            admission.configure(token, request)?;
+        }
         Ok(())
     }
 
@@ -454,6 +719,9 @@ impl MemoryRequestScope for Flux2MemoryScope {
         self.device
             .synchronize()
             .map_err(gen_core::Error::backend)?;
+        if let (Some(admission), Some(token)) = (&self.admission, self.token) {
+            admission.finish(token)?;
+        }
         self.finished = true;
         Ok(())
     }
@@ -463,6 +731,9 @@ impl Drop for Flux2MemoryScope {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.device.synchronize();
+            if let (Some(admission), Some(token)) = (&self.admission, self.token) {
+                admission.abandon(token);
+            }
             self.finished = true;
         }
     }
@@ -654,5 +925,72 @@ mod tests {
             registered_safety_check(&spec, &contract, &fixture.context),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn active_admission_is_one_shot_request_local_and_non_transferable() {
+        let spec = spec();
+        let contract = provider_contract(&spec).unwrap();
+        let context = registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .remove(0)
+            .context;
+        let registry = Flux2AdmissionRegistry::new(FLUX2_DEV_ID);
+
+        let wrong_provider = Flux2AdmissionRegistry::new("not_flux2_dev");
+        wrong_provider.approve(&context).unwrap();
+        assert!(
+            Flux2MemoryScope::new_bound(Device::Cpu, &contract, &context, wrong_provider,).is_err()
+        );
+
+        let manual_memory = contract.generation_memory(&context.selection).unwrap();
+        let manual = GenerationRequest {
+            prompt: "manual".to_owned(),
+            memory: Some(manual_memory),
+            ..Default::default()
+        };
+        assert!(registry.consume_for_generate(&manual).is_err());
+
+        assert!(
+            Flux2MemoryScope::new_bound(Device::Cpu, &contract, &context, registry.clone(),)
+                .is_err(),
+            "begin without safety approval must fail"
+        );
+
+        registry.approve(&context).unwrap();
+        let mut unconfigured =
+            Flux2MemoryScope::new_bound(Device::Cpu, &contract, &context, registry.clone())
+                .unwrap();
+        assert!(registry
+            .consume_for_generate(&GenerationRequest {
+                prompt: "unconfigured".to_owned(),
+                ..Default::default()
+            })
+            .is_err());
+        unconfigured.finish(MemoryRunOutcome::Canceled).unwrap();
+
+        registry.approve(&context).unwrap();
+        let mut scope =
+            Flux2MemoryScope::new_bound(Device::Cpu, &contract, &context, registry.clone())
+                .unwrap();
+        let mut request = GenerationRequest {
+            prompt: "bound".to_owned(),
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        let copied = request.clone();
+        assert!(registry.consume_for_generate(&copied).is_err());
+
+        request.width /= 2;
+        assert!(registry.consume_for_generate(&request).is_err());
+        request.width *= 2;
+        let expected_memory = request.memory;
+        request.memory = Some(GenerationMemory::default());
+        assert!(registry.consume_for_generate(&request).is_err());
+        request.memory = expected_memory;
+
+        registry.consume_for_generate(&request).unwrap();
+        assert!(registry.consume_for_generate(&request).is_err());
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
     }
 }

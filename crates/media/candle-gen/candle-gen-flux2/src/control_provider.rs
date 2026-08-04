@@ -152,6 +152,7 @@ impl Flux2Control {
         memory_contract: Option<MemoryProviderContract>,
         admitted_context: Option<MemoryRunContext>,
     ) -> Result<Self> {
+        validate_memory_authority(memory, admitted_context.as_ref(), "flux2 control")?;
         let optimized =
             memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks;
         if optimized && !memory.stage_residency {
@@ -274,6 +275,11 @@ impl Flux2Control {
             &self.lifecycle,
             || {
                 ensure_ordinary_generate_allowed(self.admitted_context.as_ref(), "flux2 control")?;
+                validate_memory_authority(
+                    self.memory,
+                    self.admitted_context.as_ref(),
+                    "flux2 control",
+                )?;
                 self.generate_inner(req, control_image, on_progress)
             },
             || self.pipe.device.synchronize(),
@@ -584,6 +590,20 @@ fn ensure_ordinary_generate_allowed(
     }
 }
 
+fn validate_memory_authority(
+    memory: GenerationMemory,
+    admitted_context: Option<&MemoryRunContext>,
+    label: &str,
+) -> Result<()> {
+    if memory != GenerationMemory::default() && admitted_context.is_none() {
+        Err(CandleError::Msg(format!(
+            "{label}: constrained memory requires an exact admitted context"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_admitted_context(
     admitted: &MemoryRunContext,
     runtime: &MemoryRunContext,
@@ -689,6 +709,15 @@ mod tests {
         mutated.overlay = None;
         assert!(validate_admitted_context(&admitted, &mutated, "flux2 control").is_err());
         assert!(validate_admitted_context(&admitted, &admitted, "flux2 control").is_ok());
+        let constrained = GenerationMemory {
+            tile_vae_decode: true,
+            ..Default::default()
+        };
+        assert!(validate_memory_authority(constrained, None, "flux2 control").is_err());
+        assert!(validate_memory_authority(constrained, Some(&admitted), "flux2 control").is_ok());
+        assert!(
+            validate_memory_authority(GenerationMemory::default(), None, "flux2 control").is_ok()
+        );
     }
 
     #[test]
@@ -747,6 +776,25 @@ mod tests {
         std::fs::write(&overlay, []).unwrap();
         assert!(validate_admitted_paths(&paths, &matching).is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn legacy_control_constructor_rejects_constrained_memory_without_context() {
+        let paths = Flux2ControlPaths {
+            root: PathBuf::from("/missing-flux2-dev"),
+            control: PathBuf::from("/missing-control.safetensors"),
+        };
+        let error = Flux2Control::load_with_memory(
+            &paths,
+            Some(Quant::Q4),
+            GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("legacy constrained control load must fail");
+        assert!(error.to_string().contains("exact admitted context"));
     }
 
     /// The request defaults match the dev control production knobs (1024², 28 steps, guidance 4.0,
