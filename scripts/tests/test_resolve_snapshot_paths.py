@@ -9,6 +9,9 @@ from scripts.release.resolve_snapshot_paths import resolve
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/real-weights.yml"
 RESOLVE_STEP = "Resolve runner-local snapshot paths"
+REPORT_STEP = "Report runner disk headroom"
+REPORT_SCRIPT = "scripts/ci/report_runner_disk_headroom.sh"
+REPORT_SCRIPT_PATH = Path(__file__).resolve().parents[2] / REPORT_SCRIPT
 
 
 class ResolveTests(unittest.TestCase):
@@ -130,6 +133,132 @@ class WorkflowWiringTests(unittest.TestCase):
             with self.subTest(job=name):
                 names = [s.get("name") for s in job.get("steps", [])]
                 self.assertNotIn(RESOLVE_STEP, names)
+
+
+def headroom_wiring_errors(workflow: dict) -> list[str]:
+    """Return every way the headroom report has drifted from the resolve step it shadows.
+
+    Kept as a free function so the mutation twin below can feed it a doctored workflow and
+    prove the gate actually discriminates, rather than passing because it checks nothing.
+    """
+    errors: list[str] = []
+    for name, job in workflow["jobs"].items():
+        steps = job.get("steps", [])
+        names = [step.get("name") for step in steps]
+        if RESOLVE_STEP not in names:
+            # No `~/`-relative snapshot to cost, so no report is owed. This is what excuses
+            # the `rw-chroma` and `rw-sa3` lanes: they materialize into `RUNNER_TEMP` and
+            # never touch the shared Hugging Face cache the report exists to account for.
+            if REPORT_STEP in names:
+                errors.append(f"{name} reports headroom without resolving any snapshot path")
+            continue
+        if names.count(REPORT_STEP) != 1:
+            errors.append(f"{name} must carry exactly one {REPORT_STEP!r} step")
+            continue
+
+        resolve_at = names.index(RESOLVE_STEP)
+        report_at = names.index(REPORT_STEP)
+        report = steps[report_at]
+
+        # Ordering: the report reads RESOLVED absolute paths, and it has to be a record of
+        # what the box held BEFORE the transfer, so it sits strictly between the two.
+        if not resolve_at < report_at:
+            errors.append(f"{name} reports headroom before resolving the paths it reports")
+        materialize = [
+            i for i, step in enumerate(names) if str(step).startswith("Materialize")
+        ]
+        if materialize and not report_at < materialize[0]:
+            errors.append(f"{name} reports headroom after the transfer it is meant to precede")
+
+        # The two lists must name the same variables: a lane that resolves a snapshot the
+        # report omits silently stops accounting for it, which is exactly the drift that
+        # left `mlx-media`'s cache root and three Mage snapshots unreported when this step
+        # was first written.
+        resolved = steps[resolve_at]["run"].split()[2:]
+        reported = report["run"].split()[1:]
+        if resolved != reported:
+            errors.append(
+                f"{name} resolves {resolved} but reports {reported}"
+            )
+
+        if report["run"].split()[0] != REPORT_SCRIPT:
+            errors.append(f"{name} does not call {REPORT_SCRIPT}")
+        # Report-only means report-only: this step must never be able to red the lane.
+        if report.get("continue-on-error") is not True:
+            errors.append(f"{name} lets a report-only step fail the job")
+    return errors
+
+
+class ReportHeadroomWiringTests(unittest.TestCase):
+    """Every lane that resolves a snapshot path must also record what holding it costs.
+
+    Neither box is reachable from the other and `gh api /orgs/.../actions/runners` needs
+    `admin:org`, so a run log is the only measurement of either Mac's disk anyone gets --
+    and `release/real-weight-models.toml` records `size_class`, never bytes, so the cost is
+    not derivable from the repo. A lane that resolves without reporting is silently exempt
+    from that accounting, which is a gap only a scheduled weekly lane would hide.
+    """
+
+    def setUp(self) -> None:
+        self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_the_report_script_is_committed_executable(self) -> None:
+        """`continue-on-error` keeps a lost exec bit from redding a lane, but the step would
+        still record nothing, so the bit itself is asserted rather than assumed."""
+        self.assertTrue(REPORT_SCRIPT_PATH.is_file(), f"{REPORT_SCRIPT} is missing")
+        self.assertTrue(
+            REPORT_SCRIPT_PATH.stat().st_mode & 0o111,
+            f"{REPORT_SCRIPT} is committed without an executable bit",
+        )
+
+    def test_every_resolving_lane_reports_what_it_costs(self) -> None:
+        self.assertEqual(headroom_wiring_errors(self.workflow), [])
+
+    def test_headroom_wiring_discriminates_mutations(self) -> None:
+        """The positive case alone cannot tell "the wiring is right" from "the gate is inert"."""
+        import copy
+
+        def doctor(mutate) -> dict:
+            workflow = copy.deepcopy(self.workflow)
+            steps = workflow["jobs"]["candle-audio-chatterbox"]["steps"]
+            index = [s.get("name") for s in steps].index(REPORT_STEP)
+            mutate(workflow, steps, index)
+            return workflow
+
+        def drop_step(_workflow, steps, index):
+            del steps[index]
+
+        def drop_a_variable(_workflow, steps, index):
+            steps[index]["run"] = " ".join(steps[index]["run"].split()[:-1])
+
+        def allow_failure(_workflow, steps, index):
+            steps[index]["continue-on-error"] = False
+
+        def move_after_materialize(_workflow, steps, index):
+            steps.append(steps.pop(index))
+
+        def call_something_else(_workflow, steps, index):
+            steps[index]["run"] = "true " + " ".join(steps[index]["run"].split()[1:])
+
+        def report_without_resolving(workflow, _steps, _index):
+            steps = workflow["jobs"]["same-l-metal"]["steps"]
+            steps.insert(0, {"name": REPORT_STEP, "run": f"{REPORT_SCRIPT} X"})
+
+        mutations = {
+            "report step deleted": drop_step,
+            "a resolved variable goes unreported": drop_a_variable,
+            "report-only step can red the lane": allow_failure,
+            "report moved after the transfer": move_after_materialize,
+            "report no longer calls the script": call_something_else,
+            "a non-resolving lane reports anyway": report_without_resolving,
+        }
+        for mutation, mutate in mutations.items():
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(
+                    headroom_wiring_errors(doctor(mutate)),
+                    [],
+                    f"the gate accepted a workflow where {mutation}",
+                )
 
 
 class WeightSetLabelTests(unittest.TestCase):

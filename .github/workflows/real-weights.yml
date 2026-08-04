@@ -737,6 +737,18 @@ jobs:
           MAGE_REQUEST_SCOPE_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MAGE_REQUEST_SCOPE_SNAPSHOT
       - name: Materialize and verify immutable Mage snapshot
         run: |
           if [[ -z "$MAGE_REQUEST_SCOPE_SNAPSHOT" || "$MAGE_REQUEST_SCOPE_SNAPSHOT" != /* ]]; then
@@ -795,6 +807,18 @@ jobs:
           echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"
       - name: Toolchain versions
         run: rustc --version && cargo --version && python3.12 --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          ZIMAGE_SNAPSHOT
       - name: Materialize and verify immutable Z-Image snapshot
         env:
           MEMORY_MODEL_INVENTORY: ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory.json
@@ -893,6 +917,18 @@ jobs:
           MLX_LLM_TEST_MODEL MLX_LLM_QWEN3_MODEL
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_LLM_TEST_MODEL MLX_LLM_QWEN3_MODEL
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -947,33 +983,18 @@ jobs:
               exit 1
             fi
           done
-      # sc-17271: the first run of this lane on a box that does not already hold the snapshot pays
-      # a 16 GB Hub transfer into the shared `~/.cache/huggingface` every other rw-* lane on that
-      # runner reads from, and an ENOSPC partway through leaves partial blobs behind. Nobody has a
-      # shell on these runners, so this is the only view of their disk anyone gets after the fact.
-      #
-      # This is a RECORD, not a pre-dispatch gate — by the time it runs the runner is already
-      # claimed. It also cannot become a fail-closed floor without new data: release/
-      # real-weight-models.toml records `size_class`, never byte sizes, so any numeric threshold
-      # would be an invented per-model constant rather than something the manifest already knows.
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
       - name: Report runner disk headroom
-        run: |
-          df -h "$HOME" "${RUNNER_TEMP:-$HOME}" | awk 'NR == 1 || !seen[$0]++'
-          for v in MLX_LLM_JOYCAPTION_SNAPSHOT; do
-            path="${!v}"
-            if [[ ! -d "$path" ]]; then
-              echo "$v: ABSENT — this run materializes it from the Hub"
-            elif [[ "$(basename "$(dirname "$path")")" == snapshots ]]; then
-              # Size the whole `models--*` repo dir, not `snapshots/<rev>`: revisions share
-              # `blobs/`, so a per-revision figure understates what the cache costs on disk.
-              # Plain `du` here — `-L` would follow the snapshot symlinks back down into
-              # `blobs/` and count every blob a second time.
-              repo="$(dirname "$(dirname "$path")")"
-              echo "$v: resident, $(du -sh "$repo" | awk '{print $1}') ($(basename "$repo"))"
-            else
-              echo "$v: resident, $(du -shL "$path" | awk '{print $1}')"
-            fi
-          done
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_LLM_JOYCAPTION_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1063,6 +1084,19 @@ jobs:
         run: echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
+          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT
       - name: Materialize and verify immutable snapshot
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1309,6 +1343,18 @@ jobs:
               exit 1
             fi
           done
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KREA_REALTIME_SNAPSHOT KREA_STYLE_LORA_SNAPSHOT KREA_DISTILL_LORA_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1454,6 +1500,17 @@ jobs:
             echo "KREA_REALTIME_SNAPSHOT must be an absolute path, got: $KREA_REALTIME_SNAPSHOT" >&2
             exit 1
           fi
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. A 4.3 h sweep that finds no room after hour three is the
+      # worst way to learn the box was full. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KREA_REALTIME_SNAPSHOT
       - name: Materialize and verify the immutable snapshot
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1563,6 +1620,18 @@ jobs:
           KOKORO_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KOKORO_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1618,6 +1687,18 @@ jobs:
           MOSS_SFX_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MOSS_SFX_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1646,6 +1727,18 @@ jobs:
           ACESTEP_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          ACESTEP_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1679,6 +1772,18 @@ jobs:
           KOKORO_SNAPSHOT CHATTERBOX_VE_SNAPSHOT OPENVOICE_V2_SNAPSHOT WHISPER_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KOKORO_SNAPSHOT CHATTERBOX_VE_SNAPSHOT OPENVOICE_V2_SNAPSHOT WHISPER_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1722,6 +1827,18 @@ jobs:
           KOKORO_SNAPSHOT CHATTERBOX_SNAPSHOT CHATTERBOX_PERTH_SNAPSHOT CHATTERBOX_VE_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KOKORO_SNAPSHOT CHATTERBOX_SNAPSHOT CHATTERBOX_PERTH_SNAPSHOT CHATTERBOX_VE_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1796,6 +1913,18 @@ jobs:
           KOKORO_SNAPSHOT WHISPER_SNAPSHOT CLAP_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          KOKORO_SNAPSHOT WHISPER_SNAPSHOT CLAP_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1837,6 +1966,18 @@ jobs:
           CHATTERBOX_VE_SNAPSHOT MOSS_TTSD_SNAPSHOT MOSS_XY_TOKENIZER_SNAPSHOT
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          CHATTERBOX_VE_SNAPSHOT MOSS_TTSD_SNAPSHOT MOSS_XY_TOKENIZER_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1927,24 +2068,18 @@ jobs:
               exit 1
             fi
           done
-      # sc-17271: same as the JoyCaption lane — the MOSS-TTS-Realtime AR stack and the MOSS-Audio
-      # codec are an 11 GB transfer on a box that does not already hold them, into a cache shared
-      # with every other rw-audio lane. A record rather than a gate, for the reasons spelled out
-      # at the JoyCaption copy.
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
       - name: Report runner disk headroom
-        run: |
-          df -h "$HOME" "${RUNNER_TEMP:-$HOME}" | awk 'NR == 1 || !seen[$0]++'
-          for v in MOSS_TTS_REALTIME_SNAPSHOT MOSS_AUDIO_TOKENIZER_SNAPSHOT WHISPER_SNAPSHOT CHATTERBOX_SNAPSHOT; do
-            path="${!v}"
-            if [[ ! -d "$path" ]]; then
-              echo "$v: ABSENT — this run materializes it from the Hub"
-            elif [[ "$(basename "$(dirname "$path")")" == snapshots ]]; then
-              repo="$(dirname "$(dirname "$path")")"
-              echo "$v: resident, $(du -sh "$repo" | awk '{print $1}') ($(basename "$repo"))"
-            else
-              echo "$v: resident, $(du -shL "$path" | awk '{print $1}')"
-            fi
-          done
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MOSS_TTS_REALTIME_SNAPSHOT MOSS_AUDIO_TOKENIZER_SNAPSHOT WHISPER_SNAPSHOT CHATTERBOX_SNAPSHOT
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
