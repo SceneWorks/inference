@@ -117,5 +117,7 @@ fn convert_assembles_loadable_diffusers_dir() {
         "flux2 true_v2 convert + assemble OK: loadable diffusers dir at {}",
         out.display()
     );
-    let _ = std::fs::remove_dir_all(&out);
+    if std::env::var_os("MLX_GEN_FLUX2_KEEP_CONVERTED").is_none() {
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }

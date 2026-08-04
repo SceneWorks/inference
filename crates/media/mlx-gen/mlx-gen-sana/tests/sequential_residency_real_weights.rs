@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
@@ -101,7 +102,10 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         eprintln!("skipping: set SANA_PIPELINE_WEIGHTS to run the SANA residency A/B");
         return;
     };
-    let req = probe_request();
+    let mut req = probe_request();
+    // Isolate rung 1: an explicit all-disabled request block overrides Sequential's shipping
+    // bounded-decode default, so this A/B compares only the component-residency lifecycle.
+    req.memory = Some(GenerationMemory::default());
     let (pixels_resident, peak_resident) =
         render_measured(OffloadPolicy::Resident, snap.clone(), &req);
     let (pixels_sequential, peak_sequential) =

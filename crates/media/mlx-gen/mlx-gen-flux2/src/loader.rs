@@ -25,7 +25,7 @@ use crate::vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
 /// (`{ "bits", "group_size" }`) [`crate::convert`] writes into `{dir}/config.json`. `None` for a
 /// dense snapshot (block absent / no config) ⇒ the dense load path. Defaults mirror the convert's
 /// (`bits 4`, `group_size 64`) if a field is somehow missing from an otherwise-present block.
-fn read_component_quant(dir: &Path) -> Result<Option<Flux2Quant>> {
+pub(crate) fn read_component_quant(dir: &Path) -> Result<Option<Flux2Quant>> {
     let path = dir.join("config.json");
     if !path.exists() {
         return Ok(None);
@@ -44,6 +44,14 @@ fn read_component_quant(dir: &Path) -> Result<Option<Flux2Quant>> {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(64) as i32,
         }))
+}
+
+pub(crate) fn alias_transformer_double_block(w: &mut Weights, index: usize) {
+    let from = format!("transformer_blocks.{index}.attn.to_out.0");
+    let to = format!("transformer_blocks.{index}.attn.to_out");
+    for suffix in ["weight", "scales", "biases"] {
+        w.alias(&format!("{from}.{suffix}"), &format!("{to}.{suffix}"));
+    }
 }
 
 /// Qwen2 pad token id (`<|endoftext|>`).
@@ -180,11 +188,7 @@ fn load_transformer_with(root: &Path, cfg: &Flux2Config) -> Result<Flux2Transfor
         );
     }
     for i in 0..cfg.num_double_layers {
-        alias_lin(
-            &mut w,
-            &format!("transformer_blocks.{i}.attn.to_out.0"),
-            &format!("transformer_blocks.{i}.attn.to_out"),
-        );
+        alias_transformer_double_block(&mut w, i);
     }
     Flux2Transformer::from_weights_quant(&w, cfg, quant)
 }

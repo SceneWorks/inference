@@ -46,12 +46,13 @@ const DEFAULT_TIMESTEP_TO_START_CFG: usize = 1;
 /// ArcFace (antelopev2) face embedding width — the first half of the IdFormer `id_cond`
 /// (`cat(arcface, id_cond_vit)`). The id_cond_vit half is the EVA head's `proj_dim`.
 const ARCFACE_DIM: i32 = 512;
+pub const MODEL_ID: &str = "pulid_flux";
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         control_kinds: None,
         required_components: &[],
-        id: "pulid_flux",
+        id: MODEL_ID,
         family: "pulid",
         backend: "mlx",
         modality: Modality::Image,
@@ -93,8 +94,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: true, // dev
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            supports_sequential_offload: true,
             supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -133,6 +133,9 @@ pub struct PulidFlux {
     /// computed id_embedding. `pulid_encoder.*` already consumed by `idformer`; `pulid_ca.*` here.
     pulid: Weights,
     face: FaceAnalysis,
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
+    identity_inventory: Option<crate::memory_strategy::IdentityArtifactInventory>,
 }
 
 impl PulidFlux {
@@ -146,6 +149,19 @@ impl PulidFlux {
         face: FaceAnalysis,
     ) -> Result<Self> {
         let idformer = IdFormer::from_weights(&pulid, "pulid_encoder", IdFormerConfig::default())?;
+        let mut memory_strategy = flux.memory_strategy_contract().cloned().unwrap_or_else(|| {
+            gen_core::MemoryProviderContract::compatibility_default(
+                MODEL_ID,
+                gen_core::MemoryBackendRealization::MlxMetal {
+                    bounded_wired_residency: true,
+                    lazy_or_mmap_materialization: true,
+                    explicit_evaluation_and_synchronization: true,
+                    cache_eviction: true,
+                },
+            )
+        });
+        memory_strategy.provider_id = MODEL_ID.into();
+        memory_strategy.calibration = None;
         Ok(Self {
             descriptor: descriptor(),
             flux,
@@ -153,7 +169,26 @@ impl PulidFlux {
             idformer,
             pulid,
             face,
+            memory_strategy,
+            loaded_spec: LoadSpec::new(WeightsSource::Dir("/constructed-pulid".into())),
+            identity_inventory: None,
         })
+    }
+
+    fn new_loaded(
+        flux: Flux1,
+        eva: EvaVisionTransformer,
+        pulid: Weights,
+        face: FaceAnalysis,
+        loaded_spec: LoadSpec,
+        memory_strategy: gen_core::MemoryProviderContract,
+        identity_inventory: crate::memory_strategy::IdentityArtifactInventory,
+    ) -> Result<Self> {
+        let mut model = Self::new(flux, eva, pulid, face)?;
+        model.loaded_spec = loaded_spec;
+        model.memory_strategy = memory_strategy;
+        model.identity_inventory = Some(identity_inventory);
+        Ok(model)
     }
 
     /// Face image (RGB, row-major, `h×w`) → `id_embedding` `[1,32,2048]`. Mirrors PuLID's
@@ -288,6 +323,24 @@ impl Generator for PulidFlux {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(&self.loaded_spec, &self.memory_strategy, context)
+    }
 }
 
 impl PulidFlux {
@@ -299,6 +352,7 @@ impl PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        self.verify_identity_inventory()?;
         // Self-validate first, like every sibling generate_impl (chroma/svd/ideogram) — against
         // PuLID's OWN descriptor floor (F-026), so a caller that skips `validate` still gets the
         // typed `Unsupported` (e.g. `sampler: "hyper"`, which PuLID deliberately doesn't advertise
@@ -327,6 +381,12 @@ impl PulidFlux {
                 NUM_DOUBLE_BLOCKS,
                 NUM_SINGLE_BLOCKS,
             )
+            .map(|ca| {
+                ca.with_bounded_attention(
+                    req.cancel.clone(),
+                    req.memory.is_some_and(|memory| memory.chunk_attention),
+                )
+            })
         };
         // The reference face is consumed into the injector; hand the FLUX backbone a plain request
         // (it rejects conditioning + negative_prompt it doesn't itself implement — both are handled
@@ -342,7 +402,7 @@ impl PulidFlux {
             return Err(Error::Canceled);
         }
         let true_cfg = req.true_cfg.unwrap_or(1.0);
-        if true_cfg > 1.0 + 1e-3 {
+        let result = if true_cfg > 1.0 + 1e-3 {
             // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
             let pos = mk_ca(id_embedding)?;
             let neg = mk_ca(self.compute_uncond_id_embedding()?)?;
@@ -364,7 +424,17 @@ impl PulidFlux {
             // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
             self.flux
                 .generate_with_injector(&flux_req, Some(&mk_ca(id_embedding)?), on_progress)
-        }
+        };
+        self.verify_identity_inventory()?;
+        result
+    }
+
+    fn verify_identity_inventory(&self) -> Result<()> {
+        self.identity_inventory
+            .as_ref()
+            .map_or(Ok(()), |inventory| {
+                inventory.ensure_unchanged().map_err(Into::into)
+            })
     }
 }
 
@@ -443,14 +513,23 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // conditioning (EVA tower, IDFormer, the 20 CA modules) stays f32 — it runs once per image, not
     // per step, so the memory win is the backbone, and the f32 CA residual injects into the (still
     // f32) DiT image stream unchanged. No quant-specific wiring needed here.
-    let flux = load_flux1(FluxVariant::Dev, spec)?;
+    let identity_inventory = crate::memory_strategy::admitted_identity_inventory(spec)?;
+    let memory_strategy =
+        crate::memory_strategy::contract_with_inventory(spec, &identity_inventory)?;
+    identity_inventory.ensure_unchanged()?;
+    let flux = load_flux1(
+        FluxVariant::Dev,
+        &crate::memory_strategy::backbone_spec(spec),
+    )?;
 
     // PuLID encoder + CA weights, cast f32 (conditioning path).
     let mut pulid = Weights::from_file(encoder_path)?;
     pulid.cast_all(Dtype::Float32)?;
+    identity_inventory.ensure_unchanged()?;
 
     // EVA-CLIP tower (f32).
     let eva = load_eva(&eva_path)?;
+    identity_inventory.ensure_unchanged()?;
 
     // Native face stack.
     let face = FaceAnalysis::load(
@@ -460,8 +539,17 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     .with_parser(&Weights::from_file(
         face_dir.join("bisenet_parsing.safetensors"),
     )?)?;
+    identity_inventory.ensure_unchanged()?;
 
-    Ok(Box::new(PulidFlux::new(flux, eva, pulid, face)?))
+    Ok(Box::new(PulidFlux::new_loaded(
+        flux,
+        eva,
+        pulid,
+        face,
+        spec.clone(),
+        memory_strategy,
+        identity_inventory,
+    )?))
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -471,6 +559,19 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load_pulid_flux
 }
+
+pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID,
+    contract: crate::memory_strategy::contract_for,
+    safety_check: crate::memory_strategy::safety_check,
+};
+
+pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_fixture,
+        begin_request: crate::memory_strategy::registered_begin_request,
+    };
 
 #[cfg(test)]
 mod tests {
@@ -714,13 +815,20 @@ mod tests {
         )
         .unwrap();
 
+        let flux = Flux1::new_for_tests(FluxVariant::Dev);
+        let mut memory_strategy = flux.memory_strategy_contract().unwrap().clone();
+        memory_strategy.provider_id = MODEL_ID.into();
+        memory_strategy.calibration = None;
         PulidFlux {
             descriptor: descriptor(),
-            flux: Flux1::new_for_tests(FluxVariant::Dev),
+            flux,
             eva,
             idformer,
             pulid: Weights::empty(),
             face: FaceAnalysis::new_for_tests().unwrap(),
+            memory_strategy,
+            loaded_spec: LoadSpec::new(WeightsSource::Dir("/weightless-pulid".into())),
+            identity_inventory: None,
         }
     }
 

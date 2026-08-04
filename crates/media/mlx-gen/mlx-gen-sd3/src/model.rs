@@ -101,6 +101,8 @@ pub struct Sd3Large {
     /// checks, and the error-safe cache flush once for all providers. The tokenizers stay always-warm
     /// (cheap) on the struct above.
     residency: Residency<Sd3TextEncoders, Sd3Heavy>,
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    loaded_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (everything but the triple text encoder): the MMDiT transformer
@@ -167,6 +169,10 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         }
     }
     let residency = build_residency(spec, variant)?;
+    let memory_strategy = Some(
+        crate::memory_strategy::contract_for(id, spec)
+            .map_err(|error| Error::Msg(error.to_string()))?,
+    );
     Ok(Box::new(Sd3Large {
         variant,
         descriptor: variant.descriptor(),
@@ -174,6 +180,8 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         clip_pad: loader::load_clip_pad_ids(root)?,
         t5_tokenizer: loader::load_t5_tokenizer(root)?,
         residency,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -243,13 +251,65 @@ fn load_heavy(spec: &LoadSpec, root: &Path, variant: Sd3Variant) -> Result<Sd3He
     if !spec.adapters.is_empty() {
         crate::adapters::apply_sd3_adapters(&mut transformer, &spec.adapters)?;
     }
+    if variant == Sd3Variant::Large && crate::memory_strategy::structurally_streamable(spec) {
+        let inventory = crate::artifact_inventory::Sd3ArtifactInventory::verify(spec)?.ok_or_else(
+            || {
+                Error::Unsupported(
+                    "sd3 deferred transformer materialization requires the exact calibrated Stable Diffusion 3.5 Large BF16 HF artifact"
+                        .to_owned(),
+                )
+            },
+        )?;
+        transformer = transformer.with_block_stream(inventory, arch);
+        transformer.finalize_block_stream()?;
+    }
     Ok(Sd3Heavy { transformer, vae })
 }
 
-mlx_gen::impl_generator!(Sd3Large {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+impl Generator for Sd3Large {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.memory_strategy.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{} has no memory-strategy contract", self.descriptor.id),
+            },
+            |contract| crate::memory_strategy::safety_check(&self.loaded_spec, contract, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(&self.loaded_spec, contract, context)
+    }
+}
 
 impl Sd3Large {
     /// The rich-`Result` body behind [`Generator::generate`]. The staged residency lifecycle (triple-TE
@@ -349,10 +409,13 @@ impl Sd3Large {
                 ))?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
+                let attention = crate::memory_strategy::attention_plan(req);
+                let transformer_window = crate::memory_strategy::transformer_window(req)?;
+                let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
                 for i in 0..req.count {
                     let seed = base_seed.wrapping_add(i as u64);
                     let latents = if let Some((init, _)) = reference {
-                        pipeline::denoise_img2img_cfg_with_preview(
+                        pipeline::denoise_img2img_cfg_with_memory(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -369,10 +432,12 @@ impl Sd3Large {
                             &req.cancel,
                             on_progress,
                             &req.preview,
+                            attention,
+                            transformer_window,
                         )?
                     } else {
                         let latents = pipeline::create_noise(seed, req.width, req.height)?;
-                        pipeline::denoise_cfg_with_preview(
+                        pipeline::denoise_cfg_with_memory(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -384,10 +449,17 @@ impl Sd3Large {
                             &req.cancel,
                             on_progress,
                             &req.preview,
+                            attention,
+                            transformer_window,
                         )?
                     };
                     on_progress(Progress::Decoding);
-                    images.push(pipeline::decode_to_image(&heavy.vae, &latents)?);
+                    images.push(pipeline::decode_to_image_tiled(
+                        &heavy.vae,
+                        &latents,
+                        decode_tiling.as_ref(),
+                        &req.cancel,
+                    )?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -474,6 +546,35 @@ mlx_gen::register_generators! {
     pub(crate) const LARGE_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+macro_rules! memory_registration {
+    ($registration:ident, $behavior:ident, $provider_id:expr) => {
+        pub(crate) const $registration: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| crate::memory_strategy::contract_for($provider_id, spec),
+                safety_check: crate::memory_strategy::safety_check,
+            };
+        pub(crate) const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::memory_strategy::registered_fixture,
+                begin_request: crate::memory_strategy::registered_begin_request,
+            };
+    };
+}
+
+memory_registration!(LARGE_MEMORY_REGISTRATION, LARGE_MEMORY_BEHAVIOR, MODEL_ID);
+memory_registration!(
+    TURBO_MEMORY_REGISTRATION,
+    TURBO_MEMORY_BEHAVIOR,
+    TURBO_MODEL_ID
+);
+memory_registration!(
+    MEDIUM_MEMORY_REGISTRATION,
+    MEDIUM_MEMORY_BEHAVIOR,
+    MEDIUM_MODEL_ID
+);
 mlx_gen::register_generators! {
     pub(crate) const TURBO_REGISTRATION = turbo_descriptor => load_turbo;
     footprint = component_footprint
