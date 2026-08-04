@@ -1473,10 +1473,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # cannot tell a working predicate from a malformed one — and a malformed predicate fails
         # the same silent way the story's inert one did: `log show` exits non-zero, the script's
         # `else` branch prints "log show failed", the lane stays green, and the capture records
-        # nothing. So actually run it. macOS-only, and skipped rather than failed elsewhere: this
-        # suite also runs on the Linux and Windows lanes, where there is no unified log at all.
+        # nothing. So actually run it.
+        #
+        # HONEST SCOPE, because this is the exact trap the change is about. `scripts/tests` runs on
+        # `ubuntu-latest` in ci.yml and NOWHERE ELSE, so this assertion never executes in CI — it is
+        # a developer-machine gate that fires for anyone running the suite on a Mac, which is where
+        # this script is written and where the lanes it guards run. Do not read a green CI as having
+        # checked the predicate. The runtime backstop is `report` printing "log show failed", which
+        # does run on the lanes.
         if sys.platform != "darwin":
-            self.skipTest("`log show` is macOS-only; predicate is validated on the macOS lanes")
+            self.skipTest(
+                "`log show` is macOS-only, and this suite runs on ubuntu-latest in CI — the "
+                "predicate parse check fires only on a developer Mac"
+            )
         predicate = re.search(r"--predicate '(.+?)' \\\n", code, re.DOTALL)
         self.assertIsNotNone(predicate, "could not extract the predicate from the script")
         probe = subprocess.run(
@@ -1486,8 +1495,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             text=True,
             check=False,
         )
-        self.assertEqual(
-            probe.returncode, 0, f"the shipped predicate does not parse: {probe.stderr.strip()}"
+        # Assert on the PARSE, not on the exit code. `log show` can fail for reasons that say
+        # nothing about the predicate — a sandboxed or restricted host, a busy log archive — and
+        # failing the suite on those would be a flake that teaches people to ignore this test.
+        # A malformed predicate is unambiguous and specific: `log: Bad predicate (...)`.
+        self.assertNotIn(
+            "Bad predicate",
+            probe.stderr,
+            f"the shipped predicate does not parse: {probe.stderr.strip()}",
         )
 
     def test_krea_e2e_step_pins_its_run_count_and_excludes_the_s18_sweep(self) -> None:
