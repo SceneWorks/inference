@@ -302,51 +302,64 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// to *choose* it, against calibration for that cadence, rather than receive it by omission.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
-/// The rung-4 **component scopes** this provider implements.
+/// The rung-4 **component scopes** this provider implements — and Kolors is the first MLX provider
+/// to implement more than one.
 ///
-/// `Dit` only — here meaning the U-Net's eleven `Transformer2D` sub-stacks, which is what this
-/// architecture's denoising transformer *is*.
+/// `Dit` is the U-Net's eleven `Transformer2D` sub-stacks (70 blocks), reached through the
+/// re-exported `mlx_gen_sdxl::block_stream`. `TextEncoder` is the ChatGLM3-6B tower's 28 `GlmBlock`s,
+/// reached through `crate::block_stream`. `Both` composes them in one request.
 ///
-/// **The other candidate scope had to be measured rather than dismissed, and this is the one place
-/// SDXL's answer could not have been reused.** SDXL declares `Dit` only because its dual CLIP towers
-/// are shed by rung 1 before the U-Net loads, so windowing them would bound a phase the prerequisite
-/// rung already releases entirely. Kolors' conditioning tower is **ChatGLM3-6B** — a uniform 28-layer
-/// `Vec<GlmBlock>`, structurally windowable, and 3.06 GiB even at q4 against the U-Net's 1.44 GiB.
-/// It is by far the largest single component in the model, so "rung 1 already releases it" is not
-/// obviously the end of the argument the way it is on SDXL: rung 1 releases it *before the denoise*,
-/// but the **conditioning phase itself** still has to hold it, and if that phase were the
-/// peak-bearing one a text-encoder window would move the request peak.
+/// ## Why the second scope exists here and nowhere else on this ladder
 ///
-/// Measured (`the_text_encoder_window_scope_cannot_move_the_request_peak`, per tier, per advertised
-/// geometry, conditioning-phase peak vs denoise+decode-phase peak, GiB):
+/// `gen_core::TransformerComponent::TextEncoder` has existed since SC-15449 and no adopter had ever
+/// populated it. SDXL's reasoning for `Dit`-only is sound *on SDXL*: its dual CLIP towers are shed by
+/// rung 1 before the U-Net loads, so windowing them would bound a phase that is never the maximum —
+/// and the epic is explicit that bounding a non-peak phase is not a saving.
 ///
-/// | tier | output | conditioning phase | denoise + decode phase | peak-bearing phase |
-/// |---|---:|---:|---:|---|
-/// | q4 | 512² | 3.199 | 3.088 | conditioning |
-/// | q4 | 1024² | 3.199 | 7.674 | denoise + decode |
-/// | q4 | 2048² | 3.199 | 27.246 | denoise + decode |
-/// | q8 | 1024² | 5.876 | 8.755 | denoise + decode |
+/// Kolors' tower is **ChatGLM3-6B**, larger than the U-Net at every tier (3.98 / 6.64 / 11.63 GiB
+/// against 1.80 / 2.84 / 4.80). So "rung 1 already sheds it" is not the end of the argument: rung 1
+/// sheds it before the *denoise*, but the conditioning phase itself still has to hold it. Measured
+/// per tier per advertised geometry
+/// (`the_text_encoder_window_scope_cannot_move_the_request_peak`, conditioning-phase peak against
+/// the whole-request peak, GiB):
 ///
-/// **At 512² the conditioning phase IS the peak-bearing one**, and that is a genuine divergence from
-/// SDXL, where the CLIP pair never carries the peak at any geometry. A text-encoder window would
-/// have moved the request peak there. It is still not published, and the reason is a *second*
-/// measurement rather than a shrug: the conditioning-phase peak is **3.199 GiB against a 3.056 GiB
-/// resident weight set**, i.e. the phase is 95.5% weights and 4.5% activations, and a 28-block
-/// window at the tightest cadence bounds the resident weight term to 0.109 GiB — but only if the
-/// blocks are re-readable, and **they are not**. `ChatGlmModel::from_weights` builds the 28 blocks
-/// out of one `Weights` view of a **sharded** checkpoint whose shards Kolors' loader materializes
-/// eagerly for the `encode_prompt` walk, and the encoder is dropped whole by rung 1 immediately
-/// afterwards. Arming a stream over it would mean re-opening a 3-shard index once per window inside
-/// a phase that lasts one forward — the re-open cost is paid 28 times against a phase that runs
-/// once, where the U-Net's is paid against 4–50 denoise steps.
+/// | tier | 512² | 1024² | 2048² |
+/// |---|---|---|---|
+/// | q4 | 3.769 / 5.620 | 3.781 / 16.041 | 3.781 / 57.062 |
+/// | q8 | 6.353 / 6.894 | 6.430 / 17.086 | 6.430 / 58.107 |
+/// | **bf16** | **11.360 / 11.360** | 11.364 / 19.031 | 11.364 / 60.053 |
 ///
-/// So the honest statement is: **the scope is structurally available and would move the request peak
-/// at exactly one advertised geometry (512²), and this provider does not implement it.** That is
-/// recorded here with the numbers, and `TextEncoder` is a typed rejection rather than a silent
-/// narrowing to `Dit` — see `transformer_window_size`. sc-17690 tracks the implementation.
-pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[TransformerComponent::Dit];
+/// **One cell of nine is conditioning-bearing: `bf16` at the advertised `min_size`.** There the
+/// request peak *is* the ChatGLM3 residency, and a text-encoder window moves it — which is a
+/// measured saving, not a phase win, and therefore something a caller must be able to select. It is
+/// also a cell a caller can genuinely land on: `bf16` is an advertised tier and 512² is
+/// `descriptor().capabilities.min_size`.
+///
+/// ## The two scopes have opposite cost shapes, which is why they are separately selectable
+///
+/// `gen_core`'s own note on the variant says it: the encoder re-materializes **once per generation**
+/// while the DiT re-materializes once per denoise **step**. Measured here, the text-encoder window
+/// costs 28 block re-opens against a phase that runs once; the U-Net window costs 70 re-opens across
+/// eleven sub-stacks against a phase that runs `steps` times. Folding them into one flag would have
+/// forced a caller who wants the cheap one to buy the expensive one.
+///
+/// The production **default** stays [`TRANSFORMER_WINDOW_COMPONENT`] = `Dit`, because that is the
+/// scope that pays at the tier and geometry the catalog defaults to.
+pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
+    TransformerComponent::Dit,
+    TransformerComponent::TextEncoder,
+    TransformerComponent::Both,
+];
 
-/// The scope this provider declares as its production selection.
+/// The scope this provider declares as its production selection — the one a request that engages
+/// rung 4 without naming a component receives.
+///
+/// `Dit`, because it is the scope that pays at the tier and geometry the catalog defaults to (`q4`,
+/// 1024²), where the conditioning phase is 3.78 GiB against a 16.04 GiB request peak and a
+/// text-encoder window would therefore bound nothing a selector could admit against. A caller on the
+/// one conditioning-bearing cell — `bf16` at the advertised `min_size` — has to *choose*
+/// `TextEncoder` (or `Both`), against calibration for that scope, rather than receive it by
+/// omission. See [`TRANSFORMER_WINDOW_COMPONENTS`] for the per-cell measurement.
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
 
 /// Calibration content fingerprint. It must change whenever quantization floors, tensor layout, or
@@ -388,6 +401,7 @@ pub fn streamable(spec: &LoadSpec) -> bool {
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, WeightsSource::Dir(_))
         && load_leaves_blocks_lazy(spec)
+        && text_encoder_leaves_blocks_lazy(spec)
         && adapters_are_replayable(spec)
 }
 
@@ -420,6 +434,32 @@ pub fn load_leaves_blocks_lazy(spec: &LoadSpec) -> bool {
     };
     matches!(
         mlx_gen::quant::needs_load_time_quant(root, "unet", quant.bits(), crate::MODEL_ID),
+        Ok(false)
+    )
+}
+
+/// Whether this load leaves the **ChatGLM3-6B** blocks unmaterialized — the text-encoder half of
+/// [`streamable`].
+///
+/// Checked separately from [`load_leaves_blocks_lazy`] rather than inferred from it, even though
+/// every shipped `SceneWorks/kolors-mlx` tier packs both components together. Rung 4 publishes a
+/// `TextEncoder` scope on this family, so a snapshot whose `unet/` is packed and whose
+/// `text_encoder/` is dense would arm a window over a tower `KolorsText::quantize` had already
+/// materialized — which bounds nothing and adds a copy. Deriving one from the other would make that
+/// shape invisible.
+///
+/// The rung is declared all-or-nothing across scopes (one `transformer_window_materialization` flag,
+/// one published component list), so this composes into [`streamable`] rather than gating only the
+/// `TextEncoder` arm: a half-streamable load would publish scopes it cannot honour.
+pub fn text_encoder_leaves_blocks_lazy(spec: &LoadSpec) -> bool {
+    let Some(quant) = spec.quantize else {
+        return true;
+    };
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return false;
+    };
+    matches!(
+        mlx_gen::quant::needs_load_time_quant(root, "text_encoder", quant.bits(), crate::MODEL_ID),
         Ok(false)
     )
 }
@@ -674,8 +714,8 @@ pub(crate) fn safety_check(
             if !contract.lifecycle.transformer_window_materialization {
                 return Err(CoreError::Unsupported(format!(
                     "{}: bounded transformer residency requires a DeferredMaterialization load over \
-                     a snapshot directory whose U-Net stays lazy and whose adapters (if any) are \
-                     replayable — see memory_strategy::streamable",
+                     a snapshot directory whose U-Net AND ChatGLM3 blocks stay lazy and whose \
+                     adapters (if any) are replayable — see memory_strategy::streamable",
                     contract.provider_id
                 )));
             }
@@ -818,10 +858,36 @@ fn begin_with_cleanup(
 
 // ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────
 
-/// Rung 4: the requested window cadence, or `None` for the resident stacks. A scope this family does
-/// not implement — or a cadence outside the measured [`TRANSFORMER_WINDOW_SIZES`] — is a typed
-/// rejection rather than a silently narrowed (or silently *widened*) execution.
-pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
+/// The rung-4 selection this request resolved to: a cadence, and which transformer stack(s) it
+/// applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TransformerWindow {
+    pub size: usize,
+    pub component: TransformerComponent,
+}
+
+impl TransformerWindow {
+    /// The cadence for the U-Net's eleven `Transformer2D` sub-stacks, or `None` when this scope
+    /// leaves them resident.
+    pub(crate) fn dit(&self) -> Option<usize> {
+        self.component.includes_dit().then_some(self.size)
+    }
+
+    /// The cadence for the ChatGLM3-6B tower's 28 blocks, or `None` when this scope leaves them
+    /// resident.
+    pub(crate) fn text_encoder(&self) -> Option<usize> {
+        self.component.includes_text_encoder().then_some(self.size)
+    }
+}
+
+/// Rung 4: the requested window cadence and scope, or `None` for the resident stacks.
+///
+/// A scope this family does not implement — or a cadence outside the measured
+/// [`TRANSFORMER_WINDOW_SIZES`] — is a typed rejection rather than a silently narrowed (or silently
+/// *widened*) execution.
+pub(crate) fn transformer_window(
+    req: &GenerationRequest,
+) -> mlx_gen::Result<Option<TransformerWindow>> {
     let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
         return Ok(None);
     };
@@ -830,10 +896,8 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
         .unwrap_or(TRANSFORMER_WINDOW_COMPONENT);
     if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
         return Err(mlx_gen::Error::Unsupported(format!(
-            "kolors implements only the {TRANSFORMER_WINDOW_COMPONENT:?} transformer window \
-             component, got {component:?}. The ChatGLM3-6B TextEncoder scope is structurally \
-             windowable and would move the request peak at 512² only; it is not implemented — see \
-             memory_strategy::TRANSFORMER_WINDOW_COMPONENTS"
+            "kolors implements the {TRANSFORMER_WINDOW_COMPONENTS:?} transformer window components, \
+             got {component:?}"
         )));
     }
     let size = memory
@@ -842,7 +906,10 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
     validate_window(size).map_err(|error| {
         mlx_gen::Error::Unsupported(format!("kolors transformer window rejected: {error}"))
     })?;
-    Ok(Some(size as usize))
+    Ok(Some(TransformerWindow {
+        size: size as usize,
+        component,
+    }))
 }
 
 /// Rung 2: **always a refusal.** Bounded decode is `Missing` on this provider ([`DECODE_SUPPORT`]),
@@ -1118,9 +1185,23 @@ mod tests {
                 ..Default::default()
             };
         for size in TRANSFORMER_WINDOW_SIZES {
+            let resolved = transformer_window(&request(windowed(Some(*size), None)))
+                .unwrap()
+                .expect("an engaged rung 4 resolves to a window");
+            assert_eq!(resolved.size, *size as usize);
+            assert_eq!(resolved.component, TRANSFORMER_WINDOW_COMPONENT);
+        }
+        // Every published scope resolves, and each one reaches exactly the stacks it names. This is
+        // the assertion that would have caught a `Both` silently narrowed to `Dit`.
+        for component in TRANSFORMER_WINDOW_COMPONENTS {
+            let resolved = transformer_window(&request(windowed(Some(1), Some(*component))))
+                .unwrap()
+                .expect("a published scope must resolve");
+            assert_eq!(resolved.component, *component);
+            assert_eq!(resolved.dit().is_some(), component.includes_dit());
             assert_eq!(
-                transformer_window_size(&request(windowed(Some(*size), None))).unwrap(),
-                Some(*size as usize)
+                resolved.text_encoder().is_some(),
+                component.includes_text_encoder()
             );
         }
         // Out-of-domain cadences, chosen to sit *between* and *beyond* the published ones rather
@@ -1133,37 +1214,36 @@ mod tests {
                 "the negative case list must stay disjoint from the published domain"
             );
             assert!(
-                transformer_window_size(&request(windowed(Some(bad), None))).is_err(),
+                transformer_window(&request(windowed(Some(bad), None))).is_err(),
                 "window {bad} must be refused"
             );
         }
-        // The request-side default is the TIGHTEST cadence.
-        assert_eq!(
-            transformer_window_size(&request(windowed(None, None))).unwrap(),
-            Some(TRANSFORMER_WINDOW_SIZE as usize)
-        );
+        // The request-side default is the TIGHTEST cadence at the DEFAULT scope.
+        let defaulted = transformer_window(&request(windowed(None, None)))
+            .unwrap()
+            .expect("an engaged rung 4 resolves to a window");
+        assert_eq!(defaulted.size, TRANSFORMER_WINDOW_SIZE as usize);
+        assert_eq!(defaulted.component, TRANSFORMER_WINDOW_COMPONENT);
         assert_eq!(
             TRANSFORMER_WINDOW_SIZE, TRANSFORMER_WINDOW_SIZES[0],
             "the default must be the TIGHTEST published cadence — a default is what a caller gets \
              without asking, so it must be safe across the whole advertised geometry range rather \
              than optimal at the points that happened to be measured"
         );
-        // The ChatGLM3-6B scope is a typed rejection, never a silent narrowing to `Dit`, and the
-        // refusal SAYS which component it is so the next reader is not left guessing.
-        for component in [
-            TransformerComponent::TextEncoder,
-            TransformerComponent::Both,
-        ] {
-            let err = transformer_window_size(&request(windowed(Some(1), Some(component))))
-                .expect_err("component {component:?} must be refused, never narrowed to Dit");
-            assert!(
-                err.to_string().contains("ChatGLM3-6B"),
-                "the refusal must name the unimplemented scope, got: {err}"
-            );
-        }
-        assert!(transformer_window_size(&request(GenerationMemory::default()))
+        assert!(transformer_window(&request(GenerationMemory::default()))
             .unwrap()
             .is_none());
+        // All three scopes are published, and the default is the one that pays at the catalog's
+        // default tier and geometry.
+        assert_eq!(
+            TRANSFORMER_WINDOW_COMPONENTS,
+            &[
+                TransformerComponent::Dit,
+                TransformerComponent::TextEncoder,
+                TransformerComponent::Both
+            ]
+        );
+        assert_eq!(TRANSFORMER_WINDOW_COMPONENT, TransformerComponent::Dit);
     }
 
     /// Rung 1's default follows the load-time policy, and a request overrides it in both directions.

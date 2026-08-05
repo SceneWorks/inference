@@ -38,7 +38,9 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::{GenerationMemory, GenerationOutput, GenerationRequest, Progress};
+use mlx_gen::gen_core::{
+    GenerationMemory, GenerationOutput, GenerationRequest, Progress, TransformerComponent,
+};
 use mlx_gen::memory::MEMORY_CAP_ENV;
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Quant, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
@@ -183,10 +185,14 @@ fn staged() -> GenerationMemory {
 }
 
 fn full_ladder(window: u32) -> GenerationMemory {
+    full_ladder_scoped(window, ms::TRANSFORMER_WINDOW_COMPONENT)
+}
+
+fn full_ladder_scoped(window: u32, component: TransformerComponent) -> GenerationMemory {
     GenerationMemory {
         stream_transformer_blocks: true,
         transformer_window_size: Some(window),
-        transformer_window_component: Some(ms::TRANSFORMER_WINDOW_COMPONENT),
+        transformer_window_component: Some(component),
         ..staged()
     }
 }
@@ -1101,46 +1107,65 @@ fn the_cadence_flatness_condition_is_checked_not_assumed() {
 #[test]
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
-    let dir = require_tier(DEFAULT_TIER);
-    let mut conditioning_bearing: Vec<u32> = Vec::new();
-    let mut default_geometry_bearing = None;
-    for edge in [512u32, 1024, 2048] {
-        let (row, conditioning) =
-            measure_end_to_end_phased(&dir, DEFAULT_TIER, edge, 1, false, None);
-        // The whole-request peak is the max over phases; the denoise+decode phase's own peak is
-        // therefore the request peak whenever it exceeds the conditioning phase's.
-        let bearing = if conditioning >= row.peak_gib {
-            "conditioning"
-        } else {
-            "denoise + decode"
+    let mut bearing: Vec<(String, u32)> = Vec::new();
+    let mut default_cell = None;
+    let mut measured = 0;
+    for tier in TIERS {
+        let Some(dir) = tier_dir(tier) else {
+            println!("SKIPPED-BY-ABSENCE: tier {tier} is not cached under {ROOT_ENV}");
+            continue;
         };
-        println!(
-            "[sc-15521 rung4 TextEncoder scope {DEFAULT_TIER} {edge}²] conditioning phase {:.4} \
-             GiB, request {:.4} GiB -> peak-bearing phase: {bearing}",
-            conditioning, row.peak_gib
-        );
-        if bearing == "conditioning" {
-            conditioning_bearing.push(edge);
+        for edge in [512u32, 1024, 2048] {
+            let (row, conditioning) = measure_end_to_end_phased(&dir, tier, edge, 1, false, None);
+            // The whole-request peak is the max over phases, so the conditioning phase is the
+            // peak-bearing one exactly when the request peak never rose above it.
+            let conditioning_bearing = conditioning >= row.peak_gib;
+            println!(
+                "[sc-15521 rung4 TextEncoder scope {tier} {edge}²] conditioning phase {conditioning:.4} \
+                 GiB, request {:.4} GiB -> peak-bearing phase: {}",
+                row.peak_gib,
+                if conditioning_bearing { "conditioning" } else { "denoise + decode" }
+            );
+            if conditioning_bearing {
+                bearing.push(((*tier).to_owned(), edge));
+            }
+            if *tier == DEFAULT_TIER && edge == 1024 {
+                default_cell = Some(conditioning_bearing);
+            }
+            measured += 1;
+            clear_cache();
         }
-        if edge == 1024 {
-            default_geometry_bearing = Some(bearing);
-        }
-        clear_cache();
     }
+    assert!(measured > 0, "SKIPPED-BY-ABSENCE: no tier was cached under {ROOT_ENV}");
     println!(
-        "[sc-15521 rung4 TextEncoder scope] conditioning phase carries the request peak at \
-         {conditioning_bearing:?} of the advertised range"
+        "[sc-15521 rung4 TextEncoder scope] the conditioning phase carries the request peak at \
+         {bearing:?} of the advertised (tier × geometry) range"
     );
     assert_eq!(
-        default_geometry_bearing,
-        Some("denoise + decode"),
-        "the conditioning phase now carries the request peak at the catalog's default geometry, so \
-         a TextEncoder-scoped window WOULD move the request peak there. \
-         TRANSFORMER_WINDOW_COMPONENTS declares `Dit` only on the opposite finding — re-open it"
+        default_cell,
+        Some(false),
+        "the conditioning phase now carries the request peak at the catalog's DEFAULT tier and \
+         geometry, so a TextEncoder-scoped window would move the request peak for the median \
+         caller. TRANSFORMER_WINDOW_COMPONENTS declares `Dit` only, and its recorded reason is that \
+         the scope pays at the small-output corner and nowhere else — re-open it"
     );
     assert!(
-        !ms::TRANSFORMER_WINDOW_COMPONENTS.contains(&mlx_gen::gen_core::TransformerComponent::TextEncoder),
-        "TextEncoder is declared but this provider does not implement a ChatGLM3 block stream"
+        ms::TRANSFORMER_WINDOW_COMPONENTS.contains(&TransformerComponent::TextEncoder),
+        "the conditioning phase carries the request peak at {bearing:?}, so the TextEncoder scope \
+         must be published and implemented rather than declared away"
+    );
+    assert_eq!(
+        ms::TRANSFORMER_WINDOW_COMPONENT,
+        TransformerComponent::Dit,
+        "the DEFAULT scope must be the one that pays at the catalog's default tier and geometry"
+    );
+    // Pin the SHAPE of the finding, not just the default cell: the scope's value is confined to the
+    // small-output corner, which is what makes `Dit`-only defensible. A cell at 1024² or above
+    // turning conditioning-bearing changes that argument.
+    assert!(
+        bearing.iter().all(|(_, edge)| *edge <= 512),
+        "the conditioning phase now carries the request peak at an output above the advertised \
+         min_size ({bearing:?}) — TRANSFORMER_WINDOW_COMPONENTS' recorded reason no longer holds"
     );
 }
 
@@ -1194,18 +1219,30 @@ fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path(
         );
     }
 
-    // The unimplemented scope is refused by the production path too, not narrowed to `Dit`.
-    let text_scope = GenerationMemory {
-        transformer_window_component: Some(mlx_gen::gen_core::TransformerComponent::TextEncoder),
-        ..full_ladder(ms::TRANSFORMER_WINDOW_SIZE)
-    };
-    let err = model
-        .generate(&request(Some(text_scope), 512, 1), &mut |_: Progress| {})
-        .expect_err("the TextEncoder scope must be refused by the production path");
-    assert!(
-        err.to_string().contains("ChatGLM3-6B"),
-        "the refusal must name the unimplemented scope, got: {err}"
-    );
+    // Every PUBLISHED scope is reachable on the production path and none is silently narrowed.
+    // A scope that resolved to `Dit` behind the caller's back would render identically to the `Dit`
+    // row, which is precisely what the byte-identity check below cannot distinguish — so the peak
+    // rows in `the_text_encoder_window_bounds_the_conditioning_bearing_cell` carry that half.
+    for component in ms::TRANSFORMER_WINDOW_COMPONENTS {
+        let out = model.generate(
+            &request(
+                Some(full_ladder_scoped(ms::TRANSFORMER_WINDOW_SIZE, *component)),
+                512,
+                1,
+            ),
+            &mut |_: Progress| {},
+        );
+        println!(
+            "WINDOW-REQUEST component={component:?} admitted={} refused={}",
+            out.is_ok(),
+            out.is_err()
+        );
+        assert!(
+            out.is_ok(),
+            "published scope {component:?} must be reachable on the production path: {:?}",
+            out.err()
+        );
+    }
 }
 
 /// **Rung 4's preconditions fail closed on real weights.**
@@ -1441,5 +1478,96 @@ fn the_full_ladder_renders_under_a_memory_cap() {
     assert_eq!(
         capped.pixels, windowed.pixels,
         "the capped render must be byte-identical to the uncapped windowed one"
+    );
+}
+
+/// **The `TextEncoder` scope measured where it pays** — the `bf16` tier at the advertised
+/// `min_size`, the one cell of nine where the ChatGLM3-6B conditioning phase carries the request
+/// peak (`the_text_encoder_window_scope_cannot_move_the_request_peak`).
+///
+/// Three rows, and the contrast between them is the whole point:
+///
+/// * `Dit` — bounds the U-Net's 70 blocks, in a phase that is **not** the peak-bearing one here, so
+///   the request peak barely moves;
+/// * `TextEncoder` — bounds the 28 GLM blocks, in the phase that **is**, so the request peak falls;
+/// * `Both` — bounds both, and must be at least as good as either.
+///
+/// Every row must be byte-identical to the staged control: a windowed block is re-materialized
+/// through the same constructor with the same replayed tier, so only residency differs. That
+/// identity is also the guard against a stream that silently dropped per-block state — Kolors
+/// installs none on a `GlmBlock` today, and this is what would notice if that changed.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_text_encoder_window_bounds_the_conditioning_bearing_cell() {
+    // The cell is `bf16` at `descriptor().capabilities.min_size`.
+    const TIER: &str = "bf16";
+    const EDGE: u32 = 512;
+    let dir = require_tier(TIER);
+    let control = measure(
+        &dir,
+        TIER,
+        LoadShape::DeferredMaterialization,
+        &request(Some(staged()), EDGE, STEPS),
+    );
+    let mut rows = Vec::new();
+    for component in ms::TRANSFORMER_WINDOW_COMPONENTS {
+        let row = measure(
+            &dir,
+            TIER,
+            LoadShape::DeferredMaterialization,
+            &request(
+                Some(full_ladder_scoped(ms::TRANSFORMER_WINDOW_SIZE, *component)),
+                EDGE,
+                STEPS,
+            ),
+        );
+        println!(
+            "[sc-15521 rung4 scope {TIER} {EDGE}² {STEPS} steps] {component:?}: {:.4} GiB ({:+.2}%) \
+              {:.0} ms/step  max Δ {}",
+            row.peak_gib,
+            100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
+            ms_per_step(&row, STEPS),
+            max_delta(&control.pixels, &row.pixels),
+        );
+        assert_eq!(
+            control.pixels, row.pixels,
+            "scope {component:?} is a residency change, not an arithmetic one"
+        );
+        rows.push((*component, row.peak_gib));
+    }
+    println!(
+        "[sc-15521 rung4 scope {TIER} {EDGE}²] staged control {:.4} GiB",
+        control.peak_gib
+    );
+    let peak_of = |c: TransformerComponent| {
+        rows.iter()
+            .find(|(component, _)| *component == c)
+            .map(|(_, peak)| *peak)
+            .expect("every published scope was measured")
+    };
+    let dit = peak_of(TransformerComponent::Dit);
+    let text = peak_of(TransformerComponent::TextEncoder);
+    let both = peak_of(TransformerComponent::Both);
+
+    // The claim `TRANSFORMER_WINDOW_COMPONENTS` publishes the second scope on: at this cell the
+    // text-encoder window moves the REQUEST peak, and by more than the 3% margin the ladder holds
+    // every implemented rung to.
+    assert!(
+        text < control.peak_gib * 0.97,
+        "the TextEncoder scope must bound the request peak at the one conditioning-bearing cell \
+         ({text:.4} vs {:.4} GiB) — that measurement is why the scope is published at all",
+        control.peak_gib
+    );
+    // And the contrast that makes it a distinct scope rather than a spelling of `Dit`: the U-Net
+    // window cannot reach this peak, because the phase it bounds is not the peak-bearing one here.
+    assert!(
+        text < dit,
+        "the TextEncoder scope must beat the Dit scope at the cell where the CONDITIONING phase \
+         carries the peak ({text:.4} vs {dit:.4} GiB). If it does not, the two scopes are not \
+         distinguishable here and publishing both puts a meaningless choice in front of a selector"
+    );
+    assert!(
+        both <= text * 1.01,
+        "`Both` must be at least as good as `TextEncoder` alone ({both:.4} vs {text:.4} GiB)"
     );
 }

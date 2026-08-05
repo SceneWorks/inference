@@ -217,10 +217,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    // F-181: Kolors quantizes the U-Net + ChatGLM3 DENSE at load, so a `Sequential` + `quantize` load
-    // re-quantizes each generate (repeated compute; the dense transient shrinks the memory win).
+    // F-181: a `Sequential` + `quantize` load over a **dense** snapshot re-quantizes each generate
+    // (repeated compute; the dense transient shrinks the memory win).
+    //
+    // SC-15521 narrowed the condition. The advisory used to fire on every staged quantized load,
+    // including the three shipped `SceneWorks/kolors-mlx` tiers whose weights are already packed —
+    // where nothing re-quantizes and the message is simply wrong. Staged residency is the ladder's
+    // rung 1 and therefore now the *normal* path, so an advisory that cried wolf on every default
+    // request would have trained readers to ignore it. `load_leaves_blocks_lazy` is the same
+    // predicate rung 4 gates on, so the warning and the rung cannot disagree about which loads pack
+    // at load time.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && !crate::memory_strategy::load_leaves_blocks_lazy(spec)
+        {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
@@ -270,6 +280,13 @@ pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<KolorsText, K
             // quantizes in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
             if let Some(q) = spec_text.quantize {
                 text.quantize(q.bits())?;
+            }
+            // Ladder rung 4's `TextEncoder` scope (SC-15521) — armed after the quantize, so the
+            // recorded tier is the one the resident blocks carry. Nothing is installed on a
+            // `GlmBlock` at load, so unlike the U-Net there is nothing to capture; see
+            // `crate::block_stream`.
+            if crate::memory_strategy::streamable(&spec_text) {
+                text.arm_block_stream(&root, spec_text.quantize.map(|q| q.bits()))?;
             }
             Ok(text)
         },
@@ -500,19 +517,21 @@ impl KolorsGenerator {
         // request that names nothing keeps.
         let stage_residency =
             crate::memory_strategy::stage_residency(req, self.default_stage_residency);
-        let window_size = crate::memory_strategy::transformer_window_size(req)?;
+        let window = crate::memory_strategy::transformer_window(req)?;
+        let dit_window = window.and_then(|w| w.dit());
+        let text_window = window.and_then(|w| w.text_encoder());
         // Two fail-closed guards a calibration harness driving `generate` with a hand-built
         // `GenerationMemory` must still cross — it never went through `safety_check`.
-        if window_size.is_some() && !self.streamable {
+        if window.is_some() && !self.streamable {
             return Err(Error::Unsupported(
                 "kolors: bounded transformer residency needs a DeferredMaterialization load over a \
-                 snapshot directory whose U-Net stays lazy (a pre-quantized tier, or dense with no \
+                 snapshot directory whose U-Net AND ChatGLM3 blocks stay lazy (a pre-quantized tier, or dense with no \
                  --quantize) and whose adapters (if any) are replayable; this generator cannot \
                  stream its blocks"
                     .into(),
             ));
         }
-        if window_size.is_some() && !stage_residency {
+        if window.is_some() && !stage_residency {
             return Err(Error::Unsupported(
                 "kolors: bounded transformer residency requires staged residency engaged in the \
                  same request — without the phase release the 6B ChatGLM3 encoder stays resident \
@@ -523,7 +542,7 @@ impl KolorsGenerator {
         let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
         let forward_plan =
             SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
-                .with_window(window_size.map(|size| SdxlBlockWindow {
+                .with_window(dit_window.map(|size| SdxlBlockWindow {
                     size,
                     cancel: &req.cancel,
                 }));
@@ -539,10 +558,20 @@ impl KolorsGenerator {
             // ChatGLM3 encoder before the U-Net/VAE load — bounding peak to `max(ChatGLM3, U-Net+VAE)`.
             // The negative encode is skipped when guidance is off (F-005, sc-9091): the per-mode
             // assemblies build B=1 conditioning for `cfg <= 1.0` and never read the uncond stream.
+            // Ladder rung 4's `TextEncoder` scope (SC-15521) lands HERE, not in the denoise: the
+            // ChatGLM3-6B tower is the largest component in the model, and at the one advertised
+            // cell where the conditioning phase carries the request peak (`bf16` at `min_size`) a
+            // window over these 28 blocks is what moves it. `encode_windowed` is bit-identical to
+            // `encode` — same constructor, same replayed tier — so the negative encode is windowed
+            // too rather than left resident beside a windowed positive.
             |text: &KolorsText| {
-                let pos = text.encode(&req.prompt)?;
+                let encode = |prompt: &str| match text_window {
+                    Some(size) => text.encode_windowed(prompt, size, &req.cancel),
+                    None => text.encode(prompt),
+                };
+                let pos = encode(&req.prompt)?;
                 let neg = if cfg > 1.0 {
-                    Some(text.encode(negative)?)
+                    Some(encode(negative)?)
                 } else {
                     None
                 };

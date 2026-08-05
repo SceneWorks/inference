@@ -250,6 +250,53 @@ impl KolorsText {
         self.chatglm
             .encode_prompt(&t.input_ids, &t.attention_mask, Some(&t.position_ids))
     }
+
+    /// Ladder rung 4, `TransformerComponent::TextEncoder` scope (SC-15521): the same encode with at
+    /// most `window` consecutive GLM blocks materialized at once.
+    ///
+    /// Bit-identical to [`encode`](Self::encode) — the window re-materializes each block through the
+    /// same constructor and replays the same tier, so only the residency differs.
+    pub fn encode_windowed(
+        &self,
+        prompt: &str,
+        window: usize,
+        cancel: &CancelFlag,
+    ) -> Result<(Array, Array)> {
+        let t = self.tokenizer.encode(prompt)?;
+        self.chatglm.encode_prompt_windowed(
+            &t.input_ids,
+            &t.attention_mask,
+            Some(&t.position_ids),
+            window,
+            cancel,
+        )
+    }
+
+    /// Arm ladder rung 4's text-encoder scope, recording where the 28 GLM blocks can be re-read
+    /// from.
+    ///
+    /// `root` is the snapshot directory the resident tower was built from; the stream re-opens
+    /// `root/text_encoder`, which is a **directory** because the `bf16` tier ships three shards plus
+    /// an index and a single-file source could not resolve them.
+    ///
+    /// Must be called after [`quantize`](Self::quantize), so the recorded tier is the one the
+    /// resident blocks actually carry.
+    pub(crate) fn arm_block_stream(
+        &mut self,
+        root: &std::path::Path,
+        quant_bits: Option<i32>,
+    ) -> Result<()> {
+        self.chatglm.arm_block_stream(
+            &mlx_gen::WeightsSource::Dir(root.join("text_encoder")),
+            quant_bits,
+        );
+        if !self.chatglm.can_stream_blocks() {
+            return Err(Error::Msg(
+                "kolors: arming the ChatGLM3 block stream left the tower unstreamable".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl KolorsHeavy {
