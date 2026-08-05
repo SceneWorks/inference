@@ -73,6 +73,25 @@ pub(crate) fn needs_joint_cfg(guidance: f32) -> bool {
     guidance != 1.0
 }
 
+/// Whether the encoder mask marks **every** text position valid, in which case the DiT's joint
+/// attention mask is identically zero and can be skipped entirely (sc-17719).
+///
+/// `build_joint_mask` turns `text_valid` into an additive `(valid − 1)·1e9`, so an all-ones mask is an
+/// all-zero `[B, 1, 1, img_len + txt_len]` tensor that is then broadcast-added to the **full** score
+/// matrix `[B, heads, q, k]` in every one of the 48 blocks, every step. At 256² that is small; at
+/// 2048² the score matrix is ~16.4 k × 16.4 k per head, so adding a known-zero to it is the single
+/// largest piece of pure waste in the denoise. `LensTransformer::forward` documents `text_valid: None`
+/// as the skip path — this is the predicate that lets the lanes take it.
+///
+/// After sc-17616 the all-ones case is the *common* one: a CFG-off encode returns the cond-only row
+/// (`encode_one` produces `ones([1, s])` for a single unpadded prompt), and an empty negative pads
+/// nothing. A mask only carries zeros when the two prompts differ in length and the shorter is padded.
+///
+/// Costs one host sync per render — evaluated once outside the step loop, never per step.
+fn text_mask_is_all_valid(encoder_mask: &Array) -> Result<bool> {
+    Ok(mlx_rs::ops::min(encoder_mask, None)?.item::<f32>() == 1.0)
+}
+
 /// Reject conditioning whose batch does not match the batch this guidance selects (sc-17616).
 ///
 /// The encode and the denoise lanes each derive their batching from [`needs_joint_cfg`] over the
@@ -760,6 +779,9 @@ impl LensHeavy {
         // rather than narrowing a `[pos; neg]` stack itself.
         let joint = needs_joint_cfg(guidance_scale);
         check_conditioning_batch(encoder_features, encoder_mask, joint, guidance_scale)?;
+        // sc-17719: an all-valid mask is an all-zero additive term over the whole score matrix in every
+        // block, every step. Resolve once, here, and hand the DiT its documented `None` skip path.
+        let text_valid = (!text_mask_is_all_valid(encoder_mask)?).then_some(encoder_mask);
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             if joint {
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
@@ -768,7 +790,7 @@ impl LensHeavy {
                 let noise = transformer.forward_with_memory(
                     &hidden,
                     encoder_features,
-                    Some(encoder_mask),
+                    text_valid,
                     &timestep,
                     1,
                     latent_h,
@@ -785,7 +807,7 @@ impl LensHeavy {
                 let cond = transformer.forward_with_memory(
                     latents,
                     encoder_features,
-                    Some(encoder_mask),
+                    text_valid,
                     &timestep,
                     1,
                     latent_h,
@@ -1151,6 +1173,9 @@ pub(crate) fn render_sample(
     // conditioning under the same gate, so it is already cond-only here (sc-17616).
     let joint = needs_joint_cfg(guidance_scale);
     check_conditioning_batch(encoder_features, encoder_mask, joint, guidance_scale)?;
+    // sc-17719 — see `text_mask_is_all_valid`. The trainer's preview captions are single unpadded
+    // prompts, so this is always the skip path in practice; resolved once, outside the step loop.
+    let text_valid = (!text_mask_is_all_valid(encoder_mask)?).then_some(encoder_mask);
     for (i, &sigma) in timesteps.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1163,7 +1188,7 @@ pub(crate) fn render_sample(
             let noise = transformer.forward(
                 &hidden,
                 encoder_features,
-                Some(encoder_mask),
+                text_valid,
                 &timestep,
                 1,
                 latent,
@@ -1176,7 +1201,7 @@ pub(crate) fn render_sample(
             let cond = transformer.forward(
                 &latents,
                 encoder_features,
-                Some(encoder_mask),
+                text_valid,
                 &timestep,
                 1,
                 latent,
@@ -1255,7 +1280,9 @@ mod tests {
 
     use mlx_rs::{Array, Dtype};
 
-    use super::{assemble_conditioning, check_conditioning_batch, needs_joint_cfg};
+    use super::{
+        assemble_conditioning, check_conditioning_batch, needs_joint_cfg, text_mask_is_all_valid,
+    };
 
     /// A synthetic encode result: `layers` feature layers of `[1, s, c]` filled with `fill`, plus the
     /// all-valid `[1, s]` mask a single unpadded prompt produces.
@@ -1371,6 +1398,23 @@ mod tests {
         // …and the mirror: cond-only conditioning handed to the joint lane.
         check_conditioning_batch(&cond_only.0, &cond_only.1, true, 5.0)
             .expect_err("batch-1 conditioning must be rejected by the joint lane");
+    }
+
+    /// sc-17719 — the predicate that lets a lane skip an identically-zero attention mask. It must key
+    /// on "every position valid", not on the batch: a single zero anywhere is load-bearing padding.
+    #[test]
+    fn the_attention_mask_is_skippable_exactly_when_every_text_position_is_valid() {
+        let ones = mlx_rs::ops::ones::<f32>(&[1, 4]).unwrap();
+        assert!(text_mask_is_all_valid(&ones).unwrap());
+        // Batch 2, both rows fully valid (equal-length prompts) — still skippable.
+        assert!(text_mask_is_all_valid(&mlx_rs::ops::ones::<f32>(&[2, 4]).unwrap()).unwrap());
+
+        // One padded tail position ⇒ the mask is load-bearing and must be kept.
+        let padded = Array::from_slice(&[1.0f32, 1.0, 1.0, 0.0], &[1, 4]);
+        assert!(!text_mask_is_all_valid(&padded).unwrap());
+        // The empty-negative uncond row is all-zero, so a guided empty-negative batch keeps its mask.
+        let empty_neg = Array::from_slice(&[1.0f32, 1.0, 0.0, 0.0], &[2, 2]);
+        assert!(!text_mask_is_all_valid(&empty_neg).unwrap());
     }
 
     /// The empty negative stays the unconditional branch (zero features + zero mask), still gated on
