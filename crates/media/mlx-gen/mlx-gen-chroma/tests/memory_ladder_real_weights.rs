@@ -86,11 +86,30 @@ const ENTRIES: &[(&str, &str)] = &[
     ("chroma1_flash", "CHROMA_LADDER_FLASH"),
 ];
 
-/// The representative entry — the one whose evidence the provider-level story rests on. Every
-/// sibling entry still owes its own tier/mode/overlay evidence; sharing this provider's code is
-/// explicitly not what makes an entry Verified.
-const REPRESENTATIVE: &str = "chroma1_base";
-const REPRESENTATIVE_ENV: &str = "CHROMA_LADDER_BASE";
+/// The entry the single-entry measurements run against — `chroma1_base` by default, overridable with
+/// `CHROMA_LADDER_ENTRY`.
+///
+/// Parameterised rather than hardcoded, because "the representative entry" is a convenience and not
+/// a claim: sharing this provider's code is explicitly not what makes a sibling entry Verified, so
+/// every rung-4 and scope conclusion has to be re-takeable per entry. `chroma1_hd` and
+/// `chroma1_flash` are measured through exactly these tests with this variable set (sc-17695).
+fn representative() -> &'static str {
+    match std::env::var("CHROMA_LADDER_ENTRY").ok().as_deref() {
+        Some("chroma1_hd") => "chroma1_hd",
+        Some("chroma1_flash") => "chroma1_flash",
+        Some("chroma1_base") | None => "chroma1_base",
+        Some(other) => panic!("CHROMA_LADDER_ENTRY: unknown entry {other:?}"),
+    }
+}
+
+/// The env var carrying [`representative`]'s snapshot root.
+fn representative_env() -> &'static str {
+    ENTRIES
+        .iter()
+        .find(|(entry, _)| *entry == representative())
+        .map(|(_, var)| *var)
+        .expect("every entry has an env var")
+}
 
 /// The tier every default-mode measurement runs at — the manifest's own `mlx.quantize: 4`, so the
 /// asserted rows describe what a caller who names nothing actually gets.
@@ -414,7 +433,7 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
 
     let tier = probe_tier();
     let edge = probe_size();
-    let dir = require_tier(REPRESENTATIVE_ENV, &tier);
+    let dir = require_tier(representative_env(), &tier);
     // Eight rows at the 28-step production schedule is ~40 minutes for a quantity
     // [`the_request_peak_is_step_independent`] measures to be step-invariant (0.00% over 1, 4 and
     // 28 steps). `CHROMA_LADDER_STEPS` is the licensed shortening, and the license is a measurement
@@ -424,7 +443,7 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
     let peaks: Vec<f64> = (0..SETTLE_PROBE_ROWS)
         .map(|_| {
             measure(
-                REPRESENTATIVE,
+                representative(),
                 &dir,
                 LoadShape::DeferredMaterialization,
                 &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), edge, count),
@@ -490,13 +509,13 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn the_request_peak_is_step_independent() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    warm_up(REPRESENTATIVE, &dir);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
+    warm_up(representative(), &dir);
     let production = mlx_gen_chroma::ChromaVariant::Base.default_steps();
     let mut rows = Vec::new();
     for count in [1_u32, 4, production] {
         let row = measure(
-            REPRESENTATIVE,
+            representative(),
             &dir,
             LoadShape::EagerMaterialization,
             &request(Some(staged()), 1024, count),
@@ -532,17 +551,17 @@ fn the_request_peak_is_step_independent() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn staged_residency_bounds_the_request_peak_and_preserves_output() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    warm_up(REPRESENTATIVE, &dir);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
+    warm_up(representative(), &dir);
     let shape = LoadShape::EagerMaterialization;
     let resident = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         shape,
         &request(Some(resident_memory()), 1024, steps()),
     );
     let staged_row = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         shape,
         &request(Some(staged()), 1024, steps()),
@@ -589,7 +608,7 @@ fn the_request_peak_bearing_phase_is_measured_not_assumed() {
     use mlx_gen_chroma::{loader, ChromaTransformerConfig};
     use mlx_rs::Array;
 
-    let dir = require_tier(REPRESENTATIVE_ENV, &probe_tier());
+    let dir = require_tier(representative_env(), &probe_tier());
     let edge = probe_size();
 
     // Each phase is measured doing its REAL work at the production shape. MLX is lazy, so a
@@ -738,11 +757,11 @@ fn the_request_peak_bearing_phase_is_measured_not_assumed() {
 fn the_window_component_scopes_are_measured_not_inherited() {
     let tier = probe_tier();
     let edge = probe_size();
-    let dir = require_tier(REPRESENTATIVE_ENV, &tier);
-    warm_up(REPRESENTATIVE, &dir);
+    let dir = require_tier(representative_env(), &tier);
+    warm_up(representative(), &dir);
 
     let control = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(Some(rung4_control()), edge, steps()),
@@ -756,7 +775,7 @@ fn the_window_component_scopes_are_measured_not_inherited() {
     let mut rows: Vec<(TransformerComponent, f64, f64)> = Vec::new();
     for component in ms::TRANSFORMER_WINDOW_COMPONENTS {
         let row = measure(
-            REPRESENTATIVE,
+            representative(),
             &dir,
             LoadShape::DeferredMaterialization,
             &request(
@@ -837,7 +856,7 @@ fn the_window_component_scopes_are_measured_not_inherited() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn decode_tile_mechanism_sweep_on_the_production_latent() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let list = |var: &str, default: Vec<u32>| -> Vec<u32> {
         match std::env::var(var) {
             Ok(v) => v
@@ -1004,7 +1023,7 @@ fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn the_rung_two_drift_margin_is_resampled_across_seeds() {
     const SEEDS: [u64; 5] = [1234, 7, 99, 20260805, 424242];
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let size = 1024_u32;
     // The best cell the sweep found, so the resampling is done where the verdict is closest.
     let (edge, overlap) = (BEST_SWEPT_EDGE, BEST_SWEPT_OVERLAP);
@@ -1112,10 +1131,13 @@ fn the_rung_two_drift_margin_is_resampled_across_seeds() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn the_withheld_rungs_are_refused_by_the_production_path() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let registry = mlx_gen_chroma::provider_registry().expect("provider registry");
     let model = registry
-        .load(REPRESENTATIVE, &spec(&dir, LoadShape::EagerMaterialization))
+        .load(
+            representative(),
+            &spec(&dir, LoadShape::EagerMaterialization),
+        )
         .expect("load chroma");
 
     let mut checked = 0_usize;
@@ -1202,7 +1224,7 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
     use mlx_gen_chroma::{loader, ChromaTransformerConfig};
     use mlx_rs::Array;
 
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     const EDGE: u32 = 1024;
 
     // The production conditioning, so the joint sequence is the real `[text, image]` length and the
@@ -1304,9 +1326,9 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
     // the seam saving must be smaller than the headroom between the denoise phase and the request
     // peak. If the DiT ever becomes the binding phase, or the saving ever outgrows that headroom,
     // this reddens and ATTENTION_SUPPORT is re-decided.
-    warm_up(REPRESENTATIVE, &dir);
+    warm_up(representative(), &dir);
     let request_peak = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::EagerMaterialization,
         &request(Some(staged()), EDGE, 1),
@@ -1349,15 +1371,15 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
 fn transformer_window_sweep_and_streamed_output_identity() {
     let tier = probe_tier();
     let edge = probe_size();
-    let dir = require_tier(REPRESENTATIVE_ENV, &tier);
-    warm_up(REPRESENTATIVE, &dir);
+    let dir = require_tier(representative_env(), &tier);
+    warm_up(representative(), &dir);
 
     // The control is rung 4's OWN composition minus the window. Comparing against a rung-1 row
     // instead would confound the window with rung 2's tiled decode, which rung 4 engages by cost
     // order and which is an arithmetic change — a byte-identity assertion against that control could
     // never hold, and a peak comparison against it would credit the window with rung 2's saving.
     let control = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(Some(rung4_control()), edge, steps()),
@@ -1372,7 +1394,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let mut rows: Vec<(u32, f64, f64)> = Vec::new();
     for window in probe_order() {
         let row = measure(
-            REPRESENTATIVE,
+            representative(),
             &dir,
             LoadShape::DeferredMaterialization,
             &request(Some(full_ladder(window)), edge, steps()),
@@ -1460,11 +1482,11 @@ fn transformer_window_sweep_and_streamed_output_identity() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn the_published_window_domain_is_enforced_and_reachable() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let registry = mlx_gen_chroma::provider_registry().expect("provider registry");
     let model = registry
         .load(
-            REPRESENTATIVE,
+            representative(),
             &spec(&dir, LoadShape::DeferredMaterialization),
         )
         .expect("load chroma");
@@ -1548,12 +1570,15 @@ fn the_published_window_domain_is_enforced_and_reachable() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn rung_four_preconditions_fail_closed_on_real_weights() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let registry = mlx_gen_chroma::provider_registry().expect("provider registry");
 
     // 1. Eager materialization: no reopenable stream.
     let eager = registry
-        .load(REPRESENTATIVE, &spec(&dir, LoadShape::EagerMaterialization))
+        .load(
+            representative(),
+            &spec(&dir, LoadShape::EagerMaterialization),
+        )
         .expect("load chroma eagerly");
     let error = match eager.generate(
         &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, 1),
@@ -1568,7 +1593,7 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
 
     let deferred = registry
         .load(
-            REPRESENTATIVE,
+            representative(),
             &spec(&dir, LoadShape::DeferredMaterialization),
         )
         .expect("load chroma deferred");
@@ -1593,7 +1618,7 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
          re-materialization"
     );
     let error = match registry
-        .load(REPRESENTATIVE, &requantizing)
+        .load(representative(), &requantizing)
         .expect("a re-quantizing load still builds")
         .generate(
             &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, 1),
@@ -1621,7 +1646,7 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn the_rung_four_saving_is_inside_the_block_weight_set() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let (block_bytes, trunk_bytes) = transformer_weight_arithmetic(&dir);
     println!(
         "[sc-15520 rung4 arithmetic {DEFAULT_TIER}] windowable block weights {:.4} GiB; resident \
@@ -1634,15 +1659,15 @@ fn the_rung_four_saving_is_inside_the_block_weight_set() {
         "the windowable stacks must dominate the resident trunk, else rung 4 has little to bound"
     );
 
-    warm_up(REPRESENTATIVE, &dir);
+    warm_up(representative(), &dir);
     let control = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(Some(rung4_control()), 1024, steps()),
     );
     let windowed = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(
@@ -1817,16 +1842,16 @@ fn every_cached_entry_and_tier_publishes_its_own_evidence() {
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn the_full_ladder_renders_under_a_memory_cap() {
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    warm_up(REPRESENTATIVE, &dir);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
+    warm_up(representative(), &dir);
     let staged_row = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(Some(rung4_control()), 1024, steps()),
     );
     let windowed = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(
@@ -1843,7 +1868,7 @@ fn the_full_ladder_renders_under_a_memory_cap() {
     );
     std::env::set_var(MEMORY_CAP_ENV, cap.to_string());
     let capped = measure(
-        REPRESENTATIVE,
+        representative(),
         &dir,
         LoadShape::DeferredMaterialization,
         &request(
@@ -1877,11 +1902,11 @@ fn the_full_ladder_renders_under_a_memory_cap() {
 fn the_calibration_fault_fires_at_every_phase_and_a_fresh_request_recovers() {
     use mlx_gen::gen_core::MemoryPhase;
 
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let dir = require_tier(representative_env(), DEFAULT_TIER);
     let registry = mlx_gen_chroma::provider_registry().expect("provider registry");
     let model = registry
         .load(
-            REPRESENTATIVE,
+            representative(),
             &spec(&dir, LoadShape::DeferredMaterialization),
         )
         .expect("load chroma");
