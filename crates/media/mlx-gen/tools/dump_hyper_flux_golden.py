@@ -31,7 +31,9 @@ Env-overridable: FLUX_DEV (snapshot dir or HF id), HYPER_LORA (path), FLUX_SEED,
 FLUX_H, FLUX_GUIDANCE, HYPER_LORA_SCALE, FLUX_PROMPT.
 """
 
+import json
 import os
+import struct
 
 import numpy as np
 import torch
@@ -47,6 +49,30 @@ from safetensors.numpy import save_file
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
+
+
+def _canonicalize_metadata_order(path):
+    """Sort `__metadata__` in the safetensors header so this golden is byte-reproducible.
+
+    `safetensors.numpy.save_file` serializes `__metadata__` out of a Rust `HashMap`, whose
+    iteration order is randomized per process — so two runs producing bit-identical tensors
+    still write different file bytes, and the manifest's SHA-256 pin for this artifact can
+    never be re-met by regeneration (sc-17651; the sibling dumps use `mx.save_safetensors`
+    and are unaffected). Tensor entries are already emitted in data-offset order.
+
+    Sorting only permutes keys, so the re-serialized header has the same length and the
+    payload never moves; the slot is re-padded with spaces to the original header size.
+    """
+    raw = open(path, "rb").read()
+    length = struct.unpack("<Q", raw[:8])[0]
+    header = json.loads(raw[8 : 8 + length])
+    canonical = {"__metadata__": dict(sorted(header["__metadata__"].items()))}
+    canonical.update((k, v) for k, v in header.items() if k != "__metadata__")
+    encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > length:
+        raise RuntimeError(f"canonical header {len(encoded)} exceeds the {length}-byte slot")
+    with open(path, "wb") as handle:
+        handle.write(raw[:8] + encoded + b" " * (length - len(encoded)) + raw[8 + length :])
 
 BASE = os.environ.get(
     "FLUX_DEV",
@@ -184,5 +210,6 @@ meta = {
     ),
 }
 save_file(tensors, OUT, metadata=meta)
+_canonicalize_metadata_order(OUT)
 print(f"wrote {OUT}")
 print({k: v.shape for k, v in tensors.items()})

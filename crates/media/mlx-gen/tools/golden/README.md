@@ -224,44 +224,63 @@ numbers. It keeps its `scripts` hash pin, which `validate_manifest` still enforc
 repairable in place. Both halves are covered by tests that do not mock `source_state`; if the verifier
 is ever renamed, `bound_source_files()` refuses rather than silently rebinding it.
 
-**The retained transcript's source binding is stale — and not all of it is benign.** The frozen
-`source.files` matches the sc-15505 merge commit `071b84ff` exactly. Four bound entries have moved
-since, in two different classes. Audit them by class before concluding anything about a red run;
-`adapter_parity_receipt.json`'s `proof.source.files` is the committed, path-redacted copy of the
-frozen map, so the comparison needs no gitignored binaries.
+**The source binding is current as of the sc-17651 re-record (2026-08-04).** The frozen
+`source.files` now matches `main` at the re-record, all 11 bound entries, and the two bookkeeping
+entries that used to differ are gone: `verify_adapter_parity_artifacts.py` is no longer in the
+frozen map at all (sc-17070 narrowed `source_state()`'s hashed set before this record, so verifier
+edits no longer re-stale it), and `record_adapter_parity_transcript.py` is re-bound to its current
+bytes. `adapter_parity_receipt.json`'s `proof.source.files` is the committed, path-redacted copy of
+the frozen map, so the comparison needs no gitignored binaries:
 
-*Bookkeeping (does not weaken the proof).*
+```python
+import hashlib, json, pathlib, sys
+sys.path.insert(0, 'crates/media/mlx-gen/tools')
+import record_adapter_parity_transcript as R
+frozen = json.loads(pathlib.Path('crates/media/mlx-gen/tools/adapter_parity_receipt.json').read_text())['proof']['source']['files']
+manifest = json.loads(pathlib.Path('crates/media/mlx-gen/tools/adapter_parity_artifacts.json').read_text())
+for name in R.bound_source_files(manifest):
+    live = hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
+    print(name, 'MATCH' if frozen.get(name) == live else f'DRIFT {frozen.get(name)} -> {live}')
+```
 
-- `verify_adapter_parity_artifacts.py` — the transcript was recorded while the verifier was still
-  hashed, so its entry is in the frozen `files` but no longer in `bound_source_files()`. The key
-  sets therefore differ. Benign by construction, and by design it will not recur after the next
-  re-record. That entry is also stale in its own right since the 2026-08-02 Windows path-comparison
-  fix (compare the recorded reference-host model path as `PurePosixPath` rather than
-  `str(Path(p).expanduser().absolute())`, which re-rooted the recorded `/Users/...` path onto the
-  verifying host's drive and made the check permanently red off-host).
-- `record_adapter_parity_transcript.py` — drifted before the sc-17070 split and again with it.
-  Editing the recorder necessarily moves its own hash; it produced the transcript, so that binding
-  is meant to be tight.
+*What the re-record settled (sc-17651).* Between `071b84ff` and the re-record, two bound harnesses
+had moved — `mlx-gen-z-image/tests/adapter_real_weights.rs` and
+`mlx-gen-qwen-image/tests/adapter_real_weights.rs`, the files that emit the `SC15505_RESULT` lines —
+via `11eab9cf` (sc-16057, process-unique temp fixtures) and `716c97d9` (sc-17284, macOS real-weight
+CI lanes). Re-running the full acceptance proof reproduced **every one of the 34 pinned measurement
+fields exactly**, so neither change moved a number. Two things are worth keeping, because reading
+the diffs alone would not have established either:
 
-*Real drift in producing source (sc-17651).* `mlx-gen-z-image/tests/adapter_real_weights.rs` and
-`mlx-gen-qwen-image/tests/adapter_real_weights.rs` — the harnesses that emit the `SC15505_RESULT`
-measurements — were changed by `11eab9cf` (sc-16057, process-unique temp fixtures) and `716c97d9`
-(sc-17284, macOS real-weight CI lanes). **The retained numbers attest to those files as of
-`071b84ff`, not to today's.** Nothing here re-runs them, so the evidence has not been shown to still
-hold; that is the drift this binding exists to surface, and it is an independent reason for a
-re-record, on its own schedule. `src/adapters.rs` and `hyper_flux_real_weights.rs` still match.
+- sc-16057 touched only `kohya_matches_peft_on_real_tree()`, which emits no `SC15505_RESULT` and is
+  never selected — each recorded run names one test with `--exact`.
+- sc-17284 renamed the Qwen snapshot variable to `MLX_GEN_QWEN_SNAPSHOT` on the measured path and
+  renamed `expected_runs()` in lockstep, so the resolved model directory is unchanged. But
+  `verify_result_transcript` compares `run["env"]` against a freshly built `expected_runs()`, so the
+  *old* transcript's two Qwen rows had become unverifiable (`env mismatch`) independently of any
+  measurement question. A stale binding here is not always just bookkeeping — check whether the
+  recorded run spec still reproduces before assuming the numbers are the only question.
 
-None of this is repairable in place — the frozen `files` dict and `source_sha256` are what they are.
-**Do not re-record solely to clear the two bookkeeping entries.**
+*Reproducing the artifact set.* All 12 manifest artifacts regenerate byte-for-byte on the reference
+host from the commands in each `artifacts.*.source.command`, given the frozen fork at
+`81106c83` and `.venv-0320`. That includes the MLX renders, not just the synthetic adapters. If a
+regenerated golden's SHA-256 does *not* match, treat it as a real signal rather than as expected
+float noise — the one historical exception was a defect, not nondeterministic math:
+`dump_hyper_flux_golden.py` is the only dump here that writes via `safetensors.numpy.save_file`,
+which serializes `__metadata__` out of a Rust `HashMap` with per-process iteration order, so its
+file hash changed every run while all eight tensors stayed bit-identical. `_canonicalize_metadata_order()`
+sorts the metadata after the write (a pure key permutation — same serialized length, re-padded into
+the original header slot, payload untouched), which made the artifact reproducible and moved its
+pinned hash once, in the sc-17651 review. The sibling dumps use `mx.save_safetensors` and were never
+affected.
 
-Two operational notes. A full (non-`--manifest-only`) run from an ordinary `main` checkout never
+One operational note. A full (non-`--manifest-only`) run from an ordinary `main` checkout never
 reaches the source comparison at all: `source_state()` raises `proof worktree contains changes
 outside the bound allowlist` first (942 paths differ from `implementation_base` at the time of
 writing). The comparison is only reachable from a detached checkout at `implementation_base`
-(`39a11d36…`) with the proof's source overlaid, which is the same protocol a re-record runs under.
-And when it is reached, any file-hash drift also moves `source_sha256`, which is compared first — so
-the failure you actually see is `result transcript source source_sha256 mismatch`, not the `files`
-one.
+(`39a11d36…`) with the proof's source overlaid — the 11 bound files plus `UNBOUND_SOURCE_FILES` plus
+`EVIDENCE_CHANGE_FILES` — which is the same protocol a re-record runs under. And when it is reached,
+any file-hash drift also moves `source_sha256`, which is compared first — so the failure you
+actually see is `result transcript source source_sha256 mismatch`, not the `files` one.
 
 ## Manifest
 
