@@ -20,10 +20,43 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
     linear, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
 };
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::PackedWeightSidecars;
+use std::sync::Arc;
 
 use crate::quant::QLinear;
 use crate::rope::{apply_rope, LensRope};
+
+fn streamed_linear_detect(
+    in_dim: usize,
+    out_dim: usize,
+    vb: &VarBuilder,
+    base: &str,
+    bias: bool,
+    sidecars: Option<(&PackedWeightSidecars, &str)>,
+) -> Result<QLinear> {
+    let Some((sidecars, prefix)) = sidecars else {
+        return QLinear::linear_detect(in_dim, out_dim, vb, base, bias);
+    };
+    if !vb.contains_tensor(&format!("{base}.scales")) {
+        return QLinear::linear_detect(in_dim, out_dim, vb, base, bias);
+    }
+    let sidecar_base = format!("{prefix}.{base}");
+    if !sidecars.contains(&sidecar_base) {
+        candle_gen::candle_core::bail!(
+            "lens streamed packed projection `{sidecar_base}` has no prepared device-format sidecar"
+        );
+    }
+    let dense_bias = if bias {
+        Some(vb.get(out_dim, &format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    let qtensor = sidecars.load(&sidecar_base, vb.device())?;
+    let packed = candle_gen::quant::QLinear::from_qtensor_dequant(Arc::new(qtensor), dense_bias);
+    Ok(QLinear::from_packed(packed, in_dim, out_dim))
+}
 
 /// Block / QK-norm / norm_out epsilon (the reference builds its norms at eps 1e-6). Shared with the
 /// trainable twin ([`crate::dit_train`]) so the two stay in lockstep.
@@ -135,20 +168,13 @@ fn attention(
     v: &Tensor,
     head_dim: usize,
     mask: Option<&Tensor>,
-) -> Result<Tensor> {
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
     let (b, _h, s, _d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let o = candle_gen::sdpa_budgeted_bhsd(
-        q,
-        k,
-        v,
-        scale,
-        mask,
-        softmax_last_dim,
-        candle_gen::ATTN_SCORES_BUDGET,
-    )?; // [B,H,S,head_dim]
+    let o = candle_gen::sdpa_planned_bhsd(q, k, v, scale, mask, softmax_last_dim, plan)?; // [B,H,S,head_dim]
     let (_b, h, _s, d) = o.dims4()?;
-    o.transpose(1, 2)?.reshape((b, s, h * d))
+    Ok(o.transpose(1, 2)?.reshape((b, s, h * d))?)
 }
 
 /// Sinusoidal timestep embedding `[1, dim]` from the raw sigma (diffusers `Timesteps(dim,
@@ -204,13 +230,18 @@ struct GateMlp {
 }
 
 impl GateMlp {
-    fn new(inner: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+    fn new_with_sidecars(
+        inner: usize,
+        hidden: usize,
+        vb: VarBuilder,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         // Packed-detect each projection (sc-9413): a `SceneWorks/lens-mlx` q4/q8 tier loads straight
         // from the packed parts, a dense tier loads dense (then optionally folded by `quantize`).
         Ok(Self {
-            w1: QLinear::linear_detect(inner, hidden, &vb, "w1", false)?,
-            w2: QLinear::linear_detect(hidden, inner, &vb, "w2", false)?,
-            w3: QLinear::linear_detect(inner, hidden, &vb, "w3", false)?,
+            w1: streamed_linear_detect(inner, hidden, &vb, "w1", false, sidecars)?,
+            w2: streamed_linear_detect(hidden, inner, &vb, "w2", false, sidecars)?,
+            w3: streamed_linear_detect(inner, hidden, &vb, "w3", false, sidecars)?,
         })
     }
 
@@ -258,16 +289,20 @@ struct JointAttention {
 }
 
 impl JointAttention {
-    fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
+    fn new_with_sidecars(
+        cfg: &LensDitConfig,
+        vb: VarBuilder,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim;
         let hd = cfg.head_dim;
         Ok(Self {
             // Packed-detect each projection (sc-9413). `to_out.0` is threaded as one base string so the
             // `.scales`/`.biases` siblings survive the `.0` nesting (never `.pp("0")` past the sibling).
-            img_qkv: QLinear::linear_detect(inner, 3 * inner, &vb, "img_qkv", true)?,
-            txt_qkv: QLinear::linear_detect(inner, 3 * inner, &vb, "txt_qkv", true)?,
-            to_out: QLinear::linear_detect(inner, inner, &vb, "to_out.0", true)?,
-            to_add_out: QLinear::linear_detect(inner, inner, &vb, "to_add_out", true)?,
+            img_qkv: streamed_linear_detect(inner, 3 * inner, &vb, "img_qkv", true, sidecars)?,
+            txt_qkv: streamed_linear_detect(inner, 3 * inner, &vb, "txt_qkv", true, sidecars)?,
+            to_out: streamed_linear_detect(inner, inner, &vb, "to_out.0", true, sidecars)?,
+            to_add_out: streamed_linear_detect(inner, inner, &vb, "to_add_out", true, sidecars)?,
             norm_q: rms_norm(hd, EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, EPS, vb.pp("norm_k"))?,
             norm_added_q: rms_norm(hd, EPS, vb.pp("norm_added_q"))?,
@@ -324,7 +359,8 @@ impl JointAttention {
         txt_cos: &Tensor,
         txt_sin: &Tensor,
         mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
         let img_seq = img.dim(1)?;
         let txt_seq = txt.dim(1)?;
         let hd = self.head_dim;
@@ -351,7 +387,7 @@ impl JointAttention {
         let q = Tensor::cat(&[&iq, &tq], 2)?;
         let k = Tensor::cat(&[&ik, &tk], 2)?;
         let v = Tensor::cat(&[&iv, &tv], 2)?;
-        let o = attention(&q, &k, &v, hd, mask)?; // [B, joint, H·head_dim]
+        let o = attention(&q, &k, &v, hd, mask, attention_plan)?; // [B, joint, H·head_dim]
 
         // Split back at the image/text boundary (image first).
         let img_o = o.narrow(1, 0, img_seq)?.contiguous()?;
@@ -381,6 +417,24 @@ pub struct LensTransformerBlock {
 
 impl LensTransformerBlock {
     pub fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_sidecars(cfg, vb, None)
+    }
+
+    fn new_streamed(
+        cfg: &LensDitConfig,
+        vb: VarBuilder,
+        sidecars: &PackedWeightSidecars,
+        block_index: usize,
+    ) -> Result<Self> {
+        let prefix = format!("transformer_blocks.{block_index}");
+        Self::new_with_sidecars(cfg, vb, Some((sidecars, &prefix)))
+    }
+
+    fn new_with_sidecars(
+        cfg: &LensDitConfig,
+        vb: VarBuilder,
+        sidecars: Option<(&PackedWeightSidecars, &str)>,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim;
         let hidden = cfg.mlp_hidden();
         Ok(Self {
@@ -390,9 +444,32 @@ impl LensTransformerBlock {
             img_norm2: rms_norm(inner, EPS, vb.pp("img_norm2"))?,
             txt_norm1: rms_norm(inner, EPS, vb.pp("txt_norm1"))?,
             txt_norm2: rms_norm(inner, EPS, vb.pp("txt_norm2"))?,
-            attn: JointAttention::new(cfg, vb.pp("attn"))?,
-            img_mlp: GateMlp::new(inner, hidden, vb.pp("img_mlp"))?,
-            txt_mlp: GateMlp::new(inner, hidden, vb.pp("txt_mlp"))?,
+            attn: JointAttention::new_with_sidecars(
+                cfg,
+                vb.pp("attn"),
+                sidecars
+                    .map(|(cache, prefix)| (cache, format!("{prefix}.attn")))
+                    .as_ref()
+                    .map(|(cache, prefix)| (*cache, prefix.as_str())),
+            )?,
+            img_mlp: GateMlp::new_with_sidecars(
+                inner,
+                hidden,
+                vb.pp("img_mlp"),
+                sidecars
+                    .map(|(cache, prefix)| (cache, format!("{prefix}.img_mlp")))
+                    .as_ref()
+                    .map(|(cache, prefix)| (*cache, prefix.as_str())),
+            )?,
+            txt_mlp: GateMlp::new_with_sidecars(
+                inner,
+                hidden,
+                vb.pp("txt_mlp"),
+                sidecars
+                    .map(|(cache, prefix)| (cache, format!("{prefix}.txt_mlp")))
+                    .as_ref()
+                    .map(|(cache, prefix)| (*cache, prefix.as_str())),
+            )?,
         })
     }
 
@@ -428,6 +505,35 @@ impl LensTransformerBlock {
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
+        hidden: &Tensor,
+        encoder: &Tensor,
+        temb: &Tensor,
+        img_cos: &Tensor,
+        img_sin: &Tensor,
+        txt_cos: &Tensor,
+        txt_sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_with_plan(
+            hidden,
+            encoder,
+            temb,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+        )
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_plan(
+        &self,
         hidden: &Tensor,  // image [B, img_seq, inner]
         encoder: &Tensor, // text  [B, txt_seq, inner]
         temb: &Tensor,    // [B, inner]
@@ -436,7 +542,8 @@ impl LensTransformerBlock {
         txt_cos: &Tensor,
         txt_sin: &Tensor,
         mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
         // SiLU'd timestep → per-stream 6·inner modulation, split into mod1 (around attn) / mod2 (MLP).
         let act = temb.silu()?;
         let img_mod = self.img_mod.forward(&act)?;
@@ -454,9 +561,16 @@ impl LensTransformerBlock {
         // attention path
         let (img_n, img_g1) = modulate(&self.img_norm1.forward(hidden)?, &im0)?;
         let (txt_n, txt_g1) = modulate(&self.txt_norm1.forward(encoder)?, &tm0)?;
-        let (img_attn, txt_attn) = self
-            .attn
-            .forward(&img_n, &txt_n, img_cos, img_sin, txt_cos, txt_sin, mask)?;
+        let (img_attn, txt_attn) = self.attn.forward(
+            &img_n,
+            &txt_n,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            attention_plan,
+        )?;
         let hidden = gated(hidden, &img_g1, &img_attn)?;
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
@@ -512,12 +626,22 @@ struct LensRopeCache {
 }
 
 /// The Lens denoising DiT (`LensTransformer2DModel`).
+enum TransformerBlocks {
+    Resident(Vec<LensTransformerBlock>),
+    Streamed {
+        weights: VarBuilder<'static>,
+        sidecars: Arc<PackedWeightSidecars>,
+        config: LensDitConfig,
+        count: usize,
+    },
+}
+
 pub struct LensTransformer {
     img_in: QLinear,
     txt_norm: Vec<RmsNorm>, // per-layer text front-end RMSNorm (eps 1e-5)
     txt_in: QLinear,
     time_embed: TimeEmbed,
-    blocks: Vec<LensTransformerBlock>,
+    blocks: TransformerBlocks,
     norm_out: NormOut,
     proj_out: QLinear,
     rope: LensRope,
@@ -531,6 +655,38 @@ pub struct LensTransformer {
 impl LensTransformer {
     /// Load from a diffusers `transformer/` weight set at `dtype` (bf16 production / f32 gate).
     pub fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
+        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            blocks.push(LensTransformerBlock::new(
+                cfg,
+                vb.pp("transformer_blocks").pp(i),
+            )?);
+        }
+        Self::new_with_blocks(cfg, vb, TransformerBlocks::Resident(blocks))
+    }
+
+    /// Build a Lens DiT whose uniform 48-block trunk is materialized in request-scoped windows.
+    /// The front/back projections stay resident; every window is loaded from the host-backed packed
+    /// snapshot through the shared Candle block-window driver.
+    pub fn new_block_streamed(
+        cfg: &LensDitConfig,
+        vb: VarBuilder<'static>,
+        sidecars: Arc<PackedWeightSidecars>,
+    ) -> Result<Self> {
+        let blocks = TransformerBlocks::Streamed {
+            weights: vb.clone(),
+            sidecars,
+            config: *cfg,
+            count: cfg.num_layers,
+        };
+        Self::new_with_blocks(cfg, vb, blocks)
+    }
+
+    fn new_with_blocks<'a>(
+        cfg: &LensDitConfig,
+        vb: VarBuilder<'a>,
+        blocks: TransformerBlocks,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim;
         let mut txt_norm = Vec::with_capacity(cfg.num_text_layers);
         for i in 0..cfg.num_text_layers {
@@ -538,13 +694,6 @@ impl LensTransformer {
                 cfg.enc_hidden_dim,
                 TXT_NORM_EPS,
                 vb.pp("txt_norm").pp(i),
-            )?);
-        }
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
-            blocks.push(LensTransformerBlock::new(
-                cfg,
-                vb.pp("transformer_blocks").pp(i),
             )?);
         }
         Ok(Self {
@@ -628,7 +777,12 @@ impl LensTransformer {
         self.img_in.quantize(quant)?;
         self.txt_in.quantize(quant)?;
         self.proj_out.quantize(quant)?;
-        for block in &mut self.blocks {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "lens: streamed transformer blocks must come from an already-packed tier".into(),
+            ));
+        };
+        for block in blocks {
             block.quantize(quant)?;
         }
         Ok(())
@@ -659,7 +813,12 @@ impl LensTransformer {
     ) -> candle_gen::Result<()> {
         f("img_in", &mut self.img_in)?;
         f("txt_in", &mut self.txt_in)?;
-        for (i, blk) in self.blocks.iter_mut().enumerate() {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "lens: adapters are not supported on streamed transformer blocks".into(),
+            ));
+        };
+        for (i, blk) in blocks.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
         }
         f("proj_out", &mut self.proj_out)?;
@@ -687,14 +846,55 @@ impl LensTransformer {
         h: usize,
         w: usize,
     ) -> Result<Tensor> {
+        self.forward_with_memory(
+            hidden_states,
+            text_feats,
+            text_valid,
+            timestep,
+            frame,
+            h,
+            w,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+            self.block_count().max(1),
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+    }
+
+    fn block_count(&self) -> usize {
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => blocks.len(),
+            TransformerBlocks::Streamed { count, .. } => *count,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory(
+        &self,
+        hidden_states: &Tensor,
+        text_feats: &[Tensor],
+        text_valid: Option<&Tensor>,
+        timestep: f32,
+        frame: usize,
+        h: usize,
+        w: usize,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         // Public boundary: return a typed error rather than aborting the process on a
         // caller-supplied text-feature count mismatch (sc-9025 / F-041).
         if text_feats.len() != self.cfg.num_text_layers {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "lens transformer forward: expected {} text-feature layers, got {}",
-                self.cfg.num_text_layers,
-                text_feats.len()
-            )));
+            return Err(candle_gen::CandleError::Candle(
+                candle_gen::candle_core::Error::Msg(format!(
+                    "lens transformer forward: expected {} text-feature layers, got {}",
+                    self.cfg.num_text_layers,
+                    text_feats.len()
+                )),
+            ));
         }
         let img_len = hidden_states.dim(1)?;
         let txt_len = text_feats[0].dim(1)?;
@@ -723,23 +923,74 @@ impl LensTransformer {
             None => None,
         };
 
-        for block in &self.blocks {
-            let (e, hs) = block.forward(
-                &hidden,
-                &encoder,
-                &temb,
-                &img_cos,
-                &img_sin,
-                &txt_cos,
-                &txt_sin,
-                mask.as_ref(),
-            )?;
-            encoder = e;
-            hidden = hs;
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => {
+                for block in blocks {
+                    let (e, hs) = block.forward_with_plan(
+                        &hidden,
+                        &encoder,
+                        &temb,
+                        &img_cos,
+                        &img_sin,
+                        &txt_cos,
+                        &txt_sin,
+                        mask.as_ref(),
+                        attention_plan,
+                    )?;
+                    encoder = e;
+                    hidden = hs;
+                }
+            }
+            TransformerBlocks::Streamed {
+                weights,
+                sidecars,
+                config,
+                count,
+            } => {
+                let plan = candle_gen::block_window::BlockPlan::new(*count, transformer_window)?;
+                let (_next_encoder, next_hidden) = candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &plan,
+                    cancel,
+                    (encoder, hidden),
+                    || Ok(weights.clone()),
+                    |(mut encoder, mut hidden), view, range| {
+                        let blocks = range
+                            .map(|index| {
+                                LensTransformerBlock::new_streamed(
+                                    config,
+                                    view.pp("transformer_blocks").pp(index),
+                                    sidecars,
+                                    index,
+                                )
+                                .map_err(candle_gen::CandleError::from)
+                            })
+                            .collect::<candle_gen::Result<Vec<_>>>()?;
+                        for block in &blocks {
+                            candle_gen::check_cancel(cancel)?;
+                            let (e, hs) = block.forward_with_plan(
+                                &hidden,
+                                &encoder,
+                                &temb,
+                                &img_cos,
+                                &img_sin,
+                                &txt_cos,
+                                &txt_sin,
+                                mask.as_ref(),
+                                attention_plan,
+                            )?;
+                            encoder = e;
+                            hidden = hs;
+                        }
+                        Ok((encoder, hidden))
+                    },
+                )?;
+                hidden = next_hidden;
+            }
         }
 
         let hidden = self.norm_out.forward(&hidden, &temb)?;
-        self.proj_out.forward(&hidden)
+        Ok(self.proj_out.forward(&hidden)?)
     }
 }
 
@@ -847,6 +1098,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bounded_attention_preserves_typed_cancellation() {
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 1, 2, 4), DType::F32, &dev).unwrap();
+        let cancel = candle_gen::gen_core::CancelFlag::new();
+        cancel.cancel();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(1, false))
+            .with_cancel(&cancel);
+        let error = attention(&q, &q, &q, 4, None, plan).unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
     }
 
     /// **Additive install on the Lens DiT (sc-11105).** A bare-dotted LoRA over two real `attn`
