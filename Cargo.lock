@@ -2295,6 +2295,9 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]

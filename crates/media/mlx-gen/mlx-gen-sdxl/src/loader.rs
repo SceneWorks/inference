@@ -183,6 +183,18 @@ pub fn load_unet_kolors_dtype(root: &Path, dtype: Dtype) -> Result<UNet2DConditi
     load_unet_with_config(root, dtype, &UNetConfig::kolors())
 }
 
+/// The **exact** U-Net weight file [`load_unet_with_config`] would read out of `root` at `dtype` —
+/// the re-openable source ladder rung 4 records when it arms a block stream.
+///
+/// `pub` for `mlx-gen-kolors` (SC-15521): Kolors re-exports this crate's [`UNet2DConditionModel`]
+/// verbatim but registers its own provider and arms its own streams, so it needs the same
+/// fp16/f32-variant resolution the resident load performed rather than a second derivation of the
+/// rule. Getting a *different* file here would silently stream blocks from a different snapshot
+/// variant than the resident stack was built from.
+pub fn resolve_unet_weight_file(root: &Path, dtype: Dtype) -> Result<PathBuf> {
+    resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)
+}
+
 /// Load an SDXL **ControlNet** branch (sc-3058) from a diffusers `ControlNetModel` checkpoint — a
 /// single `.safetensors` file or a directory containing `diffusion_pytorch_model.safetensors`. Cast
 /// to `dtype` (fp16 in production, matching the U-Net it injects into).
@@ -255,10 +267,22 @@ pub fn load_ip_adapter(
 /// is cached it is upcast to f32 (fp16-precision weights — note: not bit-identical to the true f32
 /// VAE; fetch `vae/diffusion_pytorch_model.safetensors` for an exact decode).
 pub fn load_vae(root: &Path) -> Result<Autoencoder> {
-    let file = resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)?;
+    let file = resolve_vae_weight_file(root)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
     Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())
+}
+
+/// The **exact** VAE weight file [`load_vae`] would read out of `root`.
+///
+/// `pub` for the same reason [`resolve_unet_weight_file`] is: a memory contract that prices the
+/// decoder must size the file the resident load actually opens, not a directory sum. It matters
+/// more here than for the U-Net, because [`load_vae`] `cast_all`s to **f32 unconditionally** while
+/// every SceneWorks SDXL-family tier ships only `diffusion_pytorch_model.fp16.safetensors` — so a
+/// decoder footprint taken from stored bytes is underpriced by exactly 2x, at every tier
+/// (sc-15839). Pair this with `mlx_gen::asset_facts::ResidentProjection::Float32`.
+pub fn resolve_vae_weight_file(root: &Path) -> Result<PathBuf> {
+    resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)
 }
 
 /// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
