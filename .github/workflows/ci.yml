@@ -1,8 +1,19 @@
 name: CI
 
 on:
+  # No `branches: [main]` here, deliberately. Ruleset 20481541 makes main reachable only through
+  # the merge queue, which runs this whole workflow against the speculative merge commit — the
+  # exact commit that then lands. A post-merge run would recompile a verdict that already exists,
+  # at ~15-30 min per merge across ~24 merges/day, which is the largest single CI saving available
+  # here. Tags keep their trigger: release lanes are driven by `refs/tags/runtime-*` and never pass
+  # through the queue.
+  #
+  # Known and accepted gap: with `max_entries_to_merge: 5` a batch is verified at its tip, so the
+  # intermediate merge commits inside a batch are not independently compiled. `grouping_strategy:
+  # ALLGREEN` keeps a batch from landing on a red member, but a `git bisect` across main can still
+  # land on an untested intermediate. Restore `branches: [main]` if that ever costs more than the
+  # duplicate runs did.
   push:
-    branches: [main]
     tags: ["runtime-*"]
   pull_request:
   # A merge queue tests a speculative merge on a `gh-readonly-queue/main/**` ref. Without this
@@ -16,21 +27,23 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded PR runs, but never cancel a push to main or a release tag.
-# github.ref is refs/heads/main for every merge, so a shared main group meant each
-# merge cancelled the previous merge's in-flight run: 24 of 60 main runs cancelled
-# over the sampled window, i.e. 40% of main commits carried no verdict at all
-# (sc-12399, filed against the sibling SceneWorks lane — same root cause here).
-# That matters most for windows-cuda-check and the macOS lanes: platform targets are
-# mutually exclusive, so each lane is the ONLY thing compiling its cfg, and a killed
-# run misattributes the break to the next commit and makes bisect over main useless.
+# Cancel superseded PR runs, but never cancel a queue entry or a release tag.
 #
-# Main keys on github.sha, not just cancel-in-progress: GitHub allows at most ONE
-# pending run per concurrency group and evicts it when a newer run queues, so a
-# shared main group still drops the middle commit of a 3+ merge burst even with
-# cancel-in-progress off. Per-SHA groups cannot evict each other; runs serialize on
-# the runner instead. Tag builds likewise never cancel (tags are immutable — see
-# CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
+# The history this encodes predates the merge queue, when main carried its own push trigger:
+# github.ref was refs/heads/main for every merge, so a shared main group meant each merge
+# cancelled the previous merge's in-flight run — 24 of 60 main runs cancelled over the sampled
+# window, i.e. 40% of main commits carried no verdict at all (sc-12399, filed against the
+# sibling SceneWorks lane — same root cause here). That mattered most for windows-cuda-check
+# and the macOS lanes: platform targets are mutually exclusive, so each lane is the ONLY thing
+# compiling its cfg, and a killed run misattributes the break to the next commit and makes
+# bisect over main useless.
+#
+# Keying on github.sha rather than relying on cancel-in-progress alone is what fixed it, and
+# the reason survives the trigger's removal: GitHub allows at most ONE pending run per
+# concurrency group and evicts it when a newer run queues, so a shared group drops the middle
+# entry of a 3+ burst even with cancel-in-progress off. Per-SHA groups cannot evict each other;
+# runs serialize on the runner instead. Tag builds likewise never cancel (tags are immutable —
+# see CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
 #
 # merge_group deliberately lands in the github.sha branch too. Each speculative merge is a
 # distinct commit, so per-SHA groups let concurrently-built queue entries run side by side
