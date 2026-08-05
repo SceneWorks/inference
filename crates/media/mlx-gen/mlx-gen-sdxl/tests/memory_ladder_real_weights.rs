@@ -217,9 +217,16 @@ fn full_ladder(window: u32) -> GenerationMemory {
 /// **+12.54%** regression which is **+0.00%** warm.
 ///
 /// This file had **no warm-up of any kind** until SC-17679, which mattered most for
-/// [`transformer_window_sweep_and_streamed_output_identity`]: its cadence-1 row is the first
-/// *windowed* row in its process, and its 512² q8 output is the entire published basis for
+/// [`transformer_window_sweep_and_streamed_output_identity`]: its first cadence row is the first
+/// *windowed* row in its process, and its 512² q8 output was the entire published basis for the old
 /// [`ms::TRANSFORMER_WINDOW_SIZE`] `= 1`.
+///
+/// **A warm-up alone is not sufficient discipline, and that is the lesson of SC-17679.** Discarding
+/// one row removes the cold-allocator bias on the row that follows it, but where the reading is
+/// indexed by ordinal it merely shifts every value one slot. Whether a cell can support a claim at
+/// all is answered by [`identical_requests_reproduce_once_the_allocator_has_settled`] (its
+/// resolution) and [`probe_order`] (whether an apparent effect follows the cadence or the position),
+/// not by this function.
 ///
 /// The warm-up is deliberately a *windowed* row, because that is the shape the bias was observed on
 /// (rung 4 calls `clear_cache()` at every window boundary, which is what interacts with the cold
@@ -232,6 +239,140 @@ fn warm_up(dir: &std::path::Path, tier: &str) {
         LoadShape::DeferredMaterialization,
         &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, 1),
     );
+}
+
+/// **Does this harness's peak reading depend on a row's ORDINAL rather than on its request?**
+///
+/// The instrument check the whole ladder rests on, and the one SC-17679 exists because nobody had
+/// run. It renders the **identical** request `SETTLE_PROBE_ROWS` times on a fresh generator each
+/// time and prints the peak of every row. A request that is byte-for-byte the same each time can
+/// only produce different peaks if the reading is a function of something other than the request.
+///
+/// **The measured answer is that the resolution is configuration-dependent, and this test pins the
+/// one place it has to be exact.** At the default configuration (`q8` 1024², the only cell whose
+/// flatness the sweep *asserts*) eight identical requests read **15.5155 GiB every time — 0.00%**.
+/// At `q8` 512² the same eight reads are `5.3213 5.3214 5.0949 5.3839 5.3213 5.3838 5.3214 5.3838`
+/// — a **5.67% spread on unchanged input that never converges**, so no amount of warming fixes it
+/// and "warm until successive rows agree" would not terminate.
+///
+/// That is why this asserts at the default configuration and *reports* under the probe vars, mirroring
+/// the sweep's own convention: the claim is not "MLX always reproduces", it is "**the tolerance the
+/// flatness assertion uses is not finer than the instrument's resolution at the cell it runs on**".
+/// A cell whose resolution is 5.67% can support no cadence claim at all, in either direction — which
+/// is exactly what SC-17679 established about 512² q8.
+#[test]
+#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+fn identical_requests_reproduce_once_the_allocator_has_settled() {
+    const SETTLE_PROBE_ROWS: usize = 8;
+    /// The tolerance `transformer_window_sweep_and_streamed_output_identity`'s flatness assertion
+    /// uses. The instrument must be at least this good wherever that assertion runs.
+    const SETTLE_TOLERANCE: f64 = 0.01;
+
+    let tier = std::env::var("SDXL_WINDOW_PROBE_TIER").unwrap_or_else(|_| "q8".to_owned());
+    let tier: &str = &tier;
+    let edge: u32 = std::env::var("SDXL_WINDOW_PROBE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let probing = std::env::var("SDXL_WINDOW_PROBE_TIER").is_ok()
+        || std::env::var("SDXL_WINDOW_PROBE_SIZE").is_ok();
+    let Some(dir) = tier_dir(REPRESENTATIVE, tier) else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing {tier}/");
+    };
+
+    let peaks: Vec<f64> = (0..SETTLE_PROBE_ROWS)
+        .map(|_| {
+            measure(
+                &dir,
+                tier,
+                LoadShape::DeferredMaterialization,
+                &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), edge, 6),
+            )
+            .peak_gib
+        })
+        .collect();
+    println!(
+        "[sc-17679 settle {tier} {edge}² cadence {}] identical request x{SETTLE_PROBE_ROWS}: {}",
+        ms::TRANSFORMER_WINDOW_SIZE,
+        peaks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("#{}: {p:.4}", i + 1))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+
+    // Row 1 is the one `warm_up` discards. Everything after it is a row this file would PUBLISH, so
+    // everything after it has to agree.
+    let published = &peaks[1..];
+    let (min, max) = published
+        .iter()
+        .fold((f64::MAX, 0f64), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+    let spread = (max - min) / min;
+    println!(
+        "[sc-17679 settle {tier} {edge}²] INSTRUMENT RESOLUTION {:.2}% over rows 2..={SETTLE_PROBE_ROWS} \
+         ({min:.4}..{max:.4} GiB; row 1 is the discarded warm-up){}",
+        100.0 * spread,
+        if probing {
+            " — reported, not asserted (this is a per-cell property)"
+        } else {
+            ""
+        }
+    );
+    if probing {
+        // A probed cell may legitimately be worse than the default one — 512² q8 measures 5.67% —
+        // and that is a finding to publish, not a failure. What it means is that NO cadence claim
+        // can be made at that cell, which is a statement about the evidence rather than the code.
+        return;
+    }
+    assert!(
+        spread < SETTLE_TOLERANCE,
+        "identical requests no longer reproduce at the DEFAULT configuration: rows 2..= span \
+         {min:.4}..{max:.4} GiB ({:.2}%), against a flatness tolerance of {:.0}%. This is the one \
+         cell whose cadence flatness the sweep ASSERTS, so the assertion would now be running at a \
+         tolerance finer than the instrument's own resolution and could not tell a real cadence \
+         effect from allocator noise — which is precisely the error SC-17679 corrected at 512² q8. \
+         Re-establish the resolution before trusting any cadence row",
+        100.0 * spread,
+        100.0 * SETTLE_TOLERANCE
+    );
+}
+
+/// The order the cadence sweep executes its rows in — **the control that tells a cadence effect
+/// apart from a positional one** (SC-17679).
+///
+/// Defaults to [`ms::TRANSFORMER_WINDOW_SIZES`]' own order. `SDXL_WINDOW_PROBE_ORDER` overrides it
+/// with a comma-separated permutation, which is how the 512² q8 row was diagnosed: re-running the
+/// same four cadences in a different execution order moves the peak values with the *positions*
+/// rather than with the cadences, which is a thing a genuine weight-residency effect cannot do.
+///
+/// This is a permanent instrument, not scaffolding. A single discarded warm-up row does not remove
+/// a positional bias — it shifts it by one slot — so "is this row cadence-borne?" needs an
+/// order permutation to answer, and the remaining families on SC-17679 will each need the same
+/// question asked.
+fn probe_order() -> Vec<u32> {
+    let Ok(spec) = std::env::var("SDXL_WINDOW_PROBE_ORDER") else {
+        return ms::TRANSFORMER_WINDOW_SIZES.to_vec();
+    };
+    let order: Vec<u32> = spec
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("SDXL_WINDOW_PROBE_ORDER: not a u32")
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    let mut domain = ms::TRANSFORMER_WINDOW_SIZES.to_vec();
+    domain.sort_unstable();
+    assert_eq!(
+        sorted, domain,
+        "SDXL_WINDOW_PROBE_ORDER must be a PERMUTATION of the published domain — an order probe \
+         that also changed which cadences ran would confound the two things it exists to separate"
+    );
+    println!("[sc-17679 order probe] executing cadences in the order {order:?}");
+    order
 }
 
 // ── Rung 0/1 ─────────────────────────────────────────────────────────────────────────────────────
@@ -1007,10 +1148,11 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let Some(dir) = tier_dir(REPRESENTATIVE, tier) else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing {tier}/");
     };
-    // **SC-17679: the discarded row this sweep needed most.** Without it, cadence 1 is the first
-    // WINDOWED row in the process — the exact shape the cold-allocator bias was measured on — and
-    // cadence 1 is what `ms::TRANSFORMER_WINDOW_SIZE` ships as the default, on the strength of a
-    // 512² q8 spread this row participates in.
+    // **SC-17679: the discarded row this sweep needed most.** Without it the first cadence executed
+    // is also the first WINDOWED row in the process — the exact shape the cold-allocator bias was
+    // measured on. It is necessary but NOT sufficient: at 512² q8 the reading is indexed by ordinal,
+    // so a warm-up shifts the values one slot rather than stabilising them. Use `probe_order` and
+    // `identical_requests_reproduce_once_the_allocator_has_settled` before trusting any row here.
     warm_up(&dir, tier);
     let deferred = LoadShape::DeferredMaterialization;
     // The attribution control: the same composition WITHOUT rung 4, on a deferred load, so the only
@@ -1028,7 +1170,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         ms_per_step(&control, STEPS)
     );
     let mut rows: Vec<(u32, f64, f64)> = Vec::new();
-    for window in ms::TRANSFORMER_WINDOW_SIZES {
+    for window in &probe_order() {
         let row = measure(
             &dir,
             tier,
@@ -1097,6 +1239,9 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     }
 
     // ── The two facts that make this a DOMAIN rather than four spellings of one choice ───────────
+    // Sorted by cadence, so `rows[0]`/`rows.last()` mean tightest/widest regardless of the order the
+    // rows were EXECUTED in ([`probe_order`]).
+    rows.sort_unstable_by_key(|(window, _, _)| *window);
     assert!(
         rows.len() >= 2,
         "a cadence sweep needs at least two published cadences to compare; got {rows:?}"
