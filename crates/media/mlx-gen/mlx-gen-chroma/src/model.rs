@@ -16,6 +16,7 @@
 //! decode lifecycle is driven by the shared [`mlx_gen::Residency`] seam.
 
 use mlx_gen::array::scalar;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -78,31 +79,42 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
             mlx_gen::residency::warn_sequential_requantize(variant.id(), q.bits());
         }
     }
+    let memory_strategy = crate::memory_strategy::contract_for(variant.id(), spec)
+        .map_err(|error| Error::Msg(error.to_string()))?;
     Ok(Chroma {
         descriptor: variant.descriptor(),
         variant,
         residency: build_residency(variant, spec)?,
+        loaded_spec: spec.clone(),
+        memory_strategy,
     })
 }
 
-/// The policy→[`Residency`] dispatch every Chroma variant shares (sc-10840), routed through the
-/// single [`Residency::from_policy`] seam so no variant re-derives the `match offload_policy`.
-/// `Resident` eager-loads the T5 encoder + heavy bundle now (the heavy loader with `use_pid = true`,
-/// loading any PiD overlay once and reusing it); `Sequential` captures the two per-phase loaders and
-/// loads nothing now, deferring each to [`Residency::run`]. Both use the same [`load_text_only`] /
-/// [`load_heavy`], so the `Resident` composition is byte-identical to the pre-seam one. The deferral is
-/// weight-free-testable: under `Sequential` this touches no component weights, so a dispatch that
-/// ignored `offload_policy` would eager-load and fail the "Sequential defers" unit test.
+/// The policy→[`Residency`] dispatch every Chroma variant shares (sc-10840), routed through one
+/// shared seam so no variant re-derives the `match offload_policy`. `Resident` eager-loads the T5
+/// encoder + heavy bundle now (the heavy loader with `use_pid = true`, loading any PiD overlay once
+/// and reusing it); `Sequential` captures the two per-phase loaders and loads nothing now, deferring
+/// each to the request. Both use the same [`load_text_only`] / [`load_heavy`], so the `Resident`
+/// composition is byte-identical to the pre-seam one. The deferral is weight-free-testable: under
+/// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
+/// eager-load and fail the "Sequential defers" unit test.
+///
+/// SC-15520: the seam is [`Residency::request_scoped_from_policy`], not `from_policy`, because the
+/// two axes are independent. `spec.offload_policy` still supplies the *default* phase staging, which
+/// a request-scoped `GenerationMemory::stage_residency` then overrides per request (rung 1); the
+/// `streamable` argument threaded into both loaders is the other axis — whether this request wants
+/// components built in a re-materializable form (rung 4). `from_policy`'s loaders take no such
+/// argument, so it cannot express rung 4 at all.
 pub(crate) fn build_residency(
     variant: ChromaVariant,
     spec: &LoadSpec,
 ) -> Result<Residency<ChromaTextOwned, ChromaHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
+    Residency::request_scoped_from_policy(
         spec.offload_policy,
-        move || load_text_only(variant, &spec_text),
-        move |use_pid| load_heavy(variant, &spec_heavy, use_pid),
+        move |_streamable| load_text_only(variant, &spec_text),
+        move |use_pid, streamable| load_heavy(variant, &spec_heavy, use_pid, streamable),
     )
 }
 
@@ -147,8 +159,21 @@ fn load_text_only(variant: ChromaVariant, spec: &LoadSpec) -> Result<ChromaTextO
 /// quantize-then-adapters order matches the pre-seam composition; the components are independent of the
 /// text encoder (separate weight files, deterministic RNG-free quant), so the `Resident` composition is
 /// byte-identical.
-fn load_heavy(variant: ChromaVariant, spec: &LoadSpec, load_pid: bool) -> Result<ChromaHeavyOwned> {
+fn load_heavy(
+    variant: ChromaVariant,
+    spec: &LoadSpec,
+    load_pid: bool,
+    streamable: bool,
+) -> Result<ChromaHeavyOwned> {
     let root = resolve_root(variant, spec)?;
+    if streamable && !crate::memory_strategy::structurally_streamable(spec) {
+        return Err(Error::Unsupported(format!(
+            "{}: bounded transformer residency requires OffloadPolicy::Sequential + \
+             LoadShape::DeferredMaterialization over a clean, already-packed (or dense) snapshot \
+             directory — this load cannot stream its blocks",
+            variant.id()
+        )));
+    }
     let cfg = ChromaTransformerConfig::default();
     let mut transformer = loader::load_transformer(root, cfg)?;
     let mut vae = loader::load_vae(root)?;
@@ -169,6 +194,14 @@ fn load_heavy(variant: ChromaVariant, spec: &LoadSpec, load_pid: bool) -> Result
     // Install LoRA/LoKr adapters AFTER quantization (forward-time residual over the quantized base;
     // sc-3842). No-op when empty; any unmatched target errors loudly (never silently dropped).
     crate::adapters::apply_chroma_adapters(&mut transformer, &spec.adapters)?;
+
+    // Rung 4 (SC-15520): arm the reopenable stream LAST, after quantization and adapters, so the
+    // capture records the state the resident blocks actually ended up in — then evict both stacks.
+    // The embedders, Approximator and `proj_out` stay resident.
+    if streamable {
+        transformer = transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")));
+        transformer.finalize_block_stream()?;
+    }
 
     // Optional PiD decoder overlay (epic 7840, sc-7846): Chroma's FLUX.1 16-ch VAE latent space has a
     // PiD student (the `flux` backbone), so the final decode can route through `mlx_gen_pid` when
@@ -230,7 +263,29 @@ pub struct Chroma {
     /// holds only the per-phase loader closures and re-loads per generation in phase order (encode →
     /// **drop the T5 encoder** → denoise/decode). The [`Residency`] seam owns the eval/drop/clear
     /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
+    ///
+    /// SC-15520: the *default* only. A request's `GenerationMemory::stage_residency` is the
+    /// production lifecycle authority, so a cached generator may hold a warm pair for one request,
+    /// stage the next, and rebuild the warm pair afterwards.
     residency: Residency<ChromaTextOwned, ChromaHeavyOwned>,
+    /// The spec this generator was loaded from — the memory-strategy contract, its safety check and
+    /// its request scope are all functions of it (SC-15520).
+    loaded_spec: LoadSpec,
+    /// The shared memory-ladder contract for this route (SC-15520).
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+}
+
+/// The request-scoped ladder selection, resolved once per `generate` and threaded through the
+/// denoise/decode bodies. Every field is `false`/`None`/`UNBOUNDED` for a request that selects
+/// nothing, which is byte-for-byte the pre-SC-15520 path.
+#[derive(Clone, Copy, Default)]
+struct RungPlan {
+    /// Rung 1.
+    stage_residency: bool,
+    /// Rung 4 needs components built in a re-materializable form.
+    streamable: bool,
+    /// Rung 4's window size in blocks, already validated against the published domain.
+    transformer_window: Option<usize>,
 }
 
 /// PiD backbone (latent-space) tag for Chroma (epic 7840, sc-7846). Chroma is a FLUX.1-schnell
@@ -434,6 +489,8 @@ impl Chroma {
                 &PreviewSink::default(),
                 seed,
                 cancel,
+                AttentionPlan::UNBOUNDED,
+                None,
                 on_progress,
             )
         })
@@ -459,6 +516,8 @@ impl Chroma {
         preview: &PreviewSink,
         seed: u64,
         cancel: &CancelFlag,
+        attention: AttentionPlan<'_>,
+        window: Option<usize>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let (pos_embeds, pos_mask) = (&encoded.pos_embeds, &encoded.pos_mask);
@@ -503,6 +562,8 @@ impl Chroma {
             mask_pos2d.as_ref(),
             neg_prepared.as_ref(),
             cancel,
+            attention,
+            window,
             on_progress,
         )
     }
@@ -524,15 +585,22 @@ impl Chroma {
         mask_pos2d: Option<&Array>,
         neg_prepared: Option<&(&Array, RopeTable, Option<Array>)>,
         cancel: &CancelFlag,
+        attention: AttentionPlan<'_>,
+        window: Option<usize>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        // Rung 4's plans are `Copy` arithmetic over the two sub-stack depths, so they are built once
+        // here and re-used by both CFG branches; each `forward_prepared` runs its own traversal.
+        let window = tr.block_window(window, cancel)?;
         // The true-CFG velocity field `v = neg + g·(pos − neg)` (single forward when CFG is off).
         // Chroma is rectified-flow (FLOW prediction), so the model is fed the raw schedule sigma as
         // its timestep ([`TimestepConvention::Sigma`]) and `predict` returns the velocity directly.
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             let ts = Array::from_slice(&[sigma], &[1]);
             let pooled = tr.pooled_temb(&ts)?;
-            let pos = tr.forward_prepared(latents, pos_embeds, &pooled, rope_pos, mask_pos2d)?;
+            let pos = tr.forward_prepared(
+                latents, pos_embeds, &pooled, rope_pos, mask_pos2d, attention, window,
+            )?;
             match neg_prepared {
                 Some((neg_embeds, rope_neg, mask_neg2d)) => {
                     let neg = tr.forward_prepared(
@@ -541,6 +609,8 @@ impl Chroma {
                         &pooled,
                         rope_neg,
                         mask_neg2d.as_ref(),
+                        attention,
+                        window,
                     )?;
                     Ok(add(
                         &neg,
@@ -637,26 +707,44 @@ impl Chroma {
         height: u32,
         decoder: Option<&dyn LatentDecoder>,
     ) -> Result<Image> {
-        self.with_parts(|_, _, _, vae| Self::decode_with_vae(vae, latents, width, height, decoder))
+        self.with_parts(|_, _, _, vae| {
+            Self::decode_with_vae(
+                vae,
+                latents,
+                width,
+                height,
+                decoder,
+                None,
+                &CancelFlag::new(),
+            )
+        })
     }
 
     /// Decode against an explicit VAE — the body shared by the public [`Self::decode`] (warm-resident
     /// VAE) and the `generate` render closure (the heavy bundle's just-loaded VAE under `Sequential`).
+    ///
+    /// Ladder rung 2 (SC-15520): `tiling` is `Some` only when the request selected a bounded decode
+    /// **and** the decode routes admitted its geometry. PiD is resolved *before* this plan — the
+    /// `decoder` override wins — so the super-resolving student never inherits native VAE tile
+    /// geometry, whose domains are disjoint by construction.
     fn decode_with_vae(
         vae: &Vae,
         latents: &Array,
         width: u32,
         height: u32,
         decoder: Option<&dyn LatentDecoder>,
+        tiling: Option<&mlx_gen::tiling::TilingConfig>,
+        cancel: &CancelFlag,
     ) -> Result<Image> {
         let unpacked = unpack_latents(latents, width, height)?;
-        let decoder: &dyn LatentDecoder = match decoder {
-            Some(d) => d,
-            None => vae,
+        let decoded = match (decoder, tiling) {
+            // The native VAE, bounded. `decode_tiled` is the shared head-once/tail-tiled decoder
+            // every crate in the FLUX.1 / Z-Image latent space uses.
+            (None, Some(tiling)) => vae.decode_tiled(&unpacked, tiling, Some(cancel))?,
+            (Some(d), _) => d.decode(&unpacked)?,
+            (None, None) => vae.decode(&unpacked)?,
         };
-        let decoded = decoder
-            .decode(&unpacked)?
-            .as_dtype(mlx_rs::Dtype::Float32)?;
+        let decoded = decoded.as_dtype(mlx_rs::Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
 }
@@ -695,10 +783,46 @@ fn encode_cfg(
     })
 }
 
-mlx_gen::impl_generator!(Chroma {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written rather than `mlx_gen::impl_generator!`: that macro emits only
+// `descriptor`/`validate`/`generate`, so a provider using it inherits the `Generator` defaults for
+// the memory-strategy hooks — contract `None` and a safety check that rejects every optimized
+// strategy. Adopting the shared ladder means overriding all three (SC-15520).
+impl Generator for Chroma {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(&self.loaded_spec, &self.memory_strategy, context)
+    }
+}
 
 impl Chroma {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -746,19 +870,32 @@ impl Chroma {
         // achieved capture σ and truncate the denoise.
         let sigmas = self.build_schedule(req.width, req.height, steps, req.scheduler.as_deref())?;
 
+        // ── The request-scoped ladder selection (SC-15520) ───────────────────────────────────────
+        //
+        // Every parameter is validated here, against the domain the contract PUBLISHED, before any
+        // weights load — so an out-of-domain value is a typed rejection on the production path
+        // rather than a silently different execution than the selector chose.
+        let plan = self.rung_plan(req)?;
+        let attention = crate::memory_strategy::attention_plan(req);
+        let tiling = crate::memory_strategy::decode_tiling(req, self.descriptor.id)?;
+
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 encoder,
         // encodes pos (+neg), materializes, then DROPS it + `clear_cache()` so it frees before the
         // DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows the warm encoder and
         // runs the identical encode/denoise/decode with no eval/clear. The prompt encode is
         // seed-independent, so hoisting it here (out of the per-image loop) is byte-identical to the
         // pre-seam per-image re-encode.
-        self.residency.run(
+        self.residency.run_request_scoped(
+            plan.stage_residency,
+            plan.streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
             // ── Phase A: prompt → T5 conditioning (pos + optional neg).
             |text: &ChromaTextOwned| {
-                encode_cfg(&text.tokenizer, &text.t5, &req.prompt, &negative, guidance)
+                let encoded =
+                    encode_cfg(&text.tokenizer, &text.t5, &req.prompt, &negative, guidance)?;
+                Ok(encoded)
             },
             // Materialize the embeds while the T5 is still alive (Sequential only) — MLX is lazy, so an
             // un-evaluated embed keeps the encoder referenced through the graph and the drop would free
@@ -774,6 +911,13 @@ impl Chroma {
                     }
                     None => mlx_rs::transforms::eval([&encoded.pos_embeds])?,
                 }
+                // SC-15449: the conditioning phase has physically completed here — the embeds are
+                // materialized and the T5 is about to be released.
+                crate::memory_strategy::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                    self.descriptor.id,
+                )?;
                 Ok(())
             },
             // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
@@ -817,7 +961,16 @@ impl Chroma {
                         &req.preview,
                         seed,
                         &req.cancel,
+                        attention,
+                        plan.transformer_window,
                         on_progress,
+                    )?;
+                    // SC-15449: the denoise phase has physically completed for this image.
+                    mlx_rs::transforms::eval([&final_latents])?;
+                    crate::memory_strategy::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Denoise,
+                        self.descriptor.id,
                     )?;
                     on_progress(Progress::Decoding);
                     images.push(Self::decode_with_vae(
@@ -826,11 +979,63 @@ impl Chroma {
                         req.width,
                         req.height,
                         pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                        tiling.as_ref(),
+                        &req.cancel,
                     )?);
+                    crate::memory_strategy::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Decode,
+                        self.descriptor.id,
+                    )?;
                 }
                 Ok(GenerationOutput::Images(images))
             },
         )
+    }
+
+    /// Resolve and validate this request's ladder selection.
+    ///
+    /// Rung 3's budget and rung 2's geometry are resolved separately (they are consumed at their own
+    /// call sites); this owns the two lifecycle axes and the rung-3 domain check, so every published
+    /// request-scoped parameter is validated on the same layer.
+    fn rung_plan(&self, req: &GenerationRequest) -> Result<RungPlan> {
+        crate::memory_strategy::validate_attention_chunk(req, self.descriptor.id)?;
+        let Some(memory) = req.memory else {
+            // No selection: fall back to the load-time policy default, exactly as before SC-15520.
+            return Ok(RungPlan {
+                stage_residency: self.residency.is_sequential(),
+                ..Default::default()
+            });
+        };
+        let transformer_window =
+            crate::memory_strategy::transformer_window(req, self.descriptor.id)?;
+        if transformer_window.is_some()
+            && !crate::memory_strategy::structurally_streamable(&self.loaded_spec)
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: this load cannot stream its blocks — bounded transformer residency needs \
+                 OffloadPolicy::Sequential + LoadShape::DeferredMaterialization on a clean base \
+                 route",
+                self.descriptor.id
+            )));
+        }
+        if memory.tile_vae_decode && !self.memory_strategy.lifecycle.decode_tiling {
+            return Err(Error::Unsupported(format!(
+                "{}: bounded decode is not selectable on this route",
+                self.descriptor.id
+            )));
+        }
+        if memory.chunk_attention && !self.memory_strategy.lifecycle.attention_chunking {
+            return Err(Error::Unsupported(format!(
+                "{}: bounded attention is not selectable on this route",
+                self.descriptor.id
+            )));
+        }
+        Ok(RungPlan {
+            stage_residency: memory.stage_residency,
+            streamable: transformer_window.is_some(),
+            transformer_window,
+        })
     }
 }
 
@@ -847,6 +1052,39 @@ pub(crate) fn component_footprint(
         &["vae"],
     )
 }
+
+macro_rules! memory_registration {
+    ($registration:ident, $behavior:ident, $provider_id:expr) => {
+        pub(crate) const $registration: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| crate::memory_strategy::contract_for($provider_id, spec),
+                safety_check: crate::memory_strategy::safety_check,
+            };
+        pub(crate) const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::memory_strategy::registered_fixture,
+                begin_request: crate::memory_strategy::registered_begin_request,
+            };
+    };
+}
+
+memory_registration!(
+    HD_MEMORY_REGISTRATION,
+    HD_MEMORY_BEHAVIOR,
+    crate::CHROMA1_HD_ID
+);
+memory_registration!(
+    BASE_MEMORY_REGISTRATION,
+    BASE_MEMORY_BEHAVIOR,
+    crate::CHROMA1_BASE_ID
+);
+memory_registration!(
+    FLASH_MEMORY_REGISTRATION,
+    FLASH_MEMORY_BEHAVIOR,
+    crate::CHROMA1_FLASH_ID
+);
 
 mlx_gen::register_generators! {
     pub(crate) const HD_REGISTRATION = descriptor_hd => load_hd;
@@ -872,6 +1110,8 @@ mod tests {
     /// `Residency::run` returns before either fires (and the `*_ref`/`denoise` accessors are the only
     /// other callers — untested here).
     fn weightless(variant: ChromaVariant) -> Chroma {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/chroma-weightless".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
         Chroma {
             descriptor: variant.descriptor(),
             variant,
@@ -879,6 +1119,9 @@ mod tests {
                 || Err(Error::Msg("weightless: text encoder not loadable".into())),
                 |_use_pid| Err(Error::Msg("weightless: heavy bundle not loadable".into())),
             ),
+            memory_strategy: crate::memory_strategy::weights_free_contract(variant.id(), &spec)
+                .expect("weights-free contract"),
+            loaded_spec: spec,
         }
     }
 
