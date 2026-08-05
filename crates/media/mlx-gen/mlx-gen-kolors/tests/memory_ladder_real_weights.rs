@@ -499,12 +499,19 @@ fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
 // ── Rung 2 ───────────────────────────────────────────────────────────────────────────────────────
 
 /// The overlap that minimises drift at [`ms::DECODE_TILE_EDGE`] — the sweep's best cell.
-const BEST_DECODE_OVERLAP: u32 = 192;
+const BEST_DECODE_OVERLAP: u32 = 256;
 
-/// Render one real 1024² Kolors image and re-encode it through the same VAE, giving the mechanism
-/// sweep a latent whose GroupNorm statistics are those of a real image rather than of noise.
+/// Render one real Kolors image at `edge` and return the **production latent** — exactly what the
+/// denoiser hands the decode phase.
+///
+/// This is the instrument choice that decides rung 2, and it is deliberately the harsher one. An
+/// earlier revision swept a latent obtained by *re-encoding a finished image*, whose statistics have
+/// already been through the VAE round trip; on Kolors that instrument reads **29/255** at the best
+/// geometry where the production latent reads **41/255** at the same one. A user gets the production
+/// latent, so the absolute bar has to be judged on it. (Both were measured; the re-encoded row is
+/// what the first revision of this file published, and it was too generous by ~40%.)
 #[track_caller]
-fn swept_latent(dir: &std::path::Path, tier: &str, edge: u32) -> (mlx_rs::Array, Vec<u8>) {
+fn production_latent(dir: &std::path::Path, tier: &str, edge: u32) -> mlx_rs::Array {
     use mlx_gen_kolors::model::{KolorsHeavy, KolorsText};
     use mlx_rs::Dtype::Float16;
 
@@ -513,7 +520,9 @@ fn swept_latent(dir: &std::path::Path, tier: &str, edge: u32) -> (mlx_rs::Array,
     if let Some(bits) = bits {
         text.quantize(bits).expect("quantize text encoder");
     }
-    let pos = text.encode("a red fox in a snowy forest, photograph").expect("pos");
+    let pos = text
+        .encode("a red fox in a snowy forest, photograph")
+        .expect("pos");
     let neg = text.encode("blurry, lowres").expect("neg");
     mlx_rs::transforms::eval([&pos.0, &pos.1, &neg.0, &neg.1]).expect("eval");
     drop(text);
@@ -543,17 +552,10 @@ fn swept_latent(dir: &std::path::Path, tier: &str, edge: u32) -> (mlx_rs::Array,
             mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED,
         )
         .expect("denoise");
-    let image = mlx_gen_sdxl::decode_image(heavy.vae(), &latents, None).expect("decode");
-    // Re-encode the finished image: the sweep's instrument compares tiled against untiled decode of
-    // the SAME latent, and a round-tripped latent is the one whose statistics the VAE itself
-    // produced.
-    let reencoded =
-        mlx_gen_sdxl::encode_init_latents(heavy.vae(), &image, edge, edge).expect("re-encode");
-    mlx_rs::transforms::eval([&reencoded]).expect("eval latent");
-    let pixels = image.pixels.clone();
+    mlx_rs::transforms::eval([&latents]).expect("eval latent");
     drop(heavy);
     clear_cache();
-    (reencoded, pixels)
+    latents
 }
 
 /// **The mechanism-level tile sweep** that decides which edges the ladder may publish.
@@ -576,7 +578,7 @@ fn swept_latent(dir: &std::path::Path, tier: &str, edge: u32) -> (mlx_rs::Array,
 fn decode_tile_mechanism_sweep() {
     let dir = require_tier(DEFAULT_TIER);
     let vae = mlx_gen_sdxl::load_vae(&dir).expect("vae");
-    let (latent, _) = swept_latent(&dir, DEFAULT_TIER, 1024);
+    let latent = production_latent(&dir, DEFAULT_TIER, 1024);
 
     let untiled = mlx_gen_sdxl::decode_image(&vae, &latent, None).expect("untiled decode");
     let mut best = (u32::MAX, 0u32, 0u32);
@@ -602,13 +604,25 @@ fn decode_tile_mechanism_sweep() {
          {best_max}/255 against a {}/255 bar",
         ms::DECODE_DRIFT_BAR
     );
+    // **The candidate IS admissible on this instrument at this geometry**, and saying so is the
+    // point: rung 2 is withheld on the RANGE argument
+    // (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`), not because
+    // no geometry works at 1024². A future reader who assumed the sweep simply failed would look for
+    // the wrong repair.
     assert!(
-        best_max > ms::DECODE_DRIFT_BAR,
-        "the best decode geometry in the whole sweep now CLEARS the sibling bar ({best_max}/255 at \
-         edge {best_edge} overlap {best_overlap}, bar {}/255). Rung 2 is declared Missing on the \
-         claim that nothing does — re-open memory_strategy::DECODE_SUPPORT rather than leaving a \
-         publishable candidate withheld",
+        best_max <= ms::DECODE_DRIFT_BAR,
+        "the best decode geometry in the whole sweep no longer clears the sibling bar at 1024² \
+         ({best_max}/255 at edge {best_edge} overlap {best_overlap}, bar {}/255). \
+         memory_strategy::DECODE_SUPPORT records the opposite, and the WHOLE of rung 2's recorded \
+         prize rests on this candidate existing",
         ms::DECODE_DRIFT_BAR
+    );
+    // The anchored geometry must BE the sweep's best, not merely a cell that happens to clear —
+    // otherwise the range argument would be made against a candidate nobody would have chosen.
+    assert_eq!(
+        (best_edge, best_overlap),
+        (ms::DECODE_TILE_EDGE, BEST_DECODE_OVERLAP),
+        "the anchored tile geometry must be the sweep's best cell"
     );
 }
 
@@ -629,28 +643,21 @@ fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range(
         BEST_DECODE_OVERLAP as i32,
     );
     let mut cleared: Vec<u32> = Vec::new();
+    let mut worst = 0u32;
     for edge in [1024u32, 1280, 1536, 2048] {
-        // A synthetic latent at each geometry: rendering four separate images at up to 2048² is
-        // minutes of GPU for a measurement about the DECODER's spatial normalization, which does not
-        // depend on how the latent was produced. The 1024² row is cross-checked against the real
-        // rendered latent by `decode_tile_mechanism_sweep`, which is the control that keeps this
-        // synthetic instrument honest.
-        mlx_rs::random::seed(99).expect("seed");
-        let (lh, lw) = ((edge / 8) as i32, (edge / 8) as i32);
-        let latent = mlx_rs::random::normal::<f32>(&[1, lh, lw, 4], None, None, None)
-            .expect("latent")
-            .as_dtype(mlx_rs::Dtype::Float32)
-            .expect("f32");
+        // A PRODUCTION latent at each geometry — rendered, not synthesised. A synthetic
+        // unit-normal latent is a materially friendlier instrument here (it reads 35/255 at 1024²
+        // where the rendered one reads 41), and a rung admitted on the friendly instrument would be
+        // admitted on evidence no user ever sees.
+        let latent = production_latent(&dir, DEFAULT_TIER, edge);
         let untiled = mlx_gen_sdxl::decode_image(&vae, &latent, None).expect("untiled");
-        let tiled = mlx_gen_sdxl::decode_image_tiled(&vae, &latent, None, Some(&cfg), None)
-            .expect("tiled");
+        let tiled =
+            mlx_gen_sdxl::decode_image_tiled(&vae, &latent, None, Some(&cfg), None).expect("tiled");
         let max = max_delta(&untiled.pixels, &tiled.pixels);
-        let tiles = ((edge as f64 / (ms::DECODE_TILE_EDGE - BEST_DECODE_OVERLAP) as f64).ceil()
-            as u32)
-            .pow(2);
+        worst = worst.max(max);
         println!(
-            "[sc-15521 rung2 range {DEFAULT_TIER}] {edge}²: ~{tiles} tiles, tile covers {:.1}% of \
-             the edge, max Δ {max}/255 (bar {})",
+            "[sc-15521 rung2 range {DEFAULT_TIER}] {edge}²: tile covers {:.1}% of the edge, max Δ \
+             {max}/255 (bar {})",
             100.0 * f64::from(ms::DECODE_TILE_EDGE) / f64::from(edge),
             ms::DECODE_DRIFT_BAR
         );
@@ -659,12 +666,40 @@ fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range(
         }
         clear_cache();
     }
-    assert!(
-        cleared.is_empty(),
-        "edge {} at overlap {BEST_DECODE_OVERLAP} now clears the {}/255 bar at {cleared:?} — the \
-         rung-2 declaration is stale and must be re-derived",
+    println!(
+        "[sc-15521 rung2 range {DEFAULT_TIER}] edge {} overlap {BEST_DECODE_OVERLAP} clears the \
+         {}/255 bar at {cleared:?}; worst cell {worst}/255",
         ms::DECODE_TILE_EDGE,
         ms::DECODE_DRIFT_BAR
+    );
+    // **This is the measurement that withholds rung 2, and it fails in BOTH directions.**
+    //
+    // `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis,
+    // so publishing edge 768 publishes it at everything `descriptor()` advertises — up to
+    // `max_size: 2048`. It must therefore clear the bar across that whole range, and it does not.
+    assert!(
+        !cleared.is_empty(),
+        "edge {} at overlap {BEST_DECODE_OVERLAP} no longer clears the {}/255 bar ANYWHERE — the \
+         candidate rung 2 records a prize for was never real",
+        ms::DECODE_TILE_EDGE,
+        ms::DECODE_DRIFT_BAR
+    );
+    assert!(
+        cleared.len() < 4,
+        "edge {} at overlap {BEST_DECODE_OVERLAP} now clears the {}/255 bar at EVERY advertised \
+         output size ({cleared:?}) — rung 2's `Missing` declaration is stale and the domain should \
+         be published",
+        ms::DECODE_TILE_EDGE,
+        ms::DECODE_DRIFT_BAR
+    );
+    // And the shape of the failure is the mechanism's prediction: the drift tracks the tile's
+    // FRACTION of the output, so it is the LARGE outputs that fail — where a fixed pixel edge covers
+    // least of the image. A failure confined to the small end would mean something else entirely.
+    assert!(
+        !cleared.contains(&2048),
+        "the largest advertised output must be the one that fails — the GroupNorm mechanism says \
+         the drift tracks the tile's fraction of the image, and rung 2's withholding argument is \
+         that no fixed pixel edge holds a constant fraction across a 2x range"
     );
 }
 
@@ -701,18 +736,28 @@ fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
         ms_per_step(&tiled, STEPS),
         mean_delta(&plain.pixels, &tiled.pixels),
     );
+    // **The prize is real and this is the number `DECODE_SUPPORT` records.** A rung withheld with a
+    // number tells the next story where to look; one withheld without a number tells it nothing —
+    // and on this family the number is the largest single saving anywhere on the ladder, which is
+    // exactly why the withholding argument had to be a strong one.
     assert!(
-        drift > ms::DECODE_DRIFT_BAR,
-        "the withheld geometry now preserves the PRODUCTION latent within the {}/255 bar \
-         ({drift}/255) — rung 2's verdict rests on it not doing so",
-        ms::DECODE_DRIFT_BAR
-    );
-    assert!(
-        tiled.peak_gib < plain.peak_gib,
-        "the tiled decode must at least bound the request peak ({:.4} vs {:.4} GiB); if it does \
-         not, the rung-2 write-up's recorded prize is wrong",
+        tiled.peak_gib < plain.peak_gib * 0.97,
+        "the tiled decode must bound the request peak by more than the 3% margin ({:.4} vs {:.4} \
+         GiB); if it does not, the rung-2 write-up's recorded prize is wrong",
         tiled.peak_gib,
         plain.peak_gib
+    );
+    // And at THIS output size the anchored geometry clears the bar, on the production latent. That
+    // is deliberately asserted here as well as in the mechanism sweep, because it is the fact a
+    // reader is most likely to get backwards: rung 2 is not withheld because 1024² fails, it is
+    // withheld because `decode_tile_edges` has no geometry axis and 1536²/2048² fail
+    // (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`).
+    assert!(
+        drift <= ms::DECODE_DRIFT_BAR,
+        "the anchored geometry no longer preserves the production latent at 1024² ({drift}/255 \
+         against a {}/255 bar) — DECODE_SUPPORT records that it does, and records the range as the \
+         sole reason for withholding",
+        ms::DECODE_DRIFT_BAR
     );
 }
 

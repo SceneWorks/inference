@@ -51,10 +51,10 @@ use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSour
 /// The decode tile edge a rung-2 request would have defaulted to, kept as the sweep's anchor.
 ///
 /// Retained as evidence, not as a published domain — see [`DECODE_SUPPORT`].
-pub const DECODE_TILE_EDGE: u32 = 896;
+pub const DECODE_TILE_EDGE: u32 = 768;
 
 /// The decode overlap paired with every swept edge, in output pixels.
-pub const DECODE_OVERLAP: u32 = 64;
+pub const DECODE_OVERLAP: u32 = 256;
 
 /// The decode tile edges the rung-2 sweep **measured** on Kolors' own VAE and latents, largest
 /// first.
