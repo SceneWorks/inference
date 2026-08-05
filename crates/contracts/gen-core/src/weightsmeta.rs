@@ -1224,9 +1224,9 @@ mod tests {
         std::fs::create_dir_all(&model).unwrap();
         std::fs::write(blobs.join("weight"), vec![0u8; 123]).unwrap();
         symlink(blobs.join("weight"), model.join("model.safetensors")).unwrap();
-        symlink(&root, model.join("cycle")).unwrap();
+        symlink(root, model.join("cycle")).unwrap();
 
-        assert_eq!(safetensors_dir_bytes(&root), 123);
+        assert_eq!(safetensors_dir_bytes(root), 123);
     }
 
     /// sc-10894: `safetensors_path_bytes` dispatches on kind — the recursive sum for a DIR, the file
