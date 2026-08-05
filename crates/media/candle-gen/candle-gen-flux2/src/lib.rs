@@ -1082,7 +1082,7 @@ pub fn descriptor_dev() -> ModelDescriptor {
 fn generator_from_pipeline(
     pipe: Pipeline,
     memory_spec: Option<&LoadSpec>,
-) -> gen_core::Result<Box<dyn Generator>> {
+) -> gen_core::Result<Flux2Generator> {
     let variant = pipe.variant;
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
@@ -1116,25 +1116,17 @@ fn generator_from_pipeline(
             )))
         },
     );
-    let loaded_quant = if pipe.variant.is_dev() {
-        match memory_spec {
-            Some(spec) => memory_strategy::resolved_quant(spec)?,
-            None => pipe.quant,
-        }
-    } else {
-        pipe.quant
+    let loaded_quant = match memory_spec {
+        Some(spec) => memory_strategy::resolved_quant(spec)?,
+        None => pipe.quant,
     };
     #[cfg(any(feature = "cuda", test))]
-    let memory_strategy = if pipe.variant.is_dev() {
-        memory_spec
-            .map(memory_strategy::provider_contract)
-            .transpose()?
-    } else {
-        None
-    };
+    let memory_strategy = memory_spec
+        .map(|spec| memory_strategy::contract_for_variant(variant, spec))
+        .transpose()?;
     #[cfg(not(any(feature = "cuda", test)))]
     let memory_strategy = None;
-    Ok(Box::new(Flux2Generator {
+    Ok(Flux2Generator {
         descriptor: descriptor(variant),
         pipe,
         residency,
@@ -1143,8 +1135,8 @@ fn generator_from_pipeline(
         bounded_host_decode,
         loaded_quant,
         memory_strategy,
-        memory_admission: memory_strategy::Flux2AdmissionRegistry::new(config::FLUX2_DEV_ID),
-    }))
+        memory_admission: memory_strategy::Flux2AdmissionRegistry::new(variant.id()),
+    })
 }
 
 /// Construct a lazy candle FLUX.2 generator for `variant`. `spec.weights` must be a
@@ -1157,6 +1149,13 @@ fn generator_from_pipeline(
 /// DENSE_TE, `Pipeline::te_quant`). Without quant both load fully dense (klein's bf16 tier; dev is
 /// fixture-only there — the full 32B needs the quant).
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant_concrete(variant, spec)?))
+}
+
+fn load_variant_concrete(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<Flux2Generator> {
     let id = variant.id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -1172,14 +1171,15 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
             "candle {id} does not support LoRA/LoKr yet"
         )));
     }
+    if spec.identity.is_some() || spec.text_encoder.is_some() || !spec.components.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support identity, external text-encoder, or named-component weights"
+        )));
+    }
     // Both variants honor Q4/Q8 on-the-fly (CPU-stage dense → quantize-onto-GPU): dev folds the 32B DiT
     // + the ~24B Mistral TE (neither fits the GPU dense), klein (sc-11031) folds ONLY the 9B DiT and
     // keeps the 8B Qwen3 TE DENSE bf16 in every tier (epic 8506 DENSE_TE — see `Pipeline::te_quant`).
-    let quant = if variant.is_dev() {
-        memory_strategy::resolved_quant(spec)?
-    } else {
-        spec.quantize
-    };
+    let quant = memory_strategy::resolved_quant(spec)?;
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
@@ -1207,7 +1207,7 @@ pub fn load_from_comfyui_dit(
     let device = candle_gen::default_device()?;
     let root = snapshot_dir.into();
     let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
-    generator_from_pipeline(pipe, None)
+    Ok(Box::new(generator_from_pipeline(pipe, None)?))
 }
 
 /// Registry load hook for `flux2_klein_9b`.
@@ -1237,6 +1237,8 @@ pub fn register_providers(
         .register_generator(DEV_REGISTRATION);
     #[cfg(feature = "cuda")]
     let registry = registry
+        .register_memory_strategy(KLEIN_MEMORY_REGISTRATION)
+        .register_memory_behavior(KLEIN_MEMORY_BEHAVIOR)
         .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
     registry
@@ -1250,9 +1252,24 @@ const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
 };
 
 #[cfg(feature = "cuda")]
+const KLEIN_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::FLUX2_KLEIN_9B_ID,
+    contract: memory_strategy::klein_provider_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+#[cfg(feature = "cuda")]
 const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: config::FLUX2_DEV_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
+
+#[cfg(feature = "cuda")]
+const KLEIN_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: config::FLUX2_KLEIN_9B_ID,
         valid_fixtures: memory_strategy::registered_valid_fixture,
         begin_request: memory_strategy::registered_begin_request,
     };
@@ -1381,25 +1398,49 @@ mod tests {
                 memory_strategy::resolved_quant(&spec).unwrap(),
                 Some(expected)
             );
-            let generator = load_dev(&spec).expect("lazy dev generator");
-            let contract = generator.memory_strategy_contract().unwrap();
-            let context = gen_core::standard_memory_behavior_context(
-                contract,
-                gen_core::MemoryStrategy::Resident,
-                memory_strategy::resolved_numeric_tier(&spec).unwrap(),
-                gen_core::MemoryBehaviorRoute {
-                    mode: gen_core::MemoryMode::TextToImage,
-                    reference_count: 0,
-                    use_pid: false,
-                    has_phases: false,
-                    overlay: None,
-                },
-            )
-            .unwrap();
-            assert!(matches!(
-                generator.memory_strategy_safety_check(&context),
-                gen_core::MemorySafetyDecision::Accept
-            ));
+            for (label, generator) in [
+                (
+                    "dev",
+                    load_variant_concrete(Flux2Variant::Dev, &spec).expect("lazy dev generator"),
+                ),
+                (
+                    "klein",
+                    load_variant_concrete(Flux2Variant::Klein9b, &spec)
+                        .expect("lazy Klein generator"),
+                ),
+            ] {
+                assert_eq!(
+                    generator.pipe.quant,
+                    Some(expected),
+                    "{label} execution pipeline must carry the auto-detected tier"
+                );
+                assert_eq!(
+                    generator.loaded_quant,
+                    Some(expected),
+                    "{label} admission identity must match execution"
+                );
+                let contract = generator.memory_strategy_contract().unwrap();
+                let context = gen_core::standard_memory_behavior_context(
+                    contract,
+                    gen_core::MemoryStrategy::Resident,
+                    memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+                    gen_core::MemoryBehaviorRoute {
+                        mode: gen_core::MemoryMode::TextToImage,
+                        reference_count: 0,
+                        use_pid: false,
+                        has_phases: false,
+                        overlay: None,
+                    },
+                )
+                .unwrap();
+                assert!(
+                    matches!(
+                        generator.memory_strategy_safety_check(&context),
+                        gen_core::MemorySafetyDecision::Accept
+                    ),
+                    "{label} must admit the auto-detected packed tier"
+                );
+            }
             std::fs::remove_dir_all(root).ok();
         }
     }
@@ -1665,7 +1706,7 @@ mod tests {
 
     #[test]
     fn load_rejects_unwired_surfaces() {
-        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec, IdentityWeights};
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
@@ -1673,6 +1714,20 @@ mod tests {
             load_klein(&lora).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
+        let mut identity = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        identity.identity = Some(IdentityWeights::default());
+        let mut external_text_encoder = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        external_text_encoder.text_encoder = Some(WeightsSource::Dir("/external-te".into()));
+        let named_component = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_component(
+            "unwired_component",
+            WeightsSource::File("/component.bin".into()),
+        );
+        for spec in [&identity, &external_text_encoder, &named_component] {
+            assert!(matches!(
+                load_klein(spec).err().expect("unwired field must reject"),
+                gen_core::Error::Unsupported(_)
+            ));
+        }
         // klein (sc-11031) AND dev now accept Q4/Q8 on-the-fly (CPU-stage → quantize-onto-GPU): klein
         // folds only the 9B DiT (Qwen3 TE stays dense bf16, `te_quant`), dev folds the DiT + Mistral TE.
         // The generator builds lazily, so load succeeds without touching the (nonexistent) weights.
@@ -2228,6 +2283,10 @@ mod tests {
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
         let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
+        let parity_failure = match &parity_result {
+            gen_core::MemoryParityResult::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
         eprintln!(
             "{}",
             candle_gen::testkit::memory_evidence_v1_line_with_parity(
@@ -2267,6 +2326,9 @@ mod tests {
             img.width,
             img.height
         );
+        if let Some(reason) = parity_failure {
+            panic!("FLUX.2 memory-ladder output parity failed: {reason}");
+        }
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868) for FLUX.2-**dev** (Mistral
@@ -2294,5 +2356,175 @@ mod tests {
     #[ignore]
     fn flux2_klein_probed_generate_for_offload_ab() {
         run_probed_offload_ab("flux2_klein_9b", "FLUX2_KLEIN_DIR", load_klein, true, 4);
+    }
+
+    /// Reference-bearing companion to [`flux2_klein_probed_generate_for_offload_ab`]. One process
+    /// exercises one exact route/rung coordinate through the bespoke context-bearing loader. Set
+    /// `FLUX2_KLEIN_ROUTE` to `edit`, `reference`, `character`, or `style`; set
+    /// `FLUX2_MEMORY_RUNG` to `resident`, `staged`, `decode`, `attention`, or `blocks`. The reference
+    /// is any image format accepted by the `image` crate at `FLUX2_KLEIN_REF`; output/parity use the same `FLUX2_OUT` and
+    /// `FLUX2_PARITY_REFERENCE` protocol as the registered text route. Invoke the coordinates in
+    /// separate serial GPU0 processes because the CUDA allocator retains its pool.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs FLUX2_KLEIN_DIR + FLUX2_KLEIN_REF + FLUX2_OUT and a CUDA GPU"]
+    fn flux2_klein_reference_routes_probed_memory_ladder() {
+        use candle_gen::testkit::env_path;
+
+        let root = env_path("FLUX2_KLEIN_DIR");
+        let reference_path = env_path("FLUX2_KLEIN_REF");
+        let reference_rgb = image::open(&reference_path)
+            .unwrap_or_else(|error| panic!("decode {}: {error}", reference_path.display()))
+            .to_rgb8();
+        let reference = Image {
+            width: reference_rgb.width(),
+            height: reference_rgb.height(),
+            pixels: reference_rgb.into_raw(),
+        };
+        let out = std::env::var("FLUX2_OUT").expect("set FLUX2_OUT to the pixel-dump path");
+        let route = std::env::var("FLUX2_KLEIN_ROUTE").unwrap_or_else(|_| "edit".to_owned());
+        let (mode, route_label) = match route.as_str() {
+            "edit" => (gen_core::MemoryMode::Edit, "flux2_klein_9b_edit"),
+            "reference" => (gen_core::MemoryMode::Edit, "flux2_klein_9b_reference"),
+            "character" => (
+                gen_core::MemoryMode::Other("character_image".to_owned()),
+                "flux2_klein_9b_character",
+            ),
+            "style" => (
+                gen_core::MemoryMode::Other("style_variations".to_owned()),
+                "flux2_klein_9b_style",
+            ),
+            value => panic!("unsupported FLUX2_KLEIN_ROUTE={value}"),
+        };
+        let rung = std::env::var("FLUX2_MEMORY_RUNG").unwrap_or_else(|_| "resident".to_owned());
+        let strategy = match rung.as_str() {
+            "resident" => gen_core::MemoryStrategy::Resident,
+            "staged" => gen_core::MemoryStrategy::StagedResidency,
+            "decode" => gen_core::MemoryStrategy::BoundedDecode,
+            "attention" => gen_core::MemoryStrategy::BoundedAttention,
+            "blocks" => gen_core::MemoryStrategy::BoundedTransformerResidency,
+            value => panic!("unsupported FLUX2_MEMORY_RUNG={value}"),
+        };
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec = match std::env::var("FLUX2_QUANT")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "q4" => spec.with_quant(Quant::Q4),
+            "q8" => spec.with_quant(Quant::Q8),
+            _ => spec,
+        };
+        spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+        let contract = memory_strategy::klein_provider_contract(&spec).expect("Klein contract");
+        let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric tier");
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            strategy,
+            tier,
+            gen_core::MemoryBehaviorRoute {
+                mode: mode.clone(),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("reference-route memory context");
+        memory_strategy::validate_context(&contract, &context, tier.quant)
+            .expect("reference-route admission");
+        let req = Flux2EditRequest {
+            prompt: "turn the reference into a cinematic portrait with warm studio lighting".into(),
+            width: 1024,
+            height: 1024,
+            steps: 4,
+            guidance: 1.0,
+            seed: 42,
+            ..Default::default()
+        };
+
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+        let load_phase = probe.phase();
+        let model =
+            Flux2Edit::load_klein_with_memory_context(&Flux2EditPaths { root }, &spec, &context)
+                .expect("load context-bound Klein edit");
+        probe.end_load(load_phase);
+
+        let mut stale = context.clone();
+        stale.calibration_fingerprint.push_str("-stale");
+        assert!(
+            model
+                .generate_with_memory_context(
+                    &stale,
+                    &req,
+                    std::slice::from_ref(&reference),
+                    &mut |_| {}
+                )
+                .is_err(),
+            "fingerprint/context mutation must fail before generation"
+        );
+
+        let generate_phase = probe.phase();
+        let img = model
+            .generate_with_memory_context(
+                &context,
+                &req,
+                std::slice::from_ref(&reference),
+                &mut |_| {},
+            )
+            .expect("generate context-bound Klein reference route");
+        probe.end_gen(generate_phase);
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
+        std::fs::write(&out, &img.pixels).expect("write pixels");
+        let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
+        let parity_failure = match &parity_result {
+            gen_core::MemoryParityResult::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        eprintln!(
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line_with_parity(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: "flux2_klein_9b",
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        spec.load_shape,
+                    ),
+                    observed_calibration: contract.calibration.clone().expect("calibration"),
+                    tier,
+                    load_shape: spec.load_shape,
+                    mode,
+                    overlay: None,
+                    geometry: context.geometry,
+                    strategy,
+                    engaged_composition: contract.engaged_composition(strategy),
+                    parameters: context.selection.parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-flux2-klein-reference-memory-ladder-v1",
+                    output_bytes: &img.pixels,
+                },
+                parity,
+                parity_result,
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC route={route_label} gpu={} {report} bytes={} {}x{} out={out}",
+            candle_gen::testkit::probe_gpu(),
+            img.pixels.len(),
+            img.width,
+            img.height,
+        );
+        if let Some(reason) = parity_failure {
+            panic!("FLUX.2 reference memory-ladder output parity failed: {reason}");
+        }
     }
 }

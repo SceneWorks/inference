@@ -28,7 +28,11 @@ use crate::sampler::Sampler;
 
 /// Filename of the merged Gemma-2-2b-it checkpoint inside the gemma snapshot dir; falls back to
 /// loading every `*.safetensors` shard in the dir when absent.
-const GEMMA_MERGED_FILE: &str = "gemma-2-2b-it.safetensors";
+///
+/// `pub` so a provider pricing the PiD overlay in its memory contract (sc-15839) resolves the same
+/// source [`PidEngine::load`] opens instead of re-spelling the filename — a duplicated spelling here
+/// silently sizes the shard dir instead of the merged file.
+pub const GEMMA_MERGED_FILE: &str = "gemma-2-2b-it.safetensors";
 
 /// A loaded PiD decoder engine for one latent space — built once, reused across generations.
 pub struct PidEngine {

@@ -203,10 +203,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
         let pe = g.require("prompt_embeds").unwrap().as_dtype(dt).unwrap();
         let pp = g.require("pooled").unwrap().as_dtype(dt).unwrap();
         let tids = text_time_ids(pp.shape()[0]);
-        let d = Denoiser {
-            unet: &unet,
-            sampler: &sampler,
-        };
+        let d = Denoiser::new(&unet, &sampler);
         let lat = denoise(
             &d,
             init,
@@ -303,10 +300,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
         // Render from the (shared, deterministic) injected latent under a given CLIP conditioning.
         let render = |cond: &Array, pooled: &Array| -> Image {
             let tids = text_time_ids(pooled.shape()[0]);
-            let d = Denoiser {
-                unet: &unet,
-                sampler: sampler.as_ref(),
-            };
+            let d = Denoiser::new(&unet, sampler.as_ref());
             let lat = denoise(
                 &d,
                 init.clone(),
@@ -371,10 +365,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
                 let pe = gl.require("prompt_embeds").unwrap().as_dtype(dt).unwrap();
                 let pp = gl.require("pooled").unwrap().as_dtype(dt).unwrap();
                 let tids = text_time_ids(pp.shape()[0]);
-                let d = Denoiser {
-                    unet: &unet,
-                    sampler: sampler.as_ref(),
-                };
+                let d = Denoiser::new(&unet, sampler.as_ref());
                 let lat = denoise(
                     &d,
                     init_l,

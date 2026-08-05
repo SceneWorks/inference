@@ -158,14 +158,20 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
             ],
         }
 
-    def write_provider(self, body: str) -> None:
+    def write_provider(self, body: str, extra: dict[str, str] | None = None) -> None:
         (self.crate / "src").mkdir(parents=True, exist_ok=True)
         (self.crate / "src" / "lib.rs").write_text(body, encoding="utf-8")
+        for name, text in (extra or {}).items():
+            (self.crate / "src" / name).write_text(text, encoding="utf-8")
 
     def run_gate(self, *, name: str = "provider", depends_on_pid: bool = True) -> None:
         self.gate.check_pid_decode_route_adoption(
             self.metadata(name=name, depends_on_pid=depends_on_pid), self.root
         )
+
+    def assert_gate_passes(self, body: str) -> None:
+        self.write_provider(body)
+        self.run_gate()
 
     def assert_gate_fails(self, body: str, *, because: str) -> None:
         self.write_provider(body)
@@ -445,18 +451,364 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
     def test_every_rung_two_trigger_spelling_arms_the_gate(self) -> None:
         """The trigger set is deliberately wide (fail-closed). Pin each spelling, so narrowing it
         back to `decode_tile_edges` alone — which is what review defeat (c) exploited — is a test
-        failure rather than a silent regression."""
+        failure rather than a silent regression.
+
+        SC-15525 refined *what the markers are evaluated against*, not the set: a provider that
+        publishes a decode DOMAIN still trips on any marker, while one that publishes none cannot
+        emit a native tile into the PiD seam and is exempt (see the gate's own comment). Both halves
+        are pinned here, so the exemption cannot widen into "any crate that mentions rung 2".
+        """
         for marker in self.gate.PID_RUNG_TWO_MARKERS:
-            with self.subTest(marker=marker):
+            with self.subTest(marker=marker, domain="published"):
+                # A published domain is the hazard: every marker must still trip alongside it.
                 self.assert_gate_fails(
                     "pub fn registry() { register_memory_strategy(REG); }\n"
-                    f"pub fn r() {{ let _ = {marker}; }}\n",
+                    f"pub fn r() {{ let _ = {marker}; }}\n"
+                    "pub fn d() { let _ = MemoryParameterRanges { decode_tile_edges: v, "
+                    "decode_overlaps: w }; }\n",
                     because="never calls the checked constructor",
                 )
 
+    def test_the_domain_markers_alone_still_trip_the_gate(self) -> None:
+        """The two markers that ARE the hazard need no corroboration: publishing a native ladder is
+        exactly what reaches `GenerationMemory::decode_tile_edge`."""
+        for marker in ("decode_tile_edges", "decode_overlaps"):
+            with self.subTest(marker=marker):
+                self.assert_gate_fails(
+                    "pub fn registry() { register_memory_strategy(REG); }\n"
+                    f"pub fn r() {{ let _ = MemoryParameterRanges {{ {marker}: v }}; }}\n",
+                    because="never calls the checked constructor",
+                )
 
-if __name__ == "__main__":
-    unittest.main()
+    # ── SC-15525's rung-2-Missing exemption, and the three shapes it must NOT cover ──────────────
+    #
+    # The first revision keyed the exemption on the ABSENCE of the two domain literals and pinned only
+    # the `fn configure_decode` hook shape. Adversarial review defeated both halves: no MLX provider
+    # writes that method (shape C below), and a provider can declare rung 2 *Implemented* while
+    # keeping every domain literal in another crate (shape B). Each defeat is a named test here.
+
+    # The real production shape: `BoundedDecode` declared Missing through a named `const`, plus the
+    # refusing decode closure every MLX family hands the shared request scope.
+    REFUSES_RUNG_TWO = (
+        "pub fn registry() { register_memory_strategy(REG); }\n"
+        "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+        "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+        "    _ => MemoryParameterRanges::default() }; }\n"
+        "fn begin(id: &'static str) -> Result<()> {\n"
+        "    let cfg = MlxRequestScopeConfig::new(id, g, m, use_pid, blocks,\n"
+        "        move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),\n"
+        "    )?;\n"
+        "    Ok(())\n"
+        "}\n"
+    )
+
+    def test_a_provider_that_declares_rung_two_missing_is_exempt(self) -> None:
+        """SC-15525: declaring `BoundedDecode` **Missing** — and refusing at both decode seams — is
+        not adoption. Such a provider publishes no native ladder, so there is nothing for the PiD
+        seam to receive. This is the shape `mlx-gen-sdxl` actually ships."""
+        self.assert_gate_passes(self.REFUSES_RUNG_TWO)
+
+    def test_the_exemption_needs_the_missing_declaration_not_just_a_bare_mention(self) -> None:
+        """The exemption is keyed on the POSITIVE claim. Naming `BoundedDecode` without a support
+        expression this reader can resolve to `Missing` proves nothing, so it must not buy an exit —
+        absence of a published domain is corroboration, never the key."""
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub fn c() { let _ = MemoryStrategy::BoundedDecode; }\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_the_exemption_does_not_cover_a_declared_implemented_rung_two(self) -> None:
+        """**Review defeat (B).** A provider whose `MemoryParameterRanges` are built by a helper in
+        another crate writes neither domain literal in its own source — while declaring rung 2
+        **Implemented**. The first revision exempted exactly that. Both the inline and the
+        via-`const` spellings of `Implemented` must arm the gate."""
+        for support in (
+            "MemoryStrategySupport::Implemented",
+            "DECODE_SUPPORT",
+        ):
+            with self.subTest(support=support):
+                self.assert_gate_fails(
+                    "pub fn registry() { register_memory_strategy(REG); }\n"
+                    "pub const DECODE_SUPPORT: MemoryStrategySupport = "
+                    "MemoryStrategySupport::Implemented;\n"
+                    f"pub fn c() {{ match s {{ MemoryStrategy::BoundedDecode => {support},\n"
+                    "    _ => MemoryParameterRanges::default() }; }\n"
+                    "pub fn r() -> MemoryParameterRanges { shared::decode_ranges(EDGES) }\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_the_exemption_does_not_cover_a_live_mlx_decode_closure(self) -> None:
+        """**Review defeat (C) — the serious one.** No MLX provider writes `fn configure_decode`;
+        that method lives once on `MlxRequestScopeCore`, and each family hands the constructor a
+        closure instead. A closure that can SUCCEED admits a native geometry into the PiD seam, so
+        the exemption must not cover it however rung 2 is declared."""
+        for body in ("Ok(())", "self.plan(edge, overlap)", "routes.pick(edge)"):
+            with self.subTest(body=body):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO.replace(
+                        "Err(refuse_decode(id, Some(edge), Some(overlap)))", body
+                    ),
+                    because="never calls the checked constructor",
+                )
+
+    def test_the_exemption_does_not_cover_a_post_construction_validator_swap(self) -> None:
+        """**Review defeat (D).** `MlxRequestScopeConfig.decode_validator` is a `pub` field, so a
+        rejecting `::new` proves nothing if the next line overwrites it. `mlx-gen-sdxl` already
+        mutates the config two lines after `::new`, so this is one line from shipping code."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO.replace(
+                "    Ok(())\n",
+                "    config.decode_validator = Box::new(|_, _, _| Ok(()));\n    Ok(())\n",
+            ),
+            because="never calls the checked constructor",
+        )
+
+    def test_the_exemption_does_not_cover_a_struct_literal_config(self) -> None:
+        """**Review defeat (E) — the vacuous one.** Every field of the config is `pub`, so a struct
+        literal never touches `::new`. The first revision then found zero call sites, ran an empty
+        loop, and returned `True` — a silent pass, which is exactly what the function's own docstring
+        says it never does."""
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "    _ => MemoryParameterRanges::default() }; }\n"
+            "fn begin(id: &'static str) -> Result<()> {\n"
+            "    let cfg = MlxRequestScopeConfig {\n"
+            "        provider_id: id,\n"
+            "        decode_validator: Box::new(|_, _, _| Ok(())),\n"
+            "        ..Default::default()\n"
+            "    };\n"
+            "    Ok(())\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_naming_the_scope_config_without_a_resolvable_construction_is_not_exempt(self) -> None:
+        """The inversion root cause A asked for: a crate that NAMES the scope config but whose
+        construction this reader cannot resolve must ARM the gate, not disarm it. The first revision
+        returned `True` from an empty loop — a silent pass its own docstring forbade.
+
+        A crate that never names the type at all is a different case and stays exempt: it installs no
+        validator, so there is nothing to be wrong about. That is the rung-4-only adopter, pinned by
+        `test_required_configure_decode_hook_that_only_rejects_is_not_rung_two_adoption`.
+        """
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "    _ => MemoryParameterRanges::default() }; }\n"
+            "fn begin(cfg: MlxRequestScopeConfig) -> Result<()> { Ok(build(cfg)) }\n",
+            because="never calls the checked constructor",
+        )
+
+    # ── SC-15525 probe, root causes A-E. Each shape below compiles and is rustfmt-stable. ────────
+
+    def test_the_exemption_does_not_cover_an_aliased_constructor(self) -> None:
+        """**Root cause A.** A literal-substring reader is one rename away from vacuous: the
+        constructor is resolved by TYPE, so `use … as X`, `type X = …` and the qualified
+        `<path::Type>::new` form all have to land on the same check."""
+        for preamble, call in (
+            (
+                "use mlx_gen::request_scope::MlxRequestScopeConfig as ScopeConfig;\n",
+                "ScopeConfig::new(id, g, m, p, b, move |_u, e, o| self.plan(e, o))",
+            ),
+            (
+                "type Scope = MlxRequestScopeConfig;\n",
+                "Scope::new(id, g, m, p, b, move |_u, e, o| self.plan(e, o))",
+            ),
+            (
+                "",
+                "<mlx_gen::request_scope::MlxRequestScopeConfig>::new(id, g, m, p, b, "
+                "move |_u, e, o| self.plan(e, o))",
+            ),
+        ):
+            with self.subTest(call=call[:40]):
+                self.assert_gate_fails(
+                    preamble
+                    + "pub fn registry() { register_memory_strategy(REG); }\n"
+                    "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+                    "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+                    "    _ => MemoryParameterRanges::default() }; }\n"
+                    f"fn begin() -> Result<()> {{ let cfg = {call}?; Ok(()) }}\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_a_second_accepting_construction_site_defeats_a_rejecting_one(self) -> None:
+        """**Root cause A.** One well-behaved `::new` does not license another that is not."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO
+            + "fn other(id: &'static str) -> Result<()> {\n"
+            "    let c2 = <MlxRequestScopeConfig>::new(id, g, m, p, b, |_u, e, o| Ok(()))?;\n"
+            "    Ok(())\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_the_exemption_does_not_cover_a_conditional_inside_the_err_argument(self) -> None:
+        """**Root cause B.** `Err(` + balanced `)` + end-of-body is a SHAPE. These arguments can
+        early-return `Ok`, and a macro hides the whole question from both this reader and rustfmt."""
+        for body in (
+            "Err(match plan(edge, overlap) { Ok(()) => return Ok(()), Err(e) => e })",
+            "Err(if self.tiles_ok(edge) { return Ok(()); } else { nope() })",
+            "Err(or_accept!(plan(edge, overlap)))",
+            "Err(plan(edge, overlap)?)",
+        ):
+            with self.subTest(body=body[:40]):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO.replace(
+                        "Err(refuse_decode(id, Some(edge), Some(overlap)))", body
+                    ),
+                    because="never calls the checked constructor",
+                )
+
+    def test_whitespace_does_not_skip_the_configure_decode_check(self) -> None:
+        """**Root cause C.** The short-circuit matched the literal `"fn configure_decode"` while the
+        helper matched `\\bfn\\s+configure_decode\\b`. One extra space slipped between them and
+        defeated this file's own `…_live_configure_decode_hook` test."""
+        for spelling in ("fn  configure_decode", "fn\n    configure_decode"):
+            with self.subTest(spelling=spelling.replace("\n", "\\n")):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO
+                    + f"{spelling}(&mut self, e: u32, o: u32) -> Result<()> {{ self.plan(e, o) }}\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_a_dead_const_in_another_file_cannot_satisfy_a_live_implemented_arm(self) -> None:
+        """**Root cause D.** The const hop used a crate-wide search, so a deprecated same-named const
+        anywhere satisfied a live arm. The hop is now scoped to the arm's own file."""
+        self.write_provider(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "    _ => MemoryParameterRanges::default() }; }\n",
+            extra={
+                "deprecated_v1.rs": "pub const DECODE_SUPPORT: MemoryStrategySupport = "
+                "MemoryStrategySupport::Missing;\n"
+            },
+        )
+        with self.assertRaises(AssertionError):
+            self.run_gate()
+
+    def test_an_or_pattern_or_guard_arm_declaring_implemented_is_not_exempt(self) -> None:
+        """**Root cause E, in its full shape.** The old arm regex could not cross an or-pattern
+        (``BoundedDecode | BoundedAttention =>``) or a guard containing ``>=`` (its ``[^=]*?`` stops
+        at the ``=``), so a live ``Implemented`` declaration was *invisible* to it.
+
+        Invisibility alone is harmless — zero arms fails closed. The defeat needs the second half,
+        and it is the half a narrower test misses: an ordinary ``Missing`` arm elsewhere in the crate,
+        which the old regex *did* see and which then satisfied its every-arm loop on its own. So the
+        shape here is the real one — a hidden ``Implemented`` **paired with** a visible ``Missing`` —
+        and it is exempt under the pre-fix gate.
+        """
+        for arm in (
+            "MemoryStrategy::BoundedDecode | MemoryStrategy::BoundedAttention => "
+            "MemoryStrategySupport::Implemented,",
+            "MemoryStrategy::BoundedDecode if self.tiles >= 2 => MemoryStrategySupport::Implemented,",
+        ):
+            with self.subTest(arm=arm[:50]):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO
+                    + f"pub fn live() {{ match s {{ {arm}\n"
+                    "    _ => MemoryParameterRanges::default() }; }\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_a_dead_sibling_missing_arm_does_not_license_a_live_one(self) -> None:
+        """**Root cause E.** Exactly one `BoundedDecode` support arm may exist; a second is how a
+        dead declaration was made to stand in for a live one."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO
+            + "pub fn legacy() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT, "
+            "_ => x }; }\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_the_exemption_does_not_cover_a_validator_installed_without_assignment(self) -> None:
+        """**Round-3 residual on root cause A.** The post-construction guard matched
+        `.decode_validator =`, which is one *spelling* of installing a validator, not the act. Each
+        shape below puts an accepting validator into the config with no `=` next to the field."""
+        for install in (
+            "std::mem::replace(&mut cfg.decode_validator, "
+            "Box::new(|_u, _e, _o| Ok(())));",
+            "swap(&mut cfg.decode_validator, &mut accepting);",
+            "install_validator(&mut cfg.decode_validator);",
+        ):
+            with self.subTest(install=install[:40]):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO + f"fn late(cfg: &mut Scope) {{ {install} }}\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_a_second_same_named_support_const_in_the_file_is_not_exempt(self) -> None:
+        """**Round-3 residual on root cause D.** Scoping the const hop to the arm's own file was
+        necessary and not sufficient: it still asked "does a `= Missing` declaration exist?" rather
+        than "is the one this arm binds Missing?". An inner module carrying a dead `Missing` beside a
+        live `Implemented` answered the first question yes. This reader resolves no module paths, so
+        two declarations of the name must fail closed rather than guess."""
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Implemented;\n"
+            "mod deprecated_v1 {\n"
+            "    pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+            "}\n"
+            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "    _ => MemoryParameterRanges::default() }; }\n"
+            "fn begin(id: &'static str) -> Result<()> {\n"
+            "    let cfg = MlxRequestScopeConfig::new(id, g, m, use_pid, blocks,\n"
+            "        move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),\n"
+            "    )?;\n"
+            "    Ok(())\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_a_bitwise_or_argument_does_not_false_red_a_rejecting_call_site(self) -> None:
+        """The one FALSE RED the probe found: a top-level `|` in an earlier argument used to swallow
+        the closure's own delimiters, route-checking a call site that genuinely rejects."""
+        self.assert_gate_passes(
+            self.REFUSES_RUNG_TWO.replace(
+                "MlxRequestScopeConfig::new(id, g, m, use_pid, blocks,",
+                "MlxRequestScopeConfig::new(id, FLAG_A | FLAG_B, m, use_pid, blocks,",
+            )
+        )
+
+    def test_the_exemption_does_not_cover_a_named_decode_validator(self) -> None:
+        """A validator passed by name is not a shape this reader can prove refuses, so it fails
+        closed rather than being taken on trust."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO.replace(
+                "move |_use_pid, edge, overlap| "
+                "Err(refuse_decode(id, Some(edge), Some(overlap)))",
+                "self.decode_validator",
+            ),
+            because="never calls the checked constructor",
+        )
+
+    def test_the_exemption_does_not_cover_a_live_configure_decode_hook(self) -> None:
+        """The trait-method half of the same rule. It is the shape a NON-MLX adopter would write, so
+        it stays pinned even though no MLX family uses it."""
+        self.assert_gate_fails(
+            self.REFUSES_RUNG_TWO
+            + "fn configure_decode(&mut self, e: u32, o: u32) -> Result<()> { self.plan(e, o) }\n",
+            because="never calls the checked constructor",
+        )
+
+    def test_a_cfg_test_missing_declaration_cannot_buy_the_exemption(self) -> None:
+        """The support declaration is read off the cfg(test)-blanked stream, so a test fixture that
+        writes `BoundedDecode => Missing` cannot exempt a production contract that never does."""
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub fn r() -> MemoryParameterRanges { shared::decode_ranges(EDGES) }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+            "    fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "        _ => MemoryParameterRanges::default() }; }\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
 
 
 class SnapshotPathDerivationTests(unittest.TestCase):
@@ -562,3 +914,6 @@ class SnapshotPathDerivationTests(unittest.TestCase):
                 '}\n'
             )
         )
+
+if __name__ == "__main__":
+    unittest.main()

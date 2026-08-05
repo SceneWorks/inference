@@ -152,6 +152,46 @@ impl ChatGlmLinear {
         })
     }
 
+    /// Whether this projection is packed. Used by the rung-4 block-stream tests to prove the replay
+    /// reproduces the tier rather than merely producing *a* quantized block.
+    #[cfg(test)]
+    fn is_quantized(&self) -> bool {
+        matches!(self, ChatGlmLinear::Quant { .. })
+    }
+
+    /// Whether two projections carry byte-equal packed parameters at the same geometry.
+    #[cfg(test)]
+    fn matches_quantized_params(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                ChatGlmLinear::Quant {
+                    q: aq,
+                    scales: asc,
+                    qbias: ab,
+                    group: ag,
+                    bits: abits,
+                    ..
+                },
+                ChatGlmLinear::Quant {
+                    q: bq,
+                    scales: bsc,
+                    qbias: bb,
+                    group: bg,
+                    bits: bbits,
+                    ..
+                },
+            ) => {
+                let close = |x: &Array, y: &Array| {
+                    mlx_rs::ops::all_close(x, y, None, None, None)
+                        .map(|r| r.item::<bool>())
+                        .unwrap_or(false)
+                };
+                ag == bg && abits == bbits && close(aq, bq) && close(asc, bsc) && close(ab, bb)
+            }
+            _ => false,
+        }
+    }
+
     /// `y = x · Wᵀ (+ bias)`. Dense bias add is the FUSED `addmm` (single rounding, matching the core
     /// [`mlx_gen::nn::linear`]); quant uses `quantized_matmul` (transpose, fp32 accumulation).
     fn forward(&self, x: &Array) -> Result<Array> {
@@ -203,7 +243,7 @@ impl ChatGlmLinear {
     }
 }
 
-struct GlmBlock {
+pub(crate) struct GlmBlock {
     input_ln: Array,
     post_attn_ln: Array,
     qkv: ChatGlmLinear, // fused query_key_value, biased
@@ -212,12 +252,83 @@ struct GlmBlock {
     h4_to_h: ChatGlmLinear,
 }
 
+impl GlmBlock {
+    /// The **single** constructor for one `encoder.layers.{index}` block.
+    ///
+    /// Both the resident stack ([`ChatGlmModel::from_weights`]) and ladder rung 4's re-materialized
+    /// window ([`crate::block_stream::GlmBlockStream`]) go through here, so a streamed block cannot
+    /// diverge from its resident twin on *which* tensors it reads or *how* they are cast.
+    pub(crate) fn from_weights(
+        w: &Weights,
+        index: usize,
+        quant: Option<ChatGlmQuant>,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        let b = format!("encoder.layers.{index}.");
+        Ok(Self {
+            input_ln: w
+                .require(&format!("{b}input_layernorm.weight"))?
+                .as_dtype(dtype)?,
+            post_attn_ln: w
+                .require(&format!("{b}post_attention_layernorm.weight"))?
+                .as_dtype(dtype)?,
+            qkv: ChatGlmLinear::load(
+                w,
+                &format!("{b}self_attention.query_key_value"),
+                quant,
+                true,
+                dtype,
+            )?,
+            dense: ChatGlmLinear::load(
+                w,
+                &format!("{b}self_attention.dense"),
+                quant,
+                false,
+                dtype,
+            )?,
+            h_to_4h: ChatGlmLinear::load(w, &format!("{b}mlp.dense_h_to_4h"), quant, false, dtype)?,
+            h4_to_h: ChatGlmLinear::load(w, &format!("{b}mlp.dense_4h_to_h"), quant, false, dtype)?,
+        })
+    }
+
+    /// Whether every projection in this block is packed.
+    #[cfg(test)]
+    pub(crate) fn is_quantized(&self) -> bool {
+        self.qkv.is_quantized()
+            && self.dense.is_quantized()
+            && self.h_to_4h.is_quantized()
+            && self.h4_to_h.is_quantized()
+    }
+
+    /// Whether this block's packed parameters match `other`'s, projection by projection.
+    #[cfg(test)]
+    pub(crate) fn matches_quantized_params(&self, other: &Self) -> bool {
+        self.qkv.matches_quantized_params(&other.qkv)
+            && self.dense.matches_quantized_params(&other.dense)
+            && self.h_to_4h.matches_quantized_params(&other.h_to_4h)
+            && self.h4_to_h.matches_quantized_params(&other.h4_to_h)
+    }
+
+    /// Replay a load-time quantization onto one block — the streamed twin of the per-block half of
+    /// [`ChatGlmModel::quantize`]. A no-op on an already-packed (pre-quantized turnkey) block, which
+    /// is exactly the no-op the resident path performed.
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.qkv.quantize(bits, None)?;
+        self.dense.quantize(bits, None)?;
+        self.h_to_4h.quantize(bits, None)?;
+        self.h4_to_h.quantize(bits, None)
+    }
+}
+
 /// The ChatGLM3-6B backbone used as the Kolors text encoder.
 pub struct ChatGlmModel {
     embed: Array, // [vocab, hidden]
     layers: Vec<GlmBlock>,
     cfg: ChatGlmConfig,
     dtype: Dtype,
+    /// Ladder rung 4's `TransformerComponent::TextEncoder` scope (SC-15521): where the 28 GLM blocks
+    /// can be re-read from, or `None` for a load that cannot stream them.
+    block_stream: Option<crate::block_stream::GlmBlockStream>,
 }
 
 impl ChatGlmModel {
@@ -232,22 +343,9 @@ impl ChatGlmModel {
         quant: Option<ChatGlmQuant>,
         dtype: Dtype,
     ) -> Result<Self> {
-        let norm = |key: &str| -> Result<Array> { Ok(w.require(key)?.as_dtype(dtype)?) };
-        let lin = |key: &str, with_bias: bool| -> Result<ChatGlmLinear> {
-            ChatGlmLinear::load(w, key, quant, with_bias, dtype)
-        };
-
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let b = format!("encoder.layers.{i}.");
-            layers.push(GlmBlock {
-                input_ln: norm(&format!("{b}input_layernorm.weight"))?,
-                post_attn_ln: norm(&format!("{b}post_attention_layernorm.weight"))?,
-                qkv: lin(&format!("{b}self_attention.query_key_value"), true)?,
-                dense: lin(&format!("{b}self_attention.dense"), false)?,
-                h_to_4h: lin(&format!("{b}mlp.dense_h_to_4h"), false)?,
-                h4_to_h: lin(&format!("{b}mlp.dense_4h_to_h"), false)?,
-            });
+            layers.push(GlmBlock::from_weights(w, i, quant, dtype)?);
         }
 
         Ok(Self {
@@ -255,6 +353,7 @@ impl ChatGlmModel {
             layers,
             cfg,
             dtype,
+            block_stream: None,
         })
     }
 
@@ -265,10 +364,7 @@ impl ChatGlmModel {
     /// norms, not quantized. Idempotent.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for layer in &mut self.layers {
-            layer.qkv.quantize(bits, None)?;
-            layer.dense.quantize(bits, None)?;
-            layer.h_to_4h.quantize(bits, None)?;
-            layer.h4_to_h.quantize(bits, None)?;
+            layer.quantize(bits)?;
         }
         Ok(())
     }
@@ -403,37 +499,16 @@ impl ChatGlmModel {
         attention_mask: &Array,
         position_ids: Option<&Array>,
     ) -> Result<Vec<Array>> {
-        let sh = input_ids.shape();
-        let (b, s) = (sh[0], sh[1]);
-        // Per-row `position_ids` ([B,S]) are flattened to a single RoPE table below, which only lines
-        // up with the [B,S,…] activations when B==1; a B>1 caller would build a B·S-row table that
-        // shape-mismatches in `apply_rope`. Production encode is always B==1, so reject B>1 with
-        // per-row positions cleanly instead of crashing in Metal (F-025).
-        if position_ids.is_some() && b != 1 {
-            return Err(Error::Msg(format!(
-                "kolors chatglm3: per-row position_ids requires batch size 1 (got {b})"
-            )));
-        }
-        let ids = input_ids.reshape(&[-1])?;
-        let mut h = self
-            .embed
-            .take_axis(&ids, 0)?
-            .reshape(&[b, s, self.cfg.hidden_size])?;
-
-        let positions: Vec<i32> = match position_ids {
-            Some(p) => p
-                .reshape(&[-1])?
-                .as_dtype(Dtype::Int32)?
-                .as_slice::<i32>()
-                .to_vec(),
-            // `None` builds a single `0..s` table shared across all B rows. That is correct for B==1
-            // (production) and for uniform/right-padded batches, but a variable-length (left-padded)
-            // B>1 batch would need per-row positions — which then hits the B==1 guard above. So
-            // variable-length batched encode is unsupported, not silently mis-positioned (F-072).
-            None => (0..s).collect(),
-        };
-        let mask = self.causal_padding_mask(attention_mask, b, s)?;
-        let (cos, sin) = self.rope_tables(&positions)?;
+        // Per-row `position_ids` ([B,S]) are flattened to a single RoPE table, which only lines up
+        // with the [B,S,…] activations when B==1; a B>1 caller would build a B·S-row table that
+        // shape-mismatches in `apply_rope`. Production encode is always B==1, so `prepare_forward`
+        // rejects B>1 with per-row positions cleanly instead of crashing in Metal (F-025). A `None`
+        // position set builds a single `0..s` table shared across all B rows — correct for B==1 and
+        // for uniform/right-padded batches; a variable-length (left-padded) B>1 batch would need
+        // per-row positions, which then hits that guard, so it is unsupported rather than silently
+        // mis-positioned (F-072).
+        let (h, mask, cos, sin) = self.prepare_forward(input_ids, attention_mask, position_ids)?;
+        let mut h = h;
 
         let mut hiddens = Vec::with_capacity(self.cfg.num_layers + 1);
         hiddens.push(h.clone()); // state 0 = embedding (input to layer 0)
@@ -442,6 +517,133 @@ impl ChatGlmModel {
             hiddens.push(h.clone()); // output of this layer
         }
         Ok(hiddens)
+    }
+
+    /// Arm ladder rung 4's `TransformerComponent::TextEncoder` scope (SC-15521): record where the 28
+    /// GLM blocks can be re-read from.
+    ///
+    /// `source` must be the `text_encoder/` directory the resident stack was built from (a directory
+    /// rather than a file, because the `bf16` tier ships three shards plus an index), and
+    /// `quant_bits` the load-time quantization the resident stack received, so a streamed block is
+    /// byte-identical to its resident twin.
+    ///
+    /// Unlike the U-Net's arming, there is nothing to capture: Kolors installs no adapters and no
+    /// IP projections on a `GlmBlock`. See `crate::block_stream` for why that is asserted rather
+    /// than assumed.
+    pub fn arm_block_stream(&mut self, source: &mlx_gen::WeightsSource, quant_bits: Option<i32>) {
+        self.block_stream = Some(crate::block_stream::GlmBlockStream::new(
+            source.clone(),
+            self.cfg.num_layers,
+            self.dtype,
+            quant_bits,
+        ));
+    }
+
+    /// Whether rung 4's text-encoder scope can execute on this encoder.
+    pub fn can_stream_blocks(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    /// The windowed twin of [`encode_prompt`](Self::encode_prompt): the same conditioning, with at
+    /// most `window` consecutive GLM blocks materialized at once.
+    ///
+    /// **Why this is not `forward_with_positions` plus a window.** The resident forward returns all
+    /// **29** hidden states, and every one of them is a `clone` of a lazy MLX graph node. Under a
+    /// window each of those nodes still references the weights of the block that produced it, so
+    /// accumulating them would pin the entire tower and the window would bound **nothing** — with
+    /// correct output either way, which is the silent MLX failure `mlx_gen::block_residency`
+    /// documents. Kolors conditioning needs exactly two of the 29 (`hidden[-2]` as the context,
+    /// `hidden[-1]`'s last position as the pooled), so the windowed loop carries a rolling
+    /// `(previous, current)` pair and forces **both** at every window boundary. Nothing else is
+    /// retained, and nothing unevaluated crosses a window drop.
+    ///
+    /// Returns the same `(context, pooled)` as `encode_prompt`, bit-for-bit: `run_windowed`
+    /// re-materializes each block through the same constructor and replays the same tier, so the
+    /// arithmetic is identical and only the residency differs.
+    pub fn encode_prompt_windowed(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        position_ids: Option<&Array>,
+        window: usize,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<(Array, Array)> {
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "kolors chatglm3: a transformer window was planned for a text encoder with no \
+                 re-openable block stream; the TextEncoder scope needs a DeferredMaterialization \
+                 load over a snapshot directory"
+                    .to_owned(),
+            )
+        })?;
+        let (h, mask, cos, sin) = self.prepare_forward(input_ids, attention_mask, position_ids)?;
+        let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), window)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        // The rolling pair: `previous` is the hidden state one block behind `current`, so after the
+        // last block they are `hidden[-2]` and `hidden[-1]`. `previous` starts as the embedding,
+        // which is what `hidden[-2]` degenerates to on a one-block stack.
+        let init = (h.clone(), h);
+        let (previous, current) = mlx_gen::block_residency::run_windowed(
+            &plan,
+            cancel,
+            init,
+            || stream.open(),
+            |(mut previous, mut current), view, range| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    previous = current;
+                    current = self.block(&block, &previous, &mask, &cos, &sin)?;
+                }
+                Ok((previous, current))
+            },
+            |(previous, current)| {
+                // LOAD-BEARING: force both carried states before the window drops. An unevaluated
+                // node keeps this window's block weights alive through the lazy graph, and the drop
+                // would free nothing while still producing the correct conditioning.
+                mlx_rs::transforms::eval([previous, current])?;
+                Ok(())
+            },
+        )?;
+        let lsh = current.shape();
+        let (b, s, hidden) = (lsh[0], lsh[1], lsh[2]);
+        let idx = Array::from_slice(&[s - 1], &[1]);
+        let pooled = current.take_axis(&idx, 1)?.reshape(&[b, hidden])?;
+        Ok((previous, pooled))
+    }
+
+    /// Everything a forward needs before the block loop: the embedded hidden state, the additive
+    /// mask and the RoPE tables. Shared by the resident and windowed paths so they cannot diverge on
+    /// positions, padding or embedding lookup — the three places a windowed encode could silently
+    /// produce different conditioning.
+    fn prepare_forward(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        position_ids: Option<&Array>,
+    ) -> Result<(Array, Array, Array, Array)> {
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        if position_ids.is_some() && b != 1 {
+            return Err(Error::Msg(format!(
+                "kolors chatglm3: per-row position_ids requires batch size 1 (got {b})"
+            )));
+        }
+        let ids = input_ids.reshape(&[-1])?;
+        let h = self
+            .embed
+            .take_axis(&ids, 0)?
+            .reshape(&[b, s, self.cfg.hidden_size])?;
+        let positions: Vec<i32> = match position_ids {
+            Some(p) => p
+                .reshape(&[-1])?
+                .as_dtype(Dtype::Int32)?
+                .as_slice::<i32>()
+                .to_vec(),
+            None => (0..s).collect(),
+        };
+        let mask = self.causal_padding_mask(attention_mask, b, s)?;
+        let (cos, sin) = self.rope_tables(&positions)?;
+        Ok((h, mask, cos, sin))
     }
 
     /// Extract Kolors conditioning: `(context, pooled)`. `context` = `hidden_states[-2]` `[B,S,hidden]`
