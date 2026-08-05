@@ -226,22 +226,36 @@ fn rung2(edge: u32, overlap: u32) -> GenerationMemory {
     }
 }
 
-/// The **rung-3** production composition: rung 3 engages rung 2 by cost order, still not rung 1.
+/// The **rung-3** production composition: rung 3 engages rung 2 by cost order, still not rung 1 —
+/// *and only where rung 2 is `Implemented`*. `MemoryProviderContract::engages` does not engage a
+/// rung the provider declares `Missing`, so a helper that hardcoded the tiling would compose a
+/// request the selector can never produce and the production path refuses.
 fn rung3() -> GenerationMemory {
     GenerationMemory {
         chunk_attention: true,
         attention_chunk_size: Some(ms::ATTENTION_CHUNK_SIZE),
-        ..rung2(ms::DECODE_TILE_EDGE, ms::DECODE_OVERLAP)
+        ..if ms::DECODE_SUPPORT {
+            rung2(ms::DECODE_TILE_EDGE, ms::DECODE_OVERLAP)
+        } else {
+            GenerationMemory::default()
+        }
     }
 }
 
 /// The **rung-4 control**: everything rung 4's composition engages *except* the window itself, which
-/// is the only way to isolate what the window buys. Rung 4 engages rungs 2 and 3 by cost order and
-/// rung 1 through this provider's declared `EngagedInSameRequest` prerequisite.
+/// is the only way to isolate what the window buys. Rung 4 engages rungs 2 and 3 by cost order —
+/// again only where they are `Implemented` — and rung 1 through this provider's declared
+/// `EngagedInSameRequest` prerequisite.
 fn rung4_control() -> GenerationMemory {
     GenerationMemory {
         stage_residency: true,
-        ..rung3()
+        ..if ms::ATTENTION_SUPPORT {
+            rung3()
+        } else if ms::DECODE_SUPPORT {
+            rung2(ms::DECODE_TILE_EDGE, ms::DECODE_OVERLAP)
+        } else {
+            GenerationMemory::default()
+        }
     }
 }
 
@@ -599,37 +613,114 @@ fn the_request_peak_bearing_phase_is_measured_not_assumed() {
         probe_tier()
     );
 
-    if probing() {
-        return;
-    }
-    // The published scope must address whichever phase binds **in rung 4's own composition**. A
-    // window scoped at a non-binding phase bounds something real and moves the request peak by
-    // nothing, which per the epic is not a saving. Asserted so a tier change — sc-16462 packing the
-    // T5, say — reddens here and forces the scope to be re-decided rather than inherited.
-    let addresses_the_binding_phase = match rung_four_binding {
-        "DENOISE" => TransformerComponent::Dit,
-        "CONDITIONING" => TransformerComponent::TextEncoder,
-        _ => panic!(
-            "the decode binds even after rung 2 has bounded it ({tiled_decode_peak:.4} GiB) — no \
-             transformer window scope can address that phase, so rung 4's scope declaration has no \
-             measurement to rest on"
-        ),
-    };
-    assert_eq!(
-        ms::TRANSFORMER_WINDOW_COMPONENT,
-        addresses_the_binding_phase,
-        "the DEFAULT rung-4 component scope is {:?}, but the {rung_four_binding} phase bears the \
-         request peak in rung 4's own composition at the default cell (conditioning \
-         {conditioning_peak:.4} / denoise {dit_peak:.4} / tiled decode {tiled_decode_peak:.4} GiB). \
-         A window scoped at a non-binding phase moves the request peak by nothing — re-decide the \
-         scope on this measurement, do not inherit it",
-        ms::TRANSFORMER_WINDOW_COMPONENT
+    // Reported, not asserted: which phase binds is the INPUT to the scope decision, and the scope
+    // decision itself is measured end to end by
+    // `the_window_component_scopes_are_measured_not_inherited` — a request-peak comparison, which is
+    // the only thing the epic counts as a saving. Asserting a phase ordering here as well would pin
+    // an intermediate quantity twice and reject a legitimate re-tiering (sc-16462 packing the T5)
+    // for the wrong reason.
+    assert!(
+        conditioning_peak > 0.0 && dit_peak > 0.0 && decode_peak > 0.0,
+        "every phase probe must do real work — MLX is lazy, so a probe that only loads reads zero"
     );
     assert!(
-        ms::TRANSFORMER_WINDOW_COMPONENTS.contains(&addresses_the_binding_phase),
-        "the published scope domain {:?} does not contain the scope that addresses the binding \
-         {rung_four_binding} phase",
-        ms::TRANSFORMER_WINDOW_COMPONENTS
+        tiled_decode_peak < decode_peak,
+        "the tiled decode must bound the decode phase ({tiled_decode_peak:.4} vs {decode_peak:.4} \
+         GiB); the rung-2 verdict rests on the mechanism working and the QUALITY failing, not on \
+         the mechanism failing"
+    );
+}
+
+/// **Which component scope actually moves the request peak** — measured, never inherited.
+///
+/// The epic's rule is that a strategy which bounds a phase but does not move the REQUEST peak is not
+/// a saving. Rung 4 can be scoped at the DiT, at the text encoder, or at both, and which of those
+/// moves the request peak is a property of where the binding phase is — which is a property of the
+/// tier's packing and of which cheaper rungs are engaged, not of the architecture. So it is measured
+/// here, against rung 4's own control, and the published default must be the winner.
+#[test]
+#[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
+fn the_window_component_scopes_are_measured_not_inherited() {
+    let tier = probe_tier();
+    let edge = probe_size();
+    let dir = require_tier(REPRESENTATIVE_ENV, &tier);
+    warm_up(REPRESENTATIVE, &dir);
+
+    let control = measure(
+        REPRESENTATIVE,
+        &dir,
+        LoadShape::DeferredMaterialization,
+        &request(Some(rung4_control()), edge, STEPS),
+    );
+    println!(
+        "[sc-15520 scope {tier} {edge}²] rung-4 control (no window) {:.4} GiB, {:.0} ms/step",
+        control.peak_gib,
+        ms_per_step(&control, STEPS)
+    );
+
+    let mut rows: Vec<(TransformerComponent, f64, f64)> = Vec::new();
+    for component in ms::TRANSFORMER_WINDOW_COMPONENTS {
+        let row = measure(
+            REPRESENTATIVE,
+            &dir,
+            LoadShape::DeferredMaterialization,
+            &request(
+                Some(full_ladder_scoped(ms::TRANSFORMER_WINDOW_SIZE, *component)),
+                edge,
+                STEPS,
+            ),
+        );
+        println!(
+            "[sc-15520 scope {tier} {edge}² {component:?}] {:.4} GiB ({:+.2}% vs control)  \
+             {:.0} ms/step  max Δ {}",
+            row.peak_gib,
+            100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
+            ms_per_step(&row, STEPS),
+            max_delta(&control.pixels, &row.pixels),
+        );
+        // Every scope is a residency change, not an arithmetic one, so every scope must be
+        // byte-identical to the control regardless of whether it moves the peak.
+        assert_eq!(
+            max_delta(&control.pixels, &row.pixels),
+            0,
+            "scope {component:?} changed the image — a re-materialized block is not reproducing its \
+             resident twin"
+        );
+        rows.push((*component, row.peak_gib, ms_per_step(&row, STEPS)));
+    }
+
+    if probing() {
+        println!("[sc-15520 scope {tier} {edge}²] probe mode: rows reported, not asserted");
+        return;
+    }
+    let best = rows
+        .iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("a non-empty scope domain");
+    // The published DEFAULT must be a scope that actually moves the request peak, by the same 3%
+    // margin every implemented rung has to clear.
+    let published = rows
+        .iter()
+        .find(|(component, _, _)| *component == ms::TRANSFORMER_WINDOW_COMPONENT)
+        .expect("the default scope must be published");
+    assert!(
+        published.1 < control.peak_gib * 0.97,
+        "the published default scope {:?} peaked at {:.4} GiB against a {:.4} GiB control — a \
+         window scoped at a non-binding phase bounds something real and moves the request peak by \
+         nothing, which is not a saving. The measured rows are {rows:?}",
+        ms::TRANSFORMER_WINDOW_COMPONENT,
+        published.1,
+        control.peak_gib
+    );
+    // And it must be the best of the published scopes, within the instrument's own resolution.
+    assert!(
+        published.1 <= best.1 * 1.01,
+        "scope {:?} peaks at {:.4} GiB but the published default {:?} peaks at {:.4} — the default \
+         must be the scope that bounds the request peak hardest",
+        best.0,
+        best.1,
+        ms::TRANSFORMER_WINDOW_COMPONENT,
+        published.1
     );
 }
 
@@ -640,8 +731,12 @@ fn the_request_peak_bearing_phase_is_measured_not_assumed() {
 /// Isolated from the request envelope on purpose: the *mechanism* column measures the tiled decode
 /// against the **exact untiled decode of the same latent**, which is the only way to see the
 /// deviation a tile actually introduces. The latent is the **production** one — what the denoiser
-/// hands the decode phase — rather than a re-encoded finished image, because the re-encoded latent's
-/// statistics have already been through the VAE round trip and are systematically friendlier.
+/// hands the decode phase — rather than a re-encoded finished image, whose statistics have already
+/// been through the VAE round trip and are systematically friendlier (SDXL's rung-2 verdict turned
+/// on exactly that difference: 38/255 on a re-encoded latent, 84/255 on the production one).
+///
+/// Driving `Vae::decode_tiled` directly also reaches geometries the production resolver refuses,
+/// which is how a rejected candidate gets a NUMBER instead of an omission.
 ///
 /// The grid it prints is evidence for a human; what it *pins* is the cell the verdict cites.
 #[test]
@@ -661,128 +756,161 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
     let overlaps = list("CHROMA_SWEEP_OVERLAPS", ms::DECODE_OVERLAPS_SWEPT.to_vec());
     let size = list("CHROMA_SWEEP_SIZE", vec![1024])[0];
 
-    warm_up(REPRESENTATIVE, &dir);
-    // The untiled reference: a real request's decode, so the drift denominator is the image a
-    // caller would actually receive.
-    let untiled = measure(
-        REPRESENTATIVE,
-        &dir,
-        LoadShape::EagerMaterialization,
-        &request(Some(staged()), size, STEPS),
-    );
+    // The production latent: the denoiser's own output at the production schedule, not a re-encode.
+    let latent = production_latent(&dir, size);
+    let vae = mlx_gen_chroma::loader::load_vae(&dir).expect("load vae");
+    let unpacked = mlx_gen_flux::unpack_latents(&latent, size, size).expect("unpack");
+    clear_cache();
+    reset_peak_memory();
+    let reference = mlx_gen::LatentDecoder::decode(&vae, &unpacked).expect("untiled decode");
+    reference.eval().expect("eval reference");
+    let untiled_peak = get_peak_memory() as f64 / GIB;
+    let ref_px =
+        mlx_gen::image::decoded_to_image(&reference.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+            .expect("reference image")
+            .pixels;
+    drop(reference);
+    clear_cache();
     println!(
-        "[sc-15520 rung2 mechanism {DEFAULT_TIER} {size}²] untiled request peak {:.4} GiB, \
-         {:.0} ms/step",
-        untiled.peak_gib,
-        ms_per_step(&untiled, STEPS)
+        "[sc-15520 rung2 mechanism {DEFAULT_TIER} {size}²] untiled decode peak {untiled_peak:.4} GiB"
     );
 
     let mut best: Option<(u32, u32, u32, f64)> = None;
-    println!("| edge | overlap | request peak (GiB) | Δpeak | max Δ | mean Δ | ms/step |");
+    println!("| edge | overlap | tiles | isolated peak (GiB) | vs untiled | max Δ | mean Δ |");
     println!("|---:|---:|---:|---:|---:|---:|---:|");
     for overlap in &overlaps {
         for edge in &edges {
-            // The mechanism is reached through the public tiled decode, which admits geometries the
-            // production resolver refuses — that is how a rejected candidate gets a NUMBER rather
-            // than an omission.
-            let row = tiled_row(&dir, size, *edge, *overlap);
-            let drift = max_delta(&untiled.pixels, &row.pixels);
+            let cfg = mlx_gen::tiling::TilingConfig::spatial_only(*edge as i32, *overlap as i32);
+            let plan = cfg.plan(
+                mlx_gen::tiling::VaeTiling {
+                    spatial_scale: 8,
+                    temporal_scale: 1,
+                    causal_temporal: false,
+                    full_res_channels: 128,
+                },
+                1,
+                unpacked.shape()[1],
+                unpacked.shape()[2],
+            );
+            let tiles = plan.h.len() * plan.w.len();
+            clear_cache();
+            reset_peak_memory();
+            let tiled = vae
+                .decode_tiled(&unpacked, &cfg, None)
+                .expect("tiled decode");
+            tiled.eval().expect("eval tiled");
+            let peak = get_peak_memory() as f64 / GIB;
+            let px =
+                mlx_gen::image::decoded_to_image(&tiled.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+                    .expect("tiled image")
+                    .pixels;
+            let drift = max_delta(&ref_px, &px);
             println!(
-                "| {edge} | {overlap} | {:.4} | {:+.2}% | {drift} | {:.4} | {:.0} |",
-                row.peak_gib,
-                100.0 * (row.peak_gib - untiled.peak_gib) / untiled.peak_gib,
-                mean_delta(&untiled.pixels, &row.pixels),
-                ms_per_step(&row, STEPS),
+                "| {edge} | {overlap} | {tiles} | {peak:.4} | {:+.2}% | {drift} | {:.4} |",
+                100.0 * (peak - untiled_peak) / untiled_peak,
+                mean_delta(&ref_px, &px),
             );
             if best.is_none_or(|(_, _, d, _)| drift < d) {
-                best = Some((*edge, *overlap, drift, row.peak_gib));
+                best = Some((*edge, *overlap, drift, peak));
             }
+            drop(tiled);
+            clear_cache();
         }
     }
     let (best_edge, best_overlap, best_drift, best_peak) = best.expect("a non-empty sweep");
     println!(
         "[sc-15520 rung2 mechanism {DEFAULT_TIER} {size}²] best cell: edge {best_edge} overlap \
-         {best_overlap} — max Δ {best_drift}/255, request peak {best_peak:.4} GiB"
+         {best_overlap} — max Δ {best_drift}/255, isolated peak {best_peak:.4} GiB against \
+         {untiled_peak:.4} untiled"
     );
 
     if edges != ms::DECODE_TILE_EDGES_SWEPT || overlaps != ms::DECODE_OVERLAPS_SWEPT || size != 1024
     {
         return;
     }
-    // The two facts the published domain rests on, asserted so either direction reddens.
+    // The facts the published domain rests on, each asserted so either direction reddens.
+    if ms::DECODE_SUPPORT {
+        assert!(
+            best_drift <= SIBLING_DRIFT_BAR,
+            "the best swept geometry now drifts {best_drift}/255 at 1024² on the PRODUCTION latent, \
+             above the {SIBLING_DRIFT_BAR}/255 sibling bar — DECODE_SUPPORT records the opposite \
+             and must be re-derived"
+        );
+        assert!(
+            ms::DECODE_TILE_EDGES.contains(&best_edge) && best_overlap == ms::DECODE_OVERLAP,
+            "the published domain must contain the sweep's best cell (edge {best_edge} overlap \
+             {best_overlap}), else it is published against a candidate nobody would choose"
+        );
+    } else {
+        assert!(
+            best_drift > SIBLING_DRIFT_BAR,
+            "the best swept geometry now clears the {SIBLING_DRIFT_BAR}/255 bar ({best_drift}/255) \
+             — rung 2 is declared Missing on a superseded measurement and must be re-decided"
+        );
+    }
     assert!(
-        best_drift <= SIBLING_DRIFT_BAR,
-        "the best swept geometry now drifts {best_drift}/255 at 1024² on the PRODUCTION latent, \
-         above the {SIBLING_DRIFT_BAR}/255 sibling bar — memory_strategy::DECODE_SUPPORT records \
-         the opposite and must be re-derived"
-    );
-    assert!(
-        best_peak < untiled.peak_gib * 0.97,
-        "the tiled decode no longer bounds the request peak ({best_peak:.4} vs {:.4} GiB) — a rung \
-         that does not move the request peak is not a saving, whatever it bounds internally",
-        untiled.peak_gib
-    );
-    assert!(
-        ms::DECODE_TILE_EDGES.contains(&best_edge) && best_overlap == ms::DECODE_OVERLAP,
-        "the published domain must contain the sweep's best cell (edge {best_edge} overlap \
-         {best_overlap}), else the range argument is made against a candidate nobody would choose"
+        best_peak < untiled_peak * 0.97,
+        "the tiled decode no longer bounds the decode phase ({best_peak:.4} vs {untiled_peak:.4} \
+         GiB) — the mechanism this rung rests on has stopped working"
     );
 }
 
+/// A **production** final latent: the denoiser's own output at the production schedule and sampler.
+///
+/// Not a re-encoded finished image. The two are not interchangeable for a drift measurement — the
+/// re-encoded one has already been through the VAE round trip and its GroupNorm statistics are
+/// systematically friendlier to a tail tile, which is exactly how SDXL's rung-2 candidate looked
+/// admissible (38/255) until it was measured on the real thing (84/255).
 #[track_caller]
-fn tiled_row(dir: &std::path::Path, size: u32, edge: u32, overlap: u32) -> Row {
-    // A geometry outside the published domain is refused by the production path (which is the
-    // point), so the sweep drives the same public generate with the request memory the selector
-    // would have set and reports the refusal as an absent row.
-    let registry = mlx_gen_chroma::provider_registry().expect("provider registry");
-    let model = registry
-        .load(REPRESENTATIVE, &spec(dir, LoadShape::EagerMaterialization))
-        .expect("load chroma");
-    clear_cache();
-    reset_peak_memory();
-    let started = std::time::Instant::now();
-    let out = model.generate(
-        &request(Some(rung2(edge, overlap)), size, STEPS),
-        &mut |_: Progress| {},
-    );
-    let peak = get_peak_memory();
-    let wall = started.elapsed();
-    let pixels = match out {
-        Ok(GenerationOutput::Images(images)) => images.first().expect("one image").pixels.clone(),
-        Ok(other) => panic!("expected images, got {other:?}"),
-        Err(error) => panic!(
-            "edge {edge} overlap {overlap} was refused by the production path: {error}. A swept \
-             candidate must either render (so it gets a number) or be listed outside \
-             DECODE_TILE_EDGES_SWEPT"
-        ),
-    };
+fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
+    let spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+        .with_offload_policy(OffloadPolicy::Resident);
+    let model = mlx_gen_chroma::load_chroma(mlx_gen_chroma::ChromaVariant::Base, &spec)
+        .expect("load chroma resident");
+    let latents = mlx_gen_flux::create_noise(1234, size, size).expect("noise");
+    let out = model
+        .denoise_with_sampler_name(
+            "a red fox in a snowy forest, photograph",
+            "blurry, lowres",
+            size,
+            size,
+            STEPS,
+            4.0,
+            latents,
+            None,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_| {},
+        )
+        .expect("denoise the production latent");
+    mlx_rs::transforms::eval([&out]).expect("eval latent");
     drop(model);
     clear_cache();
-    Row {
-        peak_gib: peak as f64 / GIB,
-        pixels,
-        wall,
-    }
+    out
 }
 
-/// **Every rejected decode geometry is refused by the PRODUCTION path**, on real weights.
+/// **Rungs 2 and 3 are refused by the PRODUCTION path** wherever they are declared `Missing`, on
+/// real weights.
 ///
-/// The rejections in `DECODE_TILE_EDGES_SWEPT` minus `DECODE_TILE_EDGES` are not doc comments: this
-/// re-asserts each one against `generate`, which is the only layer a caller can reach.
+/// The withheld mechanisms are still in the crate — `Vae::decode_tiled` and `sdpa_budgeted_bhsd` are
+/// both reachable — which is exactly why this exists: the only thing between a measured-and-rejected
+/// mechanism and a production render is the refusal, and a refusal that lives in a doc comment is
+/// not one.
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
-fn the_rejected_decode_geometries_are_refused_by_the_production_path() {
+fn the_withheld_rungs_are_refused_by_the_production_path() {
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
     let registry = mlx_gen_chroma::provider_registry().expect("provider registry");
     let model = registry
         .load(REPRESENTATIVE, &spec(&dir, LoadShape::EagerMaterialization))
         .expect("load chroma");
 
-    let mut refused = 0_usize;
+    let mut checked = 0_usize;
     let mut admitted = Vec::new();
     for edge in ms::DECODE_TILE_EDGES_SWEPT {
         for overlap in ms::DECODE_OVERLAPS_SWEPT {
-            let published = ms::DECODE_TILE_EDGES.contains(edge) && *overlap == ms::DECODE_OVERLAP;
+            let published = ms::DECODE_SUPPORT
+                && ms::DECODE_TILE_EDGES.contains(edge)
+                && *overlap == ms::DECODE_OVERLAP;
             let outcome =
                 model.generate(&request(Some(rung2(*edge, *overlap)), 1024, 1), &mut |_| {});
             println!(
@@ -796,7 +924,16 @@ fn the_rejected_decode_geometries_are_refused_by_the_production_path() {
                     panic!("published geometry {edge}/{overlap} was refused: {error}")
                 }
                 (false, Ok(_)) => admitted.push(format!("{edge}/{overlap}")),
-                (false, Err(_)) => refused += 1,
+                (false, Err(error)) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains("bounded decode is not selectable")
+                            || error.contains("decode tile edge")
+                            || error.contains("decode overlap"),
+                        "edge {edge} overlap {overlap} was refused for the wrong reason: {error}"
+                    );
+                    checked += 1;
+                }
             }
         }
     }
@@ -806,9 +943,27 @@ fn the_rejected_decode_geometries_are_refused_by_the_production_path() {
          ignored tile executes a strategy the selector did not choose"
     );
     assert!(
-        refused > 0,
+        checked > 0,
         "the swept set contains no rejected geometry, so this test asserts nothing"
     );
+
+    if !ms::ATTENTION_SUPPORT {
+        let error = match model.generate(&request(Some(rung3()), 1024, 1), &mut |_| {}) {
+            Ok(_) => panic!("bounded attention must not render on this provider"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("bounded attention is not selectable")
+                || error.contains("bounded decode is not selectable"),
+            "{error}"
+        );
+    }
+
+    // The control: the published composition renders. Without it, a generator that refused every
+    // request would satisfy every assertion above.
+    model
+        .generate(&request(Some(staged()), 1024, 1), &mut |_| {})
+        .expect("the published rung-1 composition must render");
 }
 
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
@@ -896,14 +1051,19 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let dir = require_tier(REPRESENTATIVE_ENV, &tier);
     warm_up(REPRESENTATIVE, &dir);
 
+    // The control is rung 4's OWN composition minus the window. Comparing against a rung-1 row
+    // instead would confound the window with rung 2's tiled decode, which rung 4 engages by cost
+    // order and which is an arithmetic change — a byte-identity assertion against that control could
+    // never hold, and a peak comparison against it would credit the window with rung 2's saving.
     let control = measure(
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(staged()), edge, STEPS),
+        &request(Some(rung4_control()), edge, STEPS),
     );
     println!(
-        "[sc-15520 rung4 {tier} {edge}²] staged control {:.4} GiB, {:.0} ms/step",
+        "[sc-15520 rung4 {tier} {edge}²] rung-4 control (stage+tile+chunk, no window) {:.4} GiB, \
+         {:.0} ms/step",
         control.peak_gib,
         ms_per_step(&control, STEPS)
     );
@@ -1157,7 +1317,7 @@ fn the_rung_four_saving_is_inside_the_block_weight_set() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(staged()), 1024, STEPS),
+        &request(Some(rung4_control()), 1024, STEPS),
     );
     let windowed = measure(
         REPRESENTATIVE,
@@ -1321,7 +1481,7 @@ fn the_full_ladder_renders_under_a_memory_cap() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(staged()), 1024, STEPS),
+        &request(Some(rung4_control()), 1024, STEPS),
     );
     let windowed = measure(
         REPRESENTATIVE,

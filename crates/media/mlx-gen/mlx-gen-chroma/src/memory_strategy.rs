@@ -19,15 +19,27 @@
 //! | 3 bounded attention | `sdpa_budgeted_bhsd` on both block stacks | see [`ATTENTION_SUPPORT`] |
 //! | 4 bounded transformer residency | `run_windowed` over the two DiT sub-stacks | see [`WINDOW_SUPPORT`] |
 //!
-//! ## The T5 is the conditioning phase, and it is large
+//! ## What measurement decided, and what it overturned
 //!
-//! Chroma's shipped q4 tier packs only the DiT block linears; the T5-XXL encoder ships **dense bf16**
-//! at 9.08 GiB against a 5.18 GiB packed transformer. Under rung 1 the request peak is therefore
-//! conditioning-bound rather than denoise-bound, which is why
-//! [`TRANSFORMER_WINDOW_COMPONENT`] is a **measured** choice rather than the `Dit` default every
-//! provider had before the component scope existed (SC-15794, and the Kolors precedent in SC-15521).
-//! sc-16462 (inference PR #443) is the story that packs those auxiliaries; when it lands, every
-//! conditioning-phase number in this module's tests is re-derived rather than inherited.
+//! Two verdicts here are the opposite of what the architecture suggests, and both were reached by
+//! measuring rather than by reasoning from the sibling families:
+//!
+//! * **Rung 2 is `Missing`.** Tiling the FLUX.1 VAE decode is a large saving on this family
+//!   (−11% to −72% of the decode phase) and an inadmissible one: every cell of a 7×4 geometry sweep
+//!   drifts 105-166/255 against the untiled decode of the **production** latent, more than double
+//!   the 48/255 bar the closest sibling admits, and the drift is flat in the geometry. See
+//!   [`DECODE_SUPPORT`] for the table.
+//! * **Rung 4 is scoped at the `Dit`, not the text encoder.** Chroma's shipped q4 tier packs only
+//!   the DiT block linears, so the T5-XXL encoder is the largest single component (dense bf16, 10.15
+//!   GiB against a 7.14 GiB packed DiT) — which makes the text-encoder scope look obviously right
+//!   and is exactly why it needed measuring. Rung 1 has already shed the encoder before the heavy
+//!   phase loads, so the request peak is the heavy phase and a `TextEncoder` window moves it by
+//!   **−0.00%**. See [`TRANSFORMER_WINDOW_COMPONENT`].
+//!
+//! sc-16462 (inference PR #443) packs the T5/VAE auxiliaries. It changes the conditioning phase's
+//! weight, so every conditioning number here is re-derived when it lands — but it does not disturb
+//! either verdict, because rung 1 already removes that phase from the request peak and rung 2's
+//! rejection is a decoder-quality result that a narrower text encoder does not touch.
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
@@ -56,20 +68,46 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "chroma1-base-q4-mlx-shared-lad
 ///
 /// Recorded here rather than in a comment so `the_rejected_decode_geometries_are_refused_by_the_production_path`
 /// can re-assert every rejection against the production admission path.
-pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[768, 640, 512, 384];
+pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[960, 896, 832, 768, 640, 512, 384];
 /// Feather overlaps swept beside [`DECODE_TILE_EDGES_SWEPT`].
-pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 96, 128];
+pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
-/// Whether the swept rung-2 geometry survived measurement on the production path.
+/// **Rung 2 is `Missing` on this family, and it is a measured verdict rather than an omission.**
 ///
-/// `false` publishes rung 2 as `Missing` **with its numbers recorded** in the harness, which is the
-/// epic's requirement for a measured-and-withheld rung — never a silent omission.
-pub const DECODE_SUPPORT: bool = true;
-/// The published native tile-edge domain (descending). Empty when [`DECODE_SUPPORT`] is `false`.
+/// The mechanism works and the saving is large — measured on Chroma1-Base q4 at 1024²
+/// (`decode_tile_mechanism_sweep_on_the_production_latent`), tiling the decode phase moves it from
+/// 14.135 GiB to 3.898-12.531 GiB, i.e. **−11.4% to −72.4%** depending on the edge. What it costs is
+/// not admissible:
+///
+/// | edge | overlap | isolated peak | vs untiled | max Δ |
+/// |---:|---:|---:|---:|---:|
+/// | 960 | 192 | 12.531 GiB | −11.4% | **105** |
+/// | 896 | 128 | 10.999 GiB | −22.2% | 106 |
+/// | 768 | 64 | 8.093 GiB | −42.7% | 106 |
+/// | 640 | 128 | 5.799 GiB | −59.0% | 117 |
+/// | 512 | 128 | 4.366 GiB | −69.1% | 145 |
+/// | 384 | 128 | 3.898 GiB | −72.4% | 163 |
+///
+/// Every cell in a 7×4 sweep is **more than double** the 48/255 bar the closest sibling
+/// (`mlx_gen_z_image`, the same shared tiling machinery over the same `AutoencoderKL` type) admits
+/// into a shipped ladder, and the drift is **flat in the geometry**: 105 at a tile covering 94% of
+/// the output, 106 at 87.5%, 108 at 75%. That flatness is the finding. A tail-tile GroupNorm effect
+/// shrinks as coverage grows; a floor that does not is the head-once/tail-tiled split itself
+/// deviating on *these* decoder weights against *this* latent. No admissible edge exists to publish,
+/// so none is.
+///
+/// This is a per-family, per-weights verdict and explicitly not a statement about the mechanism:
+/// Z-Image ships the same code with the same geometries because on its own weights and latents it
+/// measured inside the bar.
+pub const DECODE_SUPPORT: bool = false;
+/// The native VAE tile ladder this provider *would* publish, and the reference domain its checked
+/// [`mlx_gen_pid::DecodeRoutes`] is constructed from so the native and PiD domains stay provably
+/// disjoint. With [`DECODE_SUPPORT`] `false` none of it reaches a capability's published parameters
+/// and the production path refuses every bounded-decode request before this is consulted.
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512];
 /// The default edge inside [`DECODE_TILE_EDGES`].
 pub const DECODE_TILE_EDGE: u32 = 512;
-/// The one published feather overlap.
+/// The one feather overlap paired with [`DECODE_TILE_EDGES`].
 pub const DECODE_OVERLAP: u32 = 128;
 
 // ── Rung 3: the bounded-attention budget ─────────────────────────────────────────────────────────
@@ -91,22 +129,42 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// The **measured** default component scope, and the one a request that names none receives.
 ///
-/// This is not a `Dit`-by-inheritance choice. Measured on Chroma1-Base q4 at 1024² (Apple/Metal,
-/// `the_request_peak_bearing_phase_is_measured_not_assumed`), the phases are conditioning 10.15 GiB
-/// / denoise 7.14 GiB / decode 14.14 GiB untiled — and rung 4's own composition engages rung 2, so
-/// its decode is already bounded to 4.37 GiB and **conditioning binds**. A `Dit`-scoped window
-/// bounds the 7.14 GiB denoise, which is below the binding phase, and therefore moves the request
-/// peak by nothing. `TextEncoder` is the scope that addresses the binding phase; Kolors reached the
-/// same conclusion first, for the same reason and a different encoder (SC-15521).
-pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::TextEncoder;
-/// The component scopes this provider will admit. All three are implemented; the harness measures
-/// each and `the_window_component_scopes_are_measured_not_inherited` pins what each one buys.
-/// [`TRANSFORMER_WINDOW_COMPONENT`] leads the list: the shared behavior fixture takes the first
-/// published candidate as its representative, so a domain whose head is not the default would have
-/// the conformance walk exercising a scope no unqualified request receives.
+/// This is not a `Dit`-by-inheritance choice — it is the outcome of measuring all three scopes end
+/// to end against rung 4's own control on Chroma1-Base q4 at 1024² (Apple/Metal,
+/// `the_window_component_scopes_are_measured_not_inherited`):
+///
+/// | scope | request peak | vs control | ms/step |
+/// |---|---:|---:|---:|
+/// | control (no window) | 19.2071 GiB | — | 7020 |
+/// | `TextEncoder` | 19.2071 GiB | **−0.00%** | 8200 |
+/// | `Dit` | **14.6932 GiB** | **−23.50%** | 10090 |
+/// | `Both` | 14.6932 GiB | −23.50% | 12279 |
+///
+/// All three render a byte-identical image; only one moves the request peak. The reason
+/// `TextEncoder` is *exactly* inert here is worth stating, because the naive reading of the phase
+/// probe predicts the opposite: the conditioning phase is genuinely the largest single component
+/// (T5-XXL ships dense bf16 at 10.15 GiB against a 7.14 GiB packed DiT), but **rung 1 has already
+/// shed it** before the heavy phase loads, so the request peak is the heavy phase — and bounding a
+/// phase that is not the request peak is not a saving.
+///
+/// `Both` matches `Dit` to the fourth decimal and costs 22% more wall clock, so it is dominated
+/// rather than wrong. All three stay published because all three are implemented and
+/// output-preserving; the numbers above are what a selector's cost model should read, and the
+/// harness re-asserts them.
+///
+/// **This verdict is coupled to rung 2's.** Were the decode bounded, the heavy phase would fall
+/// below conditioning and `TextEncoder` would become the scope that binds — which is what an earlier
+/// revision of this module concluded from the phase probe alone, before rung 2 was measured and
+/// withheld. Kolors' opposite verdict (SC-15521) is the same arithmetic with a different decode.
+pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
+/// The component scopes this provider will admit, [`TRANSFORMER_WINDOW_COMPONENT`] first.
+///
+/// The head is load-bearing: the shared behavior fixture takes the first published candidate as its
+/// representative, so a domain whose head is not the default would have the conformance walk
+/// exercising a scope no unqualified request receives.
 pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
-    TransformerComponent::TextEncoder,
     TransformerComponent::Dit,
+    TransformerComponent::TextEncoder,
     TransformerComponent::Both,
 ];
 
@@ -806,29 +864,15 @@ mod tests {
         let spec = streamable_spec();
         let contract = weights_free_contract(crate::CHROMA1_BASE_ID, &spec).unwrap();
 
-        let mut fixture = registered_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
-            .unwrap()
-            .remove(0);
-        let mut scope = registered_begin_request(&spec, &contract, &fixture.context)
-            .unwrap()
-            .unwrap();
-        scope.configure_request(&mut fixture.request).unwrap();
-        let memory = fixture
-            .request
-            .memory
-            .expect("bounded decode request memory");
-        assert!(memory.tile_vae_decode);
-        let edge = memory.decode_tile_edge.expect("selected edge");
-        let overlap = memory.decode_overlap.expect("selected overlap");
-        scope
-            .configure_decode(edge, overlap, fixture.context.geometry)
-            .unwrap();
-        assert!(scope
-            .configure_decode(edge + 1, overlap, fixture.context.geometry)
-            .is_err());
-        assert!(scope
-            .configure_decode(edge, overlap + 1, fixture.context.geometry)
-            .is_err());
+        // Rung 2 is Missing, so it publishes no behavioral fixture at all — a caller cannot reach a
+        // bounded decode through the contract, and the request scope's decode validator refuses
+        // every geometry unconditionally.
+        assert!(
+            registered_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .is_empty(),
+            "a Missing rung must publish no behavioral fixture"
+        );
 
         let mut fixture = registered_fixture(&spec, &contract, MemoryStrategy::BoundedAttention)
             .unwrap()
