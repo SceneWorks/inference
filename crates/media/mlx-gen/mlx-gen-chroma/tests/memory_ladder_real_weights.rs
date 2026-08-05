@@ -39,8 +39,15 @@
 //!
 //! One env var per catalog entry, each pointing at that entry's snapshot **root** (the tier is a
 //! subdirectory: `bf16` / `q4` / `q8`). Nothing self-fetches or derives a cache location
-//! (epic 13657). A test whose entry/tier is absent **fails loudly by name** rather than passing
-//! silently.
+//! (epic 13657).
+//!
+//! Every test that names a **specific** entry/tier resolves it through [`require_tier`], which
+//! panics `SKIPPED-BY-ABSENCE: <var>` rather than early-returning green. The one exception is
+//! deliberate and is stated here rather than glossed: [`every_cached_entry_and_tier_publishes_its_own_evidence`]
+//! sweeps whatever is present, **prints every absent cell by name**, and fails only if *nothing* was
+//! measured. Its claim is per-cell — "each entry supplies its own evidence" — which an absent
+//! snapshot cannot falsify, so it reports coverage instead of demanding it. Read its printed
+//! `absent: [...]` line before treating a green run as full coverage.
 //!
 //! | env var | entry |
 //! |---|---|
@@ -92,10 +99,25 @@ const DEFAULT_TIER: &str = "q4";
 /// The three advertised tiers, in catalog order.
 const TIERS: &[&str] = &["q4", "q8", "bf16"];
 
-/// Steps for a measured row. Chroma1-Base runs true CFG at 4.0, so this is 2x this many DiT
-/// forwards per row; the peak is step-count-independent (the schedule holds no per-step residency)
-/// and the wall clock is reported per step.
-const STEPS: u32 = 4;
+/// Steps for a measured row — **the variant's real production schedule**, not a convenient short
+/// one (review of PR #496).
+///
+/// An earlier revision hardcoded 4 and justified it by peak step-independence. That justification is
+/// sound for a *peak* and worthless for a *quality* verdict, and rung 2's is a quality verdict: the
+/// tiled-decode drift is a property of the latent the denoiser actually produces, and a 4-step
+/// latent is not that latent. Re-measured at the real 28, the same 7x4 sweep's best cell moved from
+/// 105/255 to 53 — the difference between "more than double the bar" and "10% over it", which is a
+/// different claim about the same mechanism.
+///
+/// So the default binds to `ChromaVariant::Base::default_steps()`. `CHROMA_LADDER_STEPS` overrides
+/// it for iteration, and [`the_request_peak_is_step_independent`] is what makes a shorter override
+/// legitimate for the peak-bearing rows — it measures the claim instead of asserting it in prose.
+fn steps() -> u32 {
+    std::env::var("CHROMA_LADDER_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| mlx_gen_chroma::ChromaVariant::Base.default_steps())
+}
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
@@ -105,6 +127,12 @@ const STEPS: u32 = 4;
 /// exact 16-channel FLUX.1 VAE (`mlx_gen_flux::load_vae`), so it is the closest precedent that
 /// exists; a looser bar would be invented to clear and a tighter one invented to fail.
 const SIBLING_DRIFT_BAR: u32 = 48;
+
+/// The best cell in [`decode_tile_mechanism_sweep_on_the_production_latent`] at the production
+/// schedule — where rung 2's verdict is closest and therefore where it is resampled.
+const BEST_SWEPT_EDGE: u32 = 832;
+/// The overlap paired with [`BEST_SWEPT_EDGE`].
+const BEST_SWEPT_OVERLAP: u32 = 256;
 
 fn entry_root(var: &str) -> Option<PathBuf> {
     std::env::var(var).ok().map(PathBuf::from)
@@ -387,6 +415,11 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
     let tier = probe_tier();
     let edge = probe_size();
     let dir = require_tier(REPRESENTATIVE_ENV, &tier);
+    // Eight rows at the 28-step production schedule is ~40 minutes for a quantity
+    // [`the_request_peak_is_step_independent`] measures to be step-invariant (0.00% over 1, 4 and
+    // 28 steps). `CHROMA_LADDER_STEPS` is the licensed shortening, and the license is a measurement
+    // rather than a claim — which is the whole reason that test exists.
+    let count = steps();
 
     let peaks: Vec<f64> = (0..SETTLE_PROBE_ROWS)
         .map(|_| {
@@ -394,13 +427,14 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
                 REPRESENTATIVE,
                 &dir,
                 LoadShape::DeferredMaterialization,
-                &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), edge, STEPS),
+                &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), edge, count),
             )
             .peak_gib
         })
         .collect();
     println!(
-        "[sc-17679 settle {tier} {edge}² cadence {}] identical request x{SETTLE_PROBE_ROWS}: {}",
+        "[sc-17679 settle {tier} {edge}² cadence {} {count} step(s)] identical request \
+         x{SETTLE_PROBE_ROWS}: {}",
         ms::TRANSFORMER_WINDOW_SIZE,
         peaks
             .iter()
@@ -440,6 +474,54 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
     );
 }
 
+/// **Is the request peak a function of the step count?**
+///
+/// The harness runs at the variant's real 28-step schedule by default, which makes a full sweep
+/// expensive; `CHROMA_LADDER_STEPS` exists so a peak-bearing row can be taken at a shorter one. That
+/// override is only legitimate if the peak really is step-independent, and an earlier revision of
+/// this file asserted exactly that **in prose** while publishing every number from a 4-step run.
+///
+/// This measures it. The same composition at 1, 4 and the production 28 steps must land on the same
+/// peak within the instrument's own resolution — a denoise loop that accumulated per-step residency
+/// (a retained preview, an un-evaluated graph growing with the schedule) would show up here.
+///
+/// It is *not* a licence for a quality verdict at a short schedule: rung 2's drift is a property of
+/// the latent, and this says nothing about that. See [`steps`].
+#[test]
+#[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
+fn the_request_peak_is_step_independent() {
+    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    warm_up(REPRESENTATIVE, &dir);
+    let production = mlx_gen_chroma::ChromaVariant::Base.default_steps();
+    let mut rows = Vec::new();
+    for count in [1_u32, 4, production] {
+        let row = measure(
+            REPRESENTATIVE,
+            &dir,
+            LoadShape::EagerMaterialization,
+            &request(Some(staged()), 1024, count),
+        );
+        println!(
+            "[sc-15520 step-independence {DEFAULT_TIER} 1024²] {count} step(s): {:.4} GiB, \
+             {:.0} ms/step",
+            row.peak_gib,
+            ms_per_step(&row, count)
+        );
+        rows.push((count, row.peak_gib));
+    }
+    let (min, max) = rows.iter().fold((f64::MAX, 0f64), |(lo, hi), (_, p)| {
+        (lo.min(*p), hi.max(*p))
+    });
+    let spread = 100.0 * (max - min) / min;
+    println!("[sc-15520 step-independence {DEFAULT_TIER} 1024²] spread {spread:.2}% over {rows:?}");
+    assert!(
+        spread < 1.0,
+        "the request peak is NOT step-independent ({spread:.2}% over {rows:?}), so \
+         CHROMA_LADDER_STEPS cannot be used to shorten a peak-bearing row and every peak in this \
+         file must be re-taken at the production schedule"
+    );
+}
+
 // ── Rung 0/1 ─────────────────────────────────────────────────────────────────────────────────────
 
 /// **Rung 1 is request-scoped and it moves the request peak.**
@@ -457,13 +539,13 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
         REPRESENTATIVE,
         &dir,
         shape,
-        &request(Some(resident_memory()), 1024, STEPS),
+        &request(Some(resident_memory()), 1024, steps()),
     );
     let staged_row = measure(
         REPRESENTATIVE,
         &dir,
         shape,
-        &request(Some(staged()), 1024, STEPS),
+        &request(Some(staged()), 1024, steps()),
     );
     println!(
         "[sc-15520 rung1 {DEFAULT_TIER} 1024²] resident {:.4} GiB -> staged {:.4} GiB ({:+.2}%)  \
@@ -471,8 +553,8 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
         resident.peak_gib,
         staged_row.peak_gib,
         100.0 * (staged_row.peak_gib - resident.peak_gib) / resident.peak_gib,
-        ms_per_step(&resident, STEPS),
-        ms_per_step(&staged_row, STEPS),
+        ms_per_step(&resident, steps()),
+        ms_per_step(&staged_row, steps()),
     );
     assert_eq!(
         max_delta(&resident.pixels, &staged_row.pixels),
@@ -663,12 +745,12 @@ fn the_window_component_scopes_are_measured_not_inherited() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(rung4_control()), edge, STEPS),
+        &request(Some(rung4_control()), edge, steps()),
     );
     println!(
         "[sc-15520 scope {tier} {edge}²] rung-4 control (no window) {:.4} GiB, {:.0} ms/step",
         control.peak_gib,
-        ms_per_step(&control, STEPS)
+        ms_per_step(&control, steps())
     );
 
     let mut rows: Vec<(TransformerComponent, f64, f64)> = Vec::new();
@@ -680,7 +762,7 @@ fn the_window_component_scopes_are_measured_not_inherited() {
             &request(
                 Some(full_ladder_scoped(ms::TRANSFORMER_WINDOW_SIZE, *component)),
                 edge,
-                STEPS,
+                steps(),
             ),
         );
         println!(
@@ -688,7 +770,7 @@ fn the_window_component_scopes_are_measured_not_inherited() {
              {:.0} ms/step  max Δ {}",
             row.peak_gib,
             100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
-            ms_per_step(&row, STEPS),
+            ms_per_step(&row, steps()),
             max_delta(&control.pixels, &row.pixels),
         );
         // Every scope is a residency change, not an arithmetic one, so every scope must be
@@ -699,7 +781,7 @@ fn the_window_component_scopes_are_measured_not_inherited() {
             "scope {component:?} changed the image — a re-materialized block is not reproducing its \
              resident twin"
         );
-        rows.push((*component, row.peak_gib, ms_per_step(&row, STEPS)));
+        rows.push((*component, row.peak_gib, ms_per_step(&row, steps())));
     }
 
     if probing() {
@@ -794,16 +876,14 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
     for overlap in &overlaps {
         for edge in &edges {
             let cfg = mlx_gen::tiling::TilingConfig::spatial_only(*edge as i32, *overlap as i32);
+            // The SHARED geometry constant and the axes `Vae::decode_tiled` itself slices on
+            // (`sh[2], sh[3]`). A hand-rolled `VaeTiling` literal and `shape()[1]` — the 16-channel
+            // axis — under-reported the grid as 2 where the decode ran 2x2 (review of PR #496).
             let plan = cfg.plan(
-                mlx_gen::tiling::VaeTiling {
-                    spatial_scale: 8,
-                    temporal_scale: 1,
-                    causal_temporal: false,
-                    full_res_channels: 128,
-                },
+                mlx_gen::tiling::VaeTiling::QWEN_IMAGE,
                 1,
-                unpacked.shape()[1],
                 unpacked.shape()[2],
+                unpacked.shape()[3],
             );
             let tiles = plan.h.len() * plan.w.len();
             clear_cache();
@@ -876,18 +956,24 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
 /// admissible (38/255) until it was measured on the real thing (84/255).
 #[track_caller]
 fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
+    production_latent_seeded(dir, size, 1234)
+}
+
+/// [`production_latent`] at an explicit seed, so the drift statistic can be resampled.
+#[track_caller]
+fn production_latent_seeded(dir: &std::path::Path, size: u32, seed: u64) -> mlx_rs::Array {
     let spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
         .with_offload_policy(OffloadPolicy::Resident);
     let model = mlx_gen_chroma::load_chroma(mlx_gen_chroma::ChromaVariant::Base, &spec)
         .expect("load chroma resident");
-    let latents = mlx_gen_flux::create_noise(1234, size, size).expect("noise");
+    let latents = mlx_gen_flux::create_noise(seed, size, size).expect("noise");
     let out = model
         .denoise_with_sampler_name(
             "a red fox in a snowy forest, photograph",
             "blurry, lowres",
             size,
             size,
-            STEPS,
+            steps(),
             4.0,
             latents,
             None,
@@ -899,6 +985,92 @@ fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
     drop(model);
     clear_cache();
     out
+}
+
+/// **How much of the rung-2 margin is the statistic's own variance?**
+///
+/// [`decode_tile_mechanism_sweep_on_the_production_latent`] puts the best swept geometry at
+/// **53/255** against a [`SIBLING_DRIFT_BAR`] of 48 — a 10% margin, where the earlier (invalid,
+/// 4-step) measurement had reported 105 and a 2x one. Those are different claims and only one of
+/// them can be settled by a single image.
+///
+/// `max Δ` is an **extreme-order statistic over ~3.1M subpixels**: one outlier sets it, and nothing
+/// in the sweep says how much it moves between latents. This resamples exactly that — the same cell,
+/// the same schedule, different seeds — and prints the distribution beside the bar. It is the same
+/// discipline [`identical_requests_reproduce_once_the_allocator_has_settled`] applies to the peak,
+/// applied to the quality statistic that actually decides this rung.
+///
+/// It asserts the **verdict**, not a figure: whatever `DECODE_SUPPORT` records has to survive the
+/// whole sample, so a rung declared Missing must fail the bar on every seed and a rung declared
+/// Implemented must clear it on every seed. A sample that straddles the bar reddens both ways —
+/// which is the correct outcome for a margin this narrow, and is the thing a single-image sweep
+/// cannot tell you.
+#[test]
+#[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
+fn the_rung_two_drift_margin_is_resampled_across_seeds() {
+    const SEEDS: [u64; 5] = [1234, 7, 99, 20260805, 424242];
+    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let size = 1024_u32;
+    // The best cell the sweep found, so the resampling is done where the verdict is closest.
+    let (edge, overlap) = (BEST_SWEPT_EDGE, BEST_SWEPT_OVERLAP);
+    let vae = mlx_gen_chroma::loader::load_vae(&dir).expect("load vae");
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(edge as i32, overlap as i32);
+
+    let mut drifts = Vec::new();
+    for seed in SEEDS {
+        let latent = production_latent_seeded(&dir, size, seed);
+        let unpacked = mlx_gen_flux::unpack_latents(&latent, size, size).expect("unpack");
+        let reference = mlx_gen::LatentDecoder::decode(&vae, &unpacked).expect("untiled decode");
+        reference.eval().expect("eval reference");
+        let ref_px =
+            mlx_gen::image::decoded_to_image(&reference.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+                .expect("reference image")
+                .pixels;
+        drop(reference);
+        clear_cache();
+        let tiled = vae
+            .decode_tiled(&unpacked, &cfg, None)
+            .expect("tiled decode");
+        tiled.eval().expect("eval tiled");
+        let px = mlx_gen::image::decoded_to_image(&tiled.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+            .expect("tiled image")
+            .pixels;
+        let drift = max_delta(&ref_px, &px);
+        println!(
+            "[sc-15520 rung2 resample {DEFAULT_TIER} {size}² edge {edge} overlap {overlap}] seed \
+             {seed}: max Δ {drift}/255, mean Δ {:.4}",
+            mean_delta(&ref_px, &px)
+        );
+        drifts.push(drift);
+        drop(tiled);
+        clear_cache();
+    }
+
+    let lo = *drifts.iter().min().expect("a non-empty sample");
+    let hi = *drifts.iter().max().expect("a non-empty sample");
+    println!(
+        "[sc-15520 rung2 resample {DEFAULT_TIER} {size}²] max Δ over {} seeds: {drifts:?} — range \
+         {lo}..{hi}/255 against a {SIBLING_DRIFT_BAR}/255 bar",
+        SEEDS.len()
+    );
+
+    if ms::DECODE_SUPPORT {
+        assert!(
+            hi <= SIBLING_DRIFT_BAR,
+            "rung 2 is declared Implemented, but the best swept geometry exceeds the \
+             {SIBLING_DRIFT_BAR}/255 bar on at least one seed ({drifts:?}) — a rung admitted on one \
+             image is admitted on a sample of one"
+        );
+    } else {
+        assert!(
+            lo > SIBLING_DRIFT_BAR,
+            "rung 2 is declared Missing, but the best swept geometry CLEARS the \
+             {SIBLING_DRIFT_BAR}/255 bar on at least one seed ({drifts:?}, range {lo}..{hi}). The \
+             verdict is no longer supported by the whole sample and must be re-decided — either the \
+             rung is admissible, or the withholding reason has to be stated as an unresolved margin \
+             rather than as a failure"
+        );
+    }
 }
 
 /// **Rungs 2 and 3 are refused by the PRODUCTION path** wherever they are declared `Missing`, on
@@ -1159,13 +1331,13 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(rung4_control()), edge, STEPS),
+        &request(Some(rung4_control()), edge, steps()),
     );
     println!(
         "[sc-15520 rung4 {tier} {edge}²] rung-4 control (its own composition, no window) {:.4} \
          GiB, {:.0} ms/step",
         control.peak_gib,
-        ms_per_step(&control, STEPS)
+        ms_per_step(&control, steps())
     );
 
     let mut rows: Vec<(u32, f64, f64)> = Vec::new();
@@ -1174,15 +1346,15 @@ fn transformer_window_sweep_and_streamed_output_identity() {
             REPRESENTATIVE,
             &dir,
             LoadShape::DeferredMaterialization,
-            &request(Some(full_ladder(window)), edge, STEPS),
+            &request(Some(full_ladder(window)), edge, steps()),
         );
         println!(
             "[sc-15520 rung4 {tier} {edge}² cadence {window}] {:.4} GiB ({:+.2}% vs control)  \
              {:.0} ms/step ({:.1}x)  max Δ {}",
             row.peak_gib,
             100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
-            ms_per_step(&row, STEPS),
-            ms_per_step(&row, STEPS) / ms_per_step(&control, STEPS),
+            ms_per_step(&row, steps()),
+            ms_per_step(&row, steps()) / ms_per_step(&control, steps()),
             max_delta(&control.pixels, &row.pixels),
         );
         // Byte-identity is asserted in BOTH modes: a streamed block is re-materialized through the
@@ -1193,7 +1365,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
             "cadence {window} changed the image — the re-materialized blocks are NOT reproducing \
              the resident ones (tier replay? adapter replay?)"
         );
-        rows.push((window, row.peak_gib, ms_per_step(&row, STEPS)));
+        rows.push((window, row.peak_gib, ms_per_step(&row, steps())));
     }
 
     // Sorted by cadence, so `rows[0]`/`rows.last()` mean tightest/widest regardless of the order the
@@ -1236,19 +1408,15 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     //
     // The ms/step column is **printed and not asserted**, and that is a measured decision rather
     // than caution. Under [`probe_order`] the wall clock follows the row's POSITION, not its
-    // cadence (SC-17679):
+    // cadence (SC-17679): re-running the same four cadences in a different execution order moves the
+    // times with the slots. Cadence 10 has measured both the slowest row and the fastest one across
+    // orders, and an independent re-run reproduced neither ordering — which is the point. No table
+    // of those numbers is reproduced here, because a printed table reads as a finding and this one
+    // is not: the only publishable statement is that the ordering is unresolvable on this
+    // instrument.
     //
-    // | order | cadence 1 | 2 | 5 | 10 |
-    // |---|---:|---:|---:|---:|
-    // | `1,2,5,10` | 9349 | 9785 | 10354 | 10466 |
-    // | `10,5,2,1` | 12199 (last) | — | — | 10166 (first) |
-    // | `2,10,1,5` | 11259 (3rd) | 9904 (1st) | 10404 (4th) | 9472 (2nd) |
-    //
-    // Cadence 10 is the slowest row in the first order and the fastest in the third. A genuine
-    // re-materialization cost cannot do that; thermal state over a 3.5-minute run can. So no
-    // latency ordering across these cadences is publishable in either direction, and
-    // [`ms::TRANSFORMER_WINDOW_SIZE`]'s default rests on being the tightest weight bound — what the
-    // rung exists for — rather than on a latency argument this instrument cannot resolve.
+    // So `TRANSFORMER_WINDOW_SIZE`'s default rests on being the tightest weight bound — what the
+    // rung exists for — and not on a latency argument.
     assert!(
         spread < 1.0,
         "the published cadences no longer bound the request peak to the same value ({spread:.2}% \
@@ -1442,13 +1610,17 @@ fn the_rung_four_saving_is_inside_the_block_weight_set() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(rung4_control()), 1024, STEPS),
+        &request(Some(rung4_control()), 1024, steps()),
     );
     let windowed = measure(
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 1024, STEPS),
+        &request(
+            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+            1024,
+            steps(),
+        ),
     );
     let saving = (control.peak_gib - windowed.peak_gib) * GIB;
     println!(
@@ -1487,10 +1659,26 @@ fn transformer_weight_arithmetic(dir: &std::path::Path) -> (f64, f64) {
         component.display()
     );
     for path in files {
-        let bytes = std::fs::read(&path).expect("read safetensors");
-        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        // Read ONLY the 8-byte length prefix and the JSON header. Slurping the whole file pulled a
+        // ~5.06 GiB shard onto the heap to parse a few KiB of JSON, on an epic where this harness is
+        // itself the OOM risk (review of PR #496).
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&path).expect("open safetensors");
+        let mut prefix = [0_u8; 8];
+        file.read_exact(&mut prefix)
+            .expect("safetensors length prefix");
+        let header_len = u64::from_le_bytes(prefix) as usize;
+        assert!(
+            header_len > 0 && header_len < 64 * 1024 * 1024,
+            "{}: implausible safetensors header length {header_len}",
+            path.display()
+        );
+        file.seek(SeekFrom::Start(8)).expect("seek past the prefix");
+        let mut header_bytes = vec![0_u8; header_len];
+        file.read_exact(&mut header_bytes)
+            .expect("safetensors header");
         let header: serde_json::Value =
-            serde_json::from_slice(&bytes[8..8 + header_len]).expect("safetensors header");
+            serde_json::from_slice(&header_bytes).expect("safetensors header");
         for (name, entry) in header.as_object().expect("header object") {
             if name == "__metadata__" {
                 continue;
@@ -1606,13 +1794,17 @@ fn the_full_ladder_renders_under_a_memory_cap() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(rung4_control()), 1024, STEPS),
+        &request(Some(rung4_control()), 1024, steps()),
     );
     let windowed = measure(
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 1024, STEPS),
+        &request(
+            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+            1024,
+            steps(),
+        ),
     );
     // The cap sits between the two peaks, so it is a cap the windowed composition needs.
     let cap = ((staged_row.peak_gib + windowed.peak_gib) / 2.0).ceil() as u64;
@@ -1625,7 +1817,11 @@ fn the_full_ladder_renders_under_a_memory_cap() {
         REPRESENTATIVE,
         &dir,
         LoadShape::DeferredMaterialization,
-        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 1024, STEPS),
+        &request(
+            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+            1024,
+            steps(),
+        ),
     );
     std::env::remove_var(MEMORY_CAP_ENV);
     assert_eq!(

@@ -180,11 +180,13 @@ pub const WINDOW_SUPPORT: bool = true;
 ///
 /// What is deliberately *not* published is an ordering. Sibling providers publish their cadences as
 /// a time/memory trade — SDXL measured 3654 → 1318 ms/step widening 1 → 10 — and this family's
-/// ms/step column looks like the opposite of that until the order probe is applied, at which point
-/// it stops looking like anything (`probe_order` in the ladder harness): cadence 10 is the slowest
-/// row in execution order `1,2,5,10` and
-/// the *fastest* in order `2,10,1,5`. The wall clock is tracking the row's position, not its
-/// cadence, so no latency ordering across these cadences is publishable in either direction
+/// ms/step column looks like a trade until the order probe is applied, at which point it stops
+/// looking like anything: re-running the same four cadences in a different execution order moves the
+/// times with the *slots*. Cadence 10 has measured both the slowest row and the fastest one across
+/// orders, and an independent re-run reproduced neither ordering.
+///
+/// No table of those timings is reproduced here on purpose — a printed table reads as a finding, and
+/// the only publishable statement is that the ordering is **unresolvable on this instrument**
 /// (SC-17679). [`TRANSFORMER_WINDOW_SIZE`]'s default therefore rests on being the tightest weight
 /// bound — what the rung exists for — and not on a latency argument.
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
