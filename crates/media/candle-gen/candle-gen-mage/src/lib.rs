@@ -7,6 +7,7 @@
 pub mod config;
 pub mod edit_provider;
 pub mod latent;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
@@ -31,6 +32,32 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 use sha2::{Digest, Sha256};
+
+fn cancel_aware<T>(
+    result: candle_core::Result<T>,
+    cancel: &gen_core::CancelFlag,
+) -> candle_gen::Result<T> {
+    if cancel.is_cancelled() {
+        Err(candle_gen::CandleError::Canceled)
+    } else {
+        result.map_err(candle_gen::CandleError::from)
+    }
+}
+
+pub(crate) fn begin_decode(
+    cancel: &gen_core::CancelFlag,
+    label: &str,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_core::Result<()> {
+    if cancel.is_cancelled() {
+        candle_core::bail!("{label} canceled");
+    }
+    on_progress(Progress::Decoding);
+    if cancel.is_cancelled() {
+        candle_core::bail!("{label} canceled");
+    }
+    Ok(())
+}
 
 /// Caller-provisioned shared component ids. These match the MLX provider and the SceneWorks
 /// manifest: each per-variant tier contains only the transformer, while the bit-identical text
@@ -127,6 +154,10 @@ pub struct MageGenerator {
     default_steps: u32,
     default_guidance: f32,
     components: Mutex<Option<Arc<MagePipeline>>>,
+    lifecycle: Mutex<()>,
+    loaded_quant: Option<candle_gen::gen_core::Quant>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_admission: memory_strategy::AdmissionRegistry,
 }
 
 pub struct MageEditGenerator {
@@ -137,6 +168,10 @@ pub struct MageEditGenerator {
     device: candle_core::Device,
     quant: Option<candle_gen::gen_core::Quant>,
     components: Mutex<Option<Arc<MageEdit>>>,
+    lifecycle: Mutex<()>,
+    loaded_quant: Option<candle_gen::gen_core::Quant>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_admission: memory_strategy::AdmissionRegistry,
 }
 
 impl MageEditGenerator {
@@ -230,9 +265,64 @@ fn verify_edit_checkpoint(
     Ok(())
 }
 
+fn verify_staged_edit_checkpoint(
+    root: &Path,
+    variant: MageEditVariant,
+    stage_residency: bool,
+) -> candle_core::Result<()> {
+    if stage_residency {
+        verify_edit_checkpoint(root, variant)
+    } else {
+        Ok(())
+    }
+}
+
 impl Generator for MageEditGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        match memory_strategy::validate_context(contract, context, self.loaded_quant) {
+            Ok(()) => match self.memory_admission.approve(context) {
+                Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                Err(error) => gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            Err(error) => {
+                self.memory_admission.clear_approval();
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(contract, context, self.loaded_quant)?;
+        Ok(Some(Box::new(memory_strategy::MageMemoryScope::new_bound(
+            self.device.clone(),
+            contract,
+            context,
+            self.memory_admission.clone(),
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -272,32 +362,128 @@ impl Generator for MageEditGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let stream_transformer_blocks = req
+            .memory
+            .is_some_and(|memory| memory.stream_transformer_blocks);
+        if req.memory.is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        }) && !stage_residency
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: constrained strategies require staged residency",
+                self.descriptor.id
+            )));
+        }
         let references = resolve_edit_references(req)?
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let components = self.components()?;
         let (default_steps, default_guidance) = self.variant.defaults();
         let base_seed = req.seed.unwrap_or(0);
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            images.push(
-                components
-                    .edit(
-                        &req.prompt,
-                        req.negative_prompt.as_deref().unwrap_or(" "),
-                        &references,
-                        req.width,
-                        req.height,
-                        req.steps.map_or(default_steps, |steps| steps as usize),
-                        req.guidance.unwrap_or(default_guidance),
-                        base_seed.wrapping_add(index as u64),
+        let steps = req.steps.map_or(default_steps, |steps| steps as usize);
+        let guidance = req.guidance.unwrap_or(default_guidance);
+        let mut render_resident = || -> gen_core::Result<Vec<gen_core::Image>> {
+            let components = self.components()?;
+            let mut images = Vec::with_capacity(req.count as usize);
+            for index in 0..req.count {
+                let result = components.edit_with_memory(
+                    &req.prompt,
+                    req.negative_prompt.as_deref().unwrap_or(" "),
+                    &references,
+                    req.width,
+                    req.height,
+                    steps,
+                    guidance,
+                    base_seed.wrapping_add(index as u64),
+                    req.memory,
+                    &req.cancel,
+                    on_progress,
+                );
+                if req.cancel.is_cancelled() {
+                    return Err(gen_core::Error::Canceled);
+                }
+                images.push(result.map_err(candle_gen::CandleError::from)?);
+            }
+            Ok(images)
+        };
+        let images = if !stage_residency {
+            render_resident()?
+        } else {
+            // The staged loader bypasses `self.components()`, so retain the exact same sibling-
+            // checkpoint fingerprint gate before opening any conditioning/heavy component.
+            verify_staged_edit_checkpoint(&self.root, self.variant, stage_residency)
+                .map_err(candle_gen::CandleError::from)?;
+            let resident = candle_gen::lock_recover(&self.components).take();
+            drop(resident);
+            self.device
+                .synchronize()
+                .map_err(gen_core::Error::backend)?;
+            let dirs = self.component_dirs.clone();
+            let quant = self.quant;
+            let device = self.device.clone();
+            candle_gen::run_sequential(
+                &req.cancel,
+                &device,
+                on_progress,
+                || {
+                    cancel_aware(
+                        MageEdit::load_conditioning(&dirs, quant, &device),
                         &req.cancel,
-                        on_progress,
                     )
-                    .map_err(candle_gen::CandleError::from)?,
-            );
-        }
+                },
+                |conditioning| {
+                    cancel_aware(
+                        MageEdit::encode_conditioning(
+                            conditioning,
+                            &req.prompt,
+                            req.negative_prompt.as_deref().unwrap_or(" "),
+                            &references,
+                            req.width,
+                            req.height,
+                            guidance,
+                            base_seed,
+                        ),
+                        &req.cancel,
+                    )
+                },
+                || {
+                    cancel_aware(
+                        MageEdit::load_heavy(
+                            &dirs,
+                            quant,
+                            &device,
+                            stream_transformer_blocks,
+                            &req.cancel,
+                        ),
+                        &req.cancel,
+                    )
+                },
+                |heavy, encoded, on_progress| {
+                    // Optimized contexts are single-image; the shared safety gate rejects larger
+                    // batches before this point so reference-posterior seeding stays exact.
+                    cancel_aware(
+                        MageEdit::sample_heavy(
+                            heavy,
+                            encoded,
+                            req.width,
+                            req.height,
+                            steps,
+                            guidance,
+                            base_seed,
+                            req.memory,
+                            &req.cancel,
+                            on_progress,
+                        ),
+                        &req.cancel,
+                    )
+                    .map(|image| vec![image])
+                },
+            )
+            .map_err(gen_core::Error::from)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -354,6 +540,49 @@ impl Generator for MageGenerator {
         &self.descriptor
     }
 
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        match memory_strategy::validate_context(contract, context, self.loaded_quant) {
+            Ok(()) => match self.memory_admission.approve(context) {
+                Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                Err(error) => gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            Err(error) => {
+                self.memory_admission.clear_approval();
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(contract, context, self.loaded_quant)?;
+        Ok(Some(Box::new(memory_strategy::MageMemoryScope::new_bound(
+            self.device.clone(),
+            contract,
+            context,
+            self.memory_admission.clone(),
+        )?)))
+    }
+
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         self.descriptor
             .capabilities
@@ -383,28 +612,108 @@ impl Generator for MageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let components = self.components()?;
-        let base_seed = req.seed.unwrap_or(0);
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            if req.cancel.is_cancelled() {
-                return Err(gen_core::Error::Canceled);
-            }
-            images.push(
-                components
-                    .generate(
-                        &req.prompt,
-                        req.negative_prompt.as_deref().unwrap_or(" "),
-                        req.width,
-                        req.height,
-                        req.steps.unwrap_or(self.default_steps) as usize,
-                        req.guidance.unwrap_or(self.default_guidance),
-                        base_seed.wrapping_add(index as u64),
-                        on_progress,
-                    )
-                    .map_err(candle_gen::CandleError::from)?,
-            );
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        let stream_transformer_blocks = req
+            .memory
+            .is_some_and(|memory| memory.stream_transformer_blocks);
+        if req.memory.is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        }) && !stage_residency
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: constrained strategies require staged residency",
+                self.descriptor.id
+            )));
         }
+        let base_seed = req.seed.unwrap_or(0);
+        let steps = req.steps.unwrap_or(self.default_steps) as usize;
+        let guidance = req.guidance.unwrap_or(self.default_guidance);
+        let images = if !stage_residency {
+            let components = self.components()?;
+            let mut images = Vec::with_capacity(req.count as usize);
+            for index in 0..req.count {
+                if req.cancel.is_cancelled() {
+                    return Err(gen_core::Error::Canceled);
+                }
+                let result = components.generate_with_memory(
+                    &req.prompt,
+                    req.negative_prompt.as_deref().unwrap_or(" "),
+                    req.width,
+                    req.height,
+                    steps,
+                    guidance,
+                    base_seed.wrapping_add(index as u64),
+                    req.memory,
+                    &req.cancel,
+                    on_progress,
+                );
+                if req.cancel.is_cancelled() {
+                    return Err(gen_core::Error::Canceled);
+                }
+                images.push(result.map_err(candle_gen::CandleError::from)?);
+            }
+            images
+        } else {
+            let resident = candle_gen::lock_recover(&self.components).take();
+            drop(resident);
+            self.device
+                .synchronize()
+                .map_err(gen_core::Error::backend)?;
+            let dirs = self.component_dirs.clone();
+            let quant = self.quant;
+            let device = self.device.clone();
+            candle_gen::run_sequential(
+                &req.cancel,
+                &device,
+                on_progress,
+                || cancel_aware(MagePipeline::load_text(&dirs, quant, &device), &req.cancel),
+                |text| {
+                    cancel_aware(
+                        MagePipeline::encode_prompt(
+                            text,
+                            &req.prompt,
+                            req.negative_prompt.as_deref().unwrap_or(" "),
+                            guidance,
+                        ),
+                        &req.cancel,
+                    )
+                },
+                || {
+                    cancel_aware(
+                        MagePipeline::load_heavy(
+                            &dirs,
+                            quant,
+                            &device,
+                            stream_transformer_blocks,
+                            &req.cancel,
+                        ),
+                        &req.cancel,
+                    )
+                },
+                |heavy, encoded, on_progress| {
+                    cancel_aware(
+                        MagePipeline::sample(
+                            &heavy.transformer,
+                            &heavy.vae,
+                            encoded,
+                            req.width,
+                            req.height,
+                            steps,
+                            guidance,
+                            base_seed,
+                            req.memory,
+                            &req.cancel,
+                            on_progress,
+                        ),
+                        &req.cancel,
+                    )
+                    .map(|image| vec![image])
+                },
+            )
+            .map_err(gen_core::Error::from)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -439,7 +748,12 @@ fn load_generation_variant(
         ));
     }
     let device = candle_gen::default_device()?;
+    #[cfg(any(feature = "cuda", test))]
+    let memory_strategy = Some(memory_strategy::provider_contract_for(descriptor.id, spec)?);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_strategy = None;
     Ok(Box::new(MageGenerator {
+        memory_admission: memory_strategy::AdmissionRegistry::new(descriptor.id),
         descriptor,
         component_dirs,
         device,
@@ -447,6 +761,9 @@ fn load_generation_variant(
         default_steps,
         default_guidance,
         components: Mutex::new(None),
+        lifecycle: Mutex::new(()),
+        loaded_quant: spec.quantize,
+        memory_strategy,
     }))
 }
 
@@ -537,14 +854,23 @@ fn load_edit_variant(
     };
     let component_dirs = resolve_component_dirs(&root, spec)?;
     let device = candle_gen::default_device()?;
+    let descriptor = edit_descriptor(variant);
+    #[cfg(any(feature = "cuda", test))]
+    let memory_strategy = Some(memory_strategy::provider_contract_for(descriptor.id, spec)?);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_strategy = None;
     Ok(Box::new(MageEditGenerator {
-        descriptor: edit_descriptor(variant),
+        memory_admission: memory_strategy::AdmissionRegistry::new(descriptor.id),
+        descriptor,
         root,
         component_dirs,
         variant,
         device,
         quant: spec.quantize,
         components: Mutex::new(None),
+        lifecycle: Mutex::new(()),
+        loaded_quant: spec.quantize,
+        memory_strategy,
     }))
 }
 
@@ -582,14 +908,84 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(REGISTRATION)
         .register_generator(BASE_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
         .register_generator(EDIT_BASE_REGISTRATION)
-        .register_generator(EDIT_TURBO_REGISTRATION)
+        .register_generator(EDIT_TURBO_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_strategy(RL_MEMORY_REGISTRATION)
+        .register_memory_behavior(RL_MEMORY_BEHAVIOR)
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+        .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
+        .register_memory_strategy(EDIT_BASE_MEMORY_REGISTRATION)
+        .register_memory_behavior(EDIT_BASE_MEMORY_BEHAVIOR)
+        .register_memory_strategy(EDIT_TURBO_MEMORY_REGISTRATION)
+        .register_memory_behavior(EDIT_TURBO_MEMORY_BEHAVIOR);
+    registry
 }
+
+#[cfg(feature = "cuda")]
+const RL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::MODEL_ID,
+    contract: memory_strategy::contract_rl,
+    safety_check: memory_strategy::registered_safety_check,
+};
+#[cfg(feature = "cuda")]
+const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::BASE_MODEL_ID,
+    contract: memory_strategy::contract_base,
+    safety_check: memory_strategy::registered_safety_check,
+};
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::TURBO_MODEL_ID,
+    contract: memory_strategy::contract_turbo,
+    safety_check: memory_strategy::registered_safety_check,
+};
+#[cfg(feature = "cuda")]
+const EDIT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::EDIT_MODEL_ID,
+    contract: memory_strategy::contract_edit,
+    safety_check: memory_strategy::registered_safety_check,
+};
+#[cfg(feature = "cuda")]
+const EDIT_BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::EDIT_BASE_MODEL_ID,
+    contract: memory_strategy::contract_edit_base,
+    safety_check: memory_strategy::registered_safety_check,
+};
+#[cfg(feature = "cuda")]
+const EDIT_TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::EDIT_TURBO_MODEL_ID,
+    contract: memory_strategy::contract_edit_turbo,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+macro_rules! memory_behavior {
+    ($name:ident, $id:expr) => {
+        #[cfg(feature = "cuda")]
+        const $name: gen_core::MemoryBehaviorRegistration = gen_core::MemoryBehaviorRegistration {
+            provider_id: $id,
+            valid_fixtures: memory_strategy::registered_valid_fixture,
+            begin_request: memory_strategy::registered_begin_request,
+        };
+    };
+}
+
+memory_behavior!(RL_MEMORY_BEHAVIOR, config::MODEL_ID);
+memory_behavior!(BASE_MEMORY_BEHAVIOR, config::BASE_MODEL_ID);
+memory_behavior!(TURBO_MEMORY_BEHAVIOR, config::TURBO_MODEL_ID);
+memory_behavior!(EDIT_MEMORY_BEHAVIOR, config::EDIT_MODEL_ID);
+memory_behavior!(EDIT_BASE_MEMORY_BEHAVIOR, config::EDIT_BASE_MODEL_ID);
+memory_behavior!(EDIT_TURBO_MEMORY_BEHAVIOR, config::EDIT_TURBO_MODEL_ID);
 
 pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
@@ -777,5 +1173,49 @@ mod registry_tests {
             .unwrap_err()
             .to_string()
             .contains("must be staged as a directory"));
+    }
+
+    #[test]
+    fn staged_edit_keeps_the_route_checkpoint_fingerprint_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "sc15813_mage_edit_verify_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let mut invalid_checkpoint = 2u64.to_le_bytes().to_vec();
+        invalid_checkpoint.extend_from_slice(b"{}");
+        std::fs::write(
+            root.join("transformer/diffusion_pytorch_model.safetensors"),
+            invalid_checkpoint,
+        )
+        .unwrap();
+
+        assert!(verify_staged_edit_checkpoint(&root, MageEditVariant::Edit, false).is_ok());
+        let error = verify_staged_edit_checkpoint(&root, MageEditVariant::Edit, true)
+            .expect_err("staged execution must verify the exact edit checkpoint");
+        assert!(error.to_string().contains("missing transformer_blocks.0"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn decode_callback_cancellation_is_preserved_as_typed_canceled() {
+        let cancel = gen_core::CancelFlag::default();
+        let callback_flag = cancel.clone();
+        let mut progress = move |event| {
+            if event == Progress::Decoding {
+                callback_flag.cancel();
+            }
+        };
+        let decoded = begin_decode(&cancel, "mage-test", &mut progress);
+        assert!(decoded.is_err());
+        assert!(matches!(
+            cancel_aware(decoded.map(|_| ()), &cancel),
+            Err(candle_gen::CandleError::Canceled)
+        ));
     }
 }

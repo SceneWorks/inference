@@ -9,13 +9,22 @@ use crate::config::LATENT_CHANNELS;
 use crate::rope::{ImgShape, PackLayout};
 use crate::scheduler;
 use crate::{MageComponentDirs, MageConfig, MageTextEncoder, MageTransformer, MageVae};
-use candle_gen::gen_core::Quant;
+use candle_gen::gen_core::{GenerationMemory, Quant};
+
+pub(crate) struct MageEncoded {
+    positive: Tensor,
+    negative: Option<Tensor>,
+}
+
+pub(crate) struct MageHeavy {
+    pub(crate) transformer: MageTransformer,
+    pub(crate) vae: MageVae,
+}
 
 pub struct MagePipeline {
     text: MageTextEncoder,
     transformer: MageTransformer,
     vae: MageVae,
-    device: Device,
 }
 
 impl MagePipeline {
@@ -43,7 +52,48 @@ impl MagePipeline {
             )?,
             transformer: MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?,
             vae: MageVae::load(&dirs.vae, device)?,
-            device: device.clone(),
+        })
+    }
+
+    pub(crate) fn load_text(
+        dirs: &MageComponentDirs,
+        quant: Option<Quant>,
+        device: &Device,
+    ) -> Result<MageTextEncoder> {
+        MageTextEncoder::load_component_with_quant(&dirs.text_encoder, false, quant, device)
+    }
+
+    pub(crate) fn load_heavy(
+        dirs: &MageComponentDirs,
+        quant: Option<Quant>,
+        device: &Device,
+        stream_transformer_blocks: bool,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> Result<MageHeavy> {
+        let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
+        let cfg = MageConfig::from_json(&cfg_text)?;
+        let transformer = if stream_transformer_blocks {
+            MageTransformer::load_block_streamed(&dirs.transformer, &cfg, quant, device, cancel)?
+        } else {
+            MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?
+        };
+        Ok(MageHeavy {
+            transformer,
+            vae: MageVae::load(&dirs.vae, device)?,
+        })
+    }
+
+    pub(crate) fn encode_prompt(
+        text: &MageTextEncoder,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+    ) -> Result<MageEncoded> {
+        Ok(MageEncoded {
+            positive: text.encode(prompt)?,
+            negative: (guidance > 1.0)
+                .then(|| text.encode(negative_prompt))
+                .transpose()?,
         })
     }
 
@@ -59,15 +109,69 @@ impl MagePipeline {
         seed: u64,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> Result<candle_gen::gen_core::Image> {
+        self.generate_with_memory(
+            prompt,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            guidance,
+            seed,
+            None,
+            &candle_gen::gen_core::CancelFlag::default(),
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_memory(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        seed: u64,
+        memory: Option<GenerationMemory>,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> Result<candle_gen::gen_core::Image> {
+        let encoded = Self::encode_prompt(&self.text, prompt, negative_prompt, guidance)?;
+        Self::sample(
+            &self.transformer,
+            &self.vae,
+            encoded,
+            width,
+            height,
+            steps,
+            guidance,
+            seed,
+            memory,
+            cancel,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sample(
+        transformer: &MageTransformer,
+        vae: &MageVae,
+        encoded: MageEncoded,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        seed: u64,
+        memory: Option<GenerationMemory>,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> Result<candle_gen::gen_core::Image> {
         let gh = height as usize / 16;
         let gw = width as usize / 16;
-        let positive = self.text.encode(prompt)?;
-        let use_cfg = guidance > 1.0;
-        let negative = if use_cfg {
-            Some(self.text.encode(negative_prompt)?)
-        } else {
-            None
-        };
+        let MageEncoded { positive, negative } = encoded;
+        let device = positive.device().clone();
+        let use_cfg = negative.is_some();
         let base = PackLayout::generation(vec![ImgShape::latent(gh, gw)], vec![positive.dim(1)?])?;
         let (layout, text) = if let Some(negative) = &negative {
             (
@@ -78,28 +182,43 @@ impl MagePipeline {
             (base, positive)
         };
 
-        let noise = crate::latent::watermarked_noise(
-            LATENT_CHANNELS,
-            gh,
-            gw,
-            seed,
-            DType::BF16,
-            &self.device,
-        )?;
+        let noise =
+            crate::latent::watermarked_noise(LATENT_CHANNELS, gh, gw, seed, DType::BF16, &device)?;
         let mut tokens = noise
             .permute((0, 2, 3, 1))?
             .reshape((1, gh * gw, LATENT_CHANNELS))?;
         let ladder = scheduler::sigmas(steps)?;
+        let attention_budget = memory
+            .filter(|memory| memory.chunk_attention)
+            .and_then(|memory| memory.attention_chunk_size)
+            .unwrap_or(candle_gen::ATTN_SCORES_BUDGET as u32)
+            as usize;
+        let transformer_window = memory
+            .filter(|memory| memory.stream_transformer_blocks)
+            .and_then(|memory| memory.transformer_window_size)
+            .map(|window| window as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         for (i, pair) in ladder.windows(2).enumerate() {
+            if cancel.is_cancelled() {
+                candle_core::bail!("mage canceled");
+            }
             let (input, sigma) = if use_cfg {
                 (
                     Tensor::cat(&[tokens.clone(), tokens.clone()], 1)?,
-                    Tensor::new(&[pair[0], pair[0]], &self.device)?,
+                    Tensor::new(&[pair[0], pair[0]], &device)?,
                 )
             } else {
-                (tokens.clone(), Tensor::new(&[pair[0]], &self.device)?)
+                (tokens.clone(), Tensor::new(&[pair[0]], &device)?)
             };
-            let output = self.transformer.forward(&input, &text, &sigma, &layout)?;
+            let output = transformer.forward_with_memory(
+                &input,
+                &text,
+                &sigma,
+                &layout,
+                attention_budget,
+                transformer_window,
+                cancel,
+            )?;
             let velocity = if use_cfg {
                 let cond = output.narrow(1, 0, gh * gw)?;
                 let unc = output.narrow(1, gh * gw, gh * gw)?;
@@ -114,11 +233,28 @@ impl MagePipeline {
                 total: steps as u32,
             });
         }
-        on_progress(candle_gen::gen_core::Progress::Decoding);
+        crate::begin_decode(cancel, "mage", on_progress)?;
         let latent = tokens
             .reshape((1, gh, gw, LATENT_CHANNELS))?
             .permute((0, 3, 1, 2))?;
-        let decoded = self.vae.decode(&latent)?.to_dtype(DType::F32)?;
+        let decoded = if memory.is_some_and(|memory| memory.tile_vae_decode) {
+            let memory = memory.expect("guarded above");
+            vae.decode_bounded(
+                &latent,
+                memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+            )?
+        } else {
+            vae.decode(&latent)?
+        }
+        .to_dtype(DType::F32)?;
+        if cancel.is_cancelled() {
+            candle_core::bail!("mage canceled");
+        }
         let image = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
         let (c, h, w) = image.dims3()?;
         if c != 3 {

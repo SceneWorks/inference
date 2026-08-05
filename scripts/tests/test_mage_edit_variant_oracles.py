@@ -66,7 +66,11 @@ class MageEditVariantOracleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def args(self, verify_only: bool = True) -> list[str]:
+    def args(
+        self,
+        verify_only: bool = True,
+        migrate_reference_environment_manifest_only: bool = False,
+    ) -> list[str]:
         args = [
             str(SCRIPT),
             "--gen",
@@ -82,6 +86,8 @@ class MageEditVariantOracleTests(unittest.TestCase):
         ]
         if verify_only:
             args.append("--verify-only")
+        if migrate_reference_environment_manifest_only:
+            args.append("--migrate-reference-environment-manifest-only")
         return args
 
     def manifest(self) -> dict:
@@ -312,6 +318,180 @@ class MageEditVariantOracleTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
         ):
             self.module.main()
+
+    def test_manifest_only_migration_accepts_only_the_exact_legacy_manifest(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        manifest_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+        oracle_bytes = {
+            filename: (self.output / filename).read_bytes()
+            for _label, filename, _steps, _cfg in self.module.CASES
+        }
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=AssertionError("migration must be runtime-portable"),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(self.module, "validate") as validate,
+            mock.patch.object(
+                self.module.subprocess,
+                "run",
+                side_effect=AssertionError("migration must not regenerate"),
+            ),
+            mock.patch.object(
+                self.module.shutil,
+                "copy2",
+                side_effect=AssertionError("migration must not replace an oracle"),
+            ),
+        ):
+            self.assertEqual(self.module.main(), 0)
+        self.assertEqual(
+            json.loads(manifest_path.read_text(encoding="utf-8")), self.manifest()
+        )
+        self.assertEqual(
+            {
+                filename: (self.output / filename).read_bytes()
+                for _label, filename, _steps, _cfg in self.module.CASES
+            },
+            oracle_bytes,
+        )
+        self.assertEqual(validate.call_count, len(self.module.CASES))
+
+    def test_manifest_only_migration_rejects_any_non_environment_drift_without_writing(
+        self,
+    ) -> None:
+        for field, replacement in (
+            ("sha256", "stale"),
+            ("snapshotRevision", "0" * 40),
+            ("cfg", 4.0),
+        ):
+            legacy = self.manifest()
+            del legacy["referenceEnvironment"]
+            legacy["files"][1][field] = replacement
+            manifest_path = self.output / "mage_edit_variants_manifest.json"
+            original = json.dumps(legacy, indent=2) + "\n"
+            manifest_path.write_text(original, encoding="utf-8")
+            with (
+                self.subTest(field=field),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.args(
+                        verify_only=False,
+                        migrate_reference_environment_manifest_only=True,
+                    ),
+                ),
+                mock.patch.object(
+                    self.module,
+                    "sha256",
+                    side_effect=lambda path: f"hash:{path.name}",
+                ),
+                mock.patch.object(self.module, "validate"),
+                self.assertRaisesRegex(RuntimeError, "migration refused"),
+            ):
+                self.module.main()
+            self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_only_migration_never_masks_oracle_geometry_failure(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        original = json.dumps(legacy, indent=2) + "\n"
+        manifest_path.write_text(original, encoding="utf-8")
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(
+                self.module, "validate", side_effect=RuntimeError("geometry is stale")
+            ),
+            self.assertRaisesRegex(RuntimeError, "geometry is stale"),
+        ):
+            self.module.main()
+        self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_only_migration_rejects_external_manifest_hard_link(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        original = json.dumps(legacy, indent=2) + "\n"
+        external = self.root / "persistent-seed-manifest.json"
+        external.write_text(original, encoding="utf-8")
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        self.module.os.link(external, manifest_path)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(self.module, "validate"),
+            self.assertRaisesRegex(RuntimeError, "exactly one hard link"),
+        ):
+            self.module.main()
+        self.assertEqual(external.read_text(encoding="utf-8"), original)
+        self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_only_migration_rejects_external_oracle_hard_link(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        original_manifest = json.dumps(legacy, indent=2) + "\n"
+        manifest_path.write_text(original_manifest, encoding="utf-8")
+        filename = self.module.CASES[0][1]
+        oracle_path = self.output / filename
+        oracle_path.unlink()
+        external = self.root / "persistent-seed-oracle.safetensors"
+        original_oracle = filename.encode()
+        external.write_bytes(original_oracle)
+        self.module.os.link(external, oracle_path)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(self.module, "validate"),
+            self.assertRaisesRegex(RuntimeError, "exactly one hard link"),
+        ):
+            self.module.main()
+        self.assertEqual(external.read_bytes(), original_oracle)
+        self.assertEqual(oracle_path.read_bytes(), original_oracle)
+        self.assertEqual(
+            manifest_path.read_text(encoding="utf-8"), original_manifest
+        )
 
     def test_manifest_rejects_every_cross_type_numeric_alias(self) -> None:
         for _label, filename, _steps, _cfg in self.module.CASES:

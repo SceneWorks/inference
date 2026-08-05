@@ -711,6 +711,7 @@ dependencies = [
  "image",
  "rand",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tokenizers 0.22.2",
