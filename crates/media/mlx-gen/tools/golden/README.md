@@ -260,22 +260,40 @@ the diffs alone would not have established either:
   measurement question. A stale binding here is not always just bookkeeping — check whether the
   recorded run spec still reproduces before assuming the numbers are the only question.
 
-*Reproducing the artifact set.* All 12 manifest artifacts regenerate byte-for-byte on the reference
-host from the commands in each `artifacts.*.source.command`, given the frozen fork at
-`81106c83` and `.venv-0320`. That includes the MLX renders, not just the synthetic adapters. If a
-regenerated golden's SHA-256 does *not* match, treat it as a real signal rather than as expected
-float noise — the one historical exception was a defect, not nondeterministic math:
-`dump_hyper_flux_golden.py` is the only dump here that writes via `safetensors.numpy.save_file`,
-which serializes `__metadata__` out of a Rust `HashMap` with per-process iteration order, so its
-file hash changed every run while all eight tensors stayed bit-identical. `_canonicalize_metadata_order()`
-sorts the metadata after the write (a pure key permutation — same serialized length, re-padded into
-the original header slot, payload untouched), which made the artifact reproducible and moved its
-pinned hash once, in the sc-17651 review. The sibling dumps use `mx.save_safetensors` and were never
-affected.
+*Reproducing the artifact set.* The **11 generated** artifacts regenerate byte-for-byte on the
+reference host from the commands in each `artifacts.*.source.command`, given the frozen fork at
+`81106c83` and `.venv-0320`; that includes the MLX renders, not just the synthetic adapters. The
+12th, `hyper_flux_lora`, is `source.kind: "huggingface"` — a pinned 1.38 GB ByteDance download with
+no `command`, verified by hash rather than regenerated. If a regenerated golden's SHA-256 does *not*
+match, treat it as a real signal rather than as expected float noise — the one historical exception
+was a defect, not nondeterministic math: `dump_hyper_flux_golden.py` is the only dump here that
+writes via `safetensors.numpy.save_file`, which serializes `__metadata__` out of a Rust `HashMap`
+with per-process iteration order, so its file hash changed every run while all eight tensors stayed
+bit-identical. `_canonicalize_metadata_order()` sorts the metadata after the write — a key
+permutation that preserves the serialized length, re-padded into the original header slot, with the
+write confined to the header bytes so the payload cannot move. That made the artifact reproducible
+and moved its pinned hash, in the sc-17651 review.
+
+Two consequences worth knowing before you touch that script. Its own SHA-256 is embedded in the
+golden it writes (`golden_metadata()` sets `reference_script_sha256`), so **any byte edit to
+`dump_hyper_flux_golden.py` invalidates this artifact's pin and forces a licensed regeneration plus
+a re-record** — it is a bound source file too. That is the same ratchet sc-17070 removed for the
+verifier, and it is why the canonicalization helper lives in this script rather than in
+`_adapter_parity_provenance.py`: that module's hash is embedded in *all five* generated goldens as
+`reference_provenance_sha256`, so hoisting the helper there would invalidate every one of them. Do
+not "simplify" it by moving it. The sibling dumps use `mx.save_safetensors` and were never affected.
+
+Note also what the recorded Hyper-FLUX run does and does not pin. `hyper_flux_scale_zero_is_bit_exact_noop`
+compares `injected_render(None)` against `injected_render(Some(0.0))` — both sides read the same
+golden — so `byte_differences=0` is insensitive to the golden's tensor *values*; the tests that
+would detect a changed Hyper-FLUX golden (they compare against `image_u8`/`final_latents`) are not
+in the recorded run set. What evidences a faithful regeneration here is therefore the artifact's
+unchanged byte count and the ten sibling artifacts reproducing byte-exactly from the same
+fork/venv/models — not that single acceptance number.
 
 One operational note. A full (non-`--manifest-only`) run from an ordinary `main` checkout never
 reaches the source comparison at all: `source_state()` raises `proof worktree contains changes
-outside the bound allowlist` first (942 paths differ from `implementation_base` at the time of
+outside the bound allowlist` first (944 paths differ from `implementation_base` at the time of
 writing). The comparison is only reachable from a detached checkout at `implementation_base`
 (`39a11d36…`) with the proof's source overlaid — the 11 bound files plus `UNBOUND_SOURCE_FILES` plus
 `EVIDENCE_CHANGE_FILES` — which is the same protocol a re-record runs under. And when it is reached,
@@ -622,6 +640,12 @@ generated are listed.
 > ```sh
 > cd tools/golden && shasum -a 256 *.safetensors > CHECKSUMS.txt   # after a full re-dump
 > ```
+>
+> **Only run that after a genuinely full re-dump.** `>` truncates, so on a host holding a subset
+> of the directory it silently *deletes* every row it cannot see. sc-17651 regenerated only the
+> 11 sc-15505 artifacts out of the ~76 rows listed here; re-blessing from the directory would
+> have dropped the other 65, so that review hand-edited the single changed line instead. Editing
+> the affected rows is the correct move whenever you re-dumped less than everything.
 >
 > Until that next full re-dump, the `shasum -c` tripwire silently passes for any family it doesn't
 > list — so the manifest above is the source of truth for *what should exist*. The byte tripwire

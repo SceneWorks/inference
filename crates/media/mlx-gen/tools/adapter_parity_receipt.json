@@ -1,7 +1,7 @@
 {
   "proof": {
     "artifacts_after": {
-      "flux_hyper_golden": "59c0c9bde2f1d4c03856aadf887e7e016be6dc9b6fe7440f6ad38f297e8050f4",
+      "flux_hyper_golden": "e24dc881bfc93f9f9465debacfcf3ef48435fe0115145ce75f1735cdcb6dece7",
       "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
       "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
       "qwen_lokr_adapter": "1e13570724e75f926e9fb079f2ec336cc87f3932eada8415ab71b83a43e179cf",
@@ -15,7 +15,7 @@
       "z_image_lora_golden": "8fedc026546cbfb75f0e9f29e76beac848e4f197a8480c9771bfce5f884426d0"
     },
     "artifacts_before": {
-      "flux_hyper_golden": "59c0c9bde2f1d4c03856aadf887e7e016be6dc9b6fe7440f6ad38f297e8050f4",
+      "flux_hyper_golden": "e24dc881bfc93f9f9465debacfcf3ef48435fe0115145ce75f1735cdcb6dece7",
       "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
       "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
       "qwen_lokr_adapter": "1e13570724e75f926e9fb079f2ec336cc87f3932eada8415ab71b83a43e179cf",
@@ -192,8 +192,8 @@
         },
         "name": "hyper_flux_scale_zero",
         "returncode": 0,
-        "stderr": "    Finished `release` profile [optimized] target(s) in 0.40s\n     Running tests/hyper_flux_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/hyper_flux_real_weights-69d15c9f4c4fda0d)\n",
-        "stdout": "\nrunning 1 test\ntest hyper_flux_scale_zero_is_bit_exact_noop ... Hyper-FLUX scale-0: 0 RGB bytes differ vs no-adapter\nSC15505_RESULT hyper_flux_scale_zero byte_differences=0 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 73.49s\n\n"
+        "stderr": "    Finished `release` profile [optimized] target(s) in 0.41s\n     Running tests/hyper_flux_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/hyper_flux_real_weights-69d15c9f4c4fda0d)\n",
+        "stdout": "\nrunning 1 test\ntest hyper_flux_scale_zero_is_bit_exact_noop ... Hyper-FLUX scale-0: 0 RGB bytes differ vs no-adapter\nSC15505_RESULT hyper_flux_scale_zero byte_differences=0 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 27.47s\n\n"
       },
       {
         "argv": [
@@ -228,8 +228,8 @@
         },
         "name": "z_image_lora",
         "returncode": 0,
-        "stderr": "    Finished `release` profile [optimized] target(s) in 0.40s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-962bd858d9ae07cc)\n",
-        "stdout": "\nrunning 1 test\ntest lora_render_matches_fork_golden ... \u2713 lora adapter render: 17919 px>8 (2.2785%); base floor 15324 (1.9485%); cap 34580 (4.3971%); residual 15692; zero control 26587; residual cap 21139\nSC15505_RESULT z_image_lora samples_gt8=17919 base_floor=15324 cap=34580 residual_samples_gt8=15692 zero_residual_samples_gt8=26587 residual_cap=21139 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 29.32s\n\n"
+        "stderr": "    Finished `release` profile [optimized] target(s) in 0.49s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-962bd858d9ae07cc)\n",
+        "stdout": "\nrunning 1 test\ntest lora_render_matches_fork_golden ... \u2713 lora adapter render: 17919 px>8 (2.2785%); base floor 15324 (1.9485%); cap 34580 (4.3971%); residual 15692; zero control 26587; residual cap 21139\nSC15505_RESULT z_image_lora samples_gt8=17919 base_floor=15324 cap=34580 residual_samples_gt8=15692 zero_residual_samples_gt8=26587 residual_cap=21139 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 9.22s\n\n"
       },
       {
         "argv": [
@@ -264,8 +264,8 @@
         },
         "name": "z_image_lokr",
         "returncode": 0,
-        "stderr": "    Finished `release` profile [optimized] target(s) in 0.39s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-962bd858d9ae07cc)\n",
-        "stdout": "\nrunning 1 test\ntest lokr_render_matches_fork_golden ... \u2713 lokr adapter render: 13582 px>8 (1.7270%); base floor 15324 (1.9485%); cap 34580 (4.3971%); residual 15476; zero control 40120; residual cap 27798\nSC15505_RESULT z_image_lokr samples_gt8=13582 base_floor=15324 cap=34580 residual_samples_gt8=15476 zero_residual_samples_gt8=40120 residual_cap=27798 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 22.74s\n\n"
+        "stderr": "    Finished `release` profile [optimized] target(s) in 0.63s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-962bd858d9ae07cc)\n",
+        "stdout": "\nrunning 1 test\ntest lokr_render_matches_fork_golden ... \u2713 lokr adapter render: 13582 px>8 (1.7270%); base floor 15324 (1.9485%); cap 34580 (4.3971%); residual 15476; zero control 40120; residual cap 27798\nSC15505_RESULT z_image_lokr samples_gt8=13582 base_floor=15324 cap=34580 residual_samples_gt8=15476 zero_residual_samples_gt8=40120 residual_cap=27798 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 9.19s\n\n"
       },
       {
         "argv": [
@@ -300,8 +300,8 @@
         },
         "name": "qwen_lora",
         "returncode": 0,
-        "stderr": "    Finished `release` profile [optimized] target(s) in 0.26s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-e26ceaecfe2813d3)\n",
-        "stdout": "\nrunning 1 test\ntest lora_render_matches_fork_golden ... \u2713 qwen lora adapter render: 40696 px>8 (5.1748%); base floor 47293 (6.0136%); cap 98518 (12.5272%)\nSC15505_RESULT qwen_lora samples_gt8=40696 base_floor=47293 cap=98518 effect_samples_gt8=44799 minimum_samples_gt8=22399 scale_zero_byte_differences=0 applied=24 unmatched=0 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 316.31s\n\n"
+        "stderr": "    Finished `release` profile [optimized] target(s) in 0.42s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-e26ceaecfe2813d3)\n",
+        "stdout": "\nrunning 1 test\ntest lora_render_matches_fork_golden ... \u2713 qwen lora adapter render: 40696 px>8 (5.1748%); base floor 47293 (6.0136%); cap 98518 (12.5272%)\nSC15505_RESULT qwen_lora samples_gt8=40696 base_floor=47293 cap=98518 effect_samples_gt8=44799 minimum_samples_gt8=22399 scale_zero_byte_differences=0 applied=24 unmatched=0 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 51.48s\n\n"
       },
       {
         "argv": [
@@ -336,8 +336,8 @@
         },
         "name": "qwen_lokr",
         "returncode": 0,
-        "stderr": "    Finished `release` profile [optimized] target(s) in 0.33s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-e26ceaecfe2813d3)\n",
-        "stdout": "\nrunning 1 test\ntest lokr_render_matches_fork_golden ... \u2713 qwen lokr adapter render: 49765 px>8 (6.3279%); base floor 47293 (6.0136%); cap 98518 (12.5272%)\nSC15505_RESULT qwen_lokr samples_gt8=49765 base_floor=47293 cap=98518 effect_samples_gt8=39409 minimum_samples_gt8=19704 scale_zero_byte_differences=0 applied=21 unmatched=0 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 70.68s\n\n"
+        "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running tests/adapter_real_weights.rs (${CARGO_TARGET_DIR}/release/deps/adapter_real_weights-e26ceaecfe2813d3)\n",
+        "stdout": "\nrunning 1 test\ntest lokr_render_matches_fork_golden ... \u2713 qwen lokr adapter render: 49765 px>8 (6.3279%); base floor 47293 (6.0136%); cap 98518 (12.5272%)\nSC15505_RESULT qwen_lokr samples_gt8=49765 base_floor=47293 cap=98518 effect_samples_gt8=39409 minimum_samples_gt8=19704 scale_zero_byte_differences=0 applied=21 unmatched=0 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 48.07s\n\n"
       }
     ],
     "schema": 2,
@@ -368,14 +368,14 @@
         "crates/media/mlx-gen/mlx-gen-z-image/tests/adapter_real_weights.rs": "36feda573541cea0ec191a8ab21b9f1090accaba2df27b3b502b55af2e65df1a",
         "crates/media/mlx-gen/src/adapters.rs": "58fb2ae90ba456fb00741b3604f51f8345dd5976f6b68a145769b7eaa5300681",
         "crates/media/mlx-gen/tools/_adapter_parity_provenance.py": "32fcff87d1140a4d53d03a66ab8b8678e1029d03e9a8886f50b242dd3bd23bed",
-        "crates/media/mlx-gen/tools/dump_hyper_flux_golden.py": "2eb68ee0ff28f23b44c780719cac37f07f401423600c994709ebf1a058e51792",
+        "crates/media/mlx-gen/tools/dump_hyper_flux_golden.py": "3b2541078e074c30df682c05bb1e8b84d8c4335c2772eb48065dd391e09b8bd8",
         "crates/media/mlx-gen/tools/dump_qwen_adapter_golden.py": "01dcc25673e4c491d617ccd07b7ae9b13f634de047fed4d85753b97b0704f5ba",
         "crates/media/mlx-gen/tools/dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
         "crates/media/mlx-gen/tools/dump_z_image_adapter_golden.py": "b8eae6ae0759129f9529e0d9f6d0da0cbfcc169fc41e4f7035dfa9a6aa0d6dc0",
         "crates/media/mlx-gen/tools/dump_z_image_golden.py": "8dce2bc4696abb54d4e6d6f81ce974b5b66df7971f7c19d2dba8fbd683d60060",
         "crates/media/mlx-gen/tools/record_adapter_parity_transcript.py": "f6a8e8149f18f8b9b5c34fcc7465f1a1e81bf9aa24bddfc3d549e32580fac930"
       },
-      "source_sha256": "01e99bad3a60f679af373f6275a82b4dab8679127dacee232e948a871639d0ed"
+      "source_sha256": "105f6cac45b9cf41c4946869390d54cf000a1becea78ada646c10e0072423514"
     },
     "source_after": {
       "base_commit": "39a11d363663924869ea51c7cc4a8a3a6d68a2e1",
@@ -404,22 +404,22 @@
         "crates/media/mlx-gen/mlx-gen-z-image/tests/adapter_real_weights.rs": "36feda573541cea0ec191a8ab21b9f1090accaba2df27b3b502b55af2e65df1a",
         "crates/media/mlx-gen/src/adapters.rs": "58fb2ae90ba456fb00741b3604f51f8345dd5976f6b68a145769b7eaa5300681",
         "crates/media/mlx-gen/tools/_adapter_parity_provenance.py": "32fcff87d1140a4d53d03a66ab8b8678e1029d03e9a8886f50b242dd3bd23bed",
-        "crates/media/mlx-gen/tools/dump_hyper_flux_golden.py": "2eb68ee0ff28f23b44c780719cac37f07f401423600c994709ebf1a058e51792",
+        "crates/media/mlx-gen/tools/dump_hyper_flux_golden.py": "3b2541078e074c30df682c05bb1e8b84d8c4335c2772eb48065dd391e09b8bd8",
         "crates/media/mlx-gen/tools/dump_qwen_adapter_golden.py": "01dcc25673e4c491d617ccd07b7ae9b13f634de047fed4d85753b97b0704f5ba",
         "crates/media/mlx-gen/tools/dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
         "crates/media/mlx-gen/tools/dump_z_image_adapter_golden.py": "b8eae6ae0759129f9529e0d9f6d0da0cbfcc169fc41e4f7035dfa9a6aa0d6dc0",
         "crates/media/mlx-gen/tools/dump_z_image_golden.py": "8dce2bc4696abb54d4e6d6f81ce974b5b66df7971f7c19d2dba8fbd683d60060",
         "crates/media/mlx-gen/tools/record_adapter_parity_transcript.py": "f6a8e8149f18f8b9b5c34fcc7465f1a1e81bf9aa24bddfc3d549e32580fac930"
       },
-      "source_sha256": "01e99bad3a60f679af373f6275a82b4dab8679127dacee232e948a871639d0ed"
+      "source_sha256": "105f6cac45b9cf41c4946869390d54cf000a1becea78ada646c10e0072423514"
     },
     "story": "sc-15505"
   },
   "schema": 1,
   "story": "sc-15505",
   "transcript": {
-    "bytes": 22056,
+    "bytes": 22053,
     "local_path": "${TOOLS}/golden/sc-15505-real-weight-transcript.json",
-    "sha256": "9adcf12fa8aa5a984050e939a04f5481f6d36f8f7cfc27c1b931bbaec31c115e"
+    "sha256": "4aceed6adb6439e2a8053f44bfdfcd455a3b0412bb3ed7e85476f812751a165d"
   }
 }

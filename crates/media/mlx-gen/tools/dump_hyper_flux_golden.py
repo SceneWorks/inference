@@ -60,19 +60,24 @@ def _canonicalize_metadata_order(path):
     never be re-met by regeneration (sc-17651; the sibling dumps use `mx.save_safetensors`
     and are unaffected). Tensor entries are already emitted in data-offset order.
 
-    Sorting only permutes keys, so the re-serialized header has the same length and the
-    payload never moves; the slot is re-padded with spaces to the original header size.
+    Sorting only permutes keys, so the re-serialized header has the same length; it is
+    re-padded with spaces back into the original slot. The write is confined to the header
+    bytes (`r+b` + `seek(8)`, exactly `length` bytes) so the payload cannot move even if
+    this is interrupted — a truncating rewrite would put a 10-minute licensed regeneration
+    at risk for no gain.
     """
-    raw = open(path, "rb").read()
-    length = struct.unpack("<Q", raw[:8])[0]
-    header = json.loads(raw[8 : 8 + length])
-    canonical = {"__metadata__": dict(sorted(header["__metadata__"].items()))}
+    with open(path, "rb") as handle:
+        length = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(length))
+    canonical = {"__metadata__": dict(sorted(header.get("__metadata__", {}).items()))}
     canonical.update((k, v) for k, v in header.items() if k != "__metadata__")
     encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > length:
         raise RuntimeError(f"canonical header {len(encoded)} exceeds the {length}-byte slot")
-    with open(path, "wb") as handle:
-        handle.write(raw[:8] + encoded + b" " * (length - len(encoded)) + raw[8 + length :])
+    with open(path, "r+b") as handle:
+        handle.seek(8)
+        handle.write(encoded + b" " * (length - len(encoded)))
+
 
 BASE = os.environ.get(
     "FLUX_DEV",

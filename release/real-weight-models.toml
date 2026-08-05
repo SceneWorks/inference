@@ -72,8 +72,9 @@ environment = ["QWEN_IMAGE_SNAPSHOT"]
 # THIS NAME NO LONGER HAS AN MLX CONSUMER (sc-17284). Until then the 45 mlx-gen-qwen-image
 # real-weight tests read QWEN_IMAGE_SNAPSHOT too — and fed it something this row does not describe.
 # The repo's own provenance receipt records what they were actually given:
-# `tools/adapter_parity_receipt.json` pins QWEN_IMAGE_SNAPSHOT at
-# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16`, an MLX re-host at a different
+# `tools/adapter_parity_receipt.json` recorded those runs under QWEN_IMAGE_SNAPSHOT at
+# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16` — the sc-17651 re-record now
+# pins that same path under MLX_GEN_QWEN_SNAPSHOT — an MLX re-host at a different
 # revision of a different repository from the `Qwen/Qwen-Image@75e0b4be` pinned here. One name
 # cannot be verified against two pins: `ensure_model_snapshot.py --model qwen-image` checks for
 # revision 75e0b4be and would fail closed on the re-host. So the MLX half was renamed to
@@ -135,6 +136,36 @@ expected_files = [
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/config.json",
     "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# SC-15831 representative Candle/CUDA fixture. The operator-run provider/reference-route ladder
+# harness consumes the q4 tier only; catalog siblings own their own artifact/tier/mode calibration.
+key = "flux2-klein-9b-mlx-q4"
+repository = "SceneWorks/flux2-klein-9b-mlx"
+revision = "acf05e8d5103838baba6a5e32dc91d6997a56023"
+license = "FLUX Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-cuda-memory-ladder"]
+environment = ["FLUX2_KLEIN_DIR"]
+unwired_reason = "operator-run SC-15831 memory-ladder calibration; deliberately serialized on authoritative GPU0"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/added_tokens.json",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/merges.txt",
+    "q4/tokenizer/special_tokens_map.json",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/tokenizer/vocab.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
 ]
 
 [[models]]

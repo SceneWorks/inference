@@ -810,6 +810,70 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate result field"):
             VERIFY.parsed_results(duplicate_field)
 
+    def test_hyper_flux_dump_canonicalizes_metadata_order_after_saving(self):
+        """The Hyper-FLUX golden must stay byte-reproducible (sc-17651).
+
+        `safetensors.numpy.save_file` serializes `__metadata__` out of a Rust `HashMap`
+        with per-process iteration order, so without the canonicalization step this dump
+        writes a different file hash on every run while the tensors stay bit-identical —
+        making the manifest's SHA-256 pin for `flux_hyper_golden` unreachable by
+        regeneration. Dropping the call would go unnoticed until someone re-recorded on
+        the licensed host, so guard it over the source text: the module imports torch and
+        diffusers at module scope and cannot be imported here. The sibling dumps write via
+        `mx.save_safetensors` and need no such step.
+        """
+        source = (TOOLS / "dump_hyper_flux_golden.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "def _canonicalize_metadata_order(",
+            source,
+            "dump_hyper_flux_golden.py lost its metadata-order canonicalization helper",
+        )
+        save = source.index("save_file(tensors, OUT, metadata=meta)")
+        self.assertNotEqual(
+            source.find("_canonicalize_metadata_order(OUT)", save),
+            -1,
+            "dump_hyper_flux_golden.py must call _canonicalize_metadata_order(OUT) after "
+            "save_file, or the golden stops being byte-reproducible",
+        )
+
+    def test_hyper_flux_metadata_canonicalization_is_order_invariant(self):
+        """Differing metadata orders must collapse to identical bytes, payload untouched."""
+        source = (TOOLS / "dump_hyper_flux_golden.py").read_text(encoding="utf-8")
+        start = source.index("def _canonicalize_metadata_order(")
+        end = source.index("\n\n\nBASE = ", start)
+        namespace = {"json": json, "struct": struct}
+        exec(source[start:end], namespace)
+        canonicalize = namespace["_canonicalize_metadata_order"]
+
+        payload = bytes(range(256)) * 4
+        produced = []
+        for order in (["b", "a", "c"], ["c", "a", "b"]):
+            header = {
+                "__metadata__": {key: f"value-{key}" for key in order},
+                "t": {
+                    "dtype": "U8",
+                    "shape": [len(payload)],
+                    "data_offsets": [0, len(payload)],
+                },
+            }
+            blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
+            blob += b" " * ((8 - len(blob) % 8) % 8)
+            with tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "golden.safetensors"
+                path.write_bytes(struct.pack("<Q", len(blob)) + blob + payload)
+                canonicalize(path)
+                produced.append(path.read_bytes())
+
+        self.assertEqual(produced[0], produced[1], "canonicalization is not order-invariant")
+        for blob in produced:
+            length = struct.unpack("<Q", blob[:8])[0]
+            self.assertEqual(blob[8 + length :], payload, "canonicalization moved the payload")
+            self.assertEqual(
+                list(json.loads(blob[8 : 8 + length])["__metadata__"]),
+                ["a", "b", "c"],
+                "metadata was not sorted",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
