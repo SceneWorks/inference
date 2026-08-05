@@ -41,6 +41,16 @@ EVIDENCE_CHANGE_FILES = {
     "crates/media/mlx-gen/tools/golden/README.md",
     "scripts/tests/test_adapter_parity_artifacts.py",
 }
+# Manifest scripts that only *check* the evidence and produced none of it. The
+# dump scripts, the provenance helper, and this recorder made the goldens and
+# the transcript, so freezing their bytes is meaningful; freezing the checker's
+# would ratchet against ever fixing the checker, since any byte edit — a pure
+# bugfix included — would invalidate the proof and demand a licensed
+# real-weight re-record that buys no assurance about the measurements
+# (sc-17070). They stay out of the hashed set but remain permitted changes.
+UNBOUND_SOURCE_FILES = {
+    "crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py",
+}
 RESIDUAL_FIELDS = {
     "residual_samples_gt8",
     "zero_residual_samples_gt8",
@@ -119,6 +129,28 @@ def _git_paths(root: Path, argv: list[str]) -> set[str]:
     }
 
 
+def bound_source_files(manifest: dict) -> tuple[str, ...]:
+    """Producing source whose exact bytes the frozen transcript pins.
+
+    Everything in the manifest's script map except `UNBOUND_SOURCE_FILES`, plus
+    `RUST_SOURCE_FILES` — the adapter implementation and the real-weight tests
+    that emit the measurements. Callers that need the *changed path* allowlist
+    want this union `UNBOUND_SOURCE_FILES` instead — the two sets are
+    deliberately different (sc-17070).
+    """
+    candidates = {
+        *RUST_SOURCE_FILES,
+        *(f"crates/media/mlx-gen/tools/{name}" for name in manifest["scripts"]),
+    }
+    missing = UNBOUND_SOURCE_FILES - candidates
+    if missing:
+        raise RuntimeError(
+            "unbound source files are absent from the manifest script map, so they would "
+            "silently rejoin the hashed set: " + ", ".join(sorted(missing))
+        )
+    return tuple(sorted(candidates - UNBOUND_SOURCE_FILES))
+
+
 def source_state(
     manifest: dict,
     *,
@@ -126,20 +158,19 @@ def source_state(
     source_files: tuple[str, ...] | None = None,
     permitted_changes: set[str] | None = None,
 ) -> dict:
-    files = source_files or tuple(
-        sorted(
-            {
-                *RUST_SOURCE_FILES,
-                *(f"crates/media/mlx-gen/tools/{name}" for name in manifest["scripts"]),
-            }
-        )
-    )
+    files = bound_source_files(manifest) if source_files is None else tuple(source_files)
     base_commit = manifest["implementation_base"]
     changed_paths = _git_paths(
         root,
         ["diff", "--name-only", "-z", base_commit, "--"],
     ) | _git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])
-    allowed = permitted_changes or (set(files) | EVIDENCE_CHANGE_FILES)
+    # The hashed set and the allowlist are separate jobs: an edited verifier must
+    # not move `source_sha256`, but must still be a permitted worktree change.
+    allowed = (
+        set(permitted_changes)
+        if permitted_changes is not None
+        else set(files) | UNBOUND_SOURCE_FILES | EVIDENCE_CHANGE_FILES
+    )
     unexpected = sorted(changed_paths - allowed)
     if unexpected:
         raise RuntimeError(
