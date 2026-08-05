@@ -36,6 +36,9 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::{input_ids, QuantSpec, Weights};
 use mlx_llm::provider::eos_token_ids;
 
+mod common;
+use common::{assert_fixture_is_a_guarded_entry, Fixture};
+
 const PROMPT: &str = "The capital of France is";
 
 struct Ref {
@@ -134,8 +137,15 @@ fn greedy_tokens(model: &CausalLm, ids: &[i32], stop: &[i32], n: usize) -> Vec<i
         .tokens
 }
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mlx-llm-gguf-test-{}-{label}", std::process::id()))
+/// A guarded output path for the converter (sc-17768).
+///
+/// Points at an entry *inside* a `TempDir` root: the converter refuses a pre-existing output
+/// directory and allocates its staging dir as a sibling of the output, so both land inside the
+/// guard and leave with it on `Drop` — including out of a panicking test, which the trailing
+/// `remove_dir_all` lines never covered. Uniqueness comes from the call, not from the PID, so two
+/// tests sharing a label can no longer collide.
+fn tmp_out(label: &str) -> Fixture {
+    Fixture::new(&format!("mlx-llm-gguf-test-{label}-"), Some("out"))
 }
 
 /// Every GGUF in the directory converts to a dense snapshot whose prefill logits track the HF load
@@ -250,7 +260,6 @@ fn gguf_dense_conversion_tracks_hf() {
             }
         }
         covered += 1;
-        std::fs::remove_dir_all(&out).ok();
     }
 
     assert!(covered > 0, "no convertible GGUF found in MLX_LLM_GGUF_DIR");
@@ -330,7 +339,6 @@ fn gguf_requant_snapshot_loads_quantized() {
             "{tag}: requantized softmax cosine {probcos} below {floor}"
         );
         assert!(!text.trim().is_empty(), "{tag}: produced no text");
-        std::fs::remove_dir_all(&out).ok();
     }
 }
 
@@ -423,7 +431,6 @@ fn gguf_dequant_matches_hf_weights() {
             ));
         }
         covered += 1;
-        std::fs::remove_dir_all(&out).ok();
     }
     assert!(covered > 0, "no convertible GGUF found");
     assert!(
@@ -548,7 +555,6 @@ fn gguf_iq_dequant_matches_hf_by_type() {
                 e.3 = format!("{label}:{k}");
             }
         }
-        std::fs::remove_dir_all(&out).ok();
     }
 
     println!(
@@ -675,7 +681,6 @@ fn gguf_iq_snapshot_generates() {
             failures.push(format!("{label}: produced no text"));
         }
         covered += 1;
-        std::fs::remove_dir_all(&out).ok();
     }
     assert!(covered > 0, "no IQ *.gguf found in MLX_LLM_IQ_GGUF_DIR");
     assert!(
@@ -683,4 +688,12 @@ fn gguf_iq_snapshot_generates() {
         "IQ snapshot run failures:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// Drop-regression for this suite's fixture helper: the guarded root — the converter's output dir
+/// *and* the staging sibling allocated next to it — leaves with the value. Flip [`Fixture::new`]'s
+/// builder to `disable_cleanup(true)`, or drop the `Some(..)`, and this goes RED.
+#[test]
+fn gguf_fixture_is_self_removing() {
+    assert_fixture_is_a_guarded_entry(tmp_out("guard"));
 }

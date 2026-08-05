@@ -26,6 +26,9 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::{load_for_model, prepare_snapshot};
 
+mod common;
+use common::{assert_fixture_is_a_guarded_entry, Fixture};
+
 /// Pure-greedy golden tokens for the gray-384 fixture + "Write a very short caption." (16 tokens).
 const GOLDEN: &[i32] = &[
     53304, 3257, 315, 264, 6573, 11, 10269, 11, 18004, 4092, 449, 912, 9621, 6302, 11, 30953,
@@ -67,12 +70,14 @@ fn gradient_image() -> (Vec<u8>, u32, u32) {
     (px, 512, 384)
 }
 
-struct PreparedSnapshot(std::path::PathBuf);
-
-impl Drop for PreparedSnapshot {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).ok();
-    }
+/// A guarded output path for the prepared VLM snapshot (sc-17768) — see [`Fixture`].
+///
+/// This replaces a bespoke `PreparedSnapshot(PathBuf)` drop guard whose root was
+/// `temp_dir()/mlx-llm-joycaption-q4-{pid}`: PID-derived, so a recycled PID reopened a previous
+/// run's several-GiB tree, and preceded by a `remove_dir_all` that deleted whatever it found there.
+/// The fixture points *inside* a `TempDir` root because the preparer creates the directory itself.
+fn prepared_out() -> Fixture {
+    Fixture::new("mlx-llm-joycaption-q4-", Some("out"))
 }
 
 /// Release gate for stored-quantized VLM snapshots: prepare the pinned full JoyCaption source,
@@ -89,10 +94,8 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         source.display()
     );
 
-    let out = std::env::temp_dir().join(format!("mlx-llm-joycaption-q4-{}", std::process::id()));
-    std::fs::remove_dir_all(&out).ok();
-    let prepared = PreparedSnapshot(out);
-    let report = prepare_snapshot(&PrepareSpec::quantized(source, &prepared.0, Quantize::Q4))
+    let prepared = prepared_out();
+    let report = prepare_snapshot(&PrepareSpec::quantized(source, &prepared, Quantize::Q4))
         .expect("registered quantize-prepare of the pinned JoyCaption source must succeed");
     assert_eq!(report.quantized, Some(Quantize::Q4));
     assert!(
@@ -101,14 +104,14 @@ fn prepared_q4_snapshot_runs_full_vlm() {
     );
 
     let config: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(prepared.0.join("config.json"))
+        &std::fs::read_to_string(prepared.join("config.json"))
             .expect("prepared config.json must exist"),
     )
     .expect("prepared config.json must remain valid JSON");
     assert_eq!(config["quantization"]["bits"], 4);
     assert_eq!(config["text_config"]["quantization"]["bits"], 4);
 
-    let weights = Weights::from_dir(&prepared.0).expect("prepared weights must reload");
+    let weights = Weights::from_dir(&prepared).expect("prepared weights must reload");
     for base in [
         "language_model.model.layers.0.self_attn.q_proj",
         "language_model.model.layers.0.mlp.gate_proj",
@@ -140,7 +143,7 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         );
     }
 
-    let provider = load_for_model(&LoadSpec::dense(prepared.0.to_string_lossy().to_string()))
+    let provider = load_for_model(&LoadSpec::dense(prepared.to_string_lossy().to_string()))
         .expect("registered provider selection must load the prepared JoyCaption VLM");
     assert_eq!(provider.descriptor().id, "mlx-joycaption");
     assert!(provider.descriptor().capabilities.supports_vision);
@@ -385,4 +388,12 @@ fn joycaption_provider_streams_caption_through_contract() {
         ..Default::default()
     };
     assert!(provider.generate(&no_image, &mut |_| {}).is_err());
+}
+
+/// Drop-regression for this suite's fixture helper: the guarded root leaves with the value — the
+/// property the replaced `PreparedSnapshot` guard had but its PID-derived path undermined. Flip
+/// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+#[test]
+fn joycaption_fixture_is_self_removing() {
+    assert_fixture_is_a_guarded_entry(prepared_out());
 }

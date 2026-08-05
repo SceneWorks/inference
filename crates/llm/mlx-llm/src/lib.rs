@@ -52,6 +52,14 @@ pub mod primitives;
 pub mod provider;
 pub mod snapshot;
 
+// Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
+// integration suites pull in as `mod common;` — included by path rather than copied, so the two
+// contexts cannot drift. `#[cfg(test)]` keeps it out of the shipped surface and `tempfile` in
+// `[dev-dependencies]`.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_fixture;
+
 // Re-export the contract crate so consumers can reach it as `mlx_llm::core_llm::…`.
 pub use core_llm;
 
