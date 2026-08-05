@@ -25,9 +25,24 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — ChatGLM3-6B + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop ChatGLM3-6B** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) reaches every route, but no fixed tile edge holds its quality across the advertised output range |
-//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site and does not move the request peak |
-//! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
+//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%) and clears the drift bar at 1024²/1280², but fails it at 1536²/2048² and `decode_tile_edges` has no geometry axis |
+//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the request peak 0.00% (and **+12.54%** at the U-Net seam), and is not bit-exact on its query-row axis |
+//! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
+
+//!
+//! ## What this family actually buys, measured (q4 unless stated, Apple/Metal, 1024², 4 steps)
+//!
+//! | composition | request peak | vs baseline | ms/step | output |
+//! |---|---:|---:|---:|---|
+//! | resident | 19.5296 GiB | — | 849 | — |
+//! | + rung 1 | **16.0411** | **−17.86%** | 883 | byte-identical |
+//! | + rung 4 `Dit`, cadence 1 (default) | **14.8840** | **−7.21%** vs staged | 3745 | byte-identical |
+//! | + rung 4 `Dit`, cadence 10 (selectable) | **14.8840** | **−7.21%** vs staged | 1507 | byte-identical |
+//! | bf16 @ 512², + rung 4 `Both` | **4.5436** | **−60.02%** vs staged | 2043 | byte-identical |
+//!
+//! Per tier at 1024², rung 4 `Dit` against that tier's own staged control:
+//! q4 **−7.21%**, q8 **−12.72%**, bf16 **−21.37%** — the saving is the whole `transformer_blocks`
+//! weight set, so what changes across tiers is the numerator.
 //!
 //! ## Ownership
 //!
@@ -81,72 +96,93 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 
 /// **Rung 2 is `Missing` on Kolors/MLX, and that is a measurement taken on Kolors' own weights.**
 ///
-/// The mechanism is implemented and it works. Kolors decodes through
-/// [`mlx_gen_sdxl::Autoencoder`] — the same `sdxl-vae-fp16-fix` `AutoencoderKL` SDXL uses — so
-/// `decode_tiled` runs the globally-scoped head (denormalize → `post_quant_conv` → `conv_in` → mid
-/// resnets → mid **self-attention**) once on the full latent and tiles only the full-resolution
-/// upsample tail. It bounds real memory: at 1024² q4 the whole staged request falls
-/// **7.6743 → 5.0664 GiB (−33.98%)** at edge 896 / overlap 192 for ~4% wall clock
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). That is the largest single
-/// saving anywhere on this family's ladder, and it is withheld anyway.
+/// The mechanism is implemented and it works. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
+/// the same `sdxl-vae-fp16-fix` `AutoencoderKL` SDXL uses — so `decode_tiled` runs the globally-scoped
+/// head (denormalize → `post_quant_conv` → `conv_in` → mid resnets → mid **self-attention**) once on
+/// the full latent and tiles only the full-resolution upsample tail.
 ///
-/// It is withheld because it does not preserve the output, and Kolors is measurably **worse** here
-/// than SDXL rather than equal to it. Two independent measurements, each sufficient on its own:
+/// **It is also, by a wide margin, the biggest lever on this family's ladder.** At 1024² q4 it takes
+/// the whole staged request from **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock**
+/// (925 → 1018 ms/step) — against rung 4's −7.21% for +4.2× at the same tier and geometry
+/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). It is withheld anyway, and the
+/// size of the prize is exactly why the withholding argument had to be measured rather than
+/// asserted.
 ///
-/// ### 1. On the latent a real render produces, no geometry clears the bar
+/// ## The candidate is real, and at 1024² it CLEARS the bar
 ///
-/// Swept against the **exact untiled decode of the same latent** — a real 1024² Kolors render
-/// re-encoded through the same VAE — on the q4 tier (`decode_tile_mechanism_sweep`, max Δ per
-/// channel out of 255):
+/// Swept against the **exact untiled decode of the same latent**, on the *production* latent — what
+/// the denoiser actually hands the decode phase, not a re-encoded finished image — at q4 1024²
+/// (`decode_tile_mechanism_sweep`, max Δ per channel out of 255):
 ///
 /// | edge | overlap 64 | 128 | 192 | 256 |
 /// |---:|---:|---:|---:|---:|
-/// | 896 | 105 | 96 | **88** | 91 |
-/// | 768 | 120 | 124 | 121 | 122 |
-/// | 640 | 129 | 130 | 121 | 118 |
-/// | 512 | 141 | 141 | 141 | 141 |
-/// | 448 | 145 | 145 | 145 | 145 |
-/// | 384 | 150 | 150 | 150 | 150 |
-/// | 320 | 154 | 154 | 154 | 152 |
-/// | 256 | 158 | 158 | 156 | 133 |
+/// | 896 | 80 | 69 | 62 | 49 |
+/// | 768 | 59 | 59 | 44 | **38** |
+/// | 640 | 55 | 45 | 46 | 44 |
+/// | 512 | 61 | 68 | 62 | 60 |
+/// | 448 | 74 | 80 | 78 | 68 |
+/// | 384 | 101 | 85 | 70 | 69 |
+/// | 320 | 92 | 108 | 86 | 83 |
+/// | 256 | 120 | 98 | 100 | 103 |
 ///
-/// The **best** cell in the whole grid is 88/255 — 1.8× [`DECODE_DRIFT_BAR`]. SDXL's best cell on
-/// the same machinery and the same VAE was 38/255, i.e. it *cleared* the bar on this instrument and
-/// was withheld on the two arguments below. Kolors fails on the first instrument as well, and the
-/// reason is the latent rather than the decoder: Kolors' `scaling_factor` is 0.13025 against SDXL's
-/// 0.13025 — identical — but its denoiser is trained against a ChatGLM3 conditioning distribution
-/// and produces latents with visibly wider per-channel dynamic range, which is exactly what a
-/// per-tile GroupNorm punishes. **This is the concrete case for measuring per family instead of
-/// inheriting**: the same code, the same VAE weights, and a verdict that is 2.3× worse.
+/// (mean Δ ranges 0.43 → 2.78.) The best cell — edge [`DECODE_TILE_EDGE`] at overlap
+/// [`DECODE_OVERLAP`] — drifts **38/255**, comfortably inside [`DECODE_DRIFT_BAR`]. **On the 1024²
+/// evidence alone this candidate should ship.** Saying so plainly matters: a reader who assumed the
+/// sweep simply failed would look for the wrong repair.
 ///
-/// On the **production** latent (what the denoiser actually hands the decode phase, rather than a
-/// re-encoded finished image) the same geometry drifts **131/255**
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). Both instruments agree.
+/// **The instrument is the harsher of the two available, deliberately.** An earlier revision of this
+/// sweep decoded a latent obtained by re-encoding a finished image, whose statistics have already
+/// been through the VAE round trip; that instrument reads **29/255** at edge 768 / overlap 192 where
+/// the production latent reads 44 at the same geometry. A user gets the production latent, so the
+/// absolute bar is judged on it.
 ///
-/// ### 2. And the datum is a property of the geometry, not of the tile edge
+/// ## What withholds it: the datum is a property of the GEOMETRY, not of the tile edge
 ///
 /// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
-/// publishing 896 publishes it at everything `crate::registry::descriptor` advertises — and that is
-/// `max_size: 2048`. Re-swept across that range at the best overlap
+/// publishing 768 publishes it at everything `crate::registry::descriptor` advertises — and that is
+/// `max_size: 2048`. Re-swept across that range at the same overlap, on a **rendered production
+/// latent at each output size**
 /// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
 ///
-/// | output | tiles | tile covers | max Δ | vs the 48/255 bar |
-/// |---:|---:|---:|---:|---|
-/// | 1024² | 4 | 87.5% | **88** | fails |
-/// | 1280² | 4 | 70.0% | 116 | fails |
-/// | 1536² | 4 | 58.3% | 158 | fails |
-/// | 2048² | 9 | 43.75% | 134 | fails |
+/// | output | tile covers | max Δ | vs the 48/255 bar |
+/// |---:|---:|---:|---|
+/// | 1024² | 75.0% | **38** | clears |
+/// | 1280² | 60.0% | **26** | clears |
+/// | 1536² | 50.0% | 69 | **fails** |
+/// | 2048² | 37.5% | 53 | **fails** |
 ///
-/// The GroupNorm mechanism predicts this shape: what governs the drift is the tile's **fraction of
-/// the image**, because that is what sets how far a tile's statistics can sit from the global ones.
-/// Edge 896 covers 87.5% of a 1024² output and 43.75% of a 2048² one. No fixed pixel edge holds a
-/// constant fraction across a 4× range.
+/// The GroupNorm mechanism predicts this shape: every `ResnetBlock2D` in `up_blocks` and the final
+/// `conv_norm_out` computes statistics over the spatial extent it is handed, so what governs the
+/// drift is the tile's **fraction of the image** — that is what sets how far a tile's statistics can
+/// sit from the global ones. Edge 768 covers 75% of a 1024² output and 37.5% of a 2048² one. No
+/// fixed pixel edge holds a constant fraction across a 2× range, so no fixed pixel edge is
+/// admissible across this provider's advertised range. A selector would size a fit off `[768]`,
+/// choose it at 1536², and get a visibly seamed image.
 ///
-/// So the rung is withheld, and the prize is recorded with a number rather than dismissed:
-/// **−33.98% of the request peak for ~4% wall clock**, a far better memory/latency trade than rung
-/// 4's. What would unlock it is a geometry-relative tile parameter (a fraction of the output rather
-/// than a pixel edge), or a decoder whose tail normalizes over the full extent. Both are
-/// contract-level changes, and neither is this story's.
+/// The range sweep is run on **rendered** latents rather than synthetic ones for the same reason the
+/// mechanism sweep is: a unit-normal latent is a materially friendlier instrument (35/255 at 1024²
+/// against the rendered 38), and a rung admitted on the friendly instrument would be admitted on
+/// evidence no user ever sees.
+///
+/// ## How this differs from SDXL, which shares the decoder
+///
+/// SDXL withholds rung 2 too, and it is worth being precise about where the two families agree,
+/// because the shared `AutoencoderKL` makes it tempting to inherit:
+///
+/// * **SDXL's 1024² cell fails on the production latent (84/255); Kolors' passes (38/255).** Same
+///   decoder weights, same head/tail split, different denoiser and different conditioning
+///   distribution. Kolors' rung 2 is the *better* candidate of the two.
+/// * **Both fail the range argument, at different edges and different magnitudes** — SDXL at 896
+///   with 64/120/77 across 1280²/1536²/2048², Kolors at 768 with 26/69/53. Kolors even clears one
+///   extra output size.
+///
+/// So the verdict transfers and not one number does. Publishing SDXL's figures here would have
+/// misstated the best geometry (896 vs 768), the best overlap (192 vs 256), the prize (−16.51% vs
+/// −37.67%) and which output sizes clear.
+///
+/// What would unlock it is a geometry-relative tile parameter (a fraction of the output rather than
+/// a pixel edge), or a decoder whose tail normalizes over the full extent. Both are contract-level
+/// changes, and neither is this story's — tracked as sc-17693.
 pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The attention chunk size the rung-3 sweep exercised.
@@ -164,119 +200,157 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 ///
 /// 1. **It does not move the REQUEST peak**, and at the seam it moves it the wrong way. End to end
 ///    (`attention_chunking_is_measured_against_the_rung_two_top`, which re-assembles the staged
-///    request from the public pipeline entry points because the production resolver refuses a
+///    request from the public entry points because the production resolver refuses a
 ///    bounded-attention selection):
 ///
 ///    | steps | unchunked | chunked | Δ peak | max Δ px | mean Δ px |
 ///    |---:|---:|---:|---:|---:|---:|
-///    | 1 | 7.6743 GiB | 7.6743 GiB | **−0.00%** | 43/255 | 1.11 |
-///    | 4 | 7.6743 GiB | 7.6743 GiB | **−0.00%** | 255/255 | 5.87 |
+///    | 1 | 16.0412 GiB | 16.0410 GiB | **−0.00%** | 16/255 | 0.28 |
+///    | 4 | 16.0411 GiB | 16.0410 GiB | **−0.00%** | 212/255 | 0.70 |
 ///
 ///    Measured instead at the U-Net seam, where the effect is not diluted by the rest of the request
 ///    (`attention_chunking_is_measured_at_the_unet_seam`), one CFG-batched 1024² forward goes
-///    **1.6289 → 1.7573 GiB, +7.9%**: chunking *adds* transients here rather than bounding anything.
-///    That is the hazard `mlx_gen::attention`'s own docs name — when q/k/v are already materialized
-///    and pinned, chunking only adds — and on a U-Net it is the normal case, because the conv/resnet
-///    trunk between every attention has already broken the lazy graph that `eval_per_chunk` exists to
-///    cut. The epic is explicit that a rung which does not move the request peak is not a saving; one
-///    that raises it is worse than absent.
+///    **4.7672 → 5.3651 GiB, +12.54%**: chunking *adds* transients here rather than bounding
+///    anything. That is the hazard `mlx_gen::attention`'s own docs name — when q/k/v are already
+///    materialized and pinned, chunking only adds — and on a U-Net it is the normal case, because
+///    the conv/resnet trunk between every attention has already broken the lazy graph that
+///    `eval_per_chunk` exists to cut. The epic is explicit that a rung which does not move the
+///    request peak is not a saving; one that raises it is worse than absent.
+///
+///    **Kolors was the more promising candidate of the two U-Nets and still failed.** Its
+///    cross-attention memory is the ChatGLM3 context — 256 tokens against SDXL's 77 — so the
+///    cross-attention score tensors are 3.3× larger here, which is exactly where a query-row budget
+///    would be most likely to pay. It does not: the seam regression is *worse* than SDXL's (+12.54%
+///    against +5.1%), because the added per-chunk transients scale with the same axis.
 /// 2. **The output moves — and that is a property of the CHOSEN AXIS, not of Kolors.** The
 ///    arithmetic is exactly preserved: [`sdpa_budgeted_bhsd`](mlx_gen::attention::sdpa_budgeted_bhsd)
 ///    chunks the **query axis only**, so each chunk is a complete fused SDPA over the full k/v with
-///    no accumulator and no running max. What changes is which reduced-precision Metal matmul
-///    specialization MLX dispatches for the `[.., block, Sk]` product — the sc-2338 parity class.
-///    `gen_core::attention_budget` carries a second axis for exactly this reason:
-///    `AttentionBudget::head_chunks` narrows complete heads and *preserves bit identity*, and
-///    `sdpa_budgeted_bhsd` never uses it. Measured at **one** step, where the sampler cannot amplify
-///    anything, the raw per-forward divergence is `max|Δeps| = 3.98e-3` and the image moves by
-///    43/255; by four steps it is a different image.
+///    no accumulator and no running max, and the class of bug that would make chunked softmax
+///    genuinely wrong is structurally unwritable. What changes is which reduced-precision Metal
+///    matmul specialization MLX dispatches for the `[.., block, Sk]` product — the sc-2338 parity
+///    class.
 ///
-///    A head-axis implementation would be bit-exact by construction; what it would still have to beat
-///    is reason 1, which is the binding one.
+///    `gen_core::attention_budget` carries a **second** axis for exactly this reason:
+///    `AttentionBudget::head_chunks` narrows complete heads and *preserves bit identity*, and its
+///    docs say outright that the two axes "share a score budget, but not a numerical contract".
+///    `sdpa_budgeted_bhsd` never uses it. So the honest statement is: **the query-row axis is not
+///    bit-exact on Metal, and Kolors is exposed to that** — it runs fp16 through a leading-Euler
+///    schedule across 140 attention sites. Measured at **one** step, where the sampler cannot
+///    amplify anything, the raw per-forward divergence is `max|Δeps| = 3.929e-3` and the image moves
+///    by 16/255; by four steps it is 212/255.
+///
+///    A head-axis implementation would be bit-exact by construction; what it would still have to
+///    beat is reason 1, which is the binding one.
 ///
 /// The one-step control is what separates both claims from a wiring bug. It is also why the verdict
 /// is stated per family per backend: Z-Image measures −1.7% on its denoise phase with a
 /// bit-identical image on the same primitive.
 pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
-/// The production transformer-window domain for rung 4: how many consecutive `TransformerBlock`s of
-/// **each** `Transformer2D` are held materialized at once.
+/// The production transformer-window domain for rung 4: how many consecutive blocks of **each**
+/// windowed stack are held materialized at once.
 ///
-/// The domain is a **cadence**, applied independently to eleven sub-stacks of two depths
-/// (`[2, 2, 10, 10, 10, 10, 10, 10, 2, 2, 2]`).
-/// [`BlockPlan::new`](mlx_gen::block_residency::BlockPlan::new) clamps a window to its stack's
-/// depth, so a cadence wider than 2 degrades the five 2-deep sub-stacks to fully resident rather
-/// than erroring — which is why the domain is stated once and not per depth. 10 is therefore the
-/// widest cadence that means anything here: it holds one *whole* deep sub-stack, i.e. one re-open
-/// per stack per step instead of ten.
+/// The domain is a **cadence**, shared by both published scopes. On `Dit` it applies independently
+/// to eleven `Transformer2D` sub-stacks of two depths (`[2, 2, 10, 10, 10, 10, 10, 10, 2, 2, 2]`, 70
+/// blocks); on `TextEncoder` it applies to the ChatGLM3-6B tower's single 28-block stack.
+/// [`BlockPlan::new`](mlx_gen::block_residency::BlockPlan::new) clamps a window to its stack's depth,
+/// so a cadence wider than 2 degrades the five 2-deep sub-stacks to fully resident rather than
+/// erroring — which is why the domain is stated once and not per depth. 10 is the widest cadence
+/// that means anything on `Dit`: it holds one *whole* deep sub-stack, i.e. one re-open per stack per
+/// step instead of ten. On `TextEncoder` a cadence of 10 means three re-opens per request instead of
+/// 28.
 ///
 /// ## Measured: four cadences, one saving
 ///
 /// `transformer_window_sweep_and_streamed_output_identity` (`KOLORS_WINDOW_PROBE_TIER` /
-/// `KOLORS_WINDOW_PROBE_SIZE` drive the off-default rows), fresh bundle per row, every row
-/// byte-identical to its resident control. Request peak in GiB:
+/// `KOLORS_WINDOW_PROBE_SIZE` drive the off-default rows), `Dit` scope, fresh bundle per row, every
+/// row byte-identical to its resident control. Request peak in GiB:
 ///
-/// | tier | output | control | cadence 1 | 2 | 5 | 10 | spread |
+/// | tier | output | staged control | cadence 1 | 2 | 5 | 10 | spread |
 /// |---|---:|---:|---:|---:|---:|---:|---:|
-/// | q4 | 1024² | 7.674 | 6.986 | 6.986 | 6.986 | 6.986 | **0** |
-/// | q8 | 1024² | 8.755 | 7.436 | 7.436 | 7.436 | 7.436 | **0** |
-/// | q4 | 512² | 3.088 | 2.400 | 2.400 | 2.400 | 2.400 | **0** |
+/// | **q4** | **1024²** | 16.0412 | 14.8840 | 14.8840 | 14.8840 | 14.8840 | **0.00%** |
+/// | q4 | 512² | 5.6193 | 4.6924 | 4.6924 | 4.6924 | 4.6924 | **0.00%** |
 ///
-/// **Read this table as an observation, not as a gated invariant.** Exactly one row of it is
-/// asserted — **q4 / 1024²**, the sweep's default tier and geometry, which is also the catalog's
-/// default tier. The others come from re-running the sweep under `KOLORS_WINDOW_PROBE_TIER` /
-/// `KOLORS_WINDOW_PROBE_SIZE`, and in that mode the flatness and wall-clock assertions are
-/// **reported rather than asserted**. And even the asserted row is asserted by an `#[ignore]`d
-/// real-weight test, so it is gated by a human running it against cached weights, not by CI.
+/// **Read this as an observation, not as a gated invariant.** Exactly one row is asserted — q4 /
+/// 1024², the sweep's default tier and geometry, which is also the catalog's default tier. The 512²
+/// row comes from re-running under `KOLORS_WINDOW_PROBE_SIZE`, and in that mode the flatness and
+/// wall-clock assertions are reported rather than asserted. And even the asserted row is asserted by
+/// an `#[ignore]`d real-weight test, so it is gated by a human running it against cached weights,
+/// not by CI.
 ///
-/// Wall clock falls monotonically with cadence (1024² q4: 2074 → 741 ms/step, **2.8× cheaper**).
-/// Absolute numbers track machine load, so the ratio is the quantity worth quoting and the
-/// wall-clock assertions in the sweep are deliberately loose.
+/// Wall clock falls monotonically with cadence (1024² q4: 3745 → 1507 ms/step, **2.5× cheaper**;
+/// 512² q4: 5347 → 990, **5.4×**). Absolute numbers track machine load — the same rows measured
+/// 4268 → 1621 on a busier pass with **the peak column unchanged to the millibyte** — so the ratio
+/// is the quantity worth quoting and the wall-clock assertions in the sweep are deliberately loose.
 ///
-/// ## The mechanism is PHASE SEPARATION, and on Kolors the arithmetic says so twice
+/// ### Rung 4's *relative* latency cost grows as the output shrinks
+///
+/// Against each geometry's own unwindowed control, at the shipped cadence of 1: **4.2× at 1024²,
+/// 10.5× at 512².** That is arithmetic, not a regression appearing at small outputs — a re-open is
+/// weight I/O, so its cost is fixed and area-independent, while the control's per-step forward
+/// scales with area. It is also the strongest argument a selector has for *choosing* a wide cadence:
+/// at 512² q4, cadence 10 lands on the identical 4.6924 GiB peak and is 5.4× faster.
+///
+/// ## The mechanism is PHASE SEPARATION, and the arithmetic says so at every tier
 ///
 /// The request peak is a `max` over phases, and rung 4 only bounds weights *inside one of them*.
 /// Read the saving against the U-Net safetensors headers (summing `data_offsets`,
-/// `transformer_blocks.*` against the whole file):
+/// `transformer_blocks.*` against the whole file) at 1024²
+/// (`the_rung_four_saving_is_the_whole_transformer_block_weight_set`,
+/// `every_advertised_tier_loads_and_publishes_the_ladder`):
 ///
 /// | tier | U-Net total | `transformer_blocks` | one deep block | measured saving | saving ÷ block set |
 /// |---|---:|---:|---:|---:|---:|
-/// | q4 | 1.4363 GiB | 0.6875 GiB | 0.0109 GiB | 0.688 (1024² **and** 512²) | **1.001** |
-/// | q8 | 2.6303 | 1.3164 | 0.0209 | 1.319 (1024²) | **1.002** |
+/// | q4 | 1.7995 GiB | 1.1468 GiB | 0.0182 GiB | 1.1572 | **1.009** |
+/// | q8 | 2.8448 | 2.1638 | 0.0344 | 2.1737 | **1.005** |
+/// | bf16 | 4.8046 | 4.0706 | 0.0647 | 4.0668 | **0.999** |
 ///
-/// **The saving is the entire block weight set** — every tier, and *identically* at 1024² and 512²
-/// on q4 where the activation working sets differ four-fold. That is arithmetically incompatible
-/// with any window being resident when the peak is taken. Eleven `Transformer2D` sub-stacks run in
-/// sequence and `run_windowed` releases one before opening the next, so if the peak occurred during
-/// the windowed forward the saving could be **at most** `block set − w × (one deep block)` — 0.677
-/// GiB on q4 at cadence 1, 0.579 GiB at cadence 10. The measured 0.688 GiB exceeds *both*.
+/// **The saving is the entire block weight set** — every tier, to within a percent, and *identically*
+/// at 1024² and 512² on q4 where the activation working sets differ four-fold. That is
+/// arithmetically incompatible with any window being resident when the peak is taken. Eleven
+/// `Transformer2D` sub-stacks run in sequence and `run_windowed` releases one before opening the
+/// next, so at most one cadence-worth of blocks is materialized at any instant: if the peak occurred
+/// during the windowed forward, the saving could be **at most** `block set − w × (one deep block)` —
+/// 1.1285 GiB on q4 at cadence 1. The measured 1.1572 GiB exceeds it.
 ///
-/// So zero window weights are resident at the peak moment: **the peak is the decode**, stacking on a
-/// still-resident U-Net (rung 1 sheds ChatGLM3-6B, not the heavy bundle — `KolorsHeavyOwned` is one
-/// bundle and the decode runs inside the same render closure).
+/// So **zero window weights are resident at the peak moment: the peak is not in the windowed forward
+/// at all.** It is the **decode**. Rung 1's staged schedule releases the ChatGLM3-6B tower but *not*
+/// the U-Net (`KolorsHeavyOwned` is one bundle and the decode runs inside the same render closure),
+/// so the decode transient stacks on the full resident remainder. Rung 4 lowers the *floor* that
+/// transient stacks on, by the whole block set, and never touches the transient itself. Cadence is
+/// then invisible to the peak for the same reason the choice of denoise step count is.
 ///
-/// ### The condition, stated so it can be checked — and why Kolors' flat region is WIDER than SDXL's
+/// Two independent corroborations, both in this file. [`DECODE_SUPPORT`] measures that tiling **the
+/// decode alone** moves the request peak −37.67% — no change confined to the forward could do that
+/// if the forward were peak-bearing. And [`TRANSFORMER_WINDOW_COMPONENTS`] measures the phase split
+/// directly.
+///
+/// ### The condition, checked rather than inferred
 ///
 /// Flatness holds **only while** `decode transient + resident remainder` exceeds the windowed
-/// forward's own peak at the *widest* published cadence. SDXL's flat region breaks at its advertised
-/// `min_size` of 512² on q8, because there the decode transient no longer dominates. Kolors' does
-/// **not** break at 512² on any cached tier, and the reason is the same one that makes rung 1 worth
-/// so much more here: Kolors' U-Net weight set is the *only* thing left resident during the decode
-/// once ChatGLM3-6B is shed, and at q4/q8 that remainder is small enough that the decode transient
-/// still dominates at 512². The inequality is checked directly by
-/// `the_cadence_flatness_condition_is_checked_not_assumed`, which measures the decode transient and
-/// the widest-cadence windowed forward separately and asserts the ordering rather than inferring it
-/// from the flat column.
+/// forward's own peak at the *widest* published cadence. The decode transient scales with output
+/// area; the windowed forward's peak scales with weights and is geometry-insensitive. So the
+/// inequality has to reverse as the output shrinks, and the first advertised geometry where it does
+/// is the boundary of the flat region. **On SDXL that boundary is inside the advertised range** —
+/// its 512² q8 row opens to a 5.7% spread and goes non-monotonic. **On Kolors it is not**: at the
+/// advertised `min_size` the spread is still 0.00% and rung 4 still bounds the peak by 16.49%
+/// (`the_cadence_flatness_condition_is_checked_not_assumed`). Kolors' resident remainder after rung
+/// 1 is smaller relative to its decode transient, which keeps the decode ahead further down.
 ///
-/// The default stays at the tightest cadence anyway — see [`TRANSFORMER_WINDOW_SIZE`].
+/// One measurement hazard is worth recording because it produced a convincing false positive during
+/// this story: the **first** measured row in a process reads a peak biased by MLX's cold allocator.
+/// A draft of the flatness test measured a windowed row first and read 4.4632 GiB where the sweep
+/// reads 4.6924 — a 4.9% phantom spread that looked exactly like the flat region breaking at
+/// `min_size`. Every peak in this file now has a discarded warm-up row ahead of it.
 ///
 /// ### This is coupled to rung 2, and the coupling runs the wrong way
 ///
 /// Every row above was measured with [`DECODE_SUPPORT`] `Missing`, i.e. with the decode transient at
-/// **full size** — which is precisely the term keeping the forward off the peak. A story that ships
-/// a bounded decode *lowers that term deliberately*, shrinking the flat region toward the
-/// small-output end and potentially eliminating it. Publishing rung 2 invalidates every rung-4 row
-/// here and must re-measure the cadence domain in the same change — see
+/// **full size** — precisely the term keeping the forward off the peak. A story that ships a bounded
+/// decode *lowers that term deliberately*, shrinking the flat region toward the small-output end and
+/// potentially eliminating it. **"Widening the cadence is free" is not a property of this family; it
+/// is a property of this family with rung 2 withheld.** Publishing rung 2 invalidates every rung-4
+/// row here and must re-measure the cadence domain in the same change — see
 /// [`MEMORY_CALIBRATION_FINGERPRINT`], which must be bumped with it.
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 
@@ -285,20 +359,20 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// **The tightest cadence**, which is what every other MLX adopter on this ladder defaults to.
 ///
 /// The honest counter-argument is recorded because it is a good one: on every configuration measured
-/// here cadence 10's peak equals cadence 1's exactly, while cadence 10 is 2.8× faster. Read as a
-/// table of three rows, 10 dominates.
+/// here cadence 10's peak equals cadence 1's **to the millibyte**, while cadence 10 is 2.5–5.4×
+/// faster. Read as a table of two rows, 10 dominates.
 ///
-/// It is still not the default. A default is the value a caller gets *without asking*, so it has to
-/// be safe across the whole advertised geometry range (512²–2048², `crate::registry::descriptor`),
-/// not optimal at the three points that happen to have been measured. The flat column is a
-/// consequence of an inequality (see [`TRANSFORMER_WINDOW_SIZES`]) that this family satisfies at
-/// every *measured* point and that SDXL — the same U-Net, the same rung — violates at its own
-/// `min_size`. A domain known to be inequality-dependent somewhere in the sibling set does not
-/// support extrapolation to the geometries nobody measured; the tightest weight bound does, because
-/// it is the bound rung 4 can always make good on.
+/// It is still not the default, and the reason is what the flat column *depends on* rather than what
+/// its endpoints happen to tie at. Flatness is the consequence of an inequality
+/// ([`TRANSFORMER_WINDOW_SIZES`]) that this family satisfies at both measured geometries and that
+/// **SDXL — the same U-Net, the same rung, the same shared primitive — violates at its own
+/// `min_size`**, where the spread opens to 5.7% and goes non-monotonic. A property that fails on the
+/// nearest sibling is not one to extrapolate from two samples of a three-tier × 512²-to-2048² space.
+/// A default is the value a caller gets *without asking*, so it has to be the bound rung 4 can
+/// always make good on.
 ///
 /// The other three cadences remain published and selectable, and at 1024² a selector that does not
-/// need the tighter bound should absolutely pick 10 and take the 2.8× wall-clock saving; it just has
+/// need the tighter bound should absolutely pick 10 and take the 2.5× wall-clock saving; it just has
 /// to *choose* it, against calibration for that cadence, rather than receive it by omission.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
@@ -330,9 +404,25 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// | **bf16** | **11.360 / 11.360** | 11.364 / 19.031 | 11.364 / 60.053 |
 ///
 /// **One cell of nine is conditioning-bearing: `bf16` at the advertised `min_size`.** There the
-/// request peak *is* the ChatGLM3 residency, and a text-encoder window moves it — which is a
-/// measured saving, not a phase win, and therefore something a caller must be able to select. It is
-/// also a cell a caller can genuinely land on: `bf16` is an advertised tier and 512² is
+/// request peak *is* the ChatGLM3 residency, and a text-encoder window moves it. Measured at that
+/// cell against its staged control of 11.3644 GiB, at the shipped cadence
+/// (`the_text_encoder_window_bounds_the_conditioning_bearing_cell`, every row byte-identical):
+///
+/// | scope | request peak | vs control | ms/step |
+/// |---|---:|---:|---:|
+/// | `Dit` | 11.3644 GiB | **+0.00%** | 1860 |
+/// | `TextEncoder` | 8.8396 | **−22.22%** | 542 |
+/// | `Both` | 4.5436 | **−60.02%** | 2043 |
+///
+/// **The `Dit` scope buys exactly nothing there** — a correct, complete bound on a phase that is not
+/// the maximum, which is the epic's definition of a phase win rather than a saving. A provider that
+/// declared `Dit` only, as SDXL does and as every prior adopter does, would have shipped a rung that
+/// is measurably inert at an advertised cell while a −60.02% composition sat unreachable behind an
+/// unimplemented enum variant. That is the concrete cost of inheriting a sibling's scope decision,
+/// and it is why this story implemented `crate::block_stream` rather than copying SDXL's
+/// `Dit`-only declaration.
+///
+/// It is also a cell a caller can genuinely land on: `bf16` is an advertised tier and 512² is
 /// `descriptor().capabilities.min_size`.
 ///
 /// ## The two scopes have opposite cost shapes, which is why they are separately selectable
@@ -381,7 +471,8 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 ///
 /// It is **not** shared with `sdxl-mlx-unet-shared-ladder-v2` even though the U-Net module is
 /// literally the same code: the conditioning tower differs, the peaks differ, and rung 2's verdict
-/// differs by 2.3× on the same instrument. Sharing a fingerprint would let a selector reuse SDXL's
+/// differs by 2.2× on the same instrument (SDXL's production latent drifts 84/255 at its best
+/// geometry, Kolors' 38/255 at its own). Sharing a fingerprint would let a selector reuse SDXL's
 /// evidence for a Kolors fit, which is precisely the substitution the epic forbids.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "kolors-mlx-chatglm3-sdxl-unet-ladder-v1";
 
@@ -618,8 +709,9 @@ fn contract_with_asset_facts(
         // Rung 4 bounds the U-Net's denoise-phase weight residency. Without rung 1 engaged,
         // ChatGLM3-6B stays resident alongside it and the REQUEST peak does not move — a phase win
         // that is not a saving. On Kolors that encoder is the single largest component in the model,
-        // so the composition is not merely suboptimal, it is inverted: the rung would bound 0.69 GiB
-        // of U-Net weights while 3.06 GiB of encoder sat next to them. Declaring the edge lets the
+        // so the composition is not merely suboptimal, it is inverted: at q4 the `Dit` scope would
+        // bound 1.147 GiB of U-Net blocks while 3.984 GiB of encoder sat next to them, and at bf16
+        // 4.071 against 11.630. Declaring the edge lets the
         // shared selector refuse it instead of every caller re-deriving it from the cost order.
         contract.additional_prerequisites.push((
             MemoryStrategy::BoundedTransformerResidency,
@@ -643,13 +735,14 @@ fn contract_with_asset_facts(
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
         "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and withheld: its best geometry (edge \
-         {DECODE_TILE_EDGE} overlap 192) drifts 88/255 at 1024² against a {DECODE_DRIFT_BAR}/255 \
-         sibling bar, and the same edge drifts 116 at 1280², 158 at 1536² and 134 at 2048² — the \
-         upsample tail's GroupNorms normalize over each tile's own crop, so what bounds the drift \
-         is the tile's FRACTION of the output, and a fixed pixel edge cannot hold that across an \
-         advertised range up to 2048². Requested edge {edge:?} overlap {overlap:?}; see \
-         memory_strategy::DECODE_SUPPORT for the full sweep."
+         Missing). The tiled decode was measured and withheld — NOT because no geometry works: its \
+         best (edge {DECODE_TILE_EDGE} overlap {DECODE_OVERLAP}) clears the \
+         {DECODE_DRIFT_BAR}/255 sibling bar at 1024² with 38/255 and at 1280² with 26/255, and \
+         would have bought -37.67% of the request peak for +10% wall clock. It fails at 1536² \
+         (69/255) and 2048² (53/255), because the upsample tail's GroupNorms normalize over each \
+         tile's own crop — so what bounds the drift is the tile's FRACTION of the output, and a \
+         fixed pixel edge cannot hold that across an advertised range up to 2048². Requested edge \
+         {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the full sweep."
     ))
 }
 
@@ -700,7 +793,7 @@ pub(crate) fn safety_check(
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
             return Err(CoreError::Unsupported(format!(
                 "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the request peak 0.00% here (and +7.9% at the U-Net seam), and \
+                 Missing): it moves the request peak 0.00% here (and +12.54% at the U-Net seam), and \
                  the query-row chunking axis is not bit-exact on Metal, which an fp16 \
                  chaos-sensitive schedule amplifies to a different image — see \
                  memory_strategy::ATTENTION_SUPPORT",
@@ -767,7 +860,12 @@ pub(crate) fn registered_valid_fixture(
         overlay: None,
     };
     let fixtures = vec![MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(contract, strategy, tier, route(false))?,
+        mlx_gen::gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            tier,
+            route(false),
+        )?,
     )];
     Ok(fixtures)
 }
@@ -942,7 +1040,7 @@ pub(crate) fn attention_plan(
     if req.memory.is_some_and(|memory| memory.chunk_attention) {
         return Err(mlx_gen::Error::Unsupported(
             "kolors: bounded attention is not selectable on this provider (rung 3 is declared \
-             Missing): it moves the request peak 0.00% here (and +7.9% at the U-Net seam), and the \
+             Missing): it moves the request peak 0.00% here (and +12.54% at the U-Net seam), and the \
              query-row chunking axis is not bit-exact on Metal, which an fp16 chaos-sensitive \
              schedule amplifies to a different image — see memory_strategy::ATTENTION_SUPPORT"
                 .to_owned(),
@@ -1085,8 +1183,10 @@ mod tests {
     /// anyway, but the contract must not *declare* the rung for it either.
     #[test]
     fn a_single_file_source_cannot_stream() {
-        let fused = LoadSpec::new(WeightsSource::File("/nonexistent/kolors.safetensors".into()))
-            .with_load_shape(LoadShape::DeferredMaterialization);
+        let fused = LoadSpec::new(WeightsSource::File(
+            "/nonexistent/kolors.safetensors".into(),
+        ))
+        .with_load_shape(LoadShape::DeferredMaterialization);
         assert!(!streamable(&fused));
     }
 
@@ -1102,7 +1202,9 @@ mod tests {
         assert!(!load_leaves_blocks_lazy(&dense_q8));
         assert!(!streamable(&dense_q8));
         // The control: the same spec without the quantize request stays lazy.
-        assert!(load_leaves_blocks_lazy(&spec(LoadShape::DeferredMaterialization)));
+        assert!(load_leaves_blocks_lazy(&spec(
+            LoadShape::DeferredMaterialization
+        )));
     }
 
     /// **Rungs 2 and 3 are refused on every layer**, and the refusal names why.
@@ -1147,7 +1249,7 @@ mod tests {
             ..Default::default()
         };
         let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(err.to_string().contains("88/255"), "got: {err}");
+        assert!(err.to_string().contains("38/255"), "got: {err}");
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {
@@ -1156,7 +1258,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = attention_plan(&chunked).expect_err("a bounded-attention request must be refused");
+        let err =
+            attention_plan(&chunked).expect_err("a bounded-attention request must be refused");
         assert!(err.to_string().contains("0.00%"), "got: {err}");
 
         // The controls. Without these, a resolver that refused unconditionally would pass.
@@ -1265,8 +1368,8 @@ mod tests {
     }
 
     /// Rung 4 declares rung 1 as an engagement prerequisite, so the shared selector refuses a
-    /// composition that would bound 0.69 GiB of U-Net weights while 3.06 GiB of ChatGLM3-6B stayed
-    /// resident next to them.
+    /// composition that would bound 1.147 GiB of U-Net blocks (q4) while 3.984 GiB of ChatGLM3-6B
+    /// stayed resident next to them.
     #[test]
     fn rung_four_requires_rung_one_engaged_in_the_same_request() {
         let deferred = contract(LoadShape::DeferredMaterialization);

@@ -10,8 +10,8 @@
 //!  - the T2I / img2img pipelines (sc-3094/3095), quant (sc-3096), ControlNet / IP-Adapter-Plus
 //!    (sc-3097/98).
 
-pub mod chatglm3;
 pub(crate) mod block_stream;
+pub mod chatglm3;
 pub mod convert;
 pub mod ip_adapter;
 pub mod memory_strategy;
@@ -77,7 +77,9 @@ mod explicit_registry_tests {
             let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
                 .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
                 .with_load_shape(shape);
-            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
+                &registry, &spec,
+            );
         }
     }
 }

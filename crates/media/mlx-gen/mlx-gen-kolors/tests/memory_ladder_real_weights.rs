@@ -30,9 +30,11 @@
 //! | `KOLORS_LADDER_ROOT` | `kolors` — the single catalog entry, all three advertised tiers |
 //!
 //! ```text
-//! KOLORS_LADDER_ROOT=$HF_HOME/hub/models--SceneWorks--kolors-mlx/snapshots/<rev> \
+//! KOLORS_LADDER_ROOT=<the SceneWorks/kolors-mlx snapshot root, containing q4/ q8/ bf16/> \
 //!   cargo test -p mlx-gen-kolors --test memory_ladder_real_weights -- --ignored --test-threads=1
 //! ```
+//!
+//! The env var is the only input: nothing here derives a cache location (epic 13657).
 
 #![allow(clippy::items_after_test_module)]
 
@@ -582,7 +584,9 @@ fn decode_tile_mechanism_sweep() {
 
     let untiled = mlx_gen_sdxl::decode_image(&vae, &latent, None).expect("untiled decode");
     let mut best = (u32::MAX, 0u32, 0u32);
-    println!("[sc-15521 rung2 mechanism sweep {DEFAULT_TIER} 1024²] edge/overlap -> max Δ (mean Δ)");
+    println!(
+        "[sc-15521 rung2 mechanism sweep {DEFAULT_TIER} 1024²] edge/overlap -> max Δ (mean Δ)"
+    );
     for edge in ms::DECODE_TILE_EDGES_SWEPT {
         let mut line = format!("  edge {edge:>4}:");
         for overlap in ms::DECODE_OVERLAPS_SWEPT {
@@ -867,7 +871,9 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 
     let (unbounded_peak, unbounded) = run(mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED);
     let (bounded_peak, bounded) = run(mlx_gen_sdxl::SdxlForwardPlan::with_attention(
-        mlx_gen::attention::AttentionPlan::budgeted(mlx_gen::attention::AttentionBudget::CONSTRAINED),
+        mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::CONSTRAINED,
+        ),
     ));
     let max_abs = unbounded
         .iter()
@@ -988,7 +994,11 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     println!(
         "[sc-15521 rung4 sweep {tier} {edge}²] peak spread across the domain {spread:.2}%, widest \
          cadence {speedup:.1}× faster than the tightest{}",
-        if probe { " (probe mode: reported, not asserted)" } else { "" }
+        if probe {
+            " (probe mode: reported, not asserted)"
+        } else {
+            ""
+        }
     );
     if probe {
         return;
@@ -1040,11 +1050,7 @@ fn the_rung_four_saving_is_the_whole_transformer_block_weight_set() {
         &dir,
         DEFAULT_TIER,
         LoadShape::DeferredMaterialization,
-        &request(
-            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-            1024,
-            STEPS,
-        ),
+        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 1024, STEPS),
     );
     let saving = (control.peak_gib - windowed.peak_gib) * GIB;
     let block_set = blocks;
@@ -1098,9 +1104,7 @@ fn unet_weight_arithmetic(dir: &std::path::Path) -> (f64, f64, f64) {
         if let Some((prefix, rest)) = key.split_once(".transformer_blocks.") {
             blocks += size;
             let index = rest.split('.').next().unwrap_or("0");
-            *per_block
-                .entry(format!("{prefix}.{index}"))
-                .or_default() += size;
+            *per_block.entry(format!("{prefix}.{index}")).or_default() += size;
             stack_depths
                 .entry(prefix.to_owned())
                 .or_default()
@@ -1247,7 +1251,10 @@ fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
             clear_cache();
         }
     }
-    assert!(measured > 0, "SKIPPED-BY-ABSENCE: no tier was cached under {ROOT_ENV}");
+    assert!(
+        measured > 0,
+        "SKIPPED-BY-ABSENCE: no tier was cached under {ROOT_ENV}"
+    );
     println!(
         "[sc-15521 rung4 TextEncoder scope] the conditioning phase carries the request peak at \
          {bearing:?} of the advertised (tier × geometry) range"
@@ -1500,11 +1507,7 @@ fn every_advertised_tier_loads_and_publishes_the_ladder() {
             &dir,
             tier,
             LoadShape::DeferredMaterialization,
-            &request(
-                Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-                1024,
-                STEPS,
-            ),
+            &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 1024, STEPS),
         );
         println!(
             "[sc-15521 per-tier {tier} 1024² {STEPS} steps] rung4 {rung4:?}  staged {:.4} GiB -> \
@@ -1559,11 +1562,7 @@ fn the_full_ladder_renders_under_a_memory_cap() {
         &dir,
         DEFAULT_TIER,
         LoadShape::DeferredMaterialization,
-        &request(
-            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-            512,
-            STEPS,
-        ),
+        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, STEPS),
     );
     let cap_gb = (windowed.peak_gib + control.peak_gib) / 2.0 * (GIB / 1e9);
     println!(
@@ -1579,11 +1578,7 @@ fn the_full_ladder_renders_under_a_memory_cap() {
             &dir,
             DEFAULT_TIER,
             LoadShape::DeferredMaterialization,
-            &request(
-                Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-                512,
-                STEPS,
-            ),
+            &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, STEPS),
         )
     }));
     unsafe { std::env::remove_var(MEMORY_CAP_ENV) };

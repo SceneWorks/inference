@@ -60,10 +60,9 @@ pub use model::{
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
-    denoise_cfgpp_with_preview,
-    denoise_control, denoise_control_with_preview, denoise_curated, denoise_curated_with_preview,
-    denoise_inpaint, denoise_inpaint_with_preview, denoise_ip, denoise_ip_control,
-    denoise_ip_control_with_preview, denoise_ip_multi_control,
+    denoise_cfgpp_with_preview, denoise_control, denoise_control_with_preview, denoise_curated,
+    denoise_curated_with_preview, denoise_inpaint, denoise_inpaint_with_preview, denoise_ip,
+    denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
     denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
     encode_init_latents, preprocess_control_image, preprocess_init_image, seeded_prior,

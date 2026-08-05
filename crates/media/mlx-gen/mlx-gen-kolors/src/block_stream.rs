@@ -141,7 +141,8 @@ mod tests {
     /// exercised without the 4-12 GiB tower. Widths are group-64-divisible so the quantization
     /// replay test can pack them.
     fn fixture(tag: &str, n_blocks: usize) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kolors-glm-stream-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("kolors-glm-stream-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.safetensors");
         let mut named: Vec<(String, Array)> = Vec::new();
@@ -168,8 +169,14 @@ mod tests {
                 format!("{b}.self_attention.dense.weight"),
                 vec![HIDDEN, HIDDEN],
             );
-            push(format!("{b}.mlp.dense_h_to_4h.weight"), vec![2 * HIDDEN, HIDDEN]);
-            push(format!("{b}.mlp.dense_4h_to_h.weight"), vec![HIDDEN, HIDDEN]);
+            push(
+                format!("{b}.mlp.dense_h_to_4h.weight"),
+                vec![2 * HIDDEN, HIDDEN],
+            );
+            push(
+                format!("{b}.mlp.dense_4h_to_h.weight"),
+                vec![HIDDEN, HIDDEN],
+            );
         }
         let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
@@ -198,7 +205,10 @@ mod tests {
         let before = view.len();
         s.materialize(&mut view, 0).unwrap();
         let after = view.len();
-        assert!(after < before, "materializing block 0 must drain its tensors");
+        assert!(
+            after < before,
+            "materializing block 0 must drain its tensors"
+        );
         assert!(view
             .get("encoder.layers.1.self_attention.dense.weight")
             .is_some());
@@ -216,10 +226,7 @@ mod tests {
 
         // Mutation half: a tensor the constructor never reads is NOT drained.
         let mut view = s.open().unwrap();
-        view.insert(
-            "encoder.layers.0.unread_by_the_block",
-            Array::from_f32(1.0),
-        );
+        view.insert("encoder.layers.0.unread_by_the_block", Array::from_f32(1.0));
         s.materialize(&mut view, 0).unwrap();
         assert!(
             view.get("encoder.layers.0.unread_by_the_block").is_some(),
@@ -270,7 +277,10 @@ mod tests {
         s.quant_bits = Some(4);
         let mut view = s.open().unwrap();
         let packed = s.materialize(&mut view, 0).unwrap();
-        assert!(packed.is_quantized(), "the replay must pack every projection");
+        assert!(
+            packed.is_quantized(),
+            "the replay must pack every projection"
+        );
 
         let view = s.open().unwrap();
         let mut twin = GlmBlock::from_weights(&view, 0, None, Dtype::Float32).unwrap();

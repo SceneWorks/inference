@@ -403,7 +403,8 @@ impl Generator for KolorsGenerator {
     fn begin_memory_strategy_request(
         &self,
         context: &mlx_gen::gen_core::MemoryRunContext,
-    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>> {
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
         crate::memory_strategy::begin_request(
             self.descriptor.id,
             &self.loaded_spec,
