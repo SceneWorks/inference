@@ -1952,7 +1952,7 @@ jobs:
           # Streamed to a FILE as well as the log, because the evidence extraction below has to survive
           # this command failing. `bash -e` kills the step at this assignment on a non-zero cargo exit,
           # and the sweep's own verdict rule panics on evidence it judges unresolvable — precisely the
-          # run whose 21 cells someone needs to read. Extraction and upload are separate `always()`
+          # run whose measured cells someone needs to read. Extraction and upload are separate `always()`
           # steps for the same reason.
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
             cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
@@ -1975,7 +1975,7 @@ jobs:
         run: scripts/ci/gpu_fault_evidence.sh report
       # The sweep's product is its per-cell evidence, not the green check: every (row, seed) emits one
       # `S18CELL` TSV line precisely so a run can be re-aggregated without the log. `always()` because
-      # a four-hour run that ends in an unresolvable verdict still measured 21 real cells, and throwing
+      # a long run that ends in an unresolvable verdict still measured real cells, and throwing
       # them away would mean paying for the sweep twice to read them.
       #
       # KNOWN LIMIT of that guarantee, measured — it covers a FAILING SWEEP, not a DYING RUNNER.
@@ -1984,11 +1984,12 @@ jobs:
       # `nax-macos-2` 2 h 42 m in — "The self-hosted runner lost communication with the server" — and
       # because the runner died, these two steps never ran, no artifact was produced, and GitHub kept
       # no partial log (the run's log zip is empty). Every cell measured up to that point was lost.
-      # Closing that hole needs the sweep split so each row surrenders its cells as it finishes, plus
-      # a re-aggregation entry point to rebuild the verdict from the pieces — the test's own docs say
-      # the S18CELL lines exist to make that possible, but nothing exposes it to CI today. Not built
-      # here: one runner loss is n = 1, and sc-17355 records the standing posture for nax-macos-2
-      # anomalies (observe, do not redesign, until it recurs). Tracked in sc-17655.
+      # MITIGATION, not a fix — sc-17655 made the sweep divisible rather than making one long run
+      # survivable. Dispatch it in row-sized pieces (`krea_s18_rows`) and each piece uploads its own
+      # cells when it finishes, so a runner loss costs one row instead of everything; re-aggregate
+      # afterwards with `s18_verdict_from_accumulated_cells`. A single ABCDFEZ dispatch is still
+      # all-or-nothing against a dying runner, and that is a deliberate trade: the alternative is
+      # streaming uploads mid-step, which Actions does not do without a lot of machinery.
       #
       # The same limit applies to sc-17355's `Report GPU fault evidence` step above — it is `always()`
       # too, so it reports a fault the sweep survived, not one that took the runner with it. That is
