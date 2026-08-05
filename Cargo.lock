@@ -358,6 +358,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -934,6 +935,7 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -1108,6 +1110,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
 ]
@@ -3230,6 +3233,7 @@ dependencies = [
  "core-llm",
  "safetensors 0.4.5",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
 ]

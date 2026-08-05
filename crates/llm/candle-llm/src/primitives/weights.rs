@@ -166,9 +166,12 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrip() {
-        let dir =
-            std::env::temp_dir().join(format!("candle-llm-weights-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // sc-17755: guard the fixture root so it leaves on `Drop`, panic or not.
+        let guard = tempfile::Builder::new()
+            .prefix("candle-llm-weights-test-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let dir = guard.path();
         let path = dir.join("model.safetensors");
         let a = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &Device::Cpu).unwrap();
         let mut map = HashMap::new();
@@ -178,9 +181,7 @@ mod tests {
         let w = Weights::from_file(&path, &Device::Cpu).unwrap();
         assert_eq!(w.require("w").unwrap().dims(), &[2, 2]);
 
-        let w2 = Weights::from_dir(&dir, &Device::Cpu).unwrap();
+        let w2 = Weights::from_dir(dir, &Device::Cpu).unwrap();
         assert!(w2.contains("w"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
