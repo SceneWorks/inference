@@ -36,9 +36,9 @@
 //! * **Rung 2 is `Missing`, on a narrow margin.** Tiling the FLUX.1 VAE decode is a large saving on
 //!   this family (−11% to −72% of the decode phase). At the variant's real 28-step schedule the best
 //!   of 28 swept geometries drifts **53/255** against the untiled decode of the **production**
-//!   latent, ~10% over the 48/255 bar the closest sibling admits — close enough that the margin is
-//!   inside the statistic's own variance, which is measured rather than assumed. See
-//!   [`DECODE_SUPPORT`].
+//!   latent, ~10% over the 48/255 bar the closest sibling admits — and resampling that cell across
+//!   five production latents gives 28..82, a 2.9x spread that straddles the bar. Withheld as an
+//!   UNRESOLVED margin, not as a clean failure. See [`DECODE_SUPPORT`].
 //! * **Rung 3 is `Missing`.** MLX's fused attention kernel streams its scores, so query-row
 //!   chunking has no materialized score matrix to bound: measured **−0.001%** on the request peak.
 //!   See [`ATTENTION_SUPPORT`].
@@ -110,26 +110,38 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// drift `mlx_gen_z_image` *admits* into a shipped ladder on the same tiling machinery over the same
 /// `AutoencoderKL` type.
 ///
-/// ## Why this is stated as narrow, and what that costs
+/// ## Why this is withheld as UNRESOLVED rather than as a failure
 ///
-/// **A previous revision of this doc published 105–166/255 and called it "more than double the bar",
-/// with a mechanism argument built on the drift being flat in the geometry. Both were artifacts of
-/// measuring on a 4-step latent.** At the real schedule the range is 53–127, the best cell is 10%
-/// over the bar rather than 120% over, and the drift is *not* flat: at overlap 256 it falls
-/// monotonically 70 → 57 → 53 across edges 960 → 896 → 832, which is the tail-tile behaviour the old
-/// paragraph claimed to have ruled out. That argument is withdrawn; only the numbers stand.
+/// **A previous revision of this doc published 105–166/255, called it "more than double the bar",
+/// and built a mechanism argument on the drift being flat in the geometry. All of that was an
+/// artifact of measuring on a 4-step latent.** At the real schedule the range is 53–127, the best
+/// cell is ~10% over the bar rather than 120% over, and the drift is *not* flat: at overlap 256 it
+/// falls monotonically 70 → 57 → 53 across edges 960 → 896 → 832, which is the tail-tile behaviour
+/// the old paragraph claimed to have ruled out. That argument is withdrawn. Only the numbers stand.
 ///
-/// **10% is inside the statistic's own noise, and that is measured too.** `max Δ` is an
-/// extreme-order statistic over ~3.1M subpixels — one outlier sets it —
-/// so `the_rung_two_drift_margin_is_resampled_across_seeds` re-takes the best cell across five
-/// production latents and asserts the verdict against the *whole* sample rather than against one
-/// image. RESAMPLE_PLACEHOLDER
+/// **And 10% is far inside the statistic's own variance, which is measured rather than assumed.**
+/// `max Δ` is an extreme-order statistic over ~3.1M subpixels — a single outlier sets it — so
+/// `the_rung_two_drift_margin_is_resampled_across_seeds` re-takes the best cell across five
+/// production latents:
 ///
-/// The rung is therefore withheld **because the evidence does not support admitting it**, not
-/// because it clearly fails: a candidate this close to the bar would need a quality methodology this
-/// epic has not agreed on (a perceptual metric, or a bar derived rather than borrowed) before it
-/// could be published, and shipping it on a 10% margin measured from one family's borrowed threshold
-/// would be exactly the inherited-verdict failure the epic exists to prevent.
+/// | seed | 1234 | 7 | 99 | 20260805 | 424242 |
+/// |---|---:|---:|---:|---:|---:|
+/// | max Δ | 53 | 82 | 74 | 63 | **28** |
+/// | mean Δ | 1.87 | 3.57 | 2.59 | 3.45 | 0.62 |
+///
+/// **28..82 on one fixed geometry — a 2.9x spread, an order of magnitude wider than the margin the
+/// single-image sweep appeared to establish, and it straddles the bar.** Four seeds fail it, one
+/// clears it comfortably. So the rung cannot be admitted, and it also cannot honestly be called a
+/// clean rejection: on this evidence `max Δ` against a borrowed 48/255 threshold does not resolve
+/// this candidate in either direction.
+///
+/// The rung therefore ships `Missing` **because nothing here supports admitting it**, and the
+/// withholding reason is recorded as an unresolved margin. Admitting it would need a quality
+/// methodology this epic has not agreed on — a perceptual metric, or a distributional bar derived
+/// for this family rather than borrowed from a sibling — and shipping it on a margin narrower than
+/// its own seed-to-seed noise would be exactly the inherited-verdict failure the epic exists to
+/// prevent. `the_rung_two_drift_margin_is_resampled_across_seeds` pins the verdict CLASS, so a move
+/// to a clean failure or to admissibility reddens rather than sitting stale.
 pub const DECODE_SUPPORT: bool = false;
 /// The native VAE tile ladder this provider *would* publish, and the reference domain its checked
 /// [`mlx_gen_pid::DecodeRoutes`] is constructed from so the native and PiD domains stay provably

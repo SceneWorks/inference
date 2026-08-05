@@ -157,11 +157,14 @@ const BEST_SWEPT_OVERLAP: u32 = 256;
 /// `memory_strategy::DECODE_SUPPORT`'s doc states in prose.
 ///
 /// * `FAILS` — every seed is over the bar. A clear rejection.
-/// * `UNRESOLVED` — the sample straddles the bar. The rung cannot be admitted (it fails on some
+/// * `UNRESOLVED` — the sample straddles the bar. The rung cannot be admitted (it fails on most
 ///   images) *and* the rejection is not clean; the honest statement is that a margin this narrow is
-///   not decidable with a borrowed threshold on an extreme-order statistic.
+///   not decidable with a borrowed threshold on an extreme-order statistic. **This is what Chroma
+///   measured**: `[53, 82, 74, 63, 28]` at edge 832 / overlap 256, i.e. 4 of 5 seeds over the bar
+///   and one at 28 — a 2.9x spread on the same geometry, an order of magnitude wider than the 10%
+///   margin the single-image sweep appeared to establish.
 /// * `ADMISSIBLE` — every seed clears it. Would make `DECODE_SUPPORT = false` stale.
-const EXPECTED_RUNG2_VERDICT: &str = "FAILS";
+const EXPECTED_RUNG2_VERDICT: &str = "UNRESOLVED";
 
 fn entry_root(var: &str) -> Option<PathBuf> {
     std::env::var(var).ok().map(PathBuf::from)
