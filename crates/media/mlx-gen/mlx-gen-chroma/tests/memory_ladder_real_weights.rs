@@ -956,12 +956,7 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
 /// admissible (38/255) until it was measured on the real thing (84/255).
 #[track_caller]
 fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
-    production_latent_seeded(dir, size, 1234)
-}
-
-/// [`production_latent`] at an explicit seed, so the drift statistic can be resampled.
-#[track_caller]
-fn production_latent_seeded(dir: &std::path::Path, size: u32, seed: u64) -> mlx_rs::Array {
+    let seed = 1234;
     let spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
         .with_offload_policy(OffloadPolicy::Resident);
     let model = mlx_gen_chroma::load_chroma(mlx_gen_chroma::ChromaVariant::Base, &spec)
@@ -1016,9 +1011,43 @@ fn the_rung_two_drift_margin_is_resampled_across_seeds() {
     let vae = mlx_gen_chroma::loader::load_vae(&dir).expect("load vae");
     let cfg = mlx_gen::tiling::TilingConfig::spatial_only(edge as i32, overlap as i32);
 
+    // ONE resident load for the whole sample. Reloading the 14 GiB bundle per seed put the machine
+    // into allocator thrash and turned a 20-minute measurement into an hour — and the latent is a
+    // pure function of the seed, so a shared load produces the identical five.
+    let latents: Vec<(u64, mlx_rs::Array)> = {
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Resident);
+        let model = mlx_gen_chroma::load_chroma(mlx_gen_chroma::ChromaVariant::Base, &spec)
+            .expect("load chroma resident");
+        let latents = SEEDS
+            .iter()
+            .map(|seed| {
+                let noise = mlx_gen_flux::create_noise(*seed, size, size).expect("noise");
+                let out = model
+                    .denoise_with_sampler_name(
+                        "a red fox in a snowy forest, photograph",
+                        "blurry, lowres",
+                        size,
+                        size,
+                        steps(),
+                        4.0,
+                        noise,
+                        None,
+                        &mlx_gen::CancelFlag::new(),
+                        &mut |_| {},
+                    )
+                    .expect("denoise");
+                mlx_rs::transforms::eval([&out]).expect("eval latent");
+                (*seed, out)
+            })
+            .collect();
+        drop(model);
+        clear_cache();
+        latents
+    };
+
     let mut drifts = Vec::new();
-    for seed in SEEDS {
-        let latent = production_latent_seeded(&dir, size, seed);
+    for (seed, latent) in latents {
         let unpacked = mlx_gen_flux::unpack_latents(&latent, size, size).expect("unpack");
         let reference = mlx_gen::LatentDecoder::decode(&vae, &unpacked).expect("untiled decode");
         reference.eval().expect("eval reference");

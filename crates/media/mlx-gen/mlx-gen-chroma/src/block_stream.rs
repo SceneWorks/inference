@@ -682,7 +682,7 @@ mod tests {
             .keys()
             .map(|k| (k.to_owned(), existing.get(k).unwrap().clone()))
             .collect();
-        let mut linear = |named: &mut Vec<(String, Array)>, prefix: &str, out: i32, input: i32| {
+        let linear = |named: &mut Vec<(String, Array)>, prefix: &str, out: i32, input: i32| {
             named.push((format!("{prefix}.weight"), tensor(vec![out, input], 1.0)));
             named.push((format!("{prefix}.bias"), tensor(vec![out], 1.0)));
         };
