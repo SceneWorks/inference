@@ -1342,13 +1342,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Over GitHub's 360-minute default, which killed a long macOS lane mid-run in sc-16981.
         self.assertIn("timeout-minutes: 480", job)
         # Rows AND seeds: the run-count assertion below is their product, so the job owns both.
-        self.assertIn('KREA_S18_ROWS: ABCDFEZ', job)
-        self.assertIn('KREA_S18_SEEDS: "7,11,23"', job)
+        # sc-17655 made them dispatch inputs so the sweep can be run in row-sized pieces instead of
+        # one indivisible 4.3 h block, which means the count is DERIVED rather than the literal 21
+        # that only ever held for the full seven-row sweep. Both halves are pinned: the job must read
+        # the inputs, and the inputs must still DEFAULT to the full recorded sweep, or a bare
+        # dispatch would quietly measure something narrower than this lane claims.
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", job)
+        self.assertIn("KREA_S18_SEEDS: ${{ inputs.krea_s18_seeds }}", job)
+        dispatch = workflow.split("jobs:", 1)[0]
+        self.assertIn("krea_s18_rows:", dispatch)
+        self.assertIn("default: ABCDFEZ", dispatch)
+        self.assertIn("krea_s18_seeds:", dispatch)
+        self.assertIn('default: "7,11,23"', dispatch)
         # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
         self.assertIn("set -o pipefail", job)
         self.assertIn("-- --exact --ignored --nocapture", job)
         self.assertIn('grep -qE "test result: ok\\. 1 passed"', job)
-        self.assertIn('"$cells" -ne 21', job)
+        self.assertIn("expected_cells=$(( n_rows * n_seeds ))", job)
+        self.assertIn('"$cells" -ne "$expected_cells"', job)
+        # A free-text row list is a new way to make the count assertion vacuous: a typo'd letter
+        # selects fewer rows than it counts, and a repeated one counts a row twice. Both are
+        # rejected before the four-hour cargo invocation rather than after it.
+        self.assertIn('=~ ^[ABCDFEZ]+$', job)
+        self.assertIn("repeats a row", job)
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)

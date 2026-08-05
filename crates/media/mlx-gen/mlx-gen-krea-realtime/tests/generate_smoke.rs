@@ -3012,16 +3012,144 @@ fn long_clip_coherence_under_the_bounded_window() {
         cells: results.iter().map(S18Cell::from_measured).collect(),
     };
     println!("  {}", sweep.summary());
-    if want_rows.contains('A') {
+    // A verdict needs the shipped row AND the within-regime dose ladder it is attributed against.
+    // Row A alone is *resolvable* — `validate_window_dose_ladder` returns early when D or F is
+    // missing — so gating on `A` alone would let a one-row dispatch emit a verdict whose attribution
+    // clause has no ladder behind it. Piecewise runs are the normal way to drive this sweep now
+    // (sc-17655), so the partial branch is the common path, not the exotic one: measure the rows in
+    // whatever pieces the runner can afford, then re-aggregate with
+    // [`s18_verdict_from_accumulated_cells`].
+    let complete = ['A', 'D', 'F'].iter().all(|row| want_rows.contains(*row));
+    if complete {
         match sweep.verdict() {
             Ok(v) => println!("  VERDICT: {v}"),
             Err(e) => panic!("{e}"),
         }
     } else {
         println!(
-            "  (partial sweep: rows `{want_rows}` do not include the shipped row A, so no verdict \
-             is computed — re-aggregate the S18CELL lines)"
+            "  (partial sweep: rows `{want_rows}` are not the whole A/D/F dose ladder, so no \
+             verdict is computed — re-aggregate the S18CELL lines with \
+             `KREA_S18_CELLS=<file> cargo test --test generate_smoke \
+             s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture`)"
         );
+    }
+}
+
+/// **Re-aggregate a piecewise S18 sweep and apply the verdict rule to it.**
+///
+/// [`long_clip_coherence_under_the_bounded_window`] measures every (row, seed) it is asked for and
+/// prints one `S18CELL` TSV line each, and its docs have always said those lines exist "so a long
+/// sweep can be run in pieces and re-aggregated without holding a five-hour process open". Nothing
+/// exposed that re-aggregation until sc-17655: the verdict was computed only inside the measuring
+/// process, so the pieces could be measured but never resolved, and the only way to get a verdict
+/// was the whole 4.3-hour sweep in one go — which on `nax-macos-2` head-of-line-blocks `rw-audio`,
+/// `rw-llm` and `rw-chroma` for half a night (the sc-16981 failure, and the reason sc-17324's own
+/// powered run got cancelled).
+///
+/// This is that entry point. It reads accumulated `S18CELL` lines, rebuilds the [`S18Sweep`], and
+/// applies **the same [`S18Sweep::verdict`]** the live run would have — no second copy of the rule.
+///
+/// ```text
+/// cat run-A.tsv run-B.tsv ... > all-cells.tsv
+/// KREA_S18_CELLS=all-cells.tsv cargo test --test generate_smoke \
+///   s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture
+/// ```
+///
+/// Input is the artifact the sweep job uploads verbatim — `VERDICT:` lines and blanks are ignored,
+/// so `s18-cells.tsv` files concatenate without editing. `KREA_S18_BUCKET` selects the geometry when
+/// the input mixes buckets; with one bucket present it is inferred. Duplicate (row, seed) cells are
+/// NOT silently dropped: a re-measured cell reaches `validate_window_dose_ladder`, which rejects the
+/// ladder rather than quietly averaging two runs of the same configuration.
+///
+/// `#[ignore]` because it is an operator entry point rather than a gate — it asserts nothing about
+/// *which* verdict comes out, only that the rule can be applied to evidence that arrived in pieces.
+/// The rule's own outcomes stay gated, without weights, by
+/// [`the_s18_verdict_rule_distinguishes_its_outcomes`].
+#[test]
+#[ignore = "operator entry point: re-aggregates S18CELL evidence named by KREA_S18_CELLS"]
+fn s18_verdict_from_accumulated_cells() {
+    let path = std::env::var("KREA_S18_CELLS").expect(
+        "set KREA_S18_CELLS to a file of accumulated S18CELL lines (concatenated `s18-cells.tsv` \
+         artifacts are the expected input)",
+    );
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read the accumulated cells at `{path}`: {e}"));
+    // The uploaded artifact interleaves `  VERDICT:` lines with the cells, and concatenating
+    // several leaves blank lines — `parse_s18_evidence` rejects both, so filter to cells first.
+    let cells_only: String = raw
+        .lines()
+        .filter(|line| line.starts_with("S18CELL"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !cells_only.is_empty(),
+        "`{path}` contains no S18CELL lines — it is not S18 sweep evidence"
+    );
+    let evidence = parse_s18_evidence(&cells_only)
+        .unwrap_or_else(|e| panic!("parse the accumulated cells at `{path}`: {e}"));
+
+    let mut buckets: Vec<String> = evidence.iter().map(|c| c.bucket.clone()).collect();
+    buckets.sort();
+    buckets.dedup();
+    let bucket = match std::env::var("KREA_S18_BUCKET") {
+        Ok(want) => {
+            assert!(
+                buckets.contains(&want),
+                "KREA_S18_BUCKET=`{want}` is not present in `{path}` (buckets: {buckets:?})"
+            );
+            want
+        }
+        Err(_) => {
+            assert_eq!(
+                buckets.len(),
+                1,
+                "`{path}` mixes buckets {buckets:?} — set KREA_S18_BUCKET to choose one, because a \
+                 verdict is per geometry and pooling them would compare different clips"
+            );
+            buckets[0].clone()
+        }
+    };
+
+    let cells: Vec<S18Cell> = evidence
+        .iter()
+        .filter(|c| c.bucket == bucket)
+        .map(|c| S18Cell {
+            row: c.row,
+            seed: c.seed,
+            latent_frames: c.latent_frames,
+            rolls: c.rolls,
+            reported_drift: c.drift,
+            trend: c.trend,
+            excursion: c.excursion,
+            slope: c.slope,
+            peak_bytes: c.peak_bytes,
+            clip_mean: c.clip_mean,
+            head_motion: c.head_motion,
+            tail_motion: c.tail_motion,
+            // Historical rows predate the component field. `S18Cell` holds `&'static str` so the
+            // recorded tables can be `const`; leaking here is bounded by the input file and this
+            // process exits immediately after printing.
+            component: c
+                .component
+                .clone()
+                .map(|s| &*Box::leak(s.into_boxed_str()))
+                .unwrap_or(""),
+        })
+        .collect();
+
+    let mut rows: Vec<char> = cells.iter().map(|c| c.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    println!(
+        "re-aggregated {} cells at {bucket} from `{path}` — rows {}",
+        cells.len(),
+        rows.iter().collect::<String>()
+    );
+    let sweep = S18Sweep { bucket, cells };
+    println!("  {}", sweep.summary());
+    match sweep.verdict() {
+        Ok(v) => println!("  VERDICT: {v}"),
+        Err(e) => panic!("{e}"),
     }
 }
 
