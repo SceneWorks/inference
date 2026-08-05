@@ -211,19 +211,57 @@ projection of that transcript. A deliberate reference refresh must update the ma
 receipt, and `CHECKSUMS.txt` in the same review as any changed acceptance number; silently
 accepting a new golden is not permitted.
 
-**Known stale binding (sc-17070): the transcript pins the verifier's own bytes.** `source_state()`
-hashes every path in the manifest's `scripts` map, and `verify_adapter_parity_artifacts.py` is one of
-them — so the frozen transcript's `source.files` records the *verifier's* SHA-256 beside the dump
-scripts that actually produced the goldens. Any byte edit to the verifier therefore makes a full
-(non-`--manifest-only`) run report `result transcript source files mismatch`. That is **not** drift in
-the parity evidence: the measurements, artifact hashes, model inventories, and receipt projection are
-all still bound and still check. It cannot be repaired in place — the frozen `files` dict already
-holds the old hash and `source_sha256` digests it — so the entry re-syncs on the next legitimate
-re-record, which is when sc-17070 should also narrow the hashed set to exclude the verifier. Do not
-re-record solely to clear it. As of the 2026-08-02 Windows path-comparison fix (compare the recorded
-reference-host model path as `PurePosixPath` rather than `str(Path(p).expanduser().absolute())`, which
-re-rooted the recorded `/Users/...` path onto the verifying host's drive and made the check
-permanently red off-host), the verifier's entry is stale in exactly this way.
+**What the transcript binds, and what it deliberately does not (sc-17070).** `source_state()` keeps
+two different sets. The **hashed** set — `bound_source_files()` — is the Rust sources plus every
+manifest `scripts` entry *except* `UNBOUND_SOURCE_FILES`, and its SHA-256 map is frozen into the
+transcript's `source.files`/`source_sha256`. The **changed-path allowlist** is that set plus
+`UNBOUND_SOURCE_FILES` plus `EVIDENCE_CHANGE_FILES`. `verify_adapter_parity_artifacts.py` is the sole
+unbound entry: the dump scripts, `_adapter_parity_provenance.py`, and `record_adapter_parity_transcript.py`
+*produced* the goldens and the measurements, so freezing their bytes is meaningful; the verifier only
+checks, so freezing its bytes would mean any edit to it — a pure bugfix included — invalidated the
+proof and demanded a licensed real-weight re-record that buys no extra assurance about the parity
+numbers. It keeps its `scripts` hash pin, which `validate_manifest` still enforces and which *is*
+repairable in place. Both halves are covered by tests that do not mock `source_state`; if the verifier
+is ever renamed, `bound_source_files()` refuses rather than silently rebinding it.
+
+**The retained transcript's source binding is stale — and not all of it is benign.** The frozen
+`source.files` matches the sc-15505 merge commit `071b84ff` exactly. Four bound entries have moved
+since, in two different classes. Audit them by class before concluding anything about a red run;
+`adapter_parity_receipt.json`'s `proof.source.files` is the committed, path-redacted copy of the
+frozen map, so the comparison needs no gitignored binaries.
+
+*Bookkeeping (does not weaken the proof).*
+
+- `verify_adapter_parity_artifacts.py` — the transcript was recorded while the verifier was still
+  hashed, so its entry is in the frozen `files` but no longer in `bound_source_files()`. The key
+  sets therefore differ. Benign by construction, and by design it will not recur after the next
+  re-record. That entry is also stale in its own right since the 2026-08-02 Windows path-comparison
+  fix (compare the recorded reference-host model path as `PurePosixPath` rather than
+  `str(Path(p).expanduser().absolute())`, which re-rooted the recorded `/Users/...` path onto the
+  verifying host's drive and made the check permanently red off-host).
+- `record_adapter_parity_transcript.py` — drifted before the sc-17070 split and again with it.
+  Editing the recorder necessarily moves its own hash; it produced the transcript, so that binding
+  is meant to be tight.
+
+*Real drift in producing source (sc-17651).* `mlx-gen-z-image/tests/adapter_real_weights.rs` and
+`mlx-gen-qwen-image/tests/adapter_real_weights.rs` — the harnesses that emit the `SC15505_RESULT`
+measurements — were changed by `11eab9cf` (sc-16057, process-unique temp fixtures) and `716c97d9`
+(sc-17284, macOS real-weight CI lanes). **The retained numbers attest to those files as of
+`071b84ff`, not to today's.** Nothing here re-runs them, so the evidence has not been shown to still
+hold; that is the drift this binding exists to surface, and it is an independent reason for a
+re-record, on its own schedule. `src/adapters.rs` and `hyper_flux_real_weights.rs` still match.
+
+None of this is repairable in place — the frozen `files` dict and `source_sha256` are what they are.
+**Do not re-record solely to clear the two bookkeeping entries.**
+
+Two operational notes. A full (non-`--manifest-only`) run from an ordinary `main` checkout never
+reaches the source comparison at all: `source_state()` raises `proof worktree contains changes
+outside the bound allowlist` first (942 paths differ from `implementation_base` at the time of
+writing). The comparison is only reachable from a detached checkout at `implementation_base`
+(`39a11d36…`) with the proof's source overlaid, which is the same protocol a re-record runs under.
+And when it is reached, any file-hash drift also moves `source_sha256`, which is compared first — so
+the failure you actually see is `result transcript source source_sha256 mismatch`, not the `files`
+one.
 
 ## Manifest
 

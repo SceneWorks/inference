@@ -134,7 +134,7 @@
     "dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
     "dump_z_image_adapter_golden.py": "b8eae6ae0759129f9529e0d9f6d0da0cbfcc169fc41e4f7035dfa9a6aa0d6dc0",
     "dump_z_image_golden.py": "8dce2bc4696abb54d4e6d6f81ce974b5b66df7971f7c19d2dba8fbd683d60060",
-    "record_adapter_parity_transcript.py": "528ad2e16f52d61d846ac826edab5f79ed6aa2c8f9a6d4515c357b539e4701a3",
+    "record_adapter_parity_transcript.py": "f6a8e8149f18f8b9b5c34fcc7465f1a1e81bf9aa24bddfc3d549e32580fac930",
     "verify_adapter_parity_artifacts.py": "b8add2ccf74e90aa7d88c6fa59987b29576fad282648ebd829e7698b97cdfc8b"
   },
   "artifacts": {
