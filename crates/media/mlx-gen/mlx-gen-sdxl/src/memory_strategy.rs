@@ -28,21 +28,26 @@
 //! | resident | bf16 | 20.513 GiB | — | — | — |
 //! | + rung 1 | bf16 | **19.003** | **−7.4%** | 780 | byte-identical |
 //! | staged (control) | q8 | 17.693 | — | 740-913 | — |
-//! | + rung 4, window 1 | q8 | **15.516** | **−12.31%** | 3591-3790 | byte-identical |
-//! | + rung 4, window 10 (default) | q8 | **15.516** | **−12.31%** | **1318-1325** | byte-identical |
+//! | + rung 4, window 1 (default) | q8 | **15.516** | **−12.31%** | 3591-3790 | byte-identical |
+//! | + rung 4, window 10 (selectable) | q8 | **15.516** | **−12.31%** | **1318-1325** | byte-identical |
 //!
 //! ## Rung 4's cost is time, and the CADENCE is the dial that sets it
 //!
 //! SC-16355 carried re-materialization latency as an explicit hazard — *"70 blocks across 11
 //! re-opens could be a severe regression on exactly the small Macs this rung exists for"* — and it
 //! was right. Nothing had measured it, and the first revision of this file published a single
-//! cadence of 1, which turns out to be the **worst** point on the frontier: it costs **+310%** wall
-//! clock for a saving every other cadence also achieves. At the published default of 10 the same
-//! −12.31% costs **+51%**.
+//! cadence of 1 without ever comparing it: at 1024² it costs **+310%** wall clock for a saving every
+//! other published cadence also achieves, and cadence 10 delivers the same −12.31% for **+51%**. The
+//! default stays at 1 for the reason on [`TRANSFORMER_WINDOW_SIZE`] — flatness does not hold at every
+//! advertised geometry — but a selector can now choose the cheap end, which it could not do while the
+//! domain had one value.
 //!
-//! The full sweep — peak, time and byte-identity per cadence, at two geometries — is on
-//! [`TRANSFORMER_WINDOW_SIZES`]. The short version is that the peak column is **flat**: this family
-//! is activation-bound rather than weight-bound, so widening the window buys time back for free.
+//! The full sweep — peak, time and byte-identity per cadence, over three tiers and three output
+//! sizes — is on [`TRANSFORMER_WINDOW_SIZES`]. The short version is that the peak column is **flat**
+//! at five of six measured configurations, and the mechanism is **phase separation**: the peak is
+//! taken in the *decode*, not in the windowed forward, so cadence cannot move it. It stops being flat
+//! at the smallest advertised output, where the decode transient no longer dominates — which is why
+//! the default is the tightest cadence and not the cheapest one.
 //!
 //! Latency is quoted as a range because it is a wall clock and moves with thermal state and machine
 //! load (five runs of the window-1 row: 3591 / 3654 / 3674 / 3698 / 3790 ms/step, a ~5% spread). The
@@ -56,24 +61,34 @@
 //! one — which it could not do while the domain had a single value.
 //!
 //! For contrast: the rung-2 geometry this family **withholds** would have bought −16.51% of the peak
-//! for ~5% wall clock. Rung 4 at its default buys −12.31% for +51%.
-//!
-//! The obvious lever against it is a **wider cadence** — the re-open count per sub-stack falls as the
-//! window widens — which is the one thing this domain does not currently offer. That is tracked
-//! rather than guessed at: publishing a second cadence requires its own measurement on every entry,
-//! and this story measured one.
+//! for ~7% wall clock. Rung 4 at its default cadence buys −12.31% for +310%; at cadence 10, where a
+//! selector may choose it, the same −12.31% costs +51%. Rung 2 would have been the better lever, and
+//! it is withheld on quality rather than on cost.
 //!
 //! ## Per-entry coverage is NOT uniform — measured, per entry, per tier
 //!
-//! | entry | tier | staged peak (4 steps) | ms/step | rung 4 |
-//! |---|---|---:|---:|---|
-//! | `sdxl` | bf16 | 19.005 GiB | 909 | Implemented |
-//! | `realvisxl` | bf16 | 19.003 | 780 | Implemented |
-//! | `realvisxl` | q4 | 16.654 | 1115 | Implemented |
-//! | `realvisxl` | q8 | 17.693 | 1120 | Implemented |
-//! | `realvisxl_lightning` | q4 | 16.654 | 1146 | Implemented |
-//! | `illustrious_xl_v1` | q8 | 17.693 | 1169 | **Missing** |
-//! | `illustrious_xl_v2` | q8 | 17.693 | 1164 | **Missing** |
+//! Both columns are per entry per tier, because SC-16355's AC is a **request peak measured per
+//! tier** and a capability published per tier that is measured on one entry is the same substitution
+//! this table exists to refuse. Every `Implemented` row below carries its own rung-4 row, taken at
+//! the shipped default cadence against that same entry's staged control
+//! (`every_catalog_entry_loads_and_publishes_the_ladder`, 1024², 4 steps):
+//!
+//! | entry | tier | staged peak | rung-4 peak (cadence 1) | rung 4 buys | rung 4 |
+//! |---|---|---:|---:|---:|---|
+//! | `sdxl` | bf16 | 19.005 GiB | 14.938 | **−21.40%** | Implemented |
+//! | `realvisxl` | bf16 | 19.003 | 14.936 | **−21.40%** | Implemented |
+//! | `realvisxl` | q4 | 16.654 | 15.493 | **−6.97%** | Implemented |
+//! | `realvisxl` | q8 | 17.693 | 15.516 | **−12.31%** | Implemented |
+//! | `realvisxl_lightning` | q4 | 16.654 | 15.493 | **−6.97%** | Implemented |
+//! | `illustrious_xl_v1` | q8 | 17.693 | — | — | **Missing** |
+//! | `illustrious_xl_v2` | q8 | 17.693 | — | — | **Missing** |
+//!
+//! **What rung 4 is worth is a function of the tier, and it is not small variation: −21.4% at bf16
+//! against −7.0% at q4.** That is the phase-separation mechanism read off a second axis — the saving
+//! is the whole `transformer_blocks` weight set (4.071 / 2.166 / 1.149 GiB by tier), so what changes
+//! across tiers is the numerator while the resident remainder and the decode transient barely move.
+//! A selector that sized rung 4's value off the q8 row would under-buy at bf16 by a factor of three.
+//! See [`TRANSFORMER_WINDOW_SIZES`] for the arithmetic.
 //!
 //! `realvisxl`/bf16 reads 19.003 GiB at **four** steps and also at six, because under rung 1 the
 //! request peak is the phase envelope `max(CLIP-L + bigG, U-Net + VAE)` — a residency bound, not an
@@ -375,54 +390,140 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// not per depth. 10 is therefore the widest cadence that means anything here: it holds one *whole*
 /// deep sub-stack, i.e. one re-open per stack per step instead of ten.
 ///
-/// ## All four cadences bound the peak identically. They differ only in time.
+/// ## Measured: four cadences, one saving — except at the smallest advertised output
 ///
-/// `transformer_window_sweep_and_streamed_output_identity`, `realvisxl` q8, fresh bundle per row,
-/// every row byte-identical to the resident control:
+/// `transformer_window_sweep_and_streamed_output_identity` (`SDXL_WINDOW_PROBE_TIER` /
+/// `SDXL_WINDOW_PROBE_SIZE` drive the off-default rows), `realvisxl`, fresh bundle per row, every row
+/// byte-identical to its resident control. Request peak in GiB:
 ///
-/// | cadence | 1024² peak | vs control | 1024² ms/step | 768² peak | vs control | 768² ms/step |
-/// |---:|---:|---:|---:|---:|---:|---:|
-/// | control (resident) | 17.693 GiB | — | 740-877 | 11.546 GiB | — | 451 |
-/// | 1 | **15.516** | −12.31% | 3591-3654 | **9.368** | −18.86% | 3355 |
-/// | 2 | **15.516** | −12.31% | 2221-2265 | **9.368** | −18.86% | 1953 |
-/// | 5 | **15.516** | −12.31% | 1554-1565 | **9.368** | −18.86% | 1220 |
-/// | **10** | **15.516** | −12.31% | **1318-1325** | **9.368** | −18.86% | **979** |
+/// | tier | output | control | cadence 1 | 2 | 5 | 10 | spread |
+/// |---|---:|---:|---:|---:|---:|---:|---:|
+/// | bf16 | 1024² | 19.003 | 14.936 | 14.936 | 14.936 | 14.936 | **0** |
+/// | q8 | 1024² | 17.693 | 15.516 | 15.516 | 15.516 | 15.516 | **0** |
+/// | q4 | 1024² | 16.654 | 15.493 | 15.493 | 15.493 | 15.493 | **0** |
+/// | q8 | 768² | 11.546 | 9.368 | 9.368 | 9.368 | 9.368 | **0** |
+/// | bf16 | 512² | 8.809 | 4.742 | 4.742 | 4.742 | 4.742 | **0** |
+/// | **q8** | **512²** | 7.499 | 5.321 | **5.095** | **5.384** | 5.321 | **5.7%** |
 ///
-/// Absolute ms/step is indicative, not a spec: a wall clock tracks machine load. One run taken while
-/// the box was busy read control 1243 / cadence 1 5195 / cadence 10 2230 — every number inflated,
-/// **the peak column unchanged**, and the cadence-1→10 ratio still 2.33×. Across five runs that ratio
-/// sits at **2.33-2.77×**, which is the quantity worth quoting; MLX's peak accounting is per process
-/// and does not move at all.
+/// Five of six configurations are flat to the millibyte. **The sixth is not, and it is the advertised
+/// `min_size`** — which is exactly where the phase-separation argument below says the flatness should
+/// fail, so it is a confirmed prediction rather than an anomaly. Note the 512² q8 row is also
+/// *non-monotonic* (cadence 2 beats cadence 1; cadence 5 is worst), which is allocator behaviour at a
+/// small working set rather than a clean weight-residency effect — one more reason not to build a
+/// default on it.
 ///
-/// **The peak column is flat to the millibyte at both geometries**, and that is the whole finding.
-/// It is also exactly what this family's profile predicts: the down→up **skip stack** holds the whole
-/// forward's activations alive, and rung 4 bounds *weights*. Once the windowed weight residency drops
-/// below that activation floor, widening the window buys back time without costing memory — and even
-/// a whole 10-deep sub-stack resident does not reach that floor. `docs/sc-16195/resolution-sweep.json`
-/// already put illustrious q8 at 4.74 GiB resident against a 14.04 GiB transient; this is that ratio
-/// showing up as a lever.
+/// Wall clock falls monotonically with cadence everywhere it was measured on a quiet machine
+/// (1024² q8: 3591 → 1325 ms/step, **2.7× cheaper**; 512² bf16: 5438 → 2076, 2.6×; 512² q8:
+/// 2977 → 710, **4.2×**). Absolute numbers track machine load — a run taken during another build read
+/// every row 3-5× inflated with **the peak column unchanged** — so the ratio is the quantity worth
+/// quoting and the wall-clock assertions in the sweep are deliberately loose.
 ///
-/// So the domain is published as **all four**, because they are four genuinely different points on a
-/// real time/memory frontier and the selector — not this file — owns that choice. That is the same
-/// posture `mlx_gen_z_image` takes for its decode ladder: *a domain, not a recommendation.*
+/// ### Rung 4's *relative* latency cost grows as the output shrinks
 ///
-/// An earlier revision published `[1]` alone and claimed windows 1 and 2 were "identical". The peak
-/// half of that was right by accident; the claim was unmeasurable as written (the sweep iterates this
-/// constant and `validate_window` refused everything outside it), and it hid the fact that the single
-/// published cadence was the **worst** point on the frontier — the same memory for 2.7× the time.
+/// Measured against each geometry's own unwindowed control, at the shipped cadence of 1:
+/// **4.9× at 1024², 7.4× at 768², 12.5× at 512².** That is not a regression appearing at small
+/// outputs; it is arithmetic. A re-open is weight I/O, so its cost is fixed and area-independent,
+/// while the control's per-step forward scales with area — the ratio therefore has to grow as area
+/// falls. It is worth stating because the small Mac this rung exists for is also the host most likely
+/// to be rendering small, and because the sweep's 12× ceiling is calibrated at 1024² and is reported
+/// rather than asserted when probing another geometry.
+///
+/// It is also the strongest argument a selector has for *choosing* a wide cadence: at 512² q8,
+/// cadence 10 lands on the identical 5.3213 GiB peak as cadence 1 and is **4.2× faster**.
+///
+/// ## The mechanism is PHASE SEPARATION, not a weight/activation ratio
+///
+/// A previous revision of this paragraph explained the flat peak as rung 4's windowed weight
+/// residency dropping *below* an activation floor held by the down→up skip stack, so that widening
+/// the window "buys back time without costing memory". **That explanation is refuted by this file's
+/// own numbers**, and the correction matters because the wrong mechanism licenses a wrong default.
+///
+/// The request peak is a `max` over phases, and rung 4 only bounds weights *inside one of them*. Read
+/// the saving against the U-Net safetensors headers (`realvisxl`, `unet/`, summing
+/// `data_offsets`, `transformer_blocks.*` against the whole file):
+///
+/// | tier | U-Net total | `transformer_blocks` | one deep block | measured saving | saving ÷ block set |
+/// |---|---:|---:|---:|---:|---:|
+/// | bf16 | 4.7823 GiB | 4.0706 GiB | 0.0647 GiB | 4.067 (1024² **and** 512²) | **0.999** |
+/// | q8 | 3.4566 | 2.1664 | 0.0345 | 2.177 (1024²), 2.178 (768²) | **1.005** |
+/// | q4 | 2.4169 | 1.1494 | 0.0183 | 1.161 (1024²) | **1.010** |
+///
+/// **The saving is the entire block weight set** — every tier, every geometry, to within a percent,
+/// and *identically* at 1024² and 512² on bf16 where the activation working sets differ four-fold.
+/// That is arithmetically incompatible with any window being resident when the peak is taken. Eleven
+/// `Transformer2D` sub-stacks run in sequence and `run_windowed` releases one before opening the
+/// next, so at most one cadence-worth of blocks is materialized at any instant: if the peak occurred
+/// during the windowed forward, the saving could be **at most** `block set − w × (one deep block)` —
+/// 2.132 GiB on q8 at cadence 1, 1.822 GiB at cadence 10. The measured 2.177 GiB exceeds *both*.
+///
+/// So **zero window weights are resident at the peak moment: the peak is not in the windowed forward
+/// at all.** It is the **decode**. Rung 1's staged schedule releases the text encoders but *not* the
+/// U-Net (`SdxlHeavyOwned` is one bundle, and the decode runs inside the same render closure — see
+/// the module docs), so the decode transient stacks on the full resident remainder. Rung 4 lowers the
+/// *floor* that transient stacks on, by the whole block set, and never touches the transient itself.
+/// Cadence is then invisible to the peak for the same reason the choice of denoise step count is: it
+/// is a property of a phase that is not the peak-bearing one.
+///
+/// Two independent corroborations, both already in this file. [`DECODE_SUPPORT`] measures that tiling
+/// **the decode alone** moves the request peak −16.51% — no change confined to the forward could do
+/// that if the forward were peak-bearing. And the rung-1 note in the module docs states the same
+/// stacking from the other direction.
+///
+/// ### The condition, stated so it can be checked
+///
+/// Flatness holds **only while** `decode transient + resident remainder` exceeds the windowed
+/// forward's own peak at the *widest* published cadence. The decode transient scales with output
+/// area; the windowed forward's peak scales with weights and is geometry-insensitive. So the
+/// inequality has to reverse as the output shrinks, and the first advertised geometry where it does
+/// is the boundary of the flat region. Measured, that is **512² q8** — the table above — where the
+/// spread opens to 5.7% and goes non-monotonic (cadence 2 saves 2.404 GiB, *more* than the 2.166 GiB
+/// block set exists to save, which is the signature of the peak having moved phases rather than of a
+/// weight bound tightening). 512² bf16 is still flat because its transient is the same area with 2×
+/// the weights beneath it, which keeps the decode ahead.
+///
+/// ### This is coupled to rung 2, and the coupling runs the wrong way
+///
+/// Every row above was measured with [`DECODE_SUPPORT`] `Missing`, i.e. with the decode transient at
+/// **full size** — which is precisely the term keeping the forward off the peak. A story that ships a
+/// bounded decode *lowers that term deliberately*, shrinking the flat region toward the small-output
+/// end and potentially eliminating it. **"Widening the cadence is free" is not a property of this
+/// family; it is a property of this family with rung 2 withheld.** Publishing rung 2 invalidates
+/// every rung-4 row here and must re-measure the cadence domain in the same change — see
+/// [`MEMORY_CALIBRATION_FINGERPRINT`], which must be bumped with it.
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 
 /// The transformer window rung 4 executes at when a request names none.
 ///
-/// **The widest cadence, not the tightest**, and that is a measured choice rather than a default
-/// inherited from the DiT adopters. On both measured geometries every cadence bounds the request peak
-/// to the same value (see [`TRANSFORMER_WINDOW_SIZES`]), so a caller who names nothing should get the
-/// cheapest point that achieves it: 10 costs +51% wall clock where 1 costs +310%.
+/// **The tightest cadence.** A draft of this story moved it to the widest on the strength of a flat
+/// peak at 1024² q8 — the reasoning being that if every cadence saves the same memory, a caller who
+/// names nothing should get the cheapest one. Measuring the rest of the advertised range killed that:
+/// the peak is *not* cadence-independent at 512² q8, where the spread is 5.7% and non-monotonic
+/// (see [`TRANSFORMER_WINDOW_SIZES`]). A default is the value a caller gets without asking, so it has
+/// to be the one that is safe across the whole advertised geometry range, not the one that is optimal
+/// in the middle of it.
 ///
-/// A cadence of 1 is still published and still selectable — the flatness is measured at 1024² and
-/// 768² on q8, and a selector facing a geometry where the activation floor is lower may want the
-/// tighter weight bound. What it must not be is the value a caller gets by accident.
-pub const TRANSFORMER_WINDOW_SIZE: u32 = 10;
+/// **The honest counter-argument, recorded because it is a good one.** On every configuration
+/// measured, cadence 10's peak equals cadence 1's exactly — including at 512² q8, where both read
+/// 5.3213 GiB — while cadence 10 is 2.6-4.2× faster. Read as a table of six rows, 10 dominates.
+///
+/// It is still not the default, and the reason is what the 512² row *shows about the domain* rather
+/// than what its endpoints happen to tie at. Once the peak is demonstrably cadence-dependent
+/// somewhere in the advertised range — cadence 2 is 4.26% below cadence 1 there and cadence 5 is
+/// 1.17% above — "cadence does not affect the peak" has stopped being a law and become a coincidence
+/// that held at four of the six points sampled. A tie between two points on a curve known to be
+/// non-monotonic, at six samples of a two-dimensional (tier × geometry) space, does not support
+/// extrapolation to the geometries nobody measured; the tightest weight bound does, because it is the
+/// bound rung 4 can always make good on. sc-17535 asked for exactly this posture in advance — "keep
+/// `TRANSFORMER_WINDOW_SIZE` at the tightest", "do not extrapolate from `realvisxl`" — and a draft of
+/// this file overrode it on evidence that turned out to be one tier at one geometry explained by the
+/// wrong mechanism.
+///
+/// So the default is the **conservative** choice — the tightest weight bound, which is also what
+/// every other MLX adopter on this ladder defaults to. The other three cadences remain published and
+/// selectable, and at 1024² a selector that does not need the tighter bound should absolutely pick 10
+/// and take the 2.7× wall-clock saving; it just has to *choose* it, against calibration for that
+/// cadence, rather than receive it by omission.
+pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
 /// The rung-4 **component scopes** this provider implements.
 ///
@@ -447,11 +548,17 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// Evidence generated against the single-cadence draft describes a different set of selectable
 /// executions — and a different default execution — so it must not be reusable here.
 ///
-/// **The paired evidence must be keyed per cadence, not per rung.** All four cadences bound the peak
-/// identically on this family (that is the whole reason the domain has four values), but they differ
-/// by up to 2.7× in wall clock, so a selector weighing peak against time needs a row per candidate.
+/// **The paired evidence must be keyed per cadence, not per rung.** The cadences differ by up to 2.7×
+/// in wall clock, and — at 512² q8 — by 5.7% in peak, so a selector weighing peak against time needs
+/// a row per candidate rather than one row for the rung.
 /// `MemoryFormulaVariable::TransformerWindowSize` is already declared on the formula for exactly
 /// this: the window is a variable of the cost, not a constant folded into it.
+///
+/// **This fingerprint is coupled to rung 2.** The cadence rows above were all measured with
+/// [`DECODE_SUPPORT`] `Missing`, and the reason most of them are flat is that the *decode* carries the
+/// peak (see [`TRANSFORMER_WINDOW_SIZES`]). A story that publishes a bounded decode changes which
+/// phase is peak-bearing, which invalidates every rung-4 row here — so it must bump this fingerprint
+/// and re-measure the cadence domain in the same change, not inherit these numbers.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v2";
 
 /// Whether THIS load can execute rung 4. **Four** independent facts decide it.
@@ -1201,10 +1308,11 @@ mod tests {
             Some(TRANSFORMER_WINDOW_SIZE as usize)
         );
         assert_eq!(
-            TRANSFORMER_WINDOW_SIZE,
-            *TRANSFORMER_WINDOW_SIZES.last().unwrap(),
-            "the default must be the widest published cadence: every cadence bounds the peak \
-             identically on this family, so the cheapest one is the honest default"
+            TRANSFORMER_WINDOW_SIZE, TRANSFORMER_WINDOW_SIZES[0],
+            "the default must be the TIGHTEST published cadence. A draft moved it to the widest on \
+             the strength of a flat peak at 1024²; 512² q8 is not flat (5.7% spread), and a default \
+             is what a caller gets without asking, so it must be safe across the whole advertised \
+             geometry range rather than optimal in the middle of it"
         );
         for component in [
             TransformerComponent::TextEncoder,

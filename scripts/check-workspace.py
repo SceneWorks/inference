@@ -702,18 +702,38 @@ def _configure_decode_hooks_are_unconditional_rejections(text: str) -> bool:
     return True
 
 
+# Constructs that make an `Err(...)` argument capable of *not* rejecting. `Err(match p() { Ok(())
+# => return Ok(()), Err(e) => e })` and `Err(if ok { return Ok(()); } else { nope() })` both compile
+# and both read as unconditional rejections to a shape-only reader; a macro can hide either
+# (`Err(or_accept!(plan(e, o)))`) and `rustfmt` does not expand macro bodies, so the brace-wrapping
+# that would otherwise make multi-line forms conspicuous cannot be relied on.
+_CONDITIONAL_IN_ERR_ARGUMENT = re.compile(r"\breturn\b|\bmatch\b|\bif\b|\?|\w\s*!\s*[\(\[{]")
+
+
 def _is_single_err_expression(body: str) -> bool:
-    """Whether ``body`` is exactly one ``Err(...)`` expression and nothing else.
+    """Whether ``body`` is exactly one *unconditional* ``Err(...)`` rejection.
 
     Shared by the two decode-hook shapes a provider can write, so "unconditional rejection" has one
     definition rather than one per seam.
+
+    Shape alone is not enough, and the SC-15525 probe proved it: `Err(` + balanced `)` + end-of-body
+    is satisfied by an argument that early-returns `Ok`. So the argument is additionally required to
+    contain no control flow that could escape it — no ``return``, ``?``, ``match`` or ``if``, and no
+    macro invocation, since a macro body is opaque here and to ``rustfmt`` alike.
+
+    The cost of that strictness is a provider that wants a computed rejection *reason* written with a
+    ``match``; it can hoist the reason into a named function, which is what the shipping provider
+    already does (``Err(refuse_decode(id, Some(edge), Some(overlap)))``).
     """
     body = body.strip()
     prefix = re.match(r"Err\s*\(", body)
     if prefix is None:
         return False
     outer_open = body.find("(", prefix.start())
-    return _match_paren(body, outer_open) == len(body)
+    if _match_paren(body, outer_open) != len(body):
+        return False
+    argument = body[outer_open + 1 : len(body) - 1]
+    return _CONDITIONAL_IN_ERR_ARGUMENT.search(argument) is None
 
 
 # The shared MLX request-scope constructor. Its LAST positional argument is the provider's decode
@@ -726,6 +746,29 @@ def _is_single_err_expression(body: str) -> bool:
 # entire MLX provider family: flip the closure's `Err` to `Ok` and a native geometry reaches the PiD
 # seam with the gate silent.
 MLX_REQUEST_SCOPE_CONSTRUCTOR = "MlxRequestScopeConfig::new"
+
+# The config TYPE itself. Every one of its fields is `pub`, so the constructor is a convention rather
+# than a chokepoint — see `_decode_validators_are_unconditional_rejections` for the two shapes that
+# exploited that in the first revision.
+MLX_REQUEST_SCOPE_CONFIG_TYPE = "MlxRequestScopeConfig"
+
+# Assignment to the validator field after construction, and a struct-literal build of the config.
+# Both put a live validator into a scope without ever touching the checked constructor.
+_DECODE_VALIDATOR_REASSIGNMENT = re.compile(r"\.\s*decode_validator\s*=")
+_SCOPE_CONFIG_STRUCT_LITERAL = re.compile(
+    re.escape(MLX_REQUEST_SCOPE_CONFIG_TYPE) + r"\s*\{"
+)
+
+
+def _opens_a_closure(text: str, arg_start: int, bar_index: int) -> bool:
+    """Whether the ``|`` at ``bar_index`` begins a closure's parameter list.
+
+    True only when everything between the argument's start and the bar is whitespace, optionally
+    preceded by ``move``. Anything else is a bitwise/pattern or, which must not be treated as a
+    delimiter — doing so swallowed the following argument separators and produced a false red on a
+    call site whose validator genuinely rejects.
+    """
+    return re.fullmatch(r"\s*(?:move\s+)?", text[arg_start:bar_index]) is not None
 
 
 def _split_top_level_args(text: str) -> list[str]:
@@ -755,9 +798,11 @@ def _split_top_level_args(text: str) -> list[str]:
                 elif text[i] == '"':
                     break
                 i += 1
-        elif char == "|" and depth == 0:
+        elif char == "|" and depth == 0 and _opens_a_closure(text, start, i):
             # A closure parameter list at argument level. Skip to its closing `|` so a `,` between
-            # closure parameters is not mistaken for an argument separator.
+            # closure parameters is not mistaken for an argument separator. Only when the `|` STARTS
+            # the argument (optionally after `move`): a bitwise-or in an earlier argument used to
+            # swallow the real closure's delimiters and route-check an honestly-rejecting call site.
             close = text.find("|", i + 1)
             if close != -1:
                 i = close
@@ -768,21 +813,79 @@ def _split_top_level_args(text: str) -> list[str]:
     return args
 
 
+def _mentions_scope_config(text: str) -> bool:
+    """Whether the crate names the MLX request-scope config type at all, under any spelling."""
+    return MLX_REQUEST_SCOPE_CONFIG_TYPE in text
+
+
+def _scope_config_aliases(text: str) -> set[str]:
+    """Every local name the scope-config type answers to in this crate.
+
+    The SC-15525 probe defeated a literal-substring reader with `use … as ScopeConfig`, `type Scope =
+    MlxRequestScopeConfig`, and the qualified `<path::MlxRequestScopeConfig>::new` form — each one
+    `rustfmt`-stable and each one compiling today. Enumerating spellings is a losing game, so the
+    type is resolved instead: collect the local aliases, then match construction against all of them.
+    """
+    aliases = {MLX_REQUEST_SCOPE_CONFIG_TYPE}
+    pattern = re.escape(MLX_REQUEST_SCOPE_CONFIG_TYPE)
+    for match in re.finditer(
+        r"\buse\s+[^;]*?\b" + pattern + r"\s+as\s+(\w+)\s*[;,}]", text
+    ):
+        aliases.add(match.group(1))
+    for match in re.finditer(
+        r"\btype\s+(\w+)\s*(?:<[^=]*>)?\s*=\s*[^;]*?\b" + pattern + r"\b[^;]*;", text
+    ):
+        aliases.add(match.group(1))
+    return aliases
+
+
 def _decode_validators_are_unconditional_rejections(text: str) -> bool:
-    """Whether every decode validator handed to [`MLX_REQUEST_SCOPE_CONSTRUCTOR`] refuses outright.
+    """Whether every decode validator this crate installs refuses outright.
 
     The closure twin of :func:`_configure_decode_hooks_are_unconditional_rejections`, and the one an
     MLX family actually writes. Deliberately narrow, in the same way: only a literal closure whose
     entire body is one ``Err(...)`` counts. A named function, a delegation, a ``match``, or any
-    closure with a success arm is an adoption signal and must go through ``DecodeRoutes``.
+    closure with a success arm is an adoption signal and must use ``DecodeRoutes``.
 
-    Returns ``False`` — never a silent pass — when the constructor is called in a shape this reader
-    cannot resolve, so an unparseable call arms the gate instead of disarming it.
+    Returns ``False`` — never a silent pass — when a validator reaches the scope by a route this
+    reader cannot resolve. Three routes exist, because **every field of the config type is `pub`**,
+    which makes ``::new`` a convention rather than a chokepoint:
+
+    1. the checked constructor's last positional argument (what every shipping provider writes);
+    2. **assignment to** ``.decode_validator`` after construction. `mlx_gen_sdxl::memory_strategy`
+       already mutates the config two lines after ``::new`` (``config.attention_chunk_size = None``),
+       so this shape is one line from code that ships — and invisible to a reader that only inspects
+       the call site;
+    3. a **struct literal**, which bypasses ``::new`` entirely. The first revision returned ``True``
+       *vacuously* here: no ``::new`` match meant an empty loop meant "everything refuses", flatly
+       contradicting this docstring.
+
+    (2) and (3) are refused outright rather than parsed. A provider that declares rung 2 ``Missing``
+    has no legitimate reason to install a validator by either route, so "cannot prove it refuses" and
+    "should not be doing this at all" have the same answer.
     """
-    for start in re.finditer(re.escape(MLX_REQUEST_SCOPE_CONSTRUCTOR), text):
-        open_index = text.find("(", start.end())
-        if open_index < 0:
-            return False
+    aliases = _scope_config_aliases(text)
+    names = "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
+
+    # (3) A struct literal bypasses the constructor entirely. Under any of its names.
+    if re.search(r"(?:" + names + r")\s*\{", text):
+        return False
+    # (2) A post-construction overwrite defeats any amount of care taken at the call site.
+    if _DECODE_VALIDATOR_REASSIGNMENT.search(text):
+        return False
+
+    # (1) Every recognized construction site, resolved by TYPE rather than by one literal spelling.
+    # `Alias::new(`, `Type::new(` and the qualified `<path::Type>::new(` form all resolve here.
+    sites = list(re.finditer(r"(?:<[^<>]*?(?:" + names + r")>|(?:" + names + r"))\s*::\s*new\s*\(", text))
+    if not sites:
+        # The crate never names the scope config under any alias — a rung-4-only or non-MLX adopter
+        # with no validator to be wrong about. Anything else reached the `names` branch and is
+        # handled above or below; a crate that NAMES the type but whose construction this reader
+        # cannot resolve falls through to the `False` here, which is the inversion the SC-15525 probe
+        # asked for: an unrecognized construction ARMS the gate rather than disarming it.
+        return not _mentions_scope_config(text)
+    for start in sites:
+        open_index = text.rfind("(", start.start(), start.end())
         end = _match_paren(text, open_index)
         if end > len(text):
             return False
@@ -796,51 +899,81 @@ def _decode_validators_are_unconditional_rejections(text: str) -> bool:
     return True
 
 
-# `MemoryStrategy::BoundedDecode => <expr>,` — the contract arm that states this provider's rung-2
-# support. The arm is the semantic fact the SC-15525 exemption is keyed on; `<expr>` is captured so a
-# declaration made through a named `const` can be followed one hop.
-_BOUNDED_DECODE_SUPPORT_ARM = re.compile(
-    r"BoundedDecode\s*(?:if\s+[^=]*?)?=>\s*([^,\n]+?)\s*[,\n]"
-)
+# The support expression a `BoundedDecode` arm resolves to.
 _MISSING_SUPPORT_EXPR = re.compile(r"^(?:MemoryStrategySupport::)?Missing$")
+_CONST_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
-def _declares_bounded_decode_missing(text: str) -> bool:
+def _bounded_decode_arm_tails(text: str) -> list[str]:
+    """Every ``BoundedDecode`` occurrence's arm tail — the token through to end of line.
+
+    Taken as a whole line rather than parsed, because the shapes that defeated the first regex all
+    hid *between* the token and the support expression: an or-pattern (``BoundedDecode |
+    BoundedAttention => Implemented``) and a guard whose ``>=`` the old ``[^=]*?`` could not cross
+    (``BoundedDecode if self.tiles >= 2 => Implemented``). A line is coarse, and coarse is the right
+    direction here: it can only over-capture, and over-capturing fails closed.
+    """
+    tails = []
+    for match in re.finditer(r"\bBoundedDecode\b", text):
+        newline = text.find("\n", match.end())
+        tails.append(text[match.start() : len(text) if newline < 0 else newline])
+    return tails
+
+
+def _declares_bounded_decode_missing(files: list[str]) -> bool:
     """Whether this provider's contract textually declares ``BoundedDecode`` support **Missing**.
 
-    SC-15525 review defeat (B): the first revision keyed its exemption on the *absence* of the
-    ``decode_tile_edges`` / ``decode_overlaps`` literals, which is a proxy for "publishes no domain"
-    that a provider defeats simply by building its ``MemoryParameterRanges`` in another crate — while
-    declaring ``BoundedDecode`` **Implemented**. Absence of evidence was doing the work of evidence.
+    Keyed on the **positive claim**. The first revision keyed the exemption on the *absence* of the
+    ``decode_tile_edges`` / ``decode_overlaps`` literals, which review defeat (B) broke by building
+    ``MemoryParameterRanges`` in another crate while declaring rung 2 **Implemented**: absence of
+    evidence was doing the work of evidence.
 
-    So the exemption is now keyed on the positive claim instead: the crate must *say* rung 2 is
-    Missing. Two spellings are accepted, because both ship today — the support expression written
-    inline, and the same expression behind a named ``const`` this module follows exactly one hop
-    (SDXL's ``DECODE_SUPPORT``). Anything else — a computed support, a second hop, an arm this reader
-    cannot parse — is not a declaration it can verify, and the provider falls through to the route
-    checks.
+    Takes the per-file evidence rather than the concatenated crate, because the const hop must be
+    **scoped**. Resolving ``DECODE_SUPPORT`` by a crate-wide search let a dead or deprecated sibling
+    const of the same name satisfy a live ``Implemented`` arm in another module (SC-15525 probe, root
+    cause D). One hop, same file, or no exemption.
 
-    At least one arm must be found: a crate with no ``BoundedDecode`` arm at all has declared nothing
-    and is not exempt.
+    Three rules, each closing a defeated shape:
+
+    1. **No ``Implemented`` may appear in any ``BoundedDecode`` arm line.** This is what catches the
+       or-pattern and the ``>=`` guard, without this reader having to parse either.
+    2. **Exactly one support arm may exist in the whole crate.** A dead ``Missing`` arm parked beside
+       a live one — in a ``deprecated_v1`` module, or generated by a macro — is how root cause E
+       turned a real ``Implemented`` declaration into an exemption.
+    3. The single arm resolves to ``Missing`` inline, or one hop through a ``const`` **declared in the
+       same file**.
+
+    Named limitation: a macro that *generates* the support arms leaves no ``BoundedDecode`` token to
+    inspect. Rule 2 turns that into "zero arms found" and therefore no exemption, which is the safe
+    answer; but a macro-generated `Implemented` paired with a hand-written `Missing` arm elsewhere
+    would satisfy rule 2. The registry conformance walk covers the semantic declaration, and that is
+    where a macro adopter has to be caught — a text gate cannot expand macro bodies.
     """
-    arms = _BOUNDED_DECODE_SUPPORT_ARM.findall(text)
-    if not arms:
+    support_arms: list[tuple[str, str]] = []  # (rhs expression, owning file text)
+    for source in files:
+        for tail in _bounded_decode_arm_tails(source):
+            if "=>" not in tail:
+                # A bare mention — `contract.engages(…, MemoryStrategy::BoundedDecode)` and friends.
+                continue
+            if "Implemented" in tail:
+                return False
+            rhs = tail.rsplit("=>", 1)[1].strip().rstrip(",").strip()
+            support_arms.append((rhs, source))
+    if len(support_arms) != 1:
         return False
-    for expr in arms:
-        expr = expr.strip()
-        if _MISSING_SUPPORT_EXPR.match(expr):
-            continue
-        # One hop through a named const: `const NAME: MemoryStrategySupport = ...::Missing;`
-        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", expr):
-            return False
-        const_decl = re.search(
+    expr, owning_file = support_arms[0]
+    if _MISSING_SUPPORT_EXPR.match(expr):
+        return True
+    if not _CONST_NAME.match(expr):
+        return False
+    return (
+        re.search(
             r"\bconst\s+" + re.escape(expr) + r"\s*:\s*MemoryStrategySupport\s*=\s*"
             r"(?:MemoryStrategySupport::)?Missing\s*;",
-            text,
+            owning_file,
         )
-        if const_decl is None:
-            return False
-    return True
+        is not None
+    )
 
 
 def _match_paren(text: str, open_index: int) -> int:
@@ -973,6 +1106,12 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
        unconditionally: the ``configure_decode`` trait method *and* the closure handed to
        ``MlxRequestScopeConfig::new``. The latter is the one that matters in practice — no MLX
        provider writes the former.
+    4. It is a **text** gate, and two things stay outside its reach by construction. A ``macro_rules``
+       expansion that generates the support arms or the ``configure_decode`` impl leaves no tokens to
+       inspect; and a helper in another crate that builds a scope config is not this crate's source.
+       Both are handled by *arming* rather than exempting — an unresolvable construction, or zero
+       support arms, both fail closed — but neither can be positively verified here. The weights-free
+       registry conformance walk is what covers the semantic declaration.
 
     String/character literals and constructs that cannot compile without the Rust ``test`` cfg are
     excluded from evidence matching. Trigger matching uses a separate cfg-unblanked syntax stream,
@@ -1021,8 +1160,13 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         # the shared MLX request scope — must be an unconditional rejection. See
         # `_decode_validators_are_unconditional_rejections` for why the closure is the load-bearing
         # half on MLX.
+        # Matched with the SAME regex the helper uses. The first revision short-circuited on the
+        # literal `"fn configure_decode"`, which `fn  configure_decode` (two spaces) and a
+        # newline-split signature both slip past — defeating this gate's own pinned test by one
+        # keystroke.
+        defines_configure_decode = re.search(r"\bfn\s+configure_decode\b", triggers) is not None
         hooks_all_refuse = (
-            "fn configure_decode" not in triggers
+            not defines_configure_decode
             or _configure_decode_hooks_are_unconditional_rejections(triggers)
         ) and _decode_validators_are_unconditional_rejections(triggers)
         if (
@@ -1055,7 +1199,7 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
             marker in triggers for marker in ("decode_tile_edges", "decode_overlaps")
         )
         if (
-            _declares_bounded_decode_missing(evidence)
+            _declares_bounded_decode_missing(evidence_sources)
             and not publishes_decode_domain
             and hooks_all_refuse
         ):

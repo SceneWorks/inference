@@ -314,6 +314,14 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
 /// The latent is a real one: a full render at 1024², re-encoded through the same VAE, so the
 /// GroupNorm statistics the tail tiles are the statistics of a real image rather than of noise.
 ///
+/// **This is an exploration harness, and it asserts one thing only.** The 32-cell grid it prints is
+/// evidence for a human reading the rung-2 write-up, not a gate: pinning 32 drift values would fail
+/// on any MLX kernel change without telling anyone anything useful. What it *does* pin is the single
+/// cell the verdict cites — the best geometry at the default output size — because that number
+/// appears in `memory_strategy::DECODE_SUPPORT` and in `refuse_decode`'s user-facing message. The
+/// range argument that actually decides the rung is asserted separately, in
+/// `no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`.
+///
 /// Set `SDXL_SWEEP_EDGES` / `SDXL_SWEEP_OVERLAPS` (comma-separated) to explore; the defaults are the
 /// published ladder and its rejection set.
 #[test]
@@ -370,6 +378,7 @@ fn decode_tile_mechanism_sweep() {
 
     println!("[sc-15525 rung2 mechanism] latent {:?}", latent.shape());
     println!("[sc-15525 rung2 mechanism] untiled decode peak {untiled_peak:.3} GiB at {size}²");
+    let mut cited: Option<u32> = None;
     println!("| edge | overlap | tiles | isolated peak (GiB) | max Δ | mean Δ |");
     println!("|---:|---:|---:|---:|---:|---:|");
     for overlap in &overlaps {
@@ -395,12 +404,26 @@ fn decode_tile_mechanism_sweep() {
             let px = mlx_gen_sdxl::decoded_to_image(&tiled)
                 .expect("tiled image")
                 .pixels;
+            let drift = max_delta(&ref_px, &px);
             println!(
-                "| {edge} | {overlap} | {tiles} | {peak:.3} | {} | {:.4} |",
-                max_delta(&ref_px, &px),
+                "| {edge} | {overlap} | {tiles} | {peak:.3} | {drift} | {:.4} |",
                 mean_delta(&ref_px, &px)
             );
+            if size == 1024 && *edge == ms::DECODE_TILE_EDGE && *overlap == BEST_DECODE_OVERLAP {
+                cited = Some(drift);
+            }
         }
+    }
+    // The one cell this harness gates: the number `memory_strategy::DECODE_SUPPORT` publishes and
+    // `refuse_decode` puts in front of a user. Only asserted when the sweep is run at its defaults —
+    // an explicitly narrowed sweep is exploring, and should not be forced to reproduce it.
+    if let Some(drift) = cited {
+        assert!(
+            drift <= SIBLING_DRIFT_BAR,
+            "the best swept geometry now drifts {drift}/255 at 1024², above the \
+             {SIBLING_DRIFT_BAR}/255 sibling bar. DECODE_SUPPORT and `refuse_decode`'s message both \
+             quote the old figure — re-derive them"
+        );
     }
 }
 
@@ -445,7 +468,11 @@ fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range(
     let vae = mlx_gen_sdxl::load_vae(&dir).expect("load vae");
 
     let mut rows: Vec<(u32, u32, f64)> = Vec::new();
-    for size in [1024_u32, 1280, 1536] {
+    // 2048² is included because `refuse_decode`'s user-facing message quotes its number. A published
+    // figure — especially one in an error string a user reads — must come from a test, which is the
+    // defect class the first review blocked this PR on. It is the slowest row here by far; that is
+    // the cost of quoting it.
+    for size in [1024_u32, 1280, 1536, 2048] {
         // Fresh generator per size: the latent must be a real image's, and a reused bundle would
         // carry the previous size's materialization into this one's isolated decode peak.
         let model = registry
@@ -501,7 +528,7 @@ fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range(
         at(1024),
     );
     // Half two: and it is NOT admissible across the advertised range, which is why it is withheld.
-    for size in [1280_u32, 1536] {
+    for size in [1280_u32, 1536, 2048] {
         assert!(
             at(size) > SIBLING_DRIFT_BAR,
             "edge {} overlap {BEST_DECODE_OVERLAP} now clears {SIBLING_DRIFT_BAR}/255 at {size}² \
@@ -696,6 +723,63 @@ fn measure_end_to_end(
     }
 }
 
+/// **The re-assembly is bound to the real `generate`, because two withholding verdicts rest on it.**
+///
+/// [`measure_end_to_end`] rebuilds the staged request from the public pipeline entry points, and both
+/// rung 2's and rung 3's `Missing` verdicts are measured through it — because the production path
+/// refuses both selections, so `generate` cannot produce either row. Its doc claimed the
+/// reconstruction reproduces `generate`'s staged peak "to the millibyte" and **nothing bound them**.
+/// A change to `Sdxl::generate_impl` — a dtype, an added component, a reordered phase — would leave
+/// both verdicts resting on a harness that no longer models the thing it is standing in for, with
+/// nothing red.
+///
+/// This is that binding. It compares the reconstruction's unchunked, untiled peak against a real
+/// `generate` row under the same staged selection at the same geometry and step count.
+///
+/// The margin is 1%, not a bare equality: the two paths are the same phases in the same order, and
+/// they agree to **0.001%** today (19.0030 through `generate`, 19.0032 through the re-assembly), but
+/// MLX peak accounting is exact only for a fixed allocation sequence and the harness does not
+/// reproduce `generate`'s progress/cancel plumbing. 1% is a thousand times the observed disagreement
+/// and far tighter than any structural divergence: pointing the re-assembly at 768² while `generate`
+/// renders 1024² reddens it at 47.8%.
+///
+/// **What it binds is the PEAK, and that is not the same as total fidelity.** A divergence that does
+/// not move the peak passes — enabling attention chunking on one side only was tried as a mutation
+/// and stayed green, because rung 3 moves this family's request peak 0.00%, which is itself one of
+/// the two reasons `memory_strategy::ATTENTION_SUPPORT` is `Missing`. That is the honest scope: this
+/// test is what makes the rung-2 and rung-3 *peak* numbers attributable to `generate`; it is not a
+/// general equivalence proof between the two paths.
+#[test]
+#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
+    let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
+    };
+    const STEPS: u32 = 6;
+    let production = measure(
+        &dir,
+        "bf16",
+        LoadShape::EagerMaterialization,
+        &request(Some(staged()), 1024, STEPS),
+    );
+    let reassembled = measure_end_to_end(&dir, STEPS as usize, false, None);
+    let drift = 100.0 * (reassembled.peak_gib - production.peak_gib).abs() / production.peak_gib;
+    println!(
+        "[sc-15525 harness fidelity bf16 1024² {STEPS} steps] generate {:.4} GiB vs re-assembly \
+         {:.4} GiB ({drift:.3}% apart)",
+        production.peak_gib, reassembled.peak_gib
+    );
+    assert!(
+        drift < 1.0,
+        "the rung-2/rung-3 harness no longer models `generate`'s staged request ({:.4} vs {:.4} \
+         GiB, {drift:.2}% apart). Both withholding verdicts are measured through that re-assembly, \
+         so they are only as good as this agreement — re-derive the harness against \
+         `Sdxl::generate_impl` before trusting either number again",
+        reassembled.peak_gib,
+        production.peak_gib
+    );
+}
+
 /// **The rung-3 REQUEST-level measurement** — the first of the two independent reasons rung 3 is
 /// declared `Missing`, and the one [`attention_chunking_is_measured_at_the_unet_seam`] cannot supply.
 ///
@@ -856,8 +940,25 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 #[test]
 #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn transformer_window_sweep_and_streamed_output_identity() {
-    let Some(dir) = tier_dir(REPRESENTATIVE, "q8") else {
-        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing q8/");
+    // `SDXL_WINDOW_PROBE_TIER` / `SDXL_WINDOW_PROBE_SIZE` re-run the sweep at another tier or output
+    // edge. The bf16/q4 and 512² rows in `ms::TRANSFORMER_WINDOW_SIZES`' tables come from them, and
+    // they are what establish that the flat peak is a property of the PHASE SEPARATION rather than of
+    // one tier at one geometry.
+    // Probe mode: any off-default tier/size. The peak-flatness and wall-clock-frontier assertions
+    // below are claims about the DEFAULT configuration — flatness is measured false at 512² q8, and a
+    // wall clock is meaningless on a loaded machine — so in probe mode they are reported instead of
+    // asserted. What stays asserted in BOTH modes is what is true of every configuration: each
+    // cadence bounds the request peak below the control, and every row is byte-identical to it.
+    // The 12x latency ceiling is NOT in that set — an earlier draft of this comment claimed it was,
+    // and probing 512² falsified the claim at 12.6x. The re-open cost is area-independent while the
+    // control's forward is not, so that ratio is geometry-bound by construction; see the ceiling
+    // itself for the numbers.
+    let probing = std::env::var("SDXL_WINDOW_PROBE_TIER").is_ok()
+        || std::env::var("SDXL_WINDOW_PROBE_SIZE").is_ok();
+    let tier = std::env::var("SDXL_WINDOW_PROBE_TIER").unwrap_or_else(|_| "q8".to_owned());
+    let tier: &str = &tier;
+    let Some(dir) = tier_dir(REPRESENTATIVE, tier) else {
+        panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing {tier}/");
     };
     let deferred = LoadShape::DeferredMaterialization;
     // The attribution control: the same composition WITHOUT rung 4, on a deferred load, so the only
@@ -867,9 +968,9 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
-    let control = measure(&dir, "q8", deferred, &request(Some(staged()), edge, STEPS));
+    let control = measure(&dir, tier, deferred, &request(Some(staged()), edge, STEPS));
     println!(
-        "[sc-15525 rung4 q8 {edge}²] staged, no window (attribution control) {:.3} GiB, \
+        "[sc-15525 rung4 {tier} {edge}²] staged, no window (attribution control) {:.3} GiB, \
          {:.0} ms/step",
         control.peak_gib,
         ms_per_step(&control, STEPS)
@@ -878,7 +979,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     for window in ms::TRANSFORMER_WINDOW_SIZES {
         let row = measure(
             &dir,
-            "q8",
+            tier,
             deferred,
             &request(Some(full_ladder(*window)), edge, STEPS),
         );
@@ -888,7 +989,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         // once per `Transformer2D` per step — eleven re-opens covering 70 blocks — and what that
         // costs is a fact about this rung, not an implementation detail.
         println!(
-            "[sc-15525 rung4 {edge}² window {window}] request peak {:.3} GiB ({:+.2}% vs control), \
+            "[sc-15525 rung4 {tier} {edge}² window {window}] request peak {:.3} GiB ({:+.2}% vs control), \
              {:.0} ms/step ({:+.1}% vs control)",
             row.peak_gib,
             100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
@@ -919,13 +1020,28 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         // machine is doing, so asserting anything near the measurement would be asserting the
         // weather. 12x still leaves a substantial worsening detectable, which is the failure worth
         // catching — a re-open path that starts thrashing rather than one that drifts 15%.
+        //
+        // **The ceiling is a claim about the DEFAULT geometry, so probe mode reports it instead.**
+        // Re-materialization cost is weight I/O: it is fixed per re-open and does not scale with
+        // output area, while the control's per-step forward very much does. So the RATIO is a
+        // function of geometry by construction, and it grows as the output shrinks — measured 4.9x at
+        // 1024², 7.4x at 768², and 12.6x at 512², which trips a ceiling calibrated at 1024². That is
+        // the mechanism behaving exactly as described, not a regression, and asserting a single
+        // constant across a 4x area range would be asserting something this rung never claimed.
         let slowdown = ms_per_step(&row, STEPS) / ms_per_step(&control, STEPS);
-        assert!(
-            slowdown < 12.0,
-            "window {window} re-materialization cost {slowdown:.1}x the control's ms/step — \
-             SC-16355 flagged exactly this as a severe-regression risk, and past 12x the rung stops \
-             being a trade a selector could reasonably make"
-        );
+        if probing {
+            println!(
+                "[sc-15525 rung4 {tier} {edge}² cadence {window}] {slowdown:.1}x the control's \
+                 ms/step — ceiling NOT asserted in probe mode (it is calibrated at 1024²)"
+            );
+        } else {
+            assert!(
+                slowdown < 12.0,
+                "window {window} re-materialization cost {slowdown:.1}x the control's ms/step — \
+                 SC-16355 flagged exactly this as a severe-regression risk, and past 12x the rung \
+                 stops being a trade a selector could reasonably make"
+            );
+        }
     }
 
     // ── The two facts that make this a DOMAIN rather than four spellings of one choice ───────────
@@ -942,6 +1058,14 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let (tightest, tight_peak, tight_ms) = rows[0];
     let (widest, _wide_peak, wide_ms) = *rows.last().expect("at least one row");
     for (window, peak, _) in &rows {
+        if probing {
+            println!(
+                "[sc-15525 rung4 {tier} {edge}² cadence {window}] peak {peak:.4} GiB \
+                 ({:+.2}% vs cadence {tightest}) — flatness NOT asserted in probe mode",
+                100.0 * (peak - tight_peak) / tight_peak
+            );
+            continue;
+        }
         assert!(
             (peak - tight_peak).abs() < tight_peak * 0.01,
             "cadence {window} peaked at {peak:.4} GiB against cadence {tightest}'s {tight_peak:.4} \
@@ -955,13 +1079,13 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     //     noise cannot clear while still failing loudly if the re-open count stops tracking the
     //     cadence at all (which is what a `BlockPlan` that ignored the window would look like).
     assert!(
-        wide_ms < tight_ms * 0.75,
+        probing || wide_ms < tight_ms * 0.75,
         "widening the cadence {tightest} -> {widest} did not buy time back ({tight_ms:.0} -> \
          {wide_ms:.0} ms/step). The domain is published as a time/memory frontier; if every cadence \
          costs the same, it is not one and only the tightest should ship"
     );
     println!(
-        "[sc-15525 rung4 {edge}² frontier] cadence {tightest} -> {widest}: peak flat at \
+        "[sc-15525 rung4 {tier} {edge}² frontier] cadence {tightest} -> {widest}: peak flat at \
          {tight_peak:.3} GiB, wall clock {tight_ms:.0} -> {wide_ms:.0} ms/step ({:.2}x cheaper)",
         tight_ms / wide_ms
     );
@@ -1229,6 +1353,12 @@ const EXPECTED_RUNG_FOUR: &[(&str, &str, bool)] = &[
 /// matters for the two `illustrious` entries — the day their snapshot grows its `quantization`
 /// marker, this test fails and says so, instead of leaving the evidence overstating coverage for
 /// another cycle.
+///
+/// **And where rung 4 is declared Implemented, this test now measures what it is worth there** —
+/// SC-16355's "request peak measured per tier" AC. Publishing a capability per entry per tier while
+/// measuring its value on one entry is the same class of substitution as publishing a peak without
+/// saying which row it came from; the other four Implemented declarations were inheriting
+/// `realvisxl`'s number by family resemblance. Each now carries its own.
 #[test]
 #[ignore = "needs the real SDXL-family snapshots (see the module docs for the env vars)"]
 fn every_catalog_entry_loads_and_publishes_the_ladder() {
@@ -1236,6 +1366,7 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
 
     let mut covered = Vec::new();
     let mut absent = Vec::new();
+    let mut exercised: Vec<(&str, &str)> = Vec::new();
     let mut streaming = Vec::new();
     let mut not_streaming = Vec::new();
     for (entry, var) in ENTRIES {
@@ -1262,17 +1393,23 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
                 "{entry}/{tier}: `streamable` and the published rung-4 support disagree — the \
                  contract must never advertise a rung this load cannot execute"
             );
-            if let Some((_, _, expected)) = EXPECTED_RUNG_FOUR
+            let expected = EXPECTED_RUNG_FOUR
                 .iter()
                 .find(|(e, t, _)| *e == *entry && *t == tier)
-            {
-                assert_eq!(
-                    streams, *expected,
-                    "{entry}/{tier}: rung-4 availability changed. EXPECTED_RUNG_FOUR (and the \
-                     contract evidence, and the SceneWorks matrix cell) must be updated together — \
-                     see that table for why these two entries differ"
-                );
-            }
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{entry}/{tier} is cached and was measured, but has no EXPECTED_RUNG_FOUR \
+                         row. A newly-cached tier must be added to that table (and to the contract \
+                         evidence and the SceneWorks matrix) rather than measured unverified"
+                    )
+                });
+            assert_eq!(
+                streams, expected.2,
+                "{entry}/{tier}: rung-4 availability changed. EXPECTED_RUNG_FOUR (and the contract \
+                 evidence, and the SceneWorks matrix cell) must be updated together — see that \
+                 table for why the illustrious entries differ"
+            );
+            exercised.push((*entry, tier));
 
             let row = measure(&dir, tier, shape, &request(Some(staged()), 1024, 4));
             println!(
@@ -1282,7 +1419,41 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
                 ms_per_step(&row, 4),
             );
             if streams {
-                streaming.push(format!("{entry}/{tier}"));
+                // **SC-16355's "request peak measured per tier" AC.** The row above is rung *1*'s
+                // staged peak; it says nothing about what rung 4 is worth on THIS entry at THIS
+                // tier. Every `true` row of `EXPECTED_RUNG_FOUR` declares rung 4 Implemented, and
+                // before this the only entry/tier with a rung-4 request-level number was
+                // `realvisxl` — the other declarations inherited its figure by family resemblance,
+                // which is exactly the substitution the per-entry table exists to refuse.
+                let windowed = measure(
+                    &dir,
+                    tier,
+                    shape,
+                    &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 1024, 4),
+                );
+                let delta = 100.0 * (windowed.peak_gib - row.peak_gib) / row.peak_gib;
+                println!(
+                    "[sc-15525 entry {entry} tier {tier}] rung-4 request peak at the shipped \
+                     cadence {} = {:.3} GiB ({delta:+.2}% vs this entry's staged row), {:.0} ms/step",
+                    ms::TRANSFORMER_WINDOW_SIZE,
+                    windowed.peak_gib,
+                    ms_per_step(&windowed, 4),
+                );
+                // A declaration of Implemented that does not move the request peak is a false
+                // green — the rung would be reaching the blocks and buying nothing. The bar is 3%,
+                // set well under the smallest measured saving (q4's ~7%, where the block set is
+                // smallest relative to the resident remainder) and far above the noise, which for
+                // MLX's per-process peak accounting is exactly zero across repeated runs.
+                assert!(
+                    delta < -3.0,
+                    "{entry}/{tier} publishes rung 4 as Implemented but streaming it moved the \
+                     request peak only {delta:+.2}% ({:.3} -> {:.3} GiB). A rung that reaches \
+                     every block and saves nothing must be declared Missing with that measurement, \
+                     not Implemented",
+                    row.peak_gib,
+                    windowed.peak_gib
+                );
+                streaming.push(format!("{entry}/{tier} rung4 {delta:+.2}%"));
             } else {
                 not_streaming.push(format!("{entry}/{tier}"));
             }
@@ -1305,6 +1476,18 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
     // The control that keeps this test honest in the direction that matters: at least one measured
     // entry/tier must actually be on each side. A run that saw only streaming loads would pass every
     // assertion above while proving nothing about the refusal, and vice versa.
+    // Every row of the table must have been exercised. `.find()` alone let a thinner machine go green
+    // with rows unverified — the table would then be documentation, not a check.
+    let unexercised: Vec<_> = EXPECTED_RUNG_FOUR
+        .iter()
+        .filter(|(e, t, _)| !exercised.iter().any(|(ee, tt)| ee == e && tt == t))
+        .map(|(e, t, _)| format!("{e}/{t}"))
+        .collect();
+    assert!(
+        unexercised.is_empty(),
+        "EXPECTED_RUNG_FOUR rows {unexercised:?} were never measured — cache those snapshots or \
+         remove the rows; an unexercised row asserts nothing"
+    );
     assert!(
         !streaming.is_empty() && !not_streaming.is_empty(),
         "this test's per-entry claim needs both a streaming and a non-streaming snapshot cached; \
@@ -1323,30 +1506,65 @@ fn the_full_ladder_renders_under_a_memory_cap() {
     // SAFETY: `RUST_TEST_THREADS=1` is forced repo-wide, so no other test observes this env var
     // concurrently, and it is cleared before the function returns.
     unsafe { std::env::set_var(MEMORY_CAP_ENV, "8") };
-    let row = measure(
-        &dir,
-        "q8",
-        LoadShape::DeferredMaterialization,
-        &request(Some(full_ladder(1)), 1024, 4),
-    );
+    // EVERY published cadence, not just one — and emphatically not the cadence that used to be the
+    // default. This is the only test that exercises the small Mac this rung exists for, so pinning it
+    // to a single hardcoded window meant the shipped default was never the one proven to render
+    // under a cap. A domain the selector may choose from must be a domain that renders.
+    let rows: Vec<(u32, Row)> = ms::TRANSFORMER_WINDOW_SIZES
+        .iter()
+        .map(|window| {
+            (
+                *window,
+                measure(
+                    &dir,
+                    "q8",
+                    LoadShape::DeferredMaterialization,
+                    &request(Some(full_ladder(*window)), 1024, 4),
+                ),
+            )
+        })
+        .collect();
     unsafe { std::env::remove_var(MEMORY_CAP_ENV) };
-    println!(
-        "[sc-15525 capped 8 GiB q8 1024²] full-ladder request peak {:.3} GiB, {:.0} ms/step",
-        row.peak_gib,
-        ms_per_step(&row, 4)
-    );
-    // `!pixels.is_empty()` was the whole assertion in the first revision, which a decode returning a
-    // single black pixel would satisfy. Bind the two facts a capped render actually has to deliver:
-    // the requested geometry, and an image with content in it. Neither is satisfiable by a no-op.
-    assert_eq!(
-        row.pixels.len(),
-        1024 * 1024 * 3,
-        "a capped full-ladder render must still produce the requested 1024² RGB image"
-    );
-    let first = row.pixels[0];
+    for (window, row) in &rows {
+        println!(
+            "[sc-15525 capped 8 GiB q8 1024² window {window}] full-ladder request peak {:.3} GiB, \
+             {:.0} ms/step",
+            row.peak_gib,
+            ms_per_step(row, 4)
+        );
+    }
     assert!(
+        rows.iter().any(|(w, _)| *w == ms::TRANSFORMER_WINDOW_SIZE),
+        "the shipped default cadence {} must be among the cadences proven to render under a cap",
+        ms::TRANSFORMER_WINDOW_SIZE
+    );
+    for (window, row) in &rows {
+        let _ = window;
+        // `!pixels.is_empty()` was the whole assertion in the first revision, which a decode returning a
+        // single black pixel would satisfy. Bind the two facts a capped render actually has to deliver:
+        // the requested geometry, and an image with content in it. Neither is satisfiable by a no-op.
+        assert_eq!(
+            row.pixels.len(),
+            1024 * 1024 * 3,
+            "a capped full-ladder render must still produce the requested 1024² RGB image"
+        );
+        let first = row.pixels[0];
+        assert!(
         row.pixels.iter().any(|p| *p != first),
         "the capped render produced a uniform image — the window streamed blocks that decoded to \
          nothing rather than reproducing the resident stack"
     );
+    }
+    // Every cadence must render the SAME image under the cap. The cap changes MLX's allocator
+    // behaviour, not the arithmetic, so a cadence that diverges here is re-materializing differently
+    // under memory pressure — the failure mode a capped host would hit and an uncapped one would not.
+    let reference = &rows[0].1.pixels;
+    for (window, row) in &rows {
+        assert_eq!(
+            max_delta(reference, &row.pixels),
+            0,
+            "cadence {window} rendered a different image under the cap than cadence {} did",
+            rows[0].0
+        );
+    }
 }

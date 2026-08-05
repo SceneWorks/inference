@@ -1088,12 +1088,24 @@ pub fn decode_image(
 /// [`memory_strategy::decode_tiling`](crate::memory_strategy) — `None` for the exact single-pass
 /// decode, which is what every pre-SC-15525 caller gets through [`decode_image`].
 ///
-/// The **PiD branch deliberately ignores `tiling`**, and that is not a gap. The student plans and
-/// executes its own tiling from the same `GenerationMemory` fields, inside
-/// `mlx_gen_pid::mint_planned_decoder_with_tiling`, against its own disjoint edge domain — so the
-/// decoder handed in here is already bounded when the request asked for it. Applying a *native* edge
-/// on top would tile the same decode twice at two different geometries;
-/// `memory_strategy::decode_tiling` returns `None` on a PiD request for the same reason.
+/// The **PiD branch deliberately ignores `tiling`**, and that is not a gap: the student plans and
+/// executes its own tiling inside `mlx_gen_pid::mint_planned_decoder_with_tiling`, against its own
+/// disjoint edge domain. Applying a *native* edge on top would tile the same decode twice at two
+/// different geometries.
+///
+/// **On SDXL that branch is unreachable with `tiling` set, and the reason is worth stating rather
+/// than implying.** An earlier version of this comment said `memory_strategy::decode_tiling` "returns
+/// `None` on a PiD request"; it does not. Since SC-15525 it returns `Err` **unconditionally** whenever
+/// `GenerationMemory::tile_vae_decode` is set, PiD or not, because rung 2 is declared `Missing` on
+/// this provider. So a `use_pid` request that also sets `tile_vae_decode` is refused at
+/// `Sdxl::generate_impl` and never reaches here — where before SC-15525 it would have fallen through
+/// to the student's own auto-planning.
+///
+/// That is deliberate. A request that asked for a bounded decode and silently got the student's
+/// auto-plan instead would be executing a strategy the selector did not choose, which is the exact
+/// false-green the shared contract forbids; refusing is the only honest answer while the native rung
+/// is `Missing`. A PiD request that does **not** set the flag is completely unaffected and still gets
+/// the student's auto-planning, which is the pre-SC-15525 behaviour.
 ///
 /// `cancel` gives the decode a cancellation point it has never had: it is a dominant fraction of an
 /// SDXL render's wall clock, and the shared tile loop checks between tiles.
