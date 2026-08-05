@@ -72,8 +72,9 @@ environment = ["QWEN_IMAGE_SNAPSHOT"]
 # THIS NAME NO LONGER HAS AN MLX CONSUMER (sc-17284). Until then the 45 mlx-gen-qwen-image
 # real-weight tests read QWEN_IMAGE_SNAPSHOT too — and fed it something this row does not describe.
 # The repo's own provenance receipt records what they were actually given:
-# `tools/adapter_parity_receipt.json` pins QWEN_IMAGE_SNAPSHOT at
-# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16`, an MLX re-host at a different
+# `tools/adapter_parity_receipt.json` recorded those runs under QWEN_IMAGE_SNAPSHOT at
+# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16` — the sc-17651 re-record now
+# pins that same path under MLX_GEN_QWEN_SNAPSHOT — an MLX re-host at a different
 # revision of a different repository from the `Qwen/Qwen-Image@75e0b4be` pinned here. One name
 # cannot be verified against two pins: `ensure_model_snapshot.py --model qwen-image` checks for
 # revision 75e0b4be and would fail closed on the re-host. So the MLX half was renamed to
