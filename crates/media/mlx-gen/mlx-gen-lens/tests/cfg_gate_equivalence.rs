@@ -241,58 +241,10 @@ fn padded_and_unpadded_cond_streams_agree() {
     );
 }
 
-/// The empty-negative case (the `lens_turbo` default at guidance 1.0): the joint stack's row 0 IS the
-/// un-padded positive, so the gated encode and the old narrow feed byte-identical tensors — the
-/// forward must be bit-for-bit equal, not merely close.
-#[test]
-fn empty_negative_cond_only_is_bit_identical_to_the_narrowed_row() {
-    let cfg = tiny_config();
-    let dit = LensTransformer::from_weights(&tiny_weights(&cfg), &cfg, DTYPE).expect("build dit");
-
-    let (frame, h, w) = (1usize, 2usize, 2usize);
-    let latent = draw(&[1, (frame * h * w) as i32, cfg.in_channels], 9_002);
-    let timestep = Array::from_slice(&[0.3f32], &[1]).as_dtype(DTYPE).unwrap();
-
-    let s = 4i32;
-    let pos = text_layers(&cfg, s, 5_200);
-    let pos_mask = mlx_rs::ops::ones::<f32>(&[1, s]).unwrap();
-
-    let gated = dit
-        .forward(&latent, &pos, Some(&pos_mask), &timestep, frame, h, w)
-        .expect("gated forward");
-
-    // Reproduce the retired lane: stack `[pos; zeros]`, then slice row 0 back out.
-    let stacked: Vec<Array> = pos
-        .iter()
-        .map(|f| concatenate_axis(&[f, &mlx_rs::ops::zeros_like(f).unwrap()], 0).unwrap())
-        .collect();
-    let stacked_mask = concatenate_axis(
-        &[&pos_mask, &mlx_rs::ops::zeros_like(&pos_mask).unwrap()],
-        0,
-    )
-    .unwrap();
-    let narrowed_feats: Vec<Array> = stacked
-        .iter()
-        .map(|f| mlx_rs::ops::split(f, 2, 0).unwrap().swap_remove(0))
-        .collect();
-    let narrowed_mask = mlx_rs::ops::split(&stacked_mask, 2, 0)
-        .unwrap()
-        .swap_remove(0);
-    let narrowed = dit
-        .forward(
-            &latent,
-            &narrowed_feats,
-            Some(&narrowed_mask),
-            &timestep,
-            frame,
-            h,
-            w,
-        )
-        .expect("narrowed forward");
-
-    assert_eq!(
-        max_abs_diff(&gated, &narrowed),
-        0.0,
-        "an empty negative makes the gate and the narrow byte-identical"
-    );
-}
+// NOTE (deliberately not a test): the empty-negative case — the `lens_turbo` default at guidance 1.0
+// — needs no equivalence test, because the tensors are identical by construction rather than merely
+// equivalent. `s_neg == s_pos` (the uncond half is `zeros_like(pos)`), so `pad_features` no-ops and
+// the retired lane's `split(concat([pos, zeros]), 2, 0)[0]` IS `pos`. Asserting that two forwards over
+// the same tensors agree would test MLX's concat/split round-trip, not this change, and would pass
+// with the gate reverted. What the gate actually returns is pinned by the `assemble_conditioning`
+// unit tests in `src/pipeline.rs`.

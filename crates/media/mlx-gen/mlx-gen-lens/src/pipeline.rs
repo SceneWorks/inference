@@ -18,6 +18,11 @@
 //! - **Joint CFG batch.** Each step runs the DiT once over `B·2` (here `B = 1`): `hidden = [x; x]`,
 //!   `encoder_features = [pos; neg]`. The output splits `cond, uncond`; the per-step guidance is the
 //!   **norm-rescaled** CFG (`cfg_rescale`, delegating to the shared `gen_core::guidance`).
+//! - **…except when CFG is off** (sc-17616). At guidance exactly `1.0` — the `lens_turbo` default —
+//!   the combine reduces to `cond`, so the uncond half is neither encoded nor batched: the encode
+//!   returns cond-only `[1, …]` conditioning and the denoise runs a `B = 1` forward. That decision is
+//!   made ONCE, by `needs_joint_cfg` inside `assemble_conditioning`; the denoise lanes consume the
+//!   batch they are given rather than narrowing a `[pos; neg]` stack themselves.
 //! - **Timestep.** The transformer is fed the *shifted sigma* directly (the reference `timestep /
 //!   1000`, where `scheduler.timesteps = sigma · 1000`) — i.e. [`schedule::timesteps`].
 //! - **Latents.** `[B, latent_h · latent_w, 128]`, `latent_{h,w} = {height,width} / 16`; the denoise
@@ -66,6 +71,36 @@ pub const VAE_SCALE_FACTOR: u32 = 16;
 /// arithmetic still routes through `cfg_rescale(cond, cond, 1.0)` so the rescale op-order is preserved.
 pub(crate) fn needs_joint_cfg(guidance: f32) -> bool {
     guidance != 1.0
+}
+
+/// Reject conditioning whose batch does not match the batch this guidance selects (sc-17616).
+///
+/// The encode and the denoise lanes each derive their batching from [`needs_joint_cfg`] over the
+/// guidance scale, so they agree by construction whenever the caller passes the same scale to both.
+/// The lanes take the conditioning and the scale as separate arguments, though, and several are
+/// `pub` — so a caller *can* still encode at one guidance and render at another. Checking here turns
+/// that into a named error at the stage boundary instead of a raw MLX shape message from somewhere
+/// inside the first block's joint attention.
+fn check_conditioning_batch(
+    encoder_features: &[Array],
+    encoder_mask: &Array,
+    joint: bool,
+    guidance_scale: f32,
+) -> Result<()> {
+    let want = if joint { 2 } else { 1 };
+    let got = encoder_mask.shape()[0];
+    let feats = encoder_features
+        .first()
+        .map(|f| f.shape()[0])
+        .unwrap_or(got);
+    if got != want || feats != want {
+        return Err(Error::Msg(format!(
+            "lens denoise: conditioning batch (features {feats}, mask {got}) does not match \
+             guidance {guidance_scale}, which needs batch {want} — encode the prompt with the same \
+             guidance the denoise runs (sc-17616)"
+        )));
+    }
+    Ok(())
 }
 
 /// Norm-rescaled classifier-free guidance for Lens — the per-token (channel-axis `[-1]`) geometry of
@@ -319,12 +354,13 @@ impl LensText {
     /// the joint combine reduces to `cond`, so the uncond half is neither encoded nor batched: each
     /// feature layer comes back `[1, S_txt, 2880]` and the mask `[1, S_txt]`. The denoise lanes select
     /// their B=1 forward from the **same** predicate over the **same** `guidance_scale`, so they consume
-    /// this shaping directly and never re-narrow — a lane that forgot to narrow (or narrowed the
-    /// features without the mask) was the sc-14195 defect shape, and is now unrepresentable.
+    /// this shaping directly and never re-narrow — a lane that forgets to narrow, or narrows the
+    /// features without the mask, is the sc-14195 defect shape and can no longer arise from a lane.
     ///
     /// Taking the scale rather than a pre-derived `bool` (the one deliberate divergence from the candle
-    /// twin) is what makes that guarantee hold: caller and lanes cannot disagree about a value neither
-    /// of them derives.
+    /// twin) is what keeps that true: caller and lanes cannot disagree about a value neither of them
+    /// derives. A caller passing *different* scales to the encode and the denoise is still possible —
+    /// [`check_conditioning_batch`] rejects that at the stage boundary with a named error.
     pub fn encode_prompt_windowed(
         &self,
         prompt: &str,
@@ -363,8 +399,9 @@ impl LensText {
 ///   the features it accompanies (the sc-14195 defect shape).
 ///
 /// Split out from [`LensText::encode_prompt_windowed`] so the gate is unit-testable on synthetic
-/// arrays — the encoder itself needs the 12 GB real snapshot.
-fn assemble_conditioning(
+/// arrays — the encoder itself needs the 12 GB real snapshot. `pub(crate)` so the trainer's
+/// preview pre-encode goes through this same gate instead of hand-rolling a second copy of it.
+pub(crate) fn assemble_conditioning(
     positive: (Vec<Array>, Array),
     guidance_scale: f32,
     dtype: Dtype,
@@ -721,6 +758,7 @@ impl LensHeavy {
         // SAME `needs_joint_cfg` over the SAME guidance (sc-17616), so this lane consumes it as given
         // rather than narrowing a `[pos; neg]` stack itself.
         let joint = needs_joint_cfg(guidance_scale);
+        check_conditioning_batch(encoder_features, encoder_mask, joint, guidance_scale)?;
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             if joint {
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
@@ -1111,6 +1149,7 @@ pub(crate) fn render_sample(
     // through `cfg_rescale(cond, cond, 1.0)` (F-020; see `needs_joint_cfg`). The caller pre-encoded the
     // conditioning under the same gate, so it is already cond-only here (sc-17616).
     let joint = needs_joint_cfg(guidance_scale);
+    check_conditioning_batch(encoder_features, encoder_mask, joint, guidance_scale)?;
     for (i, &sigma) in timesteps.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1215,7 +1254,7 @@ mod tests {
 
     use mlx_rs::{Array, Dtype};
 
-    use super::{assemble_conditioning, needs_joint_cfg};
+    use super::{assemble_conditioning, check_conditioning_batch, needs_joint_cfg};
 
     /// A synthetic encode result: `layers` feature layers of `[1, s, c]` filled with `fill`, plus the
     /// all-valid `[1, s]` mask a single unpadded prompt produces.
@@ -1299,6 +1338,38 @@ mod tests {
             vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
             "the positive's pad tail must be masked invalid, the negative's kept valid"
         );
+    }
+
+    /// A caller that encodes at one guidance and denoises at another is the one way the sc-14195 shape
+    /// can still reach a lane (the conditioning and the scale are separate arguments, and several
+    /// lanes are `pub`). It must be a named error at the stage boundary, both directions, not a raw
+    /// MLX shape message from inside the first block's joint attention.
+    #[test]
+    fn a_conditioning_batch_that_contradicts_the_guidance_is_rejected() {
+        let joint = assemble_conditioning(encoded(3, 4, 1.5), 5.0, Dtype::Float32, || {
+            Ok(Some(encoded(3, 4, -2.0)))
+        })
+        .expect("assemble");
+        let cond_only = assemble_conditioning(encoded(3, 4, 1.5), 1.0, Dtype::Float32, || Ok(None))
+            .expect("assemble");
+
+        // Matched pairs pass.
+        check_conditioning_batch(&joint.0, &joint.1, true, 5.0)
+            .expect("joint conditioning at CFG on");
+        check_conditioning_batch(&cond_only.0, &cond_only.1, false, 1.0)
+            .expect("cond-only conditioning at CFG off");
+
+        // Joint conditioning handed to a B=1 lane — the sc-14195 shape.
+        let err = check_conditioning_batch(&joint.0, &joint.1, false, 1.0)
+            .expect_err("batch-2 conditioning must be rejected by the B=1 lane");
+        assert!(
+            err.to_string().contains("does not match guidance"),
+            "expected a named conditioning/guidance error, got: {err}"
+        );
+
+        // …and the mirror: cond-only conditioning handed to the joint lane.
+        check_conditioning_batch(&cond_only.0, &cond_only.1, true, 5.0)
+            .expect_err("batch-1 conditioning must be rejected by the joint lane");
     }
 
     /// The empty negative stays the unconditional branch (zero features + zero mask), still gated on

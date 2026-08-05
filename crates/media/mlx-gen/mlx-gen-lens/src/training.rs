@@ -76,7 +76,7 @@ use mlx_gen::{
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, concatenate_axis, multiply, ones, split_sections, subtract, zeros_like};
+use mlx_rs::ops::{add, multiply, ones, split_sections, subtract};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
@@ -85,7 +85,7 @@ use mlx_gen_flux2::{load_vae, pack_latents, patchify_latents, preprocess_ref_ima
 
 use crate::config::GptOssConfig;
 use crate::dit::{LensDitConfig, LensTransformer};
-use crate::pipeline::{needs_joint_cfg, DEFAULT_DATE, VAE_SCALE_FACTOR};
+use crate::pipeline::{assemble_conditioning, DEFAULT_DATE, VAE_SCALE_FACTOR};
 use crate::registry::MODEL_ID_BASE;
 use crate::text::{LensTokenizer, TXT_OFFSET};
 use crate::text_encoder::encoder::LensTextEncoder;
@@ -409,14 +409,13 @@ impl LensTrainer {
         }
 
         // sc-5637 — pre-encode the preview-sample prompts into the conditioning batch the preview
-        // render expects, while the 20 B-param encoder is still resident (freed just below). Lens
-        // previews use norm-rescaled CFG, so above guidance 1.0 both streams are needed: the joint CFG
-        // batch (`[2, …]` = positive then empty-negative — empty negative ⇒ zero features + zero mask,
-        // the `LensPipeline::encode_prompt` convention). At guidance 1.0 the combine reduces to `cond`
-        // and `render_sample` runs a B=1 forward, so the uncond half is not batched at all — the same
-        // `needs_joint_cfg` gate the encoder applies (sc-17616). Getting this wrong is now a shape
-        // error at the first preview rather than a silently-wrong image.
-        let sample_joint_cfg = needs_joint_cfg(cfg.sample_guidance_scale);
+        // render expects, while the 20 B-param encoder is still resident (freed just below). The
+        // trainer is the third producer of Lens conditioning (beside the registry and the struct API),
+        // so it routes through the SAME `assemble_conditioning` gate rather than hand-rolling the
+        // batching (sc-17616): above guidance 1.0 that yields the joint CFG batch (`[2, …]` = positive
+        // then empty-negative — the trainer always uses the empty negative, i.e. zero features + zero
+        // mask), and at guidance 1.0 the combine reduces to `cond` and `render_sample` runs a B=1
+        // forward, so the uncond half is not batched at all.
         let sample_caps: Vec<(String, Vec<Array>, Array)> = if cfg.sample_every > 0
             && !cfg.sample_prompts.is_empty()
             && !req.cancel.is_cancelled()
@@ -426,18 +425,13 @@ impl LensTrainer {
             })?;
             let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
             for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
-                let (pos_feats, pos_mask) =
-                    encode_caption(&self.tokenizer, encoder, prompt, compute_dtype)?;
-                let (features, mask) = if sample_joint_cfg {
-                    let features = pos_feats
-                        .iter()
-                        .map(|f| Ok(concatenate_axis(&[f, &zeros_like(f)?], 0)?))
-                        .collect::<Result<Vec<_>>>()?;
-                    let mask = concatenate_axis(&[&pos_mask, &zeros_like(&pos_mask)?], 0)?;
-                    (features, mask)
-                } else {
-                    (pos_feats, pos_mask)
-                };
+                let positive = encode_caption(&self.tokenizer, encoder, prompt, compute_dtype)?;
+                let (features, mask) = assemble_conditioning(
+                    positive,
+                    cfg.sample_guidance_scale,
+                    compute_dtype,
+                    || Ok(None), // the trainer's preview negative is always empty
+                )?;
                 let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 1);
                 to_eval.push(&mask);
                 to_eval.extend(features.iter());
