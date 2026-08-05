@@ -1,0 +1,1445 @@
+//! Real-weight conformance and **measurement** for the Kolors shared memory ladder (SC-15521), on
+//! Apple/Metal.
+//!
+//! Every number published in `crate::memory_strategy` comes from this file. **Nothing is inherited
+//! from SC-15525**, even though Kolors re-exports SDXL's `UNet2DConditionModel` unchanged: the
+//! epic's standing rule is that a rung's presence, magnitude, mechanism and candidate set are per
+//! family per backend, and Kolors swaps SDXL's ~0.8B dual-CLIP conditioning for a 6B ChatGLM3 tower
+//! — which is exactly the kind of difference that moves which phase carries the request peak.
+//!
+//! ## Measurement discipline
+//!
+//! * **MLX's own accounting**, never timer-sampled RSS. `mlx_rs::memory::get_peak_memory` reports
+//!   ACTIVE bytes; a sampled RSS measures how fast the machine happened to run.
+//! * **A fresh generator per measured row.** This is not hygiene, it is the difference between a
+//!   number and an artifact: a reused heavy bundle lets the first row materialize the lazily-loaded
+//!   trunk and every later row then reads a peak that includes work it did not do. The
+//!   `#[track_caller]` helper below is the only way a row is produced.
+//! * **`reset_peak_memory` after the load**, so a row measures the *request*, not the load.
+//! * Rejected candidates are recorded **with their numbers**, and the rejection is re-asserted
+//!   against the production path — not left in a doc comment.
+//!
+//! ## Weights
+//!
+//! One env var, pointing at the `SceneWorks/kolors-mlx` snapshot **root** (the tier is a
+//! subdirectory: `q4` / `q8` / `bf16`). Nothing self-fetches or derives a cache location
+//! (epic 13657). A test whose tier is absent **skips loudly by name** rather than passing silently.
+//!
+//! | env var | entry |
+//! |---|---|
+//! | `KOLORS_LADDER_ROOT` | `kolors` — the single catalog entry, all three advertised tiers |
+//!
+//! ```text
+//! KOLORS_LADDER_ROOT=$HF_HOME/hub/models--SceneWorks--kolors-mlx/snapshots/<rev> \
+//!   cargo test -p mlx-gen-kolors --test memory_ladder_real_weights -- --ignored --test-threads=1
+//! ```
+
+#![allow(clippy::items_after_test_module)]
+
+use std::path::PathBuf;
+
+use mlx_gen::gen_core::{GenerationMemory, GenerationOutput, GenerationRequest, Progress};
+use mlx_gen::memory::MEMORY_CAP_ENV;
+use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Quant, WeightsSource};
+use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+
+use mlx_gen_kolors::memory_strategy as ms;
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// The env var carrying the one catalog entry's snapshot root.
+const ROOT_ENV: &str = "KOLORS_LADDER_ROOT";
+
+/// The three advertised tiers, in catalog order (`q4` is the manifest default).
+const TIERS: &[&str] = &["q4", "q8", "bf16"];
+
+/// The tier every default-mode measurement runs at — the catalog's own default, so the asserted
+/// rows describe what a caller who names nothing actually gets.
+const DEFAULT_TIER: &str = "q4";
+
+/// Resolve one tier directory, or `None` when it is not cached.
+fn tier_dir(tier: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var(ROOT_ENV).ok()?);
+    let dir = root.join(tier);
+    dir.is_dir().then_some(dir)
+}
+
+#[track_caller]
+fn require_tier(tier: &str) -> PathBuf {
+    match tier_dir(tier) {
+        Some(dir) => dir,
+        None => panic!("SKIPPED-BY-ABSENCE: set {ROOT_ENV} to a snapshot root containing {tier}/"),
+    }
+}
+
+fn quant_for(tier: &str) -> Option<Quant> {
+    match tier {
+        "q4" => Some(Quant::Q4),
+        "q8" => Some(Quant::Q8),
+        _ => None,
+    }
+}
+
+/// A load spec for one tier at the shape the ladder needs.
+fn spec(dir: &std::path::Path, tier: &str, shape: LoadShape) -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(shape);
+    spec.quantize = quant_for(tier);
+    spec
+}
+
+fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> GenerationRequest {
+    GenerationRequest {
+        prompt: "a red fox in a snowy forest, photograph".into(),
+        negative_prompt: Some("blurry, lowres".into()),
+        width: edge,
+        height: edge,
+        count: 1,
+        steps: Some(steps),
+        guidance: Some(5.0),
+        seed: Some(1234),
+        memory,
+        ..Default::default()
+    }
+}
+
+/// One measured row: the request's ACTIVE-bytes peak, its pixels, and its wall clock.
+///
+/// `wall` exists because rung 4's re-materialization latency is a real hazard — 70 blocks across 11
+/// re-opens, once per denoise step — and a peak-only row cannot answer it. It is a wall clock, so it
+/// is the softest number in this file: it moves with thermal state and with whatever else the
+/// machine is doing. It is therefore *reported* and bounded loosely, never asserted tightly.
+struct Row {
+    peak_gib: f64,
+    pixels: Vec<u8>,
+    wall: std::time::Duration,
+}
+
+/// Render one row on a **fresh** generator and return its request peak.
+///
+/// The freshness is the whole contract of this helper. Kolors' U-Net weights are lazy MLX handles
+/// until something evaluates them, so a generator reused across rows carries the previous row's
+/// materialization into this row's peak — which is exactly how a rung-4 sweep can report a saving
+/// that is really just "the first row paid for the stack". Every row in this file goes through here.
+#[track_caller]
+fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &GenerationRequest) -> Row {
+    let registry = mlx_gen_kolors::provider_registry().expect("provider registry");
+    let model = registry
+        .load("kolors", &spec(dir, tier, shape))
+        .expect("load kolors");
+    clear_cache();
+    reset_peak_memory();
+    let started = std::time::Instant::now();
+    let out = model
+        .generate(req, &mut |_: Progress| {})
+        .expect("generate must succeed");
+    let peak = get_peak_memory();
+    // Timed inside the reset/read window, so the row's clock covers exactly the request its peak
+    // covers — the load is excluded from both.
+    let wall = started.elapsed();
+    let pixels = match out {
+        GenerationOutput::Images(images) => images.first().expect("one image").pixels.clone(),
+        other => panic!("expected images, got {other:?}"),
+    };
+    drop(model);
+    clear_cache();
+    Row {
+        peak_gib: peak as f64 / GIB,
+        pixels,
+        wall,
+    }
+}
+
+fn ms_per_step(row: &Row, steps: u32) -> f64 {
+    row.wall.as_secs_f64() * 1000.0 / f64::from(steps)
+}
+
+fn max_delta(a: &[u8], b: &[u8]) -> u32 {
+    assert_eq!(a.len(), b.len(), "pixel buffers differ in length");
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.abs_diff(*y) as u32)
+        .max()
+        .unwrap_or(0)
+}
+
+fn mean_delta(a: &[u8], b: &[u8]) -> f64 {
+    let sum: u64 = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u64).sum();
+    sum as f64 / a.len() as f64
+}
+
+/// The all-rungs-off baseline: an explicit Resident block, so the load-time `Sequential` policy
+/// cannot leak a phase release into the "resident" row.
+fn resident_memory() -> GenerationMemory {
+    GenerationMemory::default()
+}
+
+fn staged() -> GenerationMemory {
+    GenerationMemory {
+        stage_residency: true,
+        ..Default::default()
+    }
+}
+
+fn full_ladder(window: u32) -> GenerationMemory {
+    GenerationMemory {
+        stream_transformer_blocks: true,
+        transformer_window_size: Some(window),
+        transformer_window_component: Some(ms::TRANSFORMER_WINDOW_COMPONENT),
+        ..staged()
+    }
+}
+
+/// The default step count for a measured row. Four is enough for the sampler to have fed a
+/// per-forward divergence back into itself, and cheap enough that a five-row sweep is minutes.
+const STEPS: u32 = 4;
+
+// ── Rung 0 / rung 1 ──────────────────────────────────────────────────────────────────────────────
+
+/// **Rung 1 is request-scoped and it moves the request peak — by far the most, on this family.**
+///
+/// The same cached generator serves resident → staged, and the staged request must peak strictly
+/// lower while producing a **byte-identical** image: rung 1 sheds the ChatGLM3-6B encoder before the
+/// heavy bundle loads, which is a residency change and not an arithmetic one.
+///
+/// The margin is what makes this Kolors' evidence rather than SDXL's. SDXL's rung 1 buys −7.4%,
+/// because the dual CLIP pair it sheds is small next to the U-Net + decode transient it uncovers.
+/// Kolors sheds a component that is **2.2× the U-Net at q4 and 2.4× at bf16**, so the assertion here
+/// is set against a much larger measured saving. A change that reduced rung 1 to SDXL's magnitude
+/// would redden this test rather than quietly re-describing the family.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn staged_residency_bounds_the_request_peak_and_preserves_output() {
+    let dir = require_tier(DEFAULT_TIER);
+    let resident = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::EagerMaterialization,
+        &request(Some(resident_memory()), 1024, STEPS),
+    );
+    let staged_row = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::EagerMaterialization,
+        &request(Some(staged()), 1024, STEPS),
+    );
+    let saved = 100.0 * (resident.peak_gib - staged_row.peak_gib) / resident.peak_gib;
+    println!(
+        "[sc-15521 rung1 {DEFAULT_TIER} 1024² {STEPS} steps] resident {:.4} GiB -> staged {:.4} GiB \
+         ({saved:.2}%)  {:.0} -> {:.0} ms/step",
+        resident.peak_gib,
+        staged_row.peak_gib,
+        ms_per_step(&resident, STEPS),
+        ms_per_step(&staged_row, STEPS),
+    );
+    assert!(
+        staged_row.peak_gib < resident.peak_gib * 0.97,
+        "rung 1 must bound the request peak by more than the 3% margin ({:.4} vs {:.4} GiB)",
+        staged_row.peak_gib,
+        resident.peak_gib
+    );
+    assert_eq!(
+        resident.pixels, staged_row.pixels,
+        "rung 1 is a residency change, not an arithmetic one — the image must be byte-identical"
+    );
+}
+
+// ── Rungs 2 and 3: refused by the production path ────────────────────────────────────────────────
+
+/// **Rung 2 and rung 3 are refused by the production path**, on real weights.
+///
+/// Both were measured (see [`decode_tile_mechanism_sweep`] and
+/// [`attention_chunking_is_measured_against_the_rung_two_top`]) and both are declared `Missing`.
+/// Their mechanisms are still reachable through the crate — which is exactly why this test exists:
+/// the only thing between `Autoencoder::decode_tiled` and a production render is the refusal.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_rejected_rungs_are_refused_by_the_production_path() {
+    let dir = require_tier(DEFAULT_TIER);
+    let registry = mlx_gen_kolors::provider_registry().expect("provider registry");
+    let model = registry
+        .load(
+            "kolors",
+            &spec(&dir, DEFAULT_TIER, LoadShape::DeferredMaterialization),
+        )
+        .expect("load kolors");
+
+    let tiled = GenerationMemory {
+        tile_vae_decode: true,
+        decode_tile_edge: Some(ms::DECODE_TILE_EDGE),
+        decode_overlap: Some(ms::DECODE_OVERLAP),
+        ..staged()
+    };
+    let err = model
+        .generate(&request(Some(tiled), 1024, 1), &mut |_: Progress| {})
+        .expect_err("a bounded-decode request must be refused by the production path");
+    assert!(
+        err.to_string().contains("rung 2 is declared"),
+        "the refusal must name the withheld rung, got: {err}"
+    );
+
+    let chunked = GenerationMemory {
+        chunk_attention: true,
+        attention_chunk_size: Some(ms::ATTENTION_CHUNK_SIZE),
+        ..staged()
+    };
+    let err = model
+        .generate(&request(Some(chunked), 1024, 1), &mut |_: Progress| {})
+        .expect_err("a bounded-attention request must be refused by the production path");
+    assert!(
+        err.to_string().contains("rung 3 is declared"),
+        "the refusal must name the withheld rung, got: {err}"
+    );
+
+    // The control: without it, a `generate` that rejected everything would pass this test.
+    model
+        .generate(&request(Some(staged()), 512, 1), &mut |_: Progress| {})
+        .expect("a plain staged request must still render");
+}
+
+// ── The staged re-assembly, for the two rungs `generate` refuses ─────────────────────────────────
+
+/// One end-to-end row for a rung the production path **refuses**, measured over the whole request
+/// rather than at one U-Net forward.
+///
+/// `generate` cannot produce this row: `memory_strategy::decode_tiling` and
+/// `memory_strategy::attention_plan` reject their selections on every layer, which is the point of
+/// rungs 2 and 3 being `Missing`. So the request is re-assembled here from the same public entry
+/// points `KolorsGenerator::generate_impl` calls, in the same order, under the same **rung-1 staged
+/// schedule** — encode with the ChatGLM3-6B tower alive, `eval` the conditioning, drop the tower,
+/// *then* load the heavy bundle and denoise + decode.
+///
+/// Everything is rebuilt per row (`#[track_caller]`, same discipline as [`measure`]).
+///
+/// One deliberate difference from [`measure`]: the peak window opens **before** the loads rather
+/// than after. That is not sloppiness, it is what a staged schedule *is* — the claim rung 1 makes is
+/// that the encoder load and the heavy load never coexist, and a window that opened after both would
+/// measure the thing the schedule exists to avoid. The reconstruction is bound to the real
+/// `generate` by [`the_end_to_end_reassembly_reproduces_the_real_generate_peak`].
+#[track_caller]
+fn measure_end_to_end(
+    dir: &std::path::Path,
+    tier: &str,
+    edge: u32,
+    steps: usize,
+    chunked: bool,
+    decode_tiling: Option<&mlx_gen::tiling::TilingConfig>,
+) -> Row {
+    let (row, _) = measure_end_to_end_phased(dir, tier, edge, steps, chunked, decode_tiling);
+    row
+}
+
+/// The same re-assembly, additionally reporting the **conditioning-phase** peak separately from the
+/// whole-request peak.
+///
+/// The split is what answers the `TransformerComponent::TextEncoder` scope question
+/// (`the_text_encoder_window_scope_cannot_move_the_request_peak`): a text-encoder window can only
+/// move the request peak if the conditioning phase is the peak-bearing one, and on a family whose
+/// encoder is 6B that is a live question rather than SDXL's foregone one.
+#[track_caller]
+fn measure_end_to_end_phased(
+    dir: &std::path::Path,
+    tier: &str,
+    edge: u32,
+    steps: usize,
+    chunked: bool,
+    decode_tiling: Option<&mlx_gen::tiling::TilingConfig>,
+) -> (Row, f64) {
+    use mlx_gen_kolors::model::{KolorsHeavy, KolorsText};
+    use mlx_rs::Dtype::Float16;
+
+    let prompt = "a red fox in a snowy forest, photograph";
+    let negative = "blurry, lowres";
+    let bits = quant_for(tier).map(|q| q.bits());
+
+    clear_cache();
+    reset_peak_memory();
+    let started = std::time::Instant::now();
+
+    // ── Conditioning phase: the ChatGLM3-6B tower alive, then released.
+    let mut text = KolorsText::load(dir, Float16).expect("chatglm3");
+    if let Some(bits) = bits {
+        text.quantize(bits).expect("quantize text encoder");
+    }
+    let pos = text.encode(prompt).expect("encode positive");
+    let neg = text.encode(negative).expect("encode negative");
+    // Force the encode before dropping the tower — an unevaluated output keeps it referenced
+    // through the lazy graph, so the drop would free nothing.
+    mlx_rs::transforms::eval([&pos.0, &pos.1, &neg.0, &neg.1]).expect("eval conditioning");
+    let conditioning_peak = get_peak_memory() as f64 / GIB;
+    drop(text);
+    clear_cache();
+
+    // ── Denoise + decode phase.
+    let mut heavy = KolorsHeavy::load(dir, Float16).expect("unet + vae");
+    if let Some(bits) = bits {
+        heavy.quantize_unet(bits).expect("quantize unet");
+    }
+    let (lh, lw) = ((edge / 8) as i32, (edge / 8) as i32);
+    mlx_rs::random::seed(1234).expect("seed");
+    let noise = mlx_rs::random::normal::<f32>(&[1, lh, lw, 4], None, None, None).expect("noise");
+    let plan = if chunked {
+        mlx_gen_sdxl::SdxlForwardPlan::with_attention(mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::CONSTRAINED,
+        ))
+    } else {
+        mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED
+    };
+    let cancel = mlx_gen::gen_core::CancelFlag::default();
+    let latents = heavy
+        .denoise_latents_with_preview(
+            &noise,
+            &pos,
+            Some(&neg),
+            steps,
+            5.0,
+            edge as i32,
+            edge as i32,
+            None,
+            &cancel,
+            &mut |_: Progress| {},
+            &mlx_gen::PreviewSink::default(),
+            plan,
+        )
+        .expect("denoise");
+    let image =
+        mlx_gen_sdxl::decode_image_tiled(heavy.vae(), &latents, None, decode_tiling, Some(&cancel))
+            .expect("decode");
+
+    let peak = get_peak_memory();
+    let wall = started.elapsed();
+    drop(heavy);
+    clear_cache();
+    (
+        Row {
+            peak_gib: peak as f64 / GIB,
+            pixels: image.pixels,
+            wall,
+        },
+        conditioning_peak,
+    )
+}
+
+/// **The re-assembly is bound to the real `generate`, because two withholding verdicts rest on it.**
+///
+/// [`measure_end_to_end`] rebuilds the staged request from the public entry points, and both rung
+/// 2's and rung 3's `Missing` verdicts are measured through it — because the production path refuses
+/// both selections, so `generate` cannot produce either row. Without this binding a change to
+/// `KolorsGenerator::generate_impl` — a dtype, an added component, a reordered phase — would leave
+/// both verdicts resting on a harness that no longer models the thing it stands in for, with nothing
+/// red.
+///
+/// The margin is 1%, not a bare equality: the two paths are the same phases in the same order, but
+/// MLX peak accounting is exact only for a fixed allocation sequence and the harness does not
+/// reproduce `generate`'s progress/cancel plumbing or its per-image count loop. 1% is far tighter
+/// than any structural divergence — pointing the re-assembly at 512² while `generate` renders 1024²
+/// reddens it by more than 50%.
+///
+/// **What it binds is the PEAK**, which is not the same as total fidelity. A divergence that does
+/// not move the peak passes; that is the honest scope.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
+    let dir = require_tier(DEFAULT_TIER);
+    let production = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::EagerMaterialization,
+        &request(Some(staged()), 1024, STEPS),
+    );
+    let reassembled = measure_end_to_end(&dir, DEFAULT_TIER, 1024, STEPS as usize, false, None);
+    let drift = 100.0 * (reassembled.peak_gib - production.peak_gib).abs() / production.peak_gib;
+    println!(
+        "[sc-15521 harness fidelity {DEFAULT_TIER} 1024² {STEPS} steps] generate {:.4} GiB vs \
+         re-assembly {:.4} GiB ({drift:.3}% apart)",
+        production.peak_gib, reassembled.peak_gib
+    );
+    assert!(
+        drift < 1.0,
+        "the rung-2/rung-3 harness no longer models `generate`'s staged request ({:.4} vs {:.4} \
+         GiB, {drift:.2}% apart). Both withholding verdicts are measured through that re-assembly, \
+         so they are only as good as this agreement",
+        reassembled.peak_gib,
+        production.peak_gib
+    );
+}
+
+// ── Rung 2 ───────────────────────────────────────────────────────────────────────────────────────
+
+/// The overlap that minimises drift at [`ms::DECODE_TILE_EDGE`] — the sweep's best cell.
+const BEST_DECODE_OVERLAP: u32 = 192;
+
+/// Render one real 1024² Kolors image and re-encode it through the same VAE, giving the mechanism
+/// sweep a latent whose GroupNorm statistics are those of a real image rather than of noise.
+#[track_caller]
+fn swept_latent(dir: &std::path::Path, tier: &str, edge: u32) -> (mlx_rs::Array, Vec<u8>) {
+    use mlx_gen_kolors::model::{KolorsHeavy, KolorsText};
+    use mlx_rs::Dtype::Float16;
+
+    let bits = quant_for(tier).map(|q| q.bits());
+    let mut text = KolorsText::load(dir, Float16).expect("chatglm3");
+    if let Some(bits) = bits {
+        text.quantize(bits).expect("quantize text encoder");
+    }
+    let pos = text.encode("a red fox in a snowy forest, photograph").expect("pos");
+    let neg = text.encode("blurry, lowres").expect("neg");
+    mlx_rs::transforms::eval([&pos.0, &pos.1, &neg.0, &neg.1]).expect("eval");
+    drop(text);
+    clear_cache();
+
+    let mut heavy = KolorsHeavy::load(dir, Float16).expect("heavy");
+    if let Some(bits) = bits {
+        heavy.quantize_unet(bits).expect("quantize unet");
+    }
+    let (lh, lw) = ((edge / 8) as i32, (edge / 8) as i32);
+    mlx_rs::random::seed(1234).expect("seed");
+    let noise = mlx_rs::random::normal::<f32>(&[1, lh, lw, 4], None, None, None).expect("noise");
+    let cancel = mlx_gen::gen_core::CancelFlag::default();
+    let latents = heavy
+        .denoise_latents_with_preview(
+            &noise,
+            &pos,
+            Some(&neg),
+            STEPS as usize,
+            5.0,
+            edge as i32,
+            edge as i32,
+            None,
+            &cancel,
+            &mut |_: Progress| {},
+            &mlx_gen::PreviewSink::default(),
+            mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED,
+        )
+        .expect("denoise");
+    let image = mlx_gen_sdxl::decode_image(heavy.vae(), &latents, None).expect("decode");
+    // Re-encode the finished image: the sweep's instrument compares tiled against untiled decode of
+    // the SAME latent, and a round-tripped latent is the one whose statistics the VAE itself
+    // produced.
+    let reencoded =
+        mlx_gen_sdxl::encode_init_latents(heavy.vae(), &image, edge, edge).expect("re-encode");
+    mlx_rs::transforms::eval([&reencoded]).expect("eval latent");
+    let pixels = image.pixels.clone();
+    drop(heavy);
+    clear_cache();
+    (reencoded, pixels)
+}
+
+/// **The mechanism-level tile sweep** that decides which edges the ladder may publish.
+///
+/// Isolated from the request envelope on purpose: the *mechanism* column measures the decode against
+/// the **exact untiled decode of the same latent**, which is the only way to see the deviation a
+/// tile actually introduces. Driving it through [`Autoencoder::decode_tiled`] also reaches
+/// geometries the production resolver refuses, which is how a rejected candidate gets a *number*
+/// instead of an omission.
+///
+/// **This is an exploration harness, and it asserts one thing only.** The 32-cell grid it prints is
+/// evidence for a human reading the rung-2 write-up, not a gate: pinning 32 drift values would fail
+/// on any MLX kernel change without telling anyone anything useful. What it *does* pin is the
+/// verdict the cell carries — that the **best** cell in the whole grid fails
+/// [`ms::DECODE_DRIFT_BAR`]. That is the claim `memory_strategy::DECODE_SUPPORT` and
+/// `refuse_decode`'s user-facing message rest on, and it is the one that must redden if a future VAE
+/// or blend change makes the candidate admissible.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn decode_tile_mechanism_sweep() {
+    let dir = require_tier(DEFAULT_TIER);
+    let vae = mlx_gen_sdxl::load_vae(&dir).expect("vae");
+    let (latent, _) = swept_latent(&dir, DEFAULT_TIER, 1024);
+
+    let untiled = mlx_gen_sdxl::decode_image(&vae, &latent, None).expect("untiled decode");
+    let mut best = (u32::MAX, 0u32, 0u32);
+    println!("[sc-15521 rung2 mechanism sweep {DEFAULT_TIER} 1024²] edge/overlap -> max Δ (mean Δ)");
+    for edge in ms::DECODE_TILE_EDGES_SWEPT {
+        let mut line = format!("  edge {edge:>4}:");
+        for overlap in ms::DECODE_OVERLAPS_SWEPT {
+            let cfg = mlx_gen::tiling::TilingConfig::spatial_only(*edge as i32, *overlap as i32);
+            let tiled = mlx_gen_sdxl::decode_image_tiled(&vae, &latent, None, Some(&cfg), None)
+                .expect("tiled decode");
+            let max = max_delta(&untiled.pixels, &tiled.pixels);
+            let mean = mean_delta(&untiled.pixels, &tiled.pixels);
+            line.push_str(&format!("  o{overlap:>3}: {max:>3} ({mean:.2})"));
+            if max < best.0 {
+                best = (max, *edge, *overlap);
+            }
+        }
+        println!("{line}");
+    }
+    let (best_max, best_edge, best_overlap) = best;
+    println!(
+        "[sc-15521 rung2 mechanism sweep] best cell: edge {best_edge} overlap {best_overlap} at \
+         {best_max}/255 against a {}/255 bar",
+        ms::DECODE_DRIFT_BAR
+    );
+    assert!(
+        best_max > ms::DECODE_DRIFT_BAR,
+        "the best decode geometry in the whole sweep now CLEARS the sibling bar ({best_max}/255 at \
+         edge {best_edge} overlap {best_overlap}, bar {}/255). Rung 2 is declared Missing on the \
+         claim that nothing does — re-open memory_strategy::DECODE_SUPPORT rather than leaving a \
+         publishable candidate withheld",
+        ms::DECODE_DRIFT_BAR
+    );
+}
+
+/// **The range argument.** `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain
+/// with no geometry axis, so publishing one edge publishes it at everything `descriptor()`
+/// advertises — up to `max_size: 2048`. This measures the best candidate across that range.
+///
+/// It fails in **both** directions on purpose: if 1024² ever stops failing the bar the candidate was
+/// never real, and if the larger outputs ever start clearing it the declaration is stale. Either way
+/// the verdict gets revisited instead of inherited.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range() {
+    let dir = require_tier(DEFAULT_TIER);
+    let vae = mlx_gen_sdxl::load_vae(&dir).expect("vae");
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(
+        ms::DECODE_TILE_EDGE as i32,
+        BEST_DECODE_OVERLAP as i32,
+    );
+    let mut cleared: Vec<u32> = Vec::new();
+    for edge in [1024u32, 1280, 1536, 2048] {
+        // A synthetic latent at each geometry: rendering four separate images at up to 2048² is
+        // minutes of GPU for a measurement about the DECODER's spatial normalization, which does not
+        // depend on how the latent was produced. The 1024² row is cross-checked against the real
+        // rendered latent by `decode_tile_mechanism_sweep`, which is the control that keeps this
+        // synthetic instrument honest.
+        mlx_rs::random::seed(99).expect("seed");
+        let (lh, lw) = ((edge / 8) as i32, (edge / 8) as i32);
+        let latent = mlx_rs::random::normal::<f32>(&[1, lh, lw, 4], None, None, None)
+            .expect("latent")
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .expect("f32");
+        let untiled = mlx_gen_sdxl::decode_image(&vae, &latent, None).expect("untiled");
+        let tiled = mlx_gen_sdxl::decode_image_tiled(&vae, &latent, None, Some(&cfg), None)
+            .expect("tiled");
+        let max = max_delta(&untiled.pixels, &tiled.pixels);
+        let tiles = ((edge as f64 / (ms::DECODE_TILE_EDGE - BEST_DECODE_OVERLAP) as f64).ceil()
+            as u32)
+            .pow(2);
+        println!(
+            "[sc-15521 rung2 range {DEFAULT_TIER}] {edge}²: ~{tiles} tiles, tile covers {:.1}% of \
+             the edge, max Δ {max}/255 (bar {})",
+            100.0 * f64::from(ms::DECODE_TILE_EDGE) / f64::from(edge),
+            ms::DECODE_DRIFT_BAR
+        );
+        if max <= ms::DECODE_DRIFT_BAR {
+            cleared.push(edge);
+        }
+        clear_cache();
+    }
+    assert!(
+        cleared.is_empty(),
+        "edge {} at overlap {BEST_DECODE_OVERLAP} now clears the {}/255 bar at {cleared:?} — the \
+         rung-2 declaration is stale and must be re-derived",
+        ms::DECODE_TILE_EDGE,
+        ms::DECODE_DRIFT_BAR
+    );
+}
+
+/// **What rung 2 would have bought at the REQUEST level, and what it costs on the latent a real
+/// render actually produces.** Both are numbers the mechanism sweep cannot supply.
+///
+/// [`decode_tile_mechanism_sweep`] measures the *isolated* decode — the right scope for a drift
+/// comparison, the wrong scope for the saving, because a selector admits against the whole request.
+/// `generate` cannot supply this row either (`memory_strategy::decode_tiling` refuses every
+/// bounded-decode request), so it is assembled from the same public entry points as the rung-3 row,
+/// under the same staged schedule, with the tiled decode substituted for the single-pass one.
+///
+/// The saving is recorded because a withheld rung with a *number* tells the next story where to
+/// look, and a withheld rung without one tells it nothing.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
+    let dir = require_tier(DEFAULT_TIER);
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(
+        ms::DECODE_TILE_EDGE as i32,
+        BEST_DECODE_OVERLAP as i32,
+    );
+    let plain = measure_end_to_end(&dir, DEFAULT_TIER, 1024, STEPS as usize, false, None);
+    let tiled = measure_end_to_end(&dir, DEFAULT_TIER, 1024, STEPS as usize, false, Some(&cfg));
+    let saved = 100.0 * (plain.peak_gib - tiled.peak_gib) / plain.peak_gib;
+    let drift = max_delta(&plain.pixels, &tiled.pixels);
+    println!(
+        "[sc-15521 rung2 request-level {DEFAULT_TIER} 1024² {STEPS} steps] untiled {:.4} GiB -> \
+         tiled {:.4} GiB ({saved:.2}%)  {:.0} -> {:.0} ms/step  max Δ {drift}/255  mean Δ {:.2}",
+        plain.peak_gib,
+        tiled.peak_gib,
+        ms_per_step(&plain, STEPS),
+        ms_per_step(&tiled, STEPS),
+        mean_delta(&plain.pixels, &tiled.pixels),
+    );
+    assert!(
+        drift > ms::DECODE_DRIFT_BAR,
+        "the withheld geometry now preserves the PRODUCTION latent within the {}/255 bar \
+         ({drift}/255) — rung 2's verdict rests on it not doing so",
+        ms::DECODE_DRIFT_BAR
+    );
+    assert!(
+        tiled.peak_gib < plain.peak_gib,
+        "the tiled decode must at least bound the request peak ({:.4} vs {:.4} GiB); if it does \
+         not, the rung-2 write-up's recorded prize is wrong",
+        tiled.peak_gib,
+        plain.peak_gib
+    );
+}
+
+// ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
+
+/// **The rung-3 REQUEST-level measurement** — the first of the two independent reasons rung 3 is
+/// declared `Missing`, and the one [`attention_chunking_is_measured_at_the_unet_seam`] cannot
+/// supply.
+///
+/// The seam test answers "does chunking bound one U-Net forward?". This one answers the question the
+/// contract actually turns on: **does it move the number a selector admits against, and does the
+/// image survive?**
+///
+/// Both step counts are load-bearing:
+///
+/// * **one step** is the control that separates kernel rounding from a wiring bug — the schedule
+///   cannot amplify anything across a single step, so whatever Δ appears there is the raw
+///   per-forward divergence;
+/// * **four steps** shows what that per-forward divergence becomes once the sampler has fed it back
+///   into itself.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn attention_chunking_is_measured_against_the_rung_two_top() {
+    let dir = require_tier(DEFAULT_TIER);
+    let mut rows = Vec::new();
+    for steps in [1_usize, STEPS as usize] {
+        let plain = measure_end_to_end(&dir, DEFAULT_TIER, 1024, steps, false, None);
+        let chunked = measure_end_to_end(&dir, DEFAULT_TIER, 1024, steps, true, None);
+        let delta_pct = 100.0 * (chunked.peak_gib - plain.peak_gib) / plain.peak_gib;
+        println!(
+            "[sc-15521 rung3 end-to-end {DEFAULT_TIER} 1024² {steps} step(s)] unchunked {:.4} GiB \
+             -> chunked {:.4} GiB ({delta_pct:+.2}%)  max Δ {}/255  mean Δ {:.2}",
+            plain.peak_gib,
+            chunked.peak_gib,
+            max_delta(&plain.pixels, &chunked.pixels),
+            mean_delta(&plain.pixels, &chunked.pixels),
+        );
+        rows.push((steps, plain, chunked));
+    }
+
+    // Claim 1: the rung does not pay for itself at the request level. Asserted with the SAME 3%
+    // margin the implemented rungs must CLEAR, in the opposite direction — so a future change that
+    // makes chunking actually bound a request reddens here and forces the `Missing` declaration to
+    // be revisited rather than letting it calcify.
+    for (steps, plain, chunked) in &rows {
+        assert!(
+            chunked.peak_gib > plain.peak_gib * 0.97,
+            "bounded attention now bounds the REQUEST peak at {steps} step(s) ({:.4} vs {:.4} GiB) \
+             — re-open memory_strategy::ATTENTION_SUPPORT",
+            chunked.peak_gib,
+            plain.peak_gib
+        );
+    }
+    // Claim 2: it is not output-preserving on this path. The one-step row carries the claim, because
+    // it is the one the sampler cannot have amplified.
+    let (_, plain, chunked) = &rows[0];
+    assert!(
+        max_delta(&plain.pixels, &chunked.pixels) > 0,
+        "chunked and unchunked agreed exactly at one step — if MLX now dispatches the same kernel at \
+         every query-block size, the output-preservation half of ATTENTION_SUPPORT no longer holds \
+         and the rung must be re-measured, not left Missing on a stale reason"
+    );
+}
+
+/// **The rung-3 mechanism measurement.**
+///
+/// Driven at the U-Net level rather than through `generate`, for the same reason the rung-2 sweep
+/// is: the production resolver *refuses* a bounded-attention request, so the only way to measure a
+/// rung this family does not ship is the mechanism seam.
+/// [`UNet2DConditionModel::forward_planned`] takes the plan raw.
+///
+/// The Kolors-specific shape matters: the cross-attention memory is the **ChatGLM3 context**, 256
+/// tokens at 4096 dims projected to 2048, against SDXL's 77×2048. A longer key axis is exactly where
+/// a bounded-attention rung would be most likely to pay, which is why this is measured here rather
+/// than inherited.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn attention_chunking_is_measured_at_the_unet_seam() {
+    let dir = require_tier(DEFAULT_TIER);
+    let unet =
+        mlx_gen_sdxl::load_unet_kolors_dtype(&dir, mlx_rs::Dtype::Float16).expect("load unet");
+    let key = mlx_rs::random::key(7).unwrap();
+    let f16 = |a: mlx_rs::Array| a.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+    // The production CFG batch at 1024²: latent [2, 128, 128, 4], ChatGLM3 context [2, 256, 4096]
+    // (the U-Net's auto-detected `encoder_hid_proj` projects it to 2048), pooled [2, 4096].
+    let x = f16(mlx_rs::random::normal::<f32>(&[2, 128, 128, 4], None, None, Some(&key)).unwrap());
+    let ctx = f16(mlx_rs::random::normal::<f32>(&[2, 256, 4096], None, None, Some(&key)).unwrap());
+    let pooled = f16(mlx_rs::random::normal::<f32>(&[2, 4096], None, None, Some(&key)).unwrap());
+    let time_ids = mlx_gen_kolors::model::kolors_time_ids(2, 1024, 1024);
+
+    let run = |plan: mlx_gen_sdxl::SdxlForwardPlan<'_>| -> (f64, Vec<f32>) {
+        clear_cache();
+        reset_peak_memory();
+        let out = unet
+            .forward_planned(&x, 500.0, &ctx, &pooled, &time_ids, None, None, plan)
+            .expect("unet forward");
+        out.eval().expect("eval");
+        let peak = get_peak_memory() as f64 / GIB;
+        let v = out
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        (peak, v)
+    };
+
+    let (unbounded_peak, unbounded) = run(mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED);
+    let (bounded_peak, bounded) = run(mlx_gen_sdxl::SdxlForwardPlan::with_attention(
+        mlx_gen::attention::AttentionPlan::budgeted(mlx_gen::attention::AttentionBudget::CONSTRAINED),
+    ));
+    let max_abs = unbounded
+        .iter()
+        .zip(&bounded)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!(
+        "[sc-15521 rung3 unet-seam {DEFAULT_TIER} 1024² CFG] unbounded {unbounded_peak:.4} GiB -> \
+         bounded {bounded_peak:.4} GiB ({:+.2}%)  max|Δeps| {max_abs:.3e}",
+        100.0 * (bounded_peak - unbounded_peak) / unbounded_peak
+    );
+    assert!(
+        bounded_peak > unbounded_peak * 0.97,
+        "bounded attention now bounds something on this family ({bounded_peak:.4} vs \
+         {unbounded_peak:.4} GiB) — re-open memory_strategy::ATTENTION_SUPPORT"
+    );
+}
+
+// ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
+
+/// **The rung-4 cadence sweep** — the whole published domain, peak *and* wall clock — plus the
+/// bit-identity proof that the eleven streamed sub-stacks reproduce the resident ones exactly.
+///
+/// Three facts the domain's publication rests on:
+///
+/// 1. **every cadence bounds the peak** (each row below the staged control by a 3% margin);
+/// 2. **every cadence bounds it to the SAME value** — the finding that makes the wider cadences
+///    worth publishing, because it means they give up no memory at all. Asserted at 1%, far outside
+///    the observed spread (the peak rows reproduce to the millibyte across runs);
+/// 3. **widening the cadence buys time back**, which is what makes the domain a frontier rather than
+///    four spellings of one choice.
+///
+/// `KOLORS_WINDOW_PROBE_TIER` / `KOLORS_WINDOW_PROBE_SIZE` re-run the sweep at another tier or
+/// output edge. In probe mode the flatness and wall-clock assertions are **reported rather than
+/// asserted** — flatness is a claim about the default configuration, and a wall clock is meaningless
+/// on a loaded machine. What stays asserted in BOTH modes is what is true of every configuration:
+/// each cadence bounds the request peak below the control, and every row is byte-identical to it.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn transformer_window_sweep_and_streamed_output_identity() {
+    let tier = std::env::var("KOLORS_WINDOW_PROBE_TIER").unwrap_or_else(|_| DEFAULT_TIER.into());
+    let edge: u32 = std::env::var("KOLORS_WINDOW_PROBE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
+    let probe = tier != DEFAULT_TIER || edge != 1024;
+    let dir = require_tier(&tier);
+
+    let control = measure(
+        &dir,
+        &tier,
+        LoadShape::DeferredMaterialization,
+        &request(Some(staged()), edge, STEPS),
+    );
+    println!(
+        "[sc-15521 rung4 sweep {tier} {edge}² {STEPS} steps] staged control {:.4} GiB  {:.0} ms/step",
+        control.peak_gib,
+        ms_per_step(&control, STEPS)
+    );
+
+    let mut rows = Vec::new();
+    for window in ms::TRANSFORMER_WINDOW_SIZES {
+        let row = measure(
+            &dir,
+            &tier,
+            LoadShape::DeferredMaterialization,
+            &request(Some(full_ladder(*window)), edge, STEPS),
+        );
+        println!(
+            "  cadence {window:>2}: {:.4} GiB ({:+.2}%)  {:.0} ms/step ({:.1}× the control)  max Δ {}",
+            row.peak_gib,
+            100.0 * (row.peak_gib - control.peak_gib) / control.peak_gib,
+            ms_per_step(&row, STEPS),
+            row.wall.as_secs_f64() / control.wall.as_secs_f64(),
+            max_delta(&control.pixels, &row.pixels),
+        );
+        rows.push((*window, row));
+    }
+
+    // Asserted in BOTH modes.
+    for (window, row) in &rows {
+        assert!(
+            row.peak_gib < control.peak_gib * 0.97,
+            "cadence {window} must bound the request peak by more than the 3% margin ({:.4} vs \
+             {:.4} GiB)",
+            row.peak_gib,
+            control.peak_gib
+        );
+        assert_eq!(
+            control.pixels, row.pixels,
+            "cadence {window} is a residency change, not an arithmetic one — a streamed block must \
+             be byte-identical to its resident twin (this is also the IP/adapter replay guard's \
+             end-to-end half)"
+        );
+    }
+
+    let tightest = &rows.first().expect("a non-empty domain").1;
+    let widest = &rows.last().expect("a non-empty domain").1;
+    let spread = 100.0 * (widest.peak_gib - tightest.peak_gib).abs() / tightest.peak_gib;
+    let speedup = tightest.wall.as_secs_f64() / widest.wall.as_secs_f64();
+    println!(
+        "[sc-15521 rung4 sweep {tier} {edge}²] peak spread across the domain {spread:.2}%, widest \
+         cadence {speedup:.1}× faster than the tightest{}",
+        if probe { " (probe mode: reported, not asserted)" } else { "" }
+    );
+    if probe {
+        return;
+    }
+    assert!(
+        spread < 1.0,
+        "the published cadences no longer bound the peak to the same value ({spread:.2}% spread). \
+         TRANSFORMER_WINDOW_SIZES' flat column and the phase-separation mechanism it rests on must \
+         be re-derived before the domain is published again"
+    );
+    assert!(
+        speedup > 1.5,
+        "widening the cadence no longer buys time back ({speedup:.2}×) — the domain is a frontier \
+         only if it does, otherwise it is four spellings of one choice"
+    );
+}
+
+/// **The rung-4 saving is the whole `transformer_blocks` weight set**, cross-checked against the
+/// snapshot's own safetensors headers rather than against a doc comment.
+///
+/// This is the arithmetic that identifies the *mechanism*, and it is the check that caught SDXL's
+/// misattributed one. Eleven `Transformer2D` sub-stacks run in sequence and `run_windowed` releases
+/// one before opening the next, so at most one cadence-worth of blocks is materialized at any
+/// instant. **If the peak occurred during the windowed forward**, the saving could be at most
+/// `block set − w × (one deep block)`. A measured saving that exceeds that bound proves zero window
+/// weights are resident at the peak moment — i.e. the peak is in another phase entirely (the
+/// decode), and cadence is invisible to it.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_rung_four_saving_is_the_whole_transformer_block_weight_set() {
+    let dir = require_tier(DEFAULT_TIER);
+    let (total, blocks, deepest_block) = unet_weight_arithmetic(&dir);
+    println!(
+        "[sc-15521 rung4 arithmetic {DEFAULT_TIER}] U-Net {:.4} GiB, transformer_blocks {:.4} GiB, \
+         one deep block {:.4} GiB",
+        total / GIB,
+        blocks / GIB,
+        deepest_block / GIB
+    );
+
+    let control = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(Some(staged()), 1024, STEPS),
+    );
+    let windowed = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(
+            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+            1024,
+            STEPS,
+        ),
+    );
+    let saving = (control.peak_gib - windowed.peak_gib) * GIB;
+    let block_set = blocks;
+    let forward_bound = block_set - f64::from(ms::TRANSFORMER_WINDOW_SIZE) * deepest_block;
+    println!(
+        "[sc-15521 rung4 arithmetic {DEFAULT_TIER} 1024²] measured saving {:.4} GiB = {:.3}× the \
+         block set; the windowed-forward bound at cadence {} is {:.4} GiB",
+        saving / GIB,
+        saving / block_set,
+        ms::TRANSFORMER_WINDOW_SIZE,
+        forward_bound / GIB
+    );
+    assert!(
+        saving > forward_bound,
+        "the measured saving ({:.4} GiB) is inside the bound a peak-bearing windowed forward could \
+         produce ({:.4} GiB). The phase-separation mechanism in TRANSFORMER_WINDOW_SIZES claims the \
+         peak is the DECODE, and that claim rests on this inequality",
+        saving / GIB,
+        forward_bound / GIB
+    );
+    assert!(
+        saving < block_set * 1.15,
+        "the measured saving ({:.4} GiB) exceeds the whole transformer_blocks weight set ({:.4} \
+         GiB) by more than measurement slack — rung 4 cannot bound more than it holds, so the row \
+         is measuring something else",
+        saving / GIB,
+        block_set / GIB
+    );
+}
+
+/// Sum the U-Net snapshot's `data_offsets`: (whole file, `transformer_blocks.*`, one deep block).
+fn unet_weight_arithmetic(dir: &std::path::Path) -> (f64, f64, f64) {
+    let file = mlx_gen_sdxl::resolve_unet_weight_file(dir, mlx_rs::Dtype::Float16)
+        .expect("resolve unet weight file");
+    let bytes = std::fs::read(&file).expect("read unet safetensors");
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header: serde_json::Value =
+        serde_json::from_slice(&bytes[8..8 + header_len]).expect("safetensors header");
+    let map = header.as_object().expect("header object");
+    let (mut total, mut blocks) = (0f64, 0f64);
+    let mut per_block: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut stack_depths: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for (key, value) in map {
+        if key == "__metadata__" {
+            continue;
+        }
+        let offsets = value["data_offsets"].as_array().expect("data_offsets");
+        let size = offsets[1].as_f64().unwrap() - offsets[0].as_f64().unwrap();
+        total += size;
+        if let Some((prefix, rest)) = key.split_once(".transformer_blocks.") {
+            blocks += size;
+            let index = rest.split('.').next().unwrap_or("0");
+            *per_block
+                .entry(format!("{prefix}.{index}"))
+                .or_default() += size;
+            stack_depths
+                .entry(prefix.to_owned())
+                .or_default()
+                .insert(index.to_owned());
+        }
+    }
+    // "One deep block" is a block of a 10-deep sub-stack — the depth the widest published cadence
+    // addresses. Taking a bare max over all blocks would pick the same value here, but a bare max
+    // would silently follow a topology change to a different stack.
+    let deep_prefix = stack_depths
+        .iter()
+        .find(|(_, indices)| indices.len() == 10)
+        .map(|(prefix, _)| prefix.clone())
+        .expect("a 10-deep Transformer2D sub-stack");
+    let deepest_block = *per_block
+        .get(&format!("{deep_prefix}.0"))
+        .expect("block 0 of a deep sub-stack");
+    (total, blocks, deepest_block)
+}
+
+/// **The cadence-flatness CONDITION, checked rather than assumed.**
+///
+/// `TRANSFORMER_WINDOW_SIZES` explains its flat peak column by phase separation: flatness holds only
+/// while `decode transient + resident remainder` exceeds the windowed forward's own peak at the
+/// widest published cadence. On SDXL that inequality **reverses** at its advertised `min_size`, and
+/// the flat column stops being flat.
+///
+/// A test that only re-measured the flat column would report the *consequence* and never the
+/// condition, so a family that happened to stay flat for a different reason would look identical.
+/// This measures the two sides separately, at the advertised `min_size` where the inequality is
+/// tightest, and asserts the ordering.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_cadence_flatness_condition_is_checked_not_assumed() {
+    let dir = require_tier(DEFAULT_TIER);
+    // 512² is `descriptor().capabilities.min_size` — the smallest advertised output, where the
+    // decode transient is smallest and the inequality is therefore hardest to satisfy.
+    const MIN_EDGE: u32 = 512;
+    let widest = *ms::TRANSFORMER_WINDOW_SIZES
+        .last()
+        .expect("a non-empty domain");
+    let tightest = ms::TRANSFORMER_WINDOW_SIZES[0];
+
+    let at_widest = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(Some(full_ladder(widest)), MIN_EDGE, STEPS),
+    );
+    let at_tightest = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(Some(full_ladder(tightest)), MIN_EDGE, STEPS),
+    );
+    let spread = 100.0 * (at_widest.peak_gib - at_tightest.peak_gib).abs() / at_tightest.peak_gib;
+    println!(
+        "[sc-15521 rung4 flatness condition {DEFAULT_TIER} {MIN_EDGE}² (advertised min_size)] \
+         cadence {tightest} {:.4} GiB vs cadence {widest} {:.4} GiB — spread {spread:.2}%",
+        at_tightest.peak_gib, at_widest.peak_gib
+    );
+    assert_eq!(
+        at_tightest.pixels, at_widest.pixels,
+        "both cadences must render the same image at the advertised min_size"
+    );
+    // The condition, read off the two sides: if the decode still dominates at the SMALLEST
+    // advertised output then it dominates everywhere larger, because the decode transient grows
+    // with area while the windowed forward's peak is geometry-insensitive. If this reddens, the
+    // flat column in TRANSFORMER_WINDOW_SIZES is a coincidence at the measured points rather than a
+    // property, and the default cadence's justification changes.
+    assert!(
+        spread < 2.0,
+        "the cadence-flatness condition no longer holds at the advertised min_size \
+         ({spread:.2}% spread between cadence {tightest} and cadence {widest}). \
+         TRANSFORMER_WINDOW_SIZES documents this as the boundary of the flat region — record the \
+         new boundary rather than leaving the prose describing a region that has moved"
+    );
+}
+
+/// **The `TransformerComponent::TextEncoder` scope question, measured — the one place SDXL's answer
+/// could not have been reused.**
+///
+/// SDXL declares `Dit` only, because its CLIP pair is shed by rung 1 and could never carry the
+/// request peak. Kolors' tower is ChatGLM3-6B — larger than the U-Net at every tier — so "rung 1
+/// already releases it" is not the end of the argument: rung 1 releases it before the *denoise*, but
+/// the conditioning phase itself still has to hold it, and if that phase were the peak-bearing one a
+/// text-encoder window would move the request peak.
+///
+/// This measures both phases separately at every advertised geometry corner and reports which one
+/// carries the peak. The assertion is deliberately narrow: it pins the fact
+/// `TRANSFORMER_WINDOW_COMPONENTS` cites — that the conditioning phase is **not** peak-bearing at
+/// the geometry the catalog defaults to — so a change that made it peak-bearing there forces the
+/// scope decision to be revisited rather than inherited.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
+    let dir = require_tier(DEFAULT_TIER);
+    let mut conditioning_bearing: Vec<u32> = Vec::new();
+    let mut default_geometry_bearing = None;
+    for edge in [512u32, 1024, 2048] {
+        let (row, conditioning) =
+            measure_end_to_end_phased(&dir, DEFAULT_TIER, edge, 1, false, None);
+        // The whole-request peak is the max over phases; the denoise+decode phase's own peak is
+        // therefore the request peak whenever it exceeds the conditioning phase's.
+        let bearing = if conditioning >= row.peak_gib {
+            "conditioning"
+        } else {
+            "denoise + decode"
+        };
+        println!(
+            "[sc-15521 rung4 TextEncoder scope {DEFAULT_TIER} {edge}²] conditioning phase {:.4} \
+             GiB, request {:.4} GiB -> peak-bearing phase: {bearing}",
+            conditioning, row.peak_gib
+        );
+        if bearing == "conditioning" {
+            conditioning_bearing.push(edge);
+        }
+        if edge == 1024 {
+            default_geometry_bearing = Some(bearing);
+        }
+        clear_cache();
+    }
+    println!(
+        "[sc-15521 rung4 TextEncoder scope] conditioning phase carries the request peak at \
+         {conditioning_bearing:?} of the advertised range"
+    );
+    assert_eq!(
+        default_geometry_bearing,
+        Some("denoise + decode"),
+        "the conditioning phase now carries the request peak at the catalog's default geometry, so \
+         a TextEncoder-scoped window WOULD move the request peak there. \
+         TRANSFORMER_WINDOW_COMPONENTS declares `Dit` only on the opposite finding — re-open it"
+    );
+    assert!(
+        !ms::TRANSFORMER_WINDOW_COMPONENTS.contains(&mlx_gen::gen_core::TransformerComponent::TextEncoder),
+        "TextEncoder is declared but this provider does not implement a ChatGLM3 block stream"
+    );
+}
+
+/// **The published cadence domain is enforced AND reachable on the production path.**
+///
+/// Two directions, and the second is the one a declaration-only test misses: an out-of-domain
+/// cadence must be refused by `generate` itself (`WINDOW-REQUEST size=N admitted=false
+/// refused=true`), and every in-domain cadence must actually execute a render.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path() {
+    let dir = require_tier(DEFAULT_TIER);
+    let registry = mlx_gen_kolors::provider_registry().expect("provider registry");
+    let model = registry
+        .load(
+            "kolors",
+            &spec(&dir, DEFAULT_TIER, LoadShape::DeferredMaterialization),
+        )
+        .expect("load kolors");
+
+    for size in ms::TRANSFORMER_WINDOW_SIZES {
+        let out = model.generate(
+            &request(Some(full_ladder(*size)), 512, 1),
+            &mut |_: Progress| {},
+        );
+        println!(
+            "WINDOW-REQUEST size={size} admitted={} refused={}",
+            out.is_ok(),
+            out.is_err()
+        );
+        assert!(
+            out.is_ok(),
+            "published cadence {size} must be reachable on the production path: {:?}",
+            out.err()
+        );
+    }
+    for bad in [0_u32, 3, 4, 6, 7, 9, 11, 28, 70] {
+        let out = model.generate(
+            &request(Some(full_ladder(bad)), 512, 1),
+            &mut |_: Progress| {},
+        );
+        println!(
+            "WINDOW-REQUEST size={bad} admitted={} refused={}",
+            out.is_ok(),
+            out.is_err()
+        );
+        assert!(
+            out.is_err(),
+            "cadence {bad} is outside the published domain and must be refused by the PRODUCTION \
+             path, not clamped to the nearest legal value"
+        );
+    }
+
+    // The unimplemented scope is refused by the production path too, not narrowed to `Dit`.
+    let text_scope = GenerationMemory {
+        transformer_window_component: Some(mlx_gen::gen_core::TransformerComponent::TextEncoder),
+        ..full_ladder(ms::TRANSFORMER_WINDOW_SIZE)
+    };
+    let err = model
+        .generate(&request(Some(text_scope), 512, 1), &mut |_: Progress| {})
+        .expect_err("the TextEncoder scope must be refused by the production path");
+    assert!(
+        err.to_string().contains("ChatGLM3-6B"),
+        "the refusal must name the unimplemented scope, got: {err}"
+    );
+}
+
+/// **Rung 4's preconditions fail closed on real weights.**
+///
+/// Three shapes, each of which would otherwise produce a wrong render or a meaningless one:
+///
+/// 1. an **eager** load — its blocks are already committed, so a window adds a copy rather than
+///    bounding anything;
+/// 2. rung 4 **without rung 1** — the ChatGLM3-6B tower stays resident through the denoise and the
+///    request peak does not move;
+/// 3. a **load-time quantization over a dense snapshot** — every block packs at load, so a window
+///    over the materialized trunk bounds nothing. This is the shape the upstream
+///    `Kwai-Kolors/Kolors-diffusers` snapshot has, and it is the tier-level discriminator on this
+///    family.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn rung_four_preconditions_fail_closed_on_real_weights() {
+    let dir = require_tier(DEFAULT_TIER);
+    let registry = mlx_gen_kolors::provider_registry().expect("provider registry");
+
+    // 1. Eager load.
+    let eager = registry
+        .load(
+            "kolors",
+            &spec(&dir, DEFAULT_TIER, LoadShape::EagerMaterialization),
+        )
+        .expect("load kolors eager");
+    let err = eager
+        .generate(
+            &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, 1),
+            &mut |_: Progress| {},
+        )
+        .expect_err("an eager load must refuse rung 4");
+    assert!(
+        err.to_string().contains("cannot stream its blocks"),
+        "got: {err}"
+    );
+
+    // 2. Rung 4 without rung 1.
+    let deferred = registry
+        .load(
+            "kolors",
+            &spec(&dir, DEFAULT_TIER, LoadShape::DeferredMaterialization),
+        )
+        .expect("load kolors deferred");
+    let unstaged = GenerationMemory {
+        stage_residency: false,
+        ..full_ladder(ms::TRANSFORMER_WINDOW_SIZE)
+    };
+    let err = deferred
+        .generate(&request(Some(unstaged), 512, 1), &mut |_: Progress| {})
+        .expect_err("rung 4 without rung 1 must be refused");
+    assert!(err.to_string().contains("staged residency"), "got: {err}");
+
+    // 3. Load-time quantization over a DENSE snapshot. The bf16 tier is dense, so requesting a
+    //    packed tier over it is exactly the shape `load_leaves_blocks_lazy` refuses.
+    let Some(dense) = tier_dir("bf16") else {
+        println!("SKIPPED-BY-ABSENCE: bf16/ is not cached; the dense-quantize arm did not run");
+        return;
+    };
+    let mut dense_q8 = spec(&dense, "bf16", LoadShape::DeferredMaterialization);
+    dense_q8.quantize = Some(Quant::Q8);
+    assert!(
+        !ms::streamable(&dense_q8),
+        "a load-time quantization over the dense bf16 tier must not arm rung 4"
+    );
+    assert!(!ms::load_leaves_blocks_lazy(&dense_q8));
+}
+
+/// **Kolors' U-Net has eleven windowable sub-stacks at two depths — measured on the snapshot, not
+/// read off the config.**
+///
+/// A config/checkpoint disagreement would otherwise surface as a window that silently covers the
+/// wrong number of blocks. This reads the real key set.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_unet_has_eleven_windowable_sub_stacks_at_two_depths() {
+    let dir = require_tier(DEFAULT_TIER);
+    let file = mlx_gen_sdxl::resolve_unet_weight_file(&dir, mlx_rs::Dtype::Float16)
+        .expect("resolve unet weight file");
+    let bytes = std::fs::read(&file).expect("read unet safetensors");
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header: serde_json::Value =
+        serde_json::from_slice(&bytes[8..8 + header_len]).expect("safetensors header");
+    let mut stacks: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for key in header.as_object().expect("header").keys() {
+        if let Some((prefix, rest)) = key.split_once(".transformer_blocks.") {
+            stacks
+                .entry(prefix.to_owned())
+                .or_default()
+                .insert(rest.split('.').next().unwrap_or("0").to_owned());
+        }
+    }
+    let mut depths: Vec<usize> = stacks.values().map(|v| v.len()).collect();
+    depths.sort_unstable();
+    let total: usize = depths.iter().sum();
+    println!(
+        "[sc-15521 rung4 topology {DEFAULT_TIER}] {} Transformer2D sub-stacks, depths {depths:?}, \
+         {total} windowable blocks",
+        stacks.len()
+    );
+    assert_eq!(stacks.len(), 11, "eleven Transformer2D sub-stacks");
+    assert_eq!(depths, vec![2, 2, 2, 2, 2, 10, 10, 10, 10, 10, 10]);
+    assert_eq!(total, 70, "70 windowable TransformerBlocks");
+    assert_eq!(
+        *depths.last().unwrap() as u32,
+        *ms::TRANSFORMER_WINDOW_SIZES.last().unwrap(),
+        "the widest published cadence must equal the deepest sub-stack"
+    );
+}
+
+/// **Every advertised tier loads and publishes the ladder it actually implements.**
+///
+/// The epic's rule is that no cell becomes Verified by sharing code, and the failure mode this
+/// closes is a per-tier test that records a peak and never checks *which* ladder each tier
+/// published. Both are checked here: the rung-4 declaration per tier, and a measured rung-1 saving
+/// per tier so a tier whose numbers diverge cannot hide behind the default tier's.
+#[test]
+#[ignore = "needs the real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn every_advertised_tier_loads_and_publishes_the_ladder() {
+    let mut measured = 0;
+    for tier in TIERS {
+        let Some(dir) = tier_dir(tier) else {
+            println!("SKIPPED-BY-ABSENCE: tier {tier} is not cached under {ROOT_ENV}");
+            continue;
+        };
+        let load_spec = spec(&dir, tier, LoadShape::DeferredMaterialization);
+        let contract =
+            ms::memory_strategy_contract("kolors", &load_spec).expect("contract at this tier");
+        let rung4 = contract
+            .capability(mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung 4 capability")
+            .support
+            .clone();
+        let staged_row = measure(
+            &dir,
+            tier,
+            LoadShape::DeferredMaterialization,
+            &request(Some(staged()), 1024, STEPS),
+        );
+        let windowed = measure(
+            &dir,
+            tier,
+            LoadShape::DeferredMaterialization,
+            &request(
+                Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+                1024,
+                STEPS,
+            ),
+        );
+        println!(
+            "[sc-15521 per-tier {tier} 1024² {STEPS} steps] rung4 {rung4:?}  staged {:.4} GiB -> \
+             windowed {:.4} GiB ({:+.2}%)  conditioning {:.4} GiB / transformer {:.4} GiB / \
+             decoder {:.4} GiB",
+            staged_row.peak_gib,
+            windowed.peak_gib,
+            100.0 * (windowed.peak_gib - staged_row.peak_gib) / staged_row.peak_gib,
+            contract.asset_facts.conditioning_bytes as f64 / GIB,
+            contract.asset_facts.transformer_bytes as f64 / GIB,
+            contract.asset_facts.decoder_bytes as f64 / GIB,
+        );
+        assert_eq!(
+            rung4,
+            mlx_gen::gen_core::MemoryStrategySupport::Implemented,
+            "tier {tier} must publish rung 4 — all three shipped tiers are re-openable"
+        );
+        assert!(
+            windowed.peak_gib < staged_row.peak_gib * 0.97,
+            "tier {tier}: rung 4 must bound the request peak by more than the 3% margin"
+        );
+        assert_eq!(
+            staged_row.pixels, windowed.pixels,
+            "tier {tier}: the streamed render must be byte-identical to the resident one"
+        );
+        measured += 1;
+    }
+    assert!(
+        measured > 0,
+        "SKIPPED-BY-ABSENCE: no tier was cached under {ROOT_ENV}"
+    );
+}
+
+/// **The whole ladder renders under a memory cap that the unwindowed composition does not fit.**
+///
+/// This is the end the rung exists for: on a host where the resident composition does not fit, even
+/// a 3× wall-clock cost is the difference between a render and no render.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
+fn the_full_ladder_renders_under_a_memory_cap() {
+    let dir = require_tier(DEFAULT_TIER);
+    // The cap is set between the measured staged peak and the measured windowed peak at 512², so it
+    // is a real discriminator rather than a formality.
+    let control = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(Some(staged()), 512, STEPS),
+    );
+    let windowed = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(
+            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+            512,
+            STEPS,
+        ),
+    );
+    let cap_gb = (windowed.peak_gib + control.peak_gib) / 2.0 * (GIB / 1e9);
+    println!(
+        "[sc-15521 full ladder under a cap {DEFAULT_TIER} 512²] staged {:.4} GiB, windowed {:.4} \
+         GiB, cap {cap_gb:.2} GB",
+        control.peak_gib, windowed.peak_gib
+    );
+    // SAFETY: single-threaded by construction (`--test-threads=1` in the module docs) and the var is
+    // cleared before the function returns.
+    unsafe { std::env::set_var(MEMORY_CAP_ENV, format!("{cap_gb:.2}")) };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        measure(
+            &dir,
+            DEFAULT_TIER,
+            LoadShape::DeferredMaterialization,
+            &request(
+                Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+                512,
+                STEPS,
+            ),
+        )
+    }));
+    unsafe { std::env::remove_var(MEMORY_CAP_ENV) };
+    let capped = out.expect("the full ladder must render under a cap the staged row exceeds");
+    assert_eq!(
+        capped.pixels, windowed.pixels,
+        "the capped render must be byte-identical to the uncapped windowed one"
+    );
+}

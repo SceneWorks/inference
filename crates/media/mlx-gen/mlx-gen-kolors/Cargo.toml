@@ -25,3 +25,6 @@ image = { workspace = true }
 [dev-dependencies]
 # Weights-free memory-strategy conformance for the shared ladder (SC-15521).
 sceneworks-gen-core-testkit = { workspace = true }
+# Read the U-Net safetensors header directly, so the rung-4 weight-set arithmetic is cross-checked
+# against the snapshot rather than against a doc comment (SC-15521).
+serde_json = { workspace = true }

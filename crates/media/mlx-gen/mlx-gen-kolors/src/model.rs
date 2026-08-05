@@ -92,7 +92,7 @@ pub struct Kolors {
 
 /// The SDXL-style micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)` per row (the diffusers
 /// `_get_add_time_ids` for `original_size == target_size`, no crop).
-pub(crate) fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
+pub fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
     let (h, w) = (height as f32, width as f32);
     let row = [h, w, 0.0, 0.0, h, w];
     let mut v = Vec::with_capacity(batch as usize * 6);
@@ -291,7 +291,11 @@ impl KolorsHeavy {
     }
 
     /// The loaded VAE (the registry VAE-encodes img2img inits + decodes around the per-mode denoise).
-    pub(crate) fn vae(&self) -> &Autoencoder {
+    ///
+    /// `pub` since SC-15521: the ladder's rung-2 evidence has to drive `Autoencoder::decode_tiled`
+    /// on **this bundle's** VAE rather than on a second instance, or the phase peak it reports
+    /// carries two copies of the decoder.
+    pub fn vae(&self) -> &Autoencoder {
         &self.vae
     }
 
