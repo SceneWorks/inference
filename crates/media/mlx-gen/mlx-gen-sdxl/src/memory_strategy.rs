@@ -18,7 +18,7 @@
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
 //! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) exists and bounds the decode 14.360 → 11.237 GiB, but no fixed tile edge holds its quality across the advertised output range |
-//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the request peak 0.00% (and the U-Net seam +5.1%), and its query-row axis is not bit-exact on Metal |
+//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** (the request and the U-Net seam), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
 //! ## What this family actually buys, measured (`realvisxl`, Apple/Metal, 1024², 6 steps)
@@ -340,12 +340,24 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 ///
 ///    Measured instead at the U-Net seam, where the effect is not diluted by the rest of the request
 ///    (`attention_chunking_is_measured_at_the_unet_seam`), one CFG-batched 1024² forward goes
-///    **6.2587-6.2685 → 6.5868 GiB, +5.1%**: chunking *adds* transients here rather than bounding
-///    anything. That is the hazard `mlx_gen::attention`'s own docs name — when q/k/v are already
-///    materialized and pinned, chunking only adds — and on a U-Net it is the normal case, because
-///    the conv/resnet trunk between every attention has already broken the lazy graph that
-///    `eval_per_chunk` exists to cut. The epic is explicit that a rung which does not move the
-///    request peak is not a saving; one that raises it is worse than absent.
+///    **6.5868 → 6.5868 GiB, +0.00%** — the two plans peak identically to the millibyte, reproduced
+///    across runs. So there is **no scope on this family at which the query-row budget changes the
+///    high-water mark**, which is a cleaner statement of the withholding reason than a diluted one.
+///
+///    That is consistent with the hazard `mlx_gen::attention`'s own docs name — when q/k/v are
+///    already materialized and pinned, a query-row budget has nothing left to bound — and on a U-Net
+///    that is the normal case, because the conv/resnet trunk between every attention has already
+///    broken the lazy graph `eval_per_chunk` exists to cut. The epic is explicit that a rung which
+///    does not move the peak is not a saving.
+///
+///    **Correction (SC-17679).** An earlier revision published this seam as
+///    **6.2587-6.2685 → 6.5868 GiB, +5.1%** and argued from it that chunking *adds* transients here.
+///    Both were wrong: `attention_chunking_is_measured_at_the_unet_seam` had no discarded warm-up
+///    row, so its first (unbounded) `run` was measured against a cold allocator — that is exactly
+///    why the published figure had a *range* on one side and a single value on the other. With a
+///    warm-up the unbounded row reads the same 6.5868 the bounded one always did. The sibling Kolors
+///    harness had the identical defect and published +12.54% for the same reason; corrected, both
+///    U-Nets read +0.00%.
 /// 2. **The output moves — and that is a property of the CHOSEN AXIS, not of SDXL.** Be precise
 ///    here, because an earlier revision of this file was not: it said chunking "is not
 ///    output-preserving on this family", which overstates what was measured and points the next
@@ -403,7 +415,7 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// | q4 | 1024² | 16.654 | 15.493 | 15.493 | 15.493 | 15.493 | **0** |
 /// | q8 | 768² | 11.546 | 9.368 | 9.368 | 9.368 | 9.368 | **0** |
 /// | bf16 | 512² | 8.809 | 4.742 | 4.742 | 4.742 | 4.742 | **0** |
-/// | **q8** | **512²** | 7.499 | 5.321 | **5.095** | **5.384** | 5.321 | **5.7%** |
+/// | **q8** | **512²** | 7.499 | **5.095** | 5.384 | 5.321 | 5.384 | **5.7%** |
 ///
 /// Five of six configurations are flat to the millibyte. **The sixth is not, and it is the advertised
 /// `min_size`** — which is exactly where the phase-separation argument below says the flatness should
@@ -425,9 +437,48 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// 512² flat again would redden nothing; it would make this paragraph wrong, and only re-running
 /// the probe would show it.
 ///
-/// The 512² q8 row is also *non-monotonic* — cadence 2 beats cadence 1, cadence 5 is worst — which
-/// is allocator behaviour at a small working set rather than a clean weight-residency effect, and
-/// one more reason not to build a default on it.
+/// The 512² q8 row is also *non-monotonic* — cadence 1 is the unique minimum, cadences 2 and 10 tie
+/// for worst, cadence 5 sits between — which is allocator behaviour at a small working set rather
+/// than a clean weight-residency effect.
+///
+/// ### SC-17679: re-measured with a warm-up, and what moved
+///
+/// Every row in the table above was originally taken by a harness with **no warm-up of any kind**,
+/// which made the cadence-1 row the first *windowed* row in its process — the exact shape the
+/// cold-allocator bias was measured on. The whole table was re-measured with a discarded windowed row
+/// ahead of every published peak. The result:
+///
+/// * **Five of the six rows did not move at all.** Every control and every flat cadence value
+///   reproduces the published figure exactly (19.003 / 17.693 / 16.654 / 11.546 / 8.809 / 7.499
+///   controls; 14.9362, 15.516, 15.4930, 9.3685, 4.7422 flat rows).
+/// * **The 512² q8 row kept its spread — 5.67% against the published 5.7% — but its values moved to
+///   DIFFERENT CADENCES.** Unwarmed it read 1→5.321, 2→5.095, 5→5.384, 10→5.321; warmed it reads
+///   **1→5.0949, 2→5.3838, 5→5.3213, 10→5.3838**. Same three-valued set, same spread, permuted
+///   assignment.
+///
+/// That permutation is the finding, and it says something stronger than either "the spread is real"
+/// or "the spread is an artifact": at this cell the peak is **not a function of cadence at all**. It
+/// takes one of three allocator-quantized values, and which cadence lands on which depends on
+/// **the row's ordinal position in the process**, not on how many blocks are resident.
+///
+/// The evidence for that is direct rather than inferred. Deleting the warm-up and re-running
+/// reproduces the *original* published row exactly — 1→5.3213, 2→5.0949, 5→5.3838, 10→5.3214 — and
+/// putting it back reproduces the warmed row exactly. Line the two sequences up and the warmed
+/// series is the unwarmed series advanced by one slot: what cadence 2 read without a warm-up is what
+/// cadence 1 reads with one, and what cadence 5 read is what cadence 2 now reads. Inserting one
+/// discarded row shifted every value one cadence to the left. A quantity that moves when you prepend
+/// an unrelated render, and moves by exactly one position, is indexed by allocation history.
+///
+/// Both orderings are *deterministic*: three consecutive warmed runs reproduced all four values to
+/// four decimals, and the unwarmed ordering reproduced the figure published months earlier. So this
+/// is reproducible noise rather than random noise — which is why it is still not worth gating on,
+/// and why it must not be read as a cadence effect.
+///
+/// **It does not change the default, and it strengthens the case for it.** Warmed, cadence 1 is the
+/// unique *minimum* at this cell (5.0949 GiB) and cadence 10 costs **+5.67%**. The unwarmed table had
+/// cadence 1 tying cadence 10 with cadence 2 below both, which made the tightest cadence look like an
+/// arbitrary pick among equals at the advertised `min_size`. It is not: it is the best measured
+/// value there.
 ///
 /// Wall clock falls monotonically with cadence everywhere it was measured on a quiet machine
 /// (1024² q8: 3591 → 1325 ms/step, **2.7× cheaper**; 512² bf16: 5438 → 2076, 2.6×; 512² q8:
@@ -445,8 +496,12 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// to be rendering small, and because the sweep's 12× ceiling is calibrated at 1024² and is reported
 /// rather than asserted when probing another geometry.
 ///
-/// It is also the strongest argument a selector has for *choosing* a wide cadence: at 512² q8,
-/// cadence 10 lands on the identical 5.3213 GiB peak as cadence 1 and is **4.2× faster**.
+/// It is also the strongest argument a selector has for *choosing* a wide cadence — though SC-17679
+/// weakened the specific 512² form of it. Warmed, cadence 10 at 512² q8 does **not** tie cadence 1:
+/// it costs 5.3838 GiB against cadence 1's 5.0949 (**+5.67%**) for its 4.2× speed-up, so at the
+/// advertised `min_size` a wide cadence is a real peak-for-time trade rather than a free one. Where
+/// the peak IS flat — every other measured configuration — the trade remains free, and there the
+/// argument stands unchanged.
 ///
 /// ## The mechanism is PHASE SEPARATION, not a weight/activation ratio
 ///
@@ -493,10 +548,12 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// area; the windowed forward's peak scales with weights and is geometry-insensitive. So the
 /// inequality has to reverse as the output shrinks, and the first advertised geometry where it does
 /// is the boundary of the flat region. Measured, that is **512² q8** — the table above — where the
-/// spread opens to 5.7% and goes non-monotonic (cadence 2 saves 2.404 GiB, *more* than the 2.166 GiB
-/// block set exists to save, which is the signature of the peak having moved phases rather than of a
-/// weight bound tightening). 512² bf16 is still flat because its transient is the same area with 2×
-/// the weights beneath it, which keeps the decode ahead.
+/// spread opens to 5.7% and goes non-monotonic. The signature that the peak has moved phases rather
+/// than a weight bound tightening is that the best cadence saves *more than the block set exists to
+/// save*: warmed, cadence 1 saves 2.404 GiB against a 2.166 GiB block set. (Unwarmed the same 2.404
+/// GiB saving was attributed to cadence 2 — see the SC-17679 note above; the arithmetic is
+/// unchanged, only which cadence it lands on.) 512² bf16 is still flat because its transient is the
+/// same area with 2× the weights beneath it, which keeps the decode ahead.
 ///
 /// ### This is coupled to rung 2, and the coupling runs the wrong way
 ///
@@ -519,16 +576,22 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// to be the one that is safe across the whole advertised geometry range, not the one that is optimal
 /// in the middle of it.
 ///
-/// **The honest counter-argument, recorded because it is a good one.** On every configuration
-/// measured, cadence 10's peak equals cadence 1's exactly — including at 512² q8, where both read
-/// 5.3213 GiB — while cadence 10 is 2.6-4.2× faster. Read as a table of six rows, 10 dominates.
+/// **The honest counter-argument, recorded because it was a good one — and SC-17679 removed it.**
+/// It used to run: on every configuration measured, cadence 10's peak equals cadence 1's exactly —
+/// *including* at 512² q8, where both read 5.3213 GiB — while cadence 10 is 2.6-4.2× faster, so read
+/// as a table of six rows, 10 dominates.
 ///
-/// It is still not the default, and the reason is what the 512² row *shows about the domain* rather
-/// than what its endpoints happen to tie at. Once the peak is demonstrably cadence-dependent
-/// somewhere in the advertised range — cadence 2 is 4.26% below cadence 1 there and cadence 5 is
-/// 1.17% above — "cadence does not affect the peak" has stopped being a law and become a coincidence
-/// that held at four of the six points sampled. A tie between two points on a curve known to be
-/// non-monotonic, at six samples of a two-dimensional (tier × geometry) space, does not support
+/// That tie was an unwarmed measurement. Re-measured with a discarded warm-up row, cadence 1 at
+/// 512² q8 reads **5.0949 GiB** and cadence 10 reads **5.3838** — cadence 10 is **+5.67%**, not
+/// equal. So 10 does not dominate: it is strictly worse on peak at the advertised `min_size`, and
+/// the default has a direct measured justification rather than only a structural one.
+///
+/// The structural argument still stands on its own and is worth keeping, because it is the one that
+/// survives a future re-measurement. Once the peak is demonstrably cadence-dependent somewhere in
+/// the advertised range — cadences 2 and 10 are 5.67% above cadence 1 there and cadence 5 is 4.45%
+/// above — "cadence does not affect the peak" has stopped being a law and become a coincidence that
+/// held at five of the six points sampled. Six samples of a two-dimensional (tier × geometry) space,
+/// on a curve known to be non-monotonic, do not support
 /// extrapolation to the geometries nobody measured; the tightest weight bound does, because it is the
 /// bound rung 4 can always make good on. sc-17535 asked for exactly this posture in advance — "keep
 /// `TRANSFORMER_WINDOW_SIZE` at the tightest", "do not extrapolate from `realvisxl`" — and a draft of
@@ -572,8 +635,17 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// intermediate draft of this story moved it to 10 and an earlier version of this note was written
 /// against that draft.
 ///
+/// `v3` (SC-17679) because the **per-cadence peaks at 512² q8 changed**. That row was measured by a
+/// harness with no warm-up, and re-measuring it with a discarded windowed row ahead of every peak
+/// moved the same three values onto different cadences: 1→5.321, 2→5.095, 5→5.384, 10→5.321 became
+/// **1→5.0949, 2→5.3838, 5→5.3213, 10→5.3838**. The domain, the default and the other five rows are
+/// all unchanged — but because the paired evidence is keyed *per cadence* (see immediately below),
+/// v2 evidence records a cadence-2 peak of 5.095 GiB for a cadence that actually costs 5.384, and a
+/// selector reusing it would under-predict. That is precisely what this fingerprint exists to
+/// prevent, so it is bumped even though nothing structural moved.
+///
 /// **The paired evidence must be keyed per cadence, not per rung.** The cadences differ by up to 2.7×
-/// in wall clock, and — at 512² q8 — by 5.7% in peak, so a selector weighing peak against time needs
+/// in wall clock, and — at 512² q8 — by 5.67% in peak, so a selector weighing peak against time needs
 /// a row per candidate rather than one row for the rung.
 /// `MemoryFormulaVariable::TransformerWindowSize` is already declared on the formula for exactly
 /// this: the window is a variable of the cost, not a constant folded into it.
@@ -583,7 +655,7 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// peak (see [`TRANSFORMER_WINDOW_SIZES`]). A story that publishes a bounded decode changes which
 /// phase is peak-bearing, which invalidates every rung-4 row here — so it must bump this fingerprint
 /// and re-measure the cadence domain in the same change, not inherit these numbers.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v2";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v3";
 
 /// Whether THIS load can execute rung 4. **Four** independent facts decide it.
 ///
@@ -865,7 +937,8 @@ pub(crate) fn safety_check(
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
             return Err(CoreError::Unsupported(format!(
                 "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the request peak 0.00% here (and +5.1% at the U-Net seam), and \
+                 Missing): it moves the peak 0.00% at both measured scopes (the request and the \
+                 U-Net seam), and \
                  the query-row chunking axis is not bit-exact on Metal, which an fp16 \
                  chaos-sensitive schedule amplifies to a different image — see \
                  memory_strategy::ATTENTION_SUPPORT",
@@ -1080,7 +1153,8 @@ pub(crate) fn attention_plan(
     if req.memory.is_some_and(|memory| memory.chunk_attention) {
         return Err(mlx_gen::Error::Unsupported(
             "sdxl: bounded attention is not selectable on this provider (rung 3 is declared \
-             Missing): it moves the request peak 0.00% here (and +5.1% at the U-Net seam), and the \
+             Missing): it moves the peak 0.00% at both measured scopes (the request and the U-Net \
+             seam), and the \
              query-row chunking axis is not bit-exact on Metal, which an fp16 chaos-sensitive \
              schedule amplifies to a different image — see memory_strategy::ATTENTION_SUPPORT"
                 .to_owned(),
@@ -1336,9 +1410,10 @@ mod tests {
         assert_eq!(
             TRANSFORMER_WINDOW_SIZE, TRANSFORMER_WINDOW_SIZES[0],
             "the default must be the TIGHTEST published cadence. A draft moved it to the widest on \
-             the strength of a flat peak at 1024²; 512² q8 is not flat (5.7% spread), and a default \
-             is what a caller gets without asking, so it must be safe across the whole advertised \
-             geometry range rather than optimal in the middle of it"
+             the strength of a flat peak at 1024²; 512² q8 is not flat (5.67% spread, re-measured \
+             with a warm-up under SC-17679, where cadence 1 is the unique minimum and cadence 10 is \
+             +5.67%), and a default is what a caller gets without asking, so it must be safe across \
+             the whole advertised geometry range rather than optimal in the middle of it"
         );
         for component in [
             TransformerComponent::TextEncoder,

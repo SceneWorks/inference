@@ -207,6 +207,33 @@ fn full_ladder(window: u32) -> GenerationMemory {
     }
 }
 
+/// Discard one measured row before publishing any peak from this process (SC-17679).
+///
+/// **This is a measurement-integrity control, not hygiene.** `mlx_rs::memory::get_peak_memory` reads
+/// ACTIVE bytes, and the very first `generate` in a process reads them against a cold allocator. The
+/// sibling Kolors harness measured that bias directly and it is not small: a windowed row measured
+/// first read **4.4632 GiB** for a configuration that reads **4.6924** once warm — a 4.9% phantom
+/// spread that looked exactly like a real finding — and a U-Net-seam pair measured cold published a
+/// **+12.54%** regression which is **+0.00%** warm.
+///
+/// This file had **no warm-up of any kind** until SC-17679, which mattered most for
+/// [`transformer_window_sweep_and_streamed_output_identity`]: its cadence-1 row is the first
+/// *windowed* row in its process, and its 512² q8 output is the entire published basis for
+/// [`ms::TRANSFORMER_WINDOW_SIZE`] `= 1`.
+///
+/// The warm-up is deliberately a *windowed* row, because that is the shape the bias was observed on
+/// (rung 4 calls `clear_cache()` at every window boundary, which is what interacts with the cold
+/// allocator). It runs at the smallest advertised output for one step, so it costs seconds.
+#[track_caller]
+fn warm_up(dir: &std::path::Path, tier: &str) {
+    let _ = measure(
+        dir,
+        tier,
+        LoadShape::DeferredMaterialization,
+        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, 1),
+    );
+}
+
 // ── Rung 0/1 ─────────────────────────────────────────────────────────────────────────────────────
 
 /// **Rung 1 is request-scoped and it moves the request peak.**
@@ -220,6 +247,8 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
+    // SC-17679: discard one row before publishing a peak from this process.
+    warm_up(&dir, "bf16");
     let shape = LoadShape::EagerMaterialization;
     let resident = measure(
         &dir,
@@ -569,6 +598,8 @@ fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
+    // SC-17679: discard one row before publishing a peak from this process.
+    warm_up(&dir, "bf16");
     let untiled = measure_end_to_end(&dir, 6, false, None);
     let cfg = mlx_gen::tiling::TilingConfig::spatial_only(
         ms::DECODE_TILE_EDGE as i32,
@@ -755,6 +786,8 @@ fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
+    // SC-17679: discard one row before publishing a peak from this process.
+    warm_up(&dir, "bf16");
     const STEPS: u32 = 6;
     let production = measure(
         &dir,
@@ -801,6 +834,8 @@ fn attention_chunking_is_measured_against_the_rung_two_top() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
+    // SC-17679: discard one row before publishing a peak from this process.
+    warm_up(&dir, "bf16");
     let mut rows = Vec::new();
     for steps in [1_usize, 6] {
         let plain = measure_end_to_end(&dir, steps, false, None);
@@ -885,29 +920,41 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
         (peak, v)
     };
 
-    let (unbounded_peak, unbounded) = run(mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED);
-    let (bounded_peak, bounded) = run(mlx_gen_sdxl::SdxlForwardPlan::with_attention(
-        mlx_gen::attention::AttentionPlan::budgeted(
+    let bounded_plan = || {
+        mlx_gen_sdxl::SdxlForwardPlan::with_attention(mlx_gen::attention::AttentionPlan::budgeted(
             mlx_gen::attention::AttentionBudget::CONSTRAINED,
-        ),
-    ));
+        ))
+    };
+    // **SC-17679: the discarded warm-up row.** This test drives the seam directly rather than
+    // through `measure`, so it does not go through [`warm_up`] — and the first `run` in the process
+    // reads its peak against a cold allocator whichever plan it executes. The sibling Kolors harness
+    // had the identical defect and published a **+12.54%** "seam regression" from it that is
+    // **+0.00%** once warmed. The bounded plan is used for the warm-up because it has the larger
+    // allocation set, so the discarded row leaves the allocator warm for both published rows.
+    let (warm_up_peak, _) = run(bounded_plan());
+
+    let (unbounded_peak, unbounded) = run(mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED);
+    let (bounded_peak, bounded) = run(bounded_plan());
     let max_abs = unbounded
         .iter()
         .zip(&bounded)
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
+    let delta_pct = 100.0 * (bounded_peak - unbounded_peak) / unbounded_peak;
     println!(
-        "[sc-15525 rung3 unet-seam bf16 1024² CFG] unbounded {unbounded_peak:.4} GiB -> bounded \
-         {bounded_peak:.4} GiB ({:+.2}%)  max|Δeps| {max_abs:.3e}",
-        100.0 * (bounded_peak - unbounded_peak) / unbounded_peak
+        "[sc-15525 rung3 unet-seam bf16 1024² CFG] discarded warm-up {warm_up_peak:.4} GiB; \
+         unbounded {unbounded_peak:.4} GiB -> bounded {bounded_peak:.4} GiB ({delta_pct:+.2}%)  \
+         max|Δeps| {max_abs:.3e}"
     );
-    // The published verdict: the rung does not move this forward's peak. Asserted with the same
-    // margin the implemented rungs use, so a future change that DOES make it pay reddens here and
-    // forces the declaration to be revisited rather than silently staying `Missing`.
+    // The published verdict: the rung does not move this forward's peak. Asserted in BOTH
+    // directions, because either is a publishable change — below means chunking has started
+    // bounding this family, above means it has started adding transients — and a one-sided floor
+    // could not tell a real seam change from no change at all.
     assert!(
-        bounded_peak > unbounded_peak * 0.97,
-        "bounded attention now bounds something on this family ({bounded_peak:.4} vs \
-         {unbounded_peak:.4} GiB) — re-open memory_strategy::ATTENTION_SUPPORT"
+        delta_pct.abs() < 1.0,
+        "bounded attention moved the U-Net seam peak by {delta_pct:+.2}% ({bounded_peak:.4} vs \
+         {unbounded_peak:.4} GiB) — re-measure and re-publish memory_strategy::ATTENTION_SUPPORT \
+         rather than widening this margin"
     );
 }
 
@@ -960,6 +1007,11 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let Some(dir) = tier_dir(REPRESENTATIVE, tier) else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing {tier}/");
     };
+    // **SC-17679: the discarded row this sweep needed most.** Without it, cadence 1 is the first
+    // WINDOWED row in the process — the exact shape the cold-allocator bias was measured on — and
+    // cadence 1 is what `ms::TRANSFORMER_WINDOW_SIZE` ships as the default, on the strength of a
+    // 512² q8 spread this row participates in.
+    warm_up(&dir, tier);
     let deferred = LoadShape::DeferredMaterialization;
     // The attribution control: the same composition WITHOUT rung 4, on a deferred load, so the only
     // difference between the two rows is the window itself.
@@ -1420,6 +1472,9 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
             );
             exercised.push((*entry, tier));
 
+            // SC-17679: per (entry, tier), because each combination's first row is the first of its
+            // kind in this process and would otherwise be the one biased low.
+            warm_up(&dir, tier);
             let row = measure(&dir, tier, shape, &request(Some(staged()), 1024, 4));
             println!(
                 "[sc-15525 entry {entry} tier {tier}] staged request peak {:.3} GiB, {:.0} ms/step, \
@@ -1512,6 +1567,8 @@ fn the_full_ladder_renders_under_a_memory_cap() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "q8") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing q8/");
     };
+    // SC-17679: discard one row before publishing a peak from this process.
+    warm_up(&dir, "q8");
     // SAFETY: `RUST_TEST_THREADS=1` is forced repo-wide, so no other test observes this env var
     // concurrently, and it is cleared before the function returns.
     unsafe { std::env::set_var(MEMORY_CAP_ENV, "8") };
