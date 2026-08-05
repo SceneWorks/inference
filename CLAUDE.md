@@ -55,7 +55,7 @@ statement and the routes that would change it: `crates/media/mlx-gen/tools/golde
 `RUST_TEST_THREADS=1` with `force = true`): MLX's shared Metal device is not thread-safe and
 parallel tests SIGSEGV. Do not remove or override this.
 
-### Repository gates (Python 3, no deps)
+### Repository gates (Python 3)
 
 ```sh
 ./scripts/check-workspace.py                          # graph invariants (see below)
@@ -63,6 +63,23 @@ python3 -m unittest discover -s scripts/tests -v      # tooling unit tests
 python3 scripts/check_docs.py                         # local doc-link check
 cargo deny --locked check advisories bans licenses sources   # supply-chain policy (deny.toml)
 ```
+
+Everything above is stdlib-only **except the tooling tests**: `test_mmaudio_reference.py` needs
+`numpy` and `safetensors`, which CI installs in the `workspace` job before the discover step. It
+imports them at module scope, so a machine without them does not report a skip — the module fails
+to import and its **16 tests silently vanish from the run**, leaving a plausible-looking
+`Ran 488 tests ... FAILED (errors=1)` that is easy to dismiss as unrelated. Install the CI pins
+once, matching `.github/workflows/ci.yml`:
+
+```sh
+python3 -m pip install --user --break-system-packages numpy==2.4.3 safetensors==0.8.0
+```
+
+`--break-system-packages` is required on a Homebrew Python (PEP 668) and `--user` keeps the
+install in your user site rather than Homebrew's, which is Homebrew's own recommended form when
+overriding. User site is version-scoped, so this needs redoing when Homebrew bumps the Python
+minor. A full local run is `Ran 504 tests ... OK (skipped=1)`; the one skip is the frozen Stable
+Audio 3 checkout, which is a genuine declared skip rather than a missing dependency.
 
 `check-workspace.py` is the enforcement point for the architecture: it asserts the
 `EXPECTED_MEMBER_COUNT` of path members, one root `Cargo.lock`, one `[workspace]` manifest, that all internal deps are path edges
