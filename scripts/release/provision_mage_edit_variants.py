@@ -150,6 +150,18 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def require_exclusive_regular_file(path: Path, label: str) -> None:
+    """Reject aliases before a migration can read or mutate an external inode."""
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"{label} must be a regular, non-symlink file")
+    try:
+        link_count = path.stat().st_nlink
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect {label}: {error}") from error
+    if link_count != 1:
+        raise RuntimeError(f"{label} must have exactly one hard link, found {link_count}")
+
+
 def inspect(path: Path) -> dict:
     try:
         with safe_open(path, framework="numpy") as handle:
@@ -334,10 +346,19 @@ def main() -> int:
     parser.add_argument("--edit-base", required=True, type=Path)
     parser.add_argument("--edit-turbo", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--verify-only",
         action="store_true",
         help="validate existing files and their exact hash manifest without generating",
+    )
+    mode.add_argument(
+        "--migrate-reference-environment-manifest-only",
+        action="store_true",
+        help=(
+            "after validating every existing oracle and the exact legacy manifest, "
+            "add only the pinned referenceEnvironment field without regenerating oracles"
+        ),
     )
     args = parser.parse_args()
     snapshots = {
@@ -347,9 +368,16 @@ def main() -> int:
     }
     gen_pinned = revision(args.gen)
     reference_environment = dict(REFERENCE_PACKAGES)
-    if not args.verify_only:
+    non_generating = (
+        args.verify_only or args.migrate_reference_environment_manifest_only
+    )
+    if not non_generating:
         reference_environment = validate_reference_environment()
         args.output.mkdir(parents=True, exist_ok=True)
+    elif not args.output.is_dir() or args.output.is_symlink():
+        raise RuntimeError(
+            f"Mage oracle output must be an existing, non-symlink directory: {args.output}"
+        )
     records = []
     for label, filename, steps, cfg in CASES:
         snapshot = snapshots[label]
@@ -357,7 +385,7 @@ def main() -> int:
         destination = args.output / filename
         # provision_mage_oracles.py owns the primary Edit file and its two immutable manifests.
         # Reuse it here so adding Base/Turbo cannot overwrite a previously verified artifact.
-        if label != "edit" and not args.verify_only:
+        if label != "edit" and not non_generating:
             with tempfile.TemporaryDirectory(prefix=f"mage-{label}-") as temporary:
                 temp = Path(temporary)
                 env = producer_environment(temp, args.gen, snapshot, steps, cfg)
@@ -374,10 +402,10 @@ def main() -> int:
                 )
                 generated = temp / "mage_flow_edit_golden.safetensors"
                 shutil.copy2(generated, destination)
+        elif non_generating:
+            require_exclusive_regular_file(destination, destination.name)
         elif not destination.is_file():
-            raise RuntimeError(
-                f"{destination.name} must already exist before variant verification"
-            )
+            raise RuntimeError(f"{destination.name} must exist before variant verification")
         validate(destination, pinned, gen_pinned, steps, cfg)
         records.append(
             {
@@ -400,11 +428,30 @@ def main() -> int:
         "files": records,
     }
     manifest_path = args.output / "mage_edit_variants_manifest.json"
-    if args.verify_only:
+    if non_generating:
+        require_exclusive_regular_file(
+            manifest_path, "Mage edit variant manifest"
+        )
         try:
             existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"invalid Mage edit variant manifest: {error}") from error
+    if args.migrate_reference_environment_manifest_only:
+        legacy_manifest = {
+            key: value for key, value in manifest.items() if key != "referenceEnvironment"
+        }
+        if exact_manifest_match(existing, manifest):
+            print("Mage edit variant manifest already records the pinned reference environment")
+        elif not exact_manifest_match(existing, legacy_manifest):
+            raise RuntimeError(
+                "Mage edit variant manifest-only migration refused: legacy revisions/geometry/cfg/hash population is not exact"
+            )
+        else:
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            print("migrated only the copied Mage edit variant manifest reference environment")
+    elif args.verify_only:
         if not exact_manifest_match(existing, manifest):
             raise RuntimeError(
                 "Mage edit variant manifest revisions/geometry/cfg/hash population is stale"
