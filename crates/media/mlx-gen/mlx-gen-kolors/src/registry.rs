@@ -25,7 +25,8 @@ use mlx_gen::{
 
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_sdxl::{
-    decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder, PID_BACKBONE,
+    decode_image_tiled, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder,
+    SdxlBlockWindow, SdxlForwardPlan, PID_BACKBONE,
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
@@ -160,6 +161,15 @@ pub struct KolorsGenerator {
     /// Whether an IP-Adapter was requested (`spec.ip_adapter` is a dir). Same rationale as
     /// [`has_control`](Self::has_control).
     has_ip: bool,
+    /// The load-time `OffloadPolicy` verdict, kept as the DEFAULT for a request that names no
+    /// [`GenerationMemory::stage_residency`](mlx_gen::gen_core::GenerationMemory). Rung 1 is
+    /// request-scoped from SC-15521 onward; the policy is no longer the authority.
+    default_stage_residency: bool,
+    /// Whether THIS load can execute ladder rung 4 — see
+    /// [`memory_strategy::streamable`](crate::memory_strategy::streamable).
+    streamable: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     residency: Residency<KolorsText, KolorsHeavyOwned>,
 }
 
@@ -214,10 +224,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),
         has_control: spec.control.is_some(),
         has_ip: matches!(&spec.ip_adapter, Some(WeightsSource::Dir(_))),
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: crate::memory_strategy::streamable(spec),
+        loaded_spec: spec.clone(),
+        memory_strategy,
         residency: build_residency(spec)?,
     }))
 }
@@ -305,6 +320,20 @@ fn load_heavy_owned(
         None => None,
     };
 
+    // Ladder rung 4 (SC-15521) — armed LAST, and that ordering is the whole correctness argument.
+    // Each `Transformer2D`'s stream captures the installed IP-Adapter K/V projections and the
+    // forward-time residual adapters off its FINISHED resident blocks, so the streamed and resident
+    // paths cannot disagree about which state landed where. Arming before the LoRA merge, the
+    // quantize or the IP install would capture an empty state and silently render without the image
+    // prompt (`mlx_gen_sdxl::block_stream` fails loudly on the IP half rather than allowing that).
+    //
+    // `memory_strategy::streamable` is the single authority for whether this load may arm at all: it
+    // refuses an eager load shape, a load-time quantization over a dense snapshot that materializes
+    // the trunk, and an adapter load that merged its delta into weights the snapshot does not carry.
+    if crate::memory_strategy::streamable(spec) {
+        heavy.arm_block_streams(root, spec.quantize.map(|q| q.bits()))?;
+    }
+
     // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
     // when the spec carries it AND this generate uses it (Kolors = SDXL VAE latent space).
     let pid = if use_pid {
@@ -324,10 +353,48 @@ fn load_heavy_owned(
     })
 }
 
-mlx_gen::impl_generator!(KolorsGenerator {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Written out rather than `mlx_gen::impl_generator!` because Kolors now answers the memory-strategy
+// hooks (SC-15521); the macro covers only `descriptor`/`validate`/`generate`.
+impl Generator for KolorsGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl KolorsGenerator {
     /// The rich-`Result` body behind [`Generator::validate`]. Kept on the crate's own
@@ -428,7 +495,42 @@ impl KolorsGenerator {
             .unwrap_or(false);
         let use_curated = scheduler_curated || sampler_curated;
 
-        self.residency.run(
+        // ── Ladder request resolution (SC-15521) ────────────────────────────────────────────────
+        // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
+        // request that names nothing keeps.
+        let stage_residency =
+            crate::memory_strategy::stage_residency(req, self.default_stage_residency);
+        let window_size = crate::memory_strategy::transformer_window_size(req)?;
+        // Two fail-closed guards a calibration harness driving `generate` with a hand-built
+        // `GenerationMemory` must still cross — it never went through `safety_check`.
+        if window_size.is_some() && !self.streamable {
+            return Err(Error::Unsupported(
+                "kolors: bounded transformer residency needs a DeferredMaterialization load over a \
+                 snapshot directory whose U-Net stays lazy (a pre-quantized tier, or dense with no \
+                 --quantize) and whose adapters (if any) are replayable; this generator cannot \
+                 stream its blocks"
+                    .into(),
+            ));
+        }
+        if window_size.is_some() && !stage_residency {
+            return Err(Error::Unsupported(
+                "kolors: bounded transformer residency requires staged residency engaged in the \
+                 same request — without the phase release the 6B ChatGLM3 encoder stays resident \
+                 through the denoise and the request peak does not move"
+                    .into(),
+            ));
+        }
+        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let forward_plan =
+            SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
+                .with_window(window_size.map(|size| SdxlBlockWindow {
+                    size,
+                    cancel: &req.cancel,
+                }));
+
+        self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -653,6 +755,7 @@ impl KolorsGenerator {
                             &req.cancel,
                             on_progress,
                             &req.preview,
+                            forward_plan,
                         )?;
                         let latents = match &vp_plan {
                             Some(p) => {
@@ -661,7 +764,13 @@ impl KolorsGenerator {
                             None => latents,
                         };
                         on_progress(Progress::Decoding);
-                        images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                        images.push(decode_image_tiled(
+                            heavy.vae(),
+                            &latents,
+                            pid_ref,
+                            decode_tiling.as_ref(),
+                            Some(&req.cancel),
+                        )?);
                         continue;
                     }
 
@@ -694,6 +803,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else if let Some((image, scale)) = control {
                             heavy.denoise_controlnet_latents_with_preview(
@@ -711,6 +821,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else if let Some((tokens, scale)) = &ip {
                             heavy.denoise_ip_latents_with_preview(
@@ -727,6 +838,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else if let Some((_image, strength)) = img2img {
                             let x0 = legacy_img2img_init.as_ref().expect(
@@ -746,6 +858,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else {
                             heavy.denoise_latents_with_preview(
@@ -760,6 +873,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         };
 
@@ -770,7 +884,13 @@ impl KolorsGenerator {
                         None => latents,
                     };
                     on_progress(Progress::Decoding);
-                    images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                    images.push(decode_image_tiled(
+                        heavy.vae(),
+                        &latents,
+                        pid_ref,
+                        decode_tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -866,6 +986,28 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// The weights-free memory-strategy registration (SC-15521) — the shared registry conformance
+/// suite's entry point into this provider's declaration.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::safety_check,
+    };
+
+/// The weights-free **behavioral** registration: valid fixtures plus a request scope, so the shared
+/// suite can drive every declared rung's lifecycle without loading a 6 GB tier.
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 mod tests {

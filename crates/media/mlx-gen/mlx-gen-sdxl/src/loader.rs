@@ -183,6 +183,18 @@ pub fn load_unet_kolors_dtype(root: &Path, dtype: Dtype) -> Result<UNet2DConditi
     load_unet_with_config(root, dtype, &UNetConfig::kolors())
 }
 
+/// The **exact** U-Net weight file [`load_unet_with_config`] would read out of `root` at `dtype` —
+/// the re-openable source ladder rung 4 records when it arms a block stream.
+///
+/// `pub` for `mlx-gen-kolors` (SC-15521): Kolors re-exports this crate's [`UNet2DConditionModel`]
+/// verbatim but registers its own provider and arms its own streams, so it needs the same
+/// fp16/f32-variant resolution the resident load performed rather than a second derivation of the
+/// rule. Getting a *different* file here would silently stream blocks from a different snapshot
+/// variant than the resident stack was built from.
+pub fn resolve_unet_weight_file(root: &Path, dtype: Dtype) -> Result<PathBuf> {
+    resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)
+}
+
 /// Load an SDXL **ControlNet** branch (sc-3058) from a diffusers `ControlNetModel` checkpoint — a
 /// single `.safetensors` file or a directory containing `diffusion_pytorch_model.safetensors`. Cast
 /// to `dtype` (fp16 in production, matching the U-Net it injects into).

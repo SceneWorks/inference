@@ -35,8 +35,8 @@ use mlx_gen_sdxl::{
     denoise_ip_control_with_preview as denoise_ip_control_registered,
     denoise_ip_with_preview as denoise_ip_registered, denoise_with_preview as denoise_registered,
     encode_init_latents, load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder,
-    ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage, SdxlLoraReport,
-    UNet2DConditionModel,
+    ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage, SdxlForwardPlan,
+    SdxlLoraReport, UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -295,6 +295,48 @@ impl KolorsHeavy {
         &self.vae
     }
 
+    /// Arm ladder rung 4 (SC-15521) across every `Transformer2D` of the SDXL-family U-Net,
+    /// recording where each sub-stack's blocks can be re-read from.
+    ///
+    /// Must be called **last** — after the LoRA merge, after `quantize_unet`, after
+    /// `install_ip_adapter` — because each stream captures the installed IP-Adapter K/V projections
+    /// and residual adapters off the finished resident blocks. Arming earlier would capture an empty
+    /// state and silently render without the image prompt.
+    ///
+    /// `root` is the snapshot directory the resident stack was built from; the exact U-Net weight
+    /// file is re-resolved through the loader's own fp16/f32-variant rule
+    /// ([`mlx_gen_sdxl::resolve_unet_weight_file`]) rather than re-derived here, so a streamed block
+    /// reads the same file the resident stack did.
+    pub(crate) fn arm_block_streams(
+        &mut self,
+        root: &std::path::Path,
+        quant_bits: Option<i32>,
+    ) -> Result<()> {
+        let file = mlx_gen_sdxl::resolve_unet_weight_file(root, self.dtype)?;
+        self.unet
+            .arm_block_streams(&mlx_gen::WeightsSource::File(file), quant_bits);
+        // All-or-nothing, checked rather than assumed. A partially armed U-Net would window some
+        // sub-stacks and leave others resident — neither the measured configuration nor a
+        // describable one — and the failure would surface eleven layers deep in a denoise step
+        // rather than at load. `arm_block_streams` is infallible by construction today; this is the
+        // assertion that keeps it that way if the sub-stack walk ever gains a fallible arm.
+        if !self.can_stream_blocks() {
+            return Err(Error::Msg(
+                "kolors: arming ladder rung 4 left at least one Transformer2D without a re-openable \
+                 block stream — a partially armed U-Net is not a describable configuration"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether rung 4 can execute on this bundle's U-Net — every `Transformer2D` has a re-openable
+    /// stream. All-or-nothing: a partially armed U-Net is neither the measured configuration nor a
+    /// describable one.
+    pub(crate) fn can_stream_blocks(&self) -> bool {
+        self.unet.can_stream_blocks()
+    }
+
     /// Compute dtype (used by the PiD `from_ldm` early-stop, sc-8049, to build the throwaway sampler).
     pub(crate) fn dtype(&self) -> Dtype {
         self.dtype
@@ -327,6 +369,9 @@ impl KolorsHeavy {
             cancel,
             on_progress,
             &PreviewSink::default(),
+            // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -361,6 +406,9 @@ impl KolorsHeavy {
             cancel,
             on_progress,
             &PreviewSink::default(),
+            // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -405,6 +453,9 @@ impl KolorsHeavy {
             cancel,
             on_progress,
             &PreviewSink::default(),
+            // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -441,6 +492,9 @@ impl KolorsHeavy {
             cancel,
             on_progress,
             &PreviewSink::default(),
+            // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -475,6 +529,9 @@ impl KolorsHeavy {
             cancel,
             on_progress,
             &PreviewSink::default(),
+            // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -519,6 +576,9 @@ impl KolorsHeavy {
             cancel,
             on_progress,
             &PreviewSink::default(),
+            // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -542,6 +602,7 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): `run_steps = Some(keep-1)` truncates the schedule so the
         // solver stops at the VP-capture σ; `None` runs the full schedule byte-identically.
@@ -553,7 +614,7 @@ impl KolorsHeavy {
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
-        let d = Denoiser::new(&self.unet, &sampler);
+        let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         denoise_registered(
             &d,
             latents,
@@ -589,6 +650,7 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate the (already strength-sliced) schedule to `keep-1`
         // steps when `run_steps = Some`; `None` runs the full sliced schedule byte-identically. The
@@ -602,7 +664,7 @@ impl KolorsHeavy {
         // Seed the init: raw `x₀ + noise·σ_start` (diffusers EulerDiscrete add_noise at begin_index).
         let latents = sampler.add_noise(init_latents, noise)?;
 
-        let d = Denoiser::new(&self.unet, &sampler);
+        let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         denoise_registered(
             &d,
             latents,
@@ -655,6 +717,7 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         use mlx_rs::ops::{add, multiply};
         // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
@@ -740,10 +803,10 @@ impl KolorsHeavy {
             // `control_encoder = None` ⇒ the Kolors ControlNet cross-attends to the text
             // `conditioning` (its own `encoder_hid_proj`), matching the bespoke combined-pose path.
             None,
-            // Kolors has not adopted the SC-15525 memory ladder: it re-exports the SDXL U-Net but
-            // registers its own provider, and rungs are declared per provider. The unbounded plan is
-            // its exact pre-ladder behaviour. SC-15521 owns its adoption.
-            mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED,
+            // Ladder rungs 3 and 4 (SC-15521). The curated route is a production denoise route, so a
+            // bounded rung that reached only the native leading-Euler loop would be
+            // declared-but-unreachable on it.
+            plan,
         )
     }
 
@@ -771,6 +834,7 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
         // runs the full schedule byte-identically.
@@ -795,7 +859,7 @@ impl KolorsHeavy {
             scale: control_scale,
         };
 
-        let d = Denoiser::new(&self.unet, &sampler);
+        let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         denoise_control_registered(
             &d,
             latents,
@@ -831,6 +895,7 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
         // runs the full schedule byte-identically.
@@ -846,7 +911,7 @@ impl KolorsHeavy {
         // (the uncond row gets no image conditioning); the image tokens alone when guidance is off.
         let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
 
-        let d = Denoiser::new(&self.unet, &sampler);
+        let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         denoise_ip_registered(
             &d,
             latents,
@@ -903,6 +968,7 @@ impl KolorsHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate the (strength-sliced) schedule to `keep-1` steps
         // when `run_steps = Some`; `None` runs the full sliced schedule byte-identically.
@@ -929,7 +995,7 @@ impl KolorsHeavy {
         // `denoise_ip_latents`.
         let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
 
-        let d = Denoiser::new(&self.unet, &sampler);
+        let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         // `control_encoder = conditioning`: the Kolors ControlNet cross-attends to the ChatGLM3 text
         // context (its own `encoder_hid_proj`), NOT the IP tokens. `cn_enc = control_encoder
         // .unwrap_or(conditioning)` in `denoise_core`, so passing the text conditioning here is the

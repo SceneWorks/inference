@@ -13,6 +13,7 @@
 pub mod chatglm3;
 pub mod convert;
 pub mod ip_adapter;
+pub mod memory_strategy;
 pub mod model;
 pub mod registry;
 pub mod sampler;
@@ -30,6 +31,8 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(crate::registry::REGISTRATION)
+        .register_memory_strategy(crate::registry::MEMORY_REGISTRATION)
+        .register_memory_behavior(crate::registry::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -54,5 +57,26 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["kolors"]);
         assert_eq!(explicit_trainers, ["kolors"]);
+    }
+
+    /// Weights-free behavioral oracle for the shared memory ladder (SC-15521).
+    ///
+    /// This is the check that makes the declaration non-vacuous without weights: for **every**
+    /// declared rung it builds the provider's own representative selection, drives the whole request
+    /// scope through it (`configure_request` → phases → `configure_decode` / `configure_attention` /
+    /// `materialize_transformer_window` → `finish`), and proves the safety check is not blind to an
+    /// impossible budget.
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        for shape in [
+            mlx_gen::LoadShape::DeferredMaterialization,
+            mlx_gen::LoadShape::EagerMaterialization,
+        ] {
+            let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(shape);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+        }
     }
 }
