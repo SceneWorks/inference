@@ -657,6 +657,7 @@ impl LensGenerator {
                     &req.prompt,
                     negative,
                     DEFAULT_DATE,
+                    guidance,
                     Some(&req.cancel),
                     encoder_window,
                 )
@@ -835,6 +836,7 @@ impl LensGenerator {
                     &req.prompt,
                     negative,
                     DEFAULT_DATE,
+                    guidance,
                     Some(&req.cancel),
                     encoder_window,
                 )
