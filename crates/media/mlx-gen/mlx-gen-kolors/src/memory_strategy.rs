@@ -182,7 +182,7 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 ///
 /// What would unlock it is a geometry-relative tile parameter (a fraction of the output rather than
 /// a pixel edge), or a decoder whose tail normalizes over the full extent. Both are contract-level
-/// changes, and neither is this story's — tracked as sc-17693.
+/// changes, and neither is this story's — tracked as sc-17678.
 pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The attention chunk size the rung-3 sweep exercised.
