@@ -138,6 +138,36 @@ expected_files = [
 ]
 
 [[models]]
+# SC-15831 representative Candle/CUDA fixture. The operator-run provider/reference-route ladder
+# harness consumes the q4 tier only; catalog siblings own their own artifact/tier/mode calibration.
+key = "flux2-klein-9b-mlx-q4"
+repository = "SceneWorks/flux2-klein-9b-mlx"
+revision = "acf05e8d5103838baba6a5e32dc91d6997a56023"
+license = "FLUX Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-cuda-memory-ladder"]
+environment = ["FLUX2_KLEIN_DIR"]
+unwired_reason = "operator-run SC-15831 memory-ladder calibration; deliberately serialized on authoritative GPU0"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/added_tokens.json",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/merges.txt",
+    "q4/tokenizer/special_tokens_map.json",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/tokenizer/vocab.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 # sc-17284 — what `mlx-gen-qwen-image` ACTUALLY loads. The engine never reads `Qwen/Qwen-Image`
 # above: every real-weight test takes a tier directory of this SceneWorks MLX re-host, whose q4/q8
 # READMEs carry the upstream Qwen-Image-2512 card. Each tier subdir is a complete diffusers-layout
