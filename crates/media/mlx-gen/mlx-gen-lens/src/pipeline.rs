@@ -350,7 +350,7 @@ impl LensText {
     /// the generator boundary so direct struct/training callers remain resident by default.
     ///
     /// **The CFG batching is decided here, once** (sc-17616), mirroring `candle-gen-lens`. When
-    /// [`needs_joint_cfg`] is false for `guidance_scale` (i.e. exactly `1.0`, the `lens_turbo` default)
+    /// `needs_joint_cfg` is false for `guidance_scale` (i.e. exactly `1.0`, the `lens_turbo` default)
     /// the joint combine reduces to `cond`, so the uncond half is neither encoded nor batched: each
     /// feature layer comes back `[1, S_txt, 2880]` and the mask `[1, S_txt]`. The denoise lanes select
     /// their B=1 forward from the **same** predicate over the **same** `guidance_scale`, so they consume
@@ -360,7 +360,8 @@ impl LensText {
     /// Taking the scale rather than a pre-derived `bool` (the one deliberate divergence from the candle
     /// twin) is what keeps that true: caller and lanes cannot disagree about a value neither of them
     /// derives. A caller passing *different* scales to the encode and the denoise is still possible —
-    /// [`check_conditioning_batch`] rejects that at the stage boundary with a named error.
+    /// the denoise lanes reject that at the stage boundary with a named error
+    /// (`check_conditioning_batch`).
     pub fn encode_prompt_windowed(
         &self,
         prompt: &str,
