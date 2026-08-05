@@ -1534,8 +1534,10 @@ jobs:
     name: MLX Qwen-Image real-weight producers (operator dispatch)
     if: inputs.profile == 'qwen-image-producers'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    # Measured 485s. Same first-run materialization allowance as the regression lane, halved: this
-    # one needs only the bf16 tier.
+    # MEASURED IN CI at 1618 s of test time / 32m32s for the job (run 30959809619), NOT the 485 s I
+    # measured warm on the same box — a 3.3x cold-cache multiple, the same shape the PiD lane showed.
+    # 60 leaves 1.8x headroom on the job, which is the thinnest margin of the three; if this ever
+    # brushes the cap it is the one to raise, and it is a producer, so raising it is cheap.
     timeout-minutes: 60
     env:
       QWEN_IMAGE_MLX_SNAPSHOT: ${{ vars.QWEN_IMAGE_MLX_SNAPSHOT }}
