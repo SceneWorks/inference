@@ -197,6 +197,29 @@ fn full_ladder_scoped(window: u32, component: TransformerComponent) -> Generatio
     }
 }
 
+/// Discard one measured row before publishing any peak from this process.
+///
+/// **This is a measurement-integrity control, not hygiene.** MLX's `get_peak_memory` reads ACTIVE
+/// bytes, and the very first `generate` in a process reads them against a cold allocator: an earlier
+/// revision of `the_cadence_flatness_condition_is_checked_not_assumed` measured a windowed row first
+/// and got **4.4632 GiB** for a configuration `transformer_window_sweep_and_streamed_output_identity`
+/// reads as **4.6924 GiB**, a 4.9% phantom spread that looked exactly like the flat region breaking
+/// at the advertised `min_size` — i.e. like a real and publishable finding. It was not. Warming up
+/// removes it: the same row then reads 4.6924 to the millibyte.
+///
+/// The warm-up is deliberately a *windowed* row, because that is the shape the bias was observed on
+/// (rung 4 calls `clear_cache()` at every window boundary, which is what interacts with the cold
+/// allocator). It runs at the smallest advertised output for one step, so it costs seconds.
+#[track_caller]
+fn warm_up(dir: &std::path::Path, tier: &str) {
+    let _ = measure(
+        dir,
+        tier,
+        LoadShape::DeferredMaterialization,
+        &request(Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 512, 1),
+    );
+}
+
 /// The default step count for a measured row. Four is enough for the sampler to have fed a
 /// per-forward divergence back into itself, and cheap enough that a five-row sweep is minutes.
 const STEPS: u32 = 4;
@@ -218,6 +241,7 @@ const STEPS: u32 = 4;
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn staged_residency_bounds_the_request_peak_and_preserves_output() {
     let dir = require_tier(DEFAULT_TIER);
+    warm_up(&dir, DEFAULT_TIER);
     let resident = measure(
         &dir,
         DEFAULT_TIER,
@@ -448,6 +472,7 @@ fn measure_end_to_end_phased(
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
     let dir = require_tier(DEFAULT_TIER);
+    warm_up(&dir, DEFAULT_TIER);
     let production = measure(
         &dir,
         DEFAULT_TIER,
@@ -662,6 +687,7 @@ fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
         ms::DECODE_TILE_EDGE as i32,
         BEST_DECODE_OVERLAP as i32,
     );
+    warm_up(&dir, DEFAULT_TIER);
     let plain = measure_end_to_end(&dir, DEFAULT_TIER, 1024, STEPS as usize, false, None);
     let tiled = measure_end_to_end(&dir, DEFAULT_TIER, 1024, STEPS as usize, false, Some(&cfg));
     let saved = 100.0 * (plain.peak_gib - tiled.peak_gib) / plain.peak_gib;
@@ -711,6 +737,7 @@ fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn attention_chunking_is_measured_against_the_rung_two_top() {
     let dir = require_tier(DEFAULT_TIER);
+    warm_up(&dir, DEFAULT_TIER);
     let mut rows = Vec::new();
     for steps in [1_usize, STEPS as usize] {
         let plain = measure_end_to_end(&dir, DEFAULT_TIER, 1024, steps, false, None);
@@ -843,6 +870,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         .unwrap_or(1024);
     let probe = tier != DEFAULT_TIER || edge != 1024;
     let dir = require_tier(&tier);
+    warm_up(&dir, &tier);
 
     let control = measure(
         &dir,
@@ -875,20 +903,36 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         rows.push((*window, row));
     }
 
-    // Asserted in BOTH modes.
+    // **Byte-identity is asserted in BOTH modes**: a streamed block is re-materialized through the
+    // same constructor with the same replayed tier, so only residency differs — at every tier and
+    // every geometry, with no exceptions. It is also the IP-Adapter / adapter replay guard's
+    // end-to-end half, which is the one that would otherwise fail silently.
     for (window, row) in &rows {
+        assert_eq!(
+            control.pixels, row.pixels,
+            "cadence {window} is a residency change, not an arithmetic one — a streamed block must \
+             be byte-identical to its resident twin"
+        );
+    }
+    // **The peak bound is asserted at the DEFAULT configuration only**, and that is a measurement
+    // rather than caution. This sweep runs the `Dit` scope, which bounds the DENOISE phase — and the
+    // denoise phase is not peak-bearing at every advertised cell. At `bf16` 512² the conditioning
+    // phase carries the request peak (`the_text_encoder_window_scope_cannot_move_the_request_peak`)
+    // and the `Dit` scope there measures **+0.04%**: a correct, complete bound on a phase that is
+    // not the maximum. Asserting a peak drop in probe mode would therefore assert something
+    // measurably false, and the right answer at that cell is the `TextEncoder` scope
+    // (`the_text_encoder_window_bounds_the_conditioning_bearing_cell`, −22.19%), not a tighter
+    // cadence.
+    for (window, row) in &rows {
+        if probe {
+            continue;
+        }
         assert!(
             row.peak_gib < control.peak_gib * 0.97,
             "cadence {window} must bound the request peak by more than the 3% margin ({:.4} vs \
              {:.4} GiB)",
             row.peak_gib,
             control.peak_gib
-        );
-        assert_eq!(
-            control.pixels, row.pixels,
-            "cadence {window} is a residency change, not an arithmetic one — a streamed block must \
-             be byte-identical to its resident twin (this is also the IP/adapter replay guard's \
-             end-to-end half)"
         );
     }
 
@@ -931,6 +975,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn the_rung_four_saving_is_the_whole_transformer_block_weight_set() {
     let dir = require_tier(DEFAULT_TIER);
+    warm_up(&dir, DEFAULT_TIER);
     let (total, blocks, deepest_block) = unet_weight_arithmetic(&dir);
     println!(
         "[sc-15521 rung4 arithmetic {DEFAULT_TIER}] U-Net {:.4} GiB, transformer_blocks {:.4} GiB, \
@@ -1049,16 +1094,23 @@ fn the_cadence_flatness_condition_is_checked_not_assumed() {
     // 512² is `descriptor().capabilities.min_size` — the smallest advertised output, where the
     // decode transient is smallest and the inequality is therefore hardest to satisfy.
     const MIN_EDGE: u32 = 512;
+    warm_up(&dir, DEFAULT_TIER);
     let widest = *ms::TRANSFORMER_WINDOW_SIZES
         .last()
         .expect("a non-empty domain");
     let tightest = ms::TRANSFORMER_WINDOW_SIZES[0];
 
-    let at_widest = measure(
+    // The staged control runs FIRST and is not merely context: the first `measure` in a process
+    // reads a peak biased by MLX's cold allocator. An earlier revision of this test measured the
+    // widest cadence first and read 4.4632 GiB for a row `transformer_window_sweep_and_streamed_
+    // output_identity` reads as 4.6924 GiB in the same configuration — a 4.9% phantom spread that
+    // looked exactly like the flat region breaking. Every peak this file publishes therefore has a
+    // row ahead of it in its own process, and this comment is the reason.
+    let control = measure(
         &dir,
         DEFAULT_TIER,
         LoadShape::DeferredMaterialization,
-        &request(Some(full_ladder(widest)), MIN_EDGE, STEPS),
+        &request(Some(staged()), MIN_EDGE, STEPS),
     );
     let at_tightest = measure(
         &dir,
@@ -1066,11 +1118,24 @@ fn the_cadence_flatness_condition_is_checked_not_assumed() {
         LoadShape::DeferredMaterialization,
         &request(Some(full_ladder(tightest)), MIN_EDGE, STEPS),
     );
+    let at_widest = measure(
+        &dir,
+        DEFAULT_TIER,
+        LoadShape::DeferredMaterialization,
+        &request(Some(full_ladder(widest)), MIN_EDGE, STEPS),
+    );
     let spread = 100.0 * (at_widest.peak_gib - at_tightest.peak_gib).abs() / at_tightest.peak_gib;
     println!(
         "[sc-15521 rung4 flatness condition {DEFAULT_TIER} {MIN_EDGE}² (advertised min_size)] \
-         cadence {tightest} {:.4} GiB vs cadence {widest} {:.4} GiB — spread {spread:.2}%",
-        at_tightest.peak_gib, at_widest.peak_gib
+         staged control {:.4} GiB, cadence {tightest} {:.4} GiB, cadence {widest} {:.4} GiB — \
+         spread {spread:.2}%",
+        control.peak_gib, at_tightest.peak_gib, at_widest.peak_gib
+    );
+    assert!(
+        at_tightest.peak_gib < control.peak_gib * 0.97,
+        "rung 4 must still bound the request peak at the advertised min_size ({:.4} vs {:.4} GiB)",
+        at_tightest.peak_gib,
+        control.peak_gib
     );
     assert_eq!(
         at_tightest.pixels, at_widest.pixels,
@@ -1115,6 +1180,7 @@ fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
             println!("SKIPPED-BY-ABSENCE: tier {tier} is not cached under {ROOT_ENV}");
             continue;
         };
+        warm_up(&dir, tier);
         for edge in [512u32, 1024, 2048] {
             let (row, conditioning) = measure_end_to_end_phased(&dir, tier, edge, 1, false, None);
             // The whole-request peak is the max over phases, so the conditioning phase is the
@@ -1370,6 +1436,7 @@ fn every_advertised_tier_loads_and_publishes_the_ladder() {
             println!("SKIPPED-BY-ABSENCE: tier {tier} is not cached under {ROOT_ENV}");
             continue;
         };
+        warm_up(&dir, tier);
         let load_spec = spec(&dir, tier, LoadShape::DeferredMaterialization);
         let contract =
             ms::memory_strategy_contract("kolors", &load_spec).expect("contract at this tier");
@@ -1434,6 +1501,7 @@ fn every_advertised_tier_loads_and_publishes_the_ladder() {
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn the_full_ladder_renders_under_a_memory_cap() {
     let dir = require_tier(DEFAULT_TIER);
+    warm_up(&dir, DEFAULT_TIER);
     // The cap is set between the measured staged peak and the measured windowed peak at 512², so it
     // is a real discriminator rather than a formality.
     let control = measure(
@@ -1503,6 +1571,7 @@ fn the_text_encoder_window_bounds_the_conditioning_bearing_cell() {
     const TIER: &str = "bf16";
     const EDGE: u32 = 512;
     let dir = require_tier(TIER);
+    warm_up(&dir, TIER);
     let control = measure(
         &dir,
         TIER,
