@@ -51,14 +51,15 @@
 //! [`MEMORY_CALIBRATION_FINGERPRINT`]; the worker owns live-budget accounting and least-cost
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
-    TransformerComponent,
+    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
@@ -416,6 +417,22 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// | q8 | 6.353 / 6.894 | 6.430 / 17.086 | 6.430 / 58.107 |
 /// | **bf16** | **11.360 / 11.360** | 11.364 / 19.031 | 11.364 / 60.053 |
 ///
+/// **Instrument scope, stated plainly: eight of these nine cells are HARNESS-ONLY.** Every cell in
+/// this table is produced by `measure_end_to_end_phased`, a hand-rolled re-assembly of the staged
+/// request from the crate's public entry points — necessary, because `generate` exposes no
+/// per-phase peak and so cannot supply a conditioning/request split at all.
+/// `the_end_to_end_reassembly_reproduces_the_real_generate_peak` binds that re-assembly to
+/// production, but it binds it at **one cell (q4, 1024²) and only on the whole-request peak**. The
+/// conditioning-phase split — the left-hand number in every cell — is bound to production
+/// **nowhere**.
+///
+/// What that does and does not undermine: the *decisive* cell is corroborated by production rows, so
+/// the headline below stands on more than the harness — `the_text_encoder_window_bounds_the_
+/// conditioning_bearing_cell` drives the real `generate` at bf16 512² and measures the `TextEncoder`
+/// scope actually moving the request peak, which is only possible if the conditioning phase really
+/// does carry it there. The other eight cells have no such corroboration and should be read as
+/// harness evidence for the *shape* of the finding, not as production measurements.
+///
 /// **One cell of nine is conditioning-bearing: `bf16` at the advertised `min_size`.** There the
 /// request peak *is* the ChatGLM3 residency, and a text-encoder window moves it. Measured at that
 /// cell against its staged control of 11.3644 GiB, at the shipped cadence
@@ -611,8 +628,139 @@ pub fn memory_strategy_contract(
         components.text_encoder,
         components.dit,
         components.vae,
+        resident_overlay_components(spec)?,
     )
 }
+
+/// The **auxiliary networks this load keeps resident alongside the base three**, priced load-exact
+/// (sc-15839).
+///
+/// Kolors is not a bare txt2img provider: it advertises a ControlNet-pose route, an IP-Adapter
+/// route, a **combined strict-pose tier that loads two at once**, and a PiD decode overlay. Every
+/// one of those is loaded by `registry::load_heavy_owned` and held for the life of the generator,
+/// and until this function existed all of them were declared at **zero**. The shared validator only
+/// cross-checks the overlay legs `if overlay_bytes > 0`, so a zero passed silently — and a rung-1 or
+/// rung-4 selection admitted for a ControlNet/IP/PiD load under-predicted peak by the whole overlay
+/// set.
+///
+/// Each projection mirrors what the loader actually does, not what the file stores:
+///
+/// * **ControlNet** — `mlx_gen_sdxl::load_controlnet` casts to the compute dtype (fp16) unless the
+///   checkpoint is already packed, so a dense branch is priced at 2 bytes/element. The shared
+///   primitive independently forces `Stored` for a packed triple, so a pre-quantized branch is
+///   counted at its code size rather than projected a second time.
+/// * **IP-Adapter** — two files under the snapshot (`image_encoder/model.safetensors` and
+///   `ip_adapter_plus_general.safetensors`), both cast the same way. Both are resident: the encoder
+///   and resampler live on the generator, and the K/V pairs are installed into the U-Net. A
+///   `WeightsSource::File` IP-Adapter is rejected by `load` before it reaches here and loads nothing,
+///   so it is priced at nothing.
+/// * **PiD** — the student checkpoint and the Gemma caption encoder, both loaded verbatim
+///   (`Weights::from_file` / `from_dir`, no cast), so `Stored` is exact.
+///
+/// **The PiD carve-out, and why it is narrower here than on z-image.** The sibling providers exclude
+/// a PiD overlay outright, on the reasoning that its presence on a `LoadSpec` does not mean the
+/// request selected it. That reasoning is sound *for a Sequential load* — `registry::build_residency`
+/// passes `req.use_pid` per request there, so a non-PiD generate never materializes the student. It
+/// is **false for a Resident load**: that arm passes `use_pid = true` unconditionally, so
+/// `Residency::ensure_warm_locked` loads the PiD superset once and every subsequent request runs
+/// with it resident whether or not it asked for it. Pricing it at zero under `Resident` would
+/// under-declare the ordinary path rather than avoid overstating it, so the carve-out is applied to
+/// exactly the policy where the overlay really is request-selected.
+fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResidentComponent>> {
+    // Matches `load_controlnet` / `load_kolors_ip_adapter`: dense payloads are cast to the fp16
+    // compute dtype (2 bytes/element); an already-packed triple is left alone, which the shared
+    // primitive handles on its own.
+    let compute_dtype = |_: &_| ResidentProjection::Bfloat16;
+    let mut components = Vec::new();
+
+    if let Some(source) = &spec.control {
+        let path = match source {
+            WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+        };
+        push_overlay(
+            &mut components,
+            CONTROL_COMPONENT_ID,
+            MemoryComponentKind::ControlBranch,
+            projected_safetensors_bytes(path, compute_dtype)?,
+        );
+    }
+
+    // Only a `Dir` IP-Adapter loads; `load` rejects a `File` one before any weights are opened.
+    if let Some(WeightsSource::Dir(root)) = &spec.ip_adapter {
+        let encoder = projected_safetensors_bytes(
+            root.join("image_encoder/model.safetensors"),
+            compute_dtype,
+        )?;
+        let adapter = projected_safetensors_bytes(
+            root.join("ip_adapter_plus_general.safetensors"),
+            compute_dtype,
+        )?;
+        push_overlay(
+            &mut components,
+            IP_ADAPTER_COMPONENT_ID,
+            MemoryComponentKind::IpAdapter,
+            encoder.saturating_add(adapter),
+        );
+    }
+
+    // See the carve-out above: priced only where the load-time policy makes it unconditional.
+    if spec.offload_policy == OffloadPolicy::Resident {
+        if let Some(pid) = &spec.pid {
+            let (WeightsSource::Dir(checkpoint) | WeightsSource::File(checkpoint)) =
+                &pid.checkpoint;
+            let (WeightsSource::Dir(gemma) | WeightsSource::File(gemma)) = &pid.gemma;
+            // `PidEngine::load` prefers Gemma's merged single file and falls back to the shard dir.
+            let merged = gemma.join(mlx_gen_pid::engine::GEMMA_MERGED_FILE);
+            let gemma_source = if merged.is_file() {
+                merged
+            } else {
+                gemma.clone()
+            };
+            let student = projected_safetensors_bytes(checkpoint, |_| ResidentProjection::Stored)?;
+            let caption =
+                projected_safetensors_bytes(&gemma_source, |_| ResidentProjection::Stored)?;
+            push_overlay(
+                &mut components,
+                PID_COMPONENT_ID,
+                // `AdapterStack` is the closest existing kind for an auxiliary network installed
+                // beside the base model's own transformers. What the contract arithmetic actually
+                // consumes is `MemoryComponentKind::is_auxiliary()`, which is true for it; a
+                // dedicated `DecoderOverlay` variant would be a shared-contract change for a naming
+                // nicety, so it is deliberately not made here.
+                MemoryComponentKind::AdapterStack,
+                student.saturating_add(caption),
+            );
+        }
+    }
+
+    Ok(components)
+}
+
+/// Record one overlay, skipping a zero. The shared validator refuses a declared component with zero
+/// bytes, and a component that measured zero is not evidence of residency anyway.
+fn push_overlay(
+    into: &mut Vec<MemoryResidentComponent>,
+    id: &str,
+    kind: MemoryComponentKind,
+    resident_bytes: u64,
+) {
+    if resident_bytes == 0 {
+        return;
+    }
+    into.push(MemoryResidentComponent {
+        id: id.to_owned(),
+        kind,
+        resident_bytes,
+        // No published rung bounds an overlay on this family: rung 4's window covers the U-Net's
+        // `Transformer2D` sub-stacks and ChatGLM3's `GlmBlock`s, and nothing else.
+        bounded_by: None,
+    });
+}
+
+/// Stable provider-local ids for the overlays [`resident_overlay_components`] declares.
+const CONTROL_COMPONENT_ID: &str = "kolors.controlnet.pose";
+const IP_ADAPTER_COMPONENT_ID: &str = "kolors.ip_adapter.plus_general";
+const PID_COMPONENT_ID: &str = "kolors.pid.student_and_caption_encoder";
 
 /// Declaration-equivalent contract used by weights-free registry conformance. Structure, parameter
 /// domains and prerequisites are identical; only the measured asset facts are absent.
@@ -620,7 +768,9 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    contract_with_asset_facts(provider_id, spec, 0, 0, 0)
+    // No overlays either: sizing one means opening its checkpoint, and this path exists precisely to
+    // produce the declaration without touching a weight file.
+    contract_with_asset_facts(provider_id, spec, 0, 0, 0, Vec::new())
 }
 
 fn contract_with_asset_facts(
@@ -629,6 +779,7 @@ fn contract_with_asset_facts(
     conditioning_bytes: u64,
     transformer_bytes: u64,
     decoder_bytes: u64,
+    overlays: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
     let streamable = streamable(spec);
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -662,20 +813,36 @@ fn contract_with_asset_facts(
         // folded into `AssetBytes`.
         variables.push(MemoryFormulaVariable::TransformerWindowSize);
     }
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables,
+    let overlay_bytes = overlays.iter().fold(0_u64, |total, component| {
+        total.saturating_add(component.resident_bytes)
+    });
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    contract.formula = if overlays.is_empty() {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        // The overlay set is only a variable of the peak when there IS one, so a plain txt2img load
+        // keeps the exact envelope it declared before sc-15839 rather than gaining a variable that
+        // never varies.
+        variables.push(MemoryFormulaVariable::OverlayBytes);
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: overlays,
+        }
     };
     contract.asset_facts.conditioning_bytes = conditioning_bytes;
     contract.asset_facts.transformer_bytes = transformer_bytes;
     contract.asset_facts.decoder_bytes = decoder_bytes;
+    // `base_bytes` is the three BASE components and must exclude the overlay, which the shared
+    // validator checks; `total_resident_bytes()` is what adds the two together for an adopter.
     contract.asset_facts.base_bytes = conditioning_bytes
         .saturating_add(transformer_bytes)
         .saturating_add(decoder_bytes);
+    contract.asset_facts.overlay_bytes = overlay_bytes;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -913,8 +1080,24 @@ pub(crate) fn begin_request(
     )
 }
 
-/// The widest `Transformer2D` sub-stack depth, which is the window domain the shared request scope
-/// validates against.
+/// The deepest stack **any published scope can window**, which is the domain the shared request
+/// scope validates a window's start block against.
+///
+/// This is the max over BOTH armed stacks, and that is not tidiness. Kolors publishes two rung-4
+/// scopes ([`TRANSFORMER_WINDOW_COMPONENTS`]): `Dit` windows the U-Net's `Transformer2D` sub-stacks,
+/// which are **10** deep at their widest, and `TextEncoder` windows ChatGLM3-6B's **28** `GlmBlock`s.
+/// Passing only the U-Net's 10 would make the shared hook reject a legitimate `TextEncoder` window
+/// starting at block ≥ 10 — dormant today, because nothing drives a start block, and wrong the
+/// moment anything does. Every sibling provider passes its actual depth.
+///
+/// Both halves are read off the model configs rather than written down here, so a topology change
+/// moves this number with it.
+fn widest_windowable_stack() -> usize {
+    widest_transformer_stack().max(crate::chatglm3::ChatGlmConfig::chatglm3_6b().num_layers)
+}
+
+/// The widest `Transformer2D` sub-stack depth — the `Dit` scope's half of
+/// [`widest_windowable_stack`].
 ///
 /// Derived from [`UNetConfig::kolors`](mlx_gen_sdxl::UNetConfig) rather than hardcoded, and it is
 /// the **maximum** rather than the total: the shared hook's contract is "a window of `w` starting at
@@ -950,7 +1133,7 @@ fn begin_with_cleanup(
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
-        widest_transformer_stack(),
+        widest_windowable_stack(),
         move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
     )?;
     // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
@@ -1093,6 +1276,409 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core::GenerationMemory;
     use mlx_gen::AdapterSpec;
+
+    // ── Asset-fact projections on real safetensors headers (sc-15839) ────────────────────────────
+    //
+    // Synthesized snapshots, not a cached tier: the arithmetic under test is header-only, so a
+    // handful of tensors proves it exactly and a 6 GB tier would only make it slow and gated.
+
+    /// A throwaway snapshot root under the temp dir, removed by [`Snapshot`]'s `Drop`.
+    struct Snapshot(std::path::PathBuf);
+
+    impl Snapshot {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "kolors-assetfacts-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        /// Write one `dtype` tensor of `shape` at `rel`, creating parents.
+        fn write(&self, rel: &str, name: &str, dtype: safetensors::Dtype, shape: &[usize]) {
+            let width = match dtype {
+                safetensors::Dtype::F16 | safetensors::Dtype::BF16 => 2,
+                safetensors::Dtype::F32 => 4,
+                other => panic!("unhandled test dtype {other:?}"),
+            };
+            let bytes = vec![0_u8; shape.iter().product::<usize>() * width];
+            let view = safetensors::tensor::TensorView::new(dtype, shape.to_vec(), &bytes).unwrap();
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, safetensors::serialize([(name, view)], &None).unwrap()).unwrap();
+        }
+
+        /// The three base components, each one small dense tensor. The VAE deliberately ships ONLY
+        /// the fp16 variant, which is the layout every cached `SceneWorks/kolors-mlx` tier has.
+        fn with_base(self) -> Self {
+            self.write(
+                "text_encoder/model.safetensors",
+                "embedding.weight",
+                safetensors::Dtype::F16,
+                &[4, 8],
+            );
+            self.write(
+                "unet/diffusion_pytorch_model.safetensors",
+                "conv_in.weight",
+                safetensors::Dtype::F16,
+                &[4, 8],
+            );
+            self.write(
+                "vae/diffusion_pytorch_model.fp16.safetensors",
+                "decoder.conv_in.weight",
+                safetensors::Dtype::F16,
+                &[4, 8],
+            );
+            self
+        }
+
+        fn path(&self, rel: &str) -> std::path::PathBuf {
+            self.0.join(rel)
+        }
+    }
+
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 4x8 f16 = 64 stored **payload** bytes, which is what the header-only projections sum.
+    ///
+    /// Note this is NOT what `PerComponentBytes::from_spec_subdirs` reports for the two components
+    /// it still prices from disk: that helper sums whole-FILE bytes, so a base component also
+    /// carries its safetensors header. The tests below read the real file lengths for those rather
+    /// than assuming, so they assert the projection under test and nothing else.
+    const STORED_TENSOR_BYTES: u64 = 4 * 8 * 2;
+
+    fn file_bytes(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// **The VAE is priced at its RESIDENT f32 width, not its stored fp16 one** (sc-15839).
+    ///
+    /// `mlx_gen_sdxl::load_vae` casts unconditionally, so a stored-bytes footprint under-declared the
+    /// decoder by exactly 2x at every tier — and the worker sizes budgets off these facts. The
+    /// assertion is the factor, not a literal: it is the thing that was wrong.
+    #[test]
+    fn the_decoder_is_priced_at_its_resident_f32_width_not_its_stored_fp16_one() {
+        let snapshot = Snapshot::new("vae").with_base();
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()));
+        let components = crate::registry::component_footprint(&spec).unwrap();
+
+        // The two components that really do load at their stored precision are untouched: still the
+        // on-disk file sum `from_spec_subdirs` has always reported.
+        assert_eq!(
+            components.text_encoder,
+            file_bytes(&snapshot.path("text_encoder/model.safetensors"))
+        );
+        assert_eq!(
+            components.dit,
+            file_bytes(&snapshot.path("unet/diffusion_pytorch_model.safetensors"))
+        );
+        // The decoder is the one that changed, and the factor is the whole point.
+        let stored = snapshot.path("vae/diffusion_pytorch_model.fp16.safetensors");
+        assert_eq!(
+            components.vae,
+            STORED_TENSOR_BYTES * 2,
+            "the decoder must be projected to f32: `load_vae` does `cast_all(Float32)` on every \
+             load and every cached tier ships only the fp16 variant, so stored bytes are half the \
+             truth"
+        );
+        // Payload against payload — the invariant is the FACTOR, and it must not be read off a file
+        // length: at this synthetic scale the safetensors header dwarfs the tensor, while on the
+        // real 159.56 MiB VAE it is noise.
+        let stored_payload =
+            projected_safetensors_bytes(&stored, |_| ResidentProjection::Stored).unwrap();
+        assert_eq!(stored_payload, STORED_TENSOR_BYTES);
+        assert_eq!(
+            components.vae,
+            stored_payload * 2,
+            "exactly 2x the stored fp16 payload, at every tier"
+        );
+
+        // And the contract carries the projected value, not just the footprint helper.
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert_eq!(contract.asset_facts.decoder_bytes, STORED_TENSOR_BYTES * 2);
+        assert!(contract.conformance_errors().is_empty());
+    }
+
+    /// An f32 master alongside the fp16 variant must not double-count: the footprint sizes the ONE
+    /// file `load_vae` opens, and it prefers the f32 master.
+    #[test]
+    fn the_decoder_footprint_sizes_the_file_the_loader_opens_not_the_whole_vae_dir() {
+        let snapshot = Snapshot::new("vae-both").with_base();
+        snapshot.write(
+            "vae/diffusion_pytorch_model.safetensors",
+            "decoder.conv_in.weight",
+            safetensors::Dtype::F32,
+            &[4, 8],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()));
+        let components = crate::registry::component_footprint(&spec).unwrap();
+        assert_eq!(
+            components.vae,
+            STORED_TENSOR_BYTES * 2,
+            "the f32 master is already 2x the fp16 variant's stored size and is loaded verbatim; \
+             summing the dir would report 3x"
+        );
+    }
+
+    /// **The three resident overlays are declared and priced** (sc-15839).
+    ///
+    /// Kolors loads a ControlNet, an IP-Adapter image encoder + K/V pairs, and a PiD student — and
+    /// `overlay_bytes` was zero for all of them, which the shared validator waves through because it
+    /// only cross-checks the overlay legs `if overlay_bytes > 0`. A rung-1 or rung-4 selection
+    /// admitted for such a load under-predicted the peak by the whole overlay set.
+    #[test]
+    fn the_resident_overlays_are_declared_priced_and_attributable() {
+        let snapshot = Snapshot::new("overlays").with_base();
+        snapshot.write(
+            "control/diffusion_pytorch_model.safetensors",
+            "controlnet_cond_embedding.conv_in.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+        snapshot.write(
+            "ip/image_encoder/model.safetensors",
+            "vision_model.embeddings.patch_embedding.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+        snapshot.write(
+            "ip/ip_adapter_plus_general.safetensors",
+            "ip_adapter.0.to_k_ip.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization)
+            .with_control(WeightsSource::Dir(snapshot.path("control")))
+            .with_ip_adapter(WeightsSource::Dir(snapshot.path("ip")));
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+
+        // Every tensor here is dense f16, which the fp16 compute cast leaves at 2 bytes/element.
+        const CONTROL_BYTES: u64 = STORED_TENSOR_BYTES;
+        const IP_BYTES: u64 = STORED_TENSOR_BYTES * 2;
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            CONTROL_BYTES + IP_BYTES,
+            "both overlays this load holds resident must be priced"
+        );
+        // `base_bytes` stays the three BASE components and must not absorb the overlay.
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes,
+            "base_bytes is the three base components and excludes the overlay"
+        );
+        assert_eq!(
+            contract.total_resident_bytes(),
+            contract.asset_facts.base_bytes + CONTROL_BYTES + IP_BYTES
+        );
+
+        let by_id = |id: &str| {
+            contract
+                .resident_components()
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap_or_else(|| panic!("{id} must be declared"))
+                .clone()
+        };
+        let control = by_id(CONTROL_COMPONENT_ID);
+        assert_eq!(control.kind, MemoryComponentKind::ControlBranch);
+        assert_eq!(control.resident_bytes, CONTROL_BYTES);
+        let ip = by_id(IP_ADAPTER_COMPONENT_ID);
+        assert_eq!(ip.kind, MemoryComponentKind::IpAdapter);
+        assert_eq!(
+            ip.resident_bytes, IP_BYTES,
+            "BOTH IP files are resident: the encoder/resampler on the generator, the K/V pairs \
+             installed into the U-Net"
+        );
+        assert!(
+            contract.resident_components().iter().all(|component| {
+                component.kind != MemoryComponentKind::Transformer(TransformerComponent::Dit)
+            }),
+            "an overlay must never be reported as the base denoising transformer"
+        );
+        // No published rung bounds an overlay here — rung 4 windows the U-Net and ChatGLM3 only.
+        assert!(contract
+            .resident_components()
+            .iter()
+            .all(|component| component.bounded_by.is_none()));
+        assert!(
+            contract.formula.uses(MemoryFormulaVariable::OverlayBytes),
+            "declared auxiliary bytes are inert unless the formula consumes them"
+        );
+
+        const BASE_PEAK: u64 = 1_000;
+        let prediction = contract.predicted_peak_from_base(BASE_PEAK);
+        assert_eq!(
+            prediction.predicted_peak_bytes(),
+            BASE_PEAK + CONTROL_BYTES + IP_BYTES,
+            "zeroing the overlay, dropping a component, or dropping OverlayBytes from the formula \
+             must change this"
+        );
+        assert_eq!(prediction.unattributed_bytes, BASE_PEAK);
+    }
+
+    /// A plain txt2img load declares **no** overlay and keeps its pre-sc-15839 envelope exactly.
+    ///
+    /// The point is that the component axis is adopted only where there is something to attribute: a
+    /// provider that declared an always-on `OverlayBytes` variable would invite calibration keyed on
+    /// a value that never varies.
+    #[test]
+    fn a_plain_load_declares_no_overlay_and_keeps_the_phase_envelope() {
+        let snapshot = Snapshot::new("plain").with_base();
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        assert!(contract.resident_components().is_empty());
+        assert!(!contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
+        assert!(matches!(
+            contract.formula,
+            MemoryFormulaKind::PhaseEnvelope { .. }
+        ));
+    }
+
+    /// **The PiD carve-out is policy-scoped, not blanket.**
+    ///
+    /// `registry::build_residency` passes `use_pid = true` unconditionally on the `Resident` arm, so
+    /// the student is loaded once and every later request runs with it resident whether or not it
+    /// asked. On `Sequential` it passes `req.use_pid`, so the overlay really is request-selected and
+    /// pricing it at load time would overstate the ordinary path. Both directions are asserted,
+    /// because a blanket carve-out (what the sibling providers do) is wrong in one of them.
+    #[test]
+    fn the_pid_overlay_is_priced_where_the_policy_makes_it_unconditional() {
+        let snapshot = Snapshot::new("pid").with_base();
+        snapshot.write(
+            "pid/student.safetensors",
+            "net.blocks.0.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+        snapshot.write(
+            "pid/gemma/gemma-2-2b-it.safetensors",
+            "model.embed_tokens.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+        let with_pid = |policy: OffloadPolicy| {
+            let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()))
+                .with_offload_policy(policy)
+                .with_pid(
+                    WeightsSource::File(snapshot.path("pid/student.safetensors")),
+                    WeightsSource::Dir(snapshot.path("pid/gemma")),
+                );
+            memory_strategy_contract(crate::MODEL_ID, &spec).unwrap()
+        };
+
+        let resident = with_pid(OffloadPolicy::Resident);
+        assert!(resident.conformance_errors().is_empty());
+        assert_eq!(
+            resident.asset_facts.overlay_bytes,
+            STORED_TENSOR_BYTES * 2,
+            "under Resident the student + caption encoder are loaded unconditionally and are \
+             resident for every request, so declaring them at zero under-prices the ordinary path"
+        );
+        let pid = resident
+            .resident_components()
+            .iter()
+            .find(|component| component.id == PID_COMPONENT_ID)
+            .expect("the PiD overlay must be attributable under Resident");
+        assert!(
+            pid.kind.is_auxiliary(),
+            "the contract arithmetic keys on is_auxiliary(), which is the property that matters"
+        );
+
+        let sequential = with_pid(OffloadPolicy::Sequential);
+        assert!(sequential.conformance_errors().is_empty());
+        assert_eq!(
+            sequential.asset_facts.overlay_bytes, 0,
+            "under Sequential the student is loaded per request from `req.use_pid`, so its presence \
+             on the LoadSpec is availability rather than residency"
+        );
+        assert!(sequential.resident_components().is_empty());
+    }
+
+    /// **A mixed snapshot re-quantizes the 6B encoder every generate, and the advisory must say so.**
+    ///
+    /// `registry::load`'s `warn_sequential_requantize` gate read `load_leaves_blocks_lazy` alone,
+    /// which inspects `unet/`. A Sequential load re-runs the whole staged schedule per request —
+    /// encoder included — so on a snapshot whose `unet/` is packed and whose `text_encoder/` is
+    /// dense the advisory was suppressed while the ChatGLM3-6B tower genuinely re-packed on every
+    /// request. That is the larger of the two costs on this family, not the smaller.
+    ///
+    /// Asserted on the predicates rather than by capturing a log line, so it pins the condition the
+    /// gate is built from.
+    #[test]
+    fn a_mixed_snapshot_still_repacks_the_encoder_each_generate() {
+        let snapshot = Snapshot::new("mixed").with_base();
+        // Packed `unet/`, dense `text_encoder/` — the shape that slipped through.
+        std::fs::write(
+            snapshot.path("unet/config.json"),
+            br#"{"quantization": {"bits": 8, "group_size": 64}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q8);
+
+        assert!(
+            load_leaves_blocks_lazy(&spec),
+            "the U-Net is already packed, so the U-Net-only predicate reports nothing to do — this \
+             is exactly what suppressed the advisory"
+        );
+        assert!(
+            !text_encoder_leaves_blocks_lazy(&spec),
+            "the dense text_encoder/ DOES re-pack on every staged generate"
+        );
+        assert!(
+            !load_leaves_blocks_lazy(&spec) || !text_encoder_leaves_blocks_lazy(&spec),
+            "the gate registry::load uses must fire on this snapshot"
+        );
+
+        // The control: a fully packed snapshot re-packs nothing and must stay quiet, which is the
+        // narrowing sc-15521 made and which this must not undo.
+        std::fs::write(
+            snapshot.path("text_encoder/config.json"),
+            br#"{"quantization": {"bits": 8, "group_size": 64}}"#,
+        )
+        .unwrap();
+        assert!(load_leaves_blocks_lazy(&spec));
+        assert!(text_encoder_leaves_blocks_lazy(&spec));
+    }
+
+    /// The `TextEncoder` scope's stack is 28 blocks deep, so the window domain the shared request
+    /// scope validates against must be 28 — not the U-Net's 10.
+    #[test]
+    fn the_windowable_depth_covers_the_deeper_of_the_two_armed_stacks() {
+        assert_eq!(widest_transformer_stack(), 10, "the U-Net's deepest stack");
+        assert_eq!(
+            widest_windowable_stack(),
+            crate::chatglm3::ChatGlmConfig::chatglm3_6b().num_layers,
+            "ChatGLM3-6B's 28 GlmBlocks are windowable by the published TextEncoder scope, and a \
+             domain of 10 would reject a legitimate window starting at block >= 10"
+        );
+        assert!(
+            widest_windowable_stack() > widest_transformer_stack(),
+            "a regression to the U-Net-only depth must redden here"
+        );
+    }
 
     /// A packed-tier spec. `quantize` + a snapshot dir whose `unet/config.json` carries the
     /// `quantization` marker is what `load_leaves_blocks_lazy` needs; the weights-free tests below

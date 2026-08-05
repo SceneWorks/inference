@@ -376,6 +376,16 @@ fn measure_end_to_end(
 /// (`the_text_encoder_window_scope_cannot_move_the_request_peak`): a text-encoder window can only
 /// move the request peak if the conditioning phase is the peak-bearing one, and on a family whose
 /// encoder is 6B that is a live question rather than SDXL's foregone one.
+///
+/// **The conditioning split is not bound to production anywhere, and that limit is real.**
+/// [`the_end_to_end_reassembly_reproduces_the_real_generate_peak`] binds this re-assembly to the
+/// real `generate` at exactly one cell (q4, 1024²) and only on the WHOLE-REQUEST peak — `generate`
+/// publishes no per-phase peak, so there is nothing to bind the split against. The nine-cell table
+/// in `memory_strategy::TRANSFORMER_WINDOW_COMPONENTS` is therefore harness evidence. Its *decisive*
+/// cell is separately corroborated on the production path
+/// (`the_text_encoder_window_bounds_the_conditioning_bearing_cell` drives real `generate` rows at
+/// bf16 512² and measures the TextEncoder scope moving the request peak, which can only happen if
+/// the conditioning phase carries it); the other eight cells are not.
 #[track_caller]
 fn measure_end_to_end_phased(
     dir: &std::path::Path,
@@ -1292,9 +1302,15 @@ fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
             clear_cache();
         }
     }
-    assert!(
-        measured > 0,
-        "SKIPPED-BY-ABSENCE: no tier was cached under {ROOT_ENV}"
+    // The nine-cell grid is the claim; a subset of it is not. `bearing` is asserted below to contain
+    // only 512² cells, and that shape argument is vacuous if the 1024²/2048² cells of a missing tier
+    // were never measured.
+    assert_eq!(
+        measured,
+        TIERS.len() * 3,
+        "SKIPPED-BY-ABSENCE: only {measured} of the {} advertised (tier × geometry) cells were \
+         measured under {ROOT_ENV}; the scope finding is a claim about the whole grid",
+        TIERS.len() * 3
     );
     println!(
         "[sc-15521 rung4 TextEncoder scope] the conditioning phase carries the request peak at \
@@ -1458,10 +1474,12 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
 
     // 3. Load-time quantization over a DENSE snapshot. The bf16 tier is dense, so requesting a
     //    packed tier over it is exactly the shape `load_leaves_blocks_lazy` refuses.
-    let Some(dense) = tier_dir("bf16") else {
-        println!("SKIPPED-BY-ABSENCE: bf16/ is not cached; the dense-quantize arm did not run");
-        return;
-    };
+    //
+    // `require_tier`, not a `println!` + early return: this arm is the tier-level discriminator on
+    // this family, and skipping it while still reporting the test as PASSED is exactly what the
+    // module docs forbid ("a test whose tier is absent skips loudly by name rather than passing
+    // silently"). An absent bf16/ must fail the test by name, not shrink it to two arms.
+    let dense = require_tier("bf16");
     let mut dense_q8 = spec(&dense, "bf16", LoadShape::DeferredMaterialization);
     dense_q8.quantize = Some(Quant::Q8);
     assert!(
@@ -1576,9 +1594,16 @@ fn every_advertised_tier_loads_and_publishes_the_ladder() {
         );
         measured += 1;
     }
-    assert!(
-        measured > 0,
-        "SKIPPED-BY-ABSENCE: no tier was cached under {ROOT_ENV}"
+    // **Every** advertised tier, not "at least one". A `> 0` guard let a test whose whole promise is
+    // per-tier evidence pass having checked the default tier and skipped the other two — which is
+    // precisely the failure mode its own doc comment says it exists to close ("no cell becomes
+    // Verified by sharing code").
+    assert_eq!(
+        measured,
+        TIERS.len(),
+        "SKIPPED-BY-ABSENCE: only {measured} of the {} advertised tiers were cached under \
+         {ROOT_ENV}; this test's claim is per-tier and cannot be made from a subset",
+        TIERS.len()
     );
 }
 
@@ -1716,8 +1741,19 @@ fn the_text_encoder_window_bounds_the_conditioning_bearing_cell() {
          carries the peak ({text:.4} vs {dit:.4} GiB). If it does not, the two scopes are not \
          distinguishable here and publishing both puts a meaningless choice in front of a selector"
     );
+    // **`Both` must be MATERIALLY better than `TextEncoder`, not merely no worse.** The measured
+    // ratio is 4.5436 / 8.8396 = **0.514** — `Both` additionally bounds the U-Net's 70 blocks, in a
+    // phase `TextEncoder` leaves fully resident — so the previous `both <= text * 1.01` granted a 1%
+    // free pass against a 49% margin: roughly 50x looser than the relationship it was checking, and
+    // wide enough to pass with the `Dit` half of `Both` deleted entirely. 0.60 keeps real headroom
+    // over the measurement while still reddening on that collapse.
     assert!(
-        both <= text * 1.01,
-        "`Both` must be at least as good as `TextEncoder` alone ({both:.4} vs {text:.4} GiB)"
+        both < text * 0.60,
+        "`Both` no longer materially beats `TextEncoder` alone ({both:.4} vs {text:.4} GiB, ratio \
+         {:.3} against a measured 0.514). Either the Dit half of the `Both` scope has stopped \
+         bounding anything — which would make `Both` a spelling of `TextEncoder` and the third \
+         published scope meaningless — or the phase balance at this cell has moved and \
+         TRANSFORMER_WINDOW_COMPONENTS' table owes fresh numbers",
+        both / text
     );
 }

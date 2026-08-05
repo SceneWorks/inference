@@ -28,3 +28,6 @@ sceneworks-gen-core-testkit = { workspace = true }
 # Read the U-Net safetensors header directly, so the rung-4 weight-set arithmetic is cross-checked
 # against the snapshot rather than against a doc comment (SC-15521).
 serde_json = { workspace = true }
+# Synthesize tiny safetensors snapshots so the asset-fact projections (the f32 VAE and the resident
+# overlays, sc-15839) are asserted against real headers without a multi-GB tier.
+safetensors = { workspace = true }

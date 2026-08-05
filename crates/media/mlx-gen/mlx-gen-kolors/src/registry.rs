@@ -224,13 +224,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // including the three shipped `SceneWorks/kolors-mlx` tiers whose weights are already packed —
     // where nothing re-quantizes and the message is simply wrong. Staged residency is the ladder's
     // rung 1 and therefore now the *normal* path, so an advisory that cried wolf on every default
-    // request would have trained readers to ignore it. `load_leaves_blocks_lazy` is the same
-    // predicate rung 4 gates on, so the warning and the rung cannot disagree about which loads pack
-    // at load time.
+    // request would have trained readers to ignore it. These are the same predicates rung 4 gates
+    // on, so the warning and the rung cannot disagree about which loads pack at load time.
+    //
+    // **Both components are checked, not just the U-Net.** `load_leaves_blocks_lazy` inspects
+    // `unet/` alone, and a Sequential load re-runs the ENTIRE staged schedule per generate — encoder
+    // included. On a mixed snapshot (packed `unet/`, dense `text_encoder/`) a U-Net-only gate
+    // suppressed the advisory while the 6B ChatGLM3 tower genuinely re-quantized on every request,
+    // which is by far the larger of the two costs on this family.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && !crate::memory_strategy::load_leaves_blocks_lazy(spec)
-        {
+        let repacks_each_generate = !crate::memory_strategy::load_leaves_blocks_lazy(spec)
+            || !crate::memory_strategy::text_encoder_leaves_blocks_lazy(spec);
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) && repacks_each_generate {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
@@ -1006,10 +1011,51 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+//
+/// Per-component bytes for this snapshot — **the decoder projected to its resident width, not its
+/// stored one** (sc-15839).
+///
+/// `text_encoder/` and `unet/` are priced from stored bytes because that is what they cost resident:
+/// the ChatGLM3 tower and the U-Net load at their snapshot precision (fp16, or already-packed q4/q8
+/// codes, which `PerComponentBytes` sums verbatim).
+///
+/// The VAE is different, and the difference is a factor of two. [`mlx_gen_sdxl::load_vae`] does
+/// `cast_all(Dtype::Float32)` **unconditionally** — the SDXL VAE is fp16-unstable, so it runs f32
+/// even when everything around it is fp16 — while every cached Kolors tier ships only
+/// `vae/diffusion_pytorch_model.fp16.safetensors` (159.56 MiB). A stored-bytes footprint therefore
+/// declared 159.56 MiB for a component that is 319.11 MiB resident, at **all three** tiers, and the
+/// worker sizes budgets off these facts. Projecting through the shared
+/// [`projected_safetensors_bytes`](mlx_gen::asset_facts::projected_safetensors_bytes) primitive —
+/// the same one z-image, krea, qwen-image and mage use — keeps that arithmetic out of this file.
+///
+/// The file is resolved by [`mlx_gen_sdxl::resolve_vae_weight_file`] rather than summed over `vae/`,
+/// so the footprint sizes exactly the file the resident load opens even on a snapshot that happens
+/// to cache both the f32 master and the fp16 variant.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["unet"], &["vae"])
+    let mut components = mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["unet"],
+        &["vae"],
+    )?;
+    let WeightsSource::Dir(root) = &spec.weights else {
+        // Unreachable: `from_spec_subdirs` already rejected a single-file checkpoint.
+        return Ok(components);
+    };
+    components.vae = projected_vae_bytes(root)?;
+    Ok(components)
+}
+
+/// The VAE's **resident** bytes: every tensor of the file [`mlx_gen_sdxl::load_vae`] opens,
+/// materialized f32.
+pub(crate) fn projected_vae_bytes(root: &std::path::Path) -> mlx_gen::gen_core::Result<u64> {
+    let file = mlx_gen_sdxl::resolve_vae_weight_file(root)
+        .map_err(|e| mlx_gen::gen_core::Error::Msg(format!("kolors: {e}")))?;
+    mlx_gen::asset_facts::projected_safetensors_bytes(&file, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Float32
+    })
 }
 
 mlx_gen::register_generators! {

@@ -267,10 +267,22 @@ pub fn load_ip_adapter(
 /// is cached it is upcast to f32 (fp16-precision weights — note: not bit-identical to the true f32
 /// VAE; fetch `vae/diffusion_pytorch_model.safetensors` for an exact decode).
 pub fn load_vae(root: &Path) -> Result<Autoencoder> {
-    let file = resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)?;
+    let file = resolve_vae_weight_file(root)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
     Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())
+}
+
+/// The **exact** VAE weight file [`load_vae`] would read out of `root`.
+///
+/// `pub` for the same reason [`resolve_unet_weight_file`] is: a memory contract that prices the
+/// decoder must size the file the resident load actually opens, not a directory sum. It matters
+/// more here than for the U-Net, because [`load_vae`] `cast_all`s to **f32 unconditionally** while
+/// every SceneWorks SDXL-family tier ships only `diffusion_pytorch_model.fp16.safetensors` — so a
+/// decoder footprint taken from stored bytes is underpriced by exactly 2x, at every tier
+/// (sc-15839). Pair this with `mlx_gen::asset_facts::ResidentProjection::Float32`.
+pub fn resolve_vae_weight_file(root: &Path) -> Result<PathBuf> {
+    resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)
 }
 
 /// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
