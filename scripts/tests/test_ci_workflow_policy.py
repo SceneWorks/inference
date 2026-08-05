@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import tomllib
 import unittest
@@ -1351,9 +1352,171 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
-        self.assertEqual(job.count("if: always()"), 2)
+        # Three, not two: sc-17355's GPU/memory evidence report is the third `always()` step, and it
+        # is counted here rather than exempted — the point of a count is that a fourth has to be
+        # argued for.
+        self.assertEqual(job.count("if: always()"), 3)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("krea-s18-sweep-${{ github.sha }}", job)
+        # The sampler's CSV rides along with the cells: on a 4.3-hour run the summary this job
+        # prints is a fraction of what the trajectory holds, and re-running to get it costs 4.3 hours.
+        self.assertIn("${{ runner.temp }}/gpu-fault-evidence/memory.csv", job)
+
+    def test_krea_lanes_record_gpu_fault_evidence_with_a_predicate_that_parses(self) -> None:
+        """sc-17355: a Metal command-buffer cascade names no cause, so the record must pre-exist.
+
+        Run 30869410054 failed the LoRA gate with `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`
+        — "ignored for causing prior/excessive GPU errors", i.e. an EARLIER submission faulted and
+        this one was dropped. That earlier fault is the only thing that names a cause, and it is not
+        in the run log. Nor can it be recovered afterwards: the re-dispatch that passed destroyed the
+        machine state that would have explained it. So the collection has to be in place BEFORE the
+        recurrence, on both lanes that drive this crate on `rw-krea`.
+
+        The predicate is pinned because the obvious one is inert. `subsystem == "com.apple.gpu"` —
+        which sc-17355 itself proposed — matches ZERO events on macOS 25.5.0: IOGPU faults carry an
+        empty `subsystem` and are identifiable only by `senderImagePath`. Measured both ways on
+        nax-macos over the same 3-day window: sender-based matching returns real IOGPU faults, the
+        subsystem form returns nothing at all. A capture that silently matches nothing is worse than
+        no capture, because an empty file reads as evidence of absence.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        bounds = {
+            "  mlx-krea-realtime:": "\n  mlx-krea-realtime-s18-sweep:",
+            "  mlx-krea-realtime-s18-sweep:": "\n  candle-audio-kokoro:",
+        }
+        # The sampler bound is per-caller because the two lanes are not the same length. The sweep
+        # is `timeout-minutes: 480` and really runs ~4.3 h; the 7200s default (the regression lane's
+        # `timeout-minutes: 120`) would stop recording less than halfway through it, silently, in
+        # the half where accumulated pressure is most likely. A shared constant cannot serve both.
+        expected_start = {
+            "  mlx-krea-realtime:": "scripts/ci/gpu_fault_evidence.sh start\n",
+            "  mlx-krea-realtime-s18-sweep:": "scripts/ci/gpu_fault_evidence.sh start 30000\n",
+        }
+        for header, terminator in bounds.items():
+            start = workflow.index(header)
+            job = workflow[start : workflow.index(terminator, start)]
+            with self.subTest(job=header.strip()):
+                self.assertIn(expected_start[header], job)
+                self.assertIn("scripts/ci/gpu_fault_evidence.sh report", job)
+                # SCOPED TO EACH STEP, not counted across the job. A `job.count(...)` of
+                # `continue-on-error: true` is a false green: both evidence steps could lose the
+                # key and the count would still be satisfied by unrelated steps elsewhere in the
+                # job. The properties asserted here are per-step, so the slice must be per-step.
+                for step_name, must_have in (
+                    ("- name: Start GPU fault evidence", ("continue-on-error: true",)),
+                    (
+                        "- name: Report GPU fault evidence",
+                        # The report explains a FAILING run, so it must not be skipped by one.
+                        ("continue-on-error: true", "if: always()"),
+                    ),
+                ):
+                    body = job[job.index(step_name) :]
+                    body = body[: body.index("run:")]
+                    for key in must_have:
+                        self.assertIn(key, body, f"{step_name}: missing {key}")
+
+                # THE RAW RECORD MUST OUTLIVE `$RUNNER_TEMP`, on BOTH lanes. The `report` step
+                # prints a summary — a peak line, a 30-row tail, a histogram — and a diagnosis
+                # needs the 1 Hz CSV and the full event list, which the runner deletes when the
+                # job ends. The regression lane is the one that actually failed (30869410054), so
+                # shipping retention only on the operator-dispatch sweep would have put the record
+                # everywhere except where the fault was seen.
+                self.assertIn("actions/upload-artifact@", job)
+                self.assertIn("gpu-fault-evidence/memory.csv", job)
+                self.assertIn("gpu-fault-evidence/gpu-events.txt", job)
+
+        # ONE TEST PER PROCESS in the LoRA step, and this is a correctness constraint rather than a
+        # style one. sc-17355 made `render()` call `reset_peak_memory()`, which is a process-global
+        # MLX mutation. The step is safe only because `run_one` invokes cargo once per test with
+        # `--exact`; collapsing both names into a single invocation would let libtest's default
+        # thread pool run them concurrently, and each would rebase the other's high-water mid-render
+        # — silently corrupting the per-arm figures this lane now reports.
+        lora_step = workflow[workflow.index("- name: Run Krea Realtime real Wan LoRA gates") :]
+        lora_step = lora_step[: lora_step.index("- name: Report GPU fault evidence")]
+        self.assertIn('"$name" -- --exact --ignored --nocapture', lora_step)
+        self.assertEqual(lora_step.count("run_one real_wan_"), 2)
+
+        script_path = REAL_WEIGHTS_WORKFLOW.parents[2] / "scripts" / "ci" / "gpu_fault_evidence.sh"
+        script = script_path.read_text(encoding="utf-8")
+        # Comments stripped first: the header explains the inert predicate in prose, and that
+        # explanation is precisely why it must not silently reappear in the command itself.
+        code = "\n".join(
+            line for line in script.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn('subsystem == "com.apple.gpu"', code)
+        self.assertIn('senderImagePath CONTAINS "IOGPU"', code)
+        # `log stream` drops messages under load, and load is the only condition of interest: a
+        # local run that ended in a memory kill produced 20+ "Messages dropped during live
+        # streaming" markers and none of the events, while `log show` over the same window
+        # returned them. The reader must stay post-hoc.
+        self.assertIn("/usr/bin/log show", code)
+        self.assertNotIn("log stream", code)
+        # The hypothesis under test is memory pressure, and the kernel names the mechanism outright
+        # (`killing due to "vm-compressor-space-shortage"`). None of those lines contain "IOGPU" or
+        # "command buffer", so a GPU-only predicate throws away the most direct evidence there is.
+        self.assertIn('eventMessage CONTAINS[c] "memorystatus"', code)
+        # `log` records its own argument vector, which contains "IOGPU" — without this exclusion
+        # every run matches itself and reports a spurious hit, which is as useless as reporting none.
+        self.assertIn('processImagePath != "/usr/bin/log"', code)
+        # The sibling `report_runner_disk_headroom.sh` names a lost exec bit as the one failure it
+        # cannot see; git tracks the mode, so pin it here instead of discovering it on a real box.
+        mode = subprocess.run(
+            ["git", "ls-files", "-s", "--", "scripts/ci/gpu_fault_evidence.sh"],
+            capture_output=True,
+            text=True,
+            # `test_script_encoding` requires this explicitly: the locale default decodes these
+            # gates' output as something other than UTF-8 on Windows, where this suite also runs.
+            encoding="utf-8",
+            cwd=script_path.parents[2],
+            check=False,
+        ).stdout.split(" ", 1)[0]
+        self.assertEqual(mode, "100755")
+
+        # THE NAME OF THIS TEST HAS TO BE EARNED. Everything above is substring matching, which
+        # cannot tell a working predicate from a malformed one — and a malformed predicate fails
+        # the same silent way the story's inert one did: `log show` exits non-zero, the script's
+        # `else` branch prints "log show failed", the lane stays green, and the capture records
+        # nothing. So actually run it.
+        #
+        # THE NAME SAYS "parses", NOT "matches", and the difference is the point. This probe catches
+        # a MALFORMED predicate; it cannot catch a well-formed one that matches nothing. Appending
+        # `AND subsystem == "com.apple.iokit.IOGPUFamily"` — i.e. reintroducing exactly the inert
+        # clause sc-17355 proposed — parses fine and would keep this green while collecting zero
+        # events. No assertion here can close that: "matches something" needs an event known to be
+        # in the archive at test time, and nothing is. The guard against inertness is the
+        # `assertNotIn('subsystem == "com.apple.gpu"')` above plus the report's own unclassified
+        # count, not this probe. Naming it `…_that_matches` claimed a check that does not exist.
+        #
+        # HONEST SCOPE, because this is the exact trap the change is about. `scripts/tests` runs on
+        # `ubuntu-latest` in ci.yml and NOWHERE ELSE, so this assertion never executes in CI — it is
+        # a developer-machine gate that fires for anyone running the suite on a Mac, which is where
+        # this script is written and where the lanes it guards run. Do not read a green CI as having
+        # checked the predicate. The runtime backstop is `report` printing "log show failed", which
+        # does run on the lanes.
+        if sys.platform != "darwin":
+            self.skipTest(
+                "`log show` is macOS-only, and this suite runs on ubuntu-latest in CI — the "
+                "predicate parse check fires only on a developer Mac"
+            )
+        predicate = re.search(r"--predicate '(.+?)' \\\n", code, re.DOTALL)
+        self.assertIsNotNone(predicate, "could not extract the predicate from the script")
+        probe = subprocess.run(
+            ["/usr/bin/log", "show", "--last", "1s", "--style", "compact",
+             "--predicate", predicate.group(1)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        # Assert on the PARSE, not on the exit code. `log show` can fail for reasons that say
+        # nothing about the predicate — a sandboxed or restricted host, a busy log archive — and
+        # failing the suite on those would be a flake that teaches people to ignore this test.
+        # A malformed predicate is unambiguous and specific: `log: Bad predicate (...)`.
+        self.assertNotIn(
+            "Bad predicate",
+            probe.stderr,
+            f"the shipped predicate does not parse: {probe.stderr.strip()}",
+        )
 
     def test_krea_e2e_step_pins_its_run_count_and_excludes_the_s18_sweep(self) -> None:
         """sc-17276: the e2e step selects by `--ignored`, which is a blanket.

@@ -1645,6 +1645,14 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
+      # sc-17355 — start the GPU/memory evidence sampler. Placed AFTER the Hub transfer so the
+      # window covers the render steps and nothing else; a `kIOGPUCommandBufferCallbackError…`
+      # cascade names no cause, so the run that fails is the only chance to record one.
+      # See the script header for why the story's `subsystem == "com.apple.gpu"` predicate is
+      # not the one used (it matches zero events).
+      - name: Start GPU fault evidence
+        continue-on-error: true
+        run: scripts/ci/gpu_fault_evidence.sh start
       # Coherence floor + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v
       # single-frame anchor, the v2v strength=0 paths, and the sc-15325 decode-tiling characterization.
       #
@@ -1740,6 +1748,32 @@ jobs:
           }
           run_one real_wan_style_lora_loads_and_changes_the_render
           run_one real_wan_step_distill_lora_installs_over_the_widened_globals
+      # sc-17355 — `if: always()`, not `if: failure()`. A clean run's trajectory is what makes a
+      # failing one legible: the hypothesis under test is memory pressure, and "93 GiB peak" means
+      # nothing without the passing runs to compare it against. It is also the only way to notice
+      # that this record has quietly stopped being produced.
+      - name: Report GPU fault evidence
+        if: always()
+        continue-on-error: true
+        run: scripts/ci/gpu_fault_evidence.sh report
+      # THIS is the lane that failed (run 30869410054), so it is the lane whose raw record has to
+      # survive. The step above prints a summary; the full event list and the whole 1 Hz CSV are
+      # what a diagnosis actually needs, and `$RUNNER_TEMP` is wiped when the job ends.
+      #
+      # `if-no-files-found: warn`, NOT `error`: these files are produced by a `continue-on-error`
+      # step by design, so their absence is already a tolerated outcome — failing the upload on it
+      # would hand a record-keeping path the power to red a real-weight lane, which is the one
+      # thing this whole mechanism must not do.
+      - name: Upload GPU fault evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: krea-realtime-gpu-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/gpu-fault-evidence/memory.csv
+            ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
 
   # sc-17276 — the sc-15127/sc-15571 S18 coherence sweep, split out of the regression lane above.
   #
@@ -1799,6 +1833,18 @@ jobs:
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
+      # sc-17355 — the same evidence sampler as the regression lane above. This job is the SAME
+      # crate and the SAME box driven for ~4.3 hours instead of ~28 minutes, so if the cascade is
+      # pressure-related this is where it is most likely to be seen; a four-hour run that dies
+      # naming no cause is the most expensive possible place to have no record.
+      #
+      # 30000s, not the 7200s default: the default matches the regression lane's
+      # `timeout-minutes: 120`, and using it here would stop recording ~2h into a run this job is
+      # allowed 480 minutes for — silently, and in the half of the run where accumulated pressure
+      # is most likely. The figure is over this job's own cap so the sampler cannot expire first.
+      - name: Start GPU fault evidence
+        continue-on-error: true
+        run: scripts/ci/gpu_fault_evidence.sh start 30000
       # `--exact` after the `--` (cargo rejects it in its own argument position, exit 1) plus the
       # run-count assertion: name-selection alone turns a rename into "0 passed; N filtered out" and
       # a green step, which on a four-hour job would be an expensive way to gate nothing (sc-17250).
@@ -1833,6 +1879,12 @@ jobs:
             echo "::error::expected 21 S18CELL rows (the ${KREA_S18_ROWS} rows x the three seeds above), captured $cells — the sweep did not measure what this job claims" >&2
             exit 1
           fi
+      # sc-17355 — before the upload below, so the sampler is stopped and its CSV is final when the
+      # artifact is collected.
+      - name: Report GPU fault evidence
+        if: always()
+        continue-on-error: true
+        run: scripts/ci/gpu_fault_evidence.sh report
       # The sweep's product is its per-cell evidence, not the green check: every (row, seed) emits one
       # `S18CELL` TSV line precisely so a run can be re-aggregated without the log. `always()` because
       # a four-hour run that ends in an unresolvable verdict still measured 21 real cells, and throwing
@@ -1852,6 +1904,8 @@ jobs:
           path: |
             ${{ runner.temp }}/s18-cells.tsv
             ${{ runner.temp }}/s18-sweep.log
+            ${{ runner.temp }}/gpu-fault-evidence/memory.csv
+            ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
 
   # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
