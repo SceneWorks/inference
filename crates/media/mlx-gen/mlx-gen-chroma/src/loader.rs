@@ -82,6 +82,15 @@ pub fn quantize_vae_for_dense_source(vae: &mut Vae, bits: i32) -> Result<()> {
     vae.quantize(bits)
 }
 
+/// The reopenable description of the T5 encoder's 24 blocks (ladder rung 4, `TextEncoder` scope —
+/// SC-15520), at the same affine group size [`load_t5_encoder`] read from the component's own
+/// `config.json`, so a streamed block is rebuilt at the width its resident twin loaded at.
+pub fn t5_block_stream(root: &Path) -> Result<mlx_gen_flux::T5BlockStream> {
+    let component = root.join("text_encoder");
+    let group_size = packed_group_size(&component, "T5")?;
+    mlx_gen_flux::T5BlockStream::new(mlx_gen::WeightsSource::Dir(component), "", group_size)
+}
+
 pub fn load_transformer(root: &Path, cfg: ChromaTransformerConfig) -> Result<ChromaTransformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
     ChromaTransformer::from_weights(w, cfg)
