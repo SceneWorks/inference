@@ -352,6 +352,32 @@ expected_files = [
 ]
 
 [[models]]
+# sc-17739 — `mlx-gen-lens` shipped in the macOS catalog with NO real-weight coverage of any kind:
+# no testkit dev-dependency, no conformance test, no entry here, no job. sc-17418 recorded that its
+# `check_cfg_off_render` arm covered lens "on the nightly"; it never did, because the suite is a
+# per-crate opt-in and lens had never opted in. This row plus the `mlx-media` wiring is what makes
+# that true.
+#
+# The upstream `microsoft/Lens-Turbo` was DELETED from the Hub by Microsoft; this is SceneWorks's
+# re-assembled diffusers-layout repackage (byte-identical weights, per its model card). Three test
+# resolvers still derived the dead `models--microsoft--Lens-Turbo` path and are repointed in the same
+# change.
+key = "lens-turbo"
+repository = "SceneWorks/Lens-Turbo"
+revision = "33acd265a2fc97a4a2f5d546ef4952b5a960aa56"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["LENS_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/lens_turbo_bf16.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 key = "z-image-turbo"
 repository = "Tongyi-MAI/Z-Image-Turbo"
 revision = "f332072aa78be7aecdf3ee76d5c247082da564a6"

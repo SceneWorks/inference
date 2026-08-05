@@ -961,6 +961,9 @@ jobs:
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      # sc-17739 — the Lens snapshot. `mlx-gen-lens` ships in the macOS catalog but had no real-weight
+      # coverage at all until this lane; see the `lens-turbo` row in release/real-weight-models.toml.
+      LENS_SNAPSHOT: ${{ vars.LENS_SNAPSHOT }}
       MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -972,7 +975,7 @@ jobs:
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
           ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
-          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT
+          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT LENS_SNAPSHOT
       # actions/setup-python's Darwin package hard-codes /Users/runner during installation, which is
       # not writable on this self-hosted runner. uv installs the exact interpreter wholly in temp.
       - name: Install pinned reference Python
@@ -1002,11 +1005,12 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
-          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT
+          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT LENS_SNAPSHOT
       - name: Materialize and verify immutable snapshot
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model lens-turbo --snapshot "$LENS_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
@@ -1138,6 +1142,20 @@ jobs:
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
           z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+      # sc-17739 — the first real-weight gate `mlx-gen-lens` has ever had. Run as TWO cargo
+      # invocations, deliberately: each conformance run holds a ~21 GiB model resident across ~8
+      # renders, and running both ids in one process was SIGKILLed on the dev Mac. Separate processes
+      # bound the peak to one model at a time. `lens_turbo` is the pointed arm — its default guidance
+      # is 1.0, so sc-17418's `check_cfg_off_render` exercises the production default path; `lens`
+      # covers the guided `[pos; neg]` path. Both resolve from the one snapshot.
+      - name: Run Lens provider conformance (turbo — the CFG-off default path)
+        run: >-
+          cargo test --locked --release -p mlx-gen-lens --test conformance
+          lens_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+      - name: Run Lens provider conformance (base — the guided path)
+        run: >-
+          cargo test --locked --release -p mlx-gen-lens --test conformance
+          lens_base_satisfies_gen_core_contract -- --ignored --nocapture
       # sc-14038 DoD gate — the ONLY automatic run of the Qwen3-VL text-encoder parity suite. It
       # needs both the 8.875 GB `text_encoder/` component and the CPU-dumped boundary golden,
       # neither of which the PR lanes have. It also carries the self-invalidating assertion that
