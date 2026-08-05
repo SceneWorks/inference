@@ -208,7 +208,27 @@ fn registry_t2v_i2v_v2v_routes_publish_the_real_adapter_report() {
 }
 
 /// Render `req` with the given adapters and return the decoded frames.
+///
+/// Each call loads a COMPLETE copy of the 14B stack, and the callers drive several per process:
+/// `real_wan_style_lora_loads_and_changes_the_render` does four (three renders plus
+/// [`install_count`]), `real_wan_step_distill_lora_installs_over_the_widened_globals` three (two
+/// renders plus [`install_count`]). So the per-arm memory line below is not decoration. sc-17355's open question is whether the arms accumulate: run 30869410054 died in the
+/// `lora@1.0` arm on a Metal command-buffer cascade, and two local runs died in that same arm on a
+/// jetsam SIGKILL, which are two different deaths in one place. Whether the entering `active`
+/// figure climbs arm-over-arm is what separates "the second load starts from a dirty baseline" from
+/// "the box was simply busy", and it is the number nobody has. It is printed rather than asserted
+/// on purpose: a threshold here would be an invented constant, and sc-17355 is explicit that one
+/// failure in two runs does not yet justify changing anything.
+///
+/// `reset_peak_memory()` is a PROCESS-GLOBAL MLX mutation, not a per-test one, so this is only
+/// sound while each test here owns its process. The real-weight lane guarantees that by invoking
+/// `cargo test … "$name" -- --exact` once per test rather than selecting both in one run — if that
+/// ever collapses into a single invocation, libtest's default thread pool would run the two tests
+/// concurrently and each would rebase the other's high-water mid-render. `test_ci_workflow_policy`
+/// pins the per-test invocation for exactly this reason.
 fn render(adapters: Vec<AdapterSpec>, req: &GenerationRequest, label: &str) -> Vec<Image> {
+    use mlx_rs::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+
     let root = snapshot_dir();
     assert!(
         root.join("dit.safetensors").exists() || root.join("transformer").is_dir(),
@@ -217,6 +237,10 @@ fn render(adapters: Vec<AdapterSpec>, req: &GenerationRequest, label: &str) -> V
     );
     let mut spec = LoadSpec::new(WeightsSource::Dir(root));
     spec.adapters = adapters;
+    // Rebase the high-water to whatever this arm INHERITED, so the peak below is this arm's own
+    // allocation rather than a running maximum that only the first arm can ever set.
+    let entering = get_active_memory();
+    reset_peak_memory();
     let t0 = std::time::Instant::now();
     let gen = mlx_gen_krea_realtime::provider_registry()
         .unwrap()
@@ -225,7 +249,15 @@ fn render(adapters: Vec<AdapterSpec>, req: &GenerationRequest, label: &str) -> V
     let out = gen
         .generate(req, &mut |_| {})
         .unwrap_or_else(|e| panic!("{label}: generate must succeed: {e}"));
-    println!("  {label}: rendered in {:.1?}", t0.elapsed());
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    println!(
+        "  {label}: rendered in {:.1?} (mlx active on entry {:.2} GiB, peak {:.2} GiB, active on \
+         exit {:.2} GiB)",
+        t0.elapsed(),
+        entering as f64 / GIB,
+        get_peak_memory() as f64 / GIB,
+        get_active_memory() as f64 / GIB,
+    );
     match out {
         GenerationOutput::Video { frames, .. } => frames,
         other => panic!("{label}: expected a Video output, got {other:?}"),
