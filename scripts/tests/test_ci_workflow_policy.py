@@ -926,6 +926,27 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}",
             workflow,
         )
+        self.assertIn("migrate_mage_edit_variant_manifest:", workflow)
+        self.assertIn(
+            "default: false",
+            workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
+        )
+        migration = workflow[
+            workflow.index("\n      - name: Migrate only the copied Mage edit-variant manifest") :
+            workflow.index(
+                "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
+            )
+        ]
+        self.assertIn("inputs.profile == 'media'", migration)
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest", migration)
+        self.assertIn('golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"', migration)
+        self.assertIn('runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"', migration)
+        self.assertIn('seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"', migration)
+        self.assertIn('"$golden_root" != "$runner_root/"*', migration)
+        self.assertIn('"$golden_root" == "$seed_root"', migration)
+        self.assertIn(" -ef ", migration)
+        self.assertIn("--migrate-reference-environment-manifest-only", migration)
+        self.assertNotIn("dump_mage_flow_golden.py", migration)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
         self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
         self.assertIn(
@@ -967,7 +988,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
         self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
-        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 2)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 3)
         self.assertLess(
             workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
             workflow.index("Save verified Mage oracle cache"),

@@ -88,6 +88,11 @@ on:
         type: string
         required: false
         default: ""
+      migrate_mage_edit_variant_manifest:
+        description: Migrate only the copied Mage edit-variant manifest after strict legacy verification (media only)
+        type: boolean
+        required: false
+        default: false
       publish_chroma_artifacts:
         description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
         type: boolean
@@ -1045,6 +1050,28 @@ jobs:
             install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
           done
           echo "imported=true" >> "$GITHUB_OUTPUT"
+      - name: Migrate only the copied Mage edit-variant manifest
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: |
+          golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"
+          runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"
+          if [[ "$golden_root" != "$runner_root/"* ]]; then
+            echo "Mage manifest migration output must remain under RUNNER_TEMP" >&2
+            exit 1
+          fi
+          if [[ "$golden_root" == "$seed_root" || \
+                "$MAGE_GOLDEN_DIR/mage_edit_variants_manifest.json" -ef "$MAGE_ORACLE_SEED_DIR/mage_edit_variants_manifest.json" ]]; then
+            echo "Mage manifest migration must never mutate the persistent operator seed" >&2
+            exit 1
+          fi
+          python3.12 scripts/release/provision_mage_edit_variants.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --migrate-reference-environment-manifest-only
       # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
       # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
       # different backend/process from the Candle implementation and transferred as an immutable
