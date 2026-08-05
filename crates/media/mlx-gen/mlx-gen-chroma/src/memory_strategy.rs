@@ -53,14 +53,15 @@
 //! either verdict, because rung 1 already removes that phase from the request peak and rung 2's
 //! rejection is a decoder-quality result that a narrower text encoder does not touch.
 
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    TransformerComponent,
+    adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
+    Error as CoreError, LoadShape, LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -78,8 +79,9 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "chroma1-base-q4-mlx-shared-lad
 
 /// Tile edges swept against the exact untiled decode of the **production** latent, in output pixels.
 ///
-/// Recorded here rather than in a comment so `the_rejected_decode_geometries_are_refused_by_the_production_path`
-/// can re-assert every rejection against the production admission path.
+/// Recorded here rather than in a comment so `the_withheld_rungs_are_refused_by_the_production_path`
+/// can re-assert every rejection against the production admission path, and
+/// `native_and_pid_decode_routes_are_disjoint_and_checked` against the checked route set.
 pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[960, 896, 832, 768, 640, 512, 384];
 /// Feather overlaps swept beside [`DECODE_TILE_EDGES_SWEPT`].
 pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
@@ -130,15 +132,24 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 
 /// **Rung 3 is `Missing` on this family, and it is a measured verdict rather than an omission.**
 ///
-/// Measured on Chroma1-Base q4 at 1024² (`attention_chunking_is_measured_against_the_rung_two_top`),
-/// against rung 3's own control — the same composition minus the chunking, which per the shared cost
-/// order is *not* staged:
+/// The mechanism works. Measured at the DiT seam on Chroma1-Base q4 at 1024²
+/// (`attention_chunking_is_measured_at_the_dit_seam`, which drives
+/// `ChromaTransformer::forward_with_attention_plan` directly because the production path refuses a
+/// bounded-attention request):
 ///
-/// | steps | control | chunked | Δ |
-/// |---:|---:|---:|---:|
-/// | 1 | 28.0779 GiB | 28.0776 GiB | **−0.001%** |
+/// | | peak | output |
+/// |---|---:|---|
+/// | unbounded | 7.1679 GiB | — |
+/// | bounded | 7.0053 GiB | **bit-exact**, `max|Δv| = 0.000e0` |
 ///
-/// Inert to the fourth decimal. That is the expected shape on MLX and the reason is structural:
+/// **−2.27%, and it is confined to a phase that does not bind.** The 0.1626 GiB seam saving sits
+/// inside the 12.05 GiB headroom between the denoise phase and the staged request peak, so a caller
+/// pays wall clock for a request peak that does not move — which per the epic is not a saving. That
+/// test asserts the relation as live arithmetic over two quantities it measures in the same run, so
+/// it reddens if the denoise phase ever becomes peak-bearing rather than carrying a remembered
+/// figure.
+///
+/// The shape is expected on MLX and the reason is structural:
 /// `fast::scaled_dot_product_attention` dispatches to a fused Metal kernel that **streams** the
 /// scores, so there is no `[B,H,Sq,Sk]` materialization for query-row chunking to bound — see
 /// [`mlx_gen::attention`], where the same rung is worth −32% on candle and −1.7% on MLX's Z-Image
@@ -240,6 +251,109 @@ fn decode_routes(provider_id: &str) -> mlx_gen::gen_core::Result<mlx_gen_pid::De
     )
 }
 
+/// Stable provider-local ids for the overlays [`resident_overlay_components`] declares.
+const PID_COMPONENT_ID: &str = "chroma.pid.student_and_caption_encoder";
+const ADAPTER_COMPONENT_ID: &str = "chroma.adapters.forward_residuals";
+
+/// The **auxiliary networks this load keeps resident alongside the base three**, priced load-exact
+/// (sc-15839, mirroring the Kolors fix in `mlx_gen_kolors::memory_strategy`).
+///
+/// Until this existed Chroma declared `overlay_bytes = 0` while advertising a PiD decode overlay,
+/// and the shared validator only cross-checks the overlay legs `if overlay_bytes > 0` — so the zero
+/// passed silently and a rung-1 or rung-4 selection taken for a PiD load under-predicted peak by the
+/// whole student plus its caption encoder.
+///
+/// **The PiD carve-out, and why it is policy-scoped rather than absent.** A `pid` on the `LoadSpec`
+/// does not mean the request selected it: `build_residency`'s Sequential arm threads `req.use_pid`
+/// per request, so a non-PiD generate never materializes the student. That reasoning is false under
+/// `Resident`, where `Residency::ensure_warm_locked` calls `load_heavy(true, …)` **unconditionally**
+/// — the PiD superset is loaded once and every later request runs with it resident whether or not it
+/// asked. Pricing it at zero there under-declares the ordinary path rather than avoiding an
+/// overstatement, so it is priced at exactly the policy that makes it unconditional.
+///
+/// Projections mirror what the loader does, not what the file stores. `PidEngine::from_spec` loads
+/// the student and the Gemma caption encoder verbatim (`Weights::from_file` / `from_dir`, no cast),
+/// so `Stored` is exact; Chroma's own three components have no `cast_all` on any path, which is why
+/// none of them needs a `ResidentProjection::Float32` correction the way the SDXL VAE did.
+///
+/// Adapters are priced through the shared `adapter_stack_resident_bytes` at
+/// [`AdapterResidencyMode::Additive`], which is what `apply_chroma_adapters` installs — a
+/// rank-decomposed factor pair held on each `AdaptableLinear` and applied at forward time, never a
+/// folded `[out, in]` delta. `None` from that helper means an additive stack could not be sized, and
+/// this fails closed on it rather than declaring a zero the validator would wave through.
+fn resident_overlay_components(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<Vec<MemoryResidentComponent>> {
+    let mut components = Vec::new();
+
+    if spec.offload_policy == OffloadPolicy::Resident {
+        if let Some(pid) = &spec.pid {
+            let (WeightsSource::Dir(checkpoint) | WeightsSource::File(checkpoint)) =
+                &pid.checkpoint;
+            let (WeightsSource::Dir(gemma) | WeightsSource::File(gemma)) = &pid.gemma;
+            // `PidEngine::load` prefers Gemma's merged single file and falls back to the shard dir.
+            let merged = gemma.join(mlx_gen_pid::engine::GEMMA_MERGED_FILE);
+            let gemma_source = if merged.is_file() {
+                merged
+            } else {
+                gemma.clone()
+            };
+            let student = projected_safetensors_bytes(checkpoint, |_| ResidentProjection::Stored)?;
+            let caption =
+                projected_safetensors_bytes(&gemma_source, |_| ResidentProjection::Stored)?;
+            push_overlay(
+                &mut components,
+                PID_COMPONENT_ID,
+                // `AdapterStack` is the closest existing kind for an auxiliary network installed
+                // beside the base model's transformers; what the contract arithmetic consumes is
+                // `MemoryComponentKind::is_auxiliary()`, which is true for it.
+                MemoryComponentKind::AdapterStack,
+                student.saturating_add(caption),
+            );
+        }
+    }
+
+    let adapter_bytes =
+        adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive).ok_or_else(
+            || {
+                CoreError::Unsupported(
+                    "chroma: an adapter stack was requested but at least one source could not be \
+                     sized; refusing to declare a zero the shared validator would wave through"
+                        .to_owned(),
+                )
+            },
+        )?;
+    push_overlay(
+        &mut components,
+        ADAPTER_COMPONENT_ID,
+        MemoryComponentKind::AdapterStack,
+        adapter_bytes,
+    );
+
+    Ok(components)
+}
+
+/// Record one overlay, skipping a zero: the shared validator refuses a declared component with zero
+/// bytes, and a component that measured zero is not evidence of residency anyway.
+fn push_overlay(
+    into: &mut Vec<MemoryResidentComponent>,
+    id: &str,
+    kind: MemoryComponentKind,
+    resident_bytes: u64,
+) {
+    if resident_bytes == 0 {
+        return;
+    }
+    into.push(MemoryResidentComponent {
+        id: id.to_owned(),
+        kind,
+        resident_bytes,
+        // No published rung bounds an overlay here: rung 4's window covers the DiT's two block
+        // sub-stacks (and, unpublished, the T5 encoder's), and nothing else.
+        bounded_by: None,
+    });
+}
+
 fn variant_for(provider_id: &str) -> mlx_gen::gen_core::Result<ChromaVariant> {
     match provider_id {
         crate::CHROMA1_HD_ID => Ok(ChromaVariant::Hd),
@@ -322,6 +436,7 @@ fn build_contract(
     streamable: bool,
     calibration: Option<MemoryCalibrationIdentity>,
     footprint: mlx_gen::PerComponentBytes,
+    overlays: Vec<MemoryResidentComponent>,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     variant_for(provider_id)?;
     let staged = spec.offload_policy == OffloadPolicy::Sequential;
@@ -340,21 +455,38 @@ fn build_contract(
     );
     contract.load_shape = spec.load_shape;
     contract.calibration = calibration;
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::DecodeTileArea,
-            MemoryFormulaVariable::AttentionChunkSize,
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+    contract.asset_facts.overlay_bytes = overlays
+        .iter()
+        .try_fold(0_u64, |total, component| {
+            total.checked_add(component.resident_bytes)
+        })
+        .ok_or_else(|| CoreError::Msg("chroma: overlay byte sum overflow".to_owned()))?;
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+        MemoryFormulaVariable::TransformerWindowSize,
+        MemoryFormulaVariable::OverlayBytes,
+    ];
+    // The component axis only where there IS a resident overlay: the shared validator refuses a
+    // declared component with zero bytes, and `ComponentPhaseEnvelope` with an empty vector would
+    // claim an axis this load does not use.
+    contract.formula = if overlays.is_empty() {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: overlays,
+        }
     };
     contract.asset_facts.base_bytes = footprint
         .text_encoder
@@ -363,6 +495,7 @@ fn build_contract(
     contract.asset_facts.conditioning_bytes = footprint.text_encoder;
     contract.asset_facts.transformer_bytes = footprint.dit;
     contract.asset_facts.decoder_bytes = footprint.vae;
+
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -408,16 +541,46 @@ fn build_contract(
     Ok(contract)
 }
 
-/// The measured production key. Every axis is exact; anything else stays uncalibrated so the
-/// selector cannot reach an optimized strategy on evidence that was never taken.
+/// The measured production key.
+///
+/// **The tier is part of the key, and it has to be** (review of PR #496). The four axes this used to
+/// test — provider, precision, `quantize.is_none()`, policy — do not distinguish a q8 or bf16
+/// snapshot from the measured q4 one, because all three shipped tiers are *pre-packed* and therefore
+/// all three load with `quantize == None`. Every tier of `chroma1_base` inherited the q4 key while
+/// the doc above it called that key exact, so a q8 or bf16 request could have selected an optimized
+/// fit on q4-measured evidence.
+///
+/// The discriminant is the tier directory's own packed marker, read from the transformer component's
+/// `config.json` — the same `quantization.bits` the loader packed-detects on — so it names what was
+/// actually measured rather than what a path happens to be called. An unreadable or absent marker
+/// fails closed: no calibration, and the selector cannot reach an optimized strategy at all.
+///
+/// Measured: `chroma1_base`, transformer packed at **4** bits, bf16 precision, Sequential, clean
+/// route. Everything else — the other two entries, the q8 and bf16 tiers, every overlay — is
+/// deliberately uncalibrated until it has its own evidence (sc-17695).
 fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'static str> {
-    (provider_id == crate::CHROMA1_BASE_ID
-        && spec.precision == mlx_gen::Precision::Bf16
-        && spec.quantize.is_none()
-        && spec.offload_policy == OffloadPolicy::Sequential
-        && clean(spec))
+    if provider_id != crate::CHROMA1_BASE_ID
+        || spec.precision != mlx_gen::Precision::Bf16
+        || spec.quantize.is_some()
+        || spec.offload_policy != OffloadPolicy::Sequential
+        || !clean(spec)
+    {
+        return None;
+    }
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return None;
+    };
+    // `Ok(None)` is a dense (bf16) tier and `Err` an unreadable marker; both are "not the measured
+    // artifact" and both fail closed here.
+    (mlx_gen::quant::packed_quant_bits_at(&root.join("transformer"))
+        .ok()
+        .flatten()
+        == Some(CALIBRATED_QUANT_BITS))
     .then_some(MEMORY_CALIBRATION_FINGERPRINT)
 }
+
+/// The packed width of the one measured tier. Part of [`production_calibration_fingerprint`]'s key.
+pub const CALIBRATED_QUANT_BITS: i32 = 4;
 
 /// The production contract, with filesystem-backed asset facts.
 pub fn contract_for(
@@ -432,6 +595,7 @@ pub fn contract_for(
         structurally_streamable(spec),
         calibration,
         crate::model::component_footprint(spec)?,
+        resident_overlay_components(spec)?,
     )
 }
 
@@ -451,6 +615,9 @@ pub fn weights_free_contract(
             spec.load_shape,
         )),
         Default::default(),
+        // No overlays either: sizing one means opening its checkpoint, and this path exists exactly
+        // to produce the declaration without touching a weight file.
+        Vec::new(),
     )
 }
 
@@ -748,6 +915,32 @@ mod tests {
         sequential_spec().with_load_shape(LoadShape::DeferredMaterialization)
     }
 
+    /// A snapshot root whose `transformer/config.json` declares a packed width — the discriminant
+    /// `production_calibration_fingerprint` keys the measured tier on. `None` writes a dense tier
+    /// (no `quantization` marker), which is what a `bf16` tier looks like on disk.
+    fn tier_root(tag: &str, bits: Option<i32>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "chroma-tier-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let config = match bits {
+            Some(bits) => format!("{{\"quantization\": {{\"bits\": {bits}, \"group_size\": 64}}}}"),
+            None => "{}".to_owned(),
+        };
+        std::fs::write(root.join("transformer/config.json"), config).unwrap();
+        root
+    }
+
+    fn tier_spec(root: &std::path::Path) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+    }
+
     #[test]
     fn every_entry_publishes_the_same_ladder_and_is_internally_coherent() {
         for provider in [
@@ -777,20 +970,48 @@ mod tests {
                 );
             }
         }
-        // Sibling entries must not be Verified by sharing code: only the measured entry carries a
-        // production calibration identity.
+        // Sibling entries must not be Verified by sharing code: only the measured entry, at the
+        // measured tier, carries a production calibration identity.
+        let measured = tier_root("measured", Some(CALIBRATED_QUANT_BITS));
         assert_eq!(
-            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &sequential_spec()),
+            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&measured)),
             Some(MEMORY_CALIBRATION_FINGERPRINT)
         );
         for provider in [crate::CHROMA1_HD_ID, crate::CHROMA1_FLASH_ID] {
-            assert!(production_calibration_fingerprint(provider, &sequential_spec()).is_none());
+            assert!(production_calibration_fingerprint(provider, &tier_spec(&measured)).is_none());
         }
+        std::fs::remove_dir_all(measured).ok();
     }
 
     #[test]
     fn the_calibration_key_is_exact_and_every_other_axis_fails_closed() {
-        let exact = sequential_spec();
+        let measured = tier_root("exact", Some(CALIBRATED_QUANT_BITS));
+        let exact = tier_spec(&measured);
+        assert_eq!(
+            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &exact),
+            Some(MEMORY_CALIBRATION_FINGERPRINT),
+            "the measured tier must be calibrated, else every negative below is vacuous"
+        );
+
+        // **The tier is part of the key.** All three shipped tiers are pre-packed, so all three load
+        // with `quantize == None`: without this discriminant a q8 or bf16 request would inherit the
+        // q4-measured key and could select an optimized fit on evidence never taken for it.
+        for (tag, bits) in [("q8", Some(8)), ("bf16", None)] {
+            let other = tier_root(tag, bits);
+            assert!(
+                production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&other))
+                    .is_none(),
+                "the {tag} tier must not inherit the q4-measured calibration"
+            );
+            std::fs::remove_dir_all(other).ok();
+        }
+        // An unreadable or absent tier marker fails closed rather than defaulting to the measured
+        // one — `/nonexistent` has no `transformer/config.json` at all.
+        assert!(
+            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &sequential_spec())
+                .is_none()
+        );
+
         for changed in [
             exact.clone().with_quant(Quant::Q4),
             exact.clone().with_offload_policy(OffloadPolicy::Resident),
@@ -818,6 +1039,115 @@ mod tests {
                 "a changed axis must not inherit the calibrated key"
             );
         }
+        std::fs::remove_dir_all(measured).ok();
+    }
+
+    /// A one-tensor `.safetensors` file, so an overlay can be priced without a real checkpoint.
+    fn tiny_safetensors(path: &std::path::Path, elements: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let values: Vec<f32> = (0..elements).map(|i| i as f32).collect();
+        mlx_rs::Array::save_safetensors(
+            vec![("w", &mlx_rs::Array::from_slice(&values, &[elements as i32]))],
+            None,
+            path,
+        )
+        .unwrap();
+    }
+
+    /// **The sc-15839 class: an advertised overlay priced at zero (review of PR #496).**
+    ///
+    /// The shared validator only cross-checks the overlay legs `if overlay_bytes > 0`, so a zero
+    /// passes silently — which is exactly how a rung-1 or rung-4 selection taken for a PiD load can
+    /// under-predict peak by the whole student plus its caption encoder.
+    #[test]
+    fn a_resident_pid_overlay_is_priced_and_a_sequential_one_is_not() {
+        let root = std::env::temp_dir().join(format!(
+            "chroma-overlay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let student = root.join("pid/student.safetensors");
+        let gemma = root.join("gemma");
+        tiny_safetensors(&student, 64);
+        tiny_safetensors(&gemma.join("model.safetensors"), 32);
+        let expected = 4 * (64 + 32);
+
+        let with_pid = |policy: OffloadPolicy| {
+            LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_offload_policy(policy)
+                .with_pid(
+                    WeightsSource::File(student.clone()),
+                    WeightsSource::Dir(gemma.clone()),
+                )
+        };
+
+        // Resident: `ensure_warm_locked` calls `load_heavy(true, …)` unconditionally, so the student
+        // is resident whether or not the request asked for it — and must be priced.
+        let resident = resident_overlay_components(&with_pid(OffloadPolicy::Resident)).unwrap();
+        assert_eq!(resident.len(), 1, "the PiD overlay must be declared");
+        assert_eq!(resident[0].id, PID_COMPONENT_ID);
+        assert!(resident[0].kind.is_auxiliary());
+        assert_eq!(resident[0].resident_bytes, expected);
+
+        // Sequential: `build_residency` threads `req.use_pid` per request, so a non-PiD generate
+        // never materializes it. The carve-out is scoped to exactly that policy.
+        assert!(
+            resident_overlay_components(&with_pid(OffloadPolicy::Sequential))
+                .unwrap()
+                .is_empty(),
+            "a Sequential PiD overlay is request-selected and must not be priced unconditionally"
+        );
+
+        // And the contract carries it: `overlay_bytes` matches, the component axis is declared, and
+        // the shared conformance validator (whose overlay legs only run when it is non-zero) passes.
+        let contract = contract_for(crate::CHROMA1_BASE_ID, &with_pid(OffloadPolicy::Resident))
+            .expect("contract");
+        assert_eq!(contract.asset_facts.overlay_bytes, expected);
+        assert_eq!(contract.auxiliary_resident_bytes(), expected);
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+
+        // An adapter stack is priced too, and a stack that cannot be sized fails closed rather than
+        // declaring a zero.
+        let adapter = root.join("lora.safetensors");
+        tiny_safetensors(&adapter, 16);
+        let mut adapted = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        adapted
+            .adapters
+            .push(AdapterSpec::new(adapter, 1.0, AdapterKind::Lora));
+        let priced = resident_overlay_components(&adapted).unwrap();
+        assert_eq!(priced.len(), 1);
+        assert_eq!(priced[0].id, ADAPTER_COMPONENT_ID);
+        // The shared helper prices an additive stack at its on-disk file size (payload + header),
+        // which is what stays resident; asserted as a bound rather than an exact figure so the
+        // header's width is not pinned here.
+        assert!(priced[0].resident_bytes >= 4 * 16);
+
+        let mut unsizable = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        unsizable.adapters.push(AdapterSpec::new(
+            root.join("absent.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        ));
+        assert!(
+            resident_overlay_components(&unsizable).is_err(),
+            "an unsizable adapter stack must fail closed"
+        );
+
+        // The clean base route declares no overlay at all, which is what keeps the ordinary
+        // contract on the cheaper `PhaseEnvelope` formula.
+        assert!(resident_overlay_components(&sequential_spec())
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

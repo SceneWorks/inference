@@ -1319,6 +1319,127 @@ mod tests {
         );
     }
 
+    /// **The [`ArmedScope`] side channel's safety argument, as a test rather than a paragraph.**
+    ///
+    /// The shared residency hands its loaders one `streamable: bool` and has no scope axis, so the
+    /// rung-4 component scope reaches them through shared mutable state. That is only safe because
+    /// of a coupling this provider enforces: rung 4 declares `StagedResidency` as an
+    /// `EngagedInSameRequest` prerequisite and
+    /// [`crate::memory_strategy::transformer_window`] refuses a windowed request that is not
+    /// staged — and a staged request always evicts the warm pair and re-runs BOTH loaders, so the
+    /// value is consumed by the same request that wrote it.
+    ///
+    /// Three things are asserted, each of which would break the argument on its own:
+    ///
+    /// 1. the loaders of a staged request observe the scope armed immediately before it;
+    /// 2. a scope CHANGE re-runs both loaders rather than being served by a stale warm pair;
+    /// 3. the coupling that makes (1) and (2) sufficient — rung 4 without rung 1 is refused — still
+    ///    holds, so no unstaged request can ever reach a loader with a scope armed for another one.
+    ///
+    /// Weights-free: the loaders record what they were handed and return a unit bundle, so this runs
+    /// without a snapshot.
+    #[test]
+    fn rung_four_scope_is_read_by_the_loaders_of_the_same_request() {
+        use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
+        use std::sync::{Arc, Mutex};
+
+        let observed: Arc<Mutex<Vec<(&'static str, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let scope = ArmedScope::new();
+        let (text_log, heavy_log) = (Arc::clone(&observed), Arc::clone(&observed));
+        let (scope_text, scope_heavy) = (scope.clone(), scope.clone());
+        // The same `streamable && scope.get()…includes_*` composition `build_residency` applies,
+        // over loaders that record instead of loading.
+        let residency = Residency::<u8, u8>::request_scoped_from_policy(
+            OffloadPolicy::Sequential,
+            move |streamable| {
+                let armed = streamable
+                    && scope_text
+                        .get()
+                        .is_some_and(|component| component.includes_text_encoder());
+                text_log.lock().unwrap().push(("text", armed));
+                Ok(0)
+            },
+            move |_use_pid, streamable| {
+                let armed = streamable
+                    && scope_heavy
+                        .get()
+                        .is_some_and(|component| component.includes_dit());
+                heavy_log.lock().unwrap().push(("heavy", armed));
+                Ok(0)
+            },
+        )
+        .expect("weights-free residency");
+
+        let run = |component: Option<TransformerComponent>| {
+            scope.set(component);
+            residency
+                .run_request_scoped(
+                    true,
+                    component.is_some(),
+                    &CancelFlag::new(),
+                    false,
+                    &mut |_| {},
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_, _, _| Ok(()),
+                )
+                .expect("staged request")
+        };
+
+        // (1) Each scope reaches exactly the loader it names, in the request that armed it.
+        for (component, expect_text, expect_heavy) in [
+            (Some(TransformerComponent::Dit), false, true),
+            (Some(TransformerComponent::TextEncoder), true, false),
+            (Some(TransformerComponent::Both), true, true),
+            (None, false, false),
+        ] {
+            observed.lock().unwrap().clear();
+            run(component);
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![("text", expect_text), ("heavy", expect_heavy)],
+                "scope {component:?} did not reach the loaders of its own request"
+            );
+        }
+
+        // (2) A scope change cannot be served by a stale pair: a staged request evicts and re-runs
+        // both loaders every time, which is what makes the shared cell safe to read here.
+        observed.lock().unwrap().clear();
+        run(Some(TransformerComponent::Dit));
+        run(Some(TransformerComponent::TextEncoder));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                ("text", false),
+                ("heavy", true),
+                ("text", true),
+                ("heavy", false)
+            ],
+            "a scope change must re-run both loaders rather than reuse the previous arming"
+        );
+
+        // (3) The coupling the whole argument rests on: rung 4 without rung 1 in the same request is
+        // refused, so an UNSTAGED request can never reach a loader carrying another request's scope.
+        let unstaged = GenerationRequest {
+            memory: Some(GenerationMemory {
+                stage_residency: false,
+                stream_transformer_blocks: true,
+                transformer_window_size: Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE),
+                transformer_window_component: Some(
+                    crate::memory_strategy::TRANSFORMER_WINDOW_COMPONENT,
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = crate::memory_strategy::transformer_window(&unstaged, crate::CHROMA1_BASE_ID)
+            .expect_err("rung 4 without rung 1 must be refused");
+        assert!(
+            error.to_string().contains("staged residency"),
+            "the coupling must be refused by name, got: {error}"
+        );
+    }
+
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         let err = build_residency(

@@ -325,11 +325,31 @@ pub const T5_BLOCKS: usize = 24;
 
 /// A reopenable description of a T5 encoder's 24 blocks, for rung 4's **text-encoder** scope.
 ///
-/// The encoder is the peak-bearing phase for a T5-only-conditioned family whose auxiliary components
-/// ship dense: measured on Chroma1-Base q4 at 1024² (SC-15520) the conditioning phase peaks at
-/// **10.15 GiB** against a 7.14 GiB denoise and a 4.37 GiB bounded decode, so a DiT-scoped window is
-/// inert on the request peak and this is the scope that is not. Kolors reached the same conclusion
-/// first, for the same reason and a different encoder (SC-15521).
+/// ## Why this exists, given that it did not win where it was first measured
+///
+/// Chroma1 (SC-15520) is the first family to reach for this, and the honest record is that the
+/// scope it enables **lost** its own measurement. On Chroma1-Base q4 at 1024², the T5-XXL encoder is
+/// the largest single component by a wide margin (dense bf16, a 10.15 GiB conditioning phase against
+/// a 7.14 GiB packed DiT), which makes a text-encoder window look obviously right — and it is not:
+///
+/// | rung-4 scope | request peak | vs control |
+/// |---|---:|---:|
+/// | control (no window) | 19.2071 GiB | — |
+/// | `TextEncoder` | 19.2071 GiB | **−0.00%** |
+/// | `Dit` | 14.6932 GiB | −23.50% |
+///
+/// Ladder rung 1 already sheds the encoder before the heavy phase loads, so the request peak *is*
+/// the heavy phase, and bounding a phase that is not the binding one is not a saving. Chroma
+/// therefore publishes `TransformerComponent::Dit` as its default.
+///
+/// It is kept, rather than deleted with its measurement, for two reasons that are about the shape of
+/// the evidence rather than about this number. The scope is genuinely implemented, tested and
+/// output-preserving on a real encoder — which is the expensive part — and which phase binds is a
+/// property of the tier's packing rather than of the architecture: sc-16462 packs Chroma's T5/VAE
+/// auxiliaries, and a family whose decode is bounded (Kolors, SC-15521, whose ChatGLM3-6B encoder
+/// made conditioning peak-bearing) reaches the opposite verdict on the same arithmetic. A future
+/// caller inherits a working mechanism and takes its own measurement; what it must not inherit is
+/// the conclusion.
 #[derive(Clone)]
 pub struct T5BlockStream {
     /// The reopenable `text_encoder/` component — never the caller's snapshot root.
@@ -371,8 +391,16 @@ impl T5BlockStream {
         }
         let prefix = join(&self.prefix, &format!("encoder.block.{index}"));
         let block = T5Block::from_weights(view, &prefix, self.group_size)?;
-        // LOAD-BEARING: `Array` is refcounted and the constructor cloned out of the view, so
-        // draining exactly the accessed keys is what makes the window's drop a real release.
+        // The shared drain: `Array` is refcounted and the constructor cloned out of the view, so
+        // draining exactly the accessed keys is what lets the window's drop release them.
+        //
+        // **Not measured on this stream.** The sibling DiT stream in `mlx-gen-chroma` measured its
+        // own two drains INERT on the request peak (removing both left the sweep unchanged), because
+        // a fresh view is opened per window there so the view's references die at the window
+        // boundary regardless. The same structure holds here, so the same inertness is *expected* —
+        // but expected is not measured, and the only rung-4 scope Chroma publishes is `Dit`, so no
+        // run has exercised this path's peak. It is kept as the shared contract's discipline and
+        // deliberately **not** described as load-bearing on a sibling's evidence (SC-15520).
         view.remove_accessed();
         Ok(block)
     }
@@ -462,6 +490,19 @@ impl T5TextEncoder {
     /// what the offline converter writes at the same `(bits, group_size)`.
     pub fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
         validate_t5_group_size(group_size)?;
+        // Quantizing AFTER the block stream is armed would pack the token embedding and silently
+        // skip all 24 blocks — the stack is empty, so the loop below is a no-op and the streamed
+        // blocks would be rebuilt dense from a snapshot the caller believes it quantized. The
+        // production order (quantize, then arm) is correct; this refuses the inverted one rather
+        // than documenting it (SC-15520).
+        if self.is_streamable() && self.blocks.is_empty() {
+            return Err(Error::Unsupported(
+                "t5: cannot quantize after the encoder block stream is armed — the resident stack \
+                 is evicted, so the block linears would be silently skipped. Quantize first, then \
+                 call with_block_stream"
+                    .to_owned(),
+            ));
+        }
         self.shared.quantize_with_group_size(bits, group_size)?;
         for block in &mut self.blocks {
             block.quantize(bits, group_size)?;
@@ -782,6 +823,64 @@ fn relative_position_bucket(relative_position: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// **`quantize` after the encoder block stream is armed must refuse** (SC-15520, review of
+    /// PR #496).
+    ///
+    /// After arming, `blocks` is empty: the loop in `quantize_with_group_size` iterates nothing, so
+    /// the method would pack the token embedding, return `Ok(())`, and leave all 24 streamed blocks
+    /// to be rebuilt dense from a snapshot the caller believes it quantized.
+    #[test]
+    fn quantizing_after_the_encoder_stream_is_armed_is_refused() {
+        use mlx_gen::WeightsSource;
+        let dir = std::env::temp_dir().join(format!(
+            "t5-stream-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stream =
+            T5BlockStream::new(WeightsSource::Dir(dir.clone()), "", GROUP_SIZE).expect("stream");
+        assert_eq!(stream.n_blocks(), T5_BLOCKS);
+
+        // A hand-built encoder with the right block count and no weights: `with_block_stream` only
+        // checks the declared depth against the resident stack, so this exercises the ordering guard
+        // without a 9 GiB checkpoint.
+        let mut encoder = T5TextEncoder {
+            shared: TokenEmbedding::Dense(Array::from_slice(&[1.0f32], &[1, 1])),
+            blocks: Vec::new(),
+            final_ln_w: Array::from_slice(&[1.0f32], &[1]),
+            block_stream: None,
+        };
+        // Unarmed: the guard does not fire (the discriminating control — without it the assertion
+        // below would pass on a `quantize` that always errored).
+        let unarmed = encoder
+            .quantize_with_group_size(8, GROUP_SIZE)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            !unarmed
+                .as_deref()
+                .is_some_and(|e| e.contains("after the encoder block stream is armed")),
+            "an unarmed encoder must not hit the ordering guard, got: {unarmed:?}"
+        );
+
+        encoder.block_stream = Some(stream);
+        assert!(encoder.is_streamable());
+        assert_eq!(encoder.resident_block_count(), 0);
+        let error = match encoder.quantize_with_group_size(8, GROUP_SIZE) {
+            Ok(()) => panic!("quantize after arming packed no blocks and reported success"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("after the encoder block stream is armed"),
+            "the refusal must name the ordering, got: {error}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
     use super::*;
 
     #[test]
