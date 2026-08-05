@@ -1666,12 +1666,16 @@ fn the_calibration_fault_fires_at_every_phase_and_a_fresh_request_recovers() {
             .unwrap_or_else(|error| panic!("a fresh request after the {phase:?} fault: {error}"));
     }
 
-    // An unauthorized phase is inert: the pair is what the shared floor accepts.
+    // A phase without its authorization never reaches the provider's injection seam: the SHARED
+    // request floor refuses the half-set pair outright, which is a stronger guarantee than the
+    // provider ignoring it would be.
     let unauthorized = GenerationMemory {
         calibration_error_phase: Some(MemoryPhase::Decode),
         ..staged()
     };
-    model
-        .generate(&request(Some(unauthorized), 512, 1), &mut |_| {})
-        .expect("an unauthorized calibration phase must be inert");
+    let error = match model.generate(&request(Some(unauthorized), 512, 1), &mut |_| {}) {
+        Ok(_) => panic!("an unauthorized calibration phase must be refused by the shared floor"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("authorization"), "{error}");
 }

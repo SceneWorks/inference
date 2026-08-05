@@ -12,12 +12,21 @@
 //!
 //! ## What each rung does here
 //!
-//! | rung | mechanism | state |
-//! |---|---|---|
-//! | 1 staged residency | shed the T5-XXL encoder before the DiT/VAE load, per request | Implemented |
-//! | 2 bounded decode | `Vae::decode_tiled` over the FLUX.1 16-ch AutoencoderKL | see [`DECODE_SUPPORT`] |
-//! | 3 bounded attention | `sdpa_budgeted_bhsd` on both block stacks | see [`ATTENTION_SUPPORT`] |
-//! | 4 bounded transformer residency | `run_windowed` over the two DiT sub-stacks | see [`WINDOW_SUPPORT`] |
+//! Measured on **Chroma1-Base q4 at 1024², Apple/Metal**, 4 steps, true CFG 4.0. Every row is a
+//! fresh generator, one discarded warm-up row of the same shape, `reset_peak_memory` after the load.
+//!
+//! | rung | mechanism | request peak | state |
+//! |---|---|---|---|
+//! | 0 resident | — | 28.0779 GiB | baseline |
+//! | 1 staged residency | shed T5-XXL before the DiT/VAE load, per request | **19.2065 GiB (−31.60%)** | Implemented |
+//! | 2 bounded decode | `Vae::decode_tiled` on the FLUX.1 16-ch AutoencoderKL | bounds the phase; **fails quality** | Missing, see [`DECODE_SUPPORT`] |
+//! | 3 bounded attention | `sdpa_budgeted_bhsd` on both block stacks | bounds the phase; **not the binding one** | Missing, see [`ATTENTION_SUPPORT`] |
+//! | 4 bounded transformer residency | `run_windowed` over the two DiT sub-stacks | **14.6932 GiB (−23.50% on rung 1)** | Implemented |
+//!
+//! Rung 4's saving is attributed rather than assumed: 4.5133 GiB measured against a 4.5125 GiB
+//! windowable block weight set read from the snapshot's own safetensors `data_offsets` — the whole
+//! set, to within 0.8 MiB, which is what a window that replaces the resident stack should buy and
+//! nothing more.
 //!
 //! ## What measurement decided, and what it overturned
 //!
@@ -148,11 +157,28 @@ pub const ATTENTION_SUPPORT: bool = false;
 /// Window cadences swept over the DiT sub-stacks.
 pub const TRANSFORMER_WINDOW_SIZES_SWEPT: &[u32] = &[1, 2, 5, 10];
 /// Whether bounded transformer residency survived measurement on the production path.
+///
+/// It did, and by the largest margin of any rung here: **19.2065 → 14.6932 GiB, −23.50%** on top of
+/// rung 1, with a byte-identical image at every cadence.
 pub const WINDOW_SUPPORT: bool = true;
-/// The published window cadence domain — a time/memory frontier, pinned by
-/// `transformer_window_sweep_and_streamed_output_identity`.
+/// The published window cadence domain — **equal-peak alternatives, not a latency frontier**.
+///
+/// All four cadences bound the request peak to 14.6932 GiB, identical to the fourth decimal, in
+/// three different execution orders. They are published together because none is wrong and a caller
+/// with its own cost model may prefer any of them.
+///
+/// What is deliberately *not* published is an ordering. Sibling providers publish their cadences as
+/// a time/memory trade — SDXL measured 3654 → 1318 ms/step widening 1 → 10 — and this family's
+/// ms/step column looks like the opposite of that until [`probe_order`] is applied, at which point
+/// it stops looking like anything: cadence 10 is the slowest row in execution order `1,2,5,10` and
+/// the *fastest* in order `2,10,1,5`. The wall clock is tracking the row's position, not its
+/// cadence, so no latency ordering across these cadences is publishable in either direction
+/// (SC-17679). [`TRANSFORMER_WINDOW_SIZE`]'s default therefore rests on being the tightest weight
+/// bound — what the rung exists for — and not on a latency argument.
+///
+/// [`probe_order`]: ../../tests/memory_ladder_real_weights.rs
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
-/// The default cadence inside [`TRANSFORMER_WINDOW_SIZES`].
+/// The default cadence inside [`TRANSFORMER_WINDOW_SIZES`] — the tightest weight bound.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// The **measured** default component scope, and the one a request that names none receives.
 ///
