@@ -409,20 +409,25 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// `min_size`** — which is exactly where the phase-separation argument below says the flatness should
 /// fail, so it is a confirmed prediction rather than an anomaly.
 ///
-/// **Read this table as an observation, not as a gated invariant.** Only the first row of it — the
-/// default tier at the default geometry — is asserted by CI. The other five, including the 512² q8
-/// row the default rests on, are produced by running the sweep under `SDXL_WINDOW_PROBE_TIER` /
-/// `SDXL_WINDOW_PROBE_SIZE`, and in that mode the flatness and wall-clock assertions are *reported*
-/// rather than asserted. That is deliberate: the 512² row is non-monotonic and allocator-influenced,
-/// so pinning it would be pinning noise, and a test that asserted flatness there would have to
-/// assert it false — a gate on a number nobody should depend on. The consequence is worth stating
-/// plainly rather than leaving for a reader to discover: **the evidence for the default cadence
-/// lives in this prose and in the probe command that reproduces it, not in a red test.** A future
-/// change that quietly made 512² flat again would not redden anything; it would make this paragraph
-/// wrong, and only re-running the probe would show it. Note the 512² q8 row is also
-/// *non-monotonic* (cadence 2 beats cadence 1; cadence 5 is worst), which is allocator behaviour at a
-/// small working set rather than a clean weight-residency effect — one more reason not to build a
-/// default on it.
+/// **Read this table as an observation, not as a gated invariant.** Exactly one row of it is
+/// asserted — **q8 / 1024²**, the sweep's default tier and geometry. The other five, *including the
+/// 512² q8 row the default cadence rests on*, come from re-running the sweep under
+/// `SDXL_WINDOW_PROBE_TIER` / `SDXL_WINDOW_PROBE_SIZE`, and in that mode the flatness and wall-clock
+/// assertions are **reported rather than asserted**. (And even the asserted row is asserted by an
+/// `#[ignore]`d real-weight test, so it is gated by a human running it against cached weights, not
+/// by CI — CI never executes it.)
+///
+/// That is the right call: the 512² row is non-monotonic and allocator-influenced, so pinning it
+/// would be pinning noise, and a test that asserted flatness there would have to assert it *false* —
+/// a gate on a number nobody should depend on. But the consequence is worth stating plainly rather
+/// than leaving for a reader to infer: **the evidence for the default cadence lives in this prose
+/// and in the probe command that reproduces it, not in a red test.** A change that quietly made
+/// 512² flat again would redden nothing; it would make this paragraph wrong, and only re-running
+/// the probe would show it.
+///
+/// The 512² q8 row is also *non-monotonic* — cadence 2 beats cadence 1, cadence 5 is worst — which
+/// is allocator behaviour at a small working set rather than a clean weight-residency effect, and
+/// one more reason not to build a default on it.
 ///
 /// Wall clock falls monotonically with cadence everywhere it was measured on a quiet machine
 /// (1024² q8: 3591 → 1325 ms/step, **2.7× cheaper**; 512² bf16: 5438 → 2076, 2.6×; 512² q8:
