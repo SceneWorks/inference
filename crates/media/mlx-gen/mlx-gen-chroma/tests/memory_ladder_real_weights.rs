@@ -153,6 +153,16 @@ const BEST_SWEPT_EDGE: u32 = 832;
 /// The overlap paired with [`BEST_SWEPT_EDGE`].
 const BEST_SWEPT_OVERLAP: u32 = 256;
 
+/// The verdict class [`the_rung_two_drift_margin_is_resampled_across_seeds`] observed, and which
+/// `memory_strategy::DECODE_SUPPORT`'s doc states in prose.
+///
+/// * `FAILS` — every seed is over the bar. A clear rejection.
+/// * `UNRESOLVED` — the sample straddles the bar. The rung cannot be admitted (it fails on some
+///   images) *and* the rejection is not clean; the honest statement is that a margin this narrow is
+///   not decidable with a borrowed threshold on an extreme-order statistic.
+/// * `ADMISSIBLE` — every seed clears it. Would make `DECODE_SUPPORT = false` stale.
+const EXPECTED_RUNG2_VERDICT: &str = "FAILS";
+
 fn entry_root(var: &str) -> Option<PathBuf> {
     std::env::var(var).ok().map(PathBuf::from)
 }
@@ -1102,21 +1112,40 @@ fn the_rung_two_drift_margin_is_resampled_across_seeds() {
         SEEDS.len()
     );
 
+    // Three outcomes, not two, and the difference between the last two is the thing a single-image
+    // sweep cannot tell you — which is why the class is pinned rather than just the direction.
+    let verdict = if hi <= SIBLING_DRIFT_BAR {
+        "ADMISSIBLE"
+    } else if lo > SIBLING_DRIFT_BAR {
+        "FAILS"
+    } else {
+        "UNRESOLVED"
+    };
+    println!("[sc-15520 rung2 resample] verdict class: {verdict}");
+
     if ms::DECODE_SUPPORT {
-        assert!(
-            hi <= SIBLING_DRIFT_BAR,
+        assert_eq!(
+            verdict, "ADMISSIBLE",
             "rung 2 is declared Implemented, but the best swept geometry exceeds the \
              {SIBLING_DRIFT_BAR}/255 bar on at least one seed ({drifts:?}) — a rung admitted on one \
              image is admitted on a sample of one"
         );
     } else {
-        assert!(
-            lo > SIBLING_DRIFT_BAR,
-            "rung 2 is declared Missing, but the best swept geometry CLEARS the \
-             {SIBLING_DRIFT_BAR}/255 bar on at least one seed ({drifts:?}, range {lo}..{hi}). The \
-             verdict is no longer supported by the whole sample and must be re-decided — either the \
-             rung is admissible, or the withholding reason has to be stated as an unresolved margin \
-             rather than as a failure"
+        assert_ne!(
+            verdict, "ADMISSIBLE",
+            "rung 2 is declared Missing, but the best swept geometry clears the \
+             {SIBLING_DRIFT_BAR}/255 bar on EVERY seed ({drifts:?}) — the withholding is no longer \
+             supported by any of the sample and the rung must be re-decided"
+        );
+        // The class itself is the published claim: `DECODE_SUPPORT`'s doc says the rung is withheld
+        // on a narrow, unresolved margin rather than on a clear failure, or the reverse. A change
+        // between those two is a change to what this crate tells a reader, so it reddens here.
+        assert_eq!(
+            verdict, EXPECTED_RUNG2_VERDICT,
+            "the rung-2 drift sample moved from {EXPECTED_RUNG2_VERDICT} to {verdict} \
+             ({drifts:?}, range {lo}..{hi} against a {SIBLING_DRIFT_BAR}/255 bar). The verdict is \
+             still Missing either way, but `DECODE_SUPPORT`'s doc states WHICH, and that sentence \
+             is now wrong"
         );
     }
 }
