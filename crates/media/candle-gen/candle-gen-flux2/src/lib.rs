@@ -2283,6 +2283,10 @@ mod tests {
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
         let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
+        let parity_failure = match &parity_result {
+            gen_core::MemoryParityResult::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
         eprintln!(
             "{}",
             candle_gen::testkit::memory_evidence_v1_line_with_parity(
@@ -2322,6 +2326,9 @@ mod tests {
             img.width,
             img.height
         );
+        if let Some(reason) = parity_failure {
+            panic!("FLUX.2 memory-ladder output parity failed: {reason}");
+        }
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868) for FLUX.2-**dev** (Mistral
@@ -2480,6 +2487,10 @@ mod tests {
         );
         std::fs::write(&out, &img.pixels).expect("write pixels");
         let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
+        let parity_failure = match &parity_result {
+            gen_core::MemoryParityResult::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
         eprintln!(
             "{}",
             candle_gen::testkit::memory_evidence_v1_line_with_parity(
@@ -2512,5 +2523,8 @@ mod tests {
             img.width,
             img.height,
         );
+        if let Some(reason) = parity_failure {
+            panic!("FLUX.2 reference memory-ladder output parity failed: {reason}");
+        }
     }
 }

@@ -42,14 +42,20 @@ pub const CALIBRATION_FINGERPRINT: &str =
     "flux2-dev-cuda-staged-host-full-edge-decode-bounded-attention-device-format-blocks-v2";
 pub const CONTROL_OVERLAY: &str = "control";
 
-pub const KLEIN_DECODE_TILE_EDGE: u32 = 512;
-pub const KLEIN_DECODE_TILE_EDGES: &[u32] = &[768, 640, KLEIN_DECODE_TILE_EDGE];
-pub const KLEIN_DECODE_OVERLAP: u32 = 128;
+/// Full output edge at the representative 1024px cell. The FLUX.2 upsampling tail contains spatial
+/// GroupNorms, so splitting it into smaller tiles changes normalization statistics across most of
+/// the image; the real-weight A/B rejected the former 768/640/512 domain at max-abs 14 against the
+/// provider's <=2 RGB contract. Keep the same parity-preserving full-edge realization already used
+/// by FLUX.2-dev until a genuinely normalization-aware tiled decoder is implemented and measured.
+pub const KLEIN_DECODE_TILE_EDGE: u32 = 1024;
+pub const KLEIN_DECODE_TILE_EDGES: &[u32] = &[KLEIN_DECODE_TILE_EDGE];
+/// Positive sentinel required by the shared contract. It is inert at the full-edge 1024px cell.
+pub const KLEIN_DECODE_OVERLAP: u32 = 1;
 pub const KLEIN_DECODE_OVERLAPS: &[u32] = &[KLEIN_DECODE_OVERLAP];
 pub const KLEIN_BASE_DOUBLE_BLOCKS: u32 = 8;
 pub const KLEIN_BASE_SINGLE_BLOCKS: u32 = 24;
 pub const KLEIN_BASE_TRANSFORMER_BLOCKS: u32 = KLEIN_BASE_DOUBLE_BLOCKS + KLEIN_BASE_SINGLE_BLOCKS;
-pub const KLEIN_CALIBRATION_FINGERPRINT: &str = "flux2-klein-cuda-shared-ladder-provider-abi-v1";
+pub const KLEIN_CALIBRATION_FINGERPRINT: &str = "flux2-klein-cuda-shared-ladder-provider-abi-v2";
 
 #[derive(Clone, Copy)]
 struct ProviderProfile {
@@ -202,8 +208,8 @@ pub fn provider_contract_for(
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases.clone(),
             synchronized_phase_release: true,
-            // The hook is implemented, but the sole 1024px production candidate is full-edge and
-            // therefore does not spatially partition the representative calibration cell.
+            // The hook is implemented, but each provider's sole 1024px production candidate is
+            // full-edge and therefore does not spatially partition the representative cell.
             decode_tiling: true,
             attention_chunking: true,
             transformer_window_materialization: streamable,
@@ -986,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn klein_contract_is_distinct_and_publishes_production_candidate_ranges() {
+    fn klein_contract_is_distinct_and_publishes_parity_preserving_candidate_ranges() {
         let contract = klein_provider_contract(&spec()).unwrap();
         assert!(contract.conformance_errors().is_empty());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
@@ -1024,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn klein_scope_rejects_dev_candidate_and_block_domain() {
+    fn klein_scope_rejects_unsupported_tiled_candidate_and_block_domain() {
         let contract = klein_provider_contract(&spec()).unwrap();
         let context = registered_valid_fixture(
             &spec(),
@@ -1035,9 +1041,7 @@ mod tests {
         .remove(0)
         .context;
         let mut scope = Flux2MemoryScope::new(Device::Cpu, &contract, &context);
-        assert!(scope
-            .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, context.geometry)
-            .is_err());
+        assert!(scope.configure_decode(768, 128, context.geometry).is_err());
         assert!(scope
             .configure_decode(
                 KLEIN_DECODE_TILE_EDGE,
