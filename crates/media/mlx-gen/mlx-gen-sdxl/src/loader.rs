@@ -40,12 +40,21 @@ fn is_packed(w: &Weights) -> bool {
 }
 
 /// Resolve a component's weight file inside `subdir`, picking the variant that best matches `dtype`.
+///
+/// `pub(crate)` for ladder rung 4 (SC-15525): `model::load_heavy` records the U-Net file this
+/// resolves to as the block stream's re-openable source, so a streamed block reads the **same file**
+/// the resident stack was built from rather than re-deriving the fp16/f32 variant rule.
 /// diffusers snapshots ship the f32 master (`<stem>.safetensors`) and/or an fp16 variant
 /// (`<stem>.fp16.safetensors`); the fp16 file is exactly `astype(f16)` of the f32 master, so for an
 /// f16 load the two are equivalent. We prefer the variant matching `dtype` (fp16 file for f16, the
 /// f32 file otherwise) and fall back to the other when only one is cached — the caller casts to
 /// `dtype` regardless, so the result is identical when both exist.
-fn resolve_weight_file(root: &Path, subdir: &str, stem: &str, dtype: Dtype) -> Result<PathBuf> {
+pub(crate) fn resolve_weight_file(
+    root: &Path,
+    subdir: &str,
+    stem: &str,
+    dtype: Dtype,
+) -> Result<PathBuf> {
     let plain = root.join(subdir).join(format!("{stem}.safetensors"));
     let fp16 = root.join(subdir).join(format!("{stem}.fp16.safetensors"));
     let (first, second) = if dtype == Dtype::Float16 {

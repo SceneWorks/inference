@@ -62,6 +62,35 @@ pub fn encode_conditioning(
 pub struct Denoiser<'a> {
     pub unet: &'a UNet2DConditionModel,
     pub sampler: &'a dyn DiffusionSampler,
+    /// Ladder rungs 3 and 4 for this request (SC-15525).
+    /// [`SdxlForwardPlan::UNBOUNDED`](crate::plan::SdxlForwardPlan::UNBOUNDED) is the historical
+    /// path, which is what `Denoiser::new` builds — the field is public so the production
+    /// generate can hand it a bounded plan without a second constructor.
+    pub plan: crate::plan::SdxlForwardPlan<'a>,
+}
+
+impl<'a> Denoiser<'a> {
+    /// The unbounded denoiser — every pre-SC-15525 construction site's exact behaviour.
+    pub fn new(unet: &'a UNet2DConditionModel, sampler: &'a dyn DiffusionSampler) -> Self {
+        Self {
+            unet,
+            sampler,
+            plan: crate::plan::SdxlForwardPlan::UNBOUNDED,
+        }
+    }
+
+    /// The denoiser with a bounded-execution plan.
+    pub fn with_plan(
+        unet: &'a UNet2DConditionModel,
+        sampler: &'a dyn DiffusionSampler,
+        plan: crate::plan::SdxlForwardPlan<'a>,
+    ) -> Self {
+        Self {
+            unet,
+            sampler,
+            plan,
+        }
+    }
 }
 
 /// ControlNet conditioning for the denoise loop (sc-3058): the loaded branch, the preprocessed
@@ -536,6 +565,7 @@ fn forward_eps(
     controls: &[ControlContext],
     cn_enc: &Array,
     ip: Option<(&Array, f32)>,
+    plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
     let combined: Option<ControlResiduals> = {
         let mut acc: Option<ControlResiduals> = None;
@@ -556,29 +586,21 @@ fn forward_eps(
         }
         acc
     };
-    match (ip, combined.as_ref()) {
-        (Some((tokens, scale)), Some(res)) => unet.forward_with_ip_control(
-            x_unet,
-            timestep,
-            conditioning,
-            pooled,
-            time_ids,
-            (tokens, scale),
-            res,
-        ),
-        (Some((tokens, scale)), None) => unet.forward_with_ip(
-            x_unet,
-            timestep,
-            conditioning,
-            pooled,
-            time_ids,
-            (tokens, scale),
-        ),
-        (None, Some(res)) => {
-            unet.forward_with_control(x_unet, timestep, conditioning, pooled, time_ids, res)
-        }
-        (None, None) => unet.forward(x_unet, timestep, conditioning, pooled, time_ids),
-    }
+    // One planned call for all four (control × ip) combinations. The historical four-way dispatch
+    // over `forward_with_*` is preserved *in those wrappers*, which every non-ladder caller still
+    // uses; routing the production denoise through the single planned entry point is what makes
+    // rungs 3 and 4 reach EVERY advertised route — plain t2i, CFG, control, MultiControlNet, IP,
+    // InstantID's ip+control — rather than the subset a per-route wiring would have covered.
+    unet.forward_planned(
+        x_unet,
+        timestep,
+        conditioning,
+        pooled,
+        time_ids,
+        combined.as_ref(),
+        ip,
+        plan,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -649,6 +671,7 @@ fn denoise_core(
             controls,
             cn_enc,
             ip,
+            d.plan,
         )?;
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
@@ -718,6 +741,7 @@ pub fn denoise_curated(
         controls,
         ip,
         control_encoder,
+        crate::plan::SdxlForwardPlan::UNBOUNDED,
     )
 }
 
@@ -757,6 +781,10 @@ pub fn denoise_curated_with_preview(
     controls: &[ControlContext],
     ip: Option<(&Array, f32)>,
     control_encoder: Option<&Array>,
+    // Ladder rungs 3 and 4 for this request (SC-15525). The curated and CFG++ routes are production
+    // denoise routes, so a bounded rung that reached only the ancestral loop would be
+    // declared-but-unreachable on them.
+    plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
     // Same SiLU-fusion compile scope as the ancestral loop (sc-2963) — bit-exact in fp16.
     let _compile_glue = crate::CompileGlueGuard::enable();
@@ -792,6 +820,7 @@ pub fn denoise_curated_with_preview(
                 controls,
                 cn_enc,
                 ip,
+                plan,
             )?;
             // CFG combine via the shared `gen_core::guidance::cfg` over `MlxLatentOps` (the sc-7443
             // migration `denoise_core` already carries, F-082): byte-identical to the retired hand
@@ -847,6 +876,7 @@ pub fn denoise_cfgpp(
         controls,
         ip,
         control_encoder,
+        crate::plan::SdxlForwardPlan::UNBOUNDED,
     )
 }
 
@@ -875,6 +905,10 @@ pub fn denoise_cfgpp_with_preview(
     controls: &[ControlContext],
     ip: Option<(&Array, f32)>,
     control_encoder: Option<&Array>,
+    // Ladder rungs 3 and 4 for this request (SC-15525). The curated and CFG++ routes are production
+    // denoise routes, so a bounded rung that reached only the ancestral loop would be
+    // declared-but-unreachable on them.
+    plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cn_enc = control_encoder.unwrap_or(conditioning);
@@ -903,6 +937,7 @@ pub fn denoise_cfgpp_with_preview(
                 controls,
                 cn_enc,
                 ip,
+                plan,
             )?;
             // guided = plain CFG combine (the trajectory anchor); uncond = eps_neg (the renoise branch).
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
@@ -1044,11 +1079,49 @@ pub fn decode_image(
     latents: &Array,
     pid: Option<&dyn LatentDecoder>,
 ) -> Result<Image> {
-    let decoded = match pid {
-        Some(d) => d
+    decode_image_tiled(vae, latents, pid, None, None)
+}
+
+/// [`decode_image`] with ladder rung 2's optional native-VAE tiling (SC-15525).
+///
+/// `tiling` is the **native** decode geometry resolved by
+/// [`memory_strategy::decode_tiling`](crate::memory_strategy) — `None` for the exact single-pass
+/// decode, which is what every pre-SC-15525 caller gets through [`decode_image`].
+///
+/// The **PiD branch deliberately ignores `tiling`**, and that is not a gap: the student plans and
+/// executes its own tiling inside `mlx_gen_pid::mint_planned_decoder_with_tiling`, against its own
+/// disjoint edge domain. Applying a *native* edge on top would tile the same decode twice at two
+/// different geometries.
+///
+/// **On SDXL that branch is unreachable with `tiling` set, and the reason is worth stating rather
+/// than implying.** An earlier version of this comment said `memory_strategy::decode_tiling` "returns
+/// `None` on a PiD request"; it does not. Since SC-15525 it returns `Err` **unconditionally** whenever
+/// `GenerationMemory::tile_vae_decode` is set, PiD or not, because rung 2 is declared `Missing` on
+/// this provider. So a `use_pid` request that also sets `tile_vae_decode` is refused at
+/// `Sdxl::generate_impl` and never reaches here — where before SC-15525 it would have fallen through
+/// to the student's own auto-planning.
+///
+/// That is deliberate. A request that asked for a bounded decode and silently got the student's
+/// auto-plan instead would be executing a strategy the selector did not choose, which is the exact
+/// false-green the shared contract forbids; refusing is the only honest answer while the native rung
+/// is `Missing`. A PiD request that does **not** set the flag is completely unaffected and still gets
+/// the student's auto-planning, which is the pre-SC-15525 behaviour.
+///
+/// `cancel` gives the decode a cancellation point it has never had: it is a dominant fraction of an
+/// SDXL render's wall clock, and the shared tile loop checks between tiles.
+pub fn decode_image_tiled(
+    vae: &Autoencoder,
+    latents: &Array,
+    pid: Option<&dyn LatentDecoder>,
+    tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<Image> {
+    let decoded = match (pid, tiling) {
+        (Some(d), _) => d
             .decode(&latents.transpose_axes(&[0, 3, 1, 2])?)?
             .transpose_axes(&[0, 2, 3, 1])?,
-        None => vae.decode(latents)?,
+        (None, Some(cfg)) => vae.decode_tiled(latents, cfg, cancel)?,
+        (None, None) => vae.decode(latents)?,
     };
     decoded_to_image(&decoded)
 }
@@ -1076,10 +1149,7 @@ pub(crate) fn render_sample(
     let prior = base_sampler.sample_prior(&latent_shape)?;
     let sampler = AncestralEuler::new(base_sampler, steps.max(1), base_sampler.max_time())?;
     let time_ids = text_time_ids(pooled.shape()[0]);
-    let d = Denoiser {
-        unet,
-        sampler: &sampler,
-    };
+    let d = Denoiser::new(unet, &sampler);
     let latents = denoise(
         &d,
         prior,

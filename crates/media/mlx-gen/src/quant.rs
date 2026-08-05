@@ -407,10 +407,26 @@ pub const TURNKEY_ASSET_FILES: &[&str] = &[
 ];
 
 /// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
-/// added (HF/diffusers-compat; the Rust loaders auto-detect packed weights via `{base}.scales` and
-/// ignore this block — it is provenance/informational). A missing source config starts from an empty
-/// object. The written bytes are `serde_json::to_string_pretty` of the merged value, byte-identical
-/// across every provider that packs per-component dirs.
+/// added. A missing source config starts from an empty object. The written bytes are
+/// `serde_json::to_string_pretty` of the merged value, byte-identical across every provider that
+/// packs per-component dirs.
+///
+/// **This block is load-bearing, not provenance.** An earlier version of this doc said the Rust
+/// loaders auto-detect packed weights via `{base}.scales` and "ignore this block" — true of the
+/// *loaders*, false of everything else, and the SC-15525 review traced a real coverage gap back to
+/// believing it. [`packed_quant_bits`] reads this marker and **only** this marker, so a packed
+/// component shipped without it is reported as dense and three separate decisions go the wrong way:
+///
+/// * [`needs_load_time_quant`] answers "yes", which is what the F-144 requested-vs-packed tier guard
+///   consults — so a Q4 request against an unmarked packed-Q8 component passes the guard and is then
+///   served Q8 by a `quantize()` that no-ops on already-packed weights;
+/// * a memory-strategy contract's "does this load leave the transformer lazy" predicate answers "no"
+///   and withholds rung 4. That is exactly why `illustrious_xl_v1`/`illustrious_xl_v2` at q8 publish
+///   no bounded transformer residency — see `mlx_gen_sdxl::memory_strategy::load_leaves_blocks_lazy`;
+/// * anything sizing a fit from the declared tier reads the wrong one.
+///
+/// A packing path that omits this call produces a snapshot that *works* and is *mislabelled*, which
+/// is the hardest kind to notice. Every packing path must write it.
 pub fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
     let src_cfg = src.join("config.json");
     let mut v: serde_json::Value = if src_cfg.exists() {

@@ -18,14 +18,17 @@
 //! stage-by-stage against goldens (see `tools/dump_sdxl_golden.py`).
 
 pub mod adapters;
+pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod inpaint;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
+pub mod plan;
 pub mod preview;
 pub mod quant;
 pub mod sampler;
@@ -65,12 +68,13 @@ pub use pipeline::{
     encode_init_latents, preprocess_control_image, preprocess_init_image, seeded_prior,
     text_time_ids, ControlContext, Denoiser,
 };
+pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
 pub use training::family::{train_family, SdxlFamilyHooks, TrainTimestep};
 pub use training::{load_trainer, SdxlTrainer};
-pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
+pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel};
 pub use vae::Autoencoder;
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
@@ -96,6 +100,8 @@ pub fn register_providers(
     registry
         .register_generator(model::REGISTRATION)
         .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -120,6 +126,31 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["sdxl"]);
         assert_eq!(explicit_trainers, ["sdxl"]);
+    }
+
+    /// Weights-free behavioral oracle for the shared memory ladder (SC-15525).
+    ///
+    /// This is the check that makes the declaration non-vacuous without weights: for **every**
+    /// declared rung it builds the provider's own representative selection, drives the whole request
+    /// scope through it (`configure_request` → phases → `configure_decode` / `configure_attention` /
+    /// `materialize_transformer_window` → `finish`), proves the safety check is not blind to an
+    /// impossible budget, and — because this contract declares native/PiD decode routes — proves
+    /// each route's geometry is accepted on its own route and **rejected on the other**, with the
+    /// matching-route controls that keep the rejection non-vacuous.
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        for shape in [
+            mlx_gen::LoadShape::DeferredMaterialization,
+            mlx_gen::LoadShape::EagerMaterialization,
+        ] {
+            let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(shape);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
+                &registry, &spec,
+            );
+        }
     }
 }
 

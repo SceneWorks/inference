@@ -27,3 +27,7 @@ serde_json = { workspace = true }
 # inspection. PNG + JPEG cover the SceneWorks dataset formats; the trainer center-crops + hands the
 # Image to the VAE preprocess.
 image = { workspace = true }
+
+[dev-dependencies]
+# Weights-free memory-strategy conformance for the shared ladder (SC-15525).
+sceneworks-gen-core-testkit = { workspace = true }
