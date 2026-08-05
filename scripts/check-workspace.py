@@ -752,12 +752,16 @@ MLX_REQUEST_SCOPE_CONSTRUCTOR = "MlxRequestScopeConfig::new"
 # exploited that in the first revision.
 MLX_REQUEST_SCOPE_CONFIG_TYPE = "MlxRequestScopeConfig"
 
-# Assignment to the validator field after construction, and a struct-literal build of the config.
-# Both put a live validator into a scope without ever touching the checked constructor.
-_DECODE_VALIDATOR_REASSIGNMENT = re.compile(r"\.\s*decode_validator\s*=")
-_SCOPE_CONFIG_STRUCT_LITERAL = re.compile(
-    re.escape(MLX_REQUEST_SCOPE_CONFIG_TYPE) + r"\s*\{"
-)
+# ANY field access on the validator, not just `=` assignment. A provider that declares rung 2
+# `Missing` has no legitimate reason to touch `decode_validator` at all — it hands its rejection to
+# the constructor positionally — so the field access itself is the signal.
+#
+# This was `\.\s*decode_validator\s*=` in the first hardening pass, which reads as "catch the
+# post-construction overwrite" but only catches one spelling of it:
+# `mem::replace(&mut cfg.decode_validator, Box::new(|_u, _e, _o| Ok(())))` installs an accepting
+# validator with no `=` anywhere near the field, and so does any `&mut` handed to a helper. Matching
+# the field rather than one syntax for writing it closes the class instead of one member of it.
+_DECODE_VALIDATOR_FIELD_ACCESS = re.compile(r"\.\s*decode_validator\b")
 
 
 def _opens_a_closure(text: str, arg_start: int, bar_index: int) -> bool:
@@ -870,8 +874,9 @@ def _decode_validators_are_unconditional_rejections(text: str) -> bool:
     # (3) A struct literal bypasses the constructor entirely. Under any of its names.
     if re.search(r"(?:" + names + r")\s*\{", text):
         return False
-    # (2) A post-construction overwrite defeats any amount of care taken at the call site.
-    if _DECODE_VALIDATOR_REASSIGNMENT.search(text):
+    # (2) Any post-construction reach for the field defeats all the care taken at the call site —
+    #     an `=` overwrite, a `mem::replace`, or an `&mut` handed to a helper.
+    if _DECODE_VALIDATOR_FIELD_ACCESS.search(text):
         return False
 
     # (1) Every recognized construction site, resolved by TYPE rather than by one literal spelling.
@@ -933,6 +938,14 @@ def _declares_bounded_decode_missing(files: list[str]) -> bool:
     const of the same name satisfy a live ``Implemented`` arm in another module (SC-15525 probe, root
     cause D). One hop, same file, or no exemption.
 
+    Scoping to the file was necessary and **not sufficient**, which the first hardening pass claimed
+    and a second review caught: the hop still searched for the ``= Missing`` *spelling*, so an inner
+    ``mod deprecated_v1`` holding a dead ``DECODE_SUPPORT = Missing`` beside a live
+    ``DECODE_SUPPORT = Implemented`` in the same file satisfied it. The hop now collects every
+    declaration of that name in the file and requires **exactly one**, then checks that one's value.
+    Two declarations mean this reader cannot know which the arm binds — it resolves no module paths —
+    and "cannot prove it is Missing" gets the same answer as "not exempt".
+
     Three rules, each closing a defeated shape:
 
     1. **No ``Implemented`` may appear in any ``BoundedDecode`` arm line.** This is what catches the
@@ -966,14 +979,24 @@ def _declares_bounded_decode_missing(files: list[str]) -> bool:
         return True
     if not _CONST_NAME.match(expr):
         return False
-    return (
-        re.search(
-            r"\bconst\s+" + re.escape(expr) + r"\s*:\s*MemoryStrategySupport\s*=\s*"
-            r"(?:MemoryStrategySupport::)?Missing\s*;",
-            owning_file,
-        )
-        is not None
+    # Every `const <NAME>: MemoryStrategySupport = …;` in the arm's own file, captured by VALUE.
+    # Searching for the `= Missing` spelling directly — which is what the first hardening pass did —
+    # answers "does a Missing one exist?" when the question is "is the one this arm resolves to
+    # Missing?". Those differ as soon as the file holds two: an inner `mod deprecated_v1` carrying a
+    # dead `DECODE_SUPPORT = Missing` beside a live `DECODE_SUPPORT = Implemented` satisfied the old
+    # search and bought an exemption for a crate that declares rung 2 Implemented. Scoping the hop to
+    # the file (root cause D) narrowed that from crate-wide to file-wide; it did not close it.
+    #
+    # This reader cannot resolve Rust module paths, so it does not try to pick the right one. Two
+    # declarations of the same name mean it cannot know which the arm binds, and "cannot prove it is
+    # Missing" is the same answer as "not exempt".
+    declarations = re.findall(
+        r"\bconst\s+" + re.escape(expr) + r"\s*:\s*MemoryStrategySupport\s*=\s*([^;]+);",
+        owning_file,
     )
+    if len(declarations) != 1:
+        return False
+    return _MISSING_SUPPORT_EXPR.match(declarations[0].strip()) is not None
 
 
 def _match_paren(text: str, open_index: int) -> int:

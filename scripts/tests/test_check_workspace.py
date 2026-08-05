@@ -724,6 +724,45 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
             because="never calls the checked constructor",
         )
 
+    def test_the_exemption_does_not_cover_a_validator_installed_without_assignment(self) -> None:
+        """**Round-3 residual on root cause A.** The post-construction guard matched
+        `.decode_validator =`, which is one *spelling* of installing a validator, not the act. Each
+        shape below puts an accepting validator into the config with no `=` next to the field."""
+        for install in (
+            "std::mem::replace(&mut cfg.decode_validator, "
+            "Box::new(|_u, _e, _o| Ok(())));",
+            "swap(&mut cfg.decode_validator, &mut accepting);",
+            "install_validator(&mut cfg.decode_validator);",
+        ):
+            with self.subTest(install=install[:40]):
+                self.assert_gate_fails(
+                    self.REFUSES_RUNG_TWO + f"fn late(cfg: &mut Scope) {{ {install} }}\n",
+                    because="never calls the checked constructor",
+                )
+
+    def test_a_second_same_named_support_const_in_the_file_is_not_exempt(self) -> None:
+        """**Round-3 residual on root cause D.** Scoping the const hop to the arm's own file was
+        necessary and not sufficient: it still asked "does a `= Missing` declaration exist?" rather
+        than "is the one this arm binds Missing?". An inner module carrying a dead `Missing` beside a
+        live `Implemented` answered the first question yes. This reader resolves no module paths, so
+        two declarations of the name must fail closed rather than guess."""
+        self.assert_gate_fails(
+            "pub fn registry() { register_memory_strategy(REG); }\n"
+            "pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Implemented;\n"
+            "mod deprecated_v1 {\n"
+            "    pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;\n"
+            "}\n"
+            "pub fn c() { match s { MemoryStrategy::BoundedDecode => DECODE_SUPPORT,\n"
+            "    _ => MemoryParameterRanges::default() }; }\n"
+            "fn begin(id: &'static str) -> Result<()> {\n"
+            "    let cfg = MlxRequestScopeConfig::new(id, g, m, use_pid, blocks,\n"
+            "        move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),\n"
+            "    )?;\n"
+            "    Ok(())\n"
+            "}\n",
+            because="never calls the checked constructor",
+        )
+
     def test_a_bitwise_or_argument_does_not_false_red_a_rejecting_call_site(self) -> None:
         """The one FALSE RED the probe found: a top-level `|` in an earlier argument used to swallow
         the closure's own delimiters, route-checking a call site that genuinely rejects."""
