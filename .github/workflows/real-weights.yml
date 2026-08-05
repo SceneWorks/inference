@@ -1933,6 +1933,10 @@ jobs:
       # the S18CELL lines exist to make that possible, but nothing exposes it to CI today. Not built
       # here: one runner loss is n = 1, and sc-17355 records the standing posture for nax-macos-2
       # anomalies (observe, do not redesign, until it recurs). Tracked in sc-17655.
+      #
+      # The same limit applies to sc-17355's `Report GPU fault evidence` step above — it is `always()`
+      # too, so it reports a fault the sweep survived, not one that took the runner with it. That is
+      # the case worth knowing about here, so do not read its presence as coverage for this hole.
       - name: Extract the S18 cell evidence
         if: always()
         run: |
