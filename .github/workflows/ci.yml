@@ -5,6 +5,12 @@ on:
     branches: [main]
     tags: ["runtime-*"]
   pull_request:
+  # A merge queue tests a speculative merge on a `gh-readonly-queue/main/**` ref. Without this
+  # trigger no run is ever created for that ref, the required checks stay pending, and every
+  # queued PR is evicted when `check_response_timeout_minutes` expires. Landing the trigger
+  # before any ruleset enables a queue keeps the checks reachable from the first enqueue
+  # (sc-17780; the sibling SceneWorks change is sc-17773).
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -25,6 +31,12 @@ permissions:
 # cancel-in-progress off. Per-SHA groups cannot evict each other; runs serialize on
 # the runner instead. Tag builds likewise never cancel (tags are immutable — see
 # CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
+#
+# merge_group deliberately lands in the github.sha branch too. Each speculative merge is a
+# distinct commit, so per-SHA groups let concurrently-built queue entries run side by side
+# rather than evicting one another — grouping them by ref would serialize the queue down to
+# one entry and guarantee `check_response_timeout_minutes` evictions. GitHub cancels the run
+# itself when it dissolves a merge group, so nothing here needs to.
 concurrency:
   group: inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -49,16 +61,24 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      # Every BASE_SHA below must name `github.event.merge_group.base_sha`. A merge_group event
+      # carries NEITHER `pull_request.base.sha` NOR `before`, and the two consumers fail in
+      # opposite directions on an empty base: select_lanes.py hard-errors (visible), while
+      # check-review-findings.py degrades to `base_registry_text = None` and skips the
+      # append-only comparison while still reporting success (invisible). `github.sha` is
+      # already correct as HEAD for a merge group — it is the group's last commit — and
+      # base_sha is an ancestor of it, which the fetch-depth: 0 checkout above guarantees is
+      # present for the `git diff`.
       - name: Validate append-only code-review finding allocations
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: python3 scripts/check-review-findings.py --base "$BASE_SHA"
       - name: Expand changed paths through workspace dependencies
         id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
@@ -385,7 +405,11 @@ jobs:
     needs: changes
     # This persistent runner may execute repository build scripts, so a public-fork PR must never
     # reach it. Pushes, manual dispatches, and PRs whose head belongs to this repository remain
-    # eligible; hosted jobs continue to validate fork PRs.
+    # eligible; hosted jobs continue to validate fork PRs. merge_group is trusted for the same
+    # reason a push is: `gh-readonly-queue/main/**` is a ref in THIS repository, created by the
+    # queue from already-reviewed heads, so fork code cannot arrive by that path. Keep the guard
+    # keyed on `!= 'pull_request'` rather than an allowlist of trusted events, so a new trusted
+    # event does not silently lose CUDA coverage.
     if: >-
       needs.changes.outputs.windows_cuda == 'true' &&
       (github.event_name != 'pull_request' ||
@@ -565,3 +589,54 @@ jobs:
           name: ${{ github.ref_name }}-source
           path: dist/release/
           if-no-files-found: error
+
+  # Single aggregated verdict for branch protection and the merge queue to require. Two reasons
+  # this exists rather than naming each lane in the ruleset:
+  #
+  # 1. A lane skipped by its `if:` reports SUCCESS to a required status check, and a lane skipped
+  #    because `needs: changes` FAILED reports the same way. Naming lanes individually therefore
+  #    lets a broken `changes` job read green across the whole board. Collapsing to `needs.*.result`
+  #    distinguishes them: a failed dependency leaves `failure` in the results, a genuine path-based
+  #    skip leaves `skipped`.
+  # 2. Required contexts are matched on job *display name*, so per-lane requirements silently stop
+  #    enforcing the moment a `name:` is reworded. One context that no one renames cannot rot that
+  #    way.
+  #
+  # `if: always()` is mandatory — the default `success()` would skip this job exactly when an
+  # upstream lane failed, which reports success and inverts the gate. Every non-gate job is listed;
+  # dispatch- and tag-only lanes are included deliberately, since `skipped` is tolerated and that
+  # keeps them covered on the events where they do run. Add new jobs here, or they go ungated.
+  gate:
+    name: CI gate
+    needs:
+      - changes
+      - resolve
+      - format
+      - workspace
+      - contracts
+      - candle-cpu
+      - macos-metal
+      - macos-nax
+      - windows-cuda-check
+      - windows-cuda
+      - supply-chain
+      - docs
+      - release-metadata
+      - release-artifacts
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every lane to have succeeded or been skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "lane results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *)
+                echo "::error::a CI lane reported '$result'; see the failing job above"
+                exit 1
+                ;;
+            esac
+          done
