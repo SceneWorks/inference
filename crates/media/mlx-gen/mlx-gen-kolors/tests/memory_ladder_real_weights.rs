@@ -100,6 +100,35 @@ fn spec(dir: &std::path::Path, tier: &str, shape: LoadShape) -> LoadSpec {
     spec
 }
 
+/// The env var carrying the converted `Kwai-Kolors/Kolors-IP-Adapter-Plus` snapshot — the layout
+/// [`mlx_gen_kolors::ip_adapter::load_kolors_ip_adapter`] reads (`image_encoder/model.safetensors`
+/// plus `ip_adapter_plus_general.safetensors`).
+const IP_ADAPTER_ENV: &str = "KOLORS_IP_ADAPTER";
+
+#[track_caller]
+fn require_ip_adapter() -> PathBuf {
+    let root = PathBuf::from(std::env::var(IP_ADAPTER_ENV).unwrap_or_else(|_| {
+        panic!("SKIPPED-BY-ABSENCE: set {IP_ADAPTER_ENV} to a Kolors-IP-Adapter-Plus snapshot dir")
+    }));
+    assert!(
+        root.join("ip_adapter_plus_general.safetensors").is_file(),
+        "SKIPPED-BY-ABSENCE: {IP_ADAPTER_ENV} must point at a snapshot containing \
+         ip_adapter_plus_general.safetensors (the upstream repo ships .bin; it needs converting)"
+    );
+    root
+}
+
+/// A flat mid-grey image prompt — the IP-Adapter identity. Its *content* is irrelevant here: the
+/// claim under test is that the streamed and resident stacks agree, not what they draw.
+fn ip_reference_image() -> mlx_gen::gen_core::Image {
+    const EDGE: u32 = 336;
+    mlx_gen::gen_core::Image {
+        width: EDGE,
+        height: EDGE,
+        pixels: vec![128_u8; (EDGE * EDGE * 3) as usize],
+    }
+}
+
 fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> GenerationRequest {
     GenerationRequest {
         prompt: "a red fox in a snowy forest, photograph".into(),
@@ -1007,8 +1036,13 @@ fn transformer_window_sweep_and_streamed_output_identity() {
 
     // **Byte-identity is asserted in BOTH modes**: a streamed block is re-materialized through the
     // same constructor with the same replayed tier, so only residency differs — at every tier and
-    // every geometry, with no exceptions. It is also the IP-Adapter / adapter replay guard's
-    // end-to-end half, which is the one that would otherwise fail silently.
+    // every geometry, with no exceptions.
+    //
+    // Scope note: every `LoadSpec` in this sweep carries `ip_adapter: None` and no adapters, so
+    // `ip_expected` is false and the `BlockAdapters` are empty — this loop discriminates the TIER
+    // replay and nothing about the IP/adapter replay. That half is carried end to end by
+    // `the_rung_four_stream_replays_an_installed_ip_adapter`, and at the unit level by
+    // `mlx_gen_sdxl::block_stream`'s own tests.
     for (window, row) in &rows {
         assert_eq!(
             control.pixels, row.pixels,
@@ -1064,6 +1098,93 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         speedup > 1.5,
         "widening the cadence no longer buys time back ({speedup:.2}×) — the domain is a frontier \
          only if it does, otherwise it is four spellings of one choice"
+    );
+}
+
+/// **Rung 4 with an IP-Adapter actually installed** — the end-to-end half of the replay guard.
+///
+/// Rung 4 is deliberately permissive for IP and control (`memory_strategy`'s route gate refuses only
+/// the geometry, not the mode), so an **IP-armed rung-4 render is reachable in production**. The
+/// mechanism that makes it correct is `mlx_gen_sdxl::block_stream`'s replay: each `Transformer2D`'s
+/// stream captures the installed K/V projections off its FINISHED resident blocks (`registry`'s load
+/// arms the streams LAST, after the IP install), and a re-materialized block that comes back without
+/// its pair is refused loudly rather than rendering a plausible, wrong image.
+///
+/// That mechanism is unit-gated in `block_stream`, but until this test existed nothing exercised it
+/// through `generate` on real weights: every `LoadSpec` in this file carried `ip_adapter: None`, so
+/// the sweep's byte-identity loop ran with `ip_expected == false` and empty `BlockAdapters` and
+/// discriminated nothing about replay. A capture that silently came back empty on the production
+/// path would have been invisible here.
+///
+/// One row at the default tier, at the advertised `min_size` to keep it cheap: staged control vs the
+/// shipped cadence, byte-identical. Byte-identity is the whole assertion, and it is a strong one —
+/// dropping the image prompt for even one sub-stack's layers changes the image.
+#[test]
+#[ignore = "needs a real SceneWorks/kolors-mlx snapshot + a converted Kolors-IP-Adapter-Plus \
+            snapshot (set KOLORS_LADDER_ROOT and KOLORS_IP_ADAPTER)"]
+fn the_rung_four_stream_replays_an_installed_ip_adapter() {
+    const EDGE: u32 = 512;
+    let dir = require_tier(DEFAULT_TIER);
+    let ip_root = require_ip_adapter();
+    warm_up(&dir, DEFAULT_TIER);
+
+    let ip_spec = |shape: LoadShape| {
+        spec(&dir, DEFAULT_TIER, shape).with_ip_adapter(WeightsSource::Dir(ip_root.clone()))
+    };
+    // In IP mode the Reference IS the image prompt, and the model refuses the request without one.
+    let ip_request = |memory: GenerationMemory| {
+        let mut req = request(Some(memory), EDGE, STEPS);
+        req.conditioning = vec![mlx_gen::gen_core::Conditioning::Reference {
+            image: ip_reference_image(),
+            strength: Some(0.6),
+        }];
+        req
+    };
+
+    let render = |memory: GenerationMemory| -> Row {
+        let registry = mlx_gen_kolors::provider_registry().expect("provider registry");
+        let model = registry
+            .load("kolors", &ip_spec(LoadShape::DeferredMaterialization))
+            .expect("load kolors with an IP-Adapter");
+        clear_cache();
+        reset_peak_memory();
+        let started = std::time::Instant::now();
+        let out = model
+            .generate(&ip_request(memory), &mut |_: Progress| {})
+            .expect("an IP-armed generate must succeed");
+        let peak = get_peak_memory();
+        let wall = started.elapsed();
+        let pixels = match out {
+            GenerationOutput::Images(images) => images.first().expect("one image").pixels.clone(),
+            other => panic!("expected images, got {other:?}"),
+        };
+        drop(model);
+        clear_cache();
+        Row {
+            peak_gib: peak as f64 / GIB,
+            pixels,
+            wall,
+        }
+    };
+
+    let control = render(staged());
+    let windowed = render(full_ladder(ms::TRANSFORMER_WINDOW_SIZE));
+    println!(
+        "[sc-15521 rung4 IP replay {DEFAULT_TIER} {EDGE}² {STEPS} steps] staged control {:.4} GiB \
+         -> windowed {:.4} GiB ({:+.2}%)  {:.0} -> {:.0} ms/step  max Δ {}",
+        control.peak_gib,
+        windowed.peak_gib,
+        100.0 * (windowed.peak_gib - control.peak_gib) / control.peak_gib,
+        ms_per_step(&control, STEPS),
+        ms_per_step(&windowed, STEPS),
+        max_delta(&control.pixels, &windowed.pixels),
+    );
+    assert_eq!(
+        control.pixels, windowed.pixels,
+        "a streamed block did not reproduce its resident twin WITH an IP-Adapter installed. The \
+         replay captures each block's K/V pair off the finished resident stack, so a divergence \
+         here means the streamed cross-attention ran without the image prompt for some layers — a \
+         plausible, wrong image. See mlx_gen_sdxl::block_stream's replay guard"
     );
 }
 

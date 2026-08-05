@@ -417,6 +417,13 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// | q8 | 6.353 / 6.894 | 6.430 / 17.086 | 6.430 / 58.107 |
 /// | **bf16** | **11.360 / 11.360** | 11.364 / 19.031 | 11.364 / 60.053 |
 ///
+/// Reproduction: on a re-run, seven of the nine cells return to four decimals; the two 512² cells at
+/// `q4` and `q8` moved by ~4% (5.620 → 5.850 and 6.894 → 6.665 on the request side). Those two are
+/// the first end-to-end row of their kind per tier — the same cold-allocator sensitivity the
+/// harness's warm-up exists for, one level down — and they carry the smallest peaks in the table, so
+/// the absolute movement is small. **No cell's verdict moves**: the two phases are 1.5–5× apart
+/// everywhere except the one conditioning-bearing cell.
+///
 /// **Instrument scope, stated plainly: eight of these nine cells are HARNESS-ONLY.** Every cell in
 /// this table is produced by `measure_end_to_end_phased`, a hand-rolled re-assembly of the staged
 /// request from the crate's public entry points — necessary, because `generate` exposes no
