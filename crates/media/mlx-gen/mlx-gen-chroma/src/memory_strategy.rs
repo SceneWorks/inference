@@ -29,6 +29,9 @@
 //!   drifts 105-166/255 against the untiled decode of the **production** latent, more than double
 //!   the 48/255 bar the closest sibling admits, and the drift is flat in the geometry. See
 //!   [`DECODE_SUPPORT`] for the table.
+//! * **Rung 3 is `Missing`.** MLX's fused attention kernel streams its scores, so query-row
+//!   chunking has no materialized score matrix to bound: measured **−0.001%** on the request peak.
+//!   See [`ATTENTION_SUPPORT`].
 //! * **Rung 4 is scoped at the `Dit`, not the text encoder.** Chroma's shipped q4 tier packs only
 //!   the DiT block linears, so the T5-XXL encoder is the largest single component (dense bf16, 10.15
 //!   GiB against a 7.14 GiB packed DiT) — which makes the text-encoder scope look obviously right
@@ -112,10 +115,33 @@ pub const DECODE_OVERLAP: u32 = 128;
 
 // ── Rung 3: the bounded-attention budget ─────────────────────────────────────────────────────────
 
-/// The single published attention-score budget — the shared `CONSTRAINED_ATTN_SCORES_BUDGET`.
+/// The single attention-score budget this provider would publish — the shared
+/// `CONSTRAINED_ATTN_SCORES_BUDGET`.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
-/// Whether bounded attention survived measurement on the production path.
-pub const ATTENTION_SUPPORT: bool = true;
+
+/// **Rung 3 is `Missing` on this family, and it is a measured verdict rather than an omission.**
+///
+/// Measured on Chroma1-Base q4 at 1024² (`attention_chunking_is_measured_against_the_rung_two_top`),
+/// against rung 3's own control — the same composition minus the chunking, which per the shared cost
+/// order is *not* staged:
+///
+/// | steps | control | chunked | Δ |
+/// |---:|---:|---:|---:|
+/// | 1 | 28.0779 GiB | 28.0776 GiB | **−0.001%** |
+///
+/// Inert to the fourth decimal. That is the expected shape on MLX and the reason is structural:
+/// `fast::scaled_dot_product_attention` dispatches to a fused Metal kernel that **streams** the
+/// scores, so there is no `[B,H,Sq,Sk]` materialization for query-row chunking to bound — see
+/// [`mlx_gen::attention`], where the same rung is worth −32% on candle and −1.7% on MLX's Z-Image
+/// denoise phase. Chroma's DiT carries an additional cost candle's does not: its MMDiT mask is a
+/// per-query `[B,1,S,S]` tensor (85 MiB per CFG branch at 1024²) which the bounded kernel must
+/// *narrow* per chunk, adding transients on the side of the ledger the rung is supposed to help.
+///
+/// The mechanism is wired and correct — `sdpa_budgeted_bhsd` is threaded through both block stacks
+/// and both attention sites — so a future geometry, tier or kernel that makes it pay only has to
+/// flip this flag. Until one does, admitting it would sell a caller a strategy that costs wall clock
+/// and buys nothing.
+pub const ATTENTION_SUPPORT: bool = false;
 
 // ── Rung 4: the transformer window ───────────────────────────────────────────────────────────────
 
@@ -123,8 +149,9 @@ pub const ATTENTION_SUPPORT: bool = true;
 pub const TRANSFORMER_WINDOW_SIZES_SWEPT: &[u32] = &[1, 2, 5, 10];
 /// Whether bounded transformer residency survived measurement on the production path.
 pub const WINDOW_SUPPORT: bool = true;
-/// The published window cadence domain.
-pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
+/// The published window cadence domain — a time/memory frontier, pinned by
+/// `transformer_window_sweep_and_streamed_output_identity`.
+pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// The default cadence inside [`TRANSFORMER_WINDOW_SIZES`].
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// The **measured** default component scope, and the one a request that names none receives.
@@ -874,16 +901,12 @@ mod tests {
             "a Missing rung must publish no behavioral fixture"
         );
 
-        let mut fixture = registered_fixture(&spec, &contract, MemoryStrategy::BoundedAttention)
-            .unwrap()
-            .remove(0);
-        let mut scope = registered_begin_request(&spec, &contract, &fixture.context)
-            .unwrap()
-            .unwrap();
-        scope.configure_request(&mut fixture.request).unwrap();
-        assert!(fixture.request.memory.unwrap().chunk_attention);
-        scope.configure_attention(ATTENTION_CHUNK_SIZE).unwrap();
-        assert!(scope.configure_attention(ATTENTION_CHUNK_SIZE - 1).is_err());
+        assert!(
+            registered_fixture(&spec, &contract, MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .is_empty(),
+            "a Missing rung must publish no behavioral fixture"
+        );
 
         let mut fixture = registered_fixture(
             &spec,

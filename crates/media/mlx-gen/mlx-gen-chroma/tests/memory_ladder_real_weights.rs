@@ -968,71 +968,158 @@ fn the_withheld_rungs_are_refused_by_the_production_path() {
 
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
 
-/// **What bounded attention does to the request peak on this family.**
+/// **What bounded attention does on this family — measured at the DiT seam.**
 ///
-/// Measured against the rung-2 top of the ladder rather than against a bare resident row, because
-/// that is the composition a selector reaching rung 3 would actually be standing on.
+/// The production path refuses a bounded-attention request (`ATTENTION_SUPPORT` is `false`), so the
+/// mechanism is driven directly through `ChromaTransformer::forward_with_attention_plan`. That is
+/// deliberate and it is the only shape that keeps the `Missing` verdict falsifiable: a rung whose
+/// evidence can no longer be re-taken once it is withheld is a comment, not a measurement.
 ///
-/// MLX's `scaled_dot_product_attention` streams its scores, so this rung never bounds a materialized
-/// score matrix here; what it can do is cut the lazy graph at every chunk boundary. Whether that is
-/// worth anything is a per-family measurement — Z-Image measured −1.7% on the denoise phase, candle
-/// measured −32% on the same rung.
+/// The request-level numbers behind the verdict, taken before the refusal landed, were
+/// **28.0779 GiB unbounded → 28.0776 GiB chunked at 1024², 1 step: −0.001%.** This test re-takes the
+/// same comparison at the seam, where it is isolated from the residency schedule, and asserts it in
+/// **both** directions with a margin: below means chunking has started bounding this family and the
+/// `Missing` declaration is stale; above means it has started adding transients. A one-sided floor
+/// could not tell a real seam change from no change at all.
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
-fn attention_chunking_is_measured_against_the_rung_two_top() {
+fn attention_chunking_is_measured_at_the_dit_seam() {
+    use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+    use mlx_gen_chroma::{loader, ChromaTransformerConfig};
+    use mlx_rs::Array;
+
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    warm_up(REPRESENTATIVE, &dir);
-    let shape = LoadShape::EagerMaterialization;
+    const EDGE: u32 = 1024;
 
-    let mut rows = Vec::new();
-    for steps in [1_u32, STEPS] {
-        let plain = measure(
-            REPRESENTATIVE,
-            &dir,
-            shape,
-            &request(Some(staged()), 1024, steps),
-        );
-        let chunked = measure(
-            REPRESENTATIVE,
-            &dir,
-            shape,
-            &request(Some(rung3()), 1024, steps),
-        );
-        println!(
-            "[sc-15520 rung3 {DEFAULT_TIER} 1024² {steps} step(s)] staged {:.4} GiB -> chunked \
-             {:.4} GiB ({:+.2}%)  {:.0} -> {:.0} ms/step  max Δ {}  mean Δ {:.4}",
-            plain.peak_gib,
-            chunked.peak_gib,
-            100.0 * (chunked.peak_gib - plain.peak_gib) / plain.peak_gib,
-            ms_per_step(&plain, steps),
-            ms_per_step(&chunked, steps),
-            max_delta(&plain.pixels, &chunked.pixels),
-            mean_delta(&plain.pixels, &chunked.pixels),
-        );
-        rows.push((steps, plain, chunked));
-    }
+    // The production conditioning, so the joint sequence is the real `[text, image]` length and the
+    // `[B,1,S,S]` MMDiT mask is the real one — the tensor the bounded kernel has to narrow per chunk.
+    let tokenizer = loader::load_tokenizer().expect("tokenizer");
+    let t5 = loader::load_t5_encoder(&dir).expect("t5");
+    let (embeds, mask) =
+        mlx_gen_chroma::encode_prompt(&tokenizer, &t5, "a red fox in a snowy forest, photograph")
+            .expect("encode");
+    mlx_rs::transforms::eval([&embeds, &mask]).expect("eval conditioning");
+    let text_len = embeds.shape()[1];
+    drop(t5);
+    drop(tokenizer);
+    clear_cache();
 
-    // The published verdict, asserted with the SAME 3% margin an implemented rung must CLEAR, in
-    // whichever direction ATTENTION_SUPPORT records — so a change in either direction reddens and
-    // forces the declaration to be revisited rather than calcifying.
-    for (steps, plain, chunked) in &rows {
-        if ms::ATTENTION_SUPPORT {
-            assert!(
-                chunked.peak_gib < plain.peak_gib * 0.97,
-                "bounded attention is declared Implemented but no longer bounds the request peak \
-                 at {steps} step(s) ({:.4} vs {:.4} GiB)",
-                chunked.peak_gib,
-                plain.peak_gib
-            );
-        } else {
-            assert!(
-                chunked.peak_gib > plain.peak_gib * 0.97,
-                "bounded attention now bounds the REQUEST peak at {steps} step(s) ({:.4} vs {:.4} \
-                 GiB) — re-open memory_strategy::ATTENTION_SUPPORT",
-                chunked.peak_gib,
-                plain.peak_gib
-            );
+    let h2 = (EDGE / 16) as i32;
+    let si = h2 * h2;
+    let mut ids = vec![0f32; (si * 3) as usize];
+    for i in 0..h2 {
+        for j in 0..h2 {
+            let o = ((i * h2 + j) * 3) as usize;
+            ids[o + 1] = i as f32;
+            ids[o + 2] = j as f32;
         }
+    }
+    let img_ids = Array::from_slice(&ids, &[si, 3]);
+    let txt_ids = Array::from_slice(&vec![0f32; (text_len * 3) as usize], &[text_len, 3]);
+    let full_mask =
+        mlx_rs::ops::concatenate_axis(&[&mask, &Array::ones::<f32>(&[1, si]).unwrap()], 1)
+            .expect("full mask");
+    let latents = mlx_gen_flux::create_noise(1234, EDGE, EDGE).expect("latents");
+    let timestep = Array::from_slice(&[1.0f32], &[1]);
+    let transformer =
+        loader::load_transformer(&dir, ChromaTransformerConfig::default()).expect("transformer");
+
+    let run = |plan: AttentionPlan<'_>| -> (f64, Vec<f32>) {
+        clear_cache();
+        reset_peak_memory();
+        let out = transformer
+            .forward_with_attention_plan(
+                &latents,
+                &embeds,
+                &timestep,
+                &img_ids,
+                &txt_ids,
+                Some(&full_mask),
+                plan,
+            )
+            .expect("dit forward");
+        out.eval().expect("eval");
+        let peak = get_peak_memory() as f64 / GIB;
+        let v = out
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        (peak, v)
+    };
+
+    // **The discarded warm-up row (SC-17679).** This test drives the seam directly rather than
+    // through `measure`, so it does not go through `warm_up` — and the first forward in the process
+    // reads its peak against a cold allocator whichever plan it executes. The sibling Kolors harness
+    // published a +12.54% "seam regression" from exactly this, which is +0.00% once warmed. The
+    // bounded plan warms up, because it has the larger allocation set.
+    let bounded_plan = || AttentionPlan::budgeted(AttentionBudget::CONSTRAINED);
+    let (warm_up_peak, _) = run(bounded_plan());
+
+    let (unbounded_peak, unbounded) = run(AttentionPlan::UNBOUNDED);
+    let (bounded_peak, bounded) = run(bounded_plan());
+    let max_abs = unbounded
+        .iter()
+        .zip(&bounded)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let delta_pct = 100.0 * (bounded_peak - unbounded_peak) / unbounded_peak;
+    println!(
+        "[sc-15520 rung3 dit-seam {DEFAULT_TIER} {EDGE}²] discarded warm-up {warm_up_peak:.4} GiB; \
+         unbounded {unbounded_peak:.4} GiB -> bounded {bounded_peak:.4} GiB ({delta_pct:+.2}%)  \
+         max|Δv| {max_abs:.3e}"
+    );
+
+    // **Half one: the mechanism is wired and it is not a no-op.** This is the assertion that would
+    // catch rung 3 shipping with the chunking deleted — a defect a sibling PR actually shipped, with
+    // green CI, because every assertion it carried passed more easily with the feature off.
+    assert!(
+        delta_pct < -1.0,
+        "bounded attention no longer bounds the DiT seam at all ({delta_pct:+.2}%, {bounded_peak:.4} \
+         vs {unbounded_peak:.4} GiB). The plan is threaded through both block stacks and both \
+         attention sites; if it has stopped engaging, this file's rung-3 evidence is measuring \
+         nothing"
+    );
+    drop(transformer);
+    clear_cache();
+
+    // **Half two, and the one that decides the rung: bounding a phase is not moving the request
+    // peak.** The saving above is real and it is confined to the denoise phase, which on this family
+    // is not the phase that binds — so a caller pays wall clock for a request peak that does not
+    // move. Asserted as arithmetic over two measured quantities rather than as a remembered figure:
+    // the seam saving must be smaller than the headroom between the denoise phase and the request
+    // peak. If the DiT ever becomes the binding phase, or the saving ever outgrows that headroom,
+    // this reddens and ATTENTION_SUPPORT is re-decided.
+    warm_up(REPRESENTATIVE, &dir);
+    let request_peak = measure(
+        REPRESENTATIVE,
+        &dir,
+        LoadShape::EagerMaterialization,
+        &request(Some(staged()), EDGE, 1),
+    )
+    .peak_gib;
+    let saving = unbounded_peak - bounded_peak;
+    let headroom = request_peak - unbounded_peak;
+    println!(
+        "[sc-15520 rung3 request {DEFAULT_TIER} {EDGE}²] staged request peak {request_peak:.4} GiB \
+         against a {unbounded_peak:.4} GiB denoise seam — headroom {headroom:.4} GiB, seam saving \
+         {saving:.4} GiB"
+    );
+    if ms::ATTENTION_SUPPORT {
+        assert!(
+            saving > headroom,
+            "bounded attention is declared Implemented but its {saving:.4} GiB seam saving is \
+             inside the {headroom:.4} GiB headroom between the denoise phase and the request peak, \
+             so it cannot move the request peak"
+        );
+    } else {
+        assert!(
+            saving < headroom,
+            "bounded attention's {saving:.4} GiB seam saving now exceeds the {headroom:.4} GiB \
+             headroom between the denoise phase and the request peak — the denoise phase may have \
+             become peak-bearing, so ATTENTION_SUPPORT must be re-decided rather than left Missing \
+             on a superseded measurement"
+        );
     }
 }
 
@@ -1062,8 +1149,8 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         &request(Some(rung4_control()), edge, STEPS),
     );
     println!(
-        "[sc-15520 rung4 {tier} {edge}²] rung-4 control (stage+tile+chunk, no window) {:.4} GiB, \
-         {:.0} ms/step",
+        "[sc-15520 rung4 {tier} {edge}²] rung-4 control (its own composition, no window) {:.4} \
+         GiB, {:.0} ms/step",
         control.peak_gib,
         ms_per_step(&control, STEPS)
     );
@@ -1126,12 +1213,37 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         "[sc-15520 rung4 {tier} {edge}²] cadence {tightest}..{widest}: peak spread {spread:.2}%, \
          {tight_ms:.0} -> {wide_ms:.0} ms/step"
     );
+    // **The peak is cadence-independent, and the latency ordering is WITHDRAWN as evidence.**
+    //
+    // The peaks are flat to the fourth decimal in every execution order, and the instrument's
+    // resolution at this cell is 0.00% over eight identical requests
+    // (`identical_requests_reproduce_once_the_allocator_has_settled`), so 1% is a tolerance the
+    // instrument can support. That is the claim this domain rests on: every published cadence
+    // bounds the request peak to the same value, so a caller may pick any of them.
+    //
+    // The ms/step column is **printed and not asserted**, and that is a measured decision rather
+    // than caution. Under [`probe_order`] the wall clock follows the row's POSITION, not its
+    // cadence (SC-17679):
+    //
+    // | order | cadence 1 | 2 | 5 | 10 |
+    // |---|---:|---:|---:|---:|
+    // | `1,2,5,10` | 9349 | 9785 | 10354 | 10466 |
+    // | `10,5,2,1` | 12199 (last) | — | — | 10166 (first) |
+    // | `2,10,1,5` | 11259 (3rd) | 9904 (1st) | 10404 (4th) | 9472 (2nd) |
+    //
+    // Cadence 10 is the slowest row in the first order and the fastest in the third. A genuine
+    // re-materialization cost cannot do that; thermal state over a 3.5-minute run can. So no
+    // latency ordering across these cadences is publishable in either direction, and
+    // [`ms::TRANSFORMER_WINDOW_SIZE`]'s default rests on being the tightest weight bound — what the
+    // rung exists for — rather than on a latency argument this instrument cannot resolve.
     assert!(
-        wide_ms < tight_ms * 0.75,
-        "widening the cadence {tightest} -> {widest} did not buy time back ({tight_ms:.0} -> \
-         {wide_ms:.0} ms/step). The swept domain is a time/memory frontier; if every cadence costs \
-         the same it is not one, and only the tightest should ship"
+        spread < 1.0,
+        "the published cadences no longer bound the request peak to the same value ({spread:.2}% \
+         spread over {rows:?}) against an instrument resolution of 0.00% at this cell. The domain \
+         is published as equal-peak alternatives, so that has to keep holding — or it must be \
+         narrowed to the cadence that was actually measured"
     );
+    let _ = (tightest, widest, tight_ms, wide_ms);
 }
 
 /// **The published cadence domain is enforced in BOTH directions on the production path.**

@@ -1026,6 +1026,38 @@ impl ChromaTransformer {
             .ok_or_else(|| Error::Unsupported("chroma: no snapshot-backed block stream".to_owned()))
     }
 
+    /// Evidence hook (SC-15520): [`Self::forward`] under an explicit rung-3 attention plan.
+    ///
+    /// `mlx_gen_chroma::memory_strategy::ATTENTION_SUPPORT` is `false`, so the production path
+    /// refuses every bounded-attention request — which is exactly why the *mechanism* needs a seam a
+    /// harness can still reach. Without one, the measurement behind that `Missing` verdict could
+    /// never be re-taken and the verdict would calcify into an unfalsifiable comment.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_attention_plan(
+        &self,
+        hidden: &Array,
+        encoder: &Array,
+        timestep: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        attention_mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let pooled = self.pooled_temb(timestep)?;
+        let rope = self.build_rope_table(txt_ids, img_ids)?;
+        let mask2d = Self::attention_mask2d(attention_mask)?;
+        self.forward_prepared(
+            hidden,
+            encoder,
+            &pooled,
+            &rope,
+            mask2d.as_ref(),
+            attention,
+            None,
+        )
+    }
+
     /// Test hook: the Approximator input vector for a raw timestep `[B]` (pure elementwise — isolates
     /// the embedding build from the matmul floor).
     #[doc(hidden)]
