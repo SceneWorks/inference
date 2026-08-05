@@ -18,7 +18,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor};
 
@@ -30,6 +29,9 @@ use core_llm::{LoadSpec, Message, Quantize, TextLlmRequest};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
 const VOCAB: usize = 32;
+
+mod common;
+use common::Fixture;
 
 fn randn(shape: (usize, usize), rng: &mut SplitMix64) -> Tensor {
     let n = shape.0 * shape.1;
@@ -59,9 +61,9 @@ fn tokenizer_json() -> String {
     )
 }
 
-fn write_snapshot() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("candle-llm-conformance-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+fn write_snapshot() -> Fixture {
+    let fixture = Fixture::new("candle-llm-conformance-", None);
+    let dir = &*fixture;
     // eos_token_id outside the vocab so generation always runs to the token budget.
     let config = format!(
         r#"{{
@@ -93,7 +95,7 @@ fn write_snapshot() -> PathBuf {
         arrays.insert(p("mlp.down_proj.weight"), randn((h, inter), &mut rng));
     }
     candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
-    dir
+    fixture
 }
 
 #[test]
@@ -110,7 +112,6 @@ fn llama_provider_passes_core_llm_conformance() {
 
     // Sanity: the provider id the suite checked is the registered one.
     assert_eq!(PROVIDER_ID, "candle-llama");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -196,11 +197,10 @@ fn gguf_passes_core_llm_conformance() {
 
 /// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
 /// is weightless and architecture-aware.
-fn write_config_only(name: &str, config: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("candle-llm-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("config.json"), config).unwrap();
-    dir
+fn write_config_only(name: &str, config: &str) -> Fixture {
+    let fixture = Fixture::new(&format!("candle-llm-{name}-"), None);
+    std::fs::write(fixture.join("config.json"), config).unwrap();
+    fixture
 }
 
 /// Write a minimal, **zero-tensor** GGUF (V3) carrying a single `general.architecture` metadata
@@ -208,7 +208,7 @@ fn write_config_only(name: &str, config: &str) -> PathBuf {
 /// resolves it provably read no weights. Returns the `.gguf` file path. (Format per the GGUF spec:
 /// little-endian magic `GGUF`, u32 version, u64 tensor_count, u64 metadata_kv_count, then KV pairs;
 /// a string is a u64 length prefix + UTF-8 bytes, and value-type `8` is String.)
-fn write_minimal_gguf(name: &str, arch: &str) -> PathBuf {
+fn write_minimal_gguf(name: &str, arch: &str) -> Fixture {
     fn push_str(buf: &mut Vec<u8>, s: &str) {
         buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
@@ -222,11 +222,12 @@ fn write_minimal_gguf(name: &str, arch: &str) -> PathBuf {
     buf.extend_from_slice(&8u32.to_le_bytes()); // value type 8 = String
     push_str(&mut buf, arch);
 
-    let dir = std::env::temp_dir().join(format!("candle-llm-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{name}.gguf"));
-    std::fs::write(&path, &buf).unwrap();
-    path
+    let fixture = Fixture::new(
+        &format!("candle-llm-{name}-"),
+        Some(&format!("{name}.gguf")),
+    );
+    std::fs::write(&*fixture, &buf).unwrap();
+    fixture
 }
 
 #[test]
@@ -257,7 +258,6 @@ fn can_load_is_weightless_and_architecture_aware() {
             !candle_llm::llava::can_load(&spec),
             "{name}: vision provider must decline a text snapshot"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // An unsupported architecture is declined (no panic, no silent default).
@@ -267,7 +267,6 @@ fn can_load_is_weightless_and_architecture_aware() {
     );
     let uspec = LoadSpec::dense(unknown.to_str().unwrap().to_string());
     assert!(!candle_llm::provider::can_load(&uspec));
-    let _ = std::fs::remove_dir_all(&unknown);
 
     // A multimodal snapshot: the text provider declines (a `vision_config` is present even though
     // the nested text arch is llama), the vision provider claims it.
@@ -286,7 +285,6 @@ fn can_load_is_weightless_and_architecture_aware() {
         candle_llm::llava::can_load(&vspec),
         "vision provider must claim a VLM"
     );
-    let _ = std::fs::remove_dir_all(&vlm);
 
     // A `*.gguf` file: the text provider reads ONLY the header (the fixtures below carry zero tensor
     // data) to confirm `general.architecture`. A supported arch (llama/qwen3) is claimed; the vision
@@ -302,7 +300,6 @@ fn can_load_is_weightless_and_architecture_aware() {
             !candle_llm::llava::can_load(&spec),
             "{arch}: vision provider must decline a GGUF"
         );
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     // An unsupported / non-LLM GGUF arch (here `bert`) is declined — likewise weightlessly, from the
@@ -313,7 +310,6 @@ fn can_load_is_weightless_and_architecture_aware() {
         !candle_llm::provider::can_load(&bspec),
         "text provider must decline an unsupported/non-LLM GGUF arch"
     );
-    let _ = std::fs::remove_dir_all(bert.parent().unwrap());
 
     // A `*.gguf` path that doesn't exist (or isn't a parseable GGUF) is declined gracefully — the
     // header probe fails closed rather than claiming a file it can't read.
@@ -341,7 +337,6 @@ fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
     let req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 4);
     let out = llm.complete(&req).expect("generate");
     assert!(!out.text.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -362,7 +357,6 @@ fn load_for_model_unknown_architecture_is_a_typed_error() {
         Err(e) => panic!("expected Unsupported, got error: {e}"),
         Ok(_) => panic!("expected Unsupported, got a loaded provider"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -380,7 +374,6 @@ fn load_for_model_unsupported_gguf_is_a_typed_error() {
         Err(e) => panic!("expected Unsupported, got error: {e}"),
         Ok(_) => panic!("expected Unsupported, got a loaded provider"),
     }
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// Gated: a real GGUF (`CANDLE_LLM_GGUF`) is claimed by the weightless header probe, resolves through
@@ -412,14 +405,12 @@ fn gguf_resolves_through_load_for_model_and_probe_is_weightless() {
         .tensor_data_offset as usize;
     let mut bytes = std::fs::read(&gguf).expect("read gguf");
     bytes.truncate(header_len);
-    let dir = std::env::temp_dir().join(format!("candle-llm-gguf-trunc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let trunc = dir.join("header-only.gguf");
-    std::fs::write(&trunc, &bytes).unwrap();
+    let fixture = Fixture::new("candle-llm-gguf-trunc-", Some("header-only.gguf"));
+    let trunc = &*fixture;
+    std::fs::write(trunc, &bytes).unwrap();
     let tspec = LoadSpec::dense(trunc.to_str().unwrap().to_string());
     assert!(
         candle_llm::provider::can_load(&tspec),
         "header-only (tensor-data-truncated) GGUF must still resolve — the probe is weightless"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

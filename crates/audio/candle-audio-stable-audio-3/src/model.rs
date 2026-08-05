@@ -2962,18 +2962,16 @@ mod tests {
 
     #[test]
     fn pinned_file_authentication_rejects_size_and_payload_drift() {
-        // `ThreadId`, not `Thread::name()`: under libtest the thread name *is* the test path
-        // (`model::tests::pinned_file_authentication_rejects_size_and_payload_drift`), and `:` is
-        // an illegal character in a Windows path component, so `create_dir_all` returned
-        // `InvalidFilename` (os error 123) on the Windows CUDA runner the moment this crate's unit
-        // tests were first run there. `weights.rs` already uses the id for the same reason.
-        let root = std::env::temp_dir().join(format!(
-            "sa3-provider-pin-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        // sc-17755: a `TempDir` guard. The old `(pid, ThreadId)` path was unique per test *thread*,
+        // not per call, and the `remove_dir_all` prelude only made it idempotent within one process —
+        // so every new PID left another tree behind. `TempDir` also sidesteps the `ThreadId` reason
+        // for that naming: its suffix is generated, so no illegal Windows path character (`:` from a
+        // libtest thread name) can reach `create_dir_all` in the first place.
+        let guard = tempfile::Builder::new()
+            .prefix("sa3-provider-pin-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = guard.path();
         let path = root.join("fixture");
         std::fs::write(&path, b"exact").unwrap();
         let exact = SnapshotFilePin {
@@ -2988,6 +2986,5 @@ mod tests {
         std::fs::write(&path, b"short").unwrap();
         let wrong_size = SnapshotFilePin { bytes: 4, ..exact };
         assert!(verify_file_pin(MODEL_ID, HUB_REPO, HUB_REVISION, &path, &wrong_size).is_err());
-        let _ = std::fs::remove_dir_all(root);
     }
 }

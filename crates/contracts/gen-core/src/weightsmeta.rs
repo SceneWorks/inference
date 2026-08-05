@@ -791,6 +791,36 @@ mod tests {
     use super::*;
     use safetensors::tensor::TensorView as StTensorView;
 
+    /// A fixture root that removes itself on `Drop` (sc-17755).
+    ///
+    /// These tests used to build `temp_dir().join(format!("{prefix}{pid}"))` by hand. That is
+    /// unique per *process*, not per call, and the trailing `remove_dir_all(...).ok()` lines were
+    /// skipped entirely by a panicking test — so every failing run, and every run whose PID was new,
+    /// left its tree behind (104 of them under `%TEMP%` on the CUDA box). `TempDir` removes the tree
+    /// on `Drop`, including during unwind. Bind it for the whole test: `fixture_dir(..).path()`
+    /// unbound is dropped at the end of the enclosing statement.
+    fn fixture_dir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("fixture temp dir")
+    }
+
+    /// Guards the sc-17755 fix: the fixture root, and anything written into it, leave with the
+    /// guard. Swap `fixture_dir` back for a bare `create_dir_all` on a `temp_dir()` join and this
+    /// goes RED — which is the whole reason the leak went unnoticed for so long.
+    #[test]
+    fn fixture_dir_is_removed_on_drop() {
+        let guard = fixture_dir("gencore_drop_guard_");
+        let root = guard.path().to_path_buf();
+        let file = root.join("w.safetensors");
+        std::fs::write(&file, b"bytes").unwrap();
+        assert!(file.is_file());
+        drop(guard);
+        assert!(!file.exists(), "fixture file survived: {}", file.display());
+        assert!(!root.exists(), "fixture root survived: {}", root.display());
+    }
+
     #[test]
     fn lokr_network_type_predicate() {
         assert!(is_lokr_network_type(Some("lokr")));
@@ -1036,8 +1066,8 @@ mod tests {
         let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
         let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
 
-        let dir = std::env::temp_dir().join(format!("gencore_meta_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = fixture_dir("gencore_meta_");
+        let dir = tmp.path();
         let path = dir.join("w.safetensors");
         std::fs::write(&path, &bytes).unwrap();
 
@@ -1048,17 +1078,13 @@ mod tests {
         assert_eq!(t.shape, &[2, 2]);
         assert_eq!(t.data, &data[..]);
         assert!(meta.tensor("missing").is_none());
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn header_only_reader_rejects_oversized_sparse_header_before_allocation() {
         const OVERSIZED_HEADER: u64 = 100_000_001;
-        let path = std::env::temp_dir().join(format!(
-            "gencore_oversized_header_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp = fixture_dir("gencore_oversized_header_");
+        let path = tmp.path().join("w.safetensors");
         std::fs::write(&path, OVERSIZED_HEADER.to_le_bytes()).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
@@ -1071,17 +1097,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("100000000-byte maximum"), "{error}");
-
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn header_only_reader_rejects_non_contiguous_or_unowned_payload_bytes() {
-        let root = std::env::temp_dir().join(format!(
-            "gencore_invalid_tensor_topology_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let tmp = fixture_dir("gencore_invalid_tensor_topology_");
+        let root = tmp.path();
         let write_raw = |name: &str, raw_header: &str, payload_bytes: usize| {
             let path = root.join(name);
             let mut header = raw_header.as_bytes().to_vec();
@@ -1145,8 +1166,8 @@ mod tests {
         let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
         let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
 
-        let dir = std::env::temp_dir().join(format!("gencore_appledouble_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = fixture_dir("gencore_appledouble_");
+        let dir = tmp.path();
         std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
         // A real AppleDouble header: magic 0x00051607, version 0x00020000. Its first 8 bytes decode
         // as a ~2.2 TB safetensors header length.
@@ -1156,17 +1177,15 @@ mod tests {
         )
         .unwrap();
         // Sanity: the sidecar really does sort first, so this test would fail without the skip.
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
+        let mut names: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         names.sort();
         assert_eq!(names[0], std::ffi::OsStr::new("._model.safetensors"));
 
-        let meta = CheckpointMeta::from_dir(&dir).expect("sidecar must be skipped, not loaded");
+        let meta = CheckpointMeta::from_dir(dir).expect("sidecar must be skipped, not loaded");
         assert_eq!(meta.keys().collect::<Vec<_>>(), vec!["blk.weight"]);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// sc-10894: `safetensors_dir_bytes` recurses, counts only `.safetensors`, and skips AppleDouble
@@ -1174,7 +1193,8 @@ mod tests {
     /// component's bytes stay comparable to the total.
     #[test]
     fn safetensors_dir_bytes_recurses_and_skips_sidecars_and_nonweights() {
-        let root = std::env::temp_dir().join(format!("gencore_dirbytes_{}", std::process::id()));
+        let tmp = fixture_dir("gencore_dirbytes_");
+        let root = tmp.path();
         let te = root.join("text_encoder");
         let dit = root.join("transformer");
         std::fs::create_dir_all(&te).unwrap();
@@ -1185,12 +1205,10 @@ mod tests {
         std::fs::write(te.join("._model.safetensors"), vec![0u8; 500]).unwrap();
         std::fs::write(dit.join("config.json"), vec![0u8; 700]).unwrap();
 
-        assert_eq!(safetensors_dir_bytes(&root), 3000);
+        assert_eq!(safetensors_dir_bytes(root), 3000);
         assert_eq!(safetensors_dir_bytes(root.join("transformer")), 2000);
         // Missing dir ⇒ 0 (no signal).
         assert_eq!(safetensors_dir_bytes(root.join("nope")), 0);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(unix)]
@@ -1198,8 +1216,8 @@ mod tests {
     fn safetensors_dir_bytes_skips_directory_symlink_cycles_but_follows_file_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let root =
-            std::env::temp_dir().join(format!("gencore_dirbytes_cycle_{}", std::process::id()));
+        let tmp = fixture_dir("gencore_dirbytes_cycle_");
+        let root = tmp.path();
         let blobs = root.join("blobs");
         let model = root.join("model");
         std::fs::create_dir_all(&blobs).unwrap();
@@ -1209,8 +1227,6 @@ mod tests {
         symlink(&root, model.join("cycle")).unwrap();
 
         assert_eq!(safetensors_dir_bytes(&root), 123);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// sc-10894: `safetensors_path_bytes` dispatches on kind — the recursive sum for a DIR, the file
@@ -1218,7 +1234,8 @@ mod tests {
     /// `0` for a non-weight file or a `._*` sidecar file.
     #[test]
     fn safetensors_path_bytes_handles_file_and_dir() {
-        let root = std::env::temp_dir().join(format!("gencore_pathbytes_{}", std::process::id()));
+        let tmp = fixture_dir("gencore_pathbytes_");
+        let root = tmp.path();
         let sub = root.join("vae");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("model.safetensors"), vec![0u8; 800]).unwrap();
@@ -1240,24 +1257,20 @@ mod tests {
         );
         assert_eq!(safetensors_path_bytes(root.join("config.json")), 0);
         assert_eq!(safetensors_path_bytes(root.join("missing.safetensors")), 0);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A dir holding *only* a sidecar has no shards — the error must say so rather than surfacing a
     /// corrupt-header failure from the sidecar.
     #[test]
     fn from_dir_with_only_a_sidecar_reports_no_shards() {
-        let dir = std::env::temp_dir().join(format!("gencore_only_sidecar_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = fixture_dir("gencore_only_sidecar_");
+        let dir = tmp.path();
         std::fs::write(dir.join("._model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
 
-        let err = match CheckpointMeta::from_dir(&dir) {
+        let err = match CheckpointMeta::from_dir(dir) {
             Ok(_) => panic!("a dir holding only a sidecar must not load"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("no .safetensors files"), "unexpected: {err}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
