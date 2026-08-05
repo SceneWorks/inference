@@ -22,6 +22,19 @@
 //! * Rejected candidates are recorded **with their numbers**, and every rejection is re-asserted
 //!   against the production path.
 //!
+//! ## Mutation proofs (SC-15520)
+//!
+//! Each rung's implementation was stubbed to its no-op path and the corresponding test confirmed to
+//! REDDEN, then reverted. A test that cannot fail is worthless, and byte-identity assertions in
+//! particular pass trivially with the feature off.
+//!
+//! | rung | stub | reddened |
+//! |---|---|---|
+//! | 1 | `rung_plan` ignores `memory.stage_residency`, falls back to the load-time default | `staged_residency_bounds_the_request_peak_and_preserves_output` |
+//! | 2 | the production refusal of the withheld rung removed | `the_withheld_rungs_are_refused_by_the_production_path` |
+//! | 3 | the `sdpa` kernel discards the plan and always calls `AttentionPlan::UNBOUNDED` | `attention_chunking_is_measured_at_the_dit_seam` |
+//! | 4 | `finalize_block_stream` and `block_window` stubbed to no-ops — rung 4 declared and not executed | `transformer_window_sweep_and_streamed_output_identity` |
+//!
 //! ## Weights
 //!
 //! One env var per catalog entry, each pointing at that entry's snapshot **root** (the tier is a

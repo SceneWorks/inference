@@ -71,7 +71,7 @@ use crate::config::{ChromaTransformerConfig, ChromaVariant};
 const STATIC_CALIBRATION: &str = "chroma1-mlx-registry-behavior-v1";
 
 /// The production calibration key. Bound to the measured entry/tier/geometry in
-/// [`production_calibration_fingerprint`]; every other axis fails closed.
+/// `production_calibration_fingerprint`; every other axis fails closed.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "chroma1-base-q4-mlx-shared-ladder-2026-08-05-v1";
 
 // ── Rung 2: the native VAE decode geometry ───────────────────────────────────────────────────────
@@ -169,14 +169,13 @@ pub const WINDOW_SUPPORT: bool = true;
 ///
 /// What is deliberately *not* published is an ordering. Sibling providers publish their cadences as
 /// a time/memory trade — SDXL measured 3654 → 1318 ms/step widening 1 → 10 — and this family's
-/// ms/step column looks like the opposite of that until [`probe_order`] is applied, at which point
-/// it stops looking like anything: cadence 10 is the slowest row in execution order `1,2,5,10` and
+/// ms/step column looks like the opposite of that until the order probe is applied, at which point
+/// it stops looking like anything (`probe_order` in the ladder harness): cadence 10 is the slowest
+/// row in execution order `1,2,5,10` and
 /// the *fastest* in order `2,10,1,5`. The wall clock is tracking the row's position, not its
 /// cadence, so no latency ordering across these cadences is publishable in either direction
 /// (SC-17679). [`TRANSFORMER_WINDOW_SIZE`]'s default therefore rests on being the tightest weight
 /// bound — what the rung exists for — and not on a latency argument.
-///
-/// [`probe_order`]: ../../tests/memory_ladder_real_weights.rs
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// The default cadence inside [`TRANSFORMER_WINDOW_SIZES`] — the tightest weight bound.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;

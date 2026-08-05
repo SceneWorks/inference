@@ -19,8 +19,10 @@
 //! tensor**: the handles exist, the bytes do not, until something is evaluated. Re-opening
 //! `transformer/` once per window costs a header parse, not 5.18 GB. Only the tensors a window's
 //! blocks actually read are materialized, and [`Weights::remove_accessed`] then drops the view's own
-//! reference to exactly those — which is what turns the window's drop into a real release rather
-//! than a no-op that still produces correct images.
+//! reference to exactly those. On this family that drain is measured **inert** on the request peak
+//! (see [`ChromaBlockStream::materialize_double`]) — a fresh view is opened per window, so its
+//! references die at the window boundary regardless — and it is kept as the shared discipline rather
+//! than claimed as load-bearing on a sibling's evidence.
 //!
 //! ## What rung 4 does NOT bound here
 //!
@@ -205,9 +207,15 @@ impl ChromaBlockStream {
                 "chroma block stream: materialize double block {index}: {error}"
             ))
         })?;
-        // LOAD-BEARING (SC-15750): the view keeps its own refcounted handle to every tensor the
-        // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
-        // real release rather than a no-op that still produces correct images.
+        // The shared drain (SC-15750): the view keeps its own refcounted handle to every tensor the
+        // constructor cloned, so draining exactly the accessed keys is what lets the window's drop
+        // release them. **Measured on this family it does not move the request peak** — removing
+        // both calls leaves the sweep at 14.6932 GiB — because `run_windowed` opens a *fresh* view
+        // per window here, so the view's own references die with it at the window boundary anyway,
+        // and because the request peak is set by the decode phase rather than by the window. It
+        // stays because it is the shared contract's discipline and because it is what makes the
+        // bound hold at a configuration where the window IS the binding term; it is recorded as
+        // measured-inert here rather than claimed load-bearing on inheritance.
         view.remove_accessed();
         self.replay(
             &self.double[index],
