@@ -26,7 +26,7 @@
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — ChatGLM3-6B + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop ChatGLM3-6B** → load heavy → denoise + decode |
 //! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%) and clears the drift bar at 1024²/1280², but fails it at 1536²/2048² and `decode_tile_edges` has no geometry axis |
-//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the request peak 0.00% (and **+12.54%** at the U-Net seam), and is not bit-exact on its query-row axis |
+//! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** — the request and the U-Net seam — and is not bit-exact on its query-row axis |
 //! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
 
 //!
@@ -198,7 +198,7 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// It is not published for two reasons, either of which is sufficient. Both are measured on the q4
 /// tier at 1024², and each has its own test because they are measured at different scopes:
 ///
-/// 1. **It does not move the REQUEST peak**, and at the seam it moves it the wrong way. End to end
+/// 1. **It does not move the peak, at either scope.** End to end
 ///    (`attention_chunking_is_measured_against_the_rung_two_top`, which re-assembles the staged
 ///    request from the public entry points because the production resolver refuses a
 ///    bounded-attention selection):
@@ -210,18 +210,31 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 ///
 ///    Measured instead at the U-Net seam, where the effect is not diluted by the rest of the request
 ///    (`attention_chunking_is_measured_at_the_unet_seam`), one CFG-batched 1024² forward goes
-///    **4.7672 → 5.3651 GiB, +12.54%**: chunking *adds* transients here rather than bounding
-///    anything. That is the hazard `mlx_gen::attention`'s own docs name — when q/k/v are already
-///    materialized and pinned, chunking only adds — and on a U-Net it is the normal case, because
-///    the conv/resnet trunk between every attention has already broken the lazy graph that
-///    `eval_per_chunk` exists to cut. The epic is explicit that a rung which does not move the
-///    request peak is not a saving; one that raises it is worse than absent.
+///    **5.3652 → 5.3652 GiB, +0.00%** — the two plans peak identically to the millibyte, reproduced
+///    across three runs. So the budget is not merely diluted at the request level: there is **no
+///    scope on this family at which the query-row budget changes the high-water mark**, which is a
+///    cleaner statement of the withholding reason than a diluted one would have been.
+///
+///    That is consistent with the hazard `mlx_gen::attention`'s own docs name — when q/k/v are
+///    already materialized and pinned, a query-row budget has nothing left to bound — and on a U-Net
+///    that is the normal case, because the conv/resnet trunk between every attention has already
+///    broken the lazy graph `eval_per_chunk` exists to cut. The epic is explicit that a rung which
+///    does not move the peak is not a saving.
 ///
 ///    **Kolors was the more promising candidate of the two U-Nets and still failed.** Its
 ///    cross-attention memory is the ChatGLM3 context — 256 tokens against SDXL's 77 — so the
 ///    cross-attention score tensors are 3.3× larger here, which is exactly where a query-row budget
-///    would be most likely to pay. It does not: the seam regression is *worse* than SDXL's (+12.54%
-///    against +5.1%), because the added per-chunk transients scale with the same axis.
+///    would be most likely to pay. It does not: the seam is flat at the 3.3×-larger key axis too.
+///
+///    **Correction (sc-15521 review).** An earlier revision of this file published the seam as
+///    **4.7672 → 5.3651 GiB, +12.54%** and argued from it that chunking *adds* transients here and
+///    that the regression was "worse than SDXL's +5.1%". Both statements were wrong and the number
+///    was an artifact: `attention_chunking_is_measured_at_the_unet_seam` was the only
+///    peak-publishing test in the harness with no discarded warm-up row, and MLX's first `run` in a
+///    process reads ~4.6–4.8 GiB *whichever plan it executes*. With the warm-up in place the pair
+///    reads 5.3652 → 5.3652. Nothing about the `Missing` verdict changes — the end-to-end row was
+///    always warmed and the bit-exactness reason (2) is independent — but the "chunking adds
+///    transients" narrative it supported is withdrawn.
 /// 2. **The output moves — and that is a property of the CHOSEN AXIS, not of Kolors.** The
 ///    arithmetic is exactly preserved: [`sdpa_budgeted_bhsd`](mlx_gen::attention::sdpa_budgeted_bhsd)
 ///    chunks the **query axis only**, so each chunk is a complete fused SDPA over the full k/v with
@@ -793,9 +806,9 @@ pub(crate) fn safety_check(
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
             return Err(CoreError::Unsupported(format!(
                 "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the request peak 0.00% here (and +12.54% at the U-Net seam), and \
-                 the query-row chunking axis is not bit-exact on Metal, which an fp16 \
-                 chaos-sensitive schedule amplifies to a different image — see \
+                 Missing): it moves the peak 0.00% at both measured scopes (the request and the \
+                 U-Net seam), and the query-row chunking axis is not bit-exact on Metal, which an \
+                 fp16 chaos-sensitive schedule amplifies to a different image — see \
                  memory_strategy::ATTENTION_SUPPORT",
                 contract.provider_id
             )));
@@ -1040,9 +1053,10 @@ pub(crate) fn attention_plan(
     if req.memory.is_some_and(|memory| memory.chunk_attention) {
         return Err(mlx_gen::Error::Unsupported(
             "kolors: bounded attention is not selectable on this provider (rung 3 is declared \
-             Missing): it moves the request peak 0.00% here (and +12.54% at the U-Net seam), and the \
-             query-row chunking axis is not bit-exact on Metal, which an fp16 chaos-sensitive \
-             schedule amplifies to a different image — see memory_strategy::ATTENTION_SUPPORT"
+             Missing): it moves the peak 0.00% at both measured scopes (the request and the U-Net \
+             seam), and the query-row chunking axis is not bit-exact on Metal, which an fp16 \
+             chaos-sensitive schedule amplifies to a different image — see \
+             memory_strategy::ATTENTION_SUPPORT"
                 .to_owned(),
         ));
     }

@@ -16,6 +16,13 @@
 //!   trunk and every later row then reads a peak that includes work it did not do. The
 //!   `#[track_caller]` helper below is the only way a row is produced.
 //! * **`reset_peak_memory` after the load**, so a row measures the *request*, not the load.
+//! * **A discarded warm-up row ahead of every published peak** ([`warm_up`]). MLX's first
+//!   measurement in a process reads against a cold allocator and comes in low, and the bias is
+//!   large enough to look like a finding: it manufactured a 4.9% phantom cadence spread in one test
+//!   and a 12.54% phantom "seam regression" in another. Both were published before they were
+//!   caught. Every test in this file that publishes a peak now discards a row first —
+//!   [`attention_chunking_is_measured_at_the_unet_seam`] drives the U-Net seam directly rather than
+//!   through [`measure`], so it carries its own inline warm-up instead of calling [`warm_up`].
 //! * Rejected candidates are recorded **with their numbers**, and the rejection is re-asserted
 //!   against the production path — not left in a doc comment.
 //!
@@ -869,26 +876,60 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
         (peak, v)
     };
 
-    let (unbounded_peak, unbounded) = run(mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED);
-    let (bounded_peak, bounded) = run(mlx_gen_sdxl::SdxlForwardPlan::with_attention(
-        mlx_gen::attention::AttentionPlan::budgeted(
+    let bounded_plan = || {
+        mlx_gen_sdxl::SdxlForwardPlan::with_attention(mlx_gen::attention::AttentionPlan::budgeted(
             mlx_gen::attention::AttentionBudget::CONSTRAINED,
-        ),
-    ));
+        ))
+    };
+
+    // **The discarded warm-up row, and it is the difference between a number and an artifact.**
+    //
+    // This test drives the seam directly rather than through [`measure`], so it does not go through
+    // [`warm_up`] — and for one revision it therefore had no warm-up at all, which made it the only
+    // peak-publishing test in this file without one. The consequence was not subtle: the FIRST `run`
+    // in this process reads **~4.6–4.8 GiB whichever plan it executes** (it is also the only row
+    // here that does NOT reproduce run to run — measured 4.6104 / 4.6104 / 4.6600), against a
+    // rock-steady **5.3652** for either plan once the allocator is warm. Measuring
+    // unbounded-then-bounded cold therefore produced a **+12.54%** "seam regression" that was
+    // entirely the cold-allocator bias — the two plans read the SAME peak when both are warm. That
+    // fabricated figure reached `ATTENTION_SUPPORT`, two user-facing refusal strings and the
+    // Shortcut record before it was caught.
+    //
+    // The warm-up runs the BOUNDED plan on purpose: it is the plan with the larger allocation set
+    // (the per-chunk transients), so a discarded bounded row leaves the allocator warm for both
+    // published rows rather than only for the one whose shape it happened to match.
+    let (warm_up_peak, _) = run(bounded_plan());
+
+    let (unbounded_peak, unbounded) = run(mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED);
+    let (bounded_peak, bounded) = run(bounded_plan());
     let max_abs = unbounded
         .iter()
         .zip(&bounded)
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
+    let delta_pct = 100.0 * (bounded_peak - unbounded_peak) / unbounded_peak;
     println!(
-        "[sc-15521 rung3 unet-seam {DEFAULT_TIER} 1024² CFG] unbounded {unbounded_peak:.4} GiB -> \
-         bounded {bounded_peak:.4} GiB ({:+.2}%)  max|Δeps| {max_abs:.3e}",
-        100.0 * (bounded_peak - unbounded_peak) / unbounded_peak
+        "[sc-15521 rung3 unet-seam {DEFAULT_TIER} 1024² CFG] discarded warm-up {warm_up_peak:.4} \
+         GiB; unbounded {unbounded_peak:.4} GiB -> bounded {bounded_peak:.4} GiB \
+         ({delta_pct:+.2}%)  max|Δeps| {max_abs:.3e}"
     );
+    // **Asserted in BOTH directions, at 1%.** The measured movement is 0.00% — the two plans read
+    // the same peak to the millibyte once the allocator is warm — so a one-sided 3% floor (which is
+    // what this test carried while it was measuring the cold-allocator artifact) could not tell a
+    // real seam change from no change at all: it passed on the fabricated +12.54% and would pass on
+    // a genuine +2.9% regression too.
+    //
+    // Either direction is a publishable change and both must redden here:
+    //   * BELOW  — chunking has started bounding the seam, and rung 3's first `Missing` reason
+    //              ("the mechanism does not bound this family") no longer holds;
+    //   * ABOVE  — chunking has started ADDING transients, which is a *new* finding and not the one
+    //              `ATTENTION_SUPPORT` currently records (it records no movement at all).
     assert!(
-        bounded_peak > unbounded_peak * 0.97,
-        "bounded attention now bounds something on this family ({bounded_peak:.4} vs \
-         {unbounded_peak:.4} GiB) — re-open memory_strategy::ATTENTION_SUPPORT"
+        delta_pct.abs() < 1.0,
+        "bounded attention moved the U-Net seam peak by {delta_pct:+.2}% ({bounded_peak:.4} vs \
+         {unbounded_peak:.4} GiB). memory_strategy::ATTENTION_SUPPORT records that the two plans \
+         peak IDENTICALLY at this seam — re-measure and re-publish it rather than widening this \
+         margin"
     );
 }
 
