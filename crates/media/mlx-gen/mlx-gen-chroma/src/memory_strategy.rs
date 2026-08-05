@@ -89,17 +89,35 @@ pub const WINDOW_SUPPORT: bool = true;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 /// The default cadence inside [`TRANSFORMER_WINDOW_SIZES`].
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
-/// The **measured** component scope. See the module header: this is not a `Dit`-by-inheritance
-/// choice, it is what `transformer_window_component_scopes_are_measured_not_inherited` decided.
-pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
-/// The component scopes this provider will admit.
-pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[TransformerComponent::Dit];
+/// The **measured** default component scope, and the one a request that names none receives.
+///
+/// This is not a `Dit`-by-inheritance choice. Measured on Chroma1-Base q4 at 1024² (Apple/Metal,
+/// `the_request_peak_bearing_phase_is_measured_not_assumed`), the phases are conditioning 10.15 GiB
+/// / denoise 7.14 GiB / decode 14.14 GiB untiled — and rung 4's own composition engages rung 2, so
+/// its decode is already bounded to 4.37 GiB and **conditioning binds**. A `Dit`-scoped window
+/// bounds the 7.14 GiB denoise, which is below the binding phase, and therefore moves the request
+/// peak by nothing. `TextEncoder` is the scope that addresses the binding phase; Kolors reached the
+/// same conclusion first, for the same reason and a different encoder (SC-15521).
+pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::TextEncoder;
+/// The component scopes this provider will admit. All three are implemented; the harness measures
+/// each and `the_window_component_scopes_are_measured_not_inherited` pins what each one buys.
+/// [`TRANSFORMER_WINDOW_COMPONENT`] leads the list: the shared behavior fixture takes the first
+/// published candidate as its representative, so a domain whose head is not the default would have
+/// the conformance walk exercising a scope no unqualified request receives.
+pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
+    TransformerComponent::TextEncoder,
+    TransformerComponent::Dit,
+    TransformerComponent::Both,
+];
 
-/// The DiT depth the shared request scope validates window alignment against: the **longer** of the
-/// two sub-stacks, since each is windowed independently over the same cadence.
+/// The depth the shared request scope validates window alignment against: the **longest** windowable
+/// sub-stack across every admitted component scope, since each stack is windowed independently over
+/// the same cadence. Chroma's are 19 double + 38 single DiT blocks and 24 T5 encoder blocks.
 pub(crate) fn window_stack_depth() -> usize {
     let cfg = ChromaTransformerConfig::default();
-    cfg.num_layers.max(cfg.num_single_layers)
+    cfg.num_layers
+        .max(cfg.num_single_layers)
+        .max(mlx_gen_flux::T5_BLOCKS)
 }
 
 /// The native VAE decode ladder, declared through the checked shared constructor so it can never
@@ -178,7 +196,7 @@ fn route_mode_and_references(spec: &LoadSpec) -> (MemoryMode, u32) {
 /// [`MemoryWindowMaterialization::DeviceFormatTransfer`](mlx_gen::gen_core::MemoryWindowMaterialization)
 /// declares. A shipped packed tier loads with `quantize == None` (the loader packed-detects
 /// `{base}.scales`), so the production Q4/Q8 route is admitted and only the re-quantizing one is not.
-pub(crate) fn structurally_streamable(spec: &LoadSpec) -> bool {
+pub fn structurally_streamable(spec: &LoadSpec) -> bool {
     WINDOW_SUPPORT
         && spec.offload_policy == OffloadPolicy::Sequential
         && spec.load_shape == LoadShape::DeferredMaterialization
@@ -977,26 +995,29 @@ mod tests {
             ..Default::default()
         };
         assert!(transformer_window(&unstaged, crate::CHROMA1_BASE_ID).is_err());
-        // An out-of-domain cadence and an unimplemented component scope are both refused.
-        for memory in [
-            GenerationMemory {
+        // An out-of-domain cadence is refused on the production path.
+        let out_of_domain = GenerationRequest {
+            memory: Some(GenerationMemory {
                 transformer_window_size: Some(3),
                 ..windowed.memory.unwrap()
-            },
-            GenerationMemory {
-                transformer_window_component: Some(TransformerComponent::Both),
-                ..windowed.memory.unwrap()
-            },
-            GenerationMemory {
-                transformer_window_component: Some(TransformerComponent::TextEncoder),
-                ..windowed.memory.unwrap()
-            },
-        ] {
+            }),
+            ..Default::default()
+        };
+        assert!(transformer_window(&out_of_domain, crate::CHROMA1_BASE_ID).is_err());
+        // Every published scope is reachable, and each resolves to the same cadence.
+        for component in TRANSFORMER_WINDOW_COMPONENTS {
             let req = GenerationRequest {
-                memory: Some(memory),
+                memory: Some(GenerationMemory {
+                    transformer_window_component: Some(*component),
+                    ..windowed.memory.unwrap()
+                }),
                 ..Default::default()
             };
-            assert!(transformer_window(&req, crate::CHROMA1_BASE_ID).is_err());
+            assert_eq!(
+                transformer_window(&req, crate::CHROMA1_BASE_ID).unwrap(),
+                Some(TRANSFORMER_WINDOW_SIZE as usize),
+                "published scope {component:?} must be reachable"
+            );
         }
     }
 
@@ -1038,5 +1059,6 @@ mod tests {
         let cfg = ChromaTransformerConfig::default();
         assert_eq!(window_stack_depth(), cfg.num_single_layers);
         assert!(window_stack_depth() >= cfg.num_layers);
+        assert!(window_stack_depth() >= mlx_gen_flux::T5_BLOCKS);
     }
 }

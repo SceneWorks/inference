@@ -34,7 +34,6 @@ use std::path::Path;
 
 use crate::config::{ChromaTransformerConfig, ChromaVariant, DEFAULT_SAMPLER, HEUN_SAMPLER};
 use crate::loader;
-use crate::text::encode_prompt;
 use crate::transformer::{ChromaTransformer, RopeTable};
 
 pub fn descriptor_hd() -> ModelDescriptor {
@@ -81,13 +80,55 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     }
     let memory_strategy = crate::memory_strategy::contract_for(variant.id(), spec)
         .map_err(|error| Error::Msg(error.to_string()))?;
+    let armed_scope = ArmedScope::new();
     Ok(Chroma {
         descriptor: variant.descriptor(),
         variant,
-        residency: build_residency(variant, spec)?,
+        residency: build_residency(variant, spec, &armed_scope)?,
+        armed_scope,
         loaded_spec: spec.clone(),
         memory_strategy,
     })
+}
+
+/// The rung-4 component scope the next staged load should arm, as an atomic the residency's loader
+/// closures read.
+///
+/// A side channel by necessity — the shared residency hands its loaders one `streamable: bool` and
+/// has no scope axis — and a **safe** one because of a coupling this provider enforces: rung 4
+/// declares `StagedResidency` as an `EngagedInSameRequest` prerequisite, and
+/// [`crate::memory_strategy::transformer_window`] refuses a windowed request that is not staged. A
+/// staged request always evicts the warm pair and re-runs both loaders, so the value is read in the
+/// same request that wrote it and a scope change can never be served by a stale warm pair.
+/// `rung_four_scope_is_read_by_the_loaders_of_the_same_request` pins that coupling.
+#[derive(Clone)]
+pub(crate) struct ArmedScope(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl ArmedScope {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+
+    fn set(&self, component: Option<mlx_gen::gen_core::TransformerComponent>) {
+        use mlx_gen::gen_core::TransformerComponent as C;
+        let code = match component {
+            None => 0,
+            Some(C::Dit) => 1,
+            Some(C::TextEncoder) => 2,
+            Some(C::Both) => 3,
+        };
+        self.0.store(code, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn get(&self) -> Option<mlx_gen::gen_core::TransformerComponent> {
+        use mlx_gen::gen_core::TransformerComponent as C;
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => Some(C::Dit),
+            2 => Some(C::TextEncoder),
+            3 => Some(C::Both),
+            _ => None,
+        }
+    }
 }
 
 /// The policy→[`Residency`] dispatch every Chroma variant shares (sc-10840), routed through one
@@ -108,13 +149,28 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
 pub(crate) fn build_residency(
     variant: ChromaVariant,
     spec: &LoadSpec,
+    scope: &ArmedScope,
 ) -> Result<Residency<ChromaTextOwned, ChromaHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
+    let scope_text = scope.clone();
+    let scope_heavy = scope.clone();
     Residency::request_scoped_from_policy(
         spec.offload_policy,
-        move |_streamable| load_text_only(variant, &spec_text),
-        move |use_pid, streamable| load_heavy(variant, &spec_heavy, use_pid, streamable),
+        move |streamable| {
+            let arm = streamable
+                && scope_text
+                    .get()
+                    .is_some_and(|component| component.includes_text_encoder());
+            load_text_only(variant, &spec_text, arm)
+        },
+        move |use_pid, streamable| {
+            let arm = streamable
+                && scope_heavy
+                    .get()
+                    .is_some_and(|component| component.includes_dit());
+            load_heavy(variant, &spec_heavy, use_pid, arm)
+        },
     )
 }
 
@@ -141,11 +197,27 @@ fn resolve_root(variant: ChromaVariant, spec: &LoadSpec) -> Result<&Path> {
 /// Load the (bundled) tokenizer + the T5-XXL text encoder — the phase-A components dropped first under
 /// `Sequential`. The tokenizer is small and rides along so a `Sequential` generate re-loads the two
 /// together. Factored so the `Resident` and `Sequential` paths build byte-identical encoders.
-fn load_text_only(variant: ChromaVariant, spec: &LoadSpec) -> Result<ChromaTextOwned> {
+fn load_text_only(
+    variant: ChromaVariant,
+    spec: &LoadSpec,
+    streamable: bool,
+) -> Result<ChromaTextOwned> {
     let root = resolve_root(variant, spec)?;
     let mut t5 = loader::load_t5_encoder(root)?;
     if let Some(q) = spec.quantize {
         loader::quantize_t5_for_dense_source(&mut t5, q.bits())?;
+    }
+    // Rung 4, TextEncoder scope (SC-15520): arm the reopenable encoder stream LAST — after any
+    // load-time quantization — then evict the resident 24-block stack. The token embedding and the
+    // final layer norm stay resident; they are not block weights.
+    if streamable {
+        if !crate::memory_strategy::structurally_streamable(spec) {
+            return Err(Error::Unsupported(format!(
+                "{}: this load cannot stream its text-encoder blocks",
+                variant.id()
+            )));
+        }
+        t5 = t5.with_block_stream(loader::t5_block_stream(root)?)?;
     }
     Ok(ChromaTextOwned {
         tokenizer: loader::load_tokenizer()?,
@@ -268,6 +340,8 @@ pub struct Chroma {
     /// production lifecycle authority, so a cached generator may hold a warm pair for one request,
     /// stage the next, and rebuild the warm pair afterwards.
     residency: Residency<ChromaTextOwned, ChromaHeavyOwned>,
+    /// The rung-4 component scope the next staged load arms — see [`ArmedScope`].
+    armed_scope: ArmedScope,
     /// The spec this generator was loaded from — the memory-strategy contract, its safety check and
     /// its request scope are all functions of it (SC-15520).
     loaded_spec: LoadSpec,
@@ -286,6 +360,26 @@ struct RungPlan {
     streamable: bool,
     /// Rung 4's window size in blocks, already validated against the published domain.
     transformer_window: Option<usize>,
+    /// Rung 4's component scope, already validated against the published domain.
+    window_component: Option<mlx_gen::gen_core::TransformerComponent>,
+}
+
+impl RungPlan {
+    /// The DiT window for this request — `None` unless rung 4 is selected at a DiT-inclusive scope.
+    fn dit_window(&self) -> Option<usize> {
+        self.window_component
+            .is_some_and(|component| component.includes_dit())
+            .then_some(self.transformer_window)
+            .flatten()
+    }
+
+    /// The T5 encoder window for this request.
+    fn text_encoder_window(&self) -> Option<usize> {
+        self.window_component
+            .is_some_and(|component| component.includes_text_encoder())
+            .then_some(self.transformer_window)
+            .flatten()
+    }
 }
 
 /// PiD backbone (latent-space) tag for Chroma (epic 7840, sc-7846). Chroma is a FLUX.1-schnell
@@ -476,7 +570,7 @@ impl Chroma {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         self.with_parts(|tok, t5, tr, _| {
-            let encoded = encode_cfg(tok, t5, prompt, negative, guidance)?;
+            let encoded = encode_cfg(tok, t5, prompt, negative, guidance, None, cancel)?;
             self.denoise_prepared(
                 tr,
                 &encoded,
@@ -769,10 +863,15 @@ fn encode_cfg(
     prompt: &str,
     negative: &str,
     guidance: f32,
+    window: Option<usize>,
+    cancel: &CancelFlag,
 ) -> Result<ChromaEncoded> {
-    let (pos_embeds, pos_mask) = encode_prompt(tok, t5, prompt)?;
+    let (pos_embeds, pos_mask) =
+        crate::text::encode_prompt_windowed(tok, t5, prompt, window, cancel)?;
     let neg = if guidance > 1.0 {
-        Some(encode_prompt(tok, t5, negative)?)
+        Some(crate::text::encode_prompt_windowed(
+            tok, t5, negative, window, cancel,
+        )?)
     } else {
         None
     };
@@ -893,9 +992,15 @@ impl Chroma {
             on_progress,
             // ── Phase A: prompt → T5 conditioning (pos + optional neg).
             |text: &ChromaTextOwned| {
-                let encoded =
-                    encode_cfg(&text.tokenizer, &text.t5, &req.prompt, &negative, guidance)?;
-                Ok(encoded)
+                encode_cfg(
+                    &text.tokenizer,
+                    &text.t5,
+                    &req.prompt,
+                    &negative,
+                    guidance,
+                    plan.text_encoder_window(),
+                    &req.cancel,
+                )
             },
             // Materialize the embeds while the T5 is still alive (Sequential only) — MLX is lazy, so an
             // un-evaluated embed keeps the encoder referenced through the graph and the drop would free
@@ -962,7 +1067,7 @@ impl Chroma {
                         seed,
                         &req.cancel,
                         attention,
-                        plan.transformer_window,
+                        plan.dit_window(),
                         on_progress,
                     )?;
                     // SC-15449: the denoise phase has physically completed for this image.
@@ -1002,6 +1107,7 @@ impl Chroma {
         crate::memory_strategy::validate_attention_chunk(req, self.descriptor.id)?;
         let Some(memory) = req.memory else {
             // No selection: fall back to the load-time policy default, exactly as before SC-15520.
+            self.armed_scope.set(None);
             return Ok(RungPlan {
                 stage_residency: self.residency.is_sequential(),
                 ..Default::default()
@@ -1009,6 +1115,11 @@ impl Chroma {
         };
         let transformer_window =
             crate::memory_strategy::transformer_window(req, self.descriptor.id)?;
+        let window_component = transformer_window.is_some().then(|| {
+            memory
+                .transformer_window_component
+                .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_COMPONENT)
+        });
         if transformer_window.is_some()
             && !crate::memory_strategy::structurally_streamable(&self.loaded_spec)
         {
@@ -1031,10 +1142,16 @@ impl Chroma {
                 self.descriptor.id
             )));
         }
+        // Arm the scope the staged loaders will read. Safe because rung 4 requires rung 1 in the
+        // same request (checked above, in `transformer_window`), and a staged request always evicts
+        // the warm pair and re-runs both loaders — so this value is consumed by the same request
+        // that wrote it.
+        self.armed_scope.set(window_component);
         Ok(RungPlan {
             stage_residency: memory.stage_residency,
             streamable: transformer_window.is_some(),
             transformer_window,
+            window_component,
         })
     }
 }
@@ -1119,6 +1236,7 @@ mod tests {
                 || Err(Error::Msg("weightless: text encoder not loadable".into())),
                 |_use_pid| Err(Error::Msg("weightless: heavy bundle not loadable".into())),
             ),
+            armed_scope: ArmedScope::new(),
             memory_strategy: crate::memory_strategy::weights_free_contract(variant.id(), &spec)
                 .expect("weights-free contract"),
             loaded_spec: spec,
@@ -1192,6 +1310,7 @@ mod tests {
         let res = build_residency(
             ChromaVariant::Hd,
             &missing_snapshot_spec(OffloadPolicy::Sequential),
+            &ArmedScope::new(),
         )
         .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
@@ -1205,6 +1324,7 @@ mod tests {
         let err = build_residency(
             ChromaVariant::Hd,
             &missing_snapshot_spec(OffloadPolicy::Resident),
+            &ArmedScope::new(),
         )
         .err()
         .expect("Resident must eager-load and fail on a missing snapshot dir");
