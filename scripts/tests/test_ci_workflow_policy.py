@@ -1752,6 +1752,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ("push", "", True, True),
             ("workflow_dispatch", "", True, True),
             ("push", "", False, False),
+            # A merge group builds a `gh-readonly-queue/main/**` ref in this repository from heads
+            # that already passed the fork guard as PRs, so it is trusted exactly like a push. If
+            # this case ever flips to False the CUDA lane stops gating the merge queue while still
+            # looking green, which is the failure this whole boundary exists to prevent.
+            ("merge_group", "", True, True),
+            ("merge_group", "", False, False),
         )
         for event, head_repository, selected, expected in cases:
             with self.subTest(event=event, head_repository=head_repository, selected=selected):
@@ -1764,6 +1770,57 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
+        triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
+        self.assertIn(
+            "merge_group",
+            triggers,
+            "without a merge_group trigger no run is created for the queue's speculative ref, "
+            "so required checks stay pending and every queued PR is evicted on timeout",
+        )
+
+    def test_every_base_sha_resolves_on_a_merge_group_event(self) -> None:
+        # merge_group carries neither `pull_request.base.sha` nor `before`. An empty base is not
+        # uniformly loud: select_lanes.py hard-errors, but check-review-findings.py drops its
+        # append-only comparison and still exits 0. Assert on every BASE_SHA in the file so a new
+        # consumer cannot be added with the two-element chain.
+        assignments = [
+            line.strip()
+            for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("BASE_SHA:")
+        ]
+        self.assertTrue(assignments, "expected at least one BASE_SHA assignment in the workflow")
+        for assignment in assignments:
+            with self.subTest(assignment=assignment):
+                self.assertIn("github.event.merge_group.base_sha", assignment)
+
+    def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        gate = jobs["gate"]
+
+        # `if: always()` is the load-bearing half. The default `success()` would skip the gate
+        # precisely when an upstream lane failed, and a skipped job satisfies a required status
+        # check -- so the gate would report green on exactly the runs it exists to block.
+        self.assertEqual(gate["if"], "always()")
+
+        ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))
+        self.assertEqual(
+            ungated,
+            [],
+            f"jobs missing from the CI gate's needs, so nothing enforces them: {ungated}",
+        )
+
+    def test_gate_distinguishes_a_path_skip_from_a_failed_dependency(self) -> None:
+        # Both arrive as "the job did not run", but only one is benign: a lane skipped by its `if:`
+        # is a real path-based no-op, while a lane skipped because `needs: changes` failed means the
+        # verdict is unknown. The gate must accept `skipped` (or docs-only PRs deadlock) and reject
+        # everything else (or a failed `changes` reads green through its skipped dependents).
+        step = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["gate"]["steps"][0]
+        self.assertIn("success|skipped)", step["run"])
+        self.assertIn("exit 1", step["run"])
+        self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
 
 
 if __name__ == "__main__":
