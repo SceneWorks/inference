@@ -2610,14 +2610,21 @@ fn eviction_rolls(latent_frames: usize, frames_per_block: usize, window: i64) ->
 /// default `7`) selects seeds. Each (row, seed) prints one `S18CELL` TSV line, so a long sweep can be
 /// run in pieces and re-aggregated without holding a five-hour process open.
 ///
-/// ⚠️ **Geometry — the global reference has to fit in memory.** Row E runs the checkpoint's *global*
+/// ⚠️ **Geometry — the global reference is the expensive row.** Row E runs the checkpoint's *global*
 /// window, whose KV is `latent_frames × frame_seq_length` tokens at ≈546 KB/token. At the 832×480
-/// reference bucket a 45-latent-frame clip is 70,200 tokens ≈ 38 GiB of KV before activations, and this
-/// 128 GiB host **SIGKILLs** it (measured, sc-15127: jetsam at step 39/75) — which is exactly the
-/// ~27 GB-of-KV problem [`mac_ar_config`](mlx_gen_krea_realtime::mac_ar_config) exists to dodge, so it
-/// is a finding rather than a harness bug. Run row E only at a bucket where it fits
-/// (`KREA_SMOKE_W=640 KREA_SMOKE_H=384` → 960 tok/frame → 43,200 tokens ≈ 15 GiB, measured to
-/// complete). The bounded rows run at both buckets, and **both buckets are recorded** — see
+/// reference bucket a 45-latent-frame clip is 70,200 tokens ≈ 38 GiB of KV before activations —
+/// exactly the ~27 GB-of-KV problem [`mac_ar_config`](mlx_gen_krea_realtime::mac_ar_config) exists to
+/// dodge, so its cost is a finding rather than a harness bug.
+///
+/// **Correction (sc-17324).** This block used to say row E *SIGKILLs* a 128 GiB host at 832×480
+/// (sc-15127: jetsam at step 39/75) and to tell you to run it only at 640×384. That is no longer
+/// true, and following it would skip the row at the shipping bucket for no reason. CI run
+/// 30787887176 (2026-08-03, `nax-macos`, a 128 GiB host) ran row E to completion at 832×480:
+/// `S18CELL E 7 832x480 45 0 55.7356 ...` at a **63.32 GiB** MLX active peak in ~17.5 min. `n = 1`
+/// at this bucket so far, but one completion falsifies "SIGKILLs a 128 GiB host" outright. The
+/// original measurement predates the memory work since sc-15127; the 38 GiB KV figure above still
+/// holds, it simply fits now. 640×384 remains the cheaper place to run it (960 tok/frame → 43,200
+/// tokens ≈ 15 GiB). The bounded rows run at both buckets, and **both buckets are recorded** — see
 /// [`the_recorded_s18_sweep_is_what_the_docs_claim`].
 ///
 /// ⚠️ Must be run on a tree that has sc-15325 (the tiled-decode fix). Before it, the decode injected an
@@ -3019,6 +3026,13 @@ fn long_clip_coherence_under_the_bounded_window() {
     // (sc-17655), so the partial branch is the common path, not the exotic one: measure the rows in
     // whatever pieces the runner can afford, then re-aggregate with
     // [`s18_verdict_from_accumulated_cells`].
+    // Structural checks run on EVERY dispatch, complete or not — they are about whether the rows
+    // measured are what they claim to be, not about whether there are enough of them. A partial
+    // dispatch that mis-parameterises row E or Z, or runs too short a clip, must fail here rather
+    // than at re-aggregation hours later.
+    if let Err(e) = sweep.structural_checks() {
+        panic!("{e}");
+    }
     let complete = ['A', 'D', 'F'].iter().all(|row| want_rows.contains(*row));
     if complete {
         match sweep.verdict() {
@@ -3029,8 +3043,8 @@ fn long_clip_coherence_under_the_bounded_window() {
         println!(
             "  (partial sweep: rows `{want_rows}` are not the whole A/D/F dose ladder, so no \
              verdict is computed — re-aggregate the S18CELL lines with \
-             `KREA_S18_CELLS=<file> cargo test --test generate_smoke \
-             s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture`)"
+             `KREA_S18_CELLS=<file> cargo test -p mlx-gen-krea-realtime --test \
+             generate_smoke s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture`)"
         );
     }
 }
@@ -3051,9 +3065,14 @@ fn long_clip_coherence_under_the_bounded_window() {
 ///
 /// ```text
 /// cat run-A.tsv run-B.tsv ... > all-cells.tsv
-/// KREA_S18_CELLS=all-cells.tsv cargo test --test generate_smoke \
+/// KREA_S18_CELLS=$PWD/all-cells.tsv cargo test -p mlx-gen-krea-realtime --test generate_smoke \
 ///   s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture
 /// ```
+///
+/// `-p` is not optional: two workspace crates carry a `generate_smoke` test target, and without it
+/// the scail2 binary also runs, matches nothing under `--exact`, and exits 0 — the "0 tests, still
+/// green" shape this file warns about elsewhere. Use an ABSOLUTE path for the file, too: `cargo
+/// test` runs the binary with the CRATE root as its working directory, not the workspace root.
 ///
 /// Input is the artifact the sweep job uploads verbatim — `VERDICT:` lines and blanks are ignored,
 /// so `s18-cells.tsv` files concatenate without editing. `KREA_S18_BUCKET` selects the geometry when
@@ -3074,45 +3093,281 @@ fn s18_verdict_from_accumulated_cells() {
     );
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read the accumulated cells at `{path}`: {e}"));
+    let want_bucket = std::env::var("KREA_S18_BUCKET").ok();
+    let sweep = s18_sweep_from_accumulated(&raw, want_bucket.as_deref())
+        .unwrap_or_else(|e| panic!("`{path}`: {e}"));
+
+    let mut rows: Vec<char> = sweep.cells.iter().map(|c| c.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    println!(
+        "re-aggregated {} cells at {} from `{path}` — rows {}",
+        sweep.cells.len(),
+        sweep.bucket,
+        rows.iter().collect::<String>()
+    );
+    println!("  {}", sweep.summary());
+    // The structural guards apply to re-assembled evidence exactly as they do to a live sweep — a
+    // mis-parameterised row E or Z is no less wrong for having been measured in a separate job.
+    if let Err(e) = sweep.structural_checks() {
+        panic!("{e}");
+    }
+    match sweep.verdict() {
+        Ok(v) => println!("  VERDICT: {v}"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// **The re-aggregation ingest must refuse duplicated evidence, not pool it.**
+///
+/// This is the gate for [`s18_sweep_from_accumulated`], which is otherwise reachable only through an
+/// `#[ignore]`d entry point and would ship uncovered.
+///
+/// The duplicate case is the one that matters and it is not hypothetical: the documented workflow is
+/// `cat piece-1.tsv piece-2.tsv > all.tsv`, every piece downloads under the same `s18-cells.tsv`
+/// name, so including one twice is a slip rather than an act of malice. It must not degrade
+/// *quietly*, because pooling a duplicate does not add noise — it removes it. `spread` is
+/// `2*SD/sqrt(n)` over the sample SD, so the same three cells listed twice keep the mean and shrink
+/// the interval by ~3.2x, which is the wrong direction: re-pasting evidence would buy confidence.
+/// The assertion below pins exactly that, by showing the pooled sweep would have crossed from
+/// unresolvable to resolved.
+#[test]
+fn accumulated_s18_evidence_rejects_duplicated_cells() {
+    // A row A whose three seeds straddle the budget widely enough that 2*SEM exceeds the margin:
+    // unresolvable at n = 3, and resolvable if the same cells are counted twice.
+    let cell = |seed: u64, drift: f64| {
+        format!("S18CELL\tA\t{seed}\t832x480\t45\t13\t{drift:.4}\t{drift:.4}\t0.0000\t10.0000\t18719499004\t2.0000\t14.0000\t14.0000\topp-B-Y")
+    };
+    // mean 20.0 against the 8.0 budget, so margin 12.0, and sample SD 12.0. At n = 3 the spread is
+    // 2*12/sqrt(3) = 13.86 > 12 (unresolvable); listed twice, n = 6 and SD 10.73 give 8.76 < 12
+    // (resolved). The duplicate does not add a single new measurement, and buys the answer.
+    let once = [cell(7, 8.0), cell(11, 20.0), cell(23, 32.0)].join("\n");
+
+    let sweep = s18_sweep_from_accumulated(&once, None).expect("three distinct cells parse");
+    assert_eq!(sweep.cells.len(), 3, "one cell per (row, seed)");
+    assert_eq!(sweep.bucket, "832x480", "bucket inferred from the evidence");
+    let single = sweep.verdict();
+
+    // Pooling the duplicate would CHANGE THE ANSWER — this is the whole reason the guard exists,
+    // and asserting it keeps the guard from being weakened into a no-op later.
+    let doubled_cells = {
+        let evidence = parse_s18_evidence(&[once.clone(), once.clone()].join("\n")).expect("parse");
+        evidence
+            .iter()
+            .map(|c| S18Cell {
+                row: c.row,
+                seed: c.seed,
+                latent_frames: c.latent_frames,
+                rolls: c.rolls,
+                reported_drift: c.drift,
+                trend: c.trend,
+                excursion: c.excursion,
+                slope: c.slope,
+                peak_bytes: c.peak_bytes,
+                clip_mean: c.clip_mean,
+                head_motion: c.head_motion,
+                tail_motion: c.tail_motion,
+                component: "",
+            })
+            .collect::<Vec<_>>()
+    };
+    let pooled = S18Sweep {
+        bucket: "832x480".to_string(),
+        cells: doubled_cells,
+    };
+    // The claim is specifically that the duplicate defeats the POWER gate — not that it produces a
+    // clean verdict (this fixture has no sink rows, so the pooled sweep stops on that instead).
+    // Crossing from "cannot resolve which side of the budget" to "resolved" is the damage.
+    let single_err = single.expect_err("n = 3 must be underpowered for this fixture");
+    assert!(
+        single_err.contains("UNDERPOWERED"),
+        "fixture must start underpowered or the assertion below proves nothing: {single_err}"
+    );
+    let pooled_verdict = pooled.verdict();
+    let still_underpowered = pooled_verdict
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.contains("UNDERPOWERED"));
+    assert!(
+        !still_underpowered,
+        "fixture must be one where pooling DEFEATS the power gate, or the assertion below proves \
+         nothing: {pooled_verdict:?}"
+    );
+
+    // ...and the ingest must not let that happen.
+    let twice = [once.clone(), once.clone()].join("\n");
+    let err = s18_sweep_from_accumulated(&twice, None)
+        .expect_err("the same file concatenated twice must be rejected");
+    assert!(
+        err.contains("duplicate (row, seed)") && err.contains("A/seed 7"),
+        "the rejection must name the offending cells: {err}"
+    );
+
+    // Duplicate detection is per bucket: the same (row, seed) at two geometries is two measurements.
+    let cross_bucket = format!(
+        "{}\n{}",
+        cell(7, 2.0),
+        cell(7, 2.0).replace("832x480", "640x384")
+    );
+    assert!(
+        s18_sweep_from_accumulated(&cross_bucket, Some("832x480")).is_ok(),
+        "the same seed at another bucket is not a duplicate"
+    );
+    let mixed = s18_sweep_from_accumulated(&cross_bucket, None)
+        .expect_err("mixed buckets with no selection must be refused");
+    assert!(mixed.contains("mixes buckets"), "got: {mixed}");
+
+    // Artifact noise must survive: `VERDICT:` lines, blanks and indented cells.
+    let noisy = format!(
+        "  VERDICT: drift is real (whatever)\n\n  {}\n",
+        once.replace('\n', "\n  ")
+    );
+    assert_eq!(
+        s18_sweep_from_accumulated(&noisy, None)
+            .expect("artifact noise is filtered, indented cells are kept")
+            .cells
+            .len(),
+        3,
+        "indented S18CELL lines must not be silently dropped"
+    );
+    assert!(
+        s18_sweep_from_accumulated("  VERDICT: nothing here\n", None)
+            .expect_err("a file with no cells is not evidence")
+            .contains("no S18CELL lines"),
+    );
+}
+
+/// **Structural checks must not depend on the sweep being verdict-complete.**
+///
+/// sc-17655 made partial dispatches the normal way to drive this sweep, and these three checks used
+/// to live inside [`S18Sweep::verdict`] — reachable only when rows A/D/F were all present. A piece
+/// that mis-parameterises row E or Z has to fail on its own.
+#[test]
+fn s18_structural_checks_run_without_a_complete_ladder() {
+    let cell = |row: char, seed: u64, rolls: usize, latent: usize| S18Cell {
+        row,
+        seed,
+        latent_frames: latent,
+        rolls,
+        reported_drift: 20.0,
+        trend: 20.0,
+        excursion: 0.0,
+        slope: 10.0,
+        peak_bytes: 1,
+        clip_mean: 2.0,
+        head_motion: 14.0,
+        tail_motion: 14.0,
+        component: "",
+    };
+    let sweep = |cells: Vec<S18Cell>| S18Sweep {
+        bucket: "832x480".to_string(),
+        cells,
+    };
+
+    // A row E that evicted is not a global reference — caught with no A, D or F in sight.
+    let e_only = sweep(vec![cell('E', 7, 3, 45)]);
+    assert!(
+        e_only.validate_window_dose_ladder().is_ok(),
+        "no ladder here"
+    );
+    assert!(e_only
+        .structural_checks()
+        .expect_err("a rolled row E must be rejected")
+        .contains("not a reference"),);
+    // A row Z that evicted is not a zero-eviction floor.
+    assert!(sweep(vec![cell('Z', 7, 1, 6)])
+        .structural_checks()
+        .expect_err("an evicting row Z must be rejected")
+        .contains("zero-eviction floor"));
+    // Too short a clip is rejected on a row-A-only piece.
+    assert!(sweep(vec![cell('A', 7, 2, 9)])
+        .structural_checks()
+        .expect_err("a short clip must be rejected")
+        .contains("not a long clip"));
+    // Well-formed pieces pass.
+    assert!(sweep(vec![cell('A', 7, 13, 45), cell('Z', 11, 0, 6)])
+        .structural_checks()
+        .is_ok());
+}
+
+/// Rebuild an [`S18Sweep`] from accumulated `S18CELL` lines.
+///
+/// Split out of [`s18_verdict_from_accumulated_cells`] so the ingest is testable with no weights,
+/// no environment and no files — see [`accumulated_s18_evidence_rejects_duplicated_cells`]. The
+/// entry point itself is `#[ignore]`d, so without this split none of the parsing, bucket selection
+/// or duplicate rejection below would be covered by anything.
+fn s18_sweep_from_accumulated(src: &str, want_bucket: Option<&str>) -> Result<S18Sweep, String> {
     // The uploaded artifact interleaves `  VERDICT:` lines with the cells, and concatenating
     // several leaves blank lines — `parse_s18_evidence` rejects both, so filter to cells first.
-    let cells_only: String = raw
+    // `trim_start` because a hand-assembled file is the expected input and indented cells are the
+    // obvious way to lose one silently.
+    let cells_only: String = src
         .lines()
+        .map(str::trim_start)
         .filter(|line| line.starts_with("S18CELL"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        !cells_only.is_empty(),
-        "`{path}` contains no S18CELL lines — it is not S18 sweep evidence"
-    );
-    let evidence = parse_s18_evidence(&cells_only)
-        .unwrap_or_else(|e| panic!("parse the accumulated cells at `{path}`: {e}"));
+    if cells_only.is_empty() {
+        return Err("contains no S18CELL lines — it is not S18 sweep evidence".to_string());
+    }
+    let evidence = parse_s18_evidence(&cells_only)?;
 
     let mut buckets: Vec<String> = evidence.iter().map(|c| c.bucket.clone()).collect();
     buckets.sort();
     buckets.dedup();
-    let bucket = match std::env::var("KREA_S18_BUCKET") {
-        Ok(want) => {
-            assert!(
-                buckets.contains(&want),
-                "KREA_S18_BUCKET=`{want}` is not present in `{path}` (buckets: {buckets:?})"
-            );
-            want
+    let bucket = match want_bucket {
+        Some(want) => {
+            if !buckets.iter().any(|b| b == want) {
+                return Err(format!(
+                    "bucket `{want}` is not present (buckets: {buckets:?})"
+                ));
+            }
+            want.to_string()
         }
-        Err(_) => {
-            assert_eq!(
-                buckets.len(),
-                1,
-                "`{path}` mixes buckets {buckets:?} — set KREA_S18_BUCKET to choose one, because a \
-                 verdict is per geometry and pooling them would compare different clips"
-            );
+        None => {
+            if buckets.len() != 1 {
+                return Err(format!(
+                    "mixes buckets {buckets:?} — set KREA_S18_BUCKET to choose one, because a \
+                     verdict is per geometry and pooling them would compare different clips"
+                ));
+            }
             buckets[0].clone()
         }
     };
 
-    let cells: Vec<S18Cell> = evidence
+    let selected: Vec<&S18Evidence> = evidence.iter().filter(|c| c.bucket == bucket).collect();
+
+    // Duplicate (row, seed) cells are REJECTED here rather than left to the verdict rule.
+    // `validate_window_dose_ladder` does reject them — but only once rows A, D and F are all
+    // present; it returns early otherwise, and a piecewise sweep routinely holds one or two rows,
+    // which is precisely when this function is used. Pooling is not a harmless double count:
+    // `spread` is 2*SD/sqrt(n) over the SAMPLE SD, so including the same evidence twice shrinks
+    // the interval by ~3.2x at n = 3 and can flip an UNDERPOWERED sweep into a confident verdict.
+    // Concatenating one `s18-cells.tsv` twice is a single `cat` away, so the ingest owns this.
+    let mut seen: Vec<(char, u64)> = Vec::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for cell in &selected {
+        let key = (cell.row, cell.seed);
+        if seen.contains(&key) {
+            duplicates.push(format!("{}/seed {}", cell.row, cell.seed));
+        } else {
+            seen.push(key);
+        }
+    }
+    if !duplicates.is_empty() {
+        duplicates.sort();
+        duplicates.dedup();
+        return Err(format!(
+            "duplicate (row, seed) cells at {bucket}: {}. The same configuration appears more than \
+             once — most likely a piece was included twice. Pooling duplicates SHRINKS the \
+             between-seed spread and manufactures confidence, so the input must be de-duplicated \
+             rather than accepted.",
+            duplicates.join(", ")
+        ));
+    }
+
+    let cells: Vec<S18Cell> = selected
         .iter()
-        .filter(|c| c.bucket == bucket)
         .map(|c| S18Cell {
             row: c.row,
             seed: c.seed,
@@ -3126,31 +3381,21 @@ fn s18_verdict_from_accumulated_cells() {
             clip_mean: c.clip_mean,
             head_motion: c.head_motion,
             tail_motion: c.tail_motion,
-            // Historical rows predate the component field. `S18Cell` holds `&'static str` so the
-            // recorded tables can be `const`; leaking here is bounded by the input file and this
-            // process exits immediately after printing.
+            // `S18Cell` holds `&'static str` so the recorded tables can be `const`. Rather than
+            // leak the parsed string, bind it to the matching [`DESCRIPTOR_NAMES`] entry; anything
+            // else (including the historical rows that predate the field) becomes "". Nothing in
+            // `verdict`/`summary` reads this — only the recorded-evidence tests do — so an unknown
+            // descriptor is worth neither a leak nor a hard error here.
             component: c
                 .component
-                .clone()
-                .map(|s| &*Box::leak(s.into_boxed_str()))
+                .as_deref()
+                .and_then(|name| DESCRIPTOR_NAMES.iter().find(|known| **known == name))
+                .copied()
                 .unwrap_or(""),
         })
         .collect();
 
-    let mut rows: Vec<char> = cells.iter().map(|c| c.row).collect();
-    rows.sort_unstable();
-    rows.dedup();
-    println!(
-        "re-aggregated {} cells at {bucket} from `{path}` — rows {}",
-        cells.len(),
-        rows.iter().collect::<String>()
-    );
-    let sweep = S18Sweep { bucket, cells };
-    println!("  {}", sweep.summary());
-    match sweep.verdict() {
-        Ok(v) => println!("  VERDICT: {v}"),
-        Err(e) => panic!("{e}"),
-    }
+    Ok(S18Sweep { bucket, cells })
 }
 
 /// One measured (row, seed) cell of the S18 sweep.
@@ -3304,6 +3549,7 @@ enum WindowAttribution {
 
 /// A measured S18 sweep at one geometry bucket, and the decision rule applied to it. Split out of the
 /// real-weight driver so the **rule** is gated in CI rather than only exercised on the gated GPU run.
+#[derive(Debug)]
 struct S18Sweep {
     bucket: String,
     cells: Vec<S18Cell>,
@@ -3598,6 +3844,48 @@ impl S18Sweep {
         )
     }
 
+    /// Checks that a measurement is **structurally** what it claims to be, independent of whether
+    /// there is enough of it to conclude anything.
+    ///
+    /// These three were inside [`S18Sweep::verdict`], which meant they only ran on a sweep complete
+    /// enough to reach a verdict. Since sc-17655 the sweep is dispatched in row-sized pieces and a
+    /// piece is *usually* not verdict-complete, so a mis-parameterised row would have sailed through
+    /// green with a "partial sweep" line and only surfaced at re-aggregation — after the GPU time was
+    /// already spent. They are cheap and they are about the rows themselves, so both the live sweep
+    /// and the re-aggregation entry point now run them unconditionally.
+    ///
+    /// The shipped-row check is skipped when row A is absent, which is legitimate for a piece; row A
+    /// being *required* is [`S18Sweep::verdict`]'s concern, not this one's.
+    fn structural_checks(&self) -> std::result::Result<(), String> {
+        if let Some(shipped_rolls) = self
+            .cells
+            .iter()
+            .filter(|c| c.row == 'A')
+            .map(|c| c.rolls)
+            .max()
+        {
+            if shipped_rolls < 10 {
+                return Err(format!(
+                    "the shipped row only rolled the window {shipped_rolls} times — that is not a \
+                     long clip, so it cannot answer the long-clip question. Raise \
+                     KREA_S18_LATENT_FRAMES."
+                ));
+            }
+        }
+        if self.cells.iter().any(|c| c.row == 'E' && c.rolls != 0) {
+            return Err(
+                "the global reference row rolled the window — it is not a reference".into(),
+            );
+        }
+        if self.cells.iter().any(|c| c.row == 'Z' && c.rolls != 0) {
+            return Err(
+                "the zero-roll row Z evicted — its clip is too long to be a zero-eviction floor"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// The verdict, or the reason this sweep cannot support one.
     ///
     /// The rule is deliberately conservative about **statistical power**: a single seed per row gives
@@ -3613,23 +3901,7 @@ impl S18Sweep {
             .map(|c| c.rolls)
             .max()
             .ok_or_else(|| "no shipped (A) row was measured — nothing to conclude".to_string())?;
-        if shipped_rolls < 10 {
-            return Err(format!(
-                "the shipped row only rolled the window {shipped_rolls} times — that is not a long \
-                 clip, so it cannot answer the long-clip question. Raise KREA_S18_LATENT_FRAMES."
-            ));
-        }
-        if self.cells.iter().any(|c| c.row == 'E' && c.rolls != 0) {
-            return Err(
-                "the global reference row rolled the window — it is not a reference".into(),
-            );
-        }
-        if self.cells.iter().any(|c| c.row == 'Z' && c.rolls != 0) {
-            return Err(
-                "the zero-roll row Z evicted — its clip is too long to be a zero-eviction floor"
-                    .into(),
-            );
-        }
+        self.structural_checks()?;
         self.validate_window_dose_ladder()?;
         let a = self.mean('A').expect("row A measured above");
         let margin = (a - DRIFT_BUDGET).abs();
@@ -4263,7 +4535,8 @@ fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
         .collect()
 }
 
-/// Measured cells at **640×384** (the bucket where the global reference row fits in 128 GiB).
+/// Measured cells at **640×384** (the cheaper bucket for the global reference row, and the only one
+/// where the sc-15127 sweep recorded it).
 ///
 /// Row E is `n = 1`: its 41.90 GiB MLX peak (44,993,367,088 bytes; 45.0 GB decimal) drove this 128 GiB
 /// host into enough swap to fill the boot
@@ -4570,7 +4843,10 @@ const MEASURED_640: &[S18Cell] = &[
 ];
 
 /// Measured cells at **832×480** — the crate default and a shipping bucket. Row E is absent by
-/// necessity: the global window at this bucket SIGKILLs a 128 GiB host.
+/// necessity — the sc-15127 sweep believed the global window could not run at this bucket. It can:
+/// see the correction on [`long_clip_coherence_under_the_bounded_window`], where CI run 30787887176
+/// measured row E here at a 63.32 GiB peak. These constants stay the sc-15127/sc-15585 record, with
+/// the provenance below, so that later measurement is NOT retro-fitted into them.
 ///
 /// Provenance: the exact source lines are committed in `tests/fixtures/s18_recorded_cells.tsv`.
 /// All rows came from `s18_832.log`

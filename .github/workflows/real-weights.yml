@@ -106,8 +106,10 @@ on:
         options: [all, chroma1_base, chroma1_hd, chroma1_flash]
       # sc-17655 — the S18 sweep in row-sized pieces. The whole seven-row sweep is ~4.3 h and
       # `rw-krea` shares nax-macos-2 with `rw-audio`, `rw-llm` and `rw-chroma` one at a time, so an
-      # indivisible run head-of-line-blocks them for half a night (sc-16981, and the reason sc-17324's
-      # own powered run was cancelled). One row is 3-53 min. The defaults are the full sweep, so an
+      # indivisible run head-of-line-blocks them for half a night (sc-16981). sc-17324 needed TWO
+      # powered dispatches to learn this: run 30948568453 lost the runner outright 2h42m in, and its
+      # replacement 30964561686 was cancelled by hand at 54m precisely because it was blocking the
+      # box. One row is 3-53 min. The defaults are the full sweep, so an
       # operator who ignores these gets exactly the previous behaviour.
       #
       # A subset that is not the whole A/D/F dose ladder measures its cells and DELIBERATELY prints no
@@ -119,7 +121,7 @@ on:
         required: false
         default: ABCDFEZ
       krea_s18_seeds:
-        description: "S18 sweep seeds (krea-s18-sweep only): comma-separated; 3+ needed for a verdict"
+        description: "S18 sweep seeds (krea-s18-sweep only): comma-separated; 2+ for a between-seed spread"
         type: string
         required: false
         default: "7,11,23"
@@ -1932,9 +1934,21 @@ jobs:
           # without it the `-lt 1` branch below is unreachable and a bad seed list fails the step
           # with no ::error:: line at all. Verified against `KREA_S18_SEEDS=abc`.
           n_rows=${#KREA_S18_ROWS}
-          n_seeds="$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | grep -cE '^[[:space:]]*[0-9]+[[:space:]]*$' || true)"
+          # EVERY non-blank field must be countable, not merely one of them — this shell and Rust's
+          # `u64::from_str` must agree on the seed COUNT or the assertion at the end of the run is
+          # measuring a different sweep than the one that ran. They disagree on more than junk:
+          # `+7` parses in Rust and is rejected here, and a value above u64::MAX is rejected there
+          # and accepted by a naive `[0-9]+`. So count the fields and the valid seeds separately and
+          # require they match, rather than silently skipping what this regex cannot read.
+          # `{1,19}` keeps every accepted value inside u64 (u64::MAX has 20 digits).
+          n_fields="$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | grep -cE '[^[:blank:]]' || true)"
+          n_seeds="$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | grep -cE '^[[:blank:]]*[0-9]{1,19}[[:blank:]]*$' || true)"
           if [[ "$n_seeds" -lt 1 ]]; then
             echo "::error::KREA_S18_SEEDS='$KREA_S18_SEEDS' parsed to no seeds" >&2
+            exit 1
+          fi
+          if [[ "$n_seeds" -ne "$n_fields" ]]; then
+            echo "::error::KREA_S18_SEEDS='$KREA_S18_SEEDS' has $n_fields values but only $n_seeds this job can count as seeds (plain decimal, at most 19 digits) — the cell-count assertion would not match what the sweep runs" >&2
             exit 1
           fi
           # Seeds get the same duplicate check as rows: `7,7` measures one configuration twice, which
@@ -1943,7 +1957,9 @@ jobs:
           # `[:blank:]` (space and tab), NOT `[:space:]` — the latter includes the newlines that
           # separate the seeds, so it collapses `7,7` to a single `77` and the duplicate check
           # silently never fires. Verified.
-          if [[ -n "$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | tr -d '[:blank:]' | sort | uniq -d)" ]]; then
+          # Leading zeros are stripped first: `07` and `7` are the same seed to Rust, so comparing
+          # them textually would let a duplicate through to a late ladder panic.
+          if [[ -n "$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | tr -d '[:blank:]' | sed -E 's/^0+([0-9])/\1/' | sort | uniq -d)" ]]; then
             echo "::error::KREA_S18_SEEDS='$KREA_S18_SEEDS' repeats a seed" >&2
             exit 1
           fi
@@ -1984,6 +2000,13 @@ jobs:
       # `nax-macos-2` 2 h 42 m in — "The self-hosted runner lost communication with the server" — and
       # because the runner died, these two steps never ran, no artifact was produced, and GitHub kept
       # no partial log (the run's log zip is empty). Every cell measured up to that point was lost.
+      #
+      # NOT row E's memory, which is the obvious suspect and was checked: at the per-row wall clock
+      # measured in run 30787887176, three seeds each of A/B/C/D reach 146.8 min and row F ends at
+      # 200.2, so 162 min of job wall (~154 of sweep, after the build and snapshot verify) puts the
+      # death inside row F seed 7 — row E had not started and was ~46 min away. Row E's own peak at
+      # this bucket is 63.32 GiB, measured, and it COMPLETED; see the correction on
+      # `long_clip_coherence_under_the_bounded_window`.
       # MITIGATION, not a fix — sc-17655 made the sweep divisible rather than making one long run
       # survivable. Dispatch it in row-sized pieces (`krea_s18_rows`) and each piece uploads its own
       # cells when it finishes, so a runner loss costs one row instead of everything; re-aggregate
@@ -2004,7 +2027,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: krea-s18-sweep-${{ github.sha }}
+          # Rows and seeds in the NAME (sc-17655): every piece of a split sweep uploads from the
+          # same sha and the file inside is always `s18-cells.tsv`, so without this the pieces are
+          # indistinguishable — which is how the same piece ends up concatenated twice at
+          # re-aggregation. The ingest rejects that now, but an artifact you cannot identify is
+          # still evidence you cannot use.
+          name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/s18-cells.tsv

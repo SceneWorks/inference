@@ -10,6 +10,8 @@ import sys
 import textwrap
 import tomllib
 import unittest
+
+import yaml
 from pathlib import Path
 
 
@@ -1323,8 +1325,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         head-of-line block); it must carry the seeds WITHOUT WHICH THE TEST CANNOT PASS AT ALL, since
         the verdict rule refuses to rank configs with no between-seed variance estimate; and it must
         surrender its per-cell evidence even when the run fails, because an unresolvable verdict is
-        exactly the outcome whose 21 cells someone needs to read and re-running costs another
-        4.3 hours.
+        exactly the outcome whose measured cells someone needs to read, and re-running costs
+        hours.
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("  mlx-krea-realtime-s18-sweep:")
@@ -1349,11 +1351,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # dispatch would quietly measure something narrower than this lane claims.
         self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", job)
         self.assertIn("KREA_S18_SEEDS: ${{ inputs.krea_s18_seeds }}", job)
-        dispatch = workflow.split("jobs:", 1)[0]
-        self.assertIn("krea_s18_rows:", dispatch)
-        self.assertIn("default: ABCDFEZ", dispatch)
-        self.assertIn("krea_s18_seeds:", dispatch)
-        self.assertIn('default: "7,11,23"', dispatch)
+        # PARSED, not string-matched. Substring assertions over the pre-`jobs:` text were tried and
+        # are false greens twice over: `assertIn("krea_s18_rows:", ...)` matches the key inside a
+        # `#` comment, and `assertIn("default: ABCDFEZ", ...)` is unanchored, so swapping the two
+        # defaults between the rows and seeds inputs still passed. Both were demonstrated.
+        inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
+            "workflow_dispatch"
+        ]["inputs"]
+        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDFEZ")
+        self.assertEqual(inputs["krea_s18_seeds"]["default"], "7,11,23")
         # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
         self.assertIn("set -o pipefail", job)
         self.assertIn("-- --exact --ignored --nocapture", job)
@@ -1363,8 +1369,36 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # A free-text row list is a new way to make the count assertion vacuous: a typo'd letter
         # selects fewer rows than it counts, and a repeated one counts a row twice. Both are
         # rejected before the four-hour cargo invocation rather than after it.
-        self.assertIn('=~ ^[ABCDFEZ]+$', job)
+        self.assertIn("=~ ^[ABCDFEZ]+$", job)
         self.assertIn("repeats a row", job)
+        # Three shell details that were each a live bug in this step, pinned because every one of
+        # them fails SILENTLY — the step still exits non-zero, just with no ::error:: line and no
+        # explanation, four hours in:
+        #   * `|| true` on the seed count. `grep -c` exits 1 when it counts zero, and under
+        #     `bash -e` + `set -o pipefail` that kills the shell at the assignment, making the
+        #     "parsed to no seeds" branch unreachable.
+        #   * `[:blank:]`, not `[:space:]`, in the duplicate-seed check: `[:space:]` deletes the
+        #     newlines separating the seeds, collapsing `7,7` to `77` so the check never fires.
+        #   * field-vs-seed count parity, so a value this shell cannot read the way Rust parses it
+        #     (`+7`, or one wider than u64) fails now rather than as a cell-count mismatch later.
+        # Anchored to the seed-count line: a bare `|| true` also appears on the `cells=` line
+        # below, so the loose form still passed with this one deleted (demonstrated).
+        self.assertIn("[0-9]{1,19}[[:blank:]]*$' || true)\"", job)
+        # Same class, pre-dating sc-17655 and previously unpinned: a sweep that emits ZERO cells
+        # makes this `grep -c` exit 1 too, so without `|| true` the step dies before it can report
+        # "captured 0" — the one diagnosis that matters when nothing was measured.
+        self.assertIn("'^S18CELL' \"$RUNNER_TEMP/s18-sweep.log\" || true)\"", job)
+        self.assertIn("tr -d '[:blank:]'", job)
+        self.assertIn('"$n_seeds" -ne "$n_fields"', job)
+        self.assertIn("parsed to no seeds", job)
+        self.assertIn("repeats a seed", job)
+        # Pieces of a split sweep must be distinguishable: same sha, same inner filename, so without
+        # the rows/seeds in the artifact name the same piece can be re-aggregated twice.
+        self.assertIn(
+            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}"
+            "-s${{ inputs.krea_s18_seeds }}",
+            job,
+        )
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
