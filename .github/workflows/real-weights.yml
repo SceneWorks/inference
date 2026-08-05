@@ -16,7 +16,12 @@ name: Real-weight validation
 #   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
 #   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
 #   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB   nax-macos-2
-#   rw-chroma   none stored; materializes from the Hub per run       ~0        nax-macos-2
+#   rw-chroma   none stored; materializes from the Hub per run       ~0        BOTH boxes
+#
+# `rw-chroma` carries no stored bytes, so it is registered on both boxes and its jobs land on
+# whichever is free — verified 2026-08-04 by mapping `runner_name` across the last 40 runs, where
+# all three `Chroma packed auxiliaries` matrix legs are observed on `nax-macos` AND `nax-macos-2`.
+# This row read `nax-macos-2` until then, which understated the contention it adds to that box.
 #
 # ON DISK is GiB as `du -sh` reports it, summed over each set's `models--*` repo directories.
 # MEASURED 2026-08-03 (sc-17271); previously these were arithmetic, and rw-audio was carrying a
@@ -111,6 +116,38 @@ permissions:
 concurrency:
   group: inference-real-weights-${{ github.ref }}-${{ inputs.profile || 'schedule' }}
   cancel-in-progress: false
+
+# BUILD ARTIFACTS OUTSIDE THE DIRECTORY `actions/checkout` CLEANS.
+#
+# `actions/checkout` defaults to `clean: true`, which is `git clean -ffdx` in the repo directory.
+# `target/` is gitignored (.gitignore:79), so `-x` deletes it, and every job on a persistent box
+# therefore paid a full cold build. Measured on `nax-macos` 2026-08-04: the whole of
+# `target/debug/deps` carried a single job's timestamps (CACHEDIR.TAG 21:58, newest artifact
+# 22:16) — 13 GB rebuilt from nothing, per job, on the scarcest hardware in the fleet.
+#
+# `github.workspace` is `_work/<repo>/<repo>`; its parent is the runner's per-repo work directory,
+# which checkout does not touch and the runner does not recreate between jobs (only `_temp` is).
+# So `../cargo-target` survives the clean while staying scoped per repo and per box. The `github`
+# context is one of the three available to a workflow-level `env` (with `vars` and `inputs`) —
+# `runner.workspace` would read better here but the `runner` context is step-level only, and a
+# job-level twin would have to be repeated across all 37 jobs.
+#
+# Deliberately workflow-level, so the Windows CUDA real-weight jobs get the same treatment: the
+# mechanism is `clean: true` plus a persistent runner, which is exactly their situation too.
+# The two Chroma jobs keep their own `${{ runner.temp }}` target dirs — those are per-run by
+# design (sc-16462 builds a tier from source and must not see a previous run's artifacts).
+#
+# Cargo keys artifacts by profile and features, so the weekly `--release` lane and any debug
+# build coexist here rather than evicting each other. The cost is a persistent tens-of-GB
+# directory per box; `nax-macos` was at 247 GiB free when this landed. If a box ever runs short,
+# delete the directory — it is a cache, and the next job rebuilds it exactly as before.
+#
+# NB the `timeout-minutes` rationale on several jobs below still cites "the cold build that
+# `clean: true` forces every week" as part of its sizing. Those budgets are now loose by that
+# margin; re-sizing them from the first weekly run that executes with a warm target directory is
+# sc-17057's scope, and they stay unchanged here rather than being guessed down (sc-16981).
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
 
 jobs:
   # SC-16462: build the complete packed Chroma tier from the exact currently-shipped bf16 source,
@@ -815,8 +852,10 @@ jobs:
   # Budget: the four invocations are FAST once the snapshot is warm — 2.1 / 1.5 / 1.3 / 1.4 s
   # measured `--release` on an M5 Max dev box against this exact pinned revision. 180 minutes is not
   # sized for the tests; it is sized for the FIRST run on a box where `ensure_model_snapshot.py` has
-  # to materialize all 16 GB from the Hub, plus the cold `--release` build of the mlx tree
-  # (2m17s here) that `clean: true` forces every week.
+  # to materialize all 16 GB from the Hub, plus the `--release` build of the mlx tree (2m17s here).
+  # That build was cold every week until the workflow-level `CARGO_TARGET_DIR` above moved
+  # artifacts out of the directory `clean: true` wipes; the 2m17s is now a first-run figure, and
+  # this budget is loose by that margin until sc-17057 re-sizes it from a warm run.
   mlx-llm-joycaption:
     name: MLX JoyCaption VLM real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm' || inputs.profile == 'llm-joycaption'
@@ -1937,8 +1976,10 @@ jobs:
   # one place a numerically-shifted logit could have flipped a discrete decision — it did not).
   # The other five families have NOT been run in release. Re-sizing all seven from the first weekly
   # run that executes this lane is sc-17057; a smaller number guessed here is exactly the sc-16981
-  # defect. Note also that `actions/checkout` defaults to `clean: true`, so `target/` does not
-  # survive between jobs — every job pays a full cold build every week, in either profile.
+  # defect. Note that these figures also carried a full cold build: `actions/checkout` defaults to
+  # `clean: true`, so `target/` did not survive between jobs and every job rebuilt the candle tree
+  # from nothing, in either profile. The workflow-level `CARGO_TARGET_DIR` above ends that, so the
+  # budgets here are loose by one cold build on top of the debug-vs-release margin already noted.
   candle-audio-kokoro:
     name: Candle audio real weights (Kokoro TTS)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-kokoro'
@@ -2361,8 +2402,9 @@ jobs:
   # voice_clone 207 s, multi_turn_voice_clone 250 s); the five others are 3.99 / 6.04 / 18.1 /
   # 23.3 / 38.6 s. sc-17263's chunked-encode gate is the eleventh, at 67-106 s over five runs (a
   # 7.1 GB codec load, a single-shot `[1,20,3200,3200]` CPU attention, three chunked encodes) —
-  # call the lane ~1280 s. 120 minutes is ~5.6x that, to absorb a slower runner plus the cold
-  # `--release` build of the candle tree that `clean: true` forces every week.
+  # call the lane ~1280 s. 120 minutes is ~5.6x that, to absorb a slower runner plus the
+  # `--release` build of the candle tree — which was cold every week until the workflow-level
+  # `CARGO_TARGET_DIR` above survived `clean: true`, and is now cold only on a box's first run.
   #
   # Treat every figure above as a floor, for two measured reasons. The codec cross-check's number
   # predates sc-17270 widening it to actually run the reference-parity arm. And re-timing the five
