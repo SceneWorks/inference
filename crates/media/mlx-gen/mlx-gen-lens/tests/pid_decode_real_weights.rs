@@ -38,7 +38,7 @@ fn first_snapshot_dir(repo: &str, what: &str) -> PathBuf {
 
 fn lens_dir() -> PathBuf {
     env_path("LENS_DIR")
-        .unwrap_or_else(|| first_snapshot_dir("models--microsoft--Lens-Turbo", "Lens-Turbo"))
+        .unwrap_or_else(|| first_snapshot_dir("models--SceneWorks--Lens-Turbo", "Lens-Turbo"))
 }
 
 fn pid_checkpoint() -> PathBuf {
