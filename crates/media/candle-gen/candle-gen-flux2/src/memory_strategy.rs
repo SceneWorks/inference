@@ -1,11 +1,11 @@
-//! Candle/CUDA FLUX.2-dev adoption of the shared image-memory ladder (SC-15833).
+//! Candle/CUDA FLUX.2 adoption of the shared image-memory ladder (SC-15833, SC-15831).
 //!
-//! This contract is deliberately **dev-only**. FLUX.2 Klein shares Rust modules but not the
-//! 32B/24B weight envelope, route set, or calibration evidence. Dev exposes one contract for the
-//! registered text route and the worker-owned edit/reference/style/control routes; route identity,
-//! reference count, overlay identity, numeric tier, ABI, and fingerprint all fail closed.
+//! Dev and Klein deliberately share lifecycle and execution primitives while retaining distinct
+//! provider identities, block domains, candidate ranges, and calibration fingerprints. The three
+//! SceneWorks Klein catalog entries resolve to the one `flux2_klein_9b` Candle provider; entry-level
+//! tier/mode/overlay measurements remain catalog-owned and cannot be inferred from this contract.
 
-use crate::config::FLUX2_DEV_ID;
+use crate::config::{Flux2Variant, FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
@@ -42,6 +42,52 @@ pub const CALIBRATION_FINGERPRINT: &str =
     "flux2-dev-cuda-staged-host-full-edge-decode-bounded-attention-device-format-blocks-v2";
 pub const CONTROL_OVERLAY: &str = "control";
 
+/// Full output edge at the representative 1024px cell. The FLUX.2 upsampling tail contains spatial
+/// GroupNorms, so splitting it into smaller tiles changes normalization statistics across most of
+/// the image; the real-weight A/B rejected the former 768/640/512 domain at max-abs 14 against the
+/// provider's <=2 RGB contract. Keep the same parity-preserving full-edge realization already used
+/// by FLUX.2-dev until a genuinely normalization-aware tiled decoder is implemented and measured.
+pub const KLEIN_DECODE_TILE_EDGE: u32 = 1024;
+pub const KLEIN_DECODE_TILE_EDGES: &[u32] = &[KLEIN_DECODE_TILE_EDGE];
+/// Positive sentinel required by the shared contract. It is inert at the full-edge 1024px cell.
+pub const KLEIN_DECODE_OVERLAP: u32 = 1;
+pub const KLEIN_DECODE_OVERLAPS: &[u32] = &[KLEIN_DECODE_OVERLAP];
+pub const KLEIN_BASE_DOUBLE_BLOCKS: u32 = 8;
+pub const KLEIN_BASE_SINGLE_BLOCKS: u32 = 24;
+pub const KLEIN_BASE_TRANSFORMER_BLOCKS: u32 = KLEIN_BASE_DOUBLE_BLOCKS + KLEIN_BASE_SINGLE_BLOCKS;
+pub const KLEIN_CALIBRATION_FINGERPRINT: &str = "flux2-klein-cuda-shared-ladder-provider-abi-v2";
+
+#[derive(Clone, Copy)]
+struct ProviderProfile {
+    provider_id: &'static str,
+    decode_tile_edges: &'static [u32],
+    decode_overlaps: &'static [u32],
+    base_transformer_blocks: u32,
+    calibration_fingerprint: &'static str,
+}
+
+fn profile(provider_id: &str) -> gen_core::Result<ProviderProfile> {
+    match provider_id {
+        FLUX2_DEV_ID => Ok(ProviderProfile {
+            provider_id: FLUX2_DEV_ID,
+            decode_tile_edges: DECODE_TILE_EDGES,
+            decode_overlaps: DECODE_OVERLAPS,
+            base_transformer_blocks: BASE_TRANSFORMER_BLOCKS,
+            calibration_fingerprint: CALIBRATION_FINGERPRINT,
+        }),
+        FLUX2_KLEIN_9B_ID => Ok(ProviderProfile {
+            provider_id: FLUX2_KLEIN_9B_ID,
+            decode_tile_edges: KLEIN_DECODE_TILE_EDGES,
+            decode_overlaps: KLEIN_DECODE_OVERLAPS,
+            base_transformer_blocks: KLEIN_BASE_TRANSFORMER_BLOCKS,
+            calibration_fingerprint: KLEIN_CALIBRATION_FINGERPRINT,
+        }),
+        _ => Err(gen_core::Error::Unsupported(format!(
+            "unknown FLUX.2 memory provider {provider_id}"
+        ))),
+    }
+}
+
 fn path(source: &WeightsSource) -> &std::path::Path {
     match source {
         WeightsSource::Dir(path) | WeightsSource::File(path) => path,
@@ -58,30 +104,36 @@ fn streamable(spec: &LoadSpec) -> bool {
         && spec.identity.is_none()
 }
 
-fn resident_components(spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
+fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
     let mut out = Vec::new();
-    if let Some(control) = spec.control.as_ref() {
-        let resident_bytes = gen_core::weightsmeta::safetensors_path_bytes(path(control));
-        if resident_bytes > 0 {
-            out.push(MemoryResidentComponent {
-                id: "flux2_dev_fun_controlnet_union".to_owned(),
-                kind: MemoryComponentKind::ControlBranch,
-                resident_bytes,
-                // SC-15833 windows the 56-block base. The four overlay blocks remain resident and
-                // are therefore charged explicitly rather than hidden inside the base estimate.
-                bounded_by: None,
-            });
+    if provider_id == FLUX2_DEV_ID {
+        if let Some(control) = spec.control.as_ref() {
+            let resident_bytes = gen_core::weightsmeta::safetensors_path_bytes(path(control));
+            if resident_bytes > 0 {
+                out.push(MemoryResidentComponent {
+                    id: "flux2_dev_fun_controlnet_union".to_owned(),
+                    kind: MemoryComponentKind::ControlBranch,
+                    resident_bytes,
+                    // SC-15833 windows the 56-block base. The four overlay blocks remain resident and
+                    // are therefore charged explicitly rather than hidden inside the base estimate.
+                    bounded_by: None,
+                });
+            }
         }
     }
     out
 }
 
-pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+pub fn provider_contract_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let profile = profile(provider_id)?;
     let streamable = streamable(spec);
     let components =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
             .unwrap_or_default();
-    let resident_components = resident_components(spec);
+    let resident_components = resident_components(provider_id, spec);
     let overlay_bytes = resident_components
         .iter()
         .map(|component| component.resident_bytes)
@@ -102,8 +154,8 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
             },
             parameters: match strategy {
                 MemoryStrategy::BoundedDecode => MemoryParameterRanges {
-                    decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
-                    decode_overlaps: DECODE_OVERLAPS.to_vec(),
+                    decode_tile_edges: profile.decode_tile_edges.to_vec(),
+                    decode_overlaps: profile.decode_overlaps.to_vec(),
                     ..Default::default()
                 },
                 MemoryStrategy::BoundedAttention => MemoryParameterRanges {
@@ -123,7 +175,7 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
         .collect();
 
     Ok(MemoryProviderContract {
-        provider_id: FLUX2_DEV_ID.to_owned(),
+        provider_id: profile.provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
@@ -156,8 +208,8 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases.clone(),
             synchronized_phase_release: true,
-            // The hook is implemented, but the sole 1024px production candidate is full-edge and
-            // therefore does not spatially partition the representative calibration cell.
+            // The hook is implemented, but each provider's sole 1024px production candidate is
+            // full-edge and therefore does not spatially partition the representative cell.
             decode_tiling: true,
             attention_chunking: true,
             transformer_window_materialization: streamable,
@@ -177,7 +229,7 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
             resident_components,
         },
         calibration: Some(MemoryCalibrationIdentity::new(
-            CALIBRATION_FINGERPRINT,
+            profile.calibration_fingerprint,
             spec.load_shape,
         )),
         asset_facts: MemoryAssetFacts {
@@ -192,6 +244,21 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
         },
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })
+}
+
+pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    provider_contract_for(FLUX2_DEV_ID, spec)
+}
+
+pub fn klein_provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    provider_contract_for(FLUX2_KLEIN_9B_ID, spec)
+}
+
+pub fn contract_for_variant(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    provider_contract_for(variant.id(), spec)
 }
 
 fn packed_quant(spec: &LoadSpec) -> gen_core::Result<Option<Quant>> {
@@ -251,7 +318,7 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> gen_core::Result<MemoryNumericT
     })
 }
 
-fn route_is_supported(context: &MemoryRunContext) -> bool {
+fn route_is_supported(provider_id: &str, context: &MemoryRunContext) -> bool {
     match (
         &context.mode,
         context.geometry.reference_count,
@@ -264,7 +331,7 @@ fn route_is_supported(context: &MemoryRunContext) -> bool {
         {
             true
         }
-        (MemoryMode::TextToImage, 0, Some(CONTROL_OVERLAY)) => true,
+        (MemoryMode::TextToImage, 0, Some(CONTROL_OVERLAY)) if provider_id == FLUX2_DEV_ID => true,
         _ => false,
     }
 }
@@ -286,28 +353,32 @@ pub fn validate_context(
     ) {
         return Err(gen_core::Error::Unsupported(reason));
     }
-    if !route_is_supported(context) {
+    if !route_is_supported(&contract.provider_id, context) {
         return Err(gen_core::Error::Unsupported(format!(
-            "flux2_dev: unsupported memory route mode={} references={} overlay={:?}",
+            "{}: unsupported memory route mode={} references={} overlay={:?}",
+            contract.provider_id,
             context.mode.as_key(),
             context.geometry.reference_count,
             context.overlay
         )));
     }
     if context.geometry.batch != 1 {
-        return Err(gen_core::Error::Unsupported(
-            "flux2_dev: memory calibration is single-image only".to_owned(),
-        ));
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: memory calibration is single-image only",
+            contract.provider_id
+        )));
     }
     if context.use_pid && context.selection.strategy.is_optimized() {
-        return Err(gen_core::Error::Unsupported(
-            "flux2_dev: PiD cannot consume the native FLUX.2 VAE memory selection".to_owned(),
-        ));
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: PiD cannot consume the native FLUX.2 VAE memory selection",
+            contract.provider_id
+        )));
     }
     if context.has_phases {
-        return Err(gen_core::Error::Unsupported(
-            "flux2_dev: optimized memory strategies do not cover multi-phase denoise".to_owned(),
-        ));
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: optimized memory strategies do not cover multi-phase denoise",
+            contract.provider_id
+        )));
     }
     Ok(())
 }
@@ -559,6 +630,11 @@ impl Flux2AdmissionRegistry {
 
 pub struct Flux2MemoryScope {
     device: Device,
+    provider_id: String,
+    decode_tile_edges: Vec<u32>,
+    decode_overlaps: Vec<u32>,
+    attention_chunk_sizes: Vec<u32>,
+    base_transformer_blocks: u32,
     geometry: MemoryGeometry,
     memory: Option<GenerationMemory>,
     transformer_window: Option<u32>,
@@ -575,8 +651,21 @@ impl Flux2MemoryScope {
         contract: &MemoryProviderContract,
         context: &MemoryRunContext,
     ) -> Self {
+        let decode = contract
+            .capability(MemoryStrategy::BoundedDecode)
+            .expect("FLUX.2 contract publishes bounded decode");
+        let attention = contract
+            .capability(MemoryStrategy::BoundedAttention)
+            .expect("FLUX.2 contract publishes bounded attention");
         Self {
             device,
+            provider_id: contract.provider_id.clone(),
+            decode_tile_edges: decode.parameters.decode_tile_edges.clone(),
+            decode_overlaps: decode.parameters.decode_overlaps.clone(),
+            attention_chunk_sizes: attention.parameters.attention_chunk_sizes.clone(),
+            base_transformer_blocks: profile(&contract.provider_id)
+                .expect("validated FLUX.2 provider contract")
+                .base_transformer_blocks,
             geometry: context.geometry,
             memory: contract.generation_memory(&context.selection),
             transformer_window: contract
@@ -613,9 +702,10 @@ impl Flux2MemoryScope {
 
     fn active(&self) -> gen_core::Result<()> {
         if self.finished {
-            Err(gen_core::Error::Msg(
-                "flux2_dev: memory request scope is already finished".to_owned(),
-            ))
+            Err(gen_core::Error::Msg(format!(
+                "{}: memory request scope is already finished",
+                self.provider_id
+            )))
         } else {
             Ok(())
         }
@@ -637,9 +727,10 @@ impl MemoryRequestScope for Flux2MemoryScope {
                 .is_some_and(|phases| !phases.is_empty())
                 != self.has_phases
         {
-            return Err(gen_core::Error::Unsupported(
-                "flux2_dev: request route or geometry changed after admission".to_owned(),
-            ));
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: request route or geometry changed after admission",
+                self.provider_id
+            )));
         }
         request.memory = self.memory;
         if let (Some(admission), Some(token)) = (&self.admission, self.token) {
@@ -664,31 +755,35 @@ impl MemoryRequestScope for Flux2MemoryScope {
     ) -> gen_core::Result<()> {
         self.active()?;
         if geometry != self.geometry {
-            return Err(gen_core::Error::Unsupported(
-                "flux2_dev: decode geometry changed after admission".to_owned(),
-            ));
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: decode geometry changed after admission",
+                self.provider_id
+            )));
         }
         if self.use_pid {
-            return Err(gen_core::Error::Unsupported(
-                "flux2_dev: PiD has no admitted FLUX.2 VAE decode plan".to_owned(),
-            ));
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: PiD has no admitted FLUX.2 VAE decode plan",
+                self.provider_id
+            )));
         }
-        if DECODE_TILE_EDGES.contains(&tile_edge) && DECODE_OVERLAPS.contains(&overlap) {
+        if self.decode_tile_edges.contains(&tile_edge) && self.decode_overlaps.contains(&overlap) {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "flux2_dev: decode does not publish {tile_edge}/{overlap}"
+                "{}: decode does not publish {tile_edge}/{overlap}",
+                self.provider_id
             )))
         }
     }
 
     fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
         self.active()?;
-        if chunk_size == ATTENTION_CHUNK_SIZE {
+        if self.attention_chunk_sizes.contains(&chunk_size) {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "flux2_dev: attention chunk size is {ATTENTION_CHUNK_SIZE}, got {chunk_size}"
+                "{}: attention chunk size is not in {:?}, got {chunk_size}",
+                self.provider_id, self.attention_chunk_sizes
             )))
         }
     }
@@ -700,26 +795,30 @@ impl MemoryRequestScope for Flux2MemoryScope {
     ) -> gen_core::Result<()> {
         self.active()?;
         let Some(window) = self.transformer_window else {
-            return Err(gen_core::Error::Unsupported(
-                "flux2_dev: bounded transformer residency was not selected".to_owned(),
-            ));
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded transformer residency was not selected",
+                self.provider_id
+            )));
         };
         if window == 0 || block_count == 0 || !first_block.is_multiple_of(window) {
             return Err(gen_core::Error::Unsupported(format!(
-                "flux2_dev: invalid transformer window {block_count} at {first_block}"
+                "{}: invalid transformer window {block_count} at {first_block}",
+                self.provider_id
             )));
         }
-        if first_block >= BASE_TRANSFORMER_BLOCKS {
+        if first_block >= self.base_transformer_blocks {
             return Err(gen_core::Error::Unsupported(format!(
-                "flux2_dev: transformer window starts past the {BASE_TRANSFORMER_BLOCKS}-block base"
+                "{}: transformer window starts past the {}-block base",
+                self.provider_id, self.base_transformer_blocks
             )));
         }
-        let expected = window.min(BASE_TRANSFORMER_BLOCKS - first_block);
+        let expected = window.min(self.base_transformer_blocks - first_block);
         if block_count == expected {
             Ok(())
         } else {
             Err(gen_core::Error::Unsupported(format!(
-                "flux2_dev: admitted window {window} requires {expected} blocks at {first_block}, got {block_count}"
+                "{}: admitted window {window} requires {expected} blocks at {first_block}, got {block_count}",
+                self.provider_id
             )))
         }
     }
@@ -890,6 +989,103 @@ mod tests {
                 .transformer_window_sizes,
             TRANSFORMER_WINDOW_SIZES
         );
+    }
+
+    #[test]
+    fn klein_contract_is_distinct_and_publishes_parity_preserving_candidate_ranges() {
+        let contract = klein_provider_contract(&spec()).unwrap();
+        assert!(contract.conformance_errors().is_empty());
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        assert_eq!(contract.provider_id, FLUX2_KLEIN_9B_ID);
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            KLEIN_CALIBRATION_FINGERPRINT
+        );
+        assert_ne!(KLEIN_CALIBRATION_FINGERPRINT, CALIBRATION_FINGERPRINT);
+        assert_eq!(KLEIN_BASE_TRANSFORMER_BLOCKS, 32);
+        assert_eq!(
+            capability(&contract, MemoryStrategy::BoundedDecode)
+                .parameters
+                .decode_tile_edges,
+            KLEIN_DECODE_TILE_EDGES
+        );
+        assert_eq!(
+            capability(&contract, MemoryStrategy::BoundedDecode)
+                .parameters
+                .decode_overlaps,
+            KLEIN_DECODE_OVERLAPS
+        );
+        assert_eq!(
+            capability(&contract, MemoryStrategy::BoundedAttention)
+                .parameters
+                .attention_chunk_sizes,
+            vec![ATTENTION_CHUNK_SIZE]
+        );
+        assert_eq!(
+            capability(&contract, MemoryStrategy::BoundedTransformerResidency)
+                .parameters
+                .transformer_window_sizes,
+            TRANSFORMER_WINDOW_SIZES
+        );
+    }
+
+    #[test]
+    fn klein_scope_rejects_unsupported_tiled_candidate_and_block_domain() {
+        let contract = klein_provider_contract(&spec()).unwrap();
+        let context = registered_valid_fixture(
+            &spec(),
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0)
+        .context;
+        let mut scope = Flux2MemoryScope::new(Device::Cpu, &contract, &context);
+        assert!(scope.configure_decode(768, 128, context.geometry).is_err());
+        assert!(scope
+            .configure_decode(
+                KLEIN_DECODE_TILE_EDGE,
+                KLEIN_DECODE_OVERLAP,
+                context.geometry,
+            )
+            .is_ok());
+        assert!(scope
+            .materialize_transformer_window(KLEIN_BASE_TRANSFORMER_BLOCKS, 1)
+            .is_err());
+        assert!(scope
+            .materialize_transformer_window(KLEIN_BASE_TRANSFORMER_BLOCKS - 1, 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn klein_route_rejects_dev_only_control_overlay() {
+        let dev_contract = provider_contract(&spec()).unwrap();
+        let mut context = registered_valid_fixture(
+            &spec(),
+            &dev_contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0)
+        .context;
+        context.overlay = Some(CONTROL_OVERLAY.to_owned());
+        assert!(route_is_supported(FLUX2_DEV_ID, &context));
+        assert!(!route_is_supported(FLUX2_KLEIN_9B_ID, &context));
+    }
+
+    #[test]
+    fn klein_contract_never_inherits_dev_control_residency_identity() {
+        let mut spec = spec();
+        spec.control = Some(WeightsSource::File("control.safetensors".into()));
+        let contract = klein_provider_contract(&spec).unwrap();
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            resident_components,
+            ..
+        } = contract.formula
+        else {
+            panic!("FLUX.2 contract must use the component-phase formula")
+        };
+        assert!(resident_components.is_empty());
     }
 
     #[test]

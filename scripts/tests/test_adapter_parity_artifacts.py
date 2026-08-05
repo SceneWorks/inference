@@ -235,6 +235,130 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outside the bound allowlist"):
                 VERIFY.source_state(manifest, **kwargs)
 
+    def proof_source_repo(self, directory):
+        """A fixture worktree carrying every path `source_state` hashes.
+
+        Mirrors the real layout: the four Rust sources plus one file per
+        manifest script, all committed, so `implementation_base` is HEAD and
+        nothing is changed or untracked until a test edits it.
+        """
+        root = pathlib.Path(directory)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        # Keep the committed bytes byte-identical to what is hashed off disk.
+        subprocess.run(["git", "-C", str(root), "config", "core.autocrlf", "false"], check=True)
+        scripts = {
+            name: f"crates/media/mlx-gen/tools/{name}"
+            for name in VERIFY.load_manifest()["scripts"]
+        }
+        for index, relative in enumerate(
+            (*RECORDER.RUST_SOURCE_FILES, *scripts.values())
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"ORIGINAL = {index}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "proof base",
+            ],
+            check=True,
+        )
+        revision = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout.strip()
+        manifest = {"implementation_base": revision, "scripts": dict.fromkeys(scripts, "0" * 64)}
+        return root, manifest, scripts
+
+    def test_verifier_bytes_are_not_bound_into_the_proof_source_state(self):
+        verifier = "verify_adapter_parity_artifacts.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root, manifest, scripts = self.proof_source_repo(directory)
+            before = RECORDER.source_state(manifest, root=root)
+            self.assertNotIn(scripts[verifier], before["files"])
+            self.assertIn(scripts["record_adapter_parity_transcript.py"], before["files"])
+            self.assertIn(scripts["dump_qwen_adapter_golden.py"], before["files"])
+            self.assertIn(RECORDER.RUST_SOURCE_FILES[0], before["files"])
+
+            # Editing only the checker must neither move the digest nor trip the
+            # allowlist, even though git now reports it as a changed path.
+            (root / scripts[verifier]).write_text("EDITED = 1\n", encoding="utf-8")
+            after = RECORDER.source_state(manifest, root=root)
+            self.assertEqual(before["files"], after["files"])
+            self.assertEqual(before["source_sha256"], after["source_sha256"])
+            self.assertIn(scripts[verifier], after["changed_paths"])
+
+            # Every producing file stays bound.
+            for producer in (
+                scripts["dump_qwen_adapter_golden.py"],
+                scripts["record_adapter_parity_transcript.py"],
+                scripts["_adapter_parity_provenance.py"],
+                RECORDER.RUST_SOURCE_FILES[0],
+            ):
+                path = root / producer
+                original = path.read_bytes()
+                path.write_text("EDITED = 2\n", encoding="utf-8")
+                moved = RECORDER.source_state(manifest, root=root)
+                self.assertNotEqual(before["files"][producer], moved["files"][producer], producer)
+                self.assertNotEqual(before["source_sha256"], moved["source_sha256"], producer)
+                path.write_bytes(original)
+            self.assertEqual(
+                before["source_sha256"],
+                RECORDER.source_state(manifest, root=root)["source_sha256"],
+            )
+
+    def test_empty_overrides_are_honoured_rather_than_falling_back(self):
+        """`()`/`set()` mean "nothing", not "use the default".
+
+        Splitting the hashed set from the allowlist made both kwargs load-bearing,
+        so a falsy-but-present override must not silently reinstate the manifest
+        set or the permissive default allowlist.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root, manifest, scripts = self.proof_source_repo(directory)
+            empty = RECORDER.source_state(
+                manifest, root=root, source_files=(), permitted_changes=set()
+            )
+            self.assertEqual(empty["files"], {})
+
+            (root / scripts["dump_z_image_golden.py"]).write_text("EDITED = 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "outside the bound allowlist"):
+                RECORDER.source_state(
+                    manifest, root=root, source_files=(), permitted_changes=set()
+                )
+
+    def test_unbound_source_files_must_stay_in_the_manifest_script_map(self):
+        manifest = {"implementation_base": "0" * 40, "scripts": {"dump_z_image_golden.py": "0" * 64}}
+        with self.assertRaisesRegex(RuntimeError, "silently rejoin the hashed set"):
+            RECORDER.bound_source_files(manifest)
+
+    def test_tracked_manifest_binds_every_script_but_hashes_only_the_producers(self):
+        manifest = VERIFY.load_manifest()
+        bound = set(RECORDER.bound_source_files(manifest))
+        pinned = {f"crates/media/mlx-gen/tools/{name}" for name in manifest["scripts"]}
+        self.assertEqual(bound, (pinned | set(RECORDER.RUST_SOURCE_FILES)) - RECORDER.UNBOUND_SOURCE_FILES)
+        self.assertEqual(
+            RECORDER.UNBOUND_SOURCE_FILES,
+            {"crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py"},
+        )
+        # The verifier loses its transcript binding but keeps its in-place
+        # repairable manifest pin, which `validate_manifest` still enforces.
+        self.assertIn("verify_adapter_parity_artifacts.py", manifest["scripts"])
+
     def test_residual_diagnostic_uses_exact_sanitized_runs(self):
         runs = RECORDER.residual_diagnostic_runs(self.valid_manifest())
         self.assertEqual(
