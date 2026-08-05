@@ -8,8 +8,8 @@ name: Real-weight validation
 # keep moving, and it should not cost a workflow PR each time.
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos
-#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   BOTH boxes
+#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  BOTH boxes
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
 #   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
@@ -28,26 +28,45 @@ name: Real-weight validation
 # ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
 # measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
 #
-# `rw-mage` is pinned to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB
-# frozen-Torch oracle bundle behind `MAGE_ORACLE_SEED_DIR`, which exists on no Hub and which this
-# workflow deliberately refuses to regenerate in Actions. Every other set self-provisions on first
-# use, so its label can move freely.
+# `rw-mage` IS NOT PINNED — it is registered on BOTH boxes. This block used to claim it was "pinned
+# to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB frozen-Torch oracle bundle
+# behind `MAGE_ORACLE_SEED_DIR`". A label is not a pin, and this one is on both: observed 2026-08-05
+# (sc-17284) when `mlx-qwen-image-producers` ran on `nax-macos-2` with
+# `labels=self-hosted,macOS,ARM64,rw-mage`, which a runner cannot accept unless it carries every
+# requested label.
 #
+# What IS true about the bundle is the invariant that replaces the pin. `MAGE_ORACLE_SEED_DIR` is
+# `~/Library/Application Support/SceneWorks/oracles/sc-14052-mage-flow` — a `~/`-relative value
+# resolved per-runner by `resolve_snapshot_paths.py`, so it is ONE setting naming a DIFFERENT
+# directory on each box. It exists on no Hub and this workflow deliberately refuses to regenerate it
+# in Actions, so it cannot self-heal. Therefore: **every box carrying `rw-mage` must have the bundle
+# provisioned by hand, and adding the label to a box without it is what actually breaks `mlx-media`
+# — not moving the label around.**
+#
+# Both boxes have the bundle, confirmed 2026-08-05. `nax-macos` was checked from a shell on the box:
+# 461 MB, all 18 required files present as regular non-symlink files, which is exactly what `Require
+# operator-provisioned Mage oracle seed` demands. `nax-macos-2` was confirmed by direct operator
+# inspection, which is the strongest check available — no job or script in this repo can read that
+# box's filesystem. That step remains the enforcement: it fails closed with a named error on a cache
+# miss, so a box that quietly loses its copy surfaces as a red `mlx-media`, never a wrong oracle.
+
 # `rw-sa3` stores nothing between runs (it materializes into `RUNNER_TEMP`), so it is the free
 # rebalancing knob: move it to shift ~83 min of wall clock without moving a single stored byte.
 # It does need the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
 #
-# The sc-17284 Qwen/FLUX set is the largest row here. It transferred almost nothing onto the box —
-# all of it but the two ~0.85 GB Lightning LoRAs was already resident on nax-macos, and it is a large
-# part of why that box is at 98% (sc-17271). But "already there" is not "free": these bytes were
-# opportunistic app/dev cache that could be reclaimed, and wiring them makes them CI-REQUIRED. The
-# 31.4 GiB FLUX.1-dev snapshot in particular changes status here, because `flux-1-dev` gains
-# `media-macos`. Measured 2026-08-04 with `du -sh` over the nine `models--*` repo dirs; the two jobs
-# together consume ~131 GiB of that (the `q4` Qwen tier is stored but no wired test selects it).
+# The sc-17284 Qwen/FLUX set is the largest row here and it transferred almost nothing: all of it
+# but the two ~0.85 GB Lightning LoRAs was already resident. "Already there" is still not "free" —
+# these were opportunistic app/dev cache that could be reclaimed, and wiring them makes them
+# CI-REQUIRED; the 31.4 GiB FLUX.1-dev snapshot in particular changes status because `flux-1-dev`
+# gains `media-macos`. Measured 2026-08-04 with `du -sh` over the nine `models--*` repo dirs on
+# `nax-macos`; the two scheduled jobs consume ~131 GiB of that (`q4` is stored, no wired test
+# selects it).
 #
-# It shares `rw-mage` rather than taking an `rw-qwen` of its own only because a label no runner
-# carries queues silently (see below) — the set has no oracle-bundle pin, so splitting it out is a
-# one-line change here plus an org-settings change the moment the budget wants it on the other box.
+# THE TWO BOXES ARE NOT EQUALLY TIGHT, so read that cost per host. `nax-macos` is the 98% box
+# (sc-17271). `nax-macos-2` reported 1.0 TiB free at 45% capacity on 2026-08-05, with the 85 GiB
+# `qwen-image-mlx` re-host already resident there too — measured by this lane's own
+# `report_runner_disk_headroom.sh` step, which is what that step is for. The other six models in
+# the set are NOT confirmed on `nax-macos-2`; a job landing there materializes whatever is missing.
 #
 # A LABEL NO RUNNER CARRIES DOES NOT FAIL — IT QUEUES, SILENTLY, UNTIL THE RUN IS CANCELLED.
 # Retiring a box means moving its labels first.
@@ -1639,10 +1658,15 @@ jobs:
     name: MLX Qwen-Image real-weight producers (operator dispatch)
     if: inputs.profile == 'qwen-image-producers'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    # MEASURED IN CI at 1618 s of test time / 32m32s for the job (run 30959809619), NOT the 485 s I
-    # measured warm on the same box — a 3.3x cold-cache multiple, the same shape the PiD lane showed.
-    # 60 leaves 1.8x headroom on the job, which is the thinnest margin of the three; if this ever
-    # brushes the cap it is the one to raise, and it is a producer, so raising it is cheap.
+    # MEASURED IN CI TWICE, on different boxes, and the spread is the point:
+    #   nax-macos    1618 s of test time / 32m32s job   (run 30959809619)
+    #   nax-macos-2   370 s of test time /  6m43s job   (run 31050459516)
+    # Same test, same tier, same resident weights — a 4.4x spread that is HOST variance, not cold
+    # cache. `rw-mage` is carried by both boxes, so this job's wall clock depends on which one takes
+    # it and on what else that machine is doing (nax-macos also runs dev work outside Actions). Size
+    # the cap against the SLOW host: 60 leaves 1.8x headroom over 32m32s, the thinnest of the three
+    # jobs. If any of them ever brushes its cap, raise this one first — it is a producer, so the
+    # cost of a generous cap here is low.
     timeout-minutes: 60
     env:
       QWEN_IMAGE_MLX_SNAPSHOT: ${{ vars.QWEN_IMAGE_MLX_SNAPSHOT }}
