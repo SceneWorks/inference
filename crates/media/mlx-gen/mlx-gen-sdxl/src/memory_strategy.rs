@@ -407,7 +407,19 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 ///
 /// Five of six configurations are flat to the millibyte. **The sixth is not, and it is the advertised
 /// `min_size`** — which is exactly where the phase-separation argument below says the flatness should
-/// fail, so it is a confirmed prediction rather than an anomaly. Note the 512² q8 row is also
+/// fail, so it is a confirmed prediction rather than an anomaly.
+///
+/// **Read this table as an observation, not as a gated invariant.** Only the first row of it — the
+/// default tier at the default geometry — is asserted by CI. The other five, including the 512² q8
+/// row the default rests on, are produced by running the sweep under `SDXL_WINDOW_PROBE_TIER` /
+/// `SDXL_WINDOW_PROBE_SIZE`, and in that mode the flatness and wall-clock assertions are *reported*
+/// rather than asserted. That is deliberate: the 512² row is non-monotonic and allocator-influenced,
+/// so pinning it would be pinning noise, and a test that asserted flatness there would have to
+/// assert it false — a gate on a number nobody should depend on. The consequence is worth stating
+/// plainly rather than leaving for a reader to discover: **the evidence for the default cadence
+/// lives in this prose and in the probe command that reproduces it, not in a red test.** A future
+/// change that quietly made 512² flat again would not redden anything; it would make this paragraph
+/// wrong, and only re-running the probe would show it. Note the 512² q8 row is also
 /// *non-monotonic* (cadence 2 beats cadence 1; cadence 5 is worst), which is allocator behaviour at a
 /// small working set rather than a clean weight-residency effect — one more reason not to build a
 /// default on it.
@@ -518,6 +530,11 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// this file overrode it on evidence that turned out to be one tier at one geometry explained by the
 /// wrong mechanism.
 ///
+/// One caveat on the evidence, stated because it bears on how much weight the next reader should put
+/// on it: the 512² q8 row is a **probe-mode observation**, not an asserted invariant — see
+/// [`TRANSFORMER_WINDOW_SIZES`]. Reproduce it with
+/// `SDXL_WINDOW_PROBE_TIER=q8 SDXL_WINDOW_PROBE_SIZE=512` before changing this constant.
+///
 /// So the default is the **conservative** choice — the tightest weight bound, which is also what
 /// every other MLX adopter on this ladder defaults to. The other three cadences remain published and
 /// selectable, and at 1024² a selector that does not need the tighter bound should absolutely pick 10
@@ -544,9 +561,11 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// Load shape is a typed evidence-key axis carried separately on [`MemoryCalibrationIdentity`]; this
 /// content fingerprint stays shape-independent.
 /// `v2` because the rung-4 parameter domain changed shape: [`TRANSFORMER_WINDOW_SIZES`] went from
-/// one cadence to four and [`TRANSFORMER_WINDOW_SIZE`] moved from the tightest to the widest.
-/// Evidence generated against the single-cadence draft describes a different set of selectable
-/// executions — and a different default execution — so it must not be reusable here.
+/// one cadence to four. Evidence generated against the single-cadence draft describes a different
+/// set of *selectable executions*, so it must not be reusable here — the domain change alone
+/// justifies the bump. [`TRANSFORMER_WINDOW_SIZE`] is unchanged at **1**, the tightest; an
+/// intermediate draft of this story moved it to 10 and an earlier version of this note was written
+/// against that draft.
 ///
 /// **The paired evidence must be keyed per cadence, not per rung.** The cadences differ by up to 2.7×
 /// in wall clock, and — at 512² q8 — by 5.7% in peak, so a selector weighing peak against time needs
@@ -1300,9 +1319,11 @@ mod tests {
                 "window {bad} must be refused"
             );
         }
-        // The request-side default is the widest cadence, not the tightest — a request that engages
-        // rung 4 without naming a size must not silently get the most expensive point on the
-        // frontier. This is the resolver half of `TRANSFORMER_WINDOW_SIZE`'s claim.
+        // The request-side default is the TIGHTEST cadence — a request that engages rung 4 without
+        // naming a size must get the weight bound this provider can always make good on, not the
+        // point that is cheapest at the geometries that happen to have been measured. This is the
+        // resolver half of `TRANSFORMER_WINDOW_SIZE`'s claim; the assertion below is the other half,
+        // and the two must not be allowed to drift apart.
         assert_eq!(
             transformer_window_size(&request(windowed(None, None))).unwrap(),
             Some(TRANSFORMER_WINDOW_SIZE as usize)
@@ -1390,9 +1411,13 @@ mod tests {
             (TRANSFORMER_WINDOW_SIZES[0] as usize) < 2,
             "the tightest published cadence must bound the 2-deep sub-stacks"
         );
-        // Ascending and duplicate-free. The assertion above indexes `[0]` for "tightest" and
-        // `TRANSFORMER_WINDOW_SIZE` is checked against `.last()` for "widest", so the ordering is
-        // load-bearing rather than cosmetic.
+        // Ascending and duplicate-free, and the ordering is load-bearing rather than cosmetic:
+        // THREE separate invariants read a position and mean a superlative by it. `[0]` is "the
+        // tightest" both just above (it must bound the 2-deep sub-stacks) and in
+        // `the_request_side_window_resolver_refuses_out_of_domain_cadences`, where
+        // `TRANSFORMER_WINDOW_SIZE` must equal it.
+        // `.last()` is "the widest", checked just below against `widest_transformer_stack()`.
+        // An unsorted domain would silently redirect all three at the wrong element.
         assert!(
             TRANSFORMER_WINDOW_SIZES.windows(2).all(|w| w[0] < w[1]),
             "the domain must be strictly ascending: {TRANSFORMER_WINDOW_SIZES:?}"

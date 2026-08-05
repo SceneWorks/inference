@@ -1049,12 +1049,18 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         rows.len() >= 2,
         "a cadence sweep needs at least two published cadences to compare; got {rows:?}"
     );
-    // (a) Every cadence bounds the peak to the SAME value. This is the finding the multi-value
-    //     domain rests on: the wider cadences give up no memory, so the latency they buy back is
-    //     free. 1% is far outside the observed spread — the peak rows reproduce to the millibyte
-    //     across four runs — so unlike the latency margins this one is tight on purpose. If a
-    //     future change makes the peak cadence-sensitive, the domain needs per-cadence calibration
-    //     and this reddens to say so.
+    // (a) Every cadence bounds the peak to the SAME value — **at this configuration, where the
+    //     decode is the peak-bearing phase.** So here the wider cadences give up no memory and the
+    //     latency they buy back is free. That is a property of the configuration and NOT of the
+    //     family: at 512² q8 the decode transient no longer dominates, the spread opens to 5.7% and
+    //     goes non-monotonic, which is why this assertion is skipped in probe mode rather than
+    //     relaxed, and why the DEFAULT is the tightest cadence rather than the cheapest one. See
+    //     `ms::TRANSFORMER_WINDOW_SIZES` for the mechanism and the condition it depends on.
+    //
+    //     1% is far outside the observed spread at the default configuration — the peak rows
+    //     reproduce to the millibyte across four runs — so unlike the latency margins this one is
+    //     tight on purpose. If a future change makes the peak cadence-sensitive *here*, the domain
+    //     needs per-cadence calibration and this reddens to say so.
     let (tightest, tight_peak, tight_ms) = rows[0];
     let (widest, _wide_peak, wide_ms) = *rows.last().expect("at least one row");
     for (window, peak, _) in &rows {
@@ -1069,9 +1075,12 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         assert!(
             (peak - tight_peak).abs() < tight_peak * 0.01,
             "cadence {window} peaked at {peak:.4} GiB against cadence {tightest}'s {tight_peak:.4} \
-             — the published domain claims every cadence bounds the peak identically, which is why \
-             the widest is the default. If that is genuinely no longer true, the domain owes \
-             per-cadence evidence and the default must be revisited"
+             — the published domain claims every cadence bounds the peak identically AT THIS \
+             CONFIGURATION, which is what lets a selector trade cadence for latency here without \
+             re-calibrating. (It is not why cadence {tightest} is the default: the default is the \
+             tightest weight bound, the one this provider can make good on at every advertised \
+             geometry, and 512² q8 is already measured non-flat.) If this row is genuinely no \
+             longer flat, the flat region has moved and the domain owes fresh per-cadence evidence"
         );
     }
     // (b) And widening it buys time back. Measured 3654 -> 1318 ms/step (2.77x) at 1024² and
