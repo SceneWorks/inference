@@ -165,22 +165,30 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
-    let streamable = is_streamable(spec);
+    let staged = matches!(spec.offload_policy, OffloadPolicy::Sequential);
+    // Rung 4 needs BOTH load-time facts AND rung 1, whose own availability IS the `Sequential`
+    // policy — declaring it on a Resident load would advertise a composition its own declared
+    // prerequisite could never satisfy. ONE binding, so the capability, the lifecycle hook and the
+    // formula variable cannot disagree about whether a window can run on this load.
+    let windowed = is_streamable(spec) && staged;
+    let mut variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+    ];
+    if windowed {
+        variables.push(MemoryFormulaVariable::TransformerWindowSize);
+    }
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
             MemoryPhase::Conditioning,
             MemoryPhase::Denoise,
             MemoryPhase::Decode,
         ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::DecodeTileArea,
-            MemoryFormulaVariable::AttentionChunkSize,
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+        variables,
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         calibration_fingerprint(spec.offload_policy),
@@ -201,13 +209,12 @@ fn contract_with_asset_facts(
         synchronized_phase_release: matches!(spec.offload_policy, OffloadPolicy::Sequential),
         decode_tiling: true,
         attention_chunking: true,
-        transformer_window_materialization: streamable,
+        transformer_window_materialization: windowed,
     };
     // Sequential loads ship the measured bounded-decode default. An explicit shared-contract
     // Resident selection must therefore write an all-disabled request block to override it.
     contract.resident_request_memory = ResidentRequestMemory::ExplicitResident;
 
-    let staged = matches!(spec.offload_policy, OffloadPolicy::Sequential);
     for strategy in [
         MemoryStrategy::StagedResidency,
         MemoryStrategy::BoundedDecode,
@@ -224,10 +231,7 @@ fn contract_with_asset_facts(
             MemoryStrategy::BoundedDecode | MemoryStrategy::BoundedAttention => {
                 MemoryStrategySupport::Implemented
             }
-            // Rung 4 needs BOTH load-time facts AND rung 1, whose own availability is the
-            // `Sequential` policy — declaring it on a Resident load would advertise a composition
-            // its declared prerequisite can never satisfy.
-            MemoryStrategy::BoundedTransformerResidency if streamable && staged => {
+            MemoryStrategy::BoundedTransformerResidency if windowed => {
                 MemoryStrategySupport::Implemented
             }
             _ => MemoryStrategySupport::Missing,
@@ -254,7 +258,7 @@ fn contract_with_asset_facts(
             _ => MemoryParameterRanges::default(),
         };
     }
-    if streamable && staged {
+    if windowed {
         // Rung 4 holds ~95 MiB of trunk weights instead of ~1.85 GiB, but that only moves the
         // REQUEST peak if the phases it does not bound have already been shed. `engages` does not
         // supply this edge (rung 4 does not engage rung 1 universally), so the provider declares it.
@@ -649,6 +653,10 @@ mod tests {
                 "a load that cannot stream must not advertise rung 4"
             );
             assert!(!contract.lifecycle.transformer_window_materialization);
+            let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &contract.formula else {
+                panic!("SANA declares a phase envelope")
+            };
+            assert!(!variables.contains(&MemoryFormulaVariable::TransformerWindowSize));
             assert!(
                 !contract
                     .requires(MemoryStrategy::BoundedTransformerResidency)
@@ -684,6 +692,15 @@ mod tests {
                 .support,
             MemoryStrategySupport::Missing
         );
+        // The capability, the lifecycle hook and the formula variable are ONE binding: a contract
+        // that withheld the rung but kept advertising the hook or the variable would tell a caller
+        // its peak depends on a cadence it cannot select.
+        assert!(!resident.lifecycle.transformer_window_materialization);
+        let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &resident.formula else {
+            panic!("SANA declares a phase envelope")
+        };
+        assert!(!variables.contains(&MemoryFormulaVariable::TransformerWindowSize));
+        assert!(variables.contains(&MemoryFormulaVariable::AttentionChunkSize));
     }
 
     /// **Every published parameter is refused outside its domain, on the production layer.**
