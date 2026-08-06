@@ -1379,7 +1379,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
             "workflow_dispatch"
         ]["inputs"]
-        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDFEZ")
+        # NOT the full ABCDFEZ. sc-17324 established by measurement that two rows cannot run on
+        # this lane's runner at the pinned 832x480: F (~49 GiB) took nax-macos-2 down twice and
+        # belongs at 640x384, and E (~63-69 GiB) is unmeasurable on this infrastructure at either
+        # bucket. The memory preflight refuses both, so defaulting to all seven would be a default
+        # that always fails. Pinned so the convenience of "just put them back" has to argue with
+        # two crashed runners first.
+        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDZ")
+        self.assertNotIn("E", inputs["krea_s18_rows"]["default"])
+        self.assertNotIn("F", inputs["krea_s18_rows"]["default"])
         self.assertEqual(inputs["krea_s18_seeds"]["default"], "7,11,23")
         # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
         self.assertIn("set -o pipefail", job)

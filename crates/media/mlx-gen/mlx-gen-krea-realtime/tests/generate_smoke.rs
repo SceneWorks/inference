@@ -2616,15 +2616,26 @@ fn eviction_rolls(latent_frames: usize, frames_per_block: usize, window: i64) ->
 /// exactly the ~27 GB-of-KV problem [`mac_ar_config`](mlx_gen_krea_realtime::mac_ar_config) exists to
 /// dodge, so its cost is a finding rather than a harness bug.
 ///
-/// **Correction (sc-17324).** This block used to say row E *SIGKILLs* a 128 GiB host at 832×480
-/// (sc-15127: jetsam at step 39/75) and to tell you to run it only at 640×384. That is no longer
-/// true, and following it would skip the row at the shipping bucket for no reason. CI run
-/// 30787887176 (2026-08-03, `nax-macos`, a 128 GiB host) ran row E to completion at 832×480:
-/// `S18CELL E 7 832x480 45 0 55.7356 ...` at a **63.32 GiB** MLX active peak in ~17.5 min. `n = 1`
-/// at this bucket so far, but one completion falsifies "SIGKILLs a 128 GiB host" outright. The
-/// original measurement predates the memory work since sc-15127; the 38 GiB KV figure above still
-/// holds, it simply fits now. 640×384 remains the cheaper place to run it (960 tok/frame → 43,200
-/// tokens ≈ 15 GiB). The bounded rows run at both buckets, and **both buckets are recorded** — see
+/// **Row E is UNMEASURABLE on current infrastructure — decided in sc-17324. Do not keep retrying it.**
+///
+/// The older claim here was that row E *SIGKILLs* a 128 GiB host at 832×480 (sc-15127: jetsam at
+/// step 39/75). That is too strong: CI run 30787887176 (2026-08-03, `nax-macos`, 128 GiB) ran it to
+/// completion at 832×480 — `S18CELL E 7 832x480 45 0 55.7356 ...`, a **63.32 GiB** MLX active peak,
+/// ~17.5 min. But it fit that box by roughly 0.3 GiB, and sc-15571 records it driving a host into
+/// enough swap to fill the boot volume even at 640×384. On `nax-macos-2` (~101 GiB, where the
+/// `rw-krea` lane actually runs) it fits at neither bucket.
+///
+/// So row E is neither impossible nor fine — it is a row with no reproducible home, which is worth
+/// naming once rather than rediscovering. `scripts/ci/s18_memory_preflight.py` refuses it by default
+/// on both hosts and `krea_s18_rows` no longer includes it. **Nothing downstream depends on it:**
+/// [`S18Sweep::verdict`] already declines to use row E as attribution evidence (out of regime,
+/// different attention mask, n = 1, no variance estimate), so a sweep without it loses a reference,
+/// not a conclusion.
+///
+/// Row **F** is a different case with a real answer: 46,800 tokens ≈ 49 GiB at 832×480 took
+/// `nax-macos-2` down twice (runs 30948568453 and 31051413212, both inside row F seed 7), but at
+/// 640×384 it needs ~34 GiB and fits — the bucket the recorded sc-15127 sweep already used for it.
+/// The bounded rows run at both buckets, and **both buckets are recorded** — see
 /// [`the_recorded_s18_sweep_is_what_the_docs_claim`].
 ///
 /// ⚠️ Must be run on a tree that has sc-15325 (the tiled-decode fix). Before it, the decode injected an

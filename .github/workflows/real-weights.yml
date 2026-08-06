@@ -148,7 +148,17 @@ on:
         description: "S18 sweep rows (krea-s18-sweep only): subset of ABCDFEZ, e.g. AD for one dispatch"
         type: string
         required: false
-        default: ABCDFEZ
+        # NOT ABCDFEZ — F and E do not fit on this lane's runner at the pinned 832x480, and the
+        # preflight refuses them, so a default of all seven would be a default that always fails.
+        # sc-17324, from measurement:
+        #   * F (30-frame window, 46,800 tokens, ~49 GiB) killed nax-macos-2 twice. Run it at
+        #     KREA_SMOKE_W=640 KREA_SMOKE_H=384, where it needs ~34 GiB — the bucket the recorded
+        #     sc-15127 sweep already used for it.
+        #   * E (global window, 70,200 tokens, ~63-69 GiB) is UNMEASURABLE on this infrastructure.
+        #     It fit the 128 GiB dev Mac by 0.3 GiB and fills a boot volume with swap even at
+        #     640x384 (sc-15571). It is a reference row the verdict rule explicitly refuses to use
+        #     as attribution evidence, so nothing downstream depends on having it.
+        default: ABCDZ
       krea_s18_seeds:
         description: "S18 sweep seeds (krea-s18-sweep only): comma-separated; 2+ for a between-seed spread"
         type: string
