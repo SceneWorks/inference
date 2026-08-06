@@ -28,6 +28,7 @@
 //! separately as a per-provider `additional_prerequisites` entry, because
 //! [`MemoryStrategy::engages`] does **not** make rung 4 engage rung 1 universally.
 
+use mlx_gen::asset_facts::ResidentProjection;
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, GenerationMemory,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
@@ -98,6 +99,33 @@ fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
     )
 }
 
+/// Price the DC-AE decoder at its **resident** width rather than its stored one (the sc-15839
+/// class), falling back to the stored sum when the component is not on disk.
+///
+/// [`crate::dc_ae::DcAeDecoder::from_weights`] and its encoder twin `as_dtype(Float32)` every conv
+/// weight, bias and norm they read, on every load, unconditionally — the same shape as
+/// `mlx_gen_sdxl::load_vae`'s `cast_all(Float32)`, which sc-15839 measured as a **2x underprice at
+/// every tier**.
+///
+/// Every SANA tier shipped so far already stores the DC-AE in f32, so this projection is IDENTITY
+/// today. That is exactly why it is written down instead of left implicit: a narrower VAE in some
+/// future tier would be underpriced by 2x from the moment it shipped, and an underpriced decoder
+/// reads as a memory regression in the engine rather than as a pricing bug in the contract. The
+/// trunk and the Gemma-2 caption encoder stay [`ResidentProjection::Stored`] — both keep their
+/// on-disk width (packed tiers load packed; the dtype casts in those two components are all on
+/// activations, never on a retained weight).
+fn resident_decoder_bytes(spec: &LoadSpec, stored: u64) -> u64 {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return stored;
+    };
+    let vae = root.join("vae");
+    if !vae.is_dir() {
+        return stored;
+    }
+    mlx_gen::asset_facts::projected_safetensors_bytes(&vae, |_| ResidentProjection::Float32)
+        .unwrap_or(stored)
+}
+
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -108,7 +136,7 @@ pub fn memory_strategy_contract(
         spec,
         components.text_encoder,
         components.dit,
-        components.vae,
+        resident_decoder_bytes(spec, components.vae),
     )
 }
 
@@ -284,6 +312,12 @@ pub(crate) fn validate_request_memory(
                  directory loaded with DeferredMaterialization and no adapters"
             )));
         }
+        // Rung 4's declared `EngagedInSameRequest` prerequisite, enforced rather than documented.
+        // SANA's rung 1 is a LOAD-time mechanism (the `Sequential` policy drives the shared
+        // `Residency` seam; sc-16783 measured and published it that way), so `is_streamable` above
+        // plus the contract's `Sequential`-only rung-4 declaration already guarantee the mechanism
+        // is running. This check is the other half: the SELECTION must say so too, or a caller
+        // could compose a request the selector can never produce and get a peak nobody predicted.
         if !memory.stage_residency {
             return Err(CoreError::Unsupported(format!(
                 "{provider_id}: bounded transformer residency requires staged residency engaged in \
