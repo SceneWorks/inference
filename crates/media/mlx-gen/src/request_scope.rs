@@ -496,6 +496,11 @@ mod tests {
                 include_str!("../mlx-gen-mage/src/model.rs"),
                 "MageFlowConfig::mage_flow().depth",
             ),
+            (
+                "sana",
+                include_str!("../mlx-gen-sana/src/memory_strategy.rs"),
+                "SanaTransformerConfig::sana_1600m().num_layers",
+            ),
         ] {
             assert!(
                 source.contains("request_scope::MlxRequestScopeCore::"),
