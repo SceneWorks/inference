@@ -665,6 +665,104 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    /// A snapshot with the trunk as well as the two block stacks, so a whole
+    /// [`crate::transformer::ChromaTransformer`] can be built without the 14 GB tier. Shapes are
+    /// nominal — `from_weights` validates presence and the pruned-adaLN invariant, not dimensions.
+    fn trunk_fixture(tag: &str) -> (std::path::PathBuf, ChromaTransformerConfig) {
+        let path = fixture(tag);
+        let mut cfg = cfg();
+        cfg.approximator_layers = 2;
+        cfg.approximator_hidden_dim = 16;
+        cfg.approximator_num_channels = 8;
+        let inner = cfg.inner_dim() as i32;
+        let hidden = cfg.approximator_hidden_dim as i32;
+
+        let existing = mlx_gen::weights::Weights::from_file(&path).unwrap();
+        let mut named: Vec<(String, Array)> = existing
+            .keys()
+            .map(|k| (k.to_owned(), existing.get(k).unwrap().clone()))
+            .collect();
+        let linear = |named: &mut Vec<(String, Array)>, prefix: &str, out: i32, input: i32| {
+            named.push((format!("{prefix}.weight"), tensor(vec![out, input], 1.0)));
+            named.push((format!("{prefix}.bias"), tensor(vec![out], 1.0)));
+        };
+        linear(&mut named, "x_embedder", inner, cfg.in_channels as i32);
+        linear(
+            &mut named,
+            "context_embedder",
+            inner,
+            cfg.joint_attention_dim as i32,
+        );
+        linear(&mut named, "proj_out", cfg.in_channels as i32, inner);
+        let p = "distilled_guidance_layer";
+        linear(
+            &mut named,
+            &format!("{p}.in_proj"),
+            hidden,
+            4 * cfg.approximator_num_channels as i32,
+        );
+        linear(&mut named, &format!("{p}.out_proj"), inner, hidden);
+        for i in 0..cfg.approximator_layers {
+            linear(
+                &mut named,
+                &format!("{p}.layers.{i}.linear_1"),
+                hidden,
+                hidden,
+            );
+            linear(
+                &mut named,
+                &format!("{p}.layers.{i}.linear_2"),
+                hidden,
+                hidden,
+            );
+            named.push((format!("{p}.norms.{i}.weight"), tensor(vec![hidden], 1.0)));
+        }
+        let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        Array::save_safetensors(refs, None, &path).unwrap();
+        (path, cfg)
+    }
+
+    /// **`quantize` after the stream is armed must refuse, not silently pack nothing** (review of
+    /// PR #496).
+    ///
+    /// The production order is quantize → adapt → arm, and it is correct. But
+    /// `ChromaTransformer::quantize` is `pub`, and after arming both stacks are evicted, so its
+    /// loops iterate empty vectors: it would return `Ok(())` having packed nothing while every
+    /// streamed block was rebuilt dense from a snapshot the caller believes it quantized.
+    #[test]
+    fn quantizing_after_the_stream_is_armed_is_refused() {
+        let (path, cfg) = trunk_fixture("quant-order");
+        let build = || {
+            let view = mlx_gen::weights::Weights::from_file(&path).unwrap();
+            crate::transformer::ChromaTransformer::from_weights(view, cfg)
+                .expect("build the tiny transformer")
+        };
+
+        let mut armed = build().with_block_stream(WeightsSource::File(path.clone()));
+        armed.finalize_block_stream().expect("arm and evict");
+        assert_eq!(armed.resident_block_counts(), (0, 0));
+        let error = match armed.quantize(8) {
+            Ok(()) => panic!("quantize after arming packed nothing and reported success"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("after the block stream is armed"),
+            "the refusal must name the ordering, got: {error}"
+        );
+
+        // The discriminating control: an UNARMED transformer never reaches this guard. Its
+        // `quantize` may still fail on these nominal shapes, but never with the ordering message —
+        // without this the assertion above would pass on a `quantize` that always errored.
+        let unarmed = build().quantize(8).err().map(|e| e.to_string());
+        assert!(
+            !unarmed
+                .as_deref()
+                .is_some_and(|e| e.contains("after the block stream is armed")),
+            "an unarmed transformer must not hit the ordering guard, got: {unarmed:?}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     #[test]
     fn eviction_is_all_or_nothing_and_shape_checked() {
         let cfg = cfg();

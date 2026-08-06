@@ -795,6 +795,17 @@ impl ChromaTransformer {
     /// distilled-guidance Approximator (which drives all modulation) — stay dense, mirroring the
     /// "quantize the big GEMMs" convention. T5/VAE are quantized separately by the loader (if at all).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        // Quantizing AFTER the block stream is armed would pack nothing: both stacks are evicted, so
+        // the loops below are no-ops and every streamed block would be rebuilt dense from a snapshot
+        // the caller believes it quantized. The production order (quantize, adapt, then arm) is
+        // correct; this refuses the inverted one rather than documenting it (SC-15520).
+        if self.block_stream.is_some() && self.double_blocks.is_empty() {
+            return Err(Error::Unsupported(
+                "chroma: cannot quantize after the block stream is armed — both stacks are evicted, \
+                 so the block linears would be silently skipped. Quantize first, then arm the stream"
+                    .to_owned(),
+            ));
+        }
         for b in &mut self.double_blocks {
             b.quantize(bits)?;
         }
