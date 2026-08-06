@@ -28,7 +28,7 @@
 //! A window plan is re-walked **once per forward**, and the guided-velocity modes run several full
 //! forwards per step (`VitMode::VaeTxtVitWapg`, the `bernini_image` default, runs 4). At 40 steps that
 //! is `40 blocks x 40 steps x 4 passes = 6400` window materializations per render against ONE expert
-//! — an order of magnitude above the 240x that [`gen_core::block_window`]'s own docs use as their
+//! — an order of magnitude above the 240x that `gen_core::block_window`'s own docs use as their
 //! cautionary arithmetic. That is a latency consequence to price into the chosen window size, not a
 //! correctness problem, and it is the reason the published domain here starts at a wide cadence rather
 //! than at 1.

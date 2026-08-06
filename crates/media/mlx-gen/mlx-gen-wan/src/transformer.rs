@@ -395,8 +395,7 @@ fn sdpa_maybe_checkpoint(
             scale,
             None,
             AttentionPlan::budgeted(budget),
-        )
-        .map_err(Error::from);
+        );
     }
     let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
         Ok(vec![scaled_dot_product_attention(
@@ -1007,6 +1006,7 @@ impl WanTransformer {
     /// `cross_kv` must already be the full per-block cache (build it once per generate with
     /// [`WanBlockStream::prepare_cross_kv_windowed`](crate::block_stream::WanBlockStream::prepare_cross_kv_windowed)
     /// on a deferred stack); it is small and legitimately resident, so it is not re-derived per window.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_packed_windowed(
         &self,
         tokens: &Array,

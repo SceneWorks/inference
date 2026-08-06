@@ -99,7 +99,7 @@ const STATIC_CALIBRATION: &str = "bernini-mlx-registry-behavior-v1";
 
 /// The production calibration identity, minted once a cell has real-weight evidence behind it.
 ///
-/// Not yet returned by [`production_calibration_fingerprint`] for any load: no `MEMORY_EVIDENCE_V1`
+/// Not yet returned by `production_calibration_fingerprint` for any load: no `MEMORY_EVIDENCE_V1`
 /// record exists for this family. Until one does, `contract_for` carries `calibration: None`, which
 /// is what makes `MemoryEvidence::optimized_eligibility` refuse every optimized fit — the resident
 /// path still runs, and no selector can claim a verified saving this repository cannot show.
@@ -966,9 +966,10 @@ mod tests {
             transformer_window_component: Some(TransformerComponent::TextEncoder),
             ..Default::default()
         });
-        let error = transformer_window_size(&scope)
-            .err()
-            .expect("TextEncoder scope is not implemented");
+        let error = match transformer_window_size(&scope) {
+            Ok(_) => panic!("the TextEncoder scope is not implemented and must be refused"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("TextEncoder"), "{error}");
 
         // Rung 4 defaulting: an enabled block with no cadence takes the published default, not 1.
