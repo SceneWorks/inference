@@ -42,8 +42,14 @@ const DENSE_KV_BITS: usize = 16;
 ///
 /// The KV cache holds *activations*, not weights, so a Q4 DiT does not shrink it: for the Wan-14B
 /// backbone the shipped bf16 cache costs `2 (K and V) × 40 layers × 5120 dim × 2 bytes` =
-/// **819,200 bytes (800 KiB) per DiT token**, which for an autoregressive *video* model is the
-/// dominant term — not the ~9 GiB of Q4 weights (see [`KreaRealtimeConfig::kv_bytes_per_token`]).
+/// **819,200 bytes (800 KiB) per DiT token** (see [`KreaRealtimeConfig::kv_bytes_per_token`]).
+///
+/// Unlike the ~9 GiB of Q4 weights, that term **scales with the clip**, which is what makes it the
+/// lever. Precisely: at the shipped Mac bounded window (6 latent frames = 9,360 tokens at 832×480)
+/// the KV is 7.14 GiB — *comparable to* the weights, not yet dominant. It overtakes them at the
+/// first wider window and runs away from there: 17.9 GiB at 15 frames, 35.7 at 30, and 53.6 for the
+/// checkpoint's global window over a 45-frame clip. So "the KV dominates" is a statement about
+/// where this model goes, not about its smallest configuration.
 ///
 /// **How it is spent, and why not a quantized attention kernel.** MLX at the pinned revision exposes
 /// **no fused quantized SDPA**: `mlx_rs::fast::scaled_dot_product_attention` takes dense arrays, and
@@ -298,7 +304,7 @@ impl KreaRealtimeConfig {
             cfg.wan = WanModelConfig::from_config_json(&v);
             cfg.wan.model_version = "2.1".into();
             cfg.wan.dual_model = false;
-            overlay_ar(&v, &mut cfg.ar);
+            overlay_ar(&v, &mut cfg.ar)?;
         }
         Ok(cfg)
     }
@@ -318,7 +324,7 @@ impl KreaRealtimeConfig {
     ///
     /// Multiply by the retained window to get the cache: the Mac bounded window
     /// ([`streaming_local_attn_frames`](KreaArConfig::streaming_local_attn_frames) = 6 latent frames)
-    /// at 832×480 is `6 × 1560 = 9,360` tokens ⇒ **7.15 GiB** bf16, 3.80 GiB at Q8; the checkpoint's
+    /// at 832×480 is `6 × 1560 = 9,360` tokens ⇒ **7.14 GiB** bf16, 3.79 GiB at Q8; the checkpoint's
     /// global window over a 45-latent-frame clip is 70,200 tokens ⇒ **53.6 GiB** bf16.
     ///
     /// Errors when [`kv_cache_quant`](KreaArConfig::kv_cache_quant) names a tier MLX cannot express,
@@ -376,7 +382,14 @@ impl KreaRealtimeConfig {
 }
 
 /// Overlay any AR knobs explicitly present in a `config.json` onto the shipped defaults.
-fn overlay_ar(v: &Value, ar: &mut KreaArConfig) {
+///
+/// Every knob but one degrades silently on a malformed value — a non-numeric `sink_size` simply keeps
+/// the shipped default, which is the historical behaviour and stays that way. [`kv_cache_quant`] is
+/// the exception, and deliberately: silently degrading it means running at **1.9× the intended
+/// memory** while every log line and every recorded measurement says otherwise, which is the exact
+/// failure [`CausalKvCache::new`](crate::CausalKvCache::new) takes an explicit tier parameter to
+/// prevent. A snapshot that names the key must therefore name it correctly (sc-17807).
+fn overlay_ar(v: &Value, ar: &mut KreaArConfig) -> Result<()> {
     if let Some(n) = v.get("local_attn_size").and_then(Value::as_i64) {
         ar.local_attn_size = n;
     }
@@ -414,17 +427,35 @@ fn overlay_ar(v: &Value, ar: &mut KreaArConfig) {
         ar.context_noise = n as f32;
     }
     // An explicit `null` selects the shipped bf16 cache, so the key being *present* is what decides —
-    // a snapshot can turn the cache tier back off, not only on.
+    // a snapshot can turn the cache tier back off, not only on. Anything else present must be a
+    // well-formed tier: a half-written or mistyped one is an error, NOT a quiet fall back to bf16.
     if let Some(q) = v.get("kv_cache_quant") {
-        ar.kv_cache_quant = q
-            .get("bits")
-            .and_then(Value::as_i64)
-            .zip(q.get("group_size").and_then(Value::as_i64))
-            .map(|(bits, group_size)| KvCacheQuant {
-                bits: bits as i32,
-                group_size: group_size as i32,
-            });
+        ar.kv_cache_quant = if q.is_null() {
+            None
+        } else {
+            let field = |name: &str| -> Result<i32> {
+                q.get(name)
+                    .and_then(Value::as_i64)
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "krea-realtime: config.json `kv_cache_quant` is present but its \
+                             `{name}` is missing or not a 32-bit integer ({q}). Write both `bits` \
+                             and `group_size`, or use `null` for the shipped bf16 cache — a \
+                             malformed tier must not silently become bf16 and run at ~1.9x the \
+                             intended KV memory."
+                        ))
+                    })
+            };
+            let quant = KvCacheQuant {
+                bits: field("bits")?,
+                group_size: field("group_size")?,
+            };
+            quant.validate()?;
+            Some(quant)
+        };
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -629,7 +660,8 @@ mod tests {
         overlay_ar(
             &serde_json::from_str("{\"sink_size\": 1}").unwrap(),
             &mut ar,
-        );
+        )
+        .unwrap();
         assert_eq!(ar.kv_cache_quant, None);
         // An explicit null turns a quantized preset back off — the key's presence is what decides.
         let mut ar = KreaArConfig::krea_realtime_14b();
@@ -637,9 +669,71 @@ mod tests {
         overlay_ar(
             &serde_json::from_str("{\"kv_cache_quant\": null}").unwrap(),
             &mut ar,
-        );
+        )
+        .unwrap();
         assert_eq!(ar.kv_cache_quant, None);
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A malformed `kv_cache_quant` must be an ERROR, not a quiet fall back to bf16.**
+    ///
+    /// Every other AR knob degrades silently on a bad value, and that is fine — a non-numeric
+    /// `sink_size` keeping the shipped default costs nothing. This one is different: degrading it
+    /// silently means the run holds **1.9× the intended KV** while the config, the logs and any
+    /// recorded measurement all say `q8`. `CausalKvCache::new` takes an explicit tier parameter to
+    /// stop exactly that, and `config.json` is the only surface a product operator can reach the
+    /// knob through — so the parse has to be as strict as the constructor.
+    ///
+    /// Every case here returns `None` under the obvious `and_then(as_i64).zip(...)` form, which is
+    /// what makes them discriminating rather than decorative.
+    #[test]
+    fn a_malformed_kv_cache_quant_is_an_error_not_a_silent_bf16_downgrade() {
+        let parse = |json: &str| -> Result<Option<KvCacheQuant>> {
+            let mut ar = KreaArConfig::krea_realtime_14b();
+            overlay_ar(&serde_json::from_str(json).unwrap(), &mut ar)?;
+            Ok(ar.kv_cache_quant)
+        };
+
+        // Well formed: accepted.
+        assert_eq!(
+            parse(r#"{"kv_cache_quant": {"bits": 8, "group_size": 64}}"#).unwrap(),
+            Some(KvCacheQuant::Q8)
+        );
+        // Absent, or an explicit null: the shipped bf16 cache, no error.
+        assert_eq!(parse("{}").unwrap(), None);
+        assert_eq!(parse(r#"{"kv_cache_quant": null}"#).unwrap(), None);
+
+        // Half-written, mistyped, wrong JSON shape, or a tier MLX cannot express — all errors.
+        for bad in [
+            r#"{"kv_cache_quant": {"bits": 8}}"#,
+            r#"{"kv_cache_quant": {"group_size": 64}}"#,
+            r#"{"kv_cache_quant": {"bits": "8", "group_size": 64}}"#,
+            r#"{"kv_cache_quant": {"bits": 8.5, "group_size": 64}}"#,
+            r#"{"kv_cache_quant": 8}"#,
+            r#"{"kv_cache_quant": {}}"#,
+            r#"{"kv_cache_quant": {"bits": 7, "group_size": 64}}"#,
+            r#"{"kv_cache_quant": {"bits": 8, "group_size": 48}}"#,
+        ] {
+            let err = parse(bad)
+                .err()
+                .unwrap_or_else(|| panic!("`{bad}` must not parse to a silent bf16 cache"));
+            assert!(matches!(err, Error::Msg(_)), "`{bad}` -> {err:?}");
+        }
+
+        // ...and the same strictness reaches `from_model_dir`, which is the surface a snapshot uses.
+        let root =
+            std::env::temp_dir().join(format!("krea_realtime_badkvq_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"kv_cache_quant": {"bits": 8}}"#,
+        )
+        .unwrap();
+        assert!(
+            KreaRealtimeConfig::from_model_dir(&root).is_err(),
+            "a snapshot naming a half-written KV tier must fail to load, not load as bf16"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -689,7 +783,7 @@ mod tests {
         // An empty JSON object must not disturb any shipped AR default.
         let v: Value = serde_json::from_str("{}").unwrap();
         let mut ar = KreaArConfig::krea_realtime_14b();
-        overlay_ar(&v, &mut ar);
+        overlay_ar(&v, &mut ar).unwrap();
         assert_eq!(ar, KreaArConfig::krea_realtime_14b());
     }
 

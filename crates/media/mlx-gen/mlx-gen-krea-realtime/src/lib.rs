@@ -52,8 +52,9 @@
 //!   so long clips stay memory-feasible on Mac. Pure cache slicing.
 //! * [`causal`] — **sc-17807** makes the cache's *per-token cost* a knob on top of that *token count*.
 //!   The cache holds activations, so a Q4 DiT does not shrink it: a DiT token costs **800 KiB** of
-//!   bf16 KV ([`KreaRealtimeConfig::kv_bytes_per_token`]), which for an AR video model outweighs the
-//!   ~9 GiB of weights. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and
+//!   bf16 KV ([`KreaRealtimeConfig::kv_bytes_per_token`]) — comparable to the ~9 GiB of Q4 weights
+//!   at the shipped bounded window and several times larger at any wider one, because unlike the
+//!   weights it scales with the clip. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and
 //!   dequantizes the read window per layer (there is no fused quantized SDPA to attend over packed
 //!   K/V with — see [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`,
 //!   because a cheaper cache perturbs the same long-clip coherence sc-15127/sc-15571 measure and

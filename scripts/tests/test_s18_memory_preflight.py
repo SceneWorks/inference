@@ -204,6 +204,10 @@ class S18MemoryPreflightTests(unittest.TestCase):
             "row F fits nax-macos-2 once the KV is quantized",
         )
         self.assertEqual(run(["--rows", "A", "--ram-gib", "101", "--kv-bits", "7"]), 1)
+        # A non-numeric tier must produce the ::error:: exit path, not an uncaught traceback. `q8` is
+        # the LABEL; `8` is the value, and confusing the two is the obvious hand-run slip.
+        self.assertEqual(run(["--rows", "A", "--ram-gib", "101", "--kv-bits", "q8"]), 1)
+        self.assertEqual(run(["--rows", "A", "--ram-gib", "101", "--kv-group-size", "sixty4"]), 1)
 
 
 if __name__ == "__main__":

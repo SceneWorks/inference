@@ -2267,7 +2267,7 @@ jobs:
           KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}
           KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}
         run: |
-          # WxH[@q<bits>[/g<group>]] — the KV tier suffix is sc-17807's, and the preflight has to see
+          # WxH[@q<bits>] — the KV tier suffix is sc-17807's, and the preflight has to see
           # it or it prices the bf16 sweep while a q8 one runs and refuses rows that now fit.
           if [[ ! "$KREA_S18_GEOMETRY" =~ ^[0-9]+x[0-9]+(@q[0-9]+)?$ ]]; then
             echo "::error::krea_s18_geometry='$KREA_S18_GEOMETRY' must be WxH[@q<bits>], e.g. 832x480 or 640x384@q8" >&2

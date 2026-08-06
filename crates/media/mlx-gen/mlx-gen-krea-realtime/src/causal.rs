@@ -342,7 +342,9 @@ pub fn block_causal_mask(
 ///
 /// **Per-token cost (sc-17807).** The cache holds *activations*, so the DiT's weight tier does not
 /// shrink it: at the Wan-14B geometry a token of KV is `2 (K and V) × 40 layers × 5120 dim × 2 bytes`
-/// = **800 KiB**, which for an autoregressive video model dominates the ~9 GiB of Q4 weights. The
+/// = **800 KiB**. Unlike the ~9 GiB of Q4 weights that term scales with the clip: it is comparable
+/// to them at the shipped 6-frame bounded window (7.14 GiB) and several times larger at every wider
+/// one (35.7 GiB at 30 frames, 53.6 for a global window over a 45-frame clip). The
 /// storage representation is therefore a knob:
 /// [`KreaArConfig::kv_cache_quant`](crate::KreaArConfig::kv_cache_quant) selects group-wise affine
 /// quantization ([`KvCacheQuant`]) and the cache stores packed K/V, **dequantizing the read window

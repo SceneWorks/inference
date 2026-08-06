@@ -175,24 +175,28 @@ def main() -> int:
     p.add_argument("--ram-gib", type=float, default=None, help="override the detected host RAM")
     p.add_argument("--overhead-gib", type=float, default=NON_MLX_OVERHEAD_GIB)
     p.add_argument("--margin-gib", type=float, default=SAFETY_MARGIN_GIB)
+    # Read as STRINGS and convert below, inside the try. `default=int(os.environ[...])` evaluates at
+    # parser-construction time, so a malformed value there escapes as an uncaught traceback rather
+    # than the ::error:: line the caller can act on. The workflow's regex makes that unreachable via
+    # dispatch, but this script is also run by hand.
     p.add_argument(
         "--kv-bits",
-        type=int,
-        default=int(os.environ["KREA_S18_KV_BITS"]) if os.environ.get("KREA_S18_KV_BITS") else None,
+        default=os.environ.get("KREA_S18_KV_BITS") or None,
         help="KV cache quantization width (sc-17807); omit for the shipped bf16 cache",
     )
     p.add_argument(
         "--kv-group-size",
-        type=int,
-        default=int(os.environ.get("KREA_S18_KV_GROUP_SIZE", "64")),
+        default=os.environ.get("KREA_S18_KV_GROUP_SIZE") or "64",
     )
     args = p.parse_args()
 
     try:
-        per_token = kv_bytes_per_token(args.kv_bits, args.kv_group_size)
+        kv_bits = None if args.kv_bits is None else int(args.kv_bits)
+        per_token = kv_bytes_per_token(kv_bits, int(args.kv_group_size))
     except ValueError as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 1
+    args.kv_bits, args.kv_group_size = kv_bits, int(args.kv_group_size)
 
     unknown = [r for r in args.rows if r not in ROW_WINDOW_FRAMES]
     if unknown:
