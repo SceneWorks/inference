@@ -615,7 +615,8 @@ mod tests {
     /// only 64). `detect_packed_group` returns the text-encoder group for the ChatGLM3 thread. GPU-free.
     #[test]
     fn detect_packed_unet_reads_quantization_block() {
-        let tmp = std::env::temp_dir().join(format!("sc10819_detect_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
         std::fs::write(
@@ -656,16 +657,14 @@ mod tests {
         )
         .unwrap();
         assert!(detect_packed_unet(&tmp).is_err());
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `detect_packed_group` recovers the packed group for the ChatGLM3 `text_encoder/` thread, and is
     /// `None` for a dense config or an absent file (the dense fallback the loader defaults to 64).
     #[test]
     fn detect_packed_group_reads_text_encoder_config() {
-        let tmp = std::env::temp_dir().join(format!("sc10819_group_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let cfg = tmp.join("config.json");
         // Absent file ⇒ dense.
         assert_eq!(detect_packed_group(&cfg).unwrap(), None);
@@ -673,7 +672,6 @@ mod tests {
         assert_eq!(detect_packed_group(&cfg).unwrap(), Some(64));
         std::fs::write(&cfg, br#"{"hidden_size": 4096}"#).unwrap();
         assert_eq!(detect_packed_group(&cfg).unwrap(), None);
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

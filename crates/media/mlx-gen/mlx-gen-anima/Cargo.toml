@@ -23,6 +23,10 @@ mlx-rs = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed
 # cancellation / seed determinism / registry round-trip). Weight-gated (#[ignore]).
 sceneworks-gen-core-testkit = { workspace = true }

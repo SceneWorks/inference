@@ -407,13 +407,8 @@ mod tests {
     /// `resolve_image_encoder`: a directory resolves `model.safetensors`; a missing dir errors loudly.
     #[test]
     fn image_encoder_resolution() {
-        let dir = std::env::temp_dir().join(format!(
-            "candle_ipadapter_enc_{}_{}",
-            std::process::id(),
-            "t"
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // No weight file yet → error.
         assert!(resolve_image_encoder(&dir).is_err());
         // Create a model.safetensors stand-in → resolves to it.
@@ -422,6 +417,5 @@ mod tests {
         assert_eq!(resolve_image_encoder(&dir).unwrap(), f);
         // A direct file path is used as-is.
         assert_eq!(resolve_image_encoder(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

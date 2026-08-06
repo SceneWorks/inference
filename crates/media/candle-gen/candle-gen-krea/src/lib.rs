@@ -1908,8 +1908,8 @@ mod tests {
             (4, Quant::Q4, Some(Quant::Q8)),
             (8, Quant::Q8, Some(Quant::Q4)),
         ] {
-            let root = std::env::temp_dir()
-                .join(format!("candle-krea-tier-{bits}-{}", std::process::id()));
+            let root_tmp = tempfile::tempdir().unwrap();
+            let root = root_tmp.path().to_path_buf();
             std::fs::create_dir_all(root.join("transformer")).unwrap();
             std::fs::write(
                 root.join("transformer/config.json"),
@@ -1947,7 +1947,6 @@ mod tests {
                         if reason.contains("does not match loaded tier")
                 ));
             }
-            std::fs::remove_dir_all(root).ok();
         }
     }
 
@@ -2006,8 +2005,8 @@ mod tests {
             gen_core::MemoryStrategy::BoundedDecode
         ));
 
-        let root =
-            std::env::temp_dir().join(format!("krea-candle-q4-contract-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -2020,7 +2019,6 @@ mod tests {
             gen_core::MemoryStrategy::BoundedAttention,
             gen_core::MemoryStrategy::BoundedDecode
         ));
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
@@ -3188,14 +3186,8 @@ mod tests {
         use candle_gen::candle_core::{DType, Device, Tensor};
         use std::collections::HashMap;
 
-        let component = std::env::temp_dir().join(format!(
-            "sceneworks-krea-stage-cancel-{}",
-            std::process::id()
-        ));
-        if component.exists() {
-            std::fs::remove_dir_all(&component).unwrap();
-        }
-        std::fs::create_dir_all(&component).unwrap();
+        let component_tmp = tempfile::tempdir().unwrap();
+        let component = component_tmp.path().to_path_buf();
         std::fs::write(
             component.join("config.json"),
             r#"{"quantization":{"bits":4,"group_size":64}}"#,
@@ -3285,7 +3277,6 @@ mod tests {
             );
             assert!(cancel.is_cancelled());
         }
-        std::fs::remove_dir_all(component).unwrap();
     }
 
     #[test]

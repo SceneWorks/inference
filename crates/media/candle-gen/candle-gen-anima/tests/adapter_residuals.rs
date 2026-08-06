@@ -257,9 +257,8 @@ const COND_TARGET: (&str, usize, usize) = ("llm_adapter.blocks.0.self_attn.q_pro
 /// residual shifts the built DiT's forward, and a **scale-0** residual is an exact no-op (mutation).
 #[test]
 fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
-    let dir = std::env::temp_dir().join(format!("anima_install_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
 
     let baseline = dit_forward(&build_dit());
     let lora = write_lora(&dir, &[DIT_TARGET, COND_TARGET], 2);
@@ -299,8 +298,6 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
         0.0,
         "a scale-0 residual must be an exact no-op"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A LoKr (detected by `lokr_` keys even under an `AdapterKind::Lora` spec) installs as a **structured
@@ -308,9 +305,8 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
 /// DiT q_proj `[out,in] = [12,12]`, factored as `w1 [2,2] ⊗ w2 [6,6]` (a·b = 12, c·d = 12).
 #[test]
 fn lokr_installs_as_structured_residual_and_shifts_forward() {
-    let dir = std::env::temp_dir().join(format!("anima_install_lokr_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let baseline = dit_forward(&build_dit());
 
     // Full-factor LoKr on the DiT q_proj: w1 [2,2], w2 [6,6] ⇒ kron = [12,12]. Non-zero factors so the
@@ -343,17 +339,14 @@ fn lokr_installs_as_structured_residual_and_shifts_forward() {
         max_abs_diff(&dit_forward(&dit), &baseline) > 1e-4,
         "the structured LoKr residual must move the DiT forward"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A LoHa (Hadamard, `hada_` keys) is rejected with the actionable sc-10713 message — its Hadamard
 /// product has no allocation-free structured form, so it cannot ride unmerged on a packed tier.
 #[test]
 fn loha_on_the_residual_path_is_a_clear_error() {
-    let dir = std::env::temp_dir().join(format!("anima_install_loha_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     // A file carrying explicit LoHa factor keys (`hada_*`) → rejected.
     let mut m = HashMap::new();
     for (k, r, c) in [
@@ -380,8 +373,6 @@ fn loha_on_the_residual_path_is_a_clear_error() {
         msg.contains("LoHa") && msg.contains("sc-10713"),
         "reject must name LoHa and the follow-up story: {msg}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The visit emits **exactly** the canonical adaptable surface — the routing backstop. The expected set
@@ -457,9 +448,8 @@ fn visit_emits_exactly_the_canonical_adaptable_surface() {
 /// — sc-10274), never a quiet drop.
 #[test]
 fn off_surface_target_is_a_hard_error() {
-    let dir = std::env::temp_dir().join(format!("anima_install_unrouted_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     // A bogus path present in no host surface.
     let lora = write_lora(&dir, &[("blocks.0.self_attn.does_not_exist", 12, 12)], 2);
 
@@ -472,6 +462,4 @@ fn off_surface_target_is_a_hard_error() {
         err.to_string().contains("did not route"),
         "expected an unrouted-target error, got: {err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

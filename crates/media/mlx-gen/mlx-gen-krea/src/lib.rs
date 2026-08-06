@@ -177,8 +177,8 @@ mod explicit_registry_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn snapshot(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("krea-{tag}-{}", std::process::id()));
+    fn snapshot(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
+        let root = tmp.path().join(format!("krea-{tag}"));
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
@@ -189,10 +189,11 @@ mod explicit_registry_tests {
 
     #[test]
     fn every_base_variant_resolves_the_rung_four_contract_through_the_registry() {
+        let tmp = tempfile::tempdir().unwrap();
         use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
 
         let registry = super::provider_registry().unwrap();
-        let root = snapshot("registry-memory");
+        let root = snapshot(&tmp, "registry-memory");
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
@@ -221,6 +222,7 @@ mod explicit_registry_tests {
 
     #[test]
     fn explicit_catalog_has_stable_surface() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = super::provider_registry().unwrap();
         let descriptors: Vec<_> = registry
             .generators()
@@ -248,7 +250,7 @@ mod explicit_registry_tests {
             .iter()
             .all(|descriptor| descriptor.capabilities.supports_preview));
 
-        let root = snapshot("registry-control-memory");
+        let root = snapshot(&tmp, "registry-control-memory");
         let control = root.join("control.safetensors");
         write_minimal_safetensors(&control);
         let contract = registry

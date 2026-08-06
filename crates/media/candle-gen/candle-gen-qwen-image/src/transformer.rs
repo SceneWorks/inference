@@ -1626,11 +1626,10 @@ mod tests {
             lora.insert(format!("{path}.lora_down.weight"), mk(rank, inner)); // A [rank, in]
             lora.insert(format!("{path}.lora_up.weight"), mk(out, rank)); // B [out, rank]
         }
-        let tmp = std::env::temp_dir().join(format!(
-            "sc11091_lora_{}_{}.safetensors",
-            std::process::id(),
-            cfg.num_layers
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard
+            .path()
+            .join(format!("sc11091_lora_{}.safetensors", cfg.num_layers));
         save(&lora, &tmp).unwrap();
 
         // Base (un-adapted) and adapted DiTs share identical weights (same random seed).
@@ -1688,8 +1687,6 @@ mod tests {
             .unwrap();
         assert_eq!(b, z, "scale-0 additive install must be a byte-exact no-op");
 
-        std::fs::remove_file(&tmp).ok();
-
         // An adapter surface that matches NO DiT module errors (never renders unadapted silently).
         let mut miss_map: Map<String, Tensor> = Map::new();
         miss_map.insert(
@@ -1700,11 +1697,10 @@ mod tests {
             "transformer_blocks.0.attn.no_such_proj.lora_up.weight".into(),
             mk(inner, rank),
         );
-        let miss = std::env::temp_dir().join(format!(
-            "sc11091_miss_{}_{}.safetensors",
-            std::process::id(),
-            cfg.num_heads
-        ));
+        let miss_tmp = tempfile::tempdir().unwrap();
+        let miss = miss_tmp
+            .path()
+            .join(format!("sc11091_miss_{}.safetensors", cfg.num_heads));
         save(&miss_map, &miss).unwrap();
         let mut dit2 = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
         let miss_spec = AdapterSpec::new(miss.clone(), 1.0, AdapterKind::Lora);

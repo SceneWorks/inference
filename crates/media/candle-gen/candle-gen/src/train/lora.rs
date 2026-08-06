@@ -1570,10 +1570,8 @@ mod tests {
             "to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (out_f, in_f), &dev).unwrap(),
         );
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9416_lora_detect_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9416_lora_detect.safetensors");
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -1587,7 +1585,6 @@ mod tests {
         // The PEFT path is captured for both (the LoraHost visitor routes adapters by it).
         assert_eq!(packed.path(), "to_out.0");
         assert_eq!(dense.path(), "to_q");
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

@@ -767,8 +767,8 @@ mod tests {
         // sc-8827/sc-13749: `LoadSpec::text_encoder` drives the Gemma-encoder location. An existing dir
         // is returned as-is; a nonexistent override errors with the spec-side message. The
         // `$LTX_GEMMA_DIR` env side-channel was DELETED — this also pins that it is no longer consulted.
-        let real = std::env::temp_dir().join(format!("ltx_gemma_spec_ok_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&real);
+        let real_tmp = tempfile::tempdir().unwrap();
+        let real = real_tmp.path().to_path_buf();
         let pipe = Pipeline::load(
             Path::new("/nonexistent/root"),
             &Device::Cpu,
@@ -800,7 +800,6 @@ mod tests {
             "error must not name the removed env var: {err}"
         );
         std::env::remove_var("LTX_GEMMA_DIR");
-        std::fs::remove_dir_all(&real).ok();
     }
 
     /// sc-13749 load gate: with no `LoadSpec::text_encoder` AND no co-located `<root>/text_encoder`, the
@@ -819,12 +818,12 @@ mod tests {
         );
 
         // A co-located `<root>/text_encoder` (a passed-in path via the weights root) is honored.
-        let root = std::env::temp_dir().join(format!("ltx_gemma_colocated_{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let te = root.join("text_encoder");
         std::fs::create_dir_all(&te).unwrap();
         let pipe = Pipeline::load(&root, &Device::Cpu, None);
         assert_eq!(pipe.gemma_dir().unwrap(), te);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// sc-13749 load gate: candle LTX-2.3 recognizes NO `LoadSpec::components` keys — its Gemma TE rides
@@ -876,42 +875,34 @@ mod tests {
     #[test]
     fn ltx_checkpoint_selects_base_distilled_and_eros_bf16() {
         // Helper: a temp dir seeded with `files`, then `ltx_checkpoint()`'s chosen file name.
-        let pick = |tag: &str, files: &[&str]| -> String {
-            let dir = std::env::temp_dir().join(format!("ltx_ckpt_{tag}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+        let pick = |files: &[&str]| -> String {
+            let dir_tmp = tempfile::tempdir().unwrap();
+            let dir = dir_tmp.path().to_path_buf();
             for f in files {
                 std::fs::write(dir.join(f), b"x").unwrap();
             }
             let pipe = Pipeline::load(&dir, &Device::Cpu, None);
             let got = pipe.ltx_checkpoint().unwrap();
             let name = got.file_name().unwrap().to_str().unwrap().to_owned();
-            std::fs::remove_dir_all(&dir).unwrap();
             name
         };
         // Base `Lightricks/LTX-2.3`: the distilled file wins over dev / lora / upscaler.
         assert_eq!(
-            pick(
-                "base",
-                &[
-                    "ltx-2.3-22b-dev.safetensors",
-                    "ltx-2.3-22b-distilled.safetensors",
-                    "ltx-2.3-22b-distilled-lora-384.safetensors",
-                    "ltx-2.3-spatial-upscaler-x2.safetensors",
-                ],
-            ),
+            pick(&[
+                "ltx-2.3-22b-dev.safetensors",
+                "ltx-2.3-22b-distilled.safetensors",
+                "ltx-2.3-22b-distilled-lora-384.safetensors",
+                "ltx-2.3-spatial-upscaler-x2.safetensors",
+            ],),
             "ltx-2.3-22b-distilled.safetensors"
         );
         // Eros merge: the dense `_bf16` file wins; the fp8 / mixed variants are skipped.
         assert_eq!(
-            pick(
-                "eros",
-                &[
-                    "10Eros_v1_bf16.safetensors",
-                    "10Eros_v1-fp8mixed_learned.safetensors",
-                    "10Eros_v1_fp8_transformer.safetensors",
-                ],
-            ),
+            pick(&[
+                "10Eros_v1_bf16.safetensors",
+                "10Eros_v1-fp8mixed_learned.safetensors",
+                "10Eros_v1_fp8_transformer.safetensors",
+            ],),
             "10Eros_v1_bf16.safetensors"
         );
     }
@@ -1093,13 +1084,8 @@ mod tests {
     /// read 12_400 instead of 9_000.
     #[test]
     fn component_footprint_dense_sizes_one_checkpoint_plus_gemma() {
-        let root = std::env::temp_dir().join(format!(
-            "sc12397_ltx_dense_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         for (name, len) in [
             ("ltx-2.3-22b-distilled.safetensors", 9_000_u64), // the one that loads
             ("ltx-2.3-22b-fp8.safetensors", 2_000),           // skipped: fp8
@@ -1133,8 +1119,6 @@ mod tests {
         );
         // The slots partition the load: 13_000, not the 12_400-in-root dir sum + gemma.
         assert_eq!(fp.text_encoder + fp.dit + fp.vae, 13_000);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// sc-12397 — the PACKED TIER layout: exactly the 3 files the T2V render loads, plus the sibling
@@ -1142,12 +1126,8 @@ mod tests {
     /// `load_components_tier` never reads — summing the dir would over-count them.
     #[test]
     fn component_footprint_tier_sizes_the_three_loaded_files_plus_gemma() {
-        let snapshot = std::env::temp_dir().join(format!(
-            "sc12397_ltx_tier_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&snapshot);
+        let snapshot_tmp = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_tmp.path().to_path_buf();
         let tier = snapshot.join("q4");
         std::fs::create_dir_all(&tier).unwrap();
         // `TierPaths::detect` needs BOTH markers: transformer.safetensors + quantize_config.json.
@@ -1182,8 +1162,6 @@ mod tests {
         assert_eq!(fp.text_encoder, 4_000, "the sibling gemma/ dir");
         // 10_000 — where a dir sum would read 36_000 + gemma and refuse a card that runs this fine.
         assert_eq!(fp.text_encoder + fp.dit + fp.vae, 10_000);
-
-        std::fs::remove_dir_all(&snapshot).ok();
     }
 
     /// An unresolvable snapshot reports NO SIGNAL rather than erroring: the footprint is a pre-load

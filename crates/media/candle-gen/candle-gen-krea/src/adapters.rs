@@ -1315,10 +1315,8 @@ mod tests {
             "diffusion_model.txtfusion.layerwise_blocks.0.attn.wq",
         );
 
-        let file = std::env::temp_dir().join(format!(
-            "krea_aitoolkit_lokr_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp.path().join("krea_aitoolkit_lokr.safetensors");
         save_tensors(&tensors, &file).unwrap();
 
         // Classified `Lora` by the worker (no networkType); the sniff must route it to the LoKr merge.
@@ -1487,10 +1485,10 @@ mod tests {
         let up_randn = Tensor::randn(0f32, 1f32, (4, 2), &dev).unwrap();
         set.vars[1].set(&up_randn).unwrap(); // vars = [down(A), up(B)]
 
-        let file = std::env::temp_dir().join(format!(
-            "candle_krea_lora_roundtrip_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp
+            .path()
+            .join("candle_krea_lora_roundtrip.safetensors");
         save_lora_peft(&set, "", &HashMap::new(), &file).unwrap();
 
         let mut map = HashMap::new();
@@ -1528,9 +1526,10 @@ mod tests {
     #[test]
     fn merge_into_weights_overlays_attention_surface() {
         let dev = Device::Cpu;
-        let pid = std::process::id();
-        let base_file = std::env::temp_dir().join(format!("krea_adapt_base_{pid}.safetensors"));
-        let adapter_file = std::env::temp_dir().join(format!("krea_adapt_lora_{pid}.safetensors"));
+        let base_file_tmp = tempfile::tempdir().unwrap();
+        let base_file = base_file_tmp.path().join("krea_adapt_base.safetensors");
+        let adapter_file_tmp = tempfile::tempdir().unwrap();
+        let adapter_file = adapter_file_tmp.path().join("krea_adapt_lora.safetensors");
 
         // A 1-block base snapshot: the four attention projections, zero-initialized.
         let mut base = HashMap::new();
@@ -1602,9 +1601,10 @@ mod tests {
     #[test]
     fn fold_diff_patch_folds_projector_diff() {
         let dev = Device::Cpu;
-        let pid = std::process::id();
-        let base_file = std::env::temp_dir().join(format!("krea_diff_base_{pid}.safetensors"));
-        let adapter_file = std::env::temp_dir().join(format!("krea_diff_proj_{pid}.safetensors"));
+        let base_file_tmp = tempfile::tempdir().unwrap();
+        let base_file = base_file_tmp.path().join("krea_diff_base.safetensors");
+        let adapter_file_tmp = tempfile::tempdir().unwrap();
+        let adapter_file = adapter_file_tmp.path().join("krea_diff_proj.safetensors");
 
         // The projector weight `[1, num_text_layers] = [1, 12]`, plus an untargeted attention weight.
         let base_w = Tensor::randn(0f32, 1f32, (1, 12), &dev)
@@ -1672,9 +1672,10 @@ mod tests {
     #[test]
     fn fold_diff_patch_applies_weight_and_bias_delta() {
         let dev = Device::Cpu;
-        let pid = std::process::id();
-        let base_file = std::env::temp_dir().join(format!("krea_diffb_base_{pid}.safetensors"));
-        let adapter_file = std::env::temp_dir().join(format!("krea_diffb_adapt_{pid}.safetensors"));
+        let base_file_tmp = tempfile::tempdir().unwrap();
+        let base_file = base_file_tmp.path().join("krea_diffb_base.safetensors");
+        let adapter_file_tmp = tempfile::tempdir().unwrap();
+        let adapter_file = adapter_file_tmp.path().join("krea_diffb_adapt.safetensors");
 
         let base = HashMap::from([
             (
@@ -1723,10 +1724,9 @@ mod tests {
     #[test]
     fn fold_diff_patch_shape_mismatch_skips_whole_module() {
         let dev = Device::Cpu;
-        let pid = std::process::id();
-        let base_file = std::env::temp_dir().join(format!("krea_diffmm_base_{pid}.safetensors"));
-        let adapter_file =
-            std::env::temp_dir().join(format!("krea_diffmm_adapt_{pid}.safetensors"));
+        let base_file_tmp = tempfile::tempdir().unwrap();
+        let base_file = base_file_tmp.path().join("krea_diffmm_base.safetensors");
+        let adapter_file = base_file_tmp.path().join("krea_diffmm_adapt.safetensors");
 
         let base = HashMap::from([
             (
@@ -1796,8 +1796,8 @@ mod tests {
         use candle_gen::quant::AdaptLinear;
 
         let dev = Device::Cpu;
-        let dir = std::env::temp_dir().join("krea_diff_only");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let adapter_file = dir.join("diff_only.safetensors");
         save_tensors(
             &HashMap::from([(
@@ -1863,9 +1863,10 @@ mod tests {
     #[test]
     fn scale_zero_merge_is_base() {
         let dev = Device::Cpu;
-        let pid = std::process::id();
-        let base_file = std::env::temp_dir().join(format!("krea_adapt_base0_{pid}.safetensors"));
-        let adapter_file = std::env::temp_dir().join(format!("krea_adapt_lora0_{pid}.safetensors"));
+        let base_file_tmp = tempfile::tempdir().unwrap();
+        let base_file = base_file_tmp.path().join("krea_adapt_base0.safetensors");
+        let adapter_file_tmp = tempfile::tempdir().unwrap();
+        let adapter_file = adapter_file_tmp.path().join("krea_adapt_lora0.safetensors");
 
         // A nonzero base so "equals base" is a real assertion, not a trivial zero match.
         let base_q = Tensor::randn(0f32, 1f32, (4, 4), &dev).unwrap();
@@ -1967,9 +1968,9 @@ mod tests {
         };
 
         // A 1-block packed component: all four attention projections packed (128×128 ⇒ group-64).
-        let (dim, pid) = (128usize, std::process::id());
-        let dir = std::env::temp_dir().join(format!("krea_packed_compose_{pid}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dim = 128usize;
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         let mut grids: HashMap<String, Tensor> = HashMap::new();
         for target in ["to_q", "to_k", "to_v", "to_out.0"] {
@@ -1993,7 +1994,8 @@ mod tests {
         // A bare-dotted LoRA targeting only to_q.
         let down = Tensor::randn(0f32, 1f32, (2, dim), &dev).unwrap();
         let up = Tensor::randn(0f32, 1f32, (dim, 2), &dev).unwrap();
-        let adapter_file = std::env::temp_dir().join(format!("krea_packed_lora_{pid}.safetensors"));
+        let adapter_file_tmp = tempfile::tempdir().unwrap();
+        let adapter_file = adapter_file_tmp.path().join("krea_packed_lora.safetensors");
         safetensors::save(
             &HashMap::from([
                 (
@@ -2057,7 +2059,6 @@ mod tests {
         let q = crate::loader::linear_detect(&w, "transformer_blocks.0.attn.to_q", false).unwrap();
         assert!(!q.is_packed(), "adapter-merged to_q resolves dense");
 
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&adapter_file).ok();
     }
 
@@ -2202,8 +2203,8 @@ mod tests {
         let (di, ui) = leg();
 
         // One adapter file targeting an ATTENTION leaf (→ LoraLinear) and a FRONT-END leaf (→ AdaptLinear).
-        let dir = std::env::temp_dir().join("krea_sc11720_wide");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let adapter_file = dir.join("wide.safetensors");
         save_tensors(
             &HashMap::from([
@@ -2286,7 +2287,5 @@ mod tests {
             i_diff < 1e-4,
             "AdaptLinear front-end leaf additive != fold ({i_diff})"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

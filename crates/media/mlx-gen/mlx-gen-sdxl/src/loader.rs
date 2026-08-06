@@ -294,10 +294,9 @@ mod quant_tier_tests {
 
     /// Make a fresh temp snapshot root with `unet/config.json` = `body` (skip the file when `body` is
     /// `None` — a dense snapshot with no quantization marker).
-    fn snapshot(body: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "sdxl-tier-{}-{:?}",
-            std::process::id(),
+    fn snapshot(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
+            "sdxl-tier-{:?}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -312,9 +311,10 @@ mod quant_tier_tests {
 
     #[test]
     fn dense_snapshot_needs_quant_and_warns() {
+        let tmp = tempfile::tempdir().unwrap();
         // No config.json at all, and a config with no `quantization` marker, both read as dense.
         for body in [None, Some("{}"), Some(r#"{"in_channels": 4}"#)] {
-            let root = snapshot(body);
+            let root = snapshot(&tmp, body);
             assert!(
                 needs_load_time_quant(&root, "unet", 4, "sdxl").unwrap(),
                 "dense snapshot must report a load-time quant (→ warn)"
@@ -325,7 +325,11 @@ mod quant_tier_tests {
 
     #[test]
     fn already_packed_at_requested_bits_does_not_warn() {
-        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = snapshot(
+            &tmp,
+            Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
+        );
         assert!(
             !needs_load_time_quant(&root, "unet", 8, "sdxl").unwrap(),
             "an already-packed Q8 turnkey must NOT report a load-time quant (no warn)"
@@ -335,7 +339,11 @@ mod quant_tier_tests {
 
     #[test]
     fn tier_mismatch_errors() {
-        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = snapshot(
+            &tmp,
+            Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
+        );
         let err = needs_load_time_quant(&root, "unet", 4, "sdxl").unwrap_err();
         assert!(
             format!("{err}").contains("pre-quantized Q8"),

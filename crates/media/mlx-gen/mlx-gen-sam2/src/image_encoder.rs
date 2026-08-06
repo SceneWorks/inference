@@ -219,10 +219,10 @@ mod tests {
 
         // Process-unique — see the note in `memory.rs`: a fixed `$TMPDIR` name races a second
         // concurrent `cargo test` process running this same test.
-        let path = std::env::temp_dir().join(format!(
-            "mlx_gen_sam2_synth_encoder_{}.safetensors",
-            std::process::id()
-        ));
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp
+            .path()
+            .join("mlx_gen_sam2_synth_encoder.safetensors");
         write_synthetic_checkpoint(&cfg, &path);
 
         let w = Weights::from_file(&path).unwrap();

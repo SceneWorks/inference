@@ -79,9 +79,8 @@ mod tests {
 
     #[test]
     fn probe_rejects_non_openvoice_layouts() {
-        let dir = std::env::temp_dir().join("openvoice-prepare-probe");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // Empty dir → no.
         assert!(!can_prepare(&spec(&dir)));
         // LLM-shaped config.json (no VITS blocks) + a pth → still no.
@@ -95,14 +94,12 @@ mod tests {
         )
         .unwrap();
         assert!(can_prepare(&spec(&dir)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn prepare_passthrough_and_refuses_quantization_typed() {
-        let dir = std::env::temp_dir().join("openvoice-prepare-quant");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::write(
             dir.join(CONFIG_FILE),
             r#"{"data":{"filter_length":1024},"model":{"gin_channels":256}}"#,
@@ -115,6 +112,5 @@ mod tests {
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

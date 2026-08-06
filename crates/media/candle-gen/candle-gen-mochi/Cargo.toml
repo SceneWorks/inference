@@ -34,5 +34,9 @@ metal = ["candle-gen/metal", "candle-gen-flux/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-flux/cuda"]
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Load the A1 real-weight goldens (gitignored under ../../mlx-gen/tools/golden) in the CUDA parity tier.
 candle-gen = { path = "../candle-gen", features = ["testkit"] }

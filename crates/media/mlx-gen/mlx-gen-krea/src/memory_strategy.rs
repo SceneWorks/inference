@@ -447,13 +447,8 @@ mod tests {
 
     #[test]
     fn staged_residency_and_synchronized_release_require_a_sequential_control_load() {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-krea-pose-residency-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
 
         let resident_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
@@ -530,18 +525,12 @@ mod tests {
                 MemoryStrategy::BoundedTransformerResidency,
             ]
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn prepacked_q8_pose_without_an_override_accepts_only_the_actual_tier() {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-krea-pose-q8-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         std::fs::write(
             root.join("transformer/config.json"),
@@ -598,18 +587,12 @@ mod tests {
                     if reason.contains("does not match loaded tier")
             ));
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn q4_base_projects_pose_overlay_at_the_declared_q8_floor() {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-krea-pose-floor-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
         let control = root.join("control.safetensors");
@@ -626,17 +609,16 @@ mod tests {
         assert_eq!(contract.asset_facts.base_bytes, 768);
         assert_eq!(contract.auxiliary_resident_bytes(), 136);
         assert!(contract.conformance_errors().is_empty());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn empty_pose_base_component_cannot_be_reported_as_zero() {
-        let root = std::env::temp_dir().join(format!("mlx-krea-pose-empty-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         std::fs::remove_file(root.join("vae/model.safetensors")).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract("krea_2_turbo_control", &spec).is_err());
         assert!(weights_free_memory_strategy_contract("krea_2_turbo_control", &spec).is_ok());
-        std::fs::remove_dir_all(root).ok();
     }
 }

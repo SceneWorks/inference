@@ -145,8 +145,8 @@ mod tests {
     use mlx_gen::adapters::Adapter;
     use mlx_rs::Array;
 
-    fn fixture() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
+    fn fixture(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = tmp.path().join(format!(
             "qwen-block-stream-{}.safetensors",
             std::process::id()
         ));
@@ -204,7 +204,8 @@ mod tests {
 
     #[test]
     fn stream_reopens_remaps_and_drains_only_the_materialized_block() {
-        let path = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp);
         let stream = QwenBlockStream::new(
             WeightsSource::File(path.clone()),
             "transformer_blocks",
@@ -239,7 +240,8 @@ mod tests {
 
     #[test]
     fn captured_adapters_are_reinstalled_on_the_matching_block() {
-        let path = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp);
         let mut stream = QwenBlockStream::new(
             WeightsSource::File(path.clone()),
             "transformer_blocks",

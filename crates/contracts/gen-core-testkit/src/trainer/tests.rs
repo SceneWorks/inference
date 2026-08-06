@@ -203,11 +203,11 @@ fn item(name: &str) -> TrainingItem {
     }
 }
 
-fn profile() -> TrainerProfile {
+fn profile(tmp: &tempfile::TempDir) -> TrainerProfile {
     // Two dummy items (the stub never reads them); 2 steps via `cheap`.
     TrainerProfile::cheap(
         vec![item("red"), item("blue")],
-        std::env::temp_dir().join("gen_core_testkit_trainer_stub"),
+        tmp.path().join("gen_core_testkit_trainer_stub"),
     )
 }
 
@@ -217,20 +217,23 @@ fn make_good() -> Box<dyn Trainer> {
 
 #[test]
 fn good_stub_passes_full_conformance() {
-    trainer_conformance(make_good, &profile());
+    let tmp = tempfile::tempdir().unwrap();
+    trainer_conformance(make_good, &profile(&tmp));
 }
 
 #[test]
 fn good_stub_passes_every_check_individually() {
+    let tmp = tempfile::tempdir().unwrap();
     let mut g = StubTrainer::new(STUB_ID, Behavior::good());
-    check_trainer_validate(&g, &profile()).unwrap();
-    check_trainer_progress(&mut g, &profile()).unwrap();
-    check_trainer_cancellation(&make_good, &profile()).unwrap();
+    check_trainer_validate(&g, &profile(&tmp)).unwrap();
+    check_trainer_progress(&mut g, &profile(&tmp)).unwrap();
+    check_trainer_cancellation(&make_good, &profile(&tmp)).unwrap();
     check_trainer_registry(&registry(), &g).unwrap();
 }
 
 #[test]
 fn dishonest_validate_fails_validate_check() {
+    let tmp = tempfile::tempdir().unwrap();
     let g = StubTrainer::new(
         STUB_ID,
         Behavior {
@@ -238,11 +241,12 @@ fn dishonest_validate_fails_validate_check() {
             ..Behavior::good()
         },
     );
-    assert!(check_trainer_validate(&g, &profile()).is_err());
+    assert!(check_trainer_validate(&g, &profile(&tmp)).is_err());
 }
 
 #[test]
 fn missing_progress_fails_progress_check() {
+    let tmp = tempfile::tempdir().unwrap();
     let mut g = StubTrainer::new(
         STUB_ID,
         Behavior {
@@ -250,12 +254,13 @@ fn missing_progress_fails_progress_check() {
             ..Behavior::good()
         },
     );
-    let err = check_trainer_progress(&mut g, &profile()).unwrap_err();
+    let err = check_trainer_progress(&mut g, &profile(&tmp)).unwrap_err();
     assert!(err.contains("Training"), "got: {err}");
 }
 
 #[test]
 fn ignoring_cancel_fails_cancellation_check() {
+    let tmp = tempfile::tempdir().unwrap();
     let err = check_trainer_cancellation(
         &|| {
             StubTrainer::boxed(
@@ -266,7 +271,7 @@ fn ignoring_cancel_fails_cancellation_check() {
                 },
             )
         },
-        &profile(),
+        &profile(&tmp),
     )
     .unwrap_err();
     assert!(err.contains("returned Ok"), "got: {err}");
@@ -274,6 +279,7 @@ fn ignoring_cancel_fails_cancellation_check() {
 
 #[test]
 fn stringified_cancel_fails_cancellation_check() {
+    let tmp = tempfile::tempdir().unwrap();
     // The exact pre-sc-4895 family behavior: stops early but returns Error::Msg, not Canceled.
     let err = check_trainer_cancellation(
         &|| {
@@ -285,7 +291,7 @@ fn stringified_cancel_fails_cancellation_check() {
                 },
             )
         },
-        &profile(),
+        &profile(&tmp),
     )
     .unwrap_err();
     assert!(err.contains("typed Err(Error::Canceled)"), "got: {err}");
@@ -300,6 +306,7 @@ fn unregistered_id_fails_registry_check() {
 #[test]
 #[should_panic(expected = "conformance FAILED")]
 fn conformance_panics_on_a_broken_stub() {
+    let tmp = tempfile::tempdir().unwrap();
     trainer_conformance(
         || {
             StubTrainer::boxed(
@@ -310,6 +317,6 @@ fn conformance_panics_on_a_broken_stub() {
                 },
             )
         },
-        &profile(),
+        &profile(&tmp),
     );
 }

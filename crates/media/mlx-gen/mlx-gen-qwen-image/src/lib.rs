@@ -126,8 +126,8 @@ mod explicit_registry_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn snapshot() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("qwen-registry-{}", std::process::id()));
+    fn snapshot(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = tmp.path().join("qwen-registry");
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
@@ -165,10 +165,11 @@ mod explicit_registry_tests {
 
     #[test]
     fn every_variant_resolves_its_memory_strategy_contract() {
+        let tmp = tempfile::tempdir().unwrap();
         use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
         let registry = super::provider_registry().unwrap();
-        let root = snapshot();
+        let root = snapshot(&tmp);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);

@@ -1113,8 +1113,8 @@ mod tests {
     #[test]
     fn unresolvable_specs_error() {
         let dev = Device::Cpu;
-        let pid = std::process::id();
-        let file = std::env::temp_dir().join(format!("sd3_adapt_none_{pid}.safetensors"));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp.path().join("sd3_adapt_none.safetensors");
         let tensors = HashMap::from([
             (
                 "lora_te1_text_model_encoder_layers_0_self_attn_q_proj.lora_down.weight"
@@ -1267,10 +1267,8 @@ mod tests {
         let up_randn = Tensor::randn(0f32, 1f32, (4, 2), &dev).unwrap();
         set.vars[1].set(&up_randn).unwrap();
 
-        let file = std::env::temp_dir().join(format!(
-            "sd3_lora_roundtrip_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp.path().join("sd3_lora_roundtrip.safetensors");
         save_lora_peft(&set, "", &HashMap::new(), &file).unwrap();
 
         let mut map = base_map();

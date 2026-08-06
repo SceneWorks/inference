@@ -567,7 +567,6 @@ pub(crate) fn registered_begin_request(
 mod tests {
     use super::*;
     use gen_core::{MemorySelection, MemoryStrategyParameters};
-    use std::sync::OnceLock;
 
     fn write_control(path: &std::path::Path) {
         let mut header =
@@ -582,18 +581,13 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn spec() -> LoadSpec {
-        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let root = ROOT.get_or_init(|| {
-            let root = std::env::temp_dir()
-                .join(format!("flux1-candle-memory-spec-{}", std::process::id()));
-            for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
-                let dir = root.join(component);
-                std::fs::create_dir_all(&dir).unwrap();
-                write_control(&dir.join("model.safetensors"));
-            }
-            root
-        });
+    fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("flux1-candle-memory-spec");
+        for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_control(&dir.join("model.safetensors"));
+        }
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
@@ -625,8 +619,9 @@ mod tests {
 
     #[test]
     fn schnell_and_dev_publish_the_same_full_cuda_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
         for id in [crate::FLUX1_SCHNELL_ID, crate::FLUX1_DEV_ID] {
-            let contract = provider_contract(id, &spec()).unwrap();
+            let contract = provider_contract(id, &spec(&tmp)).unwrap();
             assert!(contract.conformance_errors().is_empty());
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
             assert_eq!(
@@ -650,7 +645,8 @@ mod tests {
 
     #[test]
     fn every_optimized_selection_is_staged_and_exactly_parameterized() {
-        let spec = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
         let contract = provider_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
         let (identity, tier) = evidence_identity_and_tier(crate::FLUX1_DEV_ID, &spec).unwrap();
         assert_eq!(identity.fingerprint, CALIBRATION_FINGERPRINT);
@@ -670,11 +666,9 @@ mod tests {
 
     #[test]
     fn exact_control_and_ip_load_specs_keep_rung_four_and_price_the_resident_overlay() {
-        let overlay_root = std::env::temp_dir().join(format!(
-            "flux1-candle-memory-overlays-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&overlay_root).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay_root_tmp = tempfile::tempdir().unwrap();
+        let overlay_root = overlay_root_tmp.path().to_path_buf();
         let control_path = overlay_root.join("control.safetensors");
         let ip_path = overlay_root.join("ip_adapter.safetensors");
         write_control(&control_path);
@@ -690,7 +684,7 @@ mod tests {
                 MemoryComponentKind::IpAdapter,
             ),
         ] {
-            let mut exact = spec();
+            let mut exact = spec(&tmp);
             match kind {
                 MemoryComponentKind::ControlBranch => exact.control = Some(source),
                 MemoryComponentKind::IpAdapter => exact.ip_adapter = Some(source),
@@ -711,7 +705,7 @@ mod tests {
             assert_eq!(contract.resident_components()[0].bounded_by, None);
         }
 
-        let mut combined = spec();
+        let mut combined = spec(&tmp);
         combined.control = Some(WeightsSource::File(control_path));
         combined.ip_adapter = Some(WeightsSource::File(ip_path));
         assert_eq!(
@@ -723,15 +717,12 @@ mod tests {
             MemoryStrategySupport::Missing,
             "combined XLabs+control is not an implemented SC-15823 route"
         );
-        let _ = std::fs::remove_dir_all(overlay_root);
     }
 
     #[test]
     fn packed_q4_q8_evidence_identity_uses_snapshot_tier_not_request_hint() {
-        let root = std::env::temp_dir().join(format!(
-            "flux1-candle-memory-packed-evidence-{}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let transformer = root.join("transformer");
         std::fs::create_dir_all(&transformer).unwrap();
 
@@ -757,7 +748,8 @@ mod tests {
 
     #[test]
     fn stale_identity_and_pid_are_rejected_before_execution() {
-        let spec = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
         let contract = provider_contract(crate::FLUX1_SCHNELL_ID, &spec).unwrap();
         let mut fixture = registered_valid_fixture(
             &spec,
@@ -782,7 +774,8 @@ mod tests {
 
     #[test]
     fn scope_covers_both_57_block_namespaces_and_cleanup() {
-        let spec = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
         let contract = provider_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
         let mut fixture = registered_valid_fixture(
             &spec,

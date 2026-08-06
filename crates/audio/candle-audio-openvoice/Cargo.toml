@@ -25,6 +25,10 @@ core-llm = { path = "../../contracts/core-llm" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Kokoro TTS supplies the distinct source + target reference voices the discriminative real-weight
 # test converts between (the sanctioned "Kokoro-generated reference audio" path — no external audio
 # fixtures). Chatterbox VE measures the timbre shift (speaker-embedding cosine). Whisper ASR

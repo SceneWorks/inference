@@ -1545,8 +1545,8 @@ mod tests {
     #[test]
     fn deferred_contract_adds_snapshot_backed_text_and_dit_windows() {
         use mlx_gen::gen_core::{MemoryStrategySupport, TransformerComponent};
-        let root =
-            std::env::temp_dir().join(format!("mage-deferred-contract-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_memory_snapshot(&root);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
@@ -1565,7 +1565,6 @@ mod tests {
             mlx_gen::LoadShape::DeferredMaterialization
         );
         assert!(contract.conformance_errors().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1632,8 +1631,8 @@ mod tests {
     fn deferred_rung_four_fails_closed_for_load_time_quant_and_diff_patch_adapters() {
         use mlx_gen::gen_core::{MemoryStrategySupport, TransformerComponent};
 
-        let root =
-            std::env::temp_dir().join(format!("mage-deferred-loadability-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_memory_snapshot(&root);
         for component in ["text_encoder", "transformer", "vae"] {
             std::fs::write(root.join(component).join("config.json"), "{}").unwrap();
@@ -1685,7 +1684,6 @@ mod tests {
                 .support,
             MemoryStrategySupport::Missing
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1703,13 +1701,8 @@ mod tests {
 
     #[test]
     fn spec_contract_uses_projected_component_bytes_and_mage_q4_floors() {
-        let root = std::env::temp_dir().join(format!(
-            "mage-memory-facts-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         for component in ["text_encoder", "transformer", "vae"] {
             std::fs::create_dir_all(root.join(component)).unwrap();
         }
@@ -1754,25 +1747,23 @@ mod tests {
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.base_bytes, 4_718_938);
         assert!(contract.conformance_errors().is_empty());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn empty_mage_component_directory_cannot_be_reported_as_zero() {
-        let root =
-            std::env::temp_dir().join(format!("mage-empty-component-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_memory_snapshot(&root);
         std::fs::remove_file(root.join("text_encoder/model.safetensors")).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract_for_spec("mage_flow", &spec).is_err());
         assert!(weights_free_memory_strategy_contract("mage_flow", &spec).is_ok());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn adapter_contract_adds_load_exact_residency_and_preserves_missing_evidence() {
-        let root =
-            std::env::temp_dir().join(format!("mage-memory-adapters-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_memory_snapshot(&root);
         let adapter = root.join("mage.safetensors");
         std::fs::write(&adapter, vec![0_u8; 4096]).unwrap();
@@ -1804,7 +1795,6 @@ mod tests {
         assert!(!missing_contract
             .formula
             .uses(MemoryFormulaVariable::OverlayBytes));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1814,8 +1804,8 @@ mod tests {
             MEMORY_CALIBRATION_ABI,
         };
 
-        let mismatch_root =
-            std::env::temp_dir().join(format!("mage-memory-mismatch-{}", std::process::id()));
+        let mismatch_root_tmp = tempfile::tempdir().unwrap();
+        let mismatch_root = mismatch_root_tmp.path().to_path_buf();
         write_memory_snapshot(&mismatch_root);
         let loaded_spec =
             LoadSpec::new(WeightsSource::Dir(mismatch_root.clone())).with_quant(Quant::Q4);
@@ -1941,7 +1931,6 @@ mod tests {
         )
         .unwrap()
         .contains("committed bytes"));
-        std::fs::remove_dir_all(mismatch_root).ok();
     }
 
     #[test]
@@ -2059,13 +2048,8 @@ mod tests {
     /// over-budget message quote a figure unrelated to the tier's real install.
     #[test]
     fn the_footprint_counts_staged_components_not_just_the_tier_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "mage-footprint-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let write = |dir: std::path::PathBuf, bytes: usize| {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("model.safetensors"), vec![0u8; bytes]).unwrap();
@@ -2102,8 +2086,6 @@ mod tests {
         let got = component_footprint(&mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(flat)))
             .unwrap();
         assert_eq!((got.dit, got.text_encoder, got.vae), (300, 700, 50));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// A minimal but structurally valid safetensors file carrying exactly the Base identity tensor
@@ -2142,13 +2124,8 @@ mod tests {
     ///     staging) — route `load_finetuned` back through the guard and this half fails.
     #[test]
     fn load_finetuned_bypasses_the_pinned_checkpoint_identity_guard() {
-        let root = std::env::temp_dir().join(format!(
-            "mage-finetuned-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let transformer = root.join("transformer");
         write_identity_only_checkpoint(
             &transformer.join("diffusion_pytorch_model.safetensors"),
@@ -2175,10 +2152,8 @@ mod tests {
         // `<path>/transformer`, so it gets past identity and fails later, at the actual load.
         // Pid-keyed so the "this path does not exist" premise cannot be broken by a leftover from,
         // or a concurrent, second `cargo test` process sharing `$TMPDIR`.
-        let staged = std::env::temp_dir().join(format!(
-            "mage-finetuned-nonexistent-component-{}",
-            std::process::id()
-        ));
+        let staged_tmp = tempfile::tempdir().unwrap();
+        let staged = staged_tmp.path().to_path_buf();
         let finetuned = load_error(
             load_finetuned(
                 MageVariant::Base,
@@ -2197,8 +2172,6 @@ mod tests {
             transformer.is_dir(),
             "fixture sanity: the nested published-layout transformer dir exists"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// sc-15328 — `load` must ACCEPT `spec.adapters` (they install in [`assemble`] via
@@ -2218,13 +2191,8 @@ mod tests {
     /// which is what makes the first half about the *guard* rather than about adapter loading.
     #[test]
     fn load_takes_adapters_while_a_fine_tuned_checkpoint_still_refuses_them() {
-        let root = std::env::temp_dir().join(format!(
-            "mage-adapters-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_identity_only_checkpoint(
             &root
                 .join("transformer")
@@ -2253,10 +2221,8 @@ mod tests {
              identity check like any other load, got: {published}"
         );
 
-        let staged = std::env::temp_dir().join(format!(
-            "mage-adapters-nonexistent-component-{}",
-            std::process::id()
-        ));
+        let staged_tmp = tempfile::tempdir().unwrap();
+        let staged = staged_tmp.path().to_path_buf();
         let finetuned = load_error(
             load_finetuned(
                 MageVariant::Base,
@@ -2272,8 +2238,6 @@ mod tests {
             "a fine-tune + adapter must be refused explicitly, and BEFORE the component staging it \
              would otherwise trip over, got: {finetuned}"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// sc-15328 — the descriptor is the engine's capability statement, and every Mage variant hosts
@@ -2299,14 +2263,8 @@ mod tests {
     /// is a directory).
     #[test]
     fn load_finetuned_requires_both_shared_components_to_be_staged() {
-        let root = std::env::temp_dir().join(format!(
-            "mage-finetuned-components-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let dir = |name: &str| WeightsSource::Dir(root.join(name));
 
         let bare = load_error(
@@ -2347,8 +2305,6 @@ mod tests {
             as_file.contains("transformer DIRECTORY"),
             "expected the directory-shape refusal, got: {as_file}"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// sc-15036 real-weights end-to-end (epic 14034 F6): TRAIN a full base fine-tune, then RENDER
@@ -2383,8 +2339,8 @@ mod tests {
             return;
         };
         let root = std::path::PathBuf::from(&root);
-        let tmp = std::env::temp_dir().join(format!("mage_finetune_render_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
 
         // --- train (tiny) ---
         let mut items = Vec::new();
@@ -2505,8 +2461,6 @@ mod tests {
                 .expect("png writes");
             println!("[sc-15036] wrote {png}");
         }
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

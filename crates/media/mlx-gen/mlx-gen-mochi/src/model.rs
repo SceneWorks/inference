@@ -434,14 +434,13 @@ mod tests {
         // `spec.quantize` only *asserts* the tier's level; a dir with no `split_model.json` quant
         // manifest is dense, so asking for Q4 there is a hard error (never a silent bf16 run / an
         // on-the-fly requant — that is not the Mochi tier mechanism).
-        let dir = std::env::temp_dir().join(format!("mochi_load_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(mlx_gen::Quant::Q4);
         assert!(
             load(&spec).is_err(),
             "Q4 against a dense (manifest-less) dir must error"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

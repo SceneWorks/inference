@@ -599,9 +599,8 @@ mod tests {
 
     #[test]
     fn request_guard_reports_post_materialization_mutation_even_after_operation_error() {
-        let root =
-            std::env::temp_dir().join(format!("sensenova-request-guard-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let path = root.join("model.safetensors");
         std::fs::write(&path, [0_u8; 8]).unwrap();
         let artifact = crate::memory_strategy::PinnedArtifact::verify_file(&path).unwrap();
@@ -617,7 +616,6 @@ mod tests {
             !error.contains("earlier generation failure"),
             "got: {error}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -544,7 +544,8 @@ mod tests {
     #[test]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
-        let (mut dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit(&tmp);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         // Move B off zero so both A and B grads are nonzero (a no-op-init adapter zeros A's grad).
@@ -594,7 +595,8 @@ mod tests {
     #[test]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
-        let (mut dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit(&tmp);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
@@ -677,7 +679,8 @@ mod tests {
         // budget then buys an unambiguous drop (see the relative-floor assert below). Seed is
         // 10794-adjacent but distinct from the sibling tests so they don't share a trajectory.
         let mut rng = StdRng::seed_from_u64(10796);
-        let (mut dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {

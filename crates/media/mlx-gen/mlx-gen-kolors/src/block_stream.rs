@@ -140,9 +140,8 @@ mod tests {
     /// A tiny two-block ChatGLM3 encoder written to a temp `.safetensors`, so the stream can be
     /// exercised without the 4-12 GiB tower. Widths are group-64-divisible so the quantization
     /// replay test can pack them.
-    fn fixture(tag: &str, n_blocks: usize) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("kolors-glm-stream-{tag}-{}", std::process::id()));
+    fn fixture(tmp: &tempfile::TempDir, tag: &str, n_blocks: usize) -> std::path::PathBuf {
+        let dir = tmp.path().join(format!("kolors-glm-stream-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.safetensors");
         let mut named: Vec<(String, Array)> = Vec::new();
@@ -199,7 +198,8 @@ mod tests {
     /// silently stopped reading a tensor.
     #[test]
     fn block_stream_drains_exactly_what_the_block_read() {
-        let path = fixture("drain", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "drain", 2);
         let s = stream(&path, 2);
         let mut view = s.open().unwrap();
         let before = view.len();
@@ -239,7 +239,8 @@ mod tests {
     /// accumulates.
     #[test]
     fn each_window_opens_an_independent_view() {
-        let path = fixture("reopen", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "reopen", 2);
         let s = stream(&path, 2);
         let mut first = s.open().unwrap();
         let full = first.len();
@@ -252,7 +253,8 @@ mod tests {
 
     #[test]
     fn out_of_range_blocks_are_rejected() {
-        let path = fixture("range", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "range", 2);
         let s = stream(&path, 2);
         let mut view = s.open().unwrap();
         let err = match s.materialize(&mut view, 2) {
@@ -268,7 +270,8 @@ mod tests {
     /// way — the property that actually matters.
     #[test]
     fn a_materialized_block_replays_the_recorded_quantization() {
-        let path = fixture("quant", 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "quant", 1);
         let mut s = stream(&path, 1);
         let mut view = s.open().unwrap();
         let dense = s.materialize(&mut view, 0).unwrap();
@@ -297,8 +300,9 @@ mod tests {
     /// silently window a prefix of the tower and leave the tail unrun.
     #[test]
     fn the_stack_depth_is_the_configured_layer_count() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_eq!(ChatGlmConfig::chatglm3_6b().num_layers, 28);
-        let path = fixture("depth", 2);
+        let path = fixture(&tmp, "depth", 2);
         assert_eq!(stream(&path, 2).n_blocks(), 2);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

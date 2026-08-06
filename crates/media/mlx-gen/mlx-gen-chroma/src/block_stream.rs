@@ -342,13 +342,12 @@ mod tests {
         Array::from_slice(&values, &shape)
     }
 
-    fn fixture(tag: &str) -> std::path::PathBuf {
+    fn fixture(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
         let cfg = cfg();
         let inner = cfg.inner_dim() as i32;
         let head = cfg.attention_head_dim as i32;
-        let dir = std::env::temp_dir().join(format!(
-            "chroma-block-stream-{tag}-{}-{}",
-            std::process::id(),
+        let dir = tmp.path().join(format!(
+            "chroma-block-stream-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -453,7 +452,8 @@ mod tests {
     /// reading one leaves that key visible instead of having the evidence wiped by a prefix sweep.
     #[test]
     fn the_drain_is_exact_and_a_fresh_view_is_independent() {
-        let path = fixture("drain");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "drain");
         let s = stream(&path);
         let mut view = s.open().unwrap();
         let before = view.len();
@@ -474,7 +474,8 @@ mod tests {
 
     #[test]
     fn out_of_range_blocks_are_refused_by_name() {
-        let path = fixture("range");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "range");
         let s = stream(&path);
         let mut view = s.open().unwrap();
         let double = match s.materialize_double(&mut view, 2) {
@@ -494,7 +495,8 @@ mod tests {
     /// double block 1 must not appear on double block 0, and must not leak into the single stack.
     #[test]
     fn captured_adapters_are_reinstalled_per_block() {
-        let path = fixture("adapters");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "adapters");
         let mut s = stream(&path);
         let (mut double, mut single) = resident(&s);
         double[1]
@@ -529,7 +531,8 @@ mod tests {
     /// be refused, not rendered without its residuals.
     #[test]
     fn a_block_missing_its_captured_adapters_errors_loudly() {
-        let path = fixture("missing");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "missing");
         let mut s = stream(&path);
         let (mut double, mut single) = resident(&s);
         double[0]
@@ -559,7 +562,8 @@ mod tests {
     /// still comes back with the wrong adapter count at that path.
     #[test]
     fn a_present_but_wrong_replay_is_refused() {
-        let path = fixture("wrong");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "wrong");
         let s = stream(&path);
         let mut view = s.open().unwrap();
         let mut block = DoubleBlock::load(&view, 0, &cfg()).unwrap();
@@ -605,7 +609,8 @@ mod tests {
     /// on the ordinary clean path (the mutation-discriminating other half of the two tests above).
     #[test]
     fn no_adapters_installed_means_no_guard() {
-        let path = fixture("clean");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "clean");
         let mut s = stream(&path);
         let (mut double, mut single) = resident(&s);
         s.capture_adapters(&mut double, &mut single);
@@ -631,7 +636,8 @@ mod tests {
     /// streamed render quietly loses part of the LoRA.
     #[test]
     fn every_listed_adapter_path_resolves_and_nothing_else_does() {
-        let path = fixture("paths");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "paths");
         let s = stream(&path);
         let (mut double, mut single) = resident(&s);
         for listed in DOUBLE_ADAPTER_PATHS {
@@ -668,8 +674,11 @@ mod tests {
     /// A snapshot with the trunk as well as the two block stacks, so a whole
     /// [`crate::transformer::ChromaTransformer`] can be built without the 14 GB tier. Shapes are
     /// nominal — `from_weights` validates presence and the pruned-adaLN invariant, not dimensions.
-    fn trunk_fixture(tag: &str) -> (std::path::PathBuf, ChromaTransformerConfig) {
-        let path = fixture(tag);
+    fn trunk_fixture(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+    ) -> (std::path::PathBuf, ChromaTransformerConfig) {
+        let path = fixture(tmp, tag);
         let mut cfg = cfg();
         cfg.approximator_layers = 2;
         cfg.approximator_hidden_dim = 16;
@@ -731,7 +740,8 @@ mod tests {
     /// streamed block was rebuilt dense from a snapshot the caller believes it quantized.
     #[test]
     fn quantizing_after_the_stream_is_armed_is_refused() {
-        let (path, cfg) = trunk_fixture("quant-order");
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, cfg) = trunk_fixture(&tmp, "quant-order");
         let build = || {
             let view = mlx_gen::weights::Weights::from_file(&path).unwrap();
             crate::transformer::ChromaTransformer::from_weights(view, cfg)
@@ -765,8 +775,9 @@ mod tests {
 
     #[test]
     fn eviction_is_all_or_nothing_and_shape_checked() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg();
-        let path = fixture("evict");
+        let path = fixture(&tmp, "evict");
         let s = stream(&path);
         let (mut double, mut single) = resident(&s);
         assert!(evict_resident_blocks(

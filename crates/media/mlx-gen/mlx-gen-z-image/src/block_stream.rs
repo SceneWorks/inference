@@ -266,14 +266,18 @@ mod tests {
 
     /// A two-block synthetic stack written to a temp `.safetensors`, so the stream can be exercised
     /// without a real snapshot.
-    fn fixture(tag: &str, n_blocks: usize) -> std::path::PathBuf {
-        fixture_at(tag, n_blocks, cfg().dim)
+    fn fixture(tmp: &tempfile::TempDir, tag: &str, n_blocks: usize) -> std::path::PathBuf {
+        fixture_at(tmp, tag, n_blocks, cfg().dim)
     }
 
     /// [`fixture`] at an explicit width, so the quantization test can use a group-64-divisible one.
-    fn fixture_at(tag: &str, n_blocks: usize, dim: i32) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zimage-block-stream-{tag}-{}", std::process::id()));
+    fn fixture_at(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+        n_blocks: usize,
+        dim: i32,
+    ) -> std::path::PathBuf {
+        let dir = tmp.path().join(format!("zimage-block-stream-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.safetensors");
         let mut named: Vec<(String, Array)> = Vec::new();
@@ -327,7 +331,8 @@ mod tests {
     /// `norm_q`.
     #[test]
     fn block_stream_drains_exactly_what_the_block_read() {
-        let path = fixture("drain", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "drain", 2);
         let s = stream(&path, 2);
         let mut view = s.open().unwrap();
         let before = view.len();
@@ -364,7 +369,8 @@ mod tests {
     /// accumulates. Re-opening returns the full key set every time.
     #[test]
     fn each_window_opens_an_independent_view() {
-        let path = fixture("reopen", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "reopen", 2);
         let s = stream(&path, 2);
         let mut first = s.open().unwrap();
         let full = first.len();
@@ -389,8 +395,9 @@ mod tests {
     /// size — the mechanism under test is per-block, and this is where it lives.
     #[test]
     fn a_materialized_block_replays_the_recorded_quantization() {
+        let tmp = tempfile::tempdir().unwrap();
         // Group-64 packing needs in-features divisible by 64, so this fixture is 64-wide.
-        let path = fixture_at("quant", 1, 64);
+        let path = fixture_at(&tmp, "quant", 1, 64);
         let mut s = ZImageBlockStream::new(
             WeightsSource::File(path.clone()),
             "layers",
@@ -463,7 +470,8 @@ mod tests {
 
     #[test]
     fn out_of_range_blocks_are_rejected() {
-        let path = fixture("range", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "range", 2);
         let s = stream(&path, 2);
         let mut view = s.open().unwrap();
         let err = match s.materialize(&mut view, 2) {
@@ -478,7 +486,8 @@ mod tests {
     /// LoRA installed on block 1 must NOT appear on block 0.
     #[test]
     fn captured_adapters_are_reinstalled_per_block() {
-        let path = fixture("adapters", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "adapters", 2);
         let mut s = stream(&path, 2);
 
         // Build the two resident blocks and install a LoRA on block 1 only.

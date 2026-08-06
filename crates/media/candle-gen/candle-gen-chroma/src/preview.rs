@@ -95,9 +95,10 @@ mod tests {
         // Chroma HD's own schedule (static shift 3), taken from the shipped pipeline rather than
         // hand-written, so the row cannot pass against a schedule Chroma never runs. `Pipeline::load`
         // is lazy — it records paths and reads no weights — so this needs neither a snapshot nor a GPU.
+        let tmp = tempfile::tempdir().unwrap();
         let pipe = crate::pipeline::Pipeline::load(
             crate::ChromaVariant::Hd,
-            &std::env::temp_dir(),
+            tmp.path(),
             &Device::Cpu,
             None,
         );

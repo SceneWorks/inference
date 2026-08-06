@@ -1844,11 +1844,10 @@ mod tests {
 
     // ---- sc-2618 kohya `lora_unet_` routing (no real weights) ---------------------------------
 
-    fn tmp(name: &str) -> std::path::PathBuf {
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         // Per-process scratch dir: two concurrent `cargo test` processes share `$TMPDIR`, so a fixed
         // name lets one run's fixtures be rewritten under the other's feet.
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_flux2_kohya_test_{}", std::process::id()));
+        let dir = tmp.path().join("mlx_gen_flux2_kohya_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -1899,6 +1898,7 @@ mod tests {
     /// A diffusers-named kohya file applies through the strict provider seam (every stem resolves).
     #[test]
     fn kohya_diffusers_applies() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -1914,7 +1914,7 @@ mod tests {
             arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
         }
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        let path = tmp("flux2_kohya_diffusers.safetensors");
+        let path = scratch_file(&tmp, "flux2_kohya_diffusers.safetensors");
         Array::save_safetensors(refs, meta, &path).unwrap();
         let report = apply_flux2_adapters(
             &mut t,
@@ -2036,6 +2036,7 @@ mod tests {
     /// single × 2 = 200 (klein's is 8×13 + 24×2 = 152), proving the wider/deeper graph is covered.
     #[test]
     fn dev_kohya_full_surface_applies() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -2052,7 +2053,7 @@ mod tests {
             arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
         }
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        let path = tmp("flux2_dev_kohya_full.safetensors");
+        let path = scratch_file(&tmp, "flux2_dev_kohya_full.safetensors");
         Array::save_safetensors(refs, meta, &path).unwrap();
         let report = apply_flux2_adapters(
             &mut t,
@@ -2074,6 +2075,7 @@ mod tests {
     /// family-agnostic engine as LoRA, on the wider graph.
     #[test]
     fn dev_lokr_resolves_on_wider_graph() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -2099,7 +2101,7 @@ mod tests {
         md.insert("networkType".to_string(), "lokr".to_string());
         md.insert("rank".to_string(), "1".to_string());
         md.insert("alpha".to_string(), "1".to_string());
-        let path = tmp("flux2_dev_lokr.safetensors");
+        let path = scratch_file(&tmp, "flux2_dev_lokr.safetensors");
         Array::save_safetensors(refs, Some(&md), &path).unwrap();
 
         let mut t = dev_transformer();
@@ -2200,6 +2202,7 @@ mod tests {
     /// (the diffusers path is fork-verified, sc-2646 → transitively the BFL path matches the fork).
     #[test]
     fn bfl_fused_qkv_resolves_and_splits_like_diffusers() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::adapters::Adapter;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -2220,7 +2223,7 @@ mod tests {
         let a = Array::from_slice(&[0.5f32, -0.5], &[r, inp]);
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-        let bpath = tmp("flux2_bfl_qkv.safetensors");
+        let bpath = scratch_file(&tmp, "flux2_bfl_qkv.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2253,7 +2256,7 @@ mod tests {
         assert!(rb.unmatched_paths.is_empty());
 
         // Equivalent diffusers split-target file: per-head up, SHARED down, same alpha.
-        let ppath = tmp("flux2_bfl_split_peft.safetensors");
+        let ppath = scratch_file(&tmp, "flux2_bfl_split_peft.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2333,6 +2336,7 @@ mod tests {
     /// independent reconstruct-then-slice (LoKr can't be expressed as a per-split file the way LoRA can).
     #[test]
     fn bfl_named_lokr_resolves_on_real_transformer() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::adapters::{reconstruct_lokr_delta, Adapter};
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -2349,7 +2353,7 @@ mod tests {
             ("alpha".to_string(), "1.0".to_string()),
             ("rank".to_string(), "1".to_string()),
         ]);
-        let path = tmp("flux2_bfl_lokr_diffmodel.safetensors");
+        let path = scratch_file(&tmp, "flux2_bfl_lokr_diffmodel.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2426,11 +2430,12 @@ mod tests {
     /// (`…linear1`→`to_qkv_mlp_proj`).
     #[test]
     fn bfl_renames_and_prefixes_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
         let meta = None as Option<&std::collections::HashMap<String, String>>;
         let s = Array::from_slice(&[0.01f32], &[1, 1]);
-        let path = tmp("flux2_bfl_renames.safetensors");
+        let path = scratch_file(&tmp, "flux2_bfl_renames.safetensors");
         Array::save_safetensors(
             vec![
                 ("base_model.model.img_in.lora_A.weight", &s),

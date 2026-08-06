@@ -290,13 +290,10 @@ mod tests {
         assert!(c.validate().is_err());
     }
 
-    fn snapshot_tmp(name: &str) -> std::path::PathBuf {
-        let tmp = std::env::temp_dir().join(format!(
-            "krea_cfg_{name}_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn snapshot_tmp(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let tmp = tmp
+            .path()
+            .join(format!("krea_cfg_{name}_{:?}", std::thread::current().id()));
         std::fs::create_dir_all(tmp.join("transformer")).unwrap();
         // A valid published transformer/config.json.
         std::fs::write(
@@ -315,29 +312,29 @@ mod tests {
 
     #[test]
     fn from_snapshot_defaults_patch_size_when_model_index_absent() {
+        let tmp = tempfile::tempdir().unwrap();
         // No model_index.json at all → keep the reference patch_size default.
-        let tmp = snapshot_tmp("idx_absent");
+        let tmp = snapshot_tmp(&tmp, "idx_absent");
         let c = Krea2Config::from_snapshot(&tmp).unwrap();
         assert_eq!(c.patch_size, Krea2Config::turbo().patch_size);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn from_snapshot_reads_present_patch_size() {
-        let tmp = snapshot_tmp("idx_present");
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = snapshot_tmp(&tmp, "idx_present");
         std::fs::write(tmp.join("model_index.json"), br#"{"patch_size": 4}"#).unwrap();
         let c = Krea2Config::from_snapshot(&tmp).unwrap();
         assert_eq!(c.patch_size, 4);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn from_snapshot_errors_on_corrupt_model_index() {
+        let tmp = tempfile::tempdir().unwrap();
         // model_index.json is present but malformed (partial download) → error, NOT silent default.
-        let tmp = snapshot_tmp("idx_corrupt");
+        let tmp = snapshot_tmp(&tmp, "idx_corrupt");
         std::fs::write(tmp.join("model_index.json"), b"{ not json").unwrap();
         assert!(Krea2Config::from_snapshot(&tmp).is_err());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

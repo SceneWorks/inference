@@ -704,14 +704,8 @@ mod tests {
     /// packed loaders assume the MLX default 64).
     #[test]
     fn transformer_packed_config_threads_parsed_group_size() {
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9474_sd3_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let tdir = tmp.join("transformer");
         std::fs::create_dir_all(&tdir).unwrap();
         let write_cfg = |json: &str| std::fs::write(tdir.join("config.json"), json).unwrap();
@@ -745,8 +739,6 @@ mod tests {
         // A dense config (no `quantization`) ⇒ None (dense path, no guard).
         write_cfg(r#"{"in_channels": 16}"#);
         assert!(pipe(&tmp).transformer_packed_config().is_none());
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Turbo's 4-step schedule starts at 1.0 and is strictly decreasing to 0.

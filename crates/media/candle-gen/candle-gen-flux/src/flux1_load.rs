@@ -159,9 +159,8 @@ mod tests {
     /// provider kept), not candle's raw mmap error.
     #[test]
     fn mmap_vb_missing_file_is_label_prefixed() {
-        let dir = std::env::temp_dir().join(format!("flux1_load_mmap_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let missing = dir.join("nope.safetensors");
         // `VarBuilder` (the Ok arm) is not `Debug`, so match rather than `unwrap_err`.
         match mmap_vb(
@@ -178,7 +177,6 @@ mod tests {
             }
             _ => panic!("expected a crafted missing-file error"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `seeded_noise` is a pure function of the seed (launch-portable determinism, sc-3673): same seed ⇒

@@ -37,9 +37,8 @@ fn hf_file(repo: &str, file: &str) -> PathBuf {
 
 /// Stage the engine's `ip_adapter` dir contract: `ip_adapter.safetensors` + `image_encoder/
 /// model.safetensors`, symlinked from the HF caches (the layout SceneWorks stages in sc-3625).
-fn staged_ip_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mlx_gen_flux_ip_e2e_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn staged_ip_dir(tmp: &tempfile::TempDir) -> PathBuf {
+    let dir = tmp.path().join("mlx_gen_flux_ip_e2e");
     std::fs::create_dir_all(dir.join("image_encoder")).unwrap();
     let ip = std::env::var("FLUX_IP_ADAPTER")
         .map(PathBuf::from)
@@ -69,9 +68,10 @@ fn gradient(w: u32, h: u32) -> Image {
 #[test]
 #[ignore = "loads a full FLUX.1-schnell snapshot + XLabs IP-Adapter + CLIP-ViT-L"]
 fn flux_ip_scale_zero_equals_txt2img() {
+    let tmp = tempfile::tempdir().unwrap();
     let model = mlx_gen_flux::load_schnell(
         &LoadSpec::new(WeightsSource::Dir(flux_schnell_snapshot()))
-            .with_ip_adapter(WeightsSource::Dir(staged_ip_dir())),
+            .with_ip_adapter(WeightsSource::Dir(staged_ip_dir(&tmp))),
     )
     .unwrap();
 
@@ -136,6 +136,7 @@ fn flux_dev_snapshot() -> PathBuf {
 #[test]
 #[ignore = "sc-3624 A/B: MLX flux+IP render on a reference PNG; set FLUX_IP_REF_PNG + FLUX_IP_OUT_PNG"]
 fn flux_ip_render_to_png() {
+    let tmp = tempfile::tempdir().unwrap();
     let ref_png = std::env::var("FLUX_IP_REF_PNG").expect("set FLUX_IP_REF_PNG");
     let out_png = std::env::var("FLUX_IP_OUT_PNG").expect("set FLUX_IP_OUT_PNG");
     let prompt = std::env::var("FLUX_IP_PROMPT")
@@ -172,7 +173,7 @@ fn flux_ip_render_to_png() {
         flux_schnell_snapshot()
     };
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot))
-        .with_ip_adapter(WeightsSource::Dir(staged_ip_dir()));
+        .with_ip_adapter(WeightsSource::Dir(staged_ip_dir(&tmp)));
     let model = if dev {
         mlx_gen_flux::load_dev(&spec)
     } else {

@@ -351,7 +351,6 @@ fn begin_with(
 mod tests {
     use super::*;
     use mlx_gen::{IdentityWeights, LoadShape, Quant};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn spec() -> LoadSpec {
         let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
@@ -399,14 +398,8 @@ mod tests {
 
     #[test]
     fn noncanonical_identity_is_admitted_uncalibrated_and_pinned() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "mlx-gen-pulid-identity-inventory-{}-{unique}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let face = root.join("face");
         std::fs::create_dir_all(&face).unwrap();
         let encoder = root.join("encoder.safetensors");
@@ -433,6 +426,5 @@ mod tests {
 
         std::fs::write(&encoder, b"mutated noncanonical encoder").unwrap();
         assert!(inventory.ensure_unchanged().is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
