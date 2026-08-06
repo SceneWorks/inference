@@ -24,9 +24,13 @@ use crate::pipeline::unpack_latents;
 /// **Refit whenever the VAE lineage changes**, with `tests/fit_preview_rgb.rs`:
 ///
 /// ```sh
-/// MLX_GEN_QWEN_SNAPSHOT=… cargo test -p mlx-gen-qwen-image --release \
-///   --test fit_preview_rgb -- --ignored --nocapture
+/// MLX_GEN_QWEN_SNAPSHOT=…/bf16 QWEN_LIGHTNING_SNAPSHOT=…/models--lightx2v--Qwen-Image-Lightning/snapshots/<rev> \
+///   cargo test -p mlx-gen-qwen-image --release --test fit_preview_rgb -- --ignored --nocapture
 /// ```
+///
+/// Both variables, not one: the corpus renders through the 8-step Lightning **adapter**, because
+/// "8-step Lightning" is what this block documents and the distilled schedule alone is half of it.
+/// The producer panics on a missing variable rather than skipping.
 ///
 /// That producer renders the corpus, solves the system, and prints this block ready to paste. It
 /// exists because this comment used to end at "re-solving" — naming a procedure with no
@@ -36,20 +40,40 @@ use crate::pipeline::unpack_latents;
 ///
 /// **These values are validated, not merely inherited.** sc-17515 scored them unchanged against
 /// `SceneWorks/qwen-image-mlx@8080a417` bf16 over 32,768 fresh samples: **R² = 0.9450, mean |ΔRGB|
-/// 12.58/255**, versus 0.9633 for an in-sample re-solve on the same corpus. The producer now asserts
-/// that number every run, so a VAE re-pin that moves the lineage out from under this block fails its
-/// lane instead of silently degrading previews. (The R² = 0.0114 that story opened on was a defect
-/// in the producer's host readback, not in these constants — `mlx-rs` `as_slice` returns physical
-/// storage for a transpose view. [`project_latents`](mlx_gen::preview::project_latents) is
-/// unaffected: it performs the same reshape/transpose but consumes it with a stride-aware `matmul`,
-/// and reads back only that op's contiguous output.)
+/// 12.58/255**, against **R² = 0.9633, mean |ΔRGB| 10.01/255** for an in-sample re-solve on the same
+/// corpus. Both are clamped the way [`project_latents`](mlx_gen::preview::project_latents) clamps
+/// before the 8-bit round, and the producer computes and prints the pair from one run — so the
+/// comparison is reproducible rather than asserted. (Its paste-ready block is annotated with the
+/// *unclamped* re-solve, 0.9521 on that corpus. That is the number the floor gates and it is not
+/// comparable to either figure above.) Giving up 0.018 of R² and 2.58/255 of mean error to a
+/// best-case, in-sample refit is not grounds for re-baselining shipping constants onto a two-render
+/// sample, which is why these are unchanged.
+///
+/// What the producer asserts every run is the **0.90 floor, against these constants** — not the
+/// 0.9450 itself, so a slide from 0.9450 to 0.91 would still pass. That is deliberate: the floor
+/// asks whether the linear projection still describes this VAE at all, which is the failure that
+/// reaches a preview, and a tighter bound on a two-render corpus would flake on sampling noise. A
+/// VAE re-pin that moves the lineage out from under this block fails its lane instead of silently
+/// degrading previews. (The R² = 0.0114 that story opened on was a defect in the producer's host
+/// readback, not in these constants — `mlx-rs` `as_slice` returns physical storage for a transpose
+/// view. `project_latents` is unaffected: it performs the same reshape/transpose but consumes it
+/// with a stride-aware `matmul`, and reads back only that op's contiguous output.)
 ///
 /// A stale fit degrades preview colour only; it cannot affect the render, which never reads these.
 ///
 /// **These are not Qwen-Image-only.** `mlx-gen-krea` reuses [`QwenVae`](crate::QwenVae) directly, so
 /// the same latent space — and therefore the same fit — applies to the Krea family unchanged. A
 /// second family needs its own fit only if it has its own VAE.
-const RGB_FACTORS: [[f32; 3]; 16] = [
+///
+/// `pub` for one reason: `tests/fit_preview_rgb.rs` is an integration test — a separate crate — and
+/// its drift gate has to score **these** values, not a copy of them. It carried a hand-typed
+/// duplicate while it only printed a delta report; now that the duplicate feeds an `assert!`, a
+/// divergent copy would make the weekly lane score the OLD constants and report green while previews
+/// use the new ones — a false green on precisely the scenario the gate was added for. `#[doc(hidden)]`
+/// because that is a test seam, not API: these were private, so this changes nothing about the
+/// rendered docs.
+#[doc(hidden)]
+pub const RGB_FACTORS: [[f32; 3]; 16] = [
     [-0.00986379, 0.0257554, 0.211834],
     [-0.00150066, -0.00355605, 0.00219657],
     [0.0881243, 0.0565462, 0.0390654],
@@ -69,7 +93,10 @@ const RGB_FACTORS: [[f32; 3]; 16] = [
 ];
 
 /// Intercept of the [`RGB_FACTORS`] fit — the mid-grey a zero latent projects to.
-const RGB_BIAS: [f32; 3] = [0.406258, 0.385829, 0.287052];
+///
+/// `pub` on the same terms, and for the same reason, as [`RGB_FACTORS`].
+#[doc(hidden)]
+pub const RGB_BIAS: [f32; 3] = [0.406258, 0.385829, 0.287052];
 
 /// Unpack the current Qwen latent `[1, seq, 64]` and hand it to the shared preview machinery.
 ///
