@@ -10,4 +10,8 @@ __pycache__/
 # worth keeping does NOT belong here — promote it to `examples/`, where it is committed and
 # documented but stays out of the per-env-var test census `release/real-weight-models.toml` keeps
 # (see `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs`, sc-17513).
-*_scratch.rs
+#
+# Anchored to `tests/` on purpose. Unanchored, this would swallow a `*_scratch.rs` anywhere in the
+# tree — including `src/` — where the file is real source: it would build for its author and be
+# missing, silently, from every other checkout.
+**/tests/*_scratch.rs

@@ -1,14 +1,16 @@
 //! sc-17513 sweep harness: the producer behind every number in
-//! `tests/perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL`.
+//! `tests/perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I` and
+//! `tests/perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_EDIT` — one bound per arm, each derived from
+//! that arm's own run of this sweep.
 //!
 //! It discriminates (a) the bf16/Metal + `mx.compile` f32 ULP floor amplified by a 60-layer stack
-//! from (b) a genuine compiled-glue fusion divergence on the Qwen-Image MMDiT, and it derives the
-//! gate's bound from the `conditioning` mode's measured envelope. It is an **example, not a test**,
-//! on purpose: it is far too expensive to wire (the 13-shape sweep is ~10 minutes of 40 GiB
-//! forwards, and `depth` wants one process per depth), and adding four `#[ignore]` tests would
+//! from (b) a genuine compiled-glue fusion divergence on the Qwen-Image MMDiT, and it derives each
+//! arm's bound from that arm's `conditioning` mode measured envelope. It is an **example, not a
+//! test**, on purpose: it is far too expensive to wire (the 13-shape sweep is ~10 minutes of 40
+//! GiB forwards, and `depth` wants one process per depth), and adding four `#[ignore]` tests would
 //! enlarge the per-variable test census `release/real-weight-models.toml` accounts for without
-//! buying any CI coverage. The gate that CI runs is `tests/perf.rs`; this is how its number was
-//! obtained and how to obtain it again.
+//! buying any CI coverage. The gate that CI runs is `tests/perf.rs`; this is how its numbers were
+//! obtained and how to obtain them again.
 //!
 //! Run from the workspace root, one mode per process:
 //! ```text
@@ -205,9 +207,14 @@ fn sweep_depth() {
 /// the divergence, is the quantity a bound should be derived from, because it measures what the
 /// stack does to *any* sub-ULP difference rather than what it did to one particular one.
 ///
-/// k = 4 is measured alongside k = 1 so the linear extrapolation the bound rests on is a measured
-/// property and not an assumption: 4 ULP is [`mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL`], the op-level
-/// budget the fused glue is separately gated to.
+/// k = 4 is measured alongside k = 1 to **test whether** the response scales with the perturbation
+/// magnitude — and the answer is that it does not. It plateaus: across the 16 paired probes the
+/// largest increase is 2.1× and 6 of 16 pairs *decreased*, so quadrupling the input does not
+/// quadruple the output difference. That is why `tests/perf.rs` documents the ×4 in each bound as
+/// margin for **shapes not sampled** and for the second host, and explicitly **not** as a magnitude
+/// extrapolation — extrapolating linearly off k = 1 would overstate it. (k = 4 is worth probing at
+/// all because 4 ULP is [`mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL`], the op-level budget the fused
+/// glue is separately gated to.)
 ///
 /// Run per arm: the T2I bf16 and Edit q8 tiers are different weight encodings and there is no
 /// reason to assume one arm's envelope transfers to the other, so each arm's bound is derived from
