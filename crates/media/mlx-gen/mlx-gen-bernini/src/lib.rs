@@ -28,6 +28,7 @@ pub mod convert;
 pub mod forward;
 pub mod guidance;
 pub mod mar;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod preprocess;
 pub mod process;
