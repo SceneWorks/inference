@@ -123,6 +123,52 @@ class S18MemoryPreflightTests(unittest.TestCase):
         # ...and the fallback bucket is what makes row F reachable on the smaller box at all.
         self.assertLess(peak("F", 640, 384), budget(101.0))
 
+    def test_the_kv_tier_prices_the_sweep_and_agrees_with_the_rust_figure(self) -> None:
+        """sc-17807 — the cache tier is a config knob, so the preflight has to price the right one.
+
+        The bytes-per-token table is duplicated across the language boundary (here and
+        `KreaRealtimeConfig::kv_bytes_per_token`), and a preflight that priced bf16 while the sweep
+        ran Q8 would over-predict by ~1.9x and refuse rows that fit — the *other* failure mode, and
+        the one that quietly stops the evidence being collected at all.
+        """
+        # bf16 is the shipped default and must be unchanged by the knob's introduction.
+        self.assertEqual(preflight.kv_bytes_per_token(None), 819_200)
+        self.assertEqual(preflight.kv_bytes_per_token(None), 800 * 1024)
+        # Q8: 5120 packed bytes + 80 groups x (bf16 scale + bf16 bias), doubled for K and V, x40.
+        self.assertEqual(preflight.kv_bytes_per_token(8), 2 * 40 * (5120 + 80 * 4))
+        self.assertEqual(preflight.kv_bytes_per_token(8), 435_200)
+        self.assertEqual(preflight.kv_bytes_per_token(4), 230_400)
+        # 0.53x, not the clean 0.5x that ignores the per-group scale/bias.
+        self.assertAlmostEqual(
+            preflight.kv_bytes_per_token(8) / preflight.kv_bytes_per_token(None), 0.53125, places=9
+        )
+
+        # The literals the Rust side pins, read out of its own test rather than retyped — so the two
+        # implementations cannot drift apart silently.
+        rust = (
+            Path(__file__).resolve().parents[2]
+            / "crates/media/mlx-gen/mlx-gen-krea-realtime/src/config.rs"
+        ).read_text(encoding="utf-8")
+        for literal in ("819_200", "435_200", "230_400"):
+            self.assertIn(
+                literal,
+                rust,
+                f"config.rs no longer pins {literal}; the Rust and Python per-token tables have "
+                "drifted apart",
+            )
+
+        # An unusable tier is refused rather than silently mispriced.
+        for bits, group in ((7, 64), (8, 48)):
+            with self.assertRaises(ValueError):
+                preflight.kv_bytes_per_token(bits, group)
+
+        # The whole point: at Q8 the row that took nax-macos-2 down twice fits on it.
+        def budget(ram: float) -> float:
+            return ram - preflight.NON_MLX_OVERHEAD_GIB - preflight.SAFETY_MARGIN_GIB
+
+        self.assertGreater(preflight.predicted_peak_gib("F", 832, 480, 45), budget(101.0))
+        self.assertLess(preflight.predicted_peak_gib("F", 832, 480, 45, 8), budget(101.0))
+
     def test_exit_codes(self) -> None:
         import contextlib
         import io
@@ -150,6 +196,14 @@ class S18MemoryPreflightTests(unittest.TestCase):
         self.assertEqual(run(["--rows", "AQ", "--ram-gib", "101"]), 1, "unknown row is an error")
         # An unmeasurable host must not block the lane.
         self.assertEqual(run(["--rows", "F", "--ram-gib", "0"]), 0)
+        # sc-17807 — the Q8 tier changes the verdict for row F on the box it killed, and an
+        # unusable tier is an error rather than a silent misprice.
+        self.assertEqual(
+            run(["--rows", "F", "--ram-gib", "101", "--kv-bits", "8"]),
+            0,
+            "row F fits nax-macos-2 once the KV is quantized",
+        )
+        self.assertEqual(run(["--rows", "A", "--ram-gib", "101", "--kv-bits", "7"]), 1)
 
 
 if __name__ == "__main__":

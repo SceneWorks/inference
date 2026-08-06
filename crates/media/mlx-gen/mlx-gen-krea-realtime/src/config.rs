@@ -29,6 +29,104 @@ use serde_json::Value;
 /// The registered [`Generator`](crate::KreaRealtime) is composed under this id (sc-8439 S6).
 pub const MODEL_ID: &str = "krea_realtime_14b";
 
+/// Bytes MLX spends on one affine-quantization group's `scale` **and** `bias`. `mlx_rs::ops::quantize`
+/// emits both in the **input's** dtype, and the KV cache quantizes bf16 post-RoPE K / raw V, so each
+/// group costs 2 + 2 bytes on top of its packed payload. This is the term that makes Q8 KV `0.53×`
+/// bf16 rather than a clean half — see [`KvCacheQuant::row_bytes`].
+const QUANT_GROUP_OVERHEAD_BYTES: usize = 4;
+
+/// Bits per element of the shipped (unquantized) KV cache — bf16 post-RoPE keys + raw values.
+const DENSE_KV_BITS: usize = 16;
+
+/// Group-wise affine quantization of the **persistent self-attention KV cache** (sc-17807).
+///
+/// The KV cache holds *activations*, not weights, so a Q4 DiT does not shrink it: for the Wan-14B
+/// backbone the shipped bf16 cache costs `2 (K and V) × 40 layers × 5120 dim × 2 bytes` =
+/// **819,200 bytes (800 KiB) per DiT token**, which for an autoregressive *video* model is the
+/// dominant term — not the ~9 GiB of Q4 weights (see [`KreaRealtimeConfig::kv_bytes_per_token`]).
+///
+/// **How it is spent, and why not a quantized attention kernel.** MLX at the pinned revision exposes
+/// **no fused quantized SDPA**: `mlx_rs::fast::scaled_dot_product_attention` takes dense arrays, and
+/// the only quantized primitives are `quantize` / `dequantize` / `quantized_matmul`. Consuming a packed
+/// cache directly therefore means the decomposed `quantized_matmul → softmax → quantized_matmul` form
+/// (mlx-lm's `quantized_scaled_dot_product_attention`), which **materializes the whole `Sq × Sk` score
+/// matrix** that the fused kernel never builds. That is fine for LLM decode, where `Sq = 1`; for one
+/// Krea AR chunk `Sq` is a full frame-block (4,680 tokens at 832×480), and *one layer's* bf16 score
+/// matrix (3.50 GB) is already the size of the Q8 saving on the *whole 40-layer cache* (3.59 GB) —
+/// while costing **37×** what dequantizing that layer's read window costs (0.096 GB). A `precise` f32
+/// softmax, which is what mlx-lm uses, doubles the transient again. Both figures are computed by
+/// `decomposed_quantized_attention_costs_far_more_than_dequantizing_the_window` in `causal.rs`. So the
+/// cache stores packed and **dequantizes the read window per layer**, keeping the fused SDPA path. The
+/// dequantized window is an anonymous graph intermediate (built and dropped inside one chunk forward,
+/// before the AR loop's per-step `eval`), so MLX frees it as each layer's attention completes; what
+/// stays resident across chunks is the packed cache.
+///
+/// Grouping runs along the **last** axis of the cached `[B, n, S, head_dim]` K/V — i.e. within a head,
+/// exactly the layout `take_axis`/`concatenate_axis` on the token axis leave untouched — so
+/// `head_dim` must be a multiple of [`group_size`](Self::group_size) (128 / 64 for this backbone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvCacheQuant {
+    /// Bits per packed element. MLX's affine mode supports 2, 3, 4, 5, 6 and 8.
+    pub bits: i32,
+    /// Elements sharing one scale/bias. MLX's affine mode supports 32, 64 and 128.
+    pub group_size: i32,
+}
+
+impl KvCacheQuant {
+    /// Q8 KV at MLX's default group size — the tier sc-17807 measured (`0.53×` the bf16 cache).
+    pub const Q8: Self = Self {
+        bits: 8,
+        group_size: 64,
+    };
+
+    /// Q4 KV at MLX's default group size (`0.28×` the bf16 cache). Materially lossier than
+    /// [`Q8`](Self::Q8) and **not** measured by the sc-17807 sweep — treat it as unvalidated.
+    pub const Q4: Self = Self {
+        bits: 4,
+        group_size: 64,
+    };
+
+    /// Reject a tier MLX's affine quantization cannot express, before it becomes an opaque MLX
+    /// exception several layers down inside a chunk forward.
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) {
+            return Err(Error::Msg(format!(
+                "krea KV cache: {} bits is not an MLX affine quantization width (2, 3, 4, 5, 6, 8)",
+                self.bits
+            )));
+        }
+        if !matches!(self.group_size, 32 | 64 | 128) {
+            return Err(Error::Msg(format!(
+                "krea KV cache: group size {} is not an MLX affine quantization group (32, 64, 128)",
+                self.group_size
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bytes one row of `dim` cached elements occupies at this tier: the packed payload plus one
+    /// scale **and** one bias per group. `dim` must be a multiple of
+    /// [`group_size`](Self::group_size) — the same divisibility MLX's `quantize` enforces on the
+    /// grouped axis.
+    ///
+    /// The per-group overhead is why Q8 is `0.53×` bf16 and not `0.50×`: at `group_size = 64` a group
+    /// costs 64 packed bytes plus 4 bytes of bf16 scale/bias against bf16's 128.
+    pub fn row_bytes(&self, dim: usize) -> Result<usize> {
+        self.validate()?;
+        let group_size = self.group_size as usize;
+        if dim == 0 || !dim.is_multiple_of(group_size) {
+            return Err(Error::Msg(format!(
+                "krea KV cache: {dim} elements per row is not a positive multiple of the \
+                 quantization group size {group_size}"
+            )));
+        }
+        // Exact integer arithmetic: `bits · dim` is a whole number of bits because `dim` is a
+        // multiple of the group size and every supported group size is a multiple of 8.
+        let packed = dim * self.bits as usize / 8;
+        Ok(packed + dim / group_size * QUANT_GROUP_OVERHEAD_BYTES)
+    }
+}
+
 /// The autoregressive / self-forcing inference knobs Krea Realtime carries on top of the shared
 /// Wan-2.1-T2V-14B DiT. These describe the AR **denoise regime**, not the weights, and are consumed by
 /// S3 (causal attention), S4 (KV cache), and S5 (the self-forcing AR loop) — **not** by the S2 load
@@ -72,6 +170,17 @@ pub struct KreaArConfig {
     /// which the few-step schedule's argmin maps to the smallest tabled sigma `≈ 0.00498` — near-clean,
     /// not exactly clean. Consumed by S5.
     pub context_noise: f32,
+    /// Group-wise affine quantization of the persistent self-attention KV cache, or `None` — the
+    /// shipped default — to retain post-RoPE K / raw V as **bf16** (sc-17807). The reference has no
+    /// such knob; this is a memory lever for the bounded-window Mac path, where the KV, not the Q4
+    /// weights, is the dominant term (800 KiB per DiT token at bf16 —
+    /// [`KreaRealtimeConfig::kv_bytes_per_token`]). Consumed by
+    /// [`CausalKvCache`](crate::CausalKvCache).
+    ///
+    /// **Opt-in on purpose.** Quantizing the cache perturbs the same long-clip coherence sc-15571 /
+    /// sc-15127 measure, so it is off by default and turning it on is a measured decision, not a free
+    /// one — see the sc-17807 arm of the S18 sweep.
+    pub kv_cache_quant: Option<KvCacheQuant>,
 }
 
 impl Default for KreaArConfig {
@@ -140,6 +249,7 @@ impl KreaArConfig {
             timestep_shift: 5.0,
             do_kv_recomp: true,
             context_noise: 0.0,
+            kv_cache_quant: None,
         }
     }
 }
@@ -193,6 +303,49 @@ impl KreaRealtimeConfig {
         Ok(cfg)
     }
 
+    /// Bytes of **persistent self-attention KV per DiT token**, across every layer — the quantity that
+    /// actually sizes an autoregressive video run (sc-17807).
+    ///
+    /// `2 (K and V) × num_layers × row_bytes(dim)`, where a bf16 row costs `2·dim` bytes and a
+    /// quantized row costs its packed payload plus a bf16 scale **and** bias per group
+    /// ([`KvCacheQuant::row_bytes`]). At the shipped Wan-14B geometry (40 layers, dim 5120):
+    ///
+    /// | KV tier | bytes/token | KiB/token | vs bf16 |
+    /// |---|---|---|---|
+    /// | bf16 (shipped default) | 819,200 | 800 | 1.00× |
+    /// | Q8 / group 64 | 435,200 | 425 | 0.53× |
+    /// | Q4 / group 64 | 230,400 | 225 | 0.28× |
+    ///
+    /// Multiply by the retained window to get the cache: the Mac bounded window
+    /// ([`streaming_local_attn_frames`](KreaArConfig::streaming_local_attn_frames) = 6 latent frames)
+    /// at 832×480 is `6 × 1560 = 9,360` tokens ⇒ **7.15 GiB** bf16, 3.80 GiB at Q8; the checkpoint's
+    /// global window over a 45-latent-frame clip is 70,200 tokens ⇒ **53.6 GiB** bf16.
+    ///
+    /// Errors when [`kv_cache_quant`](KreaArConfig::kv_cache_quant) names a tier MLX cannot express,
+    /// or one whose group size does not divide the model's `head_dim` (the grouped axis).
+    pub fn kv_bytes_per_token(&self) -> Result<usize> {
+        let row = match self.ar.kv_cache_quant {
+            None => self.wan.dim * DENSE_KV_BITS / 8,
+            Some(q) => {
+                // Grouping runs along `head_dim` (the cached tensor's last axis), so that — not the
+                // full `dim` — is the axis the group size has to divide. Once it does, the whole
+                // `dim` row is an exact multiple of the group too, which is what `row_bytes` costs.
+                q.row_bytes(self.wan.head_dim())?;
+                q.row_bytes(self.wan.dim)?
+            }
+        };
+        Ok(2 * self.wan.num_layers * row)
+    }
+
+    /// Reject a [`kv_cache_quant`](KreaArConfig::kv_cache_quant) tier this backbone cannot express.
+    ///
+    /// Called on the request path so a snapshot `config.json` naming an impossible tier fails where
+    /// the caller can see it, rather than several layers down inside the first chunk forward — by
+    /// which point a long clip has already been paid for.
+    pub fn validate_kv_cache_quant(&self) -> Result<()> {
+        self.kv_bytes_per_token().map(|_| ())
+    }
+
     /// Serialize to the `config.json` schema [`from_model_dir`](Self::from_model_dir) reads back — the
     /// shared Wan DiT half ([`WanModelConfig::to_json`], which carries the `quantization` block of a
     /// pre-quantized tier) plus the AR knobs `overlay_ar` consumes. Round-trips by construction (the
@@ -210,6 +363,14 @@ impl KreaRealtimeConfig {
         v["timestep_shift"] = serde_json::json!(self.ar.timestep_shift);
         v["do_kv_recomp"] = serde_json::json!(self.ar.do_kv_recomp);
         v["context_noise"] = serde_json::json!(self.ar.context_noise);
+        // Emitted only when the cache is quantized, mirroring the Wan half's `quantization` block: a
+        // bf16-KV snapshot must not read as one carrying an (identity) KV tier.
+        if let Some(q) = self.ar.kv_cache_quant {
+            v["kv_cache_quant"] = serde_json::json!({
+                "bits": q.bits,
+                "group_size": q.group_size,
+            });
+        }
         v
     }
 }
@@ -251,6 +412,18 @@ fn overlay_ar(v: &Value, ar: &mut KreaArConfig) {
     }
     if let Some(n) = v.get("context_noise").and_then(Value::as_f64) {
         ar.context_noise = n as f32;
+    }
+    // An explicit `null` selects the shipped bf16 cache, so the key being *present* is what decides —
+    // a snapshot can turn the cache tier back off, not only on.
+    if let Some(q) = v.get("kv_cache_quant") {
+        ar.kv_cache_quant = q
+            .get("bits")
+            .and_then(Value::as_i64)
+            .zip(q.get("group_size").and_then(Value::as_i64))
+            .map(|(bits, group_size)| KvCacheQuant {
+                bits: bits as i32,
+                group_size: group_size as i32,
+            });
     }
 }
 
@@ -353,6 +526,121 @@ mod tests {
         streaming.local_attn_size = ar.streaming_local_attn_frames() as i64;
         assert_eq!(streaming.max_attention_size(), 9360);
         assert!(streaming.max_attention_size() < ar.seq_length);
+    }
+
+    /// **The per-token KV figure, computed rather than recited (sc-17807).**
+    ///
+    /// The crate previously documented the cache at 546 kB a token, which is wrong by 1.5× — the correct bf16
+    /// cost at this backbone's geometry is `2 (K and V) × 40 layers × 5120 dim × 2 bytes` =
+    /// **819,200 bytes = 800 KiB**. That is not a rounding quibble: at the checkpoint's global window
+    /// over a 45-latent-frame 832×480 clip it is the difference between a documented "≈38 GiB of KV"
+    /// and the 53.6 GiB the run actually holds, which is the gap between "tight on a 128 GiB host"
+    /// and "does not fit". The literals here are derived independently of `kv_bytes_per_token`'s
+    /// implementation, so the two have to agree.
+    #[test]
+    fn kv_bytes_per_token_is_800_kib_dense_and_425_kib_at_q8() {
+        let cfg = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(cfg.ar.kv_cache_quant, None, "the shipped cache is bf16");
+        assert_eq!(cfg.kv_bytes_per_token().unwrap(), 819_200);
+        assert_eq!(cfg.kv_bytes_per_token().unwrap(), 800 * 1024);
+        // The withdrawn figure, named so it cannot quietly return.
+        assert_ne!(
+            cfg.kv_bytes_per_token().unwrap(),
+            546 * 1000,
+            "the stale estimate priced a token at 546 kB; the derived cost is 800 KiB"
+        );
+
+        let mut q8 = cfg.clone();
+        q8.ar.kv_cache_quant = Some(KvCacheQuant::Q8);
+        // 5120 packed bytes + 80 groups x (bf16 scale + bf16 bias), x2 for K and V, x40 layers.
+        assert_eq!(q8.kv_bytes_per_token().unwrap(), 2 * 40 * (5120 + 80 * 4));
+        assert_eq!(q8.kv_bytes_per_token().unwrap(), 435_200);
+        // Q8 is 0.53x, NOT the clean 0.5x a "halves the KV" claim would imply — the per-group
+        // scale/bias is a real 6% of the tier.
+        let ratio =
+            q8.kv_bytes_per_token().unwrap() as f64 / cfg.kv_bytes_per_token().unwrap() as f64;
+        assert!((ratio - 0.53125).abs() < 1e-9, "Q8 KV is {ratio} of bf16");
+
+        let mut q4 = cfg.clone();
+        q4.ar.kv_cache_quant = Some(KvCacheQuant::Q4);
+        assert_eq!(q4.kv_bytes_per_token().unwrap(), 230_400);
+
+        // The window figures the docs quote, derived from the same function.
+        let shipped_window_tokens = 6 * 1560; // the Mac bounded window at 832x480
+        assert_eq!(
+            shipped_window_tokens * cfg.kv_bytes_per_token().unwrap(),
+            7_667_712_000
+        );
+        let global_window_tokens = 45 * 1560; // the checkpoint's global window over a 45-frame clip
+        let global_gib =
+            (global_window_tokens * cfg.kv_bytes_per_token().unwrap()) as f64 / 1024f64.powi(3);
+        assert!(
+            (global_gib - 53.6).abs() < 0.1,
+            "the global window over a 45-latent-frame 832x480 clip is {global_gib:.1} GiB of KV"
+        );
+    }
+
+    /// A tier MLX cannot express must be rejected by the config, not deep inside a chunk forward —
+    /// and the `head_dim` divisibility (the axis grouping actually runs along) must be part of it.
+    #[test]
+    fn kv_bytes_per_token_rejects_a_tier_the_backbone_cannot_express() {
+        let mut cfg = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(cfg.wan.head_dim(), 128);
+        // group 128 divides head_dim 128 — allowed.
+        cfg.ar.kv_cache_quant = Some(KvCacheQuant {
+            bits: 8,
+            group_size: 128,
+        });
+        assert!(cfg.kv_bytes_per_token().is_ok());
+        // A model whose head_dim is not a multiple of the group is refused, even though `dim` is.
+        cfg.wan.num_heads = 80; // head_dim = 5120 / 80 = 64 < 128, while dim stays a multiple of 128
+        let err = cfg
+            .kv_bytes_per_token()
+            .expect_err("head_dim 64 cannot carry a 128-wide group");
+        assert!(format!("{err}").contains("group size"), "{err}");
+    }
+
+    /// The knob must survive `to_json` → `from_model_dir`, and — the discriminating half — a snapshot
+    /// with no `kv_cache_quant` key must stay bf16 rather than inheriting whatever the preset had.
+    #[test]
+    fn kv_cache_quant_round_trips_and_is_absent_from_a_dense_config() {
+        let mut cfg = KreaRealtimeConfig::krea_realtime_14b();
+        cfg.ar.kv_cache_quant = Some(KvCacheQuant {
+            bits: 4,
+            group_size: 32,
+        });
+        let root = std::env::temp_dir().join(format!("krea_realtime_kvq_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_string_pretty(&cfg.to_json()).unwrap(),
+        )
+        .unwrap();
+        let back = KreaRealtimeConfig::from_model_dir(&root).unwrap();
+        assert_eq!(back.ar.kv_cache_quant, cfg.ar.kv_cache_quant);
+        assert_eq!(back, cfg);
+
+        // A bf16 config emits no key at all, so a dense snapshot never reads as quantized.
+        let dense = KreaRealtimeConfig::krea_realtime_14b();
+        assert!(dense.to_json().get("kv_cache_quant").is_none());
+
+        // ...and a JSON that omits the key leaves the shipped bf16 default in place.
+        let mut ar = KreaArConfig::krea_realtime_14b();
+        overlay_ar(
+            &serde_json::from_str("{\"sink_size\": 1}").unwrap(),
+            &mut ar,
+        );
+        assert_eq!(ar.kv_cache_quant, None);
+        // An explicit null turns a quantized preset back off — the key's presence is what decides.
+        let mut ar = KreaArConfig::krea_realtime_14b();
+        ar.kv_cache_quant = Some(KvCacheQuant::Q8);
+        overlay_ar(
+            &serde_json::from_str("{\"kv_cache_quant\": null}").unwrap(),
+            &mut ar,
+        );
+        assert_eq!(ar.kv_cache_quant, None);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

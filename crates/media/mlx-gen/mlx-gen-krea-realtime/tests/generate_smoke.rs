@@ -40,7 +40,9 @@ use std::time::Instant;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
-use mlx_gen_krea_realtime::{decode_latents_to_video, decode_tiling, KreaRealtimeConfig, MODEL_ID};
+use mlx_gen_krea_realtime::{
+    decode_latents_to_video, decode_tiling, KreaRealtimeConfig, KvCacheQuant, MODEL_ID,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Environment / fixtures
@@ -1748,14 +1750,24 @@ fn v2v_strength_zero_is_latent_identity() {
     );
 }
 
-/// **Measured KV-cache residency at the production geometry.** The self-attention KV cache holds
-/// post-RoPE **activations**, so it is bf16 on every weight tier — a Q4 DiT does not shrink it, which
-/// is the whole point of measuring it next to the Q4 weights. Drives the real DiT chunk-by-chunk with
-/// the same bounded window the pipeline uses and reports the retained bytes plus the allocator delta.
+/// **Measured KV-cache residency at the production geometry, per storage tier.** The self-attention
+/// KV cache holds post-RoPE **activations**, so the *weight* tier does not shrink it: a Q4 DiT still
+/// carries a bf16 cache, which is the whole point of measuring it next to the Q4 weights. What *does*
+/// shrink it is [`KreaArConfig::kv_cache_quant`](mlx_gen_krea_realtime::KreaArConfig::kv_cache_quant)
+/// (sc-17807), so this drives the real DiT chunk-by-chunk **once per tier** — the shipped bf16 cache
+/// and Q8 — over the same bounded window the pipeline uses.
+///
+/// The gate is the one that makes the published per-token table evidence rather than arithmetic:
+/// measured `retained_bytes` must equal
+/// [`kv_bytes_per_token`](mlx_gen_krea_realtime::KreaRealtimeConfig::kv_bytes_per_token) × retained
+/// tokens **exactly**, on real weights, for both tiers. A table that drifted from the allocator, or a
+/// tier that silently stored dense, fails here.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
 fn kv_cache_residency_at_the_production_geometry() {
-    use mlx_gen_krea_realtime::{load_krea_realtime_transformer_with_quant, CausalKreaTransformer};
+    use mlx_gen_krea_realtime::{
+        load_krea_realtime_transformer_with_quant, CausalKreaTransformer, CausalKvCache,
+    };
     use mlx_rs::Array;
 
     let root = require_snapshot();
@@ -1782,8 +1794,6 @@ fn kv_cache_residency_at_the_production_geometry() {
         load_krea_realtime_transformer_with_quant(raw, &cfg).expect("load the Krea DiT");
     println!("  DiT tier on disk: {packed:?}");
     let transformer = CausalKreaTransformer::new(dit, &cfg);
-
-    let mut cache = transformer.new_cache();
 
     // A zero context is enough: this measures cache growth, not image quality.
     let ctx = Array::zeros::<f32>(&[cfg.wan.text_len as i32, cfg.wan.text_dim as i32])
@@ -1812,69 +1822,107 @@ fn kv_cache_residency_at_the_production_geometry() {
     let partially_staged = mlx_rs::memory::get_active_memory();
 
     let fpb = cfg.ar.num_frames_per_block as i32;
-    let mut start = 0usize;
-    let mut peak_retained_bytes = 0usize;
     let chunks = latent_frames.div_ceil(cfg.ar.num_frames_per_block);
-    for c in 0..chunks {
-        let chunk =
-            Array::zeros::<f32>(&[cfg.wan.in_dim as i32, fpb, latent_h as i32, latent_w as i32])
-                .expect("chunk");
-        let velocity = transformer
-            .forward_chunk(&chunk, 500.0, &cross_kv, start, &mut cache)
-            .expect("causal chunk forward");
-        start += (fpb as usize) * cfg.ar.frame_seq_length;
-        // Sum the retained (k, v) bytes across every layer — the true residency, after eviction.
-        //
-        // MLX is LAZY: without this `eval` the whole chunk forward is an unexecuted graph, the cache
-        // arrays are unmaterialized, and `get_active_memory()` reads ~0 — the measurement would be a
-        // shape calculation dressed up as a memory reading. Forcing the cache (and the velocity that
-        // depends on the same graph) makes the reported bytes and the allocator's active figure both
-        // real, and makes the run take actual GPU time.
-        let mut resident: Vec<&Array> = vec![&velocity];
-        for l in 0..cache.num_layers() {
-            if let Some((k, v)) = cache.layer_kv(l) {
-                resident.push(k);
-                resident.push(v);
-            }
-        }
-        mlx_rs::transforms::eval(resident).expect("materialize the KV cache");
-        let mut bytes = 0usize;
-        for l in 0..cache.num_layers() {
-            if let Some((k, v)) = cache.layer_kv(l) {
-                for a in [k, v] {
-                    bytes += a.nbytes();
-                }
-            }
-        }
-        peak_retained_bytes = peak_retained_bytes.max(bytes);
-        println!(
-            "  chunk {c:>2}: stored {} tok, retained {} tok, KV {:.2} GiB, MLX active {:.2} GiB",
-            cache.stored_tokens(),
-            cache.retained_tokens(),
-            gib(bytes),
-            gib(mlx_rs::memory::get_active_memory()),
-        );
-    }
-
-    println!(
-        "  KV-cache residency at {w}x{h} ({} tok/frame, window {} frames): {:.2} GiB \
-         (MLX active after PARTIAL staging -- text embed + cross-attn k/v only, ~15% of the DiT: \
-         {:.2} GiB)",
-        cfg.ar.frame_seq_length,
-        cfg.ar.streaming_local_attn_frames(),
-        gib(peak_retained_bytes),
-        gib(partially_staged),
-    );
-    assert!(
-        peak_retained_bytes > 0,
-        "the KV cache never retained anything — the measurement is inert"
-    );
     // The bound is structural: retention can never exceed the read window plus one in-flight chunk.
     let max_tokens = cfg.ar.max_attention_size() + cfg.ar.block_size();
+    let mut peak_by_tier: Vec<(Option<KvCacheQuant>, usize)> = Vec::new();
+
+    for tier in [None, Some(KvCacheQuant::Q8)] {
+        let mut tier_cfg = cfg.clone();
+        tier_cfg.ar.kv_cache_quant = tier;
+        let per_token = tier_cfg
+            .kv_bytes_per_token()
+            .expect("the tier must be expressible at this backbone's geometry");
+        // Built from the config rather than `transformer.new_cache()` so both tiers run against the
+        // one loaded DiT (the transformer bakes its tier at construction).
+        let mut cache = CausalKvCache::new(
+            tier_cfg.wan.num_layers,
+            tier_cfg.ar.max_attention_size(),
+            tier_cfg.ar.sink_tokens(),
+            tier,
+        );
+        let label = match tier {
+            None => "bf16".to_string(),
+            Some(q) => format!("q{}/g{}", q.bits, q.group_size),
+        };
+        println!("  --- KV tier {label} ({per_token} bytes/token) ---");
+
+        let mut start = 0usize;
+        let mut peak_retained_bytes = 0usize;
+        for c in 0..chunks {
+            let chunk = Array::zeros::<f32>(&[
+                cfg.wan.in_dim as i32,
+                fpb,
+                latent_h as i32,
+                latent_w as i32,
+            ])
+            .expect("chunk");
+            let velocity = transformer
+                .forward_chunk(&chunk, 500.0, &cross_kv, start, &mut cache)
+                .expect("causal chunk forward");
+            start += (fpb as usize) * cfg.ar.frame_seq_length;
+            // MLX is LAZY: without this `eval` the whole chunk forward is an unexecuted graph, the
+            // cache arrays are unmaterialized, and `get_active_memory()` reads ~0 — the measurement
+            // would be a shape calculation dressed up as a memory reading. Forcing the cache (and the
+            // velocity that depends on the same graph) makes the reported bytes and the allocator's
+            // active figure both real, and makes the run take actual GPU time.
+            //
+            // `eval_retained` materializes the cache **as stored** and `retained_bytes` reports that
+            // same representation, so a quantized cache (sc-17807) is measured at its packed cost.
+            // Evaluating `layer_kv` and summing its `nbytes` instead would dequantize first and
+            // report every tier at the bf16 size — blind to the thing the knob changes.
+            mlx_rs::transforms::eval([&velocity]).expect("materialize the chunk forward");
+            cache.eval_retained().expect("materialize the KV cache");
+            let bytes = cache.retained_bytes();
+            peak_retained_bytes = peak_retained_bytes.max(bytes);
+            println!(
+                "  chunk {c:>2}: stored {} tok, retained {} tok, KV {:.2} GiB, MLX active {:.2} GiB",
+                cache.stored_tokens(),
+                cache.retained_tokens(),
+                gib(bytes),
+                gib(mlx_rs::memory::get_active_memory()),
+            );
+            // The published per-token cost, checked against the allocator on real weights every
+            // chunk — including the chunks before eviction starts and the ones after it.
+            assert_eq!(
+                bytes,
+                cache.retained_tokens() * per_token,
+                "{label}: {} retained tokens should cost {per_token} bytes each",
+                cache.retained_tokens()
+            );
+        }
+
+        println!(
+            "  KV-cache residency at {w}x{h} ({} tok/frame, window {} frames, KV {label}): \
+             {:.2} GiB (MLX active after PARTIAL staging -- text embed + cross-attn k/v only, ~15% \
+             of the DiT: {:.2} GiB)",
+            cfg.ar.frame_seq_length,
+            cfg.ar.streaming_local_attn_frames(),
+            gib(peak_retained_bytes),
+            gib(partially_staged),
+        );
+        assert!(
+            peak_retained_bytes > 0,
+            "{label}: the KV cache never retained anything — the measurement is inert"
+        );
+        assert!(
+            cache.retained_tokens() <= max_tokens,
+            "{label}: retained {} tokens > the bounded window's {max_tokens} — eviction is not \
+             bounding the cache",
+            cache.retained_tokens()
+        );
+        peak_by_tier.push((tier, peak_retained_bytes));
+        mlx_rs::memory::clear_cache();
+    }
+
+    // Both tiers held the same tokens, so the ratio is the tier's, not the window's — 0.53x, the
+    // published Q8 figure, NOT the clean 0.5x that ignores the per-group scale/bias.
+    let (dense, q8) = (peak_by_tier[0].1, peak_by_tier[1].1);
+    let ratio = q8 as f64 / dense as f64;
+    println!("  Q8 KV residency is {ratio:.5}x the bf16 cache ({q8} vs {dense} bytes)");
     assert!(
-        cache.retained_tokens() <= max_tokens,
-        "retained {} tokens > the bounded window's {max_tokens} — eviction is not bounding the cache",
-        cache.retained_tokens()
+        (ratio - 0.53125).abs() < 1e-6,
+        "measured Q8/bf16 KV residency is {ratio:.5}, not the published 0.53125"
     );
 }
 
@@ -2611,10 +2659,21 @@ fn eviction_rolls(latent_frames: usize, frames_per_block: usize, window: i64) ->
 /// run in pieces and re-aggregated without holding a five-hour process open.
 ///
 /// ⚠️ **Geometry — the global reference is the expensive row.** Row E runs the checkpoint's *global*
-/// window, whose KV is `latent_frames × frame_seq_length` tokens at ≈546 KB/token. At the 832×480
-/// reference bucket a 45-latent-frame clip is 70,200 tokens ≈ 38 GiB of KV before activations —
-/// exactly the ~27 GB-of-KV problem [`mac_ar_config`](mlx_gen_krea_realtime::mac_ar_config) exists to
-/// dodge, so its cost is a finding rather than a harness bug.
+/// window, whose KV is `latent_frames × frame_seq_length` tokens at **800 KiB/token** (`2 (K and V) ×
+/// 40 layers × 5120 dim × 2 bytes` = 819,200 bytes —
+/// [`KreaRealtimeConfig::kv_bytes_per_token`](mlx_gen_krea_realtime::KreaRealtimeConfig::kv_bytes_per_token),
+/// measured against the allocator by [`kv_cache_residency_at_the_production_geometry`]). At the
+/// 832×480 reference bucket a 45-latent-frame clip is 70,200 tokens ≈ **53.6 GiB** of KV before
+/// activations — exactly the ~27 GB-of-KV problem
+/// [`mac_ar_config`](mlx_gen_krea_realtime::mac_ar_config) exists to dodge, so its cost is a finding
+/// rather than a harness bug.
+///
+/// **Corrected in sc-17807.** This doc priced the cache at 546 kB per DiT token and the clip at
+/// 38 GiB — both 1.5× low, which made row E look like it ought to fit a 128 GiB host with room to
+/// spare. It did not: the
+/// recorded run measured a 63.32 GiB MLX peak and sc-15571 recorded it swapping a host's boot volume
+/// full. The corrected figure is what
+/// [`the_kv_per_token_figure_in_crate_prose_is_the_computed_one`] gates.
 ///
 /// **Row E is UNMEASURABLE on current infrastructure — decided in sc-17324. Do not keep retrying it.**
 ///
@@ -2663,6 +2722,20 @@ fn long_clip_coherence_under_the_bounded_window() {
     assert!(!seeds.is_empty(), "KREA_S18_SEEDS parsed to nothing");
     let want_rows = std::env::var("KREA_S18_ROWS").unwrap_or_else(|_| "ABCDFEZ".to_string());
     let (latent_h, latent_w) = (h / 8, w / 8);
+    // sc-17807 — the KV cache storage tier. Unset is the shipped bf16 cache, so an unchanged
+    // dispatch measures exactly what it measured before. Setting it re-runs the same rows against a
+    // quantized cache, which is a SEPARATE arm: it is recorded on its own and compared against the
+    // bf16 baseline by `the_q8_kv_sweep_is_not_resolvably_worse_than_the_bf16_baseline`, never
+    // pooled with it.
+    let kv_quant = env_opt_usize("KREA_S18_KV_BITS").map(|bits| KvCacheQuant {
+        bits: bits as i32,
+        group_size: env_usize("KREA_S18_KV_GROUP_SIZE", 64) as i32,
+    });
+    if let Some(q) = kv_quant {
+        q.validate()
+            .expect("KREA_S18_KV_BITS/KREA_S18_KV_GROUP_SIZE must name an MLX tier");
+    }
+    let kv_tier = kv_tier_label(kv_quant);
 
     let base = KreaRealtimeConfig::krea_realtime_14b();
     let fpb = base.ar.num_frames_per_block; // 3 latent frames per AR chunk
@@ -2786,6 +2859,7 @@ fn long_clip_coherence_under_the_bounded_window() {
             let mut cfg = base.clone();
             cfg.ar.local_attn_size = r.window;
             cfg.ar.sink_size = r.sink;
+            cfg.ar.kv_cache_quant = kv_quant;
             cfg.ar.frame_seq_length =
                 (latent_h / cfg.wan.patch_size.1) * (latent_w / cfg.wan.patch_size.2);
             cfg.ar.seq_length = lat * cfg.ar.frame_seq_length;
@@ -2797,9 +2871,11 @@ fn long_clip_coherence_under_the_bounded_window() {
 
             println!(
                 "=== {} seed {seed} | {lat} latent frames, {chunks} chunks, {rolls} evicting, \
-                 baseline {row_pre_len} output frames, window {} tok",
+                 baseline {row_pre_len} output frames, window {} tok, KV {kv_tier} ({} B/token)",
                 r.label,
-                cfg.ar.max_attention_size()
+                cfg.ar.max_attention_size(),
+                cfg.kv_bytes_per_token()
+                    .expect("the KV tier must fit this backbone")
             );
 
             mlx_rs::memory::clear_cache();
@@ -2911,7 +2987,7 @@ fn long_clip_coherence_under_the_bounded_window() {
             // Machine-readable, so a sweep split across processes can be re-aggregated.
             println!(
                 "S18CELL\t{}\t{seed}\t{w}x{h}\t{lat}\t{rolls}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t\
-                 {:.4}\t{:.4}\t{:.4}\t{}",
+                 {:.4}\t{:.4}\t{:.4}\t{}\t{kv_tier}",
                 r.row,
                 worst_drift(&d),
                 worst_trend(&d),
@@ -3027,6 +3103,7 @@ fn long_clip_coherence_under_the_bounded_window() {
 
     let sweep = S18Sweep {
         bucket: format!("{w}x{h}"),
+        kv: kv_tier,
         cells: results.iter().map(S18Cell::from_measured).collect(),
     };
     println!("  {}", sweep.summary());
@@ -3184,6 +3261,7 @@ fn accumulated_s18_evidence_rejects_duplicated_cells() {
     };
     let pooled = S18Sweep {
         bucket: "832x480".to_string(),
+        kv: KV_TIER_BF16.to_string(),
         cells: doubled_cells,
     };
     // The claim is specifically that the duplicate defeats the POWER gate — not that it produces a
@@ -3272,6 +3350,7 @@ fn s18_structural_checks_run_without_a_complete_ladder() {
     };
     let sweep = |cells: Vec<S18Cell>| S18Sweep {
         bucket: "832x480".to_string(),
+        kv: KV_TIER_BF16.to_string(),
         cells,
     };
 
@@ -3348,6 +3427,27 @@ fn s18_sweep_from_accumulated(src: &str, want_bucket: Option<&str>) -> Result<S1
 
     let selected: Vec<&S18Evidence> = evidence.iter().filter(|c| c.bucket == bucket).collect();
 
+    // sc-17807 — the KV storage tier is part of what a cell measured, so a file that mixes tiers is
+    // refused rather than pooled. Pooling would look like "more seeds" while actually comparing two
+    // different models: quantizing the cache perturbs the very coherence this sweep measures, which
+    // is why the knob ships opt-in and why its arm is recorded separately from the bf16 baseline.
+    let mut tiers: Vec<String> = selected
+        .iter()
+        .map(|c| c.kv.clone().unwrap_or_else(|| KV_TIER_BF16.to_string()))
+        .collect();
+    tiers.sort();
+    tiers.dedup();
+    let kv = match tiers.as_slice() {
+        [only] => only.clone(),
+        _ => {
+            return Err(format!(
+                "mixes KV cache tiers {tiers:?} at {bucket} — a verdict is per tier, and pooling \
+                 them would compare two different models while looking like added seeds. Split the \
+                 evidence and re-aggregate each tier on its own."
+            ))
+        }
+    };
+
     // Duplicate (row, seed) cells are REJECTED here rather than left to the verdict rule.
     // `validate_window_dose_ladder` does reject them — but only once rows A, D and F are all
     // present; it returns early otherwise, and a piecewise sweep routinely holds one or two rows,
@@ -3406,7 +3506,7 @@ fn s18_sweep_from_accumulated(src: &str, want_bucket: Option<&str>) -> Result<S1
         })
         .collect();
 
-    Ok(S18Sweep { bucket, cells })
+    Ok(S18Sweep { bucket, kv, cells })
 }
 
 /// One measured (row, seed) cell of the S18 sweep.
@@ -3563,7 +3663,25 @@ enum WindowAttribution {
 #[derive(Debug)]
 struct S18Sweep {
     bucket: String,
+    /// The **KV cache storage tier** this sweep ran at (sc-17807) — `"bf16"` for the shipped cache,
+    /// `"q8/g64"` and friends for a quantized one. Carried on the sweep rather than on each cell
+    /// because one dispatch runs one tier, and pooling two tiers would compare different models
+    /// while looking like added seeds. `s18_sweep_from_accumulated` refuses a mixed file for exactly
+    /// that reason.
+    kv: String,
     cells: Vec<S18Cell>,
+}
+
+/// The label a bf16-KV sweep carries — the shipped default, and what every cell recorded before
+/// sc-17807 implicitly is.
+const KV_TIER_BF16: &str = "bf16";
+
+/// The `S18CELL` / summary label for a KV storage tier: `bf16`, or `q<bits>/g<group>`.
+fn kv_tier_label(quant: Option<KvCacheQuant>) -> String {
+    match quant {
+        None => KV_TIER_BF16.to_string(),
+        Some(q) => format!("q{}/g{}", q.bits, q.group_size),
+    }
 }
 
 impl S18Sweep {
@@ -3843,9 +3961,10 @@ impl S18Sweep {
             (Some(m), Some(s)) => format!("{m:.2} ±{s:.2} (n={}, 2*SEM)", self.of(r).len()),
         };
         format!(
-            "{} — A shipped {} | B sink1 {} | C sink3 {} | D wide15 {} | F wide30 {} | E global-ref {} | budget \
+            "{} KV {} — A shipped {} | B sink1 {} | C sink3 {} | D wide15 {} | F wide30 {} | E global-ref {} | budget \
              {DRIFT_BUDGET:.2}/255 (absolute)",
             self.bucket,
+            self.kv,
             f('A'),
             f('B'),
             f('C'),
@@ -3853,6 +3972,141 @@ impl S18Sweep {
             f('F'),
             f('E'),
         )
+    }
+
+    /// Mean MLX active peak (bytes) for a row, or `None` if it was not measured.
+    fn mean_peak(&self, row: char) -> Option<f64> {
+        let v: Vec<f64> = self
+            .cells
+            .iter()
+            .filter(|c| c.row == row)
+            .map(|c| c.peak_bytes as f64)
+            .collect();
+        (!v.is_empty()).then(|| mean_f64(&v))
+    }
+
+    /// **The sc-17807 A/B: is a quantized KV cache resolvably worse than the bf16 baseline?**
+    ///
+    /// `self` is the quantized arm, `baseline` the recorded bf16 sweep at the same geometry. The rule
+    /// is deliberately *the sweep's own*, not a new one:
+    ///
+    ///   * each row's drift is the same gated statistic [`S18Sweep::verdict`] uses;
+    ///   * "resolvable" is the same predeclared 2·SEM heuristic, combined across the two independent
+    ///     arms as `sqrt(a² + b²)` — so a difference smaller than the seed-to-seed scatter of either
+    ///     arm is reported as unresolved rather than ranked;
+    ///   * the arm must independently pass [`S18Sweep::verdict`], which the caller checks — a cheaper
+    ///     cache that drifts is not a win, and this comparison alone cannot say so.
+    ///
+    /// A resolvably worse row is an `Err`: that is the outcome that says "do not ship this tier",
+    /// and it must not be reportable as a pass. Everything else returns the text, including the
+    /// effect size the comparison **can** exclude, so an underpowered A/B reads as underpowered
+    /// rather than as agreement.
+    ///
+    /// The memory half is reported alongside, because the whole point of the tier is the trade: a
+    /// coherence result with no measured saving next to it is only half an answer.
+    fn kv_tier_comparison(&self, baseline: &S18Sweep) -> std::result::Result<String, String> {
+        if self.bucket != baseline.bucket {
+            return Err(format!(
+                "cannot compare KV tiers across geometries ({} vs {}) — the clips differ",
+                self.bucket, baseline.bucket
+            ));
+        }
+        if self.kv == baseline.kv {
+            return Err(format!(
+                "both arms ran the same KV tier ({}) — that is a repeat, not an A/B",
+                self.kv
+            ));
+        }
+        if baseline.kv != KV_TIER_BF16 {
+            return Err(format!(
+                "the baseline arm is `{}`, not the shipped `{KV_TIER_BF16}` cache — the comparison \
+                 is defined against what ships",
+                baseline.kv
+            ));
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut worse: Vec<String> = Vec::new();
+        let mut compared = 0usize;
+        for row in ['A', 'B', 'C', 'D', 'F'] {
+            let (Some(arm), Some(base)) = (self.mean(row), baseline.mean(row)) else {
+                continue;
+            };
+            compared += 1;
+            let delta = arm - base;
+            // Combined uncertainty of the two independent arm means. A row with one seed has no
+            // variance estimate at all, which makes the row unrankable rather than agreeing.
+            let unc = match (self.spread(row), baseline.spread(row)) {
+                (Some(a), Some(b)) => Some((a * a + b * b).sqrt()),
+                _ => None,
+            };
+            let verdict = match unc {
+                None => "UNRANKABLE (a row has one seed — no variance estimate)".to_string(),
+                Some(u) if delta.abs() <= u => {
+                    format!(
+                        "unresolved (|Δ| {:.2} <= combined 2*SEM {u:.2})",
+                        delta.abs()
+                    )
+                }
+                Some(u) if delta > 0.0 => {
+                    worse.push(format!("{row} +{delta:.2}/255 (2*SEM {u:.2})"));
+                    format!("WORSE by {delta:.2} beyond combined 2*SEM {u:.2}")
+                }
+                Some(u) => format!("better by {:.2} beyond combined 2*SEM {u:.2}", -delta),
+            };
+            lines.push(format!(
+                "row {row}: {} {arm:.2} vs {KV_TIER_BF16} {base:.2} — {verdict}",
+                self.kv
+            ));
+        }
+        if compared == 0 {
+            return Err(format!(
+                "no bounded row is present in both arms at {} — there is nothing to compare",
+                self.bucket
+            ));
+        }
+        // The memory half, from the same cells. Reported per row because the saving scales with the
+        // window, which is the whole reason the tier matters more on the wide rows.
+        let mut mem: Vec<String> = Vec::new();
+        for row in ['A', 'B', 'C', 'D', 'F'] {
+            if let (Some(arm), Some(base)) = (self.mean_peak(row), baseline.mean_peak(row)) {
+                mem.push(format!(
+                    "{row} {:.2}->{:.2} GiB ({:.2}x)",
+                    base / 1024f64.powi(3),
+                    arm / 1024f64.powi(3),
+                    arm / base
+                ));
+            }
+        }
+
+        if !worse.is_empty() {
+            return Err(format!(
+                "KV tier `{}` is RESOLVABLY WORSE than the shipped bf16 cache at {} on {}. A \
+                 cheaper cache that costs long-clip coherence is not a win, whatever it saves \
+                 ({}).\n  {}",
+                self.kv,
+                self.bucket,
+                worse.join(", "),
+                if mem.is_empty() {
+                    "no peaks recorded".to_string()
+                } else {
+                    mem.join(", ")
+                },
+                lines.join("\n  ")
+            ));
+        }
+        Ok(format!(
+            "KV tier `{}` is not resolvably worse than the shipped bf16 cache at {} over \
+             {compared} bounded row(s). MLX active peak: {}.\n  {}",
+            self.kv,
+            self.bucket,
+            if mem.is_empty() {
+                "not recorded".to_string()
+            } else {
+                mem.join(", ")
+            },
+            lines.join("\n  ")
+        ))
     }
 
     /// Checks that a measurement is **structurally** what it claims to be, independent of whether
@@ -4142,6 +4396,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
         }
         S18Sweep {
             bucket: "test".into(),
+            kv: KV_TIER_BF16.to_string(),
             cells,
         }
     };
@@ -4231,6 +4486,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
     cells.extend(probe('C', [17.0, 28.0, 19.0]));
     let v = S18Sweep {
         bucket: "reviewer-probe".into(),
+        kv: KV_TIER_BF16.to_string(),
         cells,
     }
     .verdict()
@@ -4400,6 +4656,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
     // 8. No shipped row at all — refuse, do not index off the end.
     let empty = S18Sweep {
         bucket: "test".into(),
+        kv: KV_TIER_BF16.to_string(),
         cells: vec![],
     };
     assert!(empty.verdict().unwrap_err().contains("nothing to conclude"));
@@ -4470,6 +4727,213 @@ fn the_withdrawn_s18_claims_do_not_survive_in_crate_prose() {
     }
 }
 
+/// **CI gate for the sc-17807 KV-tier A/B rule.** The quantized arm is measured on a gated host; the
+/// rule applied to those numbers must not itself be untested, and it must be *symmetric* — able to
+/// return "worse" as readily as "fine". A comparison that can only pass is not a comparison.
+///
+/// Drives [`S18Sweep::kv_tier_comparison`] over every outcome it can produce, with hand-built cells
+/// so no weights are needed.
+#[test]
+fn the_kv_tier_comparison_can_fail_the_quantized_arm() {
+    fn cell(row: char, seed: u64, drift: f64, peak: usize) -> S18Cell {
+        S18Cell {
+            row,
+            seed,
+            latent_frames: 45,
+            rolls: 13,
+            reported_drift: drift,
+            trend: drift,
+            excursion: 0.0,
+            slope: 1.0,
+            peak_bytes: peak,
+            clip_mean: 1.0,
+            head_motion: 12.0,
+            tail_motion: 8.0,
+            component: "luma-mean",
+        }
+    }
+    let sweep = |kv: &str, cells: Vec<S18Cell>| S18Sweep {
+        bucket: "640x384".into(),
+        kv: kv.into(),
+        cells,
+    };
+    // A tight three-seed baseline: mean 20.0, spread ~0.47.
+    let base_cells = |offset: f64, peak: usize| {
+        vec![
+            cell('A', 7, 19.5 + offset, peak),
+            cell('A', 11, 20.0 + offset, peak),
+            cell('A', 23, 20.5 + offset, peak),
+        ]
+    };
+    let bf16 = sweep(KV_TIER_BF16, base_cells(0.0, 16_000_000_000));
+
+    // 1. A near-identical arm is not resolvably worse, and says so — including the memory saving.
+    let same = sweep("q8/g64", base_cells(0.1, 12_000_000_000));
+    let ok = same
+        .kv_tier_comparison(&bf16)
+        .expect("a 0.1/255 difference is inside the combined 2*SEM");
+    assert!(ok.contains("not resolvably worse"), "{ok}");
+    assert!(ok.contains("unresolved"), "{ok}");
+    assert!(
+        ok.contains("0.75x"),
+        "the memory saving must be reported: {ok}"
+    );
+
+    // 2. A materially worse arm FAILS. This is the assertion that makes the rule a real gate: a
+    //    cheaper cache that drifts must not be reportable as a pass.
+    let worse = sweep("q8/g64", base_cells(6.0, 12_000_000_000));
+    let err = worse
+        .kv_tier_comparison(&bf16)
+        .expect_err("a 6/255 regression against a ~0.7 combined 2*SEM must not pass");
+    assert!(err.contains("RESOLVABLY WORSE"), "{err}");
+    assert!(err.contains("not a win"), "{err}");
+
+    // 3. A materially BETTER arm passes, and is not silently reported as "worse" — the rule has to
+    //    be signed correctly, which an asymmetric implementation would get wrong.
+    let better = sweep("q8/g64", base_cells(-6.0, 12_000_000_000));
+    let text = better
+        .kv_tier_comparison(&bf16)
+        .expect("better is not worse");
+    assert!(text.contains("better by"), "{text}");
+
+    // 4. One seed per row is UNRANKABLE, not "agrees". An arm with no variance estimate must not
+    //    borrow confidence from the baseline's.
+    let single = sweep("q8/g64", vec![cell('A', 7, 26.0, 12_000_000_000)]);
+    let text = single
+        .kv_tier_comparison(&bf16)
+        .expect("an unrankable row is not a failure, it is an absent comparison");
+    assert!(text.contains("UNRANKABLE"), "{text}");
+
+    // 5. Malformed comparisons are refused rather than answered.
+    assert!(bf16
+        .kv_tier_comparison(&bf16)
+        .unwrap_err()
+        .contains("not an A/B"));
+    let other_bucket = S18Sweep {
+        bucket: "832x480".into(),
+        kv: "q8/g64".into(),
+        cells: base_cells(0.0, 12_000_000_000),
+    };
+    assert!(other_bucket
+        .kv_tier_comparison(&bf16)
+        .unwrap_err()
+        .contains("across geometries"));
+    let no_overlap = sweep("q8/g64", vec![cell('D', 7, 20.0, 12_000_000_000)]);
+    assert!(no_overlap
+        .kv_tier_comparison(&bf16)
+        .unwrap_err()
+        .contains("nothing to compare"));
+    // A "baseline" that is itself quantized is not the shipped reference.
+    let q4 = sweep("q4/g64", base_cells(0.0, 8_000_000_000));
+    assert!(same
+        .kv_tier_comparison(&q4)
+        .unwrap_err()
+        .contains("not the shipped"));
+}
+
+/// Accumulated evidence from two KV tiers must be refused, not pooled — the sc-17807 analogue of the
+/// duplicate-cell and mixed-bucket guards. Pooling would read as "more seeds" while silently
+/// averaging two different models, and it is one `cat` away.
+#[test]
+fn accumulated_s18_evidence_refuses_to_pool_two_kv_tiers() {
+    let bf16 = "S18CELL\tA\t7\t640x384\t45\t13\t23.0413\t19.9907\t23.0413\t12.8146\t15625190652\t\
+                1.8230\t13.5111\t8.4549\tspatial-sd";
+    let q8 = "S18CELL\tA\t11\t640x384\t45\t13\t23.5000\t20.0000\t23.5000\t12.9000\t9900000000\t\
+              1.8000\t13.5000\t8.4000\tspatial-sd\tq8/g64";
+
+    // Each tier on its own resolves, and carries the right label.
+    assert_eq!(
+        s18_sweep_from_accumulated(bf16, None)
+            .expect("bf16 alone")
+            .kv,
+        KV_TIER_BF16,
+        "a pre-sc-17807 line has no tier field and is bf16 by construction"
+    );
+    assert_eq!(
+        s18_sweep_from_accumulated(q8, None).expect("q8 alone").kv,
+        "q8/g64"
+    );
+
+    // Concatenated, they are refused.
+    let mixed = format!("{bf16}\n{q8}");
+    let err = s18_sweep_from_accumulated(&mixed, None)
+        .expect_err("two tiers in one file must not be pooled");
+    assert!(err.contains("mixes KV cache tiers"), "{err}");
+    assert!(err.contains("two different models"), "{err}");
+}
+
+/// **The per-token KV figure quoted in crate prose must be the computed one (sc-17807).**
+///
+/// The same hole [`the_withdrawn_s18_claims_do_not_survive_in_crate_prose`] closes, for a *number*
+/// rather than a claim: a 546 kB per-token cost sat in this file's own S18 doc block and in the S18
+/// memory preflight's prose, 1.5× below the real figure, and nothing read it. A per-token cost that is
+/// 1.5× low is not cosmetic — it is what makes a row look affordable on a host that it then takes
+/// down, which is exactly what sc-17324 spent two runner crashes discovering.
+///
+/// The ban targets the **assertive** spellings — the withdrawn number quoted as *the* per-token cost,
+/// with or without an approximation sign (the exact needles are assembled below). A sentence that names
+/// the withdrawn number as withdrawn — as the two correction notes above do — is the point of the
+/// correction, not a relapse, so it deliberately stays legal.
+///
+/// So: the stale figure is banned from the doc-bearing sources, and the figure that replaced it is
+/// asserted to be the one [`KreaRealtimeConfig::kv_bytes_per_token`] computes — prose and code cannot
+/// drift apart without this going red.
+#[test]
+fn the_kv_per_token_figure_in_crate_prose_is_the_computed_one() {
+    fn normalise(src: &str) -> String {
+        src.split_whitespace()
+            .filter(|w| *w != "//!" && *w != "///" && *w != "//" && *w != "#")
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    let cfg = KreaRealtimeConfig::krea_realtime_14b();
+    let per_token = cfg.kv_bytes_per_token().expect("the shipped bf16 cache");
+    assert_eq!(
+        per_token, 819_200,
+        "800 KiB — 2 x 40 layers x 5120 x 2 bytes"
+    );
+
+    for (file, src) in [
+        ("tests/generate_smoke.rs", include_str!("generate_smoke.rs")),
+        ("src/causal.rs", include_str!("../src/causal.rs")),
+        ("src/config.rs", include_str!("../src/config.rs")),
+        ("src/t2v.rs", include_str!("../src/t2v.rs")),
+        (
+            "scripts/ci/s18_memory_preflight.py",
+            include_str!("../../../../../scripts/ci/s18_memory_preflight.py"),
+        ),
+    ] {
+        let prose = normalise(src);
+        // The needles are ASSEMBLED rather than written as literals: this scan reads its own source
+        // file, so writing a banned spelling out here would make the test flag its own assertion. (The
+        // same reason `the_withdrawn_s18_claims_do_not_survive_in_crate_prose` scans only `src/`.)
+        let n = 546;
+        for stale in [
+            format!("{n} kb/token"),
+            format!("\u{2248}{n}"),
+            format!("~{n}"),
+        ] {
+            assert!(
+                !prose.contains(&stale),
+                "{file} still quotes the WITHDRAWN `{stale}` KV cost. The derived figure is \
+                 {per_token} bytes/token (800 KiB) — see KreaRealtimeConfig::kv_bytes_per_token, \
+                 measured against the allocator by kv_cache_residency_at_the_production_geometry. \
+                 Do not delete this assertion to make the build pass: a 1.5x-low per-token figure is \
+                 what makes an unaffordable sweep row look affordable (sc-17324)."
+            );
+        }
+        // ...and the corrected one is actually present where the cost is discussed, rather than the
+        // stale figure having simply been deleted.
+        assert!(
+            prose.contains("800 kib") || prose.contains("819_200") || prose.contains("819,200"),
+            "{file} no longer states the per-token KV cost at all — the correction was a deletion, \
+             not a replacement"
+        );
+    }
+}
+
 // --- The recorded measurement -----------------------------------------------------------------
 //
 // The gated real-weight sweep runs on one host; the numbers it produced are recorded here so the
@@ -4491,6 +4955,9 @@ struct S18Evidence {
     row: char,
     seed: u64,
     bucket: String,
+    /// The KV storage tier the emitting sweep ran at (sc-17807). `None` for the pre-sc-17807 lines,
+    /// which are all bf16 by construction — the knob did not exist when they were measured.
+    kv: Option<String>,
     latent_frames: usize,
     rolls: usize,
     drift: f64,
@@ -4516,9 +4983,10 @@ fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
         .map(|(index, line)| {
             let line_number = index + 1;
             let fields: Vec<&str> = line.split('\t').collect();
-            if !(14..=15).contains(&fields.len()) || fields[0] != "S18CELL" {
+            if !(14..=16).contains(&fields.len()) || fields[0] != "S18CELL" {
                 return Err(format!(
-                    "line {line_number}: expected a 14- or 15-field S18CELL record, got `{line}`"
+                    "line {line_number}: expected a 14-, 15- or 16-field S18CELL record, got \
+                     `{line}`"
                 ));
             }
             let mut row_chars = fields[1].chars();
@@ -4530,6 +4998,7 @@ fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
                 row,
                 seed: number(fields[2], "seed", line_number)?,
                 bucket: fields[3].to_string(),
+                kv: fields.get(15).map(|value| (*value).to_string()),
                 latent_frames: number(fields[4], "latent_frames", line_number)?,
                 rolls: number(fields[5], "rolls", line_number)?,
                 drift: number(fields[6], "drift", line_number)?,
@@ -5112,6 +5581,7 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
         );
         let sweep = S18Sweep {
             bucket: bucket.to_string(),
+            kv: KV_TIER_BF16.to_string(),
             cells: cells.to_vec(),
         };
         println!("{}", sweep.summary());
@@ -5222,6 +5692,7 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
     // sc-15571's — must be revisited, because then a same-content floor WOULD exist.
     let sweep = S18Sweep {
         bucket: "640x384".into(),
+        kv: KV_TIER_BF16.to_string(),
         cells: MEASURED_640.to_vec(),
     };
     let (z, a) = (

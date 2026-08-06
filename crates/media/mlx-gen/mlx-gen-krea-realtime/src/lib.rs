@@ -50,6 +50,14 @@
 //! * [`causal`] — **S5** also bounds the KV cache: [`CausalKvCache`] evicts older tail K/V beyond the
 //!   sink + read window (unit-corrected to the reference's `local_attn_size × frame_seq_length` frames),
 //!   so long clips stay memory-feasible on Mac. Pure cache slicing.
+//! * [`causal`] — **sc-17807** makes the cache's *per-token cost* a knob on top of that *token count*.
+//!   The cache holds activations, so a Q4 DiT does not shrink it: a DiT token costs **800 KiB** of
+//!   bf16 KV ([`KreaRealtimeConfig::kv_bytes_per_token`]), which for an AR video model outweighs the
+//!   ~9 GiB of weights. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and
+//!   dequantizes the read window per layer (there is no fused quantized SDPA to attend over packed
+//!   K/V with — see [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`,
+//!   because a cheaper cache perturbs the same long-clip coherence sc-15127/sc-15571 measure and
+//!   turning it on is therefore a measured decision rather than a free one.
 //!
 //! **Attention-bias reconciliation (S5).** The block-causal mask ([`build_block_causal_mask`]) + the KV
 //! read window + the causal RoPE offset are the *complete* causal mechanism: the released reference
@@ -114,7 +122,7 @@ pub mod t2v;
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
 };
-pub use config::{KreaArConfig, KreaRealtimeConfig, MODEL_ID};
+pub use config::{KreaArConfig, KreaRealtimeConfig, KvCacheQuant, MODEL_ID};
 pub use convert::{
     convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
     convert_krea_realtime_tier_with_config, convert_krea_realtime_transformer, normalize_krea_keys,

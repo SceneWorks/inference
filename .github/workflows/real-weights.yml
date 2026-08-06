@@ -191,8 +191,19 @@ on:
       # carries 8. Needed because row F does not fit at the default 832x480 on this lane's runner
       # (~49 GiB, two dead runners) but does at 640x384 (~34 GiB) — without this the fallback bucket
       # is unreachable and row F is simply unrunnable, which is not the same thing as unmeasurable.
+      # The optional `@q<bits>` suffix selects the sc-17807 KV cache tier. It rides this input for
+      # the same reason WxH does: the dispatcher is already at the input cap, and a separate
+      # `krea_s18_kv_bits` would push it over. Omitted = the shipped bf16 cache, so an unchanged
+      # dispatch measures exactly what it measured before. A quantized dispatch is a SEPARATE arm —
+      # its cells carry the tier in a 16th S18CELL field and the re-aggregator refuses to pool them
+      # with the bf16 baseline.
+      #
+      # Group size is MLX's default 64 here and is not dispatchable: it would need a `/` in the
+      # value, which is not a legal character in the artifact name this input now feeds. The Rust
+      # knob (`KreaArConfig::kv_cache_quant`) still carries an arbitrary group size for a caller who
+      # wants one; only this shorthand is fixed.
       krea_s18_geometry:
-        description: "S18 sweep geometry (krea-s18-sweep only), WxH — use 640x384 for row F"
+        description: "S18 sweep geometry (krea-s18-sweep only), WxH[@q<bits>] — 640x384 for row F, e.g. 640x384@q8"
         type: string
         required: false
         default: 832x480
@@ -2256,11 +2267,17 @@ jobs:
           KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}
           KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}
         run: |
-          if [[ ! "$KREA_S18_GEOMETRY" =~ ^[0-9]+x[0-9]+$ ]]; then
-            echo "::error::krea_s18_geometry='$KREA_S18_GEOMETRY' must be WxH, e.g. 832x480" >&2
+          # WxH[@q<bits>[/g<group>]] — the KV tier suffix is sc-17807's, and the preflight has to see
+          # it or it prices the bf16 sweep while a q8 one runs and refuses rows that now fit.
+          if [[ ! "$KREA_S18_GEOMETRY" =~ ^[0-9]+x[0-9]+(@q[0-9]+)?$ ]]; then
+            echo "::error::krea_s18_geometry='$KREA_S18_GEOMETRY' must be WxH[@q<bits>], e.g. 832x480 or 640x384@q8" >&2
             exit 1
           fi
-          KREA_SMOKE_W="${KREA_S18_GEOMETRY%x*}" KREA_SMOKE_H="${KREA_S18_GEOMETRY#*x}" \
+          geom="${KREA_S18_GEOMETRY%%@*}"
+          if [[ "$KREA_S18_GEOMETRY" == *@q* ]]; then
+            export KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"
+          fi
+          KREA_SMOKE_W="${geom%x*}" KREA_SMOKE_H="${geom#*x}" \
             python3.12 scripts/ci/s18_memory_preflight.py
       - name: Start GPU fault evidence
         continue-on-error: true
@@ -2283,8 +2300,13 @@ jobs:
           set -o pipefail
           name=long_clip_coherence_under_the_bounded_window
           # Same split as the preflight above, so the guard and the run cannot disagree about which
-          # geometry is being measured.
-          export KREA_SMOKE_W="${KREA_S18_GEOMETRY%x*}" KREA_SMOKE_H="${KREA_S18_GEOMETRY#*x}"
+          # geometry — or, since sc-17807, which KV cache tier — is being measured.
+          geom="${KREA_S18_GEOMETRY%%@*}"
+          if [[ "$KREA_S18_GEOMETRY" == *@q* ]]; then
+            export KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"
+            echo "KV cache tier: q$KREA_S18_KV_BITS/g64 (sc-17807)"
+          fi
+          export KREA_SMOKE_W="${geom%x*}" KREA_SMOKE_H="${geom#*x}"
           # The run-count assertion below is rows x seeds, and BOTH now come from dispatch inputs
           # (sc-17655), so validate them here rather than letting a typo become a confusing count
           # mismatch 4 hours later. `ABCDFEZ` is the row alphabet; a repeated letter selects one row
@@ -2401,7 +2423,7 @@ jobs:
           # indistinguishable — which is how the same piece ends up concatenated twice at
           # re-aggregation. The ingest rejects that now, but an artifact you cannot identify is
           # still evidence you cannot use.
-          name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}
+          name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_geometry }}-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/s18-cells.tsv
