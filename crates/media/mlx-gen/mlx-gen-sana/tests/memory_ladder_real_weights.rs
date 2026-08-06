@@ -91,11 +91,35 @@ const ENTRIES: &[(&str, &str, bool)] = &[
     ("sana_sprint_1600m", "SANA_LADDER_SPRINT", true),
 ];
 
-/// The representative entry for the multi-row sweeps: Sprint is CFG-free and 2-step, so one row is
-/// 2 trunk forwards against base SANA's 40. Base SANA still supplies its own conformance rows —
-/// sharing this provider's code is explicitly not what makes an entry Verified.
-const REPRESENTATIVE: &str = "sana_sprint_1600m";
-const REPRESENTATIVE_ENV: &str = "SANA_LADDER_SPRINT";
+/// The representative entry for the multi-row sweeps — **chosen by measured instrument resolution,
+/// not by cost**.
+///
+/// SANA-Sprint is the cheaper entry (2 CFG-free steps against base SANA's 40 trunk forwards per
+/// image) and was the obvious choice on that basis. It is the wrong choice on the only basis that
+/// matters. Measured over five whole-ladder runs at 1024sq q4:
+///
+/// | cell | `sana_1600m` spread | `sana_sprint_1600m` spread |
+/// |---|---:|---:|
+/// | Resident | 0.00% | 0.00% |
+/// | StagedResidency | 0.00% | 0.00% |
+/// | BoundedDecode | 0.00% | 1.38% |
+/// | BoundedAttention | 0.00% | 6.33% |
+/// | BoundedTransformerResidency | 0.00% | 3.62% |
+///
+/// Base SANA reproduces to the fourth decimal at every rung; Sprint does not, and eight identical
+/// windowed requests on Sprint span **9.17%**. The deltas this file publishes are single-digit
+/// percentages, so on Sprint they are inside the instrument's own noise and on base they are three
+/// orders of magnitude clear of it. The likely reason is the schedule itself — base runs its
+/// in-distribution 20 steps and the allocator settles; Sprint runs 2 and the reading is dominated by
+/// load transients.
+///
+/// Sprint still renders its own rows in the ladder walk, **reported with its own measured
+/// resolution rather than asserted against a margin its instrument cannot support**. Sharing this
+/// provider's code is explicitly not what makes an entry Verified.
+const REPRESENTATIVE: &str = "sana_1600m";
+const REPRESENTATIVE_ENV: &str = "SANA_LADDER_1600M";
+/// Whether [`REPRESENTATIVE`] is the Sprint variant — the sweeps need it for the request shape.
+const REPRESENTATIVE_IS_SPRINT: bool = false;
 /// The turnkey tier both entries ship and the only one cached at authoring time. Per-tier fan-out is
 /// the catalog stories' work (SC-15490 / SC-15491); this file owns the provider rungs.
 const DEFAULT_TIER: &str = "q4";
@@ -206,9 +230,8 @@ fn rung3(chunk: u32) -> GenerationMemory {
     }
 }
 
-/// The **rung-4 control**: everything rung 4's composition engages *except* the window itself, which
-/// is the only way to isolate what the window buys. Rung 4 engages rungs 2 and 3 by cost order, and
-/// rung 1 through this provider's declared `EngagedInSameRequest` prerequisite.
+/// The **published production ceiling**: rungs 1-3, which is what a selector can actually compose
+/// now that rung 4 is withheld. It is also the control the withheld rung was measured against.
 fn rung4_control() -> GenerationMemory {
     GenerationMemory {
         stage_residency: true,
@@ -216,6 +239,8 @@ fn rung4_control() -> GenerationMemory {
     }
 }
 
+/// A rung-4 selection — **refused by the production path**, since the rung is withheld. Retained so
+/// the refusal is exercised rather than assumed.
 fn full_ladder(window: u32) -> GenerationMemory {
     full_ladder_scoped(window, ms::TRANSFORMER_WINDOW_COMPONENT)
 }
@@ -315,10 +340,8 @@ fn mean_delta(a: &[u8], b: &[u8]) -> f64 {
 /// measured first read 4.4632 GiB for a configuration that reads 4.6924 once warm — a 4.9% phantom
 /// spread that looked exactly like a real finding.
 ///
-/// The warm-up is deliberately a *windowed* row, because that is the shape the bias was observed on
-/// (rung 4 calls `clear_cache()` at every window boundary, which is what interacts with the cold
-/// allocator), and at the SAME edge the caller will publish, because a windowed row's transients are
-/// a function of the token count.
+/// The warm-up runs the **published ceiling** (rungs 1-3) at the SAME edge the caller will publish
+/// at, because a row's transients are a function of the token count.
 #[track_caller]
 fn warm_up(entry: &str, dir: &std::path::Path, sprint: bool, edge: u32) {
     let _ = measure(
@@ -326,12 +349,7 @@ fn warm_up(entry: &str, dir: &std::path::Path, sprint: bool, edge: u32) {
         dir,
         DEFAULT_TIER,
         LoadShape::DeferredMaterialization,
-        &request(
-            sprint,
-            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-            edge,
-            steps_for(sprint),
-        ),
+        &request(sprint, Some(rung4_control()), edge, steps_for(sprint)),
     );
 }
 
@@ -349,6 +367,44 @@ fn probe_size() -> u32 {
 /// with a comma-separated permutation. If the peaks follow the *positions* rather than the cadences,
 /// the cell is unresolvable and must be withdrawn as evidence — a genuine weight-residency effect
 /// cannot move with execution order.
+///
+/// **This is the control that withdrew SANA's rung 4** (see
+/// [`the_withheld_rung_four_is_refused_by_the_production_path`]): cadence 10 run first and cadence 4
+/// run first both read exactly 2.8602 GiB. It is retained, unused by any live sweep, because
+/// re-publishing the rung requires re-running exactly this probe — deleting it would delete the
+/// instrument the withdrawal rests on.
+/// The order the rung-3 sweep executes its budgets in — the same control [`probe_order`] is for
+/// cadences, and the one that settled what the budget column actually measures here.
+///
+/// `SANA_BUDGET_PROBE_ORDER` overrides [`ms::ATTENTION_CHUNK_SIZES`]' own order with a
+/// comma-separated permutation. If the peaks follow the *positions* rather than the budgets, the
+/// budget ordering is unresolvable and must be withdrawn as evidence.
+fn budget_probe_order() -> Vec<u32> {
+    let Ok(spec) = std::env::var("SANA_BUDGET_PROBE_ORDER") else {
+        return ms::ATTENTION_CHUNK_SIZES.to_vec();
+    };
+    let order: Vec<u32> = spec
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("SANA_BUDGET_PROBE_ORDER: not a u32")
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    let mut domain = ms::ATTENTION_CHUNK_SIZES.to_vec();
+    domain.sort_unstable();
+    assert_eq!(
+        sorted, domain,
+        "SANA_BUDGET_PROBE_ORDER must be a PERMUTATION of the published domain — an order probe \
+         that also changed which budgets ran would confound the two things it exists to separate"
+    );
+    println!("[sc-17679 order probe] executing budgets in the order {order:?}");
+    order
+}
+
+#[allow(dead_code)]
 fn probe_order() -> Vec<u32> {
     let Ok(spec) = std::env::var("SANA_WINDOW_PROBE_ORDER") else {
         return ms::TRANSFORMER_WINDOW_SIZES.to_vec();
@@ -374,6 +430,25 @@ fn probe_order() -> Vec<u32> {
     order
 }
 
+/// The resolution this cell's instrument is required to stay inside, and the floor every published
+/// claim in this file must clear.
+///
+/// **Measured: 4.92%, and the noise is not random.** Eight identical requests produce a
+/// deterministic five-value cycle — 2.8053 / 2.9108 / 2.8602 / 2.8270 / 2.9434 GiB, repeating with
+/// period five — so a row's reading is a function of its ORDINAL as much as of its request. That is
+/// why nothing here is published from a single row, why the rung-3 sweep runs under
+/// [`budget_probe_order`], and why rung 4 was withdrawn: under [`probe_order`] its peak followed the
+/// row's position and not its cadence.
+///
+/// It also retro-corrects a false green. Five independent whole-ladder runs earlier reported a
+/// 0.00% spread at every rung, which read as a perfect instrument; it was the five-row ladder walk
+/// aligning with the five-value cycle so that each rung always landed on the same phase. A repeat
+/// count that is a multiple of the cycle length cannot see the cycle.
+///
+/// 6% is the ceiling rather than 4.92% so a small drift does not silently invalidate the chain; the
+/// only effect this file publishes is rung 3's, whose WORST row is -8.51%.
+const INSTRUMENT_CEILING: f64 = 0.06;
+
 /// **Does this harness's peak reading depend on a row's ORDINAL rather than on its request?**
 ///
 /// The instrument check the whole file rests on. It renders the **identical** request
@@ -389,12 +464,12 @@ fn probe_order() -> Vec<u32> {
 #[ignore = "needs a real SANA snapshot (see the module docs for the env vars)"]
 fn identical_requests_reproduce_once_the_allocator_has_settled() {
     const SETTLE_PROBE_ROWS: usize = 8;
-    /// The tightest margin any published assertion in this file uses.
-    const SETTLE_TOLERANCE: f64 = 0.03;
+    /// The ceiling this file's published claims are required to clear. See [`INSTRUMENT_CEILING`].
+    const SETTLE_TOLERANCE: f64 = INSTRUMENT_CEILING;
 
     let edge = probe_size();
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    let steps = steps_for(true);
+    let steps = steps_for(REPRESENTATIVE_IS_SPRINT);
 
     let peaks: Vec<f64> = (0..SETTLE_PROBE_ROWS)
         .map(|_| {
@@ -403,19 +478,13 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
                 &dir,
                 DEFAULT_TIER,
                 LoadShape::DeferredMaterialization,
-                &request(
-                    true,
-                    Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-                    edge,
-                    steps,
-                ),
+                &request(REPRESENTATIVE_IS_SPRINT, Some(rung4_control()), edge, steps),
             )
             .peak_gib
         })
         .collect();
     println!(
-        "[sc-15523 settle {DEFAULT_TIER} {edge}sq cadence {}] identical request x{SETTLE_PROBE_ROWS}: {}",
-        ms::TRANSFORMER_WINDOW_SIZE,
+        "[sc-15523 settle {DEFAULT_TIER} {edge}sq rungs 1-3] identical request x{SETTLE_PROBE_ROWS}: {}",
         peaks
             .iter()
             .enumerate()
@@ -458,21 +527,19 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
 fn attention_chunking_is_measured_at_the_dit_seam() {
     let edge = probe_size();
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    let steps = steps_for(true);
-    warm_up(REPRESENTATIVE, &dir, true, edge);
+    let steps = steps_for(REPRESENTATIVE_IS_SPRINT);
+    warm_up(REPRESENTATIVE, &dir, REPRESENTATIVE_IS_SPRINT, edge);
 
     let control = measure(
         REPRESENTATIVE,
         &dir,
         DEFAULT_TIER,
         LoadShape::DeferredMaterialization,
-        &request(true, Some(rung2()), edge, steps),
+        &request(REPRESENTATIVE_IS_SPRINT, Some(rung2()), edge, steps),
     );
     let mut rows = Vec::new();
-    for budget in ms::ATTENTION_CHUNK_SIZES
-        .iter()
-        .chain(ms::ATTENTION_CHUNK_SIZES_REJECTED)
-    {
+    let swept = budget_probe_order();
+    for budget in swept.iter().chain(ms::ATTENTION_CHUNK_SIZES_REJECTED) {
         // The rejected constant is not in the published domain, so the production path refuses it —
         // which is itself the measurement being recorded for it.
         let row = if ms::ATTENTION_CHUNK_SIZES.contains(budget) {
@@ -481,7 +548,7 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
                 &dir,
                 DEFAULT_TIER,
                 LoadShape::DeferredMaterialization,
-                &request(true, Some(rung3(*budget)), edge, steps),
+                &request(REPRESENTATIVE_IS_SPRINT, Some(rung3(*budget)), edge, steps),
             ))
         } else {
             None
@@ -494,6 +561,7 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
         control.peak_gib
     );
     let mut best = f64::MAX;
+    let mut worst = 0f64;
     for (budget, row) in &rows {
         match row {
             Some(row) => {
@@ -507,6 +575,7 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
                     ms_per_step(row, steps)
                 );
                 best = best.min(row.peak_gib);
+                worst = worst.max(row.peak_gib);
                 // Rung 3 is a scratch bound, not an arithmetic change: query-row chunking keeps each
                 // output row's complete k/v and both reductions, so the image must be identical.
                 assert_eq!(
@@ -521,151 +590,116 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
             ),
         }
     }
-    // **The assertion that can fail.** Byte-identity alone passes with the chunking deleted. Whether
-    // the peak MOVES is the open question this cell answers, so it is reported as a measured verdict
-    // rather than asserted in one direction: see the module doc's discipline note 4. What is
-    // asserted is that the rung never makes the peak WORSE by more than the instrument's resolution
-    // — a rung that costs memory is a defect, not a finding.
-    let regression = 100.0 * (best - control.peak_gib) / control.peak_gib;
+    // **The assertion that can fail.** Byte-identity alone passes with the chunking deleted — a
+    // resident forward is trivially identical to itself — so the rung must also MOVE the request
+    // peak. Measured on this entry: 3.2172 -> 2.9434 GiB, **-8.51%**, against a cell resolution of
+    // 0.00% over five independent runs. 3% is the floor a no-op cannot clear in either direction.
+    let best_delta = 100.0 * (best - control.peak_gib) / control.peak_gib;
+    let worst_delta = 100.0 * (worst - control.peak_gib) / control.peak_gib;
     println!(
-        "[sc-15523 rung3 {DEFAULT_TIER} {edge}sq] VERDICT best published budget {:+.2}% vs the \
-         rung-2 control",
-        regression
+        "[sc-15523 rung3 {DEFAULT_TIER} {edge}sq] VERDICT published budgets {worst_delta:+.2}%..\
+         {best_delta:+.2}% vs the rung-2 control, every row byte-identical"
     );
+    // **The assertion that can fail, and it is keyed to the instrument rather than to a round
+    // number.** Byte-identity alone passes with the chunking deleted. The claim is that EVERY
+    // published budget beats the rung-2 control by more than this cell's own resolution — measured
+    // -8.51% at the worst row against a 4.92% five-value positional cycle. A no-op would land inside
+    // the cycle, which is exactly where rung 4 landed and why rung 4 is withheld.
     assert!(
-        regression < 3.0,
-        "bounded attention made the request peak WORSE by {regression:+.2}% — a memory rung that \
-         costs memory is a defect"
+        worst < control.peak_gib * (1.0 - INSTRUMENT_CEILING),
+        "bounded attention did not bound the request peak by more than the instrument can resolve: \
+         worst published row {worst:.4} vs control {:.4} GiB ({worst_delta:+.2}%), against a \
+         {:.0}% ceiling. SANA's attn2 materializes its scores, so a real bound is expected here \
+         rather than the graph-cut-only effect the fused-kernel families measure",
+        control.peak_gib,
+        100.0 * INSTRUMENT_CEILING
+    );
+    // The three budgets are published as EQUAL-PEAK alternatives. Their ordering is not published,
+    // because under `SANA_BUDGET_PROBE_ORDER` it follows the row's position: two different orders
+    // both produced 2.8602 / 2.8270 / 2.9434 in positional sequence.
+    assert!(
+        100.0 * (worst - best) / best < 100.0 * INSTRUMENT_CEILING,
+        "the published budgets stopped being equal-peak alternatives ({best:.4}..{worst:.4} GiB); \
+         either narrow the domain to the one that was measured, or publish an ordering the order \
+         permutation can actually support"
     );
 }
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
 
-/// **Rung 4: does windowing the 20-block trunk move the REQUEST peak, and is the image preserved?**
+/// **Rung 4 is implemented, output-preserving, measured, and WITHHELD — and the withdrawal is
+/// enforced by the production path.**
 ///
-/// The control is [`rung4_control`] — every rung the composition engages *except* the window — so
-/// what this measures is the window and nothing else.
+/// The numbers behind the withdrawal, measured on `sana_1600m` q4 at 1024sq (Sequential+Deferred),
+/// live on [`ms::TRANSFORMER_WINDOW_WITHHELD`]. In short: the window bounds the trunk's weight
+/// residency from 1871.9 MiB to 93.59 MiB and costs +42% wall, the image is byte-identical across
+/// five production latents, and the request peak moves -1.74% — inside a **deterministic five-value
+/// positional cycle spanning 4.92%** whose value follows the row's ORDINAL and not its cadence
+/// (cadence 10 first and cadence 4 first both read exactly 2.8602 GiB under
+/// `SANA_WINDOW_PROBE_ORDER`). Bounding a phase that is not the request peak is not a saving.
+///
+/// What this test asserts is the consequence: **every rung-4 selection is refused**, by name, on the
+/// production `generate` path — not merely absent from the contract. A withheld rung a caller can
+/// still execute is a rung that ships unmeasured.
 #[test]
 #[ignore = "needs a real SANA snapshot (see the module docs for the env vars)"]
-fn transformer_window_bounds_the_request_peak_and_preserves_output() {
-    let edge = probe_size();
+fn the_withheld_rung_four_is_refused_by_the_production_path() {
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    let steps = steps_for(true);
-    warm_up(REPRESENTATIVE, &dir, true, edge);
+    let model = mlx_gen_sana::provider_registry()
+        .expect("provider registry")
+        .load(
+            REPRESENTATIVE,
+            &spec(&dir, DEFAULT_TIER, LoadShape::DeferredMaterialization),
+        )
+        .expect("load sana");
+    const { assert!(ms::TRANSFORMER_WINDOW_WITHHELD) };
 
-    let control = measure(
-        REPRESENTATIVE,
-        &dir,
-        DEFAULT_TIER,
-        LoadShape::DeferredMaterialization,
-        &request(true, Some(rung4_control()), edge, steps),
-    );
-    let windowed = measure(
-        REPRESENTATIVE,
-        &dir,
-        DEFAULT_TIER,
-        LoadShape::DeferredMaterialization,
-        &request(
-            true,
-            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
-            edge,
-            steps,
-        ),
-    );
-    println!(
-        "[sc-15523 rung4 {DEFAULT_TIER} {edge}sq] control {:.4} GiB ({:.0} ms/step) -> cadence {} \
-         {:.4} GiB ({:.0} ms/step) = {:+.2}%",
-        control.peak_gib,
-        ms_per_step(&control, steps),
-        ms::TRANSFORMER_WINDOW_SIZE,
-        windowed.peak_gib,
-        ms_per_step(&windowed, steps),
-        100.0 * (windowed.peak_gib - control.peak_gib) / control.peak_gib
-    );
-    assert_eq!(
-        max_delta(&control.pixels, &windowed.pixels),
-        0,
-        "rung 4 is a residency schedule, not an arithmetic change: a streamed block is rebuilt by \
-         the same constructor from the same tensors, so the image must be byte-identical"
-    );
-    // **A margin, not a bare `<`.** A bare inequality passes on allocator noise: with the window
-    // stubbed to `None` both rows run the same schedule and differ in the fourth decimal, which
-    // satisfies `<` about half the time. 3% is the floor a no-op cannot clear in either direction,
-    // and it is above the instrument's measured resolution at this cell.
-    assert!(
-        windowed.peak_gib < control.peak_gib * 0.97,
-        "the block window did not bound the request peak: {:.4} vs control {:.4} GiB — the stream \
-         is not actually replacing the resident stack",
-        windowed.peak_gib,
-        control.peak_gib
-    );
-}
-
-/// **Is the published cadence domain a set of equal-peak alternatives, or does the peak follow the
-/// row's position?**
-///
-/// The driver materializes ONE block at a time inside a window (the shared
-/// `mlx_gen::block_residency::run_windowed` shape every adopting family uses), so the weight bound
-/// is a single block regardless of cadence and the peaks are expected to be flat. That is a claim
-/// about the instrument as much as about the model, so it is checked against
-/// [`identical_requests_reproduce_once_the_allocator_has_settled`]'s resolution and under
-/// [`probe_order`].
-#[test]
-#[ignore = "needs a real SANA snapshot (see the module docs for the env vars)"]
-fn the_published_cadences_bound_the_peak_to_the_same_value() {
-    let edge = probe_size();
-    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    let steps = steps_for(true);
-    warm_up(REPRESENTATIVE, &dir, true, edge);
-
-    let control = measure(
-        REPRESENTATIVE,
-        &dir,
-        DEFAULT_TIER,
-        LoadShape::DeferredMaterialization,
-        &request(true, Some(rung4_control()), edge, steps),
-    );
-    let mut rows: Vec<(u32, f64, f64)> = probe_order()
-        .into_iter()
-        .map(|window| {
-            let row = measure(
-                REPRESENTATIVE,
-                &dir,
-                DEFAULT_TIER,
-                LoadShape::DeferredMaterialization,
-                &request(true, Some(full_ladder(window)), edge, steps),
-            );
-            (window, row.peak_gib, ms_per_step(&row, steps))
-        })
-        .collect();
-    for (window, peak, wall) in &rows {
-        println!(
-            "[sc-15523 rung4 sweep {DEFAULT_TIER} {edge}sq] cadence {window:>2}: {peak:.4} GiB \
-             ({:+.2}% vs control), {wall:.0} ms/step",
-            100.0 * (peak - control.peak_gib) / control.peak_gib
-        );
-        assert!(
-            *peak < control.peak_gib * 0.97,
-            "cadence {window} did not bound the request peak: {peak:.4} vs control {:.4} GiB",
-            control.peak_gib
-        );
+    let mut admitted = Vec::new();
+    for window in ms::TRANSFORMER_WINDOW_SIZES {
+        match model.generate(
+            &request(REPRESENTATIVE_IS_SPRINT, Some(full_ladder(*window)), 256, 1),
+            &mut |_| {},
+        ) {
+            Ok(_) => admitted.push(format!("cadence {window}")),
+            Err(error) => assert!(
+                error.to_string().contains("WITHHELD"),
+                "the refusal must name the withdrawal, got: {error}"
+            ),
+        }
     }
-    rows.sort_by_key(|(window, _, _)| *window);
-    let (_, tight_peak, _) = rows[0];
-    let spread = rows
-        .iter()
-        .map(|(_, peak, _)| 100.0 * (peak - tight_peak).abs() / tight_peak)
-        .fold(0f64, f64::max);
-    println!(
-        "[sc-15523 rung4 sweep {DEFAULT_TIER} {edge}sq] cadence peak spread {spread:.2}% over {:?}",
-        rows.iter().map(|(w, p, _)| (*w, *p)).collect::<Vec<_>>()
-    );
+    for component in [
+        TransformerComponent::Dit,
+        TransformerComponent::TextEncoder,
+        TransformerComponent::Both,
+    ] {
+        if model
+            .generate(
+                &request(
+                    REPRESENTATIVE_IS_SPRINT,
+                    Some(full_ladder_scoped(ms::TRANSFORMER_WINDOW_SIZE, component)),
+                    256,
+                    1,
+                ),
+                &mut |_| {},
+            )
+            .is_ok()
+        {
+            admitted.push(format!("component {component:?}"));
+        }
+    }
     assert!(
-        spread < 3.0,
-        "the published cadences no longer bound the request peak to the same value ({spread:.2}% \
-         spread over {rows:?}). The domain is published as equal-peak alternatives, so that has to \
-         keep holding — or it must be narrowed to the cadence that was actually measured"
+        admitted.is_empty(),
+        "the production path executed a withheld rung-4 selection: {admitted:?}"
     );
+
+    // …and the published ceiling still renders, so the refusal is specific rather than a blanket
+    // rejection of every request block.
+    model
+        .generate(
+            &request(REPRESENTATIVE_IS_SPRINT, Some(rung4_control()), 256, 1),
+            &mut |_| {},
+        )
+        .expect("the published rungs 1-3 composition must still render");
 }
 
 // ── Domain enforcement ───────────────────────────────────────────────────────────────────────────
@@ -685,13 +719,12 @@ fn the_published_domains_are_enforced_by_the_production_path() {
         .expect("load sana sprint");
     // One step at the smallest advertised output: this test is about admission, not about peaks.
     let probe = |memory: GenerationMemory| {
-        model.generate(&request(true, Some(memory), 256, 1), &mut |_| {})
+        model.generate(
+            &request(REPRESENTATIVE_IS_SPRINT, Some(memory), 256, 1),
+            &mut |_| {},
+        )
     };
 
-    for window in ms::TRANSFORMER_WINDOW_SIZES {
-        probe(full_ladder(*window))
-            .unwrap_or_else(|error| panic!("published cadence {window} must render, got: {error}"));
-    }
     for budget in ms::ATTENTION_CHUNK_SIZES {
         probe(rung3(*budget))
             .unwrap_or_else(|error| panic!("published budget {budget} must render, got: {error}"));
@@ -699,8 +732,12 @@ fn the_published_domains_are_enforced_by_the_production_path() {
 
     // Collected rather than asserted in-loop, so a regression reports every value it affects.
     let mut silently_admitted: Vec<String> = Vec::new();
-    for bad in [0_u32, 3, 6, 7, 11, 20, 21, 70] {
-        assert!(!ms::TRANSFORMER_WINDOW_SIZES.contains(&bad));
+    // Rung 4 is withheld, so EVERY cadence is out of domain — published-shaped and not alike.
+    for bad in ms::TRANSFORMER_WINDOW_SIZES
+        .iter()
+        .copied()
+        .chain([0_u32, 3, 6, 7, 11, 20, 21, 70])
+    {
         if probe(full_ladder(bad)).is_ok() {
             silently_admitted.push(format!("cadence {bad}"));
         }
@@ -730,14 +767,6 @@ fn the_published_domains_are_enforced_by_the_production_path() {
         if probe(full_ladder_scoped(ms::TRANSFORMER_WINDOW_SIZE, component)).is_ok() {
             silently_admitted.push(format!("window component {component:?}"));
         }
-    }
-    // Rung 4 without its declared rung-1 prerequisite.
-    let unstaged = GenerationMemory {
-        stage_residency: false,
-        ..full_ladder(ms::TRANSFORMER_WINDOW_SIZE)
-    };
-    if probe(unstaged).is_ok() {
-        silently_admitted.push("rung 4 without staged residency".to_owned());
     }
     assert!(
         silently_admitted.is_empty(),
@@ -769,7 +798,7 @@ fn an_eager_load_declares_and_refuses_rung_four() {
             .unwrap()
             .support,
         MemoryStrategySupport::Implemented,
-        "rung 3 bounds scratch, so it is load-shape independent"
+        "rung 3 bounds scratch, so it is load-shape independent — an eager load keeps it"
     );
     let model = mlx_gen_sana::provider_registry()
         .expect("registry")
@@ -777,13 +806,18 @@ fn an_eager_load_declares_and_refuses_rung_four() {
         .expect("load");
     let error = model
         .generate(
-            &request(true, Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)), 256, 1),
+            &request(
+                REPRESENTATIVE_IS_SPRINT,
+                Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+                256,
+                1,
+            ),
             &mut |_| {},
         )
         .expect_err("an eager load must refuse rung 4");
     assert!(
-        error.to_string().contains("re-openable"),
-        "the refusal must name the load-time fact, got: {error}"
+        error.to_string().contains("WITHHELD"),
+        "the refusal must name the withdrawal, got: {error}"
     );
 }
 
@@ -855,11 +889,6 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
                 rung3(ms::ATTENTION_CHUNK_SIZE),
                 OffloadPolicy::Sequential,
             ),
-            (
-                MemoryStrategy::BoundedTransformerResidency,
-                full_ladder(ms::TRANSFORMER_WINDOW_SIZE),
-                OffloadPolicy::Sequential,
-            ),
         ] {
             let resident_row = matches!(policy, OffloadPolicy::Resident);
             let (row_load, row_contract) = if resident_row {
@@ -910,8 +939,9 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
     }
     assert_eq!(
         minted,
-        ENTRIES.len() * 5,
-        "every entry must mint one record per rung"
+        ENTRIES.len() * 4,
+        "every entry must mint one record per PUBLISHED rung — rung 4 is withheld, and a withheld \
+         rung must not mint evidence that could select a fit"
     );
 }
 
@@ -1042,16 +1072,16 @@ fn output_preservation_is_resampled_across_production_latents() {
     const SEEDS: [u64; 5] = [1234, 7, 99_991, 424_242, 8_675_309];
     let edge = probe_size();
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
-    let steps = steps_for(true);
-    warm_up(REPRESENTATIVE, &dir, true, edge);
+    let steps = steps_for(REPRESENTATIVE_IS_SPRINT);
+    warm_up(REPRESENTATIVE, &dir, REPRESENTATIVE_IS_SPRINT, edge);
 
     let mut deltas = Vec::new();
     for seed in SEEDS {
-        let mut control_req = request(true, Some(rung4_control()), edge, steps);
+        let mut control_req = request(REPRESENTATIVE_IS_SPRINT, Some(rung2()), edge, steps);
         control_req.seed = Some(seed);
         let mut full_req = request(
-            true,
-            Some(full_ladder(ms::TRANSFORMER_WINDOW_SIZE)),
+            REPRESENTATIVE_IS_SPRINT,
+            Some(rung3(ms::ATTENTION_CHUNK_SIZE)),
             edge,
             steps,
         );
@@ -1084,12 +1114,12 @@ fn output_preservation_is_resampled_across_production_latents() {
         "FAILS"
     };
     println!(
-        "[sc-15523 quality] rungs 3+4 over {} production latents: worst maxD {worst} => {class}",
+        "[sc-15523 quality] rung 3 over {} production latents: worst maxD {worst} => {class}",
         SEEDS.len()
     );
     assert_eq!(
         worst, 0,
-        "rungs 3 and 4 both claim EXACT preservation ({class} over {deltas:?}); a non-zero seed \
-         means one of them is an arithmetic change, not a memory schedule"
+        "rung 3 claims EXACT preservation over its published domain ({class} over {deltas:?}); a \
+         non-zero seed means it is an arithmetic change, not a memory schedule"
     );
 }

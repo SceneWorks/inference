@@ -137,13 +137,27 @@ mod explicit_registry_tests {
                 .expect("SANA provider should expose a memory contract");
 
             assert_eq!(contract.provider_id, provider_id);
-            for strategy in MemoryStrategy::ALL {
+            for strategy in [
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+            ] {
                 assert_eq!(
                     contract.capability(strategy).unwrap().support,
                     MemoryStrategySupport::Implemented,
                     "{provider_id} must publish {strategy:?} on the full-ladder route"
                 );
             }
+            // Rung 4 is implemented and output-preserving, and WITHHELD because it does not move
+            // the request peak on this family — see `TRANSFORMER_WINDOW_WITHHELD` for the numbers.
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            );
         }
     }
 }

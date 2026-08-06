@@ -71,7 +71,44 @@ pub const ATTENTION_CHUNK_SIZE: u32 = 1_048_576;
 /// 64 Mi is the sibling families' constant and is inert at every advertised SANA geometry.
 pub const ATTENTION_CHUNK_SIZES_REJECTED: &[u32] = &[67_108_864];
 
-/// Rung 4's published block cadences over the 20-block `transformer_blocks` stack.
+/// **Rung 4 is implemented, output-preserving, and WITHHELD — measured, not assumed (SC-15523).**
+///
+/// The window runs and it bounds what it claims to bound. From the safetensors `data_offsets`, all
+/// 20 blocks are 93.59 MiB each and the stack is 1871.9 MiB, so a `window = 1` render holds
+/// **93.59 MiB instead of 1871.9 MiB** of trunk weights; the wall clock confirms the mechanism
+/// executes (651 → 929 ms/step, +42%, which is the 20-blocks-per-step re-materialization cost). The
+/// image is byte-identical across five production latents.
+///
+/// It does **not move the REQUEST peak**, and this epic's rule is that bounding a phase which is not
+/// the request peak is not a saving. Measured on `sana_1600m` q4 at 1024² (Sequential + Deferred):
+///
+/// | row | peak | vs the rung-3 control |
+/// |---|---:|---:|
+/// | rung-3 control | 2.9108 GiB | — |
+/// | `window = 1` | 2.8602 GiB | −1.74% |
+///
+/// −1.74% is inside this cell's **positional** noise, and the noise is not random: eight identical
+/// windowed requests produce a deterministic five-value cycle spanning **4.92%**
+/// (2.8053 / 2.9108 / 2.8602 / 2.8270 / 2.9434, repeating). Under `SANA_WINDOW_PROBE_ORDER` the
+/// peak follows the row's POSITION and not its cadence — cadence 10 run first and cadence 4 run
+/// first both read exactly 2.8602 GiB. A genuine weight-residency effect cannot do that, so the
+/// cadence column is withdrawn as evidence rather than published.
+///
+/// **Why, mechanically.** After rungs 1-3 the request peak is ≈2.87 GiB while the *windowed* denoise
+/// weights are ≈1.28 GiB (93.59 MiB trunk + 24.8 MiB non-block + 1191.1 MiB dense-f32 DC-AE). The
+/// peak therefore cannot be the denoise weight residency, and the only component large enough to
+/// account for it is the **Gemma-2 caption encoder at 2211.4 MiB** plus its conditioning
+/// activations. SC-15969's own survey noted that a TextEncoder-scoped window is structurally
+/// available for this family; that scope, not the DiT one, is what would move SANA's peak — tracked
+/// as its own story because the encoder lives in `mlx-gen-pid` and is shared with PiD and LTX.
+///
+/// The implementation is retained deliberately: it is correct, it is exercised by the weights-free
+/// block-stream and windowed-forward tests, and it is the foundation the TextEncoder scope builds
+/// on. Flipping this one constant re-publishes the rung when a measurement justifies it.
+pub const TRANSFORMER_WINDOW_WITHHELD: bool = true;
+
+/// Rung 4's block cadences over the 20-block `transformer_blocks` stack. Published only when
+/// [`TRANSFORMER_WINDOW_WITHHELD`] is cleared.
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 5, 10];
 /// The default cadence — the tightest weight bound.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
@@ -179,7 +216,7 @@ fn contract_with_asset_facts(
     // policy — declaring it on a Resident load would advertise a composition its own declared
     // prerequisite could never satisfy. ONE binding, so the capability, the lifecycle hook and the
     // formula variable cannot disagree about whether a window can run on this load.
-    let windowed = is_streamable(spec) && staged;
+    let windowed = is_streamable(spec) && staged && !TRANSFORMER_WINDOW_WITHHELD;
     let mut variables = vec![
         MemoryFormulaVariable::AssetBytes,
         MemoryFormulaVariable::PixelCount,
@@ -319,6 +356,13 @@ pub(crate) fn validate_request_memory(
         }
     }
     if memory.stream_transformer_blocks {
+        if TRANSFORMER_WINDOW_WITHHELD {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: bounded transformer residency is implemented and measured, and \
+                 WITHHELD because it does not move the request peak on this family (-1.74% inside \
+                 a 4.92% positional cycle); see TRANSFORMER_WINDOW_WITHHELD for the numbers"
+            )));
+        }
         if !is_streamable(spec) {
             return Err(CoreError::Unsupported(format!(
                 "{provider_id}: bounded transformer residency needs a re-openable snapshot \
@@ -540,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn both_ids_publish_the_same_five_rung_ladder() {
+    fn both_ids_publish_the_same_ladder_with_rung_four_withheld() {
         let spec = streamable_spec(OffloadPolicy::Sequential);
         let base = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         let sprint = weights_free_memory_strategy_contract(crate::SPRINT_MODEL_ID, &spec).unwrap();
@@ -552,35 +596,43 @@ mod tests {
         for strategy in MemoryStrategy::ALL {
             assert_eq!(base.capability(strategy), sprint.capability(strategy));
         }
-        for strategy in MemoryStrategy::ALL {
+        for strategy in [
+            MemoryStrategy::Resident,
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+        ] {
             assert_eq!(
                 base.capability(strategy).unwrap().support,
                 MemoryStrategySupport::Implemented,
                 "{strategy:?} must be implemented on the full-ladder route"
             );
         }
+        // Rung 4: implemented, output-preserving, measured, and WITHHELD. The withdrawal is a
+        // measured verdict at a stated cell, not a structural one, so it is one flippable constant.
+        const { assert!(TRANSFORMER_WINDOW_WITHHELD) };
+        assert_eq!(
+            base.capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        assert!(!base.lifecycle.transformer_window_materialization);
         assert_eq!(
             base.resident_request_memory,
             ResidentRequestMemory::ExplicitResident
         );
         assert!(base.lifecycle.attention_chunking);
-        assert!(base.lifecycle.transformer_window_materialization);
-        // Rung 4's rung-1 edge is a PROVIDER declaration: the shared `engages` order deliberately
-        // does not drag rung 1 in, so a missing `additional_prerequisites` entry would leave the
-        // composition selectable without the phase release that makes it move the request peak.
-        assert!(
-            base.requires(MemoryStrategy::BoundedTransformerResidency)
-                .any(|prerequisite| prerequisite
-                    == MemoryStrategyPrerequisite::Rung {
-                        rung: MemoryStrategy::StagedResidency,
-                        scope: MemoryPrerequisiteScope::EngagedInSameRequest,
-                    }),
-            "rung 4 must declare its rung-1 engagement prerequisite"
-        );
+        // The rung-1 edge rung 4 WOULD carry is a provider declaration, never an inherited one: the
+        // shared cost order deliberately does not drag rung 1 in. Pinned here so a future
+        // re-publication cannot quietly rely on the shared order for it.
         assert!(
             !MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::StagedResidency),
-            "the shared cost order must NOT be the source of that edge"
+            "the shared cost order must never be the source of rung 4's rung-1 edge"
         );
+        assert!(base
+            .requires(MemoryStrategy::BoundedTransformerResidency)
+            .all(|prerequisite| !matches!(prerequisite, MemoryStrategyPrerequisite::Rung { .. })));
     }
 
     #[test]
@@ -604,17 +656,13 @@ mod tests {
                 .attention_chunk_sizes,
             ATTENTION_CHUNK_SIZES.to_vec()
         );
+        // Rung 4 is withheld, so it publishes NO parameter domain — a withheld rung that still
+        // advertised cadences would let a caller select one the contract refuses.
         let window = contract
             .capability(MemoryStrategy::BoundedTransformerResidency)
             .unwrap();
-        assert_eq!(
-            window.parameters.transformer_window_sizes,
-            TRANSFORMER_WINDOW_SIZES.to_vec()
-        );
-        assert_eq!(
-            window.parameters.transformer_window_components,
-            vec![TransformerComponent::Dit]
-        );
+        assert!(window.parameters.transformer_window_sizes.is_empty());
+        assert!(window.parameters.transformer_window_components.is_empty());
         // The rejected sibling constant must stay out of the published domain in both directions.
         for rejected in ATTENTION_CHUNK_SIZES_REJECTED {
             assert!(!ATTENTION_CHUNK_SIZES.contains(rejected));
@@ -630,6 +678,8 @@ mod tests {
     fn rung_four_availability_reads_source_load_shape_and_the_staged_prerequisite() {
         let deferred_dir = streamable_spec(OffloadPolicy::Sequential);
         assert!(is_streamable(&deferred_dir));
+        // The load-time predicate is kept correct even while the rung is withheld, so a future
+        // re-publication does not have to re-derive it.
 
         let mut eager = deferred_dir.clone();
         eager.load_shape = LoadShape::EagerMaterialization;
@@ -666,6 +716,7 @@ mod tests {
                 panic!("SANA declares a phase envelope")
             };
             assert!(!variables.contains(&MemoryFormulaVariable::TransformerWindowSize));
+            let _ = &deferred_dir;
             assert!(
                 !contract
                     .requires(MemoryStrategy::BoundedTransformerResidency)
@@ -728,25 +779,42 @@ mod tests {
             transformer_window_component: Some(TransformerComponent::Dit),
             ..Default::default()
         };
-        validate_request_memory(crate::MODEL_ID, &spec, &full)
+        // Rung 4 is withheld, so the fully published SELECTION is rungs 1-3.
+        let published = GenerationMemory {
+            stream_transformer_blocks: false,
+            transformer_window_size: None,
+            transformer_window_component: None,
+            ..full
+        };
+        validate_request_memory(crate::MODEL_ID, &spec, &published)
             .expect("the fully published selection must be accepted");
+        // …and every rung-4 selection is refused by name, whatever its parameters.
+        for window in TRANSFORMER_WINDOW_SIZES {
+            let error = validate_request_memory(
+                crate::MODEL_ID,
+                &spec,
+                &GenerationMemory {
+                    transformer_window_size: Some(*window),
+                    ..full
+                },
+            )
+            .expect_err("a withheld rung must be refused");
+            assert!(
+                error.to_string().contains("WITHHELD"),
+                "the refusal must name the withdrawal, got: {error}"
+            );
+        }
         // Every published value in every domain is reachable.
         for edge in DECODE_TILE_EDGES {
-            let mut memory = full;
+            let mut memory = published;
             memory.decode_tile_edge = Some(*edge);
             validate_request_memory(crate::MODEL_ID, &spec, &memory).unwrap();
         }
         for size in ATTENTION_CHUNK_SIZES {
-            let mut memory = full;
+            let mut memory = published;
             memory.attention_chunk_size = Some(*size);
             validate_request_memory(crate::MODEL_ID, &spec, &memory).unwrap();
         }
-        for window in TRANSFORMER_WINDOW_SIZES {
-            let mut memory = full;
-            memory.transformer_window_size = Some(*window);
-            validate_request_memory(crate::MODEL_ID, &spec, &memory).unwrap();
-        }
-
         let mut refusals = Vec::new();
         let mut check = |label: &str, memory: GenerationMemory| {
             if validate_request_memory(crate::MODEL_ID, &spec, &memory).is_ok() {
@@ -758,7 +826,7 @@ mod tests {
                 "decode edge",
                 GenerationMemory {
                     decode_tile_edge: Some(*rejected),
-                    ..full
+                    ..published
                 },
             );
         }
@@ -767,7 +835,7 @@ mod tests {
                 "attention budget",
                 GenerationMemory {
                     attention_chunk_size: Some(*rejected),
-                    ..full
+                    ..published
                 },
             );
         }
@@ -810,6 +878,7 @@ mod tests {
         assert!(validate_request_memory(crate::MODEL_ID, &eager, &full).is_err());
         // …while a request that selects no rung is untouched by any of this.
         validate_request_memory(crate::MODEL_ID, &eager, &GenerationMemory::default()).unwrap();
+        validate_request_memory(crate::MODEL_ID, &eager, &published).unwrap();
     }
 
     /// **The three sc-15839 defect classes, pre-checked against this provider.**
@@ -886,7 +955,7 @@ mod tests {
             (
                 OffloadPolicy::Sequential,
                 LoadShape::DeferredMaterialization,
-                MemoryStrategy::BoundedTransformerResidency,
+                MemoryStrategy::BoundedAttention,
             ),
         ] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/sana-evidence".into()))
