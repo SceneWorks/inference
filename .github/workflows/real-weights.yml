@@ -1871,9 +1871,13 @@ jobs:
       # swept 18 shapes across both arms and two independent controls (compiled vs eager is exactly
       # `0.0` at 1 layer and 0.3 ULP at 2; a 1-ULP-f32 perturbation of the EAGER forward's own input
       # moves its output by the same 1e-4…2.5e-3 the whole gap does), so the residual is this
-      # stack's amplification floor, not a fusion defect. The gate is now peak-RELATIVE at 1.6e-2,
-      # 7x the worst measured. The evidence and the table live on
-      # `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL`; do not loosen it here.
+      # stack's amplification floor, not a fusion defect. The gate is now peak-RELATIVE and PER-ARM
+      # — 1.0e-2 (T2I bf16) and 2.6e-3 (Edit q8) — each 4x that arm's own MEASURED conditioning
+      # envelope, which is 3.9x smaller on Edit, so one shared constant cost that arm most of its
+      # sensitivity. The evidence, the tables and the derivation live on
+      # `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`, and the sweep that produced them is
+      # committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs`. Re-measure with it
+      # before touching either number here.
       #
       # The Edit arm takes `q8` for the same reason the residency step above does — this re-host's
       # `bf16/` tier is metadata-only. Each test loads its own transformer, so they are selected one
@@ -1882,8 +1886,9 @@ jobs:
       #
       # MEASURED 2026-08-06 on nax-macos with both tiers resident, over three runs: T2I 55-59s, Edit
       # 170-185s = 225-244s of test time (peak RSS 40.8 GB and 21.7 GB respectively). That is +4 min
-      # on this job's 736s of compute; `timeout-minutes: 90` is sized by the ~131 GiB first-run
-      # materialization budget, not by compute, so it is unchanged — see the job header.
+      # on the 811-953s this job carried before it, taking the header total to 1036-1197s;
+      # `timeout-minutes: 90` is sized by the ~131 GiB first-run materialization budget, not by
+      # compute, so it is unchanged — see the job header.
       - name: Run Qwen-Image compiled-glue vs eager per-step A/B
         run: |
           set -o pipefail

@@ -3,3 +3,11 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Local scratch harnesses parked inside a crate's `tests/`. Anything under `tests/` is a cargo
+# integration-test target: it compiles on every `cargo test -p <crate>` and `git add -A` would
+# commit it. Name scratch files `*_scratch.rs` so neither can happen by accident. A sweep or probe
+# worth keeping does NOT belong here — promote it to `examples/`, where it is committed and
+# documented but stays out of the per-env-var test census `release/real-weight-models.toml` keeps
+# (see `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs`, sc-17513).
+*_scratch.rs

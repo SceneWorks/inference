@@ -216,13 +216,18 @@ expected_files = [
 #     max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit). sc-17513
 #     swept 18 shapes across both arms (T2I bf16 128..1280 px, Edit q8 256..1024 px) and ran two
 #     controls that settle what the residual IS: truncating the transformer to 1 layer makes
-#     compiled-vs-eager exactly 0.0 on the same real weights (0.3 ULP at 2 layers), and perturbing
-#     the EAGER forward's own input by one f32 ULP moves its output by the same 1e-4..2.5e-3 the
-#     whole compiled-vs-eager gap does. So it is this stack's 1.3e3..2.2e4x amplification of a
-#     sub-ULP rounding difference, not a fusion defect — which also explains why it is
-#     non-monotonic in sequence length (the amplification is). The gate is now peak-RELATIVE at
-#     1.6e-2, 7x the worst measured; a genuinely wrong fusion is O(1e-1) and still trips it. The
-#     table and the derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL`.
+#     compiled-vs-eager exactly 0.0 on the same real weights against a max|out| of 114.1, so the
+#     zero is not vacuous (0.3 ULP at 2 layers), and perturbing the EAGER forward's own input by
+#     1-4 f32 ULP moves its output by the same 1e-4..2.5e-3 the whole compiled-vs-eager gap does.
+#     So it is this stack's amplification of a sub-ULP rounding difference, not a fusion defect —
+#     which also explains why it is non-monotonic in sequence length (the amplification is). The
+#     gate is now peak-RELATIVE and PER-ARM: 1.0e-2 (T2I) and 2.6e-3 (Edit), each 4x that arm's own
+#     measured conditioning envelope and ~4.5x its worst measured divergence. One shared constant
+#     left the Edit arm 85x loose at the geometry this lane runs, which would not have caught a 20x
+#     regression on it. A genuinely wrong fusion is O(1e-1) and still trips both. The tables and the
+#     derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`; the sweep that produced them
+#     is committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs` (an example, not a
+#     test — it adds nothing to the 45 above).
 # All four are WIRED above. None weakened a gate to get there.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
