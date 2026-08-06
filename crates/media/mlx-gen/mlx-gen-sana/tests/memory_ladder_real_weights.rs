@@ -36,11 +36,39 @@
 //! particular pass trivially with the feature off — which is why every rung test here also asserts
 //! that the rung MOVED something (a peak, or a probe count).
 //!
-//! | rung | stub | reddened |
-//! |---|---|---|
-//! | 3 | `CrossAttn::forward` ignores `budget` and always takes the single-call branch | `chunked_cross_attention_is_bit_exact_and_actually_chunks` (unit), `attention_chunking_is_measured_at_the_dit_seam` |
-//! | 4 | `resolved_rung_plan` returns `window: None` — rung 4 declared and not executed | `transformer_window_bounds_the_request_peak_and_preserves_output` |
-//! | domain | `validate_request_memory` returns `Ok(())` unconditionally | `the_published_domains_are_enforced_by_the_production_path` |
+//! | # | stub | reddened | weights |
+//! |---|---|---|---|
+//! | 1 | `CrossAttn::forward` ignores `budget`, always the single-call branch | `chunked_cross_attention_is_bit_exact_and_actually_chunks` | no |
+//! | 2 | …the same stub, on real weights | `attention_chunking_is_measured_at_the_dit_seam` — all three rows read 3.2172 GiB, +0.00% | **yes** |
+//! | 3 | `SanaBlock::forward` drops the budget on the way to `attn2` | `a_block_forward_threads_the_attention_budget_to_attn2` | no |
+//! | 4 | the chunked path drops the caption mask | `the_caption_mask_changes_the_chunked_result` | no |
+//! | 5 | `validate_request_memory` returns `Ok(())` unconditionally | `request_scoped_parameters_are_refused_outside_the_published_domain` — 17 selections admitted | no |
+//! | 6 | …the same stub, on real weights | `the_published_domains_are_enforced_by_the_production_path` | **yes** |
+//! | 7 | the rung-4 withholding check removed from `validate_request_memory` | `the_withheld_rung_four_is_refused_by_the_production_path` | **yes** |
+//! | 8 | the phase probe's decode left unbounded, so the peak may scale | `the_request_peak_bearing_phase_is_measured_not_assumed` — +343.77% over 16x tokens | **yes** |
+//! | 9 | `is_streamable` returns `true` | `rung_four_availability_reads_source_load_shape_and_the_staged_prerequisite` | no |
+//! | 10 | `windowed` drops its rung-1 half | the same test | no |
+//! | 11 | the window view is never drained | `block_stream_drains_exactly_what_the_block_read` | no |
+//! | 12 | the drain is `remove_prefix`, not `remove_accessed` | the same test's un-read-key half | no |
+//! | 13 | the block stream ignores the trunk's config | `a_materialized_block_matches_its_resident_twin` | no |
+//! | 14 | the stream drops **only** the Sprint `qk_norm` gate | `a_base_config_stream_over_sprint_weights_is_present_but_wrong` | no |
+//!
+//! **Rung 4's execution has no real-weight mutation, and cannot have one.** The rung is withheld, so
+//! its mechanism is unreachable from the production `generate` path by construction — #7 proves the
+//! withholding is enforced and #11-#14 prove the mechanism weights-free. Stating that plainly is the
+//! point: an earlier revision of this table cited a real-weight rung-4 test that had been *deleted*
+//! when the rung was withdrawn, which is the fourth phantom citation this epic has produced.
+//!
+//! **Two mutations deliberately recorded as NOT reddening**, because a mutation that fails to redden
+//! bounds an assertion's reach and that is worth knowing:
+//!
+//! - Forcing degenerate one-row chunks — measured NOT bit-exact at ~1e-6 in the latent — leaves the
+//!   rendered image byte-identical. The exactness boundary is real in the latent and does not reach
+//!   uint8 pixels, which is why `a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one`
+//!   asserts on tensors rather than on an image.
+//! - Dropping the caption mask on the chunked path reddens the unit test (#4) but leaves the real
+//!   render byte-identical: at the CHI prompt this file drives, the mask is not load-bearing. So the
+//!   real-weight byte-identity rows cannot stand in for #4, and both are kept.
 //!
 //! ## Weights
 //!
@@ -370,9 +398,34 @@ fn probe_size() -> u32 {
 ///
 /// **This is the control that withdrew SANA's rung 4** (see
 /// [`the_withheld_rung_four_is_refused_by_the_production_path`]): cadence 10 run first and cadence 4
-/// run first both read exactly 2.8602 GiB. It is retained, unused by any live sweep, because
-/// re-publishing the rung requires re-running exactly this probe — deleting it would delete the
-/// instrument the withdrawal rests on.
+/// run first both read exactly 2.8602 GiB. It stays LIVE rather than `#[allow(dead_code)]` — that
+/// test drives its refusal loop through it, so a permutation must refuse exactly the same set.
+/// Deleting it would delete the instrument the withdrawal rests on.
+fn probe_order() -> Vec<u32> {
+    let Ok(spec) = std::env::var("SANA_WINDOW_PROBE_ORDER") else {
+        return ms::TRANSFORMER_WINDOW_SIZES.to_vec();
+    };
+    let order: Vec<u32> = spec
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("SANA_WINDOW_PROBE_ORDER: not a u32")
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    let mut domain = ms::TRANSFORMER_WINDOW_SIZES.to_vec();
+    domain.sort_unstable();
+    assert_eq!(
+        sorted, domain,
+        "SANA_WINDOW_PROBE_ORDER must be a PERMUTATION of the published domain — an order probe \
+         that also changed which cadences ran would confound the two things it exists to separate"
+    );
+    println!("[sc-17679 order probe] executing cadences in the order {order:?}");
+    order
+}
+
 /// The order the rung-3 sweep executes its budgets in — the same control [`probe_order`] is for
 /// cadences, and the one that settled what the budget column actually measures here.
 ///
@@ -404,32 +457,6 @@ fn budget_probe_order() -> Vec<u32> {
     order
 }
 
-#[allow(dead_code)]
-fn probe_order() -> Vec<u32> {
-    let Ok(spec) = std::env::var("SANA_WINDOW_PROBE_ORDER") else {
-        return ms::TRANSFORMER_WINDOW_SIZES.to_vec();
-    };
-    let order: Vec<u32> = spec
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse()
-                .expect("SANA_WINDOW_PROBE_ORDER: not a u32")
-        })
-        .collect();
-    let mut sorted = order.clone();
-    sorted.sort_unstable();
-    let mut domain = ms::TRANSFORMER_WINDOW_SIZES.to_vec();
-    domain.sort_unstable();
-    assert_eq!(
-        sorted, domain,
-        "SANA_WINDOW_PROBE_ORDER must be a PERMUTATION of the published domain — an order probe \
-         that also changed which cadences ran would confound the two things it exists to separate"
-    );
-    println!("[sc-17679 order probe] executing cadences in the order {order:?}");
-    order
-}
-
 /// The resolution this cell's instrument is required to stay inside, and the floor every published
 /// claim in this file must clear.
 ///
@@ -440,13 +467,44 @@ fn probe_order() -> Vec<u32> {
 /// [`budget_probe_order`], and why rung 4 was withdrawn: under [`probe_order`] its peak followed the
 /// row's position and not its cadence.
 ///
-/// It also retro-corrects a false green. Five independent whole-ladder runs earlier reported a
-/// 0.00% spread at every rung, which read as a perfect instrument; it was the five-row ladder walk
-/// aligning with the five-value cycle so that each rung always landed on the same phase. A repeat
-/// count that is a multiple of the cycle length cannot see the cycle.
+/// **The baseline the deltas are measured against is exact.** Measured, not assumed: the rung-2
+/// control cell reads 3.2172..3.2173 GiB over eight rows — **0.00%** — and 3.2170..3.2173 over
+/// eleven (0.01%). The cycle therefore belongs to the rung-3-engaged path, not to the harness. That
+/// is also what makes mutation #2's "+0.00% to four decimals" legitimate rather than the false-green
+/// signature it superficially resembles: the stubbed rows land on the control's own exact value.
 ///
-/// 6% is the ceiling rather than 4.92% so a small drift does not silently invalidate the chain; the
-/// only effect this file publishes is rung 3's, whose WORST row is -8.51%.
+/// ## The aliasing rule, corrected — it is about STRIDE, not repeat count
+///
+/// Five independent whole-ladder runs earlier reported a 0.00% spread at every rung, which read as a
+/// perfect instrument. An earlier revision of this doc explained it as *"a repeat count that is a
+/// multiple of the cycle length cannot see the cycle"*. **That is false**, and it is the sentence
+/// the next family would have copied. Falsified by measurement: at `SANA_SETTLE_ROWS=11` the
+/// published window is rows 2..=11 — exactly ten rows, a multiple of five — and it still reports
+/// **4.92%**, showing all five values.
+///
+/// The real invariant is about the **stride** a comparison takes through the cycle:
+///
+/// > A comparison whose stride is a multiple of the cycle period cannot see the cycle.
+///
+/// The five-rung ladder walk is exactly that: each rung is sampled once per walk, so each rung's
+/// stride is 5 ≡ 0 (mod 5) and every rung always lands on the same phase — five runs, five identical
+/// readings, 0.00%. The repeat COUNT was never the mechanism.
+///
+/// **Corollary, and the reason the sibling probes are trustworthy:** a settle probe samples
+/// *consecutive* rows, so its stride is 1, and 1 is coprime to every period. A stride-1 probe is
+/// therefore immune at any repeat count — which is why `mlx-gen-sdxl`'s and `mlx-gen-chroma`'s
+/// 8-repeat 0.00% readings mean what they say. Design the probe stride-1; do not tune the count.
+///
+/// **Caveat: the cycle is deterministic per FRESH PROCESS, not invariant to process history.**
+/// Observed directly in the eleven-row run, where the control cell's eleven rows execute first in
+/// the same process: the rung-3 rows then open `2.8643 / 2.8563 / 2.8270 / 2.8784 / 2.8053 …`, three
+/// of which are outside the five-value set, before settling into the cycle from row #5. The period
+/// and the amplitude are stable; the phase and the exact members are not portable across a process
+/// that has already allocated differently. Every number this file publishes therefore comes from a
+/// **targeted `--exact` run**, and the 6% ceiling exists partly to absorb this.
+///
+/// The only effect this file publishes is rung 3's, whose WORST row is -8.51% — comfortably clear of
+/// both the cycle and the ceiling, and measured against a baseline that is itself exact.
 const INSTRUMENT_CEILING: f64 = 0.06;
 
 /// **Does this harness's peak reading depend on a row's ORDINAL rather than on its request?**
@@ -463,7 +521,13 @@ const INSTRUMENT_CEILING: f64 = 0.06;
 #[test]
 #[ignore = "needs a real SANA snapshot (see the module docs for the env vars)"]
 fn identical_requests_reproduce_once_the_allocator_has_settled() {
-    const SETTLE_PROBE_ROWS: usize = 8;
+    // Overridable so the stride invariant above is CHECKABLE rather than asserted: with
+    // `SANA_SETTLE_ROWS=11` the published window is rows 2..=11, exactly ten — a multiple of the
+    // period — and it still reports the full 4.92%.
+    let settle_probe_rows: usize = std::env::var("SANA_SETTLE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     /// The ceiling this file's published claims are required to clear. See [`INSTRUMENT_CEILING`].
     const SETTLE_TOLERANCE: f64 = INSTRUMENT_CEILING;
 
@@ -471,20 +535,57 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
     let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
     let steps = steps_for(REPRESENTATIVE_IS_SPRINT);
 
-    let peaks: Vec<f64> = (0..SETTLE_PROBE_ROWS)
-        .map(|_| {
-            measure(
-                REPRESENTATIVE,
-                &dir,
-                DEFAULT_TIER,
-                LoadShape::DeferredMaterialization,
-                &request(REPRESENTATIVE_IS_SPRINT, Some(rung4_control()), edge, steps),
-            )
-            .peak_gib
-        })
-        .collect();
+    // **Both cells, because a delta needs its baseline resolved too.** Probing only the
+    // rung-3-engaged cell would leave a reader unable to tell a cycle that belongs to the rung from
+    // one that belongs to the harness — and mutation #2's "+0.00% to four decimals" would be
+    // indistinguishable from the false-green signature it superficially resembles.
+    let sample = |memory: GenerationMemory| -> Vec<f64> {
+        (0..settle_probe_rows)
+            .map(|_| {
+                measure(
+                    REPRESENTATIVE,
+                    &dir,
+                    DEFAULT_TIER,
+                    LoadShape::DeferredMaterialization,
+                    &request(REPRESENTATIVE_IS_SPRINT, Some(memory), edge, steps),
+                )
+                .peak_gib
+            })
+            .collect()
+    };
+    let spread_of = |peaks: &[f64]| {
+        let published = &peaks[1..];
+        let (min, max) = published
+            .iter()
+            .fold((f64::MAX, 0f64), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+        (min, max, (max - min) / min)
+    };
+
+    let control_peaks = sample(rung2());
+    let (cmin, cmax, cspread) = spread_of(&control_peaks);
     println!(
-        "[sc-15523 settle {DEFAULT_TIER} {edge}sq rungs 1-3] identical request x{SETTLE_PROBE_ROWS}: {}",
+        "[sc-15523 settle {DEFAULT_TIER} {edge}sq rung-2 CONTROL] x{settle_probe_rows}: {}",
+        control_peaks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("#{}: {p:.4}", i + 1))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    println!(
+        "[sc-15523 settle {DEFAULT_TIER} {edge}sq] CONTROL RESOLUTION {:.2}% ({cmin:.4}..{cmax:.4} GiB)",
+        100.0 * cspread
+    );
+    assert!(
+        cspread < INSTRUMENT_CEILING,
+        "the rung-2 control is no longer a stable baseline: {cmin:.4}..{cmax:.4} GiB ({:.2}%) — \
+         every published delta inherits this cell's noise",
+        100.0 * cspread
+    );
+
+    let peaks = sample(rung4_control());
+    println!(
+        "[sc-15523 settle {DEFAULT_TIER} {edge}sq rungs 1-3] identical request x{settle_probe_rows}: {}",
         peaks
             .iter()
             .enumerate()
@@ -494,14 +595,10 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
     );
 
     // Row 1 is the one `warm_up` discards. Everything after it is a row this file would PUBLISH.
-    let published = &peaks[1..];
-    let (min, max) = published
-        .iter()
-        .fold((f64::MAX, 0f64), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
-    let spread = (max - min) / min;
+    let (min, max, spread) = spread_of(&peaks);
     println!(
         "[sc-15523 settle {DEFAULT_TIER} {edge}sq] INSTRUMENT RESOLUTION {:.2}% over rows \
-         2..={SETTLE_PROBE_ROWS} ({min:.4}..{max:.4} GiB; row 1 is the discarded warm-up)",
+         2..={settle_probe_rows} ({min:.4}..{max:.4} GiB; row 1 is the discarded warm-up)",
         100.0 * spread
     );
     assert!(
@@ -654,8 +751,10 @@ fn the_withheld_rung_four_is_refused_by_the_production_path() {
         .expect("load sana");
     const { assert!(ms::TRANSFORMER_WINDOW_WITHHELD) };
 
+    // Driven through [`probe_order`] so the cadence-order control stays live rather than becoming a
+    // relic of the sweep it withdrew: a permutation must refuse exactly the same set.
     let mut admitted = Vec::new();
-    for window in ms::TRANSFORMER_WINDOW_SIZES {
+    for window in &probe_order() {
         match model.generate(
             &request(REPRESENTATIVE_IS_SPRINT, Some(full_ladder(*window)), 256, 1),
             &mut |_| {},
@@ -700,6 +799,79 @@ fn the_withheld_rung_four_is_refused_by_the_production_path() {
             &mut |_| {},
         )
         .expect("the published rungs 1-3 composition must still render");
+}
+
+/// **Which PHASE bears the request peak — measured, not inferred from a byte table.**
+///
+/// The rung-4 withdrawal rests on the claim that after rungs 1-3 the peak is no longer the denoise
+/// weight residency. That claim began as an *inference*: the peak is ~2.87 GiB, the windowed denoise
+/// phase holds ~1.28 GiB, and the only component large enough to account for the difference is the
+/// Gemma-2 caption encoder at 2211.4 MiB. Sound arithmetic, but arithmetic.
+///
+/// This measures it, using the one lever that separates the phases without instrumenting them:
+/// **geometry**. SANA's conditioning phase is geometry-INDEPENDENT — the CHI prompt pads to a fixed
+/// 300 caption slots at every output size — while denoise and decode both scale with the token count
+/// `N = (edge/32)²`. So sweeping the advertised edge range separates them:
+///
+/// - a peak that stays **flat** as the edge grows is borne by the conditioning phase;
+/// - a peak that **scales** with pixels is borne by denoise or decode.
+///
+/// Measured: 2.9108 / 2.8602 / 2.8270 GiB at 256² / 512² / 1024² — **-2.88% across a 16x token
+/// increase**, and every value a member of the five-cycle. Flat. A denoise- or decode-borne peak
+/// cannot do that, which is what makes rung 4 a withdrawal rather than a defect: bounding the trunk
+/// cannot move a peak the trunk does not set. It also tells sc-17859 it is aimed at the right
+/// component.
+#[test]
+#[ignore = "needs a real SANA snapshot (see the module docs for the env vars)"]
+fn the_request_peak_bearing_phase_is_measured_not_assumed() {
+    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let steps = steps_for(REPRESENTATIVE_IS_SPRINT);
+    warm_up(REPRESENTATIVE, &dir, REPRESENTATIVE_IS_SPRINT, 1024);
+
+    let mut rows = Vec::new();
+    for edge in [256_u32, 512, 1024] {
+        let row = measure(
+            REPRESENTATIVE,
+            &dir,
+            DEFAULT_TIER,
+            LoadShape::DeferredMaterialization,
+            &request(REPRESENTATIVE_IS_SPRINT, Some(rung4_control()), edge, steps),
+        );
+        let pixels = u64::from(edge) * u64::from(edge);
+        println!(
+            "[sc-15523 phase {DEFAULT_TIER}] {edge}sq ({pixels} px): {:.4} GiB, {:.0} ms/step",
+            row.peak_gib,
+            ms_per_step(&row, steps)
+        );
+        rows.push((edge, row.peak_gib));
+    }
+
+    let (_, smallest) = rows[0];
+    let (_, largest) = rows[rows.len() - 1];
+    let growth = 100.0 * (largest - smallest) / smallest;
+    println!(
+        "[sc-15523 phase {DEFAULT_TIER}] 256sq -> 1024sq is 16x the tokens: peak {growth:+.2}% \
+         => the peak-bearing phase is {}",
+        if growth.abs() < 100.0 * INSTRUMENT_CEILING {
+            "GEOMETRY-INDEPENDENT (the conditioning phase — the Gemma-2 caption encoder)"
+        } else {
+            "GEOMETRY-SCALING (denoise or decode)"
+        }
+    );
+    assert!(
+        growth.abs() < 100.0 * INSTRUMENT_CEILING,
+        "the request peak now scales with geometry ({growth:+.2}% over a 16x token increase), so \
+         it is no longer borne by the geometry-independent conditioning phase — the rung-4 \
+         withdrawal was argued on the opposite finding and has to be re-measured"
+    );
+    // …and the flat peak must be large enough to BE the caption encoder, rather than something
+    // smaller that merely happens not to scale. Gemma-2 q4 is 2211.37 MiB of weights alone.
+    const GEMMA_WEIGHT_GIB: f64 = 2211.37 / 1024.0;
+    assert!(
+        smallest > GEMMA_WEIGHT_GIB,
+        "the flat peak {smallest:.4} GiB is below the Gemma-2 weight floor {GEMMA_WEIGHT_GIB:.4} \
+         GiB, so the conditioning phase cannot be what sets it"
+    );
 }
 
 // ── Domain enforcement ───────────────────────────────────────────────────────────────────────────
@@ -865,6 +1037,7 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
         assert!(resident_contract.conformance_errors().is_empty());
 
         let mut previous: Option<(MemoryStrategy, f64)> = None;
+        let mut baseline_sha: Option<String> = None;
         for (strategy, memory, policy) in [
             (
                 MemoryStrategy::Resident,
@@ -923,6 +1096,18 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
             }
             previous = Some((strategy, row.peak_gib));
 
+            // The `Passed` parity verdict each record carries is established HERE, against the
+            // rung-0 row of the same entry: a record must not claim a verdict this run did not
+            // produce. The first row is the baseline and compares against itself.
+            let sha = format!("{:x}", Sha256::digest(&row.pixels));
+            match &baseline_sha {
+                None => baseline_sha = Some(sha.clone()),
+                Some(baseline) => assert_eq!(
+                    &sha, baseline,
+                    "{entry} {strategy:?} is not byte-identical to the rung-0 row, so its record \
+                     must not carry a Passed parity verdict"
+                ),
+            }
             let record = evidence(
                 entry,
                 var,
@@ -1030,7 +1215,14 @@ fn evidence(
         harness_version: "inference-sana-memory-ladder-v1".to_owned(),
         output_sha256: format!("{:x}", Sha256::digest(&row.pixels)),
         parity: MemoryParityContract::Exact,
-        parity_result: MemoryParityResult::NotRun,
+        // **Measured, not deferred.** The declared contract is `Exact` and this run establishes it:
+        // the ladder walk asserts every optimized row's `output_sha256` equals its entry's rung-0
+        // row, and `output_preservation_is_resampled_across_production_latents` re-establishes it
+        // across five production latents. `NotRun` is honest only for a harness that captures an
+        // output and leaves comparison to a later verifier; here it would understate evidence this
+        // run actually produced. (`mlx-gen-z-image` still hardcodes `NotRun` in the same position —
+        // tracked epic-wide as sc-17863 rather than swept in here.)
+        parity_result: MemoryParityResult::Passed,
     }
 }
 

@@ -45,7 +45,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::attention::AttentionBudget;
+use mlx_gen::attention::{slice_axis, AttentionBudget};
 use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
 use mlx_gen::weights::Weights;
@@ -80,8 +80,14 @@ impl SanaForwardPlan {
 /// Test-only observation of how many query chunks the last [`CrossAttn::forward`] actually ran.
 ///
 /// Without it every "chunked == unbounded" equivalence assertion in this crate passes with the
-/// chunking deleted, because the claim is trivially true when the lever never engages. Mirrors
-/// [`mlx_gen::attention`]'s probe. Compiled out entirely in release.
+/// chunking deleted, because the claim is trivially true when the lever never engages.
+///
+/// [`mlx_gen::attention`] has the same probe and this is **not** a fork of convenience: that one is
+/// `#[cfg(test)]`, and `cfg(test)` is set only for the crate being tested, never for its
+/// dependencies. A dependent crate links `mlx-gen` compiled *without* `cfg(test)`, so the symbol
+/// does not exist to import — sharing it would mean promoting it to a cargo feature, i.e. a change
+/// to `mlx-gen`'s public surface for a counter that is compiled out of release entirely.
+/// `slice_axis`, which carries no such constraint, IS imported from there rather than copied.
 #[cfg(test)]
 mod cross_attn_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -109,12 +115,6 @@ fn record_chunk_count(n: usize) {
 #[cfg(not(test))]
 #[inline(always)]
 fn record_chunk_count(_n: usize) {}
-
-/// Contiguous `[.., start..start+len, ..]` slice along `axis` via boundary splits — no host index
-/// vector and no gather, matching [`mlx_gen::attention`]'s own helper.
-fn slice_axis(a: &Array, axis: i32, start: i32, len: i32) -> Result<Array> {
-    Ok(a.split_axis(&[start, start + len], axis)?.swap_remove(1))
-}
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
@@ -1123,14 +1123,12 @@ mod query_row_boundary_tests {
              test is the place that records the change, and the domain guard below can relax"
         );
 
-        // The domain guard: the tightest published budget over the whole advertised size range.
+        // The domain guard: EVERY published budget over the whole advertised size range — not just
+        // the tightest, because the narrowest chunk is not necessarily produced by the smallest
+        // budget once the token count varies.
         let cfg = SanaTransformerConfig::sana_1600m();
         let heads = cfg.num_cross_attention_heads;
         let caption = 300;
-        let tightest = AttentionBudget::from_score_elements(
-            u64::from(crate::memory_strategy::ATTENTION_CHUNK_SIZE),
-            true,
-        );
         let mut narrowest = i32::MAX;
         // SANA advertises 256..=1024 on a 32-pixel stride; every one of those is a reachable
         // request, so every one of them is checked.
@@ -1148,7 +1146,6 @@ mod query_row_boundary_tests {
                     narrowest = narrowest.min(block);
                 }
             }
-            let _ = tightest;
             edge += 32;
         }
         // Recorded, not merely bounded: the narrowest chunk any published budget produces anywhere in

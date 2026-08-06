@@ -94,14 +94,29 @@ pub const ATTENTION_CHUNK_SIZES_REJECTED: &[u32] = &[67_108_864];
 /// first both read exactly 2.8602 GiB. A genuine weight-residency effect cannot do that, so the
 /// cadence column is withdrawn as evidence rather than published.
 ///
-/// **Why, mechanically.** After rungs 1-3 the request peak is ≈2.87 GiB while the *windowed* denoise
-/// weights are ≈1.28 GiB (93.59 MiB trunk + 24.8 MiB non-block + 1191.1 MiB dense-f32 DC-AE). The
-/// peak therefore cannot be the denoise weight residency, and the only component large enough to
-/// account for it is the **Gemma-2 caption encoder at 2211.4 MiB** plus its conditioning
-/// activations. SC-15969's own survey noted that a TextEncoder-scoped window is structurally
-/// available for this family; that scope, not the DiT one, is what would move SANA's peak — tracked
-/// as **sc-17859**, its own story because the encoder lives in `mlx-gen-pid` and is shared with PiD
-/// and LTX, so windowing it is a change to a component three families load.
+/// **Why, mechanically — and this half is MEASURED, not inferred from the byte table.**
+/// `the_request_peak_bearing_phase_is_measured_not_assumed` sweeps the advertised edge range with
+/// rungs 1-3 engaged. SANA's conditioning phase is geometry-INDEPENDENT (the CHI prompt pads to a
+/// fixed 300 caption slots at every size) while denoise and decode both scale with `N = (edge/32)²`,
+/// so the sweep separates them:
+///
+/// | edge | tokens | peak |
+/// |---|---:|---:|
+/// | 256² | 64 | 2.9108 GiB |
+/// | 512² | 256 | 2.8602 GiB |
+/// | 1024² | 1024 | 2.8270 GiB |
+///
+/// **−2.88% across a 16× token increase** — flat, every value a member of the five-cycle. A denoise-
+/// or decode-borne peak cannot do that, and the flat value is above the 2.1596 GiB Gemma-2 weight
+/// floor, so the component setting it is large enough to be the caption encoder rather than
+/// something smaller that merely happens not to scale. The arithmetic agrees — after rungs 1-3 the
+/// *windowed* denoise phase holds only ≈1.28 GiB (93.59 MiB trunk + 24.8 MiB non-block +
+/// 1191.1 MiB dense-f32 DC-AE) — but the measurement is what settles it.
+///
+/// SC-15969's own survey noted that a TextEncoder-scoped window is structurally available for this
+/// family; that scope, not the DiT one, is what would move SANA's peak — tracked as **sc-17859**,
+/// its own story because the encoder lives in `mlx-gen-pid` and is shared with PiD and LTX, so
+/// windowing it is a change to a component three families load.
 ///
 /// The implementation is retained deliberately: it is correct, it is exercised by the weights-free
 /// block-stream and windowed-forward tests, and it is the foundation the TextEncoder scope builds
