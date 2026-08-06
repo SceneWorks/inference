@@ -26,6 +26,7 @@
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter, DiffPatchPart};
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -177,6 +178,9 @@ struct SelfAttention {
     /// decomposed attention (MLX has no fused SDPA backward) instead of retaining the per-layer seq²
     /// probability matrix. Training-only; `false` on the inference path (byte-identical).
     ckpt_sdpa: bool,
+    /// Ladder rung 3 (sc-15528). [`AttentionBudget::UNBOUNDED`] is the load default and takes the
+    /// bare `scaled_dot_product_attention` line, so every pre-rung-3 caller is byte-identical.
+    attn_budget: AttentionBudget,
 }
 
 impl SelfAttention {
@@ -195,6 +199,7 @@ impl SelfAttention {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
@@ -281,7 +286,7 @@ impl SelfAttention {
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa)?;
+        let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa, self.attn_budget)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
@@ -364,9 +369,34 @@ impl SelfAttention {
 /// through them) and only the f32 `scale` is captured; the backward recomputes the decomposed
 /// attention for this layer alone, so the seq² probability matrix is a per-layer transient rather than
 /// retained across all blocks. `ckpt = false` is byte-identical to the bare call (inference).
-fn sdpa_maybe_checkpoint(q: &Array, k: &Array, v: &Array, scale: f32, ckpt: bool) -> Result<Array> {
+///
+/// The `ckpt` arm is taken FIRST and always runs unbounded: `eval` inside an autograd trace is
+/// invalid, so gradient checkpointing and a rung-3 budget are mutually exclusive by construction
+/// rather than by convention. A training forward therefore stays `UNBOUNDED` whatever is declared.
+fn sdpa_maybe_checkpoint(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    ckpt: bool,
+    budget: AttentionBudget,
+) -> Result<Array> {
     if !ckpt {
-        return Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?);
+        if budget.is_unbounded() {
+            return Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?);
+        }
+        // Ladder rung 3 (sc-15528). On MLX the saving is NOT a bounded score tensor — `fast::sdpa` is
+        // a fused Metal kernel that already streams them — it is the per-chunk `eval` cutting the lazy
+        // graph. See `mlx_gen::attention`'s module docs, and do not carry the Candle figure across.
+        return mlx_gen::attention::sdpa_budgeted_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            AttentionPlan::budgeted(budget),
+        )
+        .map_err(Error::from);
     }
     let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
         Ok(vec![scaled_dot_product_attention(
@@ -393,6 +423,8 @@ struct CrossAttention {
     eps: f32,
     /// sc-4942 — SDPA-segment checkpointing (training-only). See [`SelfAttention::ckpt_sdpa`].
     ckpt_sdpa: bool,
+    /// Ladder rung 3 (sc-15528). See [`SelfAttention::attn_budget`].
+    attn_budget: AttentionBudget,
 }
 
 impl CrossAttention {
@@ -411,6 +443,7 @@ impl CrossAttention {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
@@ -496,14 +529,21 @@ impl CrossAttention {
         let q = rms_norm(&self.q.forward(&bf16(x)?)?, &self.norm_q, self.eps)?
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let out = sdpa_maybe_checkpoint(&q, &kv.0, &kv.1, self.scale, self.ckpt_sdpa)?;
+        let out = sdpa_maybe_checkpoint(
+            &q,
+            &kv.0,
+            &kv.1,
+            self.scale,
+            self.ckpt_sdpa,
+            self.attn_budget,
+        )?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
 }
 
 #[derive(Clone)]
-struct Block {
+pub(crate) struct Block {
     modulation: Array, // [1, 6, dim]
     self_attn: SelfAttention,
     cross_attn: CrossAttention,
@@ -515,7 +555,7 @@ struct Block {
 }
 
 impl Block {
-    fn load(w: &Weights, i: usize, cfg: &WanModelConfig) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, i: usize, cfg: &WanModelConfig) -> Result<Self> {
         let p = format!("blocks.{i}");
         Ok(Self {
             modulation: f32(w.require(&format!("{p}.modulation"))?)?,
@@ -531,7 +571,7 @@ impl Block {
 
     /// Quantize this block's `_quantize_predicate` surface (self/cross attn `q/k/v/o` + `ffn.fc1/fc2`)
     /// to Q4/Q8 in place. The modulation table, `norm3`, and the qk-RMSNorm weights stay dense.
-    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+    pub(crate) fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
         self.self_attn.quantize(bits, group)?;
         self.cross_attn.quantize(bits, group)?;
         self.ffn_fc1.quantize(bits, group)?;
@@ -539,8 +579,14 @@ impl Block {
         Ok(())
     }
 
+    /// Apply ladder rung 3's attention budget to both of this block's SDPA seams (sc-15528).
+    pub(crate) fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.self_attn.attn_budget = budget;
+        self.cross_attn.attn_budget = budget;
+    }
+
     /// Collect this block's quantized packs (sc-5360 eval-to-free).
-    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+    pub(crate) fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
         self.self_attn.push_quant_arrays(out);
         self.cross_attn.push_quant_arrays(out);
         push_quant_arrays(&self.ffn_fc1, out);
@@ -588,7 +634,7 @@ impl Block {
         [sq, sk, cq, ck, &self.norm3_w, &self.norm3_b]
     }
 
-    fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
+    pub(crate) fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
         self.cross_attn.prepare_kv(context)
     }
 
@@ -603,7 +649,7 @@ impl Block {
     /// `L_e = L` for the **per-token** timestep (TI2V mask-blend `t_tokens`, sc-2680; broadcasts over
     /// the CFG batch only). Every modulation/residual op below is broadcast over `B`; only the
     /// self/cross attention reshapes to `B`.
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &Array,
         e: &Array,
@@ -703,6 +749,13 @@ pub struct WanTransformer {
     time_embedding_1: AdaptableLinear,
     time_projection: AdaptableLinear,
     blocks: Vec<Block>,
+    /// Ladder rung 4 (sc-15528): this transformer was built with
+    /// [`LoadShape::DeferredMaterialization`](mlx_gen::LoadShape::DeferredMaterialization) and holds
+    /// **no** blocks. `blocks` is empty and every block-reading path must route through a
+    /// [`WanBlockStream`](crate::block_stream::WanBlockStream). Kept as an explicit flag rather than
+    /// inferred from `blocks.is_empty()` so "deferred" and "degenerate zero-layer config" cannot be
+    /// confused by a reader or by a future `num_layers` overlay.
+    blocks_deferred: bool,
     head_modulation: Array, // [1, 2, dim]
     head: AdaptableLinear,
     rope: RopeTable,
@@ -831,10 +884,18 @@ impl WanTransformer {
     }
 
     pub fn from_weights(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        let mut dit = Self::from_weights_without_blocks(w, cfg)?;
+        dit.blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            blocks.push(Block::load(w, i, cfg)?);
+            dit.blocks.push(Block::load(w, i, cfg)?);
         }
+        Ok(dit)
+    }
+
+    /// Everything except the block stack. The single derivation both
+    /// [`from_weights`](Self::from_weights) and [`from_weights_deferred`](Self::from_weights_deferred)
+    /// share, so the two shapes cannot drift on the embeddings, the head or the RoPE table.
+    fn from_weights_without_blocks(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
         let half = cfg.freq_dim / 2;
         let inv: Vec<f32> = (0..half)
             .map(|j| (10000.0_f64.powf(-(j as f64) / half as f64)) as f32)
@@ -850,7 +911,8 @@ impl WanTransformer {
             time_embedding_0: load_linear(w, "time_embedding_0", None)?,
             time_embedding_1: load_linear(w, "time_embedding_1", None)?,
             time_projection: load_linear(w, "time_projection", None)?,
-            blocks,
+            blocks: Vec::new(),
+            blocks_deferred: false,
             head_modulation: f32(w.require("head.modulation")?)?,
             head: load_linear(w, "head.head", None)?,
             rope: RopeTable::new(cfg.dim / cfg.num_heads),
@@ -890,8 +952,110 @@ impl WanTransformer {
     }
 
     /// Number of transformer blocks (for the trainer's target enumeration).
+    ///
+    /// On a **deferred** stack (rung 4) this is the config's `num_layers` rather than `blocks.len()`,
+    /// which is zero — the plan must be sized by the stack the checkpoint has, not by what is
+    /// currently materialized.
     pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
+        if self.blocks_deferred {
+            self.cfg.num_layers
+        } else {
+            self.blocks.len()
+        }
+    }
+
+    /// Whether this transformer holds **no** blocks and must be driven through a
+    /// [`WanBlockStream`](crate::block_stream::WanBlockStream) — ladder rung 4 (sc-15528).
+    pub fn is_deferred(&self) -> bool {
+        self.blocks_deferred
+    }
+
+    /// Build every non-block component and **defer** the block stack (ladder rung 4, sc-15528).
+    ///
+    /// The result holds zero blocks, so the whole `blocks.*` weight set — 40 of 40 layers on a Wan
+    /// A14B expert — is never materialized. `forward_packed` and every other resident block path will
+    /// refuse; the caller must drive [`forward_packed_windowed`](Self::forward_packed_windowed) with a
+    /// stream and a plan.
+    ///
+    /// This is the shape [`LoadShape::DeferredMaterialization`](mlx_gen::LoadShape::DeferredMaterialization)
+    /// names, and it is the prerequisite the shared contract declares for rung 4: a window over an
+    /// already-materialized trunk bounds nothing — it *adds* a copy on top.
+    pub fn from_weights_deferred(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
+        let mut dit = Self::from_weights_without_blocks(w, cfg)?;
+        dit.blocks_deferred = true;
+        Ok(dit)
+    }
+
+    /// Apply ladder rung 3's attention budget to every resident block (sc-15528).
+    ///
+    /// A **deferred** stack has no resident block to configure; its budget travels on the stream
+    /// ([`WanBlockStream::set_attention_budget`](crate::block_stream::WanBlockStream::set_attention_budget)),
+    /// so this is a no-op there rather than a silent half-application.
+    pub fn set_attention_budget(&mut self, budget: mlx_gen::attention::AttentionBudget) {
+        for block in &mut self.blocks {
+            block.set_attention_budget(budget);
+        }
+    }
+
+    /// [`forward_packed`](Self::forward_packed) over a **windowed** block schedule (ladder rung 4).
+    ///
+    /// Identical arithmetic to `forward_packed` — same `time_embed`, same per-block call, same head —
+    /// with the block stack materialized `plan.window()` blocks at a time out of a freshly re-opened
+    /// lazy view and released after each window. Output is bit-identical to the resident path, which
+    /// is what makes the parity contract `Exact` rather than a tolerance.
+    ///
+    /// `cross_kv` must already be the full per-block cache (build it once per generate with
+    /// [`WanBlockStream::prepare_cross_kv_windowed`](crate::block_stream::WanBlockStream::prepare_cross_kv_windowed)
+    /// on a deferred stack); it is small and legitimately resident, so it is not re-derived per window.
+    pub fn forward_packed_windowed(
+        &self,
+        tokens: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        stream: &crate::block_stream::WanBlockStream,
+        plan: &mlx_gen::block_residency::BlockPlan,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<Array> {
+        if plan.n_blocks() != self.num_blocks() || stream.n_blocks() != self.num_blocks() {
+            return Err(Error::Msg(format!(
+                "wan: windowed forward plan covers {} blocks and the stream {}, but the transformer \
+                 has {}",
+                plan.n_blocks(),
+                stream.n_blocks(),
+                self.num_blocks()
+            )));
+        }
+        if cross_kv.len() != self.num_blocks() {
+            return Err(Error::Msg(format!(
+                "wan: windowed forward needs one cross-K/V pair per block, got {} for {} blocks",
+                cross_kv.len(),
+                self.num_blocks()
+            )));
+        }
+        let (e, e0) = self.time_embed(t)?;
+        let x = mlx_gen::block_residency::run_windowed(
+            plan,
+            cancel,
+            tokens.clone(),
+            || stream.open(),
+            |mut x: Array, view: &mut Weights, range: std::ops::Range<usize>| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    x = block.forward(&x, &e0, &cross_kv[index], cos, sin)?;
+                }
+                Ok(x)
+            },
+            |x: &Array| {
+                // LOAD-BEARING: MLX is lazy, so the carried activation is an unevaluated graph node
+                // still referencing the window's weights. Dropping before forcing evaluation frees
+                // NOTHING — silently, with correct output either way.
+                mlx_rs::transforms::eval([x])?;
+                Ok(())
+            },
+        )?;
+        self.apply_head(&x, &e)
     }
 
     /// Toggle SDPA-segment gradient checkpointing across the whole block stack (sc-4942) — both the
