@@ -718,9 +718,29 @@ jobs:
   #
   # SPLITTING. Two axes, both already the house pattern. `chroma_model` picks the entry (the
   # matrix leg, exactly as `chroma-auxiliary` does) and `chroma_ladder_tests` picks tests within
-  # one. The whole ladder for ONE entry does not comfortably fit a single job at the 28-step
-  # production schedule, so the entry axis is the intended default split and the matrix runs
-  # `max-parallel: 1` — three legs of one entry each, never one leg of three.
+  # one. The entry axis is the intended default split and the matrix runs `max-parallel: 1` —
+  # three legs of one entry each, never one leg of three.
+  #
+  # MEASURED, not estimated (chroma1_base q4 1024², 2026-08-06, this machine). All 16 tests for ONE
+  # entry are ~2.96 h, which fits the 360-minute timeout with roughly 2x margin:
+  #
+  #   identical_requests_reproduce_once_the_allocator_has_settled   44m 06s   <- 8 x 28-step renders
+  #   transformer_window_sweep_and_streamed_output_identity         24m 27s
+  #   the_window_component_scopes_are_measured_not_inherited        19m 51s
+  #   the_rung_two_drift_margin_is_resampled_across_seeds           26m 27s   <- 5 x 28-step renders
+  #   decode_tile_mechanism_sweep_on_the_production_latent          ~17m
+  #   the_full_ladder_renders_under_a_memory_cap                    13m 58s
+  #   the_rung_four_saving_is_inside_the_block_weight_set           10m 03s
+  #   staged_residency_bounds_the_request_peak_and_preserves_output  9m 21s
+  #   the_request_peak_is_step_independent                           5m 12s
+  #   attention_chunking_is_measured_at_the_dit_seam                ~4m
+  #   every_cached_entry_and_tier_publishes_its_own_evidence          2m 18s
+  #   the six refusal / domain / precondition / phase tests          < 20s each
+  #
+  # So one ENTRY fits one job, but `chroma_model: all` is ~9 h of wall clock on a box three other
+  # lanes queue behind. Dispatch one entry at a time unless a night is genuinely free, and reach
+  # for `chroma_ladder_tests` when only part of the ladder is in question — the top four rows are
+  # 80% of the cost.
   #
   # EVERY test is named and run with `--exact`, and each is required to report exactly one passing
   # test. A filter that matches nothing makes libtest print "0 passed" and cargo exit 0, which is
