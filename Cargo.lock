@@ -2488,6 +2488,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sha2",
 ]
 
 [[package]]

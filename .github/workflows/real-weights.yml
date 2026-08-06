@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -133,6 +133,29 @@ on:
         required: false
         default: all
         options: [all, chroma1_base, chroma1_hd, chroma1_flash]
+      # sc-15520 — the memory ladder in dispatchable pieces, for the same reason `krea_s18_rows`
+      # exists: `rw-chroma` shares nax-macos-2 with `rw-krea`, `rw-audio` and `rw-llm` one at a
+      # time, and the whole 16-test ladder at the 28-step production schedule is multi-hour per
+      # entry, so an indivisible run head-of-line-blocks the box for a night. `chroma_model`
+      # already splits by entry; this splits within one.
+      #
+      # Space-separated test names, each validated against the ladder's own list before anything
+      # runs — an unknown or renamed name is a HARD ERROR at dispatch rather than a filter that
+      # quietly matches nothing. Empty (the default) is the whole ladder.
+      chroma_ladder_tests:
+        description: "Ladder tests (chroma-memory-ladder only): space-separated subset, empty = all 16"
+        type: string
+        required: false
+        default: ""
+      # The ladder measures `q4` (`DEFAULT_TIER`) for every asserted row; the other two tiers are
+      # swept only by the per-cell coverage test, which reports absentees rather than demanding
+      # them. Downloading all three roughly quadruples the transfer for evidence nothing asserts,
+      # so widening this is opt-in.
+      chroma_ladder_tiers:
+        description: "Ladder tiers (chroma-memory-ladder only): space-separated subset of q4 q8 bf16"
+        type: string
+        required: false
+        default: "q4"
       # sc-17655 — the S18 sweep in row-sized pieces. The whole seven-row sweep is ~4.3 h and
       # `rw-krea` shares nax-macos-2 with `rw-audio`, `rw-llm` and `rw-chroma` one at a time, so an
       # indivisible run head-of-line-blocks them for half a night (sc-16981). sc-17324 needed TWO
@@ -679,6 +702,205 @@ jobs:
           name: chroma-sc16462-artifact-${{ matrix.model }}
           if-no-files-found: error
           path: ${{ runner.temp }}/chroma-sc16462-artifact-${{ matrix.model }}.json
+
+  # SC-15520: the Chroma1 memory ladder on real weights.
+  #
+  # WHY THIS EXISTS. Every number the ladder publishes — the rung peaks, the rung-2 drift verdict,
+  # the rung-4 attribution — was measured by hand on a developer Mac and verifiable nowhere else:
+  # `CHROMA_LADDER_*` appeared in no workflow, so nothing in CI ever executed these 16 tests. That
+  # is not a coverage gap in the abstract. Four separate instrument defects reached `main` through
+  # it, and the fourth was a live mutation (`measure()` scaled every peak by `1 + steps/100`) that
+  # survived a push and a merge because no lane would have run the test it reddened. A measured
+  # claim that CI cannot re-take is a claim nobody can check.
+  #
+  # MANUAL DISPATCH IS THE POINT, not a limitation. This is hours of Metal time on a shared box;
+  # it should be runnable and discoverable on demand, not on every push.
+  #
+  # SPLITTING. Two axes, both already the house pattern. `chroma_model` picks the entry (the
+  # matrix leg, exactly as `chroma-auxiliary` does) and `chroma_ladder_tests` picks tests within
+  # one. The entry axis is the intended default split and the matrix runs `max-parallel: 1` —
+  # three legs of one entry each, never one leg of three.
+  #
+  # MEASURED, not estimated (chroma1_base q4 1024², 2026-08-06, this machine). All 16 tests for ONE
+  # entry are ~2.96 h, which fits the 360-minute timeout with roughly 2x margin:
+  #
+  #   identical_requests_reproduce_once_the_allocator_has_settled   44m 06s   <- 8 x 28-step renders
+  #   transformer_window_sweep_and_streamed_output_identity         24m 27s
+  #   the_window_component_scopes_are_measured_not_inherited        19m 51s
+  #   the_rung_two_drift_margin_is_resampled_across_seeds           26m 27s   <- 5 x 28-step renders
+  #   decode_tile_mechanism_sweep_on_the_production_latent          ~17m
+  #   the_full_ladder_renders_under_a_memory_cap                    13m 58s
+  #   the_rung_four_saving_is_inside_the_block_weight_set           10m 03s
+  #   staged_residency_bounds_the_request_peak_and_preserves_output  9m 21s
+  #   the_request_peak_is_step_independent                           5m 12s
+  #   attention_chunking_is_measured_at_the_dit_seam                ~4m
+  #   every_cached_entry_and_tier_publishes_its_own_evidence          2m 18s
+  #   the six refusal / domain / precondition / phase tests          < 20s each
+  #
+  # So one ENTRY fits one job, but `chroma_model: all` is ~9 h of wall clock on a box three other
+  # lanes queue behind. Dispatch one entry at a time unless a night is genuinely free, and reach
+  # for `chroma_ladder_tests` when only part of the ladder is in question — the top four rows are
+  # 80% of the cost.
+  #
+  # EVERY test is named and run with `--exact`, and each is required to report exactly one passing
+  # test. A filter that matches nothing makes libtest print "0 passed" and cargo exit 0, which is
+  # the silent green this lane exists to prevent — the same guard the qwen-image and krea lanes use.
+  mlx-chroma-memory-ladder:
+    name: Chroma memory ladder (${{ matrix.model }})
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-memory-ladder'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      # One entry at a time: `rw-chroma` is a single box shared with three other lanes, and two
+      # concurrent Metal workloads on one device is the documented SIGSEGV.
+      max-parallel: 1
+      matrix:
+        include:
+          - model: chroma1_base
+            repository: SceneWorks/chroma1-base-mlx
+            source_revision: e7330dda29d00ffdeeb719b28e92ee74cff0884c
+          - model: chroma1_hd
+            repository: SceneWorks/chroma1-hd-mlx
+            source_revision: 9d99afe1ebca67032476756bc70d4a7152bc1bd5
+          - model: chroma1_flash
+            repository: SceneWorks/chroma1-flash-mlx
+            source_revision: 6a9cb6178709559461506bf247f708d0d1008d00
+    env:
+      CHROMA_MODEL: ${{ matrix.model }}
+      CHROMA_REPOSITORY: ${{ matrix.repository }}
+      CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
+      CHROMA_LADDER_TESTS: ${{ inputs.chroma_ladder_tests }}
+      CHROMA_LADDER_TIERS: ${{ inputs.chroma_ladder_tiers }}
+      # The harness resolves the entry under test through this; `representative()` panics on any
+      # value outside the three catalog entries, so a matrix typo fails rather than silently
+      # measuring base three times.
+      CHROMA_LADDER_ENTRY: ${{ matrix.model }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3.12 --version
+      # No `report_runner_disk_headroom.sh` step here, deliberately. That script reports on the
+      # `~/`-relative snapshot VARIABLES a lane resolves through `resolve_snapshot_paths.py`, and
+      # this lane resolves none: like `chroma-auxiliary`, `rw-chroma` stores no Chroma bytes and
+      # materializes into `runner.temp` from the Hub per run. Reporting headroom without a
+      # resolved path is what `test_every_resolving_lane_reports_what_it_costs` forbids.
+      #
+      # Validate the dispatch inputs BEFORE the download, so a typo costs seconds rather than a
+      # 14 GiB transfer and a runner-hour. Both lists are checked against the real names.
+      - name: Validate ladder dispatch inputs
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        run: |
+          set -euo pipefail
+          # The ladder's tests are exactly the `#[ignore]`d ones; helpers are not dispatchable.
+          all_tests="$(python3.12 - <<'PY'
+          import re, pathlib
+          src = pathlib.Path("crates/media/mlx-gen/mlx-gen-chroma/tests/memory_ladder_real_weights.rs").read_text()
+          names = re.findall(r'#\[test\]\s*\n\s*#\[ignore[^\]]*\]\s*\nfn ([a-z0-9_]+)\(', src)
+          print("\n".join(names))
+          PY
+          )"
+          n_all="$(grep -c . <<<"$all_tests")"
+          if [[ "$n_all" -ne 16 ]]; then
+            echo "::error::expected 16 ignored ladder tests, found $n_all — the list this lane dispatches has drifted from the file" >&2
+            exit 1
+          fi
+          for t in $CHROMA_LADDER_TESTS; do
+            if ! grep -qxF "$t" <<<"$all_tests"; then
+              echo "::error::chroma_ladder_tests names '$t', which is not a test in memory_ladder_real_weights.rs" >&2
+              exit 1
+            fi
+          done
+          for tier in $CHROMA_LADDER_TIERS; do
+            case "$tier" in
+              q4|q8|bf16) ;;
+              *) echo "::error::chroma_ladder_tiers names '$tier'; valid tiers are q4 q8 bf16" >&2; exit 1 ;;
+            esac
+          done
+          if ! tr ' ' '\n' <<<"$CHROMA_LADDER_TIERS" | grep -qx q4; then
+            echo "::error::chroma_ladder_tiers must include q4 — DEFAULT_TIER is what every asserted row measures" >&2
+            exit 1
+          fi
+          { echo "CHROMA_LADDER_ALL_TESTS<<EOF"; echo "$all_tests"; echo "EOF"; } >> "$GITHUB_ENV"
+      - name: Materialize the pinned Chroma snapshot
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          # Step-level, not job-level: `runner.temp` in a job `env:` block is refused by
+          # `test_mage_media_lane_requires_verified_operator_cpu_oracles`.
+          CHROMA_LADDER_ROOT: ${{ runner.temp }}/chroma-ladder-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          tiers = os.environ["CHROMA_LADDER_TIERS"].split()
+          snapshot_download(
+              repo_id=os.environ["CHROMA_REPOSITORY"],
+              revision=os.environ["CHROMA_SOURCE_REVISION"],
+              allow_patterns=[f"{tier}/**" for tier in tiers],
+              local_dir=os.environ["CHROMA_LADDER_ROOT"],
+              token=False,
+          )
+          PY
+          # The harness takes a snapshot ROOT and joins the tier itself, so assert the layout it
+          # expects rather than discovering a `SKIPPED-BY-ABSENCE` panic hours into the ladder.
+          for tier in $CHROMA_LADDER_TIERS; do
+            test -d "$CHROMA_LADDER_ROOT/$tier/transformer"
+            test -d "$CHROMA_LADDER_ROOT/$tier/text_encoder"
+            test -d "$CHROMA_LADDER_ROOT/$tier/vae"
+          done
+          # The harness takes ONE env var per catalog entry. Only this leg's entry is
+          # materialized, so the other two stay unset and the per-cell coverage test reports them
+          # as absent rather than measuring them — its documented contract, not a gap. Exported
+          # here rather than as a job `env:` ternary so the path expression exists once.
+          case "$CHROMA_MODEL" in
+            chroma1_base)  entry_var=CHROMA_LADDER_BASE ;;
+            chroma1_hd)    entry_var=CHROMA_LADDER_HD ;;
+            chroma1_flash) entry_var=CHROMA_LADDER_FLASH ;;
+            *) echo "::error::unknown Chroma entry '$CHROMA_MODEL'" >&2; exit 1 ;;
+          esac
+          echo "$entry_var=$CHROMA_LADDER_ROOT" >> "$GITHUB_ENV"
+      - name: Run the memory ladder
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        run: |
+          set -euo pipefail
+          tests="$CHROMA_LADDER_TESTS"
+          if [[ -z "${tests// }" ]]; then
+            tests="$CHROMA_LADDER_ALL_TESTS"
+          fi
+          ran=0
+          for name in $tests; do
+            echo "::group::$name"
+            # `--exact` AFTER `--`: it is a libtest flag, and libtest is also what consumes
+            # `--ignored`. The filter itself is cargo's positional test-name argument.
+            out="$(cargo test --locked --release -p mlx-gen-chroma \
+              --test memory_ladder_real_weights \
+              "$name" -- --exact --ignored --test-threads=1 --nocapture 2>&1 \
+              | tee "$RUNNER_TEMP/chroma-ladder-$name.log" /dev/stderr)"
+            echo "::endgroup::"
+            # A rename, a typo, or a lost `#[ignore]` all produce "0 passed" and exit 0. This is
+            # the guard that makes the lane's green mean something (sc-15520 review round 2).
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
+              exit 1
+            fi
+            ran=$((ran + 1))
+          done
+          echo "ran $ran ladder test(s) for $CHROMA_MODEL"
+          if [[ "$ran" -eq 0 ]]; then
+            echo "::error::the ladder ran no tests at all" >&2
+            exit 1
+          fi
+      - name: Upload ladder measurement logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chroma-memory-ladder-${{ matrix.model }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/chroma-ladder-*.log
 
   # SC-15507: a narrow, independently dispatchable acceptance lane for the request-scoped
   # MLX lifecycle. The broader `media` profile also runs this test, but it requires the complete
@@ -1348,6 +1570,12 @@ jobs:
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
+    #
+    # sc-17518 added a third test to the golden-free adapter step. MEASURED 2026-08-06 on nax-macos,
+    # weights resident: `lightning_loras_apply_cleanly` 0.29-0.51s of libtest time over three runs
+    # (it installs adapters onto a lazily-loaded tree and renders nothing), so the step is ~3s and
+    # the 736s total above is unchanged to the minute. The 90-minute cap is untouched: it is sized
+    # by the materialization budget, and this test transfers no bytes the lane did not already pull.
     timeout-minutes: 90
     env:
       # Repo-variable names are deliberately NOT the test-facing names. `vars.QWEN_IMAGE_SNAPSHOT`
@@ -1437,9 +1665,9 @@ jobs:
       #      first. None of them has it — each panics on a missing variable. `perf.rs` DID have it
       #      (`eprintln!("skip: ...")` + `return`); this commit removed that, so those two tests now
       #      fail loudly. They are still not in this lane, for a different reason: they FAIL on real
-      #      weights and always have (sc-17513). Nor is `fit_preview_rgb_factors` (sc-17515) or
-      #      `lightning_loras_apply_cleanly` (sc-17518). A lane that is red every week is ignored
-      #      within a month; each exclusion is recorded with its measurement in the manifest.
+      #      weights and always have (sc-17513). Nor is `fit_preview_rgb_factors` (sc-17515). A lane
+      #      that is red every week is ignored within a month; each exclusion is recorded with its
+      #      measurement in the manifest.
       - name: Run Qwen-Image control-branch gates
         run: |
           set -o pipefail
@@ -1535,16 +1763,23 @@ jobs:
           }
           run_one lightning_render_is_coherent
           run_one edit_lightning_render_is_coherent
-      # Two of `adapter_real_weights.rs`'s nine tests resolve NO golden — they only need the real
+      # Three of `adapter_real_weights.rs`'s nine tests resolve NO golden — they only need the real
       # 60-block tree — so they do not wait on the sc-17503 oracle bundle the other six do.
       # `routing_map_covers_full_fork_surface` proves the host LoRA map reaches all 60 x 14 fork
       # targets and refuses the paths it should; `kohya_matches_peft_on_real_tree` proves the two
       # adapter naming conventions produce byte-identical results across all 840 modules.
       #
-      # `lightning_loras_apply_cleanly` is the third golden-free one and is NOT here: it asserts
-      # `applied == 840`, and the pinned `Qwen-Image-Lightning-8steps-V1.1-bf16` file carries only
-      # 12 of the 14 per-block modules (no img/txt modulation), so it applies 720 with zero
-      # unmatched. sc-17518.
+      # `lightning_loras_apply_cleanly` joins them here as of sc-17518. It was excluded because it
+      # asserted `applied == 840` — the HOST map's target count, never a measured application. Both
+      # pinned lightx2v files carry 60 x 12 = 720 with zero unmatched (no img/txt modulation is
+      # trained, in any published Lightning release), so the assertion now pins the FILE's surface
+      # per module class. It is the only one of the three tests in this step that loads a LoRA file
+      # (the Lightning render step above loads them too): it resolves both from the
+      # QWEN_LIGHTNING_SNAPSHOT / QWEN_EDIT_LIGHTNING_SNAPSHOT dirs the materialize step derived
+      # from the manifest pin and exported through $GITHUB_ENV — the SAME dirs
+      # `ensure_model_snapshot.py` verified, so the gate cannot measure a revision merely cached
+      # beside the pinned one (sc-17284). It asserts BOTH resolved, and fails loudly (never skips)
+      # if either file is absent.
       - name: Run Qwen-Image adapter-surface gates (golden-free)
         run: |
           set -o pipefail
@@ -1561,6 +1796,7 @@ jobs:
           }
           run_one routing_map_covers_full_fork_surface
           run_one kohya_matches_peft_on_real_tree
+          run_one lightning_loras_apply_cleanly
 
   # sc-17284 — the integrated PiD (progressive-in-decoder) super-resolution decode seam, for BOTH
   # engines that have one. Split from the job above because it is the only place `FLUX_DEV_DIR` and

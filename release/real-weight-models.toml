@@ -181,30 +181,33 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 19 + 5 = 45:
+# The 45 account for exactly, and the arithmetic is the point — 21 + 20 + 4 = 45:
 #
-# WIRED, 19: 15 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2), 3 in
+# WIRED, 20: 16 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3), 3 in
 # `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing on
-# nax-macos 2026-08-04.
+# nax-macos — 19 of them 2026-08-04, `lightning_loras_apply_cleanly` 2026-08-06 (sc-17518).
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 5. A lane that is red every week is ignored within a month
+# EXCLUDED WITH A MEASUREMENT, 4. A lane that is red every week is ignored within a month
 # (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
 #   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
 #     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
 #     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
 #     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
 #   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
-#   * `lightning_loras_apply_cleanly` x1 — FAILS: asserts 840 per-block modules, and the pinned
-#     lightx2v file carries 12 of 14 per block (no img/txt modulation) so it applies 720 with zero
-#     unmatched. Golden-free, so it joins the wired adapter step the moment sc-17518 settles it.
 #   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
 #     exist in no repository and on no Hub.
+#
+# `lightning_loras_apply_cleanly` was the fifth exclusion until sc-17518 and is now WIRED above. It
+# asserted `applied == 840` — the HOST map's 60 x 14 target count, never a measured application.
+# Both pinned lightx2v files apply 60 x 12 = 720 with zero unmatched; no published Lightning release
+# has ever trained `img_mod.1`/`txt_mod.1`. Evidence and the per-class assertion that replaced the
+# raw count are in the test's doc comment.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
 revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
@@ -308,10 +311,17 @@ expected_files = ["pid_flux_2kto4k.safetensors"]
 # The lightx2v 8-step Lightning distillation LoRAs for T2I and Edit-2511. Only the one file each
 # suite loads is fetched (~0.85 GB apiece), not the repos' full variant matrices.
 #
-# These resolve through MLX_GEN_MODELS_ROOT + a HARD-CODED `models--<org>--<repo>/snapshots/<rev>`
-# layout inside the tests, not from their own variable, so the lane derives the path from the models
-# root and the revision below rather than carrying a second repository variable that could drift out
-# of agreement with this pin.
+# Neither carries a repository variable of its own. The LANE derives
+# `$MLX_GEN_MODELS_ROOT/models--<org>--<repo>/snapshots/<rev>` from the revision pinned below,
+# exports it as the environment name in this record via `$GITHUB_ENV`, and verifies THAT dir with
+# `ensure_model_snapshot.py`; the tests read the variable and fail loudly if it points at a file
+# that is not there. Deriving the dir from this pin is what keeps the revision CI verifies and the
+# revision the tests actually load identical; a second repository variable could only drift from it.
+#
+# No test hard-codes a revision. With the variable unset (local dev) the two suites fall back
+# differently: `adapter_real_weights` scans `snapshots/` and takes the sorted-first entry, while
+# `lightning_render_real_weights` takes whatever `read_dir` yields first — so only the former is
+# even run-to-run stable, and neither is this pin.
 key = "qwen-image-lightning"
 repository = "lightx2v/Qwen-Image-Lightning"
 revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"
@@ -1229,3 +1239,54 @@ profiles = ["media-macos"]
 environment = ["KREA_DISTILL_LORA_SNAPSHOT"]
 download_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
 expected_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+
+[[models]]
+# SANA-1.6B 1024px, the SceneWorks MLX re-host (epic 8485, memory ladder SC-15523). The pin exists so
+# the SC-15523 rung-3/rung-4 evidence records can name the exact bytes they were measured over:
+# `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on disk into the
+# `model_revision` + `model_inventory_sha256` pair every `MEMORY_EVIDENCE_V1` record carries, and
+# without it those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 turnkey tier, the tier both SANA entries ship and the one the ladder
+# was measured at; bf16/ and q8/ are siblings under the same revision and are inventoried when
+# present, so a later per-tier sweep changes the inventory sha rather than silently reusing this one.
+key = "sana-1600m-mlx"
+repository = "SceneWorks/Sana_1600M_1024px_mlx"
+revision = "ac421696dd6eb0b41f446f4c45a53ccc057d82a1"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_1600M"]
+# The image memory-ladder harnesses are operator-run on authoritative Apple hardware, not CI-wired —
+# the same posture as every sibling family on epic 15448 (Chroma's CHROMA_LADDER_*, SDXL's
+# SDXL_LADDER_*, Kolors'), none of which has a real-weights lane either. A rung-4 sweep re-materializes
+# the trunk once per block per step, so a hosted lane would be hours per entry. This entry exists for
+# the evidence binding above; wiring a lane is a separate, family-wide decision (sc-17848).
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]
+
+[[models]]
+# SANA-Sprint 1.6B 1024px — the CFG-free, continuous-time-consistency-distilled few-step variant
+# (sc-8490). Same Linear-DiT backbone and the same DC-AE, a different checkpoint and a different
+# sampler, which is exactly why it owes its own memory-ladder evidence rather than inheriting the
+# base entry's. It is the SC-15523 representative for the multi-row sweeps: 2 CFG-free steps against
+# base SANA's 40 trunk forwards per image.
+key = "sana-sprint-1600m-mlx"
+repository = "SceneWorks/Sana_Sprint_1.6B_1024px_mlx"
+revision = "0b0d18484cac2fb515e76d25a09a5911ae4ab58e"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_SPRINT"]
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]

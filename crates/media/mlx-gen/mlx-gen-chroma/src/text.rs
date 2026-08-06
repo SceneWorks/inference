@@ -38,8 +38,15 @@ pub fn encode_prompt(
 ///
 /// `window = None` is byte-for-byte [`encode_prompt`]. `Some(size)` requires a T5 loaded with an
 /// armed [`mlx_gen_flux::T5BlockStream`] and holds `size` of its 24 blocks materialized at a time —
-/// the `TransformerComponent::TextEncoder` scope, which on this family is the scope that addresses
-/// the request-peak-bearing phase.
+/// the `TransformerComponent::TextEncoder` scope.
+///
+/// **That scope is implemented and it is not this family's default**, which is the opposite of what
+/// the component sizes suggest: the T5-XXL encoder is the largest single component (dense bf16, a
+/// 10.15 GiB conditioning phase against a 7.14 GiB packed DiT), but ladder rung 1 has already shed
+/// it before the heavy phase loads, so measured end to end a `TextEncoder` window moves the request
+/// peak by **−0.00%** against `Dit`'s −23.50%. See
+/// [`crate::memory_strategy::TRANSFORMER_WINDOW_COMPONENT`] for the table and
+/// `the_window_component_scopes_are_measured_not_inherited` for the measurement.
 pub fn encode_prompt_windowed(
     tokenizer: &TextTokenizer,
     t5: &T5TextEncoder,

@@ -45,6 +45,8 @@
 //! `[1, H, W, 3]`; [`mlx_gen::image::decoded_to_image`] expects NCHW, so the output is transposed back
 //! to NCHW before the `clip(x·0.5 + 0.5)` → RGB8 conversion.
 
+use mlx_gen::attention::AttentionBudget;
+use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -147,14 +149,53 @@ pub fn denoise_cfg_with_preview(
     on_progress: &mut dyn FnMut(Progress),
     preview: &PreviewSink,
 ) -> Result<Array> {
+    denoise_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        uncond,
+        uncond_mask,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        crate::transformer::SanaForwardPlan::RESIDENT,
+    )
+}
+
+/// [`denoise_cfg_with_preview`] under an explicit memory plan (SC-15523 rungs 3 and 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_cfg_with_memory(
+    transformer: &SanaTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    uncond: Option<&Array>,
+    uncond_mask: Option<&Array>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    plan: crate::transformer::SanaForwardPlan,
+) -> Result<Array> {
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
-        let pred_cond = transformer.forward_with_guidance(x, cond, &t, None, cond_mask)?;
+        let pred_cond =
+            transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
                 let pred_uncond =
-                    transformer.forward_with_guidance(x, uc, &t, None, uncond_mask)?;
+                    transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = subtract(&pred_cond, &pred_uncond)?;
                 Ok(add(
@@ -283,6 +324,53 @@ pub fn resolve_decode_tiling(
 ) -> Option<TilingConfig> {
     resolved_decode_plan(memory, is_sequential)
         .map(|plan| TilingConfig::spatial_only(plan.edge, plan.overlap))
+}
+
+/// Resolve the two **denoise-phase** constrained rungs from the request-scoped shared-contract
+/// signal (SC-15523). Rung 2 has its own resolver above; this is rungs 3 and 4.
+///
+/// Nothing is selected by default: a request that sets neither flag gets
+/// [`SanaForwardPlan::RESIDENT`], which is byte-for-byte the pre-SC-15523 trunk forward. `n_blocks`
+/// comes from the loaded trunk rather than from the config constant, so a plan can never describe a
+/// different stack than the one that will run it.
+///
+/// Parameter *values* are validated against the published domain before this runs — see
+/// [`crate::memory_strategy::validate_request_memory`], which the production `generate` path calls
+/// and which refuses an out-of-domain selection rather than silently executing an unmeasured one.
+pub(crate) fn resolved_rung_plan(
+    memory: Option<GenerationMemory>,
+    n_blocks: usize,
+) -> Result<crate::transformer::SanaForwardPlan> {
+    let Some(memory) = memory else {
+        return Ok(crate::transformer::SanaForwardPlan::RESIDENT);
+    };
+    let attention = if memory.chunk_attention {
+        AttentionBudget::from_score_elements(
+            u64::from(
+                memory
+                    .attention_chunk_size
+                    .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE),
+            ),
+            // The per-chunk graph cut is where MLX's saving comes from; a lazily-chunked budget
+            // measured as no better than unbounded on the sibling families (SC-15615).
+            true,
+        )
+    } else {
+        AttentionBudget::UNBOUNDED
+    };
+    let window = memory
+        .stream_transformer_blocks
+        .then(|| {
+            BlockPlan::new(
+                n_blocks,
+                memory
+                    .transformer_window_size
+                    .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE)
+                    as usize,
+            )
+        })
+        .transpose()?;
+    Ok(crate::transformer::SanaForwardPlan { attention, window })
 }
 
 const DC_AE_TILING: VaeTiling = VaeTiling {
@@ -462,6 +550,40 @@ pub fn denoise_sprint_from_with_preview(
     on_progress: &mut dyn FnMut(Progress),
     preview: &PreviewSink,
 ) -> Result<Array> {
+    denoise_sprint_from_with_memory(
+        transformer,
+        scheduler,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+        preview,
+        crate::transformer::SanaForwardPlan::RESIDENT,
+    )
+}
+
+/// [`denoise_sprint_from_with_preview`] under an explicit memory plan (SC-15523 rungs 3 and 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_sprint_from_with_memory(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    plan: crate::transformer::SanaForwardPlan,
+) -> Result<Array> {
     use mlx_rs::transforms::eval;
 
     let sd = scheduler.sigma_data;
@@ -512,12 +634,14 @@ pub fn denoise_sprint_from_with_preview(
         // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
         let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
         let scm_t_arr = arr1(scm_t);
-        let raw = transformer.forward_with_guidance(
+        let raw = transformer.forward_with_memory(
             &lat_in,
             cond,
             &scm_t_arr,
             Some(&guidance),
             cond_mask,
+            plan,
+            cancel,
         )?;
 
         // diffusers trigflow recombination of the raw output (uses `latent_model_input` = the SCALED
@@ -844,13 +968,27 @@ impl SanaHeavy {
         preview: &PreviewSink,
         tiling: Option<&TilingConfig>,
     ) -> Result<Image> {
-        let latents =
-            self.denoise_one_with_preview(cond, req, guidance, cancel, on_progress, preview)?;
+        let latents = self.denoise_one_with_preview(
+            cond,
+            req,
+            guidance,
+            cancel,
+            on_progress,
+            preview,
+            crate::transformer::SanaForwardPlan::RESIDENT,
+        )?;
         mlx_rs::transforms::eval([&latents])?;
         on_progress(Progress::Decoding);
         self.decode_view().decode_one(&latents, cancel, tiling)
     }
 
+    /// The trunk's block count — the rung-4 plan's `n_blocks`, read from the loaded trunk rather
+    /// than from a config constant.
+    pub(crate) fn transformer_blocks(&self) -> usize {
+        self.transformer.n_blocks()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn denoise_one_with_preview(
         &self,
         cond: &SanaConditioning,
@@ -859,15 +997,17 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
     ) -> Result<Array> {
         if self.sprint {
-            self.denoise_sprint(cond, req, guidance, cancel, on_progress, preview)
+            self.denoise_sprint(cond, req, guidance, cancel, on_progress, preview, plan)
         } else {
-            self.denoise_cfg(cond, req, guidance, cancel, on_progress, preview)
+            self.denoise_cfg(cond, req, guidance, cancel, on_progress, preview, plan)
         }
     }
 
     /// The base SANA-1.6B true-CFG flow-match denoise for one image.
+    #[allow(clippy::too_many_arguments)]
     fn denoise_cfg(
         &self,
         cond: &SanaConditioning,
@@ -876,6 +1016,7 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
     ) -> Result<Array> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
@@ -933,7 +1074,7 @@ impl SanaHeavy {
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
         let uncond_mask = cond.uncond.as_ref().map(|(_, um)| um);
-        let latents = denoise_cfg_with_preview(
+        let latents = denoise_cfg_with_memory(
             &self.transformer,
             &scheduler,
             req.sampler,
@@ -948,6 +1089,7 @@ impl SanaHeavy {
             cancel,
             on_progress,
             preview,
+            plan,
         )?;
         Ok(latents)
     }
@@ -961,6 +1103,7 @@ impl SanaHeavy {
     /// DC-AE-encoded init to that angle: `x_t = cos(t)·x0 + sin(t)·noise·σ_data` with `x0 =
     /// encode·scaling_factor·σ_data` and `t = timesteps[start]`. Distilled/consistency, so the strength
     /// window is narrow — validate the band on-device. `start = 0` is the byte-identical txt2img path.
+    #[allow(clippy::too_many_arguments)]
     fn denoise_sprint(
         &self,
         cond: &SanaConditioning,
@@ -969,6 +1112,7 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
     ) -> Result<Array> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
@@ -1010,7 +1154,7 @@ impl SanaHeavy {
             // txt2img: the SCM prior is `noise · σ_data`.
             multiply(&noise, arr1(sd))?
         };
-        let latents = denoise_sprint_from_with_preview(
+        let latents = denoise_sprint_from_with_memory(
             &self.transformer,
             &scheduler,
             start_step,
@@ -1023,6 +1167,7 @@ impl SanaHeavy {
             cancel,
             on_progress,
             preview,
+            plan,
         )?;
         Ok(latents)
     }

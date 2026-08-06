@@ -388,10 +388,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
-        # `mlx-qwen-image-producers` jobs
-        # (24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 27,
+        # 28 since sc-15520 added the `mlx-chroma-memory-ladder` job
+        # (27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
+        # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
+        # MOSS-TTS-Realtime jobs; 22 before).
+        MACOS_HUB_LOCK: 28,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -557,7 +558,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 27)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 28)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1634,18 +1635,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
         """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.
 
-        Each of the 20 selections has to survive all three traps at once. `--exact` AFTER the `--`,
+        Each of the 21 selections has to survive all three traps at once. `--exact` AFTER the `--`,
         because cargo rejects it in its own argument position; a run-count assertion, because with
         `--exact` accepted a renamed test yields `0 passed; N filtered out` and cargo EXITS 0; and a
         NAME, because `--ignored` alone is a blanket that silently conscripts whatever `#[ignore]`
         test lands in the file next -- which is exactly how an 85-minute sweep joined a 20-minute
         regression lane in sc-17276.
 
-        Four tests are deliberately absent and must stay absent while their stories are open:
-        `perf.rs` x2 (sc-17513) and `fit_preview_rgb_factors` (sc-17515) FAIL on real weights, and
-        `lightning_loras_apply_cleanly` (sc-17518) asserts 840 modules against a published LoRA that
-        carries 720. A red weekly lane is ignored within a month, so they are recorded rather than
-        wired.
+        Three tests are deliberately absent and must stay absent while their stories are open:
+        `perf.rs` x2 (sc-17513) and `fit_preview_rgb_factors` (sc-17515) FAIL on real weights. A red
+        weekly lane is ignored within a month, so they are recorded rather than wired.
+        `lightning_loras_apply_cleanly` was a fourth until sc-17518 measured its 840 against the
+        pinned lightx2v files (720, zero unmatched) and fixed the assertion; it is now selected.
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
@@ -1684,6 +1685,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "edit_lightning_render_is_coherent",
                 "routing_map_covers_full_fork_surface",
                 "kohya_matches_peft_on_real_tree",
+                "lightning_loras_apply_cleanly",
             ],
             "mlx-qwen-image-pid": [
                 "use_pid_without_loaded_pid_errors",
@@ -1745,7 +1747,6 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "qwen_t2i_per_step_compiled_vs_eager",
             "qwen_edit_per_step_compiled_vs_eager",
             "fit_preview_rgb_factors",
-            "lightning_loras_apply_cleanly",
             "edit_lightning_user_lora_reference_repro",
         ):
             for job in jobs:
