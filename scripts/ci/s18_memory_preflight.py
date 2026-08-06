@@ -8,13 +8,12 @@ every measured cell is lost too. The second crash cost ~14 minutes; the first co
 
 The cause is entirely predictable from the geometry, which is why this exists. The Krea Realtime 14B
 q4 weights are ~9 GiB and never the problem. What scales is the **KV cache**: this is an
-autoregressive VIDEO model, and the sweep's whole purpose is varying the KV read window, so the
-biggest row holds a bounded window of 30 latent frames at 832x480 = 46,800 tokens of *unquantized*
-bf16 KV.
+autoregressive VIDEO model, and the sweep's whole purpose is varying the KV read window.
 
     KV per token = 2 (K and V) x 40 layers x 5120 dim x 2 bytes = 800 KiB
 
-Which reproduces every measured peak on that host to within ~10%:
+Before sc-17894, retention equalled the whole attention window. That reproduced every measured peak
+on that host to within ~10%:
 
     row  window          tokens   KV GiB   predicted   MEASURED (run 30787887176)
     A     6 frames        9,360      7.1        17.7        17.43
@@ -24,22 +23,32 @@ Which reproduces every measured peak on that host to within ~10%:
 
 Rows A and D were measured taking `active+wired` to 80.55 and 88.13 GiB of that box's ~101 GiB, with
 NO swap and NO compression — comfortable. Row F extrapolates to ~100.6 GiB, i.e. the whole machine.
-That is the cliff, and it is a straight line, so it can simply be computed in advance.
+That is the cliff, and it is a straight line, so it can simply be computed in advance. sc-17894 now
+evicts at the next read, when the actual next chunk length is known. For the normal three-frame chunk
+the cached portion is `window - 3`; a short final chunk is simulated explicitly because it reads
+farther back. Subtracting the exact freed bf16 bytes from the measurements above preserves the
+calibration while changing the retained-token term:
+
+    row  cached history  tokens   KV GiB   predicted
+    A     3 frames        4,680      3.6        14.2
+    D    12 frames       18,720     14.3        25.9
+    F    27 frames       42,120     32.1        45.6
+    E    45 (global)     70,200     53.6        69.1
 
 sc-17807 made the 800 KiB a knob rather than a constant (`KreaArConfig::kv_cache_quant`), so
 `--kv-bits` / `KREA_S18_KV_BITS` prices the tier a dispatch is actually running. At Q8 the same
 rows cost 0.53x the KV, which moves every prediction:
 
-    row  window          tokens   KV GiB bf16   KV GiB q8   predicted q8
-    A     6 frames        9,360      7.1           3.8          14.1
-    D    15 frames       23,400     17.9           9.5          20.3
-    F    30 frames       46,800     35.7          19.0          30.8
-    E    45 (global)     70,200     53.6          28.5          41.2
+    row  cached history  tokens   KV GiB bf16   KV GiB q8   predicted q8
+    A     3 frames        4,680      3.6           1.9          12.3
+    D    12 frames       18,720     14.3           7.6          18.6
+    F    27 frames       42,120     32.1          17.1          29.0
+    E    45 (global)     70,200     53.6          28.5          41.5
 
 Those are PREDICTIONS, not measurements — the q8 arm's measured peaks live in the S18 sweep's
 recorded cells, and this preflight is only as good as its bf16 calibration until they land. What
 they predict is concrete though: row F at 832x480, the row that took `nax-macos-2` down twice, is
-~30.8 GiB against that box's ~36 GiB budget at Q8, i.e. affordable on the host it killed.
+~29.0 GiB against that box's ~36 GiB budget at Q8, i.e. affordable on the host it killed.
 """
 
 from __future__ import annotations
@@ -63,7 +72,10 @@ DIM = 5120
 LAYERS = 40
 
 # Krea Realtime 14B at q4, plus the resident activations the AR loop needs beyond its KV.
-BASE_RESIDENT_GIB = 9.0
+# Refit against the recorded 832x480 rows after subtracting the exact KV bytes sc-17894 evicts. The
+# old rounded 9.0 value relied on multiplying the now-removed KV by OVERHEAD for ~0.3 GiB of margin;
+# 9.3 preserves the guard's observed safe-side error after that storage disappears.
+BASE_RESIDENT_GIB = 9.3
 
 # Measured peaks run ~7-10% above (weights + KV) alone; round up so the guard errs toward refusing.
 OVERHEAD = 1.10
@@ -75,6 +87,11 @@ PATCH = 2
 # Bounded read window per row, in LATENT FRAMES. Row E is the checkpoint's global window, so it is
 # not a fixed number — it spans the whole clip. Mirrors `all_runs` in generate_smoke.rs.
 ROW_WINDOW_FRAMES = {"A": 6, "B": 6, "C": 6, "D": 15, "F": 30, "E": None, "Z": 6}
+
+# The AR loop normally advances three latent frames per chunk. The final chunk may be shorter, and
+# therefore reads farther back; `window_tokens` simulates the actual chunk plan rather than blindly
+# subtracting three from every bounded window.
+FRAMES_PER_BLOCK = 3
 
 # Row Z is deliberately short: the longest clip the shipped 6-frame window never evicts on.
 ROW_LATENT_FRAMES = {"Z": 6}
@@ -141,12 +158,25 @@ def window_tokens(row: str, width: int, height: int, latent_frames: int) -> int:
     per_frame = tokens_per_latent_frame(width, height)
     frames = ROW_WINDOW_FRAMES[row]
     clip = ROW_LATENT_FRAMES.get(row, latent_frames)
-    # A global window (row E) never evicts, so its KV spans the entire clip. A bounded window is
-    # capped by the clip too — a 30-frame window over a 6-frame clip only ever holds 6.
-    span = clip if frames is None else min(frames, clip)
-    # The sink is additive and permanent; it cannot exceed the clip it is taken from.
+    # A global window (row E) never evicts, so its KV spans the entire clip. A bounded cache now
+    # evicts lazily when the next read supplies its ACTUAL chunk length (sc-17894). Simulate every
+    # chunk boundary and price the largest cached prefix+tail that attention really reads. This is
+    # deliberately not `window - FRAMES_PER_BLOCK`: a short final chunk reads farther back.
+    if frames is None:
+        return clip * per_frame
+
     sink = min(ROW_SINK_FRAMES.get(row, 0), clip)
-    return (span + sink) * per_frame
+    committed = 0
+    peak = 0
+    while committed < clip:
+        chunk = min(FRAMES_PER_BLOCK, clip - committed)
+        sink_end = min(sink, committed)
+        read_start = max(sink, max(0, committed + chunk - frames))
+        read_start = min(read_start, committed)
+        tail_start = max(read_start, sink_end)
+        peak = max(peak, sink_end + committed - tail_start)
+        committed += chunk
+    return peak * per_frame
 
 
 def predicted_peak_gib(

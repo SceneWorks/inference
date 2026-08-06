@@ -45,11 +45,12 @@ const DENSE_KV_BITS: usize = 16;
 /// **819,200 bytes (800 KiB) per DiT token** (see [`KreaRealtimeConfig::kv_bytes_per_token`]).
 ///
 /// Unlike the ~9 GiB of Q4 weights, that term **scales with the clip**, which is what makes it the
-/// lever. Precisely: at the shipped Mac bounded window (6 latent frames = 9,360 tokens at 832×480)
-/// the KV is 7.14 GiB — *comparable to* the weights, not yet dominant. It overtakes them at the
-/// first wider window and runs away from there: 17.9 GiB at 15 frames, 35.7 at 30, and 53.6 for the
-/// checkpoint's global window over a 45-frame clip. So "the KV dominates" is a statement about
-/// where this model goes, not about its smallest configuration.
+/// lever. Precisely: the shipped 6-frame attention window includes the new 3-frame chunk itself, so
+/// sc-17894 retains only the 3 cached frames the next read consumes: 4,680 tokens / **3.57 GiB** at
+/// 832×480, rather than the old 9,360-token / 7.14-GiB buffer. Wider 15- and 30-frame windows retain
+/// 12 and 27 cached frames (14.3 and 32.1 GiB); the checkpoint's global window still retains 53.6 GiB
+/// over a 45-frame clip. So "the KV dominates" is a statement about where this model goes, not about
+/// its smallest configuration.
 ///
 /// **How it is spent, and why not a quantized attention kernel.** MLX at the pinned revision exposes
 /// **no fused quantized SDPA**: `mlx_rs::fast::scaled_dot_product_attention` takes dense arrays, and
@@ -322,10 +323,12 @@ impl KreaRealtimeConfig {
     /// | Q8 / group 64 | 435,200 | 425 | 0.53× |
     /// | Q4 / group 64 | 230,400 | 225 | 0.28× |
     ///
-    /// Multiply by the retained window to get the cache: the Mac bounded window
-    /// ([`streaming_local_attn_frames`](KreaArConfig::streaming_local_attn_frames) = 6 latent frames)
-    /// at 832×480 is `6 × 1560 = 9,360` tokens ⇒ **7.14 GiB** bf16, 3.79 GiB at Q8; the checkpoint's
-    /// global window over a 45-latent-frame clip is 70,200 tokens ⇒ **53.6 GiB** bf16.
+    /// Multiply by the cached part of the read window to get retention. The Mac's 6-frame attention
+    /// window includes the new 3-frame chunk, so at 832×480 the persisted history is
+    /// `3 × 1560 = 4,680` tokens ⇒ **3.57 GiB** bf16, 1.90 GiB at Q8 (0.27× the old bf16
+    /// 9,360-token buffer). A short final chunk reads farther back and is trimmed using its actual
+    /// length. The checkpoint's global window over 45 latent frames remains 70,200 tokens ⇒
+    /// **53.6 GiB** bf16.
     ///
     /// Errors when [`kv_cache_quant`](KreaArConfig::kv_cache_quant) names a tier MLX cannot express,
     /// or one whose group size does not divide the model's `head_dim` (the grouped axis).
@@ -596,12 +599,17 @@ mod tests {
         q4.ar.kv_cache_quant = Some(KvCacheQuant::Q4);
         assert_eq!(q4.kv_bytes_per_token().unwrap(), 230_400);
 
-        // The window figures the docs quote, derived from the same function.
-        let shipped_window_tokens = 6 * 1560; // the Mac bounded window at 832x480
+        // The retention figures the docs quote, derived from the same function. The six-frame
+        // attention window includes the new three-frame chunk, leaving three cached frames.
+        let shipped_window_tokens = 6 * 1560;
+        let shipped_retained_tokens = 3 * 1560;
         assert_eq!(
-            shipped_window_tokens * cfg.kv_bytes_per_token().unwrap(),
-            7_667_712_000
+            shipped_retained_tokens * cfg.kv_bytes_per_token().unwrap(),
+            3_833_856_000
         );
+        let composed = (shipped_retained_tokens * q8.kv_bytes_per_token().unwrap()) as f64
+            / (shipped_window_tokens * cfg.kv_bytes_per_token().unwrap()) as f64;
+        assert!((composed - 0.265625).abs() < 1e-9);
         let global_window_tokens = 45 * 1560; // the checkpoint's global window over a 45-frame clip
         let global_gib =
             (global_window_tokens * cfg.kv_bytes_per_token().unwrap()) as f64 / 1024f64.powi(3);
