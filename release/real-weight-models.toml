@@ -318,8 +318,10 @@ expected_files = ["pid_flux_2kto4k.safetensors"]
 # that is not there. Deriving the dir from this pin is what keeps the revision CI verifies and the
 # revision the tests actually load identical; a second repository variable could only drift from it.
 #
-# No test hard-codes a revision. With the variable unset (local dev) both resolution paths scan
-# `snapshots/` and take the first entry in sorted order, which is deterministic but is NOT this pin.
+# No test hard-codes a revision. With the variable unset (local dev) the two suites fall back
+# differently: `adapter_real_weights` scans `snapshots/` and takes the sorted-first entry, while
+# `lightning_render_real_weights` takes whatever `read_dir` yields first — so only the former is
+# even run-to-run stable, and neither is this pin.
 key = "qwen-image-lightning"
 repository = "lightx2v/Qwen-Image-Lightning"
 revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"

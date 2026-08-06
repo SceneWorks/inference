@@ -1532,7 +1532,8 @@ jobs:
       # asserted `applied == 840` — the HOST map's target count, never a measured application. Both
       # pinned lightx2v files carry 60 x 12 = 720 with zero unmatched (no img/txt modulation is
       # trained, in any published Lightning release), so the assertion now pins the FILE's surface
-      # per module class. It is the only step here that needs a LoRA: it resolves both from the
+      # per module class. It is the only one of the three tests in this step that loads a LoRA file
+      # (the Lightning render step above loads them too): it resolves both from the
       # QWEN_LIGHTNING_SNAPSHOT / QWEN_EDIT_LIGHTNING_SNAPSHOT dirs the materialize step derived
       # from the manifest pin and exported through $GITHUB_ENV — the SAME dirs
       # `ensure_model_snapshot.py` verified, so the gate cannot measure a revision merely cached
