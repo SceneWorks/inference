@@ -89,4 +89,27 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit, ["bernini_renderer", "bernini"]);
     }
+
+    /// The shared weights-free behavior oracle: every registered contract, safety check, fixture and
+    /// request scope has to agree with the ladder each provider declares — including that a rung the
+    /// contract calls `Missing` cannot be begun, and that an admitted scope's lifecycle hooks accept
+    /// exactly the parameters it advertised.
+    ///
+    /// Both load shapes are walked because rung 4 is declared **per load**: the eager pass is what
+    /// proves the `Missing` declaration is enforced rather than merely written.
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        for load_shape in [
+            mlx_gen::LoadShape::DeferredMaterialization,
+            mlx_gen::LoadShape::EagerMaterialization,
+        ] {
+            let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(load_shape);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
+                &registry, &spec,
+            );
+        }
+    }
 }

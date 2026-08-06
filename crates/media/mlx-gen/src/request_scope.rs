@@ -496,6 +496,15 @@ mod tests {
                 include_str!("../mlx-gen-mage/src/model.rs"),
                 "MageFlowConfig::mage_flow().depth",
             ),
+            // sc-15528. The marker is the DUAL-expert derivation: Bernini's rung-4 window covers
+            // both experts in one global index space, so the count handed to this core is
+            // `2 * num_layers`. A regression to one expert's depth would silently admit a window at
+            // block 39 and reject one at block 40 — the low expert's first block.
+            (
+                "bernini",
+                include_str!("../mlx-gen-bernini/src/memory_strategy.rs"),
+                "WanModelConfig::wan22_t2v_14b().num_layers",
+            ),
         ] {
             assert!(
                 source.contains("request_scope::MlxRequestScopeCore::"),
