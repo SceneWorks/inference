@@ -812,6 +812,56 @@ mod tests {
         validate_request_memory(crate::MODEL_ID, &eager, &GenerationMemory::default()).unwrap();
     }
 
+    /// **The three sc-15839 defect classes, pre-checked against this provider.**
+    ///
+    /// The epic requires a new rung to answer them rather than inherit a sibling's answer, and two
+    /// of the three are answered by a *property* rather than by code, which is exactly the kind of
+    /// answer that rots silently if it is only written in prose.
+    ///
+    /// 1. **F32 materialization underpricing** — [`resident_decoder_bytes`] projects the DC-AE at
+    ///    its resident width; its own doc carries the reasoning.
+    /// 2. **A resident overlay priced as zero** — SANA has none (no ControlNet branch, and
+    ///    `mlx-gen-pid` is used only for Gemma-2 conditioning, never as a decoder overlay), so
+    ///    `overlay_bytes` is zero and there are no auxiliary resident components. Asserted so that a
+    ///    future overlay cannot be added while the contract keeps saying the request costs nothing
+    ///    extra.
+    /// 3. **Unconstrained batch geometry** — the formula declares `BatchCount`, the descriptor caps
+    ///    `max_count`, and `validate_request` refuses above it. A memory contract whose peak scales
+    ///    with a batch nothing bounds is a contract that cannot predict its own worst case.
+    #[test]
+    fn the_sc15839_pricing_defect_classes_are_answered_for_this_provider() {
+        let contract = weights_free_memory_strategy_contract(
+            crate::MODEL_ID,
+            &streamable_spec(OffloadPolicy::Sequential),
+        )
+        .unwrap();
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        assert_eq!(contract.auxiliary_resident_bytes(), 0);
+        assert!(
+            contract.resident_components().is_empty(),
+            "SANA declares no auxiliary resident component; an overlay must revisit the pricing"
+        );
+        let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &contract.formula else {
+            panic!("SANA declares a phase envelope")
+        };
+        assert!(variables.contains(&MemoryFormulaVariable::BatchCount));
+
+        // The batch the formula scales with is bounded by the descriptor, and the bound is enforced.
+        let descriptor = crate::model::descriptor();
+        assert_eq!(descriptor.capabilities.max_count, 8);
+        let over_batch = mlx_gen::GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            count: descriptor.capabilities.max_count + 1,
+            ..Default::default()
+        };
+        assert!(
+            crate::model::validate_request(&descriptor, &over_batch).is_err(),
+            "an unbounded batch would make the declared BatchCount term unpredictable"
+        );
+    }
+
     #[test]
     fn decode_domain_and_rejection_set_are_pinned() {
         assert_eq!(DECODE_TILE_EDGES, &[512, 384, 256, 192]);
