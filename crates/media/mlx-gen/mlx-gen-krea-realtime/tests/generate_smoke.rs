@@ -2014,6 +2014,11 @@ const DESCRIPTOR_NAMES: [&str; N_DESC] = [
 /// same-content floor, and "past the budget" means "past an absolute number bracketed by synthetic
 /// controls", not "past a measured same-content baseline".
 ///
+/// Those numbers are 640×384. sc-17324 measured row Z at **832×480** — the shipping bucket — for the
+/// first time and it comes out the same way, harder: Z runs at 38.29/100f against row A's 18.82,
+/// A/Z = 0.49. So the missing floor is not an artifact of the smaller bucket. See
+/// [`MEASURED_832_SC17324`] and [`the_sc17324_832_sweep_reports_its_rate_comparison`].
+///
 /// The two sides are measured, not asserted, and they bracket a **narrow** range:
 /// * floor — motion and jitter both score **2.81/255**;
 /// * ceiling — the *weakest* of the four failure shapes (a 180° hue rotation at constant luma and
@@ -5234,6 +5239,326 @@ const MEASURED_832: &[S18Cell] = &[
         component: "opp-B-Y",
     },
 ];
+
+/// Measured cells from the **sc-17324 re-measurement at 832×480** — a SEPARATE sweep from the
+/// sc-15127/sc-15585 record in [`MEASURED_832`], which is why it lives in its own constant rather
+/// than being retro-fitted into that one (see its doc).
+///
+/// It is the first sweep to measure **row Z at 832×480**. The earlier record only ever had a
+/// zero-eviction row at 640×384, so the A-vs-Z rate comparison had never been made at the shipping
+/// bucket. It has no rows D or F: row F needs ~46,800 tokens ≈ 49 GiB there and took `nax-macos-2`
+/// (~101 GiB) down twice, so the window attribution at this bucket is `Unmeasured` by necessity —
+/// which is exactly the shape that used to make [`S18Sweep::verdict`] discard the rate clause
+/// (sc-17841). The same sweep effort also re-measured row F at **640×384** (run 31066428149); that
+/// cell is deliberately NOT recorded here, because it duplicates a row the sc-15585 record already
+/// holds at a different bucket and is a separate question from this one.
+///
+/// Provenance: the exact source lines are committed in `tests/fixtures/s18_sc17324_832_cells.tsv`
+/// (SHA-256 `7d2990063260ccb6662db7011fe17cbf0dfb0ab0d2e6c10ca6c390e0b8945015`), downloaded verbatim
+/// from the `krea-s18-sweep-*` artifacts of CI runs 31045621675 (row A), 31052700151 (row B),
+/// 31060390246 (row C) and 31062386153 (row Z), all `Real-weight validation` on `nax-macos-2`,
+/// 2026-08-05/06, seeds 7/11/23.
+const MEASURED_832_SC17324: &[S18Cell] = &[
+    S18Cell {
+        row: 'A',
+        seed: 7,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 46.0496,
+        trend: 39.8551,
+        excursion: 46.0496,
+        slope: 25.5482,
+        peak_bytes: 18_719_499_004,
+        clip_mean: 2.3528,
+        head_motion: 13.8854,
+        tail_motion: 11.8398,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'A',
+        seed: 11,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 29.7962,
+        trend: 23.7863,
+        excursion: 29.7962,
+        slope: 15.2476,
+        peak_bytes: 19_012_740_420,
+        clip_mean: 4.1180,
+        head_motion: 16.6477,
+        tail_motion: 10.3963,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'A',
+        seed: 23,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 33.1889,
+        trend: 24.4320,
+        excursion: 33.1889,
+        slope: 15.6615,
+        peak_bytes: 19_012_740_420,
+        clip_mean: 2.4759,
+        head_motion: 13.1568,
+        tail_motion: 6.8421,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'B',
+        seed: 7,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 35.3929,
+        trend: 26.8303,
+        excursion: 35.3929,
+        slope: 17.1989,
+        peak_bytes: 20_043_274_384,
+        clip_mean: 2.7394,
+        head_motion: 15.8696,
+        tail_motion: 17.5720,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'B',
+        seed: 11,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 28.4557,
+        trend: 15.7773,
+        excursion: 28.4557,
+        slope: 10.1136,
+        peak_bytes: 20_336_515_800,
+        clip_mean: 5.9908,
+        head_motion: 18.8493,
+        tail_motion: 21.3614,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'B',
+        seed: 23,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 24.1367,
+        trend: 19.2189,
+        excursion: 24.1367,
+        slope: 12.3198,
+        peak_bytes: 20_336_515_800,
+        clip_mean: 3.2686,
+        head_motion: 14.5934,
+        tail_motion: 8.8424,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'C',
+        seed: 7,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 24.3310,
+        trend: 18.5957,
+        excursion: 24.3310,
+        slope: 11.9203,
+        peak_bytes: 22_854_817_936,
+        clip_mean: 4.0987,
+        head_motion: 16.3794,
+        tail_motion: 14.6675,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'C',
+        seed: 11,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 22.1048,
+        trend: 10.1373,
+        excursion: 22.1048,
+        slope: 6.4983,
+        peak_bytes: 23_148_059_352,
+        clip_mean: 5.3745,
+        head_motion: 17.9580,
+        tail_motion: 16.1059,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'C',
+        seed: 23,
+        latent_frames: 45,
+        rolls: 13,
+        reported_drift: 21.8817,
+        trend: 12.1768,
+        excursion: 21.8817,
+        slope: 7.8056,
+        peak_bytes: 23_148_059_352,
+        clip_mean: 2.6829,
+        head_motion: 15.9028,
+        tail_motion: 8.5545,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'Z',
+        seed: 7,
+        latent_frames: 6,
+        rolls: 0,
+        reported_drift: 2.5149,
+        trend: 2.5149,
+        excursion: 0.0000,
+        slope: 20.9576,
+        peak_bytes: 14_455_722_556,
+        clip_mean: 0.6207,
+        head_motion: 12.3112,
+        tail_motion: 16.1128,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'Z',
+        seed: 11,
+        latent_frames: 6,
+        rolls: 0,
+        reported_drift: 8.6831,
+        trend: 8.6831,
+        excursion: 0.0000,
+        slope: 72.3588,
+        peak_bytes: 14_748_963_972,
+        clip_mean: 3.7369,
+        head_motion: 13.8205,
+        tail_motion: 19.4322,
+        component: "spatial-sd",
+    },
+    S18Cell {
+        row: 'Z',
+        seed: 23,
+        latent_frames: 6,
+        rolls: 0,
+        reported_drift: 2.5876,
+        trend: 2.5876,
+        excursion: 0.0000,
+        slope: 21.5635,
+        peak_bytes: 14_748_963_972,
+        clip_mean: 4.7098,
+        head_motion: 10.1449,
+        tail_motion: 13.8240,
+        component: "spatial-sd",
+    },
+];
+
+/// **CI gate on the sc-17841 fix, against real cells rather than synthetic ones.**
+///
+/// [`the_s18_verdict_rule_distinguishes_its_outcomes`] proves the rule emits the rate clause on an
+/// `Unmeasured` attribution using constructed sweeps. This proves it on the measurement that
+/// motivated the fix, and pins the finding itself so it stops living in a story description: at the
+/// **shipping** bucket, as at 640×384, the zero-eviction row runs FASTER than the shipped row, so
+/// there is still no measured same-content rate floor anywhere.
+///
+/// Before sc-17841 the verdict for exactly these cells contained no rate sentence at all — the
+/// clause was computed and then discarded with the empty attribution clause — so three cells of real
+/// GPU time produced a number that had to be worked out by hand. This test is what makes that
+/// unable to happen again quietly.
+#[test]
+fn the_sc17324_832_sweep_reports_its_rate_comparison() {
+    // The committed raw lines and the typed table must not drift apart, exactly as
+    // `the_recorded_s18_sweep_is_what_the_docs_claim` requires of the sc-15127 record.
+    let evidence = parse_s18_evidence(include_str!("fixtures/s18_sc17324_832_cells.tsv"))
+        .expect("the committed sc-17324 S18CELL evidence must parse");
+    assert_eq!(
+        evidence.len(),
+        MEASURED_832_SC17324.len(),
+        "the committed sc-17324 evidence and its table have different cell counts"
+    );
+    for raw in &evidence {
+        assert_eq!(
+            raw.bucket, "832x480",
+            "this record is the 832x480 re-measurement"
+        );
+        let cell = MEASURED_832_SC17324
+            .iter()
+            .find(|c| c.row == raw.row && c.seed == raw.seed)
+            .unwrap_or_else(|| {
+                panic!(
+                    "row {} seed {} is missing from the table",
+                    raw.row, raw.seed
+                )
+            });
+        assert_eq!(
+            (
+                raw.latent_frames,
+                raw.rolls,
+                raw.peak_bytes,
+                raw.drift,
+                raw.trend,
+                raw.excursion,
+                raw.slope,
+                raw.clip_mean,
+                raw.head_motion,
+                raw.tail_motion,
+                raw.component.as_deref(),
+            ),
+            (
+                cell.latent_frames,
+                cell.rolls,
+                cell.peak_bytes,
+                cell.reported_drift,
+                cell.trend,
+                cell.excursion,
+                cell.slope,
+                cell.clip_mean,
+                cell.head_motion,
+                cell.tail_motion,
+                Some(cell.component),
+            ),
+            "row {} seed {} differs between the committed lines and the table",
+            raw.row,
+            raw.seed
+        );
+        assert!(
+            DESCRIPTOR_NAMES.contains(&cell.component),
+            "row {} seed {} records component `{}`, which is not a descriptor component",
+            raw.row,
+            raw.seed,
+            cell.component
+        );
+    }
+
+    let sweep = S18Sweep {
+        bucket: "832x480".into(),
+        cells: MEASURED_832_SC17324.to_vec(),
+    };
+    println!("{}", sweep.summary());
+    // The shape that motivated sc-17841: no D and no F, so the ladder cannot be fitted at all.
+    assert!(
+        matches!(sweep.window_attribution(), WindowAttribution::Unmeasured),
+        "this record has no A/D/F ladder, so its window attribution must be Unmeasured — if that          changed, the sweep is no longer the case sc-17841 was about"
+    );
+
+    // The finding, pinned. `mean_slope` is the per-100-output-frame rate, the only statistic
+    // comparable across row Z's 12-frame post segment and row A's 156.
+    let (a, z) = (
+        sweep.mean_slope('A').expect("row A is recorded"),
+        sweep.mean_slope('Z').expect("row Z is recorded"),
+    );
+    assert!(
+        (a - 18.8191).abs() < 0.0001 && (z - 38.2933).abs() < 0.0001,
+        "the sc-17324 rate statistics drifted: A {a:.4}/100f, Z {z:.4}/100f; expected 18.8191 and          38.2933"
+    );
+    assert!(
+        z > a,
+        "row Z now runs SLOWER than row A at 832x480 ({z:.2} vs {a:.2}/100f) — a same-content rate          floor WOULD then exist at the shipping bucket, and both this crate's prose and sc-15571's          narrowed wording would need revisiting"
+    );
+
+    // ...and the verdict must actually SAY so. This is the sc-17841 regression gate on real data:
+    // before the fix this string contained no rate sentence, because the attribution is Unmeasured.
+    let v = sweep
+        .verdict()
+        .expect("the sc-17324 sweep supports a verdict");
+    println!("  VERDICT: {v}");
+    assert!(
+        v.contains("zero-eviction row Z does NOT establish a rate floor here"),
+        "the measured row-Z evidence must reach the verdict rather than being discarded with the          empty attribution clause (sc-17841): {v}"
+    );
+    assert!(
+        v.contains("which is HIGHER than the shipped row's"),
+        "row Z is faster than row A here, so the verdict must report the HIGHER branch: {v}"
+    );
+}
 
 /// **CI gate on the recorded measurement.** The numbers the crate documentation cites live in
 /// [`MEASURED_640`] / [`MEASURED_832`], and this applies the *same* [`S18Sweep::verdict`] rule to them

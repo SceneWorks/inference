@@ -442,6 +442,10 @@ pub fn decode_latents_to_video(
 /// ~1.9×. Row Z cannot be lengthened either — the shipped 6-latent-frame window evicts as soon as a
 /// clip passes 6 latent frames. "Past the budget" therefore means past an absolute number pinned by
 /// synthetic stimuli, not past a measured baseline of the same content.
+///
+/// Those figures are 640×384; sc-17324 later measured row Z at the shipping 832×480 bucket for the
+/// first time and it replicates — Z 38.29/100f against row A's 18.82, A/Z = 0.49 — so the absent
+/// floor is a property of the comparison, not of the smaller bucket.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
