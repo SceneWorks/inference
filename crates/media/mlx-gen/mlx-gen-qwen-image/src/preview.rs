@@ -47,7 +47,10 @@ use crate::pipeline::unpack_latents;
 /// *unclamped* re-solve, 0.9521 on that corpus. That is the number the floor gates and it is not
 /// comparable to either figure above.) Giving up 0.018 of R² and 2.58/255 of mean error to a
 /// best-case, in-sample refit is not grounds for re-baselining shipping constants onto a two-render
-/// sample, which is why these are unchanged.
+/// sample, which is why these are unchanged. Those two deltas are the producer's own
+/// `a refit would buy` line — `+0.0183` and `2.58`, differenced from the UNROUNDED quantities, so
+/// the mean-error gap reads 2.58 and not the 2.57 you get by subtracting the rounded 10.01 from the
+/// rounded 12.58.
 ///
 /// What the producer asserts every run is the **0.90 floor, against these constants** — not the
 /// 0.9450 itself, so a slide from 0.9450 to 0.91 would still pass. That is deliberate: the floor

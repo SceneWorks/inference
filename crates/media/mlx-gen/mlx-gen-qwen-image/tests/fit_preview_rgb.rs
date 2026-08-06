@@ -522,9 +522,15 @@ fn fit_preview_rgb_factors() {
         "\n// {total} samples, {} renders, {STEPS}-step Lightning at {W}x{H}",
         CORPUS.len()
     );
+    // Annotated with its scoring, not bare. The inherited `R² = 0.9586` in `src/preview.rs` is the
+    // one figure in this tree quoted with no scoring attached, and it got there by being pasted out
+    // of a producer that printed it exactly this way — so a bare number here mints the next one.
     println!(
-        "// R^2 = {r2_overall:.4} (r {:.4}, g {:.4}, b {:.4})",
+        "// R^2 = {r2_overall:.4} (r {:.4}, g {:.4}, b {:.4}) — UNCLAMPED re-solve.",
         r2[0], r2[1], r2[2]
+    );
+    println!(
+        "// That is the quantity R2_FLOOR gates; it is NOT comparable to the clamped pair below."
     );
     println!("const RGB_FACTORS: [[f32; 3]; {c}] = [");
     for row in coef.iter().take(c) {
@@ -615,6 +621,10 @@ fn fit_preview_rgb_factors() {
     // 2.58/255 of mean error to a best-case refit, which is why sc-17515 left it alone rather than
     // re-baselining shipping constants onto a two-render sample. Both halves of that comparison are
     // printed above, from this run; neither is a figure a reader has to take on trust.
+    //
+    // Those deltas are the `a refit would buy` line verbatim (`+0.0183`, `2.58`), and that line
+    // differences the UNROUNDED quantities. Subtracting the rounded figures instead gives 2.57 —
+    // the discrepancy is rounding, not a typo in either number.
     //
     // Note what this does NOT assert: the 0.9450. A slide to 0.91 passes. That is the floor's job —
     // catching the lineage moving out from under the constants, not policing sampling noise on a
