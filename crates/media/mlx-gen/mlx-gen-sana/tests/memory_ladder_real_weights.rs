@@ -132,8 +132,25 @@ fn quant_for(tier: &str) -> Option<Quant> {
 }
 
 fn spec(dir: &std::path::Path, tier: &str, shape: LoadShape) -> LoadSpec {
+    spec_with_policy(dir, tier, shape, OffloadPolicy::Sequential)
+}
+
+/// **SANA's rung 1 is a LOAD-time mechanism**, so a rung-0 row has to be a `Resident` LOAD.
+///
+/// The shared `Residency` seam is driven by `spec.offload_policy`; `GenerationMemory::stage_residency`
+/// is a contract-level marker for this provider, not a lever the engine reads (sc-16783 measured and
+/// published rung 1 that way). A row rendered on a Sequential load with `stage_residency: false`
+/// therefore still stages its phases — and labelling that row `MemoryStrategy::Resident` in an
+/// evidence record would name a composition the engine did not run, which is exactly the mislabelled
+/// evidence this story's last acceptance criterion is about.
+fn spec_with_policy(
+    dir: &std::path::Path,
+    tier: &str,
+    shape: LoadShape,
+    policy: OffloadPolicy,
+) -> LoadSpec {
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
-        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_offload_policy(policy)
         .with_load_shape(shape);
     spec.quantize = quant_for(tier);
     spec
@@ -235,9 +252,21 @@ fn measure(
     shape: LoadShape,
     req: &GenerationRequest,
 ) -> Row {
+    measure_with_policy(entry, dir, tier, shape, OffloadPolicy::Sequential, req)
+}
+
+#[track_caller]
+fn measure_with_policy(
+    entry: &str,
+    dir: &std::path::Path,
+    tier: &str,
+    shape: LoadShape,
+    policy: OffloadPolicy,
+    req: &GenerationRequest,
+) -> Row {
     let registry = mlx_gen_sana::provider_registry().expect("provider registry");
     let model = registry
-        .load(entry, &spec(dir, tier, shape))
+        .load(entry, &spec_with_policy(dir, tier, shape, policy))
         .unwrap_or_else(|error| panic!("load {entry}: {error}"));
     clear_cache();
     reset_peak_memory();
@@ -789,40 +818,71 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
             contract.conformance_errors()
         );
 
+        // The rung-0 baseline is a RESIDENT LOAD, not a Sequential load with the request flags off —
+        // see `spec_with_policy`. Its contract is a different contract, so it is resolved per row.
+        let resident_load = spec_with_policy(
+            &dir,
+            DEFAULT_TIER,
+            LoadShape::EagerMaterialization,
+            OffloadPolicy::Resident,
+        );
+        let resident_contract =
+            ms::memory_strategy_contract(entry, &resident_load).expect("contract");
+        assert!(resident_contract.conformance_errors().is_empty());
+
         let mut previous: Option<(MemoryStrategy, f64)> = None;
-        for (strategy, memory) in [
-            (MemoryStrategy::Resident, resident_memory()),
-            (MemoryStrategy::StagedResidency, {
+        for (strategy, memory, policy) in [
+            (
+                MemoryStrategy::Resident,
+                resident_memory(),
+                OffloadPolicy::Resident,
+            ),
+            (
+                MemoryStrategy::StagedResidency,
                 GenerationMemory {
                     stage_residency: true,
                     ..Default::default()
-                }
-            }),
-            (MemoryStrategy::BoundedDecode, rung2()),
+                },
+                OffloadPolicy::Sequential,
+            ),
+            (
+                MemoryStrategy::BoundedDecode,
+                rung2(),
+                OffloadPolicy::Sequential,
+            ),
             (
                 MemoryStrategy::BoundedAttention,
                 rung3(ms::ATTENTION_CHUNK_SIZE),
+                OffloadPolicy::Sequential,
             ),
             (
                 MemoryStrategy::BoundedTransformerResidency,
                 full_ladder(ms::TRANSFORMER_WINDOW_SIZE),
+                OffloadPolicy::Sequential,
             ),
         ] {
+            let resident_row = matches!(policy, OffloadPolicy::Resident);
+            let (row_load, row_contract) = if resident_row {
+                (&resident_load, &resident_contract)
+            } else {
+                (&load, &contract)
+            };
             assert_eq!(
-                contract.capability(strategy).unwrap().support,
+                row_contract.capability(strategy).unwrap().support,
                 MemoryStrategySupport::Implemented,
-                "{entry} must implement {strategy:?} on the full-ladder route"
+                "{entry} must implement {strategy:?} on the route its row runs"
             );
-            let row = measure(
+            let row = measure_with_policy(
                 entry,
                 &dir,
                 DEFAULT_TIER,
-                LoadShape::DeferredMaterialization,
+                row_load.load_shape,
+                policy,
                 &request(*sprint, Some(memory), edge, steps),
             );
             println!(
-                "[sc-15523 ladder {entry} {DEFAULT_TIER} {edge}sq] {strategy:?}: {:.4} GiB, \
-                 {:.0} ms/step",
+                "[sc-15523 ladder {entry} {DEFAULT_TIER} {edge}sq] {strategy:?} ({policy:?}): \
+                 {:.4} GiB, {:.0} ms/step",
                 row.peak_gib,
                 ms_per_step(&row, steps)
             );
@@ -834,7 +894,16 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
             }
             previous = Some((strategy, row.peak_gib));
 
-            let record = evidence(entry, var, &load, &contract, strategy, memory, edge, &row);
+            let record = evidence(
+                entry,
+                var,
+                row_load,
+                row_contract,
+                strategy,
+                memory,
+                edge,
+                &row,
+            );
             println!("{}", record.to_json_line().expect("serialize evidence"));
             minted += 1;
         }
