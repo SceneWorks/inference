@@ -170,18 +170,39 @@ class TempDirGuardTests(unittest.TestCase):
             }
         )
 
-    def test_a_stable_name_is_out_of_scope_and_this_is_deliberate(self) -> None:
-        # Pins the gap the docstring names rather than leaving it to be rediscovered. A stable
-        # name is bounded at one entry and is usually a deliberate artifact or cross-run cache
-        # (`krea_turbo_smoke`, `mlx_gen_flux2_dev_prequant_q4`); nothing syntactic tells it apart
-        # from a fixture root someone forgot to clean, so the lint stays on the unbounded class.
-        # If this row ever starts failing, the scope was widened — update the docstring with it.
-        self.run_gate(
+    def test_a_stable_name_is_flagged_too(self) -> None:
+        # The inverse of what an earlier revision pinned. Scoping the lint to per-run names looked
+        # safe until the sweep measured where the leaks actually were: on `main`, every one of the
+        # 14 directories the audio lane left behind on a GREEN run had a stable name, and none was
+        # deliberate. A stable name is also the worse collision — a `{pid}` path clashes only
+        # within one process, a fixed one across every concurrent `cargo test`.
+        self.assert_flags(
             {
                 "crates/x/tests/artifact.rs": (
                     "#[test]\n"
                     "fn writes_a_render() {\n"
                     "    let dir = std::env::temp_dir().join(\"x_turbo_smoke\");\n"
+                    "    std::fs::create_dir_all(&dir).unwrap();\n"
+                    "}\n"
+                )
+            }
+        )
+
+    def test_a_deliberate_artifact_says_so_with_an_override(self) -> None:
+        # The escape hatch for the sixteen real artifact/cache sites: state the intent and the
+        # lint stands down. Same path by default — the override only moves it.
+        self.run_gate(
+            {
+                "crates/x/tests/artifact.rs": (
+                    "fn artifact_root() -> std::path::PathBuf {\n"
+                    "    std::env::var(\"X_ARTIFACT_DIR\")\n"
+                    "        .map(std::path::PathBuf::from)\n"
+                    "        .unwrap_or_else(|_| std::env::temp_dir())\n"
+                    "}\n"
+                    "\n"
+                    "#[test]\n"
+                    "fn writes_a_render() {\n"
+                    "    let dir = artifact_root().join(\"x_turbo_smoke\");\n"
                     "    std::fs::create_dir_all(&dir).unwrap();\n"
                     "}\n"
                 )

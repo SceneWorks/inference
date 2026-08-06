@@ -25,6 +25,16 @@ use std::time::Instant;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec, GenerationRequest, Image};
 use candle_gen_krea::pipeline::{load_components, load_edit_components, render_edit};
 
+/// Root for this suite's **deliberately persistent** artifacts. `KREA_SMOKE_ARTIFACT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (rendered PNGs you open afterwards), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn artifact_root() -> PathBuf {
+    std::env::var("KREA_SMOKE_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) — a coherent natural image has a broad
 /// histogram AND spatial smoothness; pure noise has a high adjacent Δ and flat std.
 fn image_stats(px: &[u8], w: u32) -> (f32, usize, f32) {
@@ -110,7 +120,7 @@ fn read_source(path: &PathBuf) -> Image {
 }
 
 fn save(img: &Image, name: &str) {
-    let dir = std::env::temp_dir().join("krea_edit_smoke");
+    let dir = artifact_root().join("krea_edit_smoke");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.png"));
     image::save_buffer(
