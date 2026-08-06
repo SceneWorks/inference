@@ -56,9 +56,10 @@
 //!   at the shipped bounded window and several times larger at any wider one, because unlike the
 //!   weights it scales with the clip. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and
 //!   dequantizes the read window per layer (there is no fused quantized SDPA to attend over packed
-//!   K/V with — see [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`,
-//!   because a cheaper cache perturbs the same long-clip coherence sc-15127/sc-15571 measure and
-//!   turning it on is therefore a measured decision rather than a free one.
+//!   K/V with — see [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`
+//!   and the measurement says keep it there: the sc-17807 A/B found Q8 drifting further than bf16 on
+//!   every bounded row of the S18 sweep, resolvably on row C (+2.79/255 against a 2·SEM of 0.80),
+//!   for a 0.76–0.86× peak. A trade with a measured price, not a free saving.
 //!
 //! **Attention-bias reconciliation (S5).** The block-causal mask ([`build_block_causal_mask`]) + the KV
 //! read window + the causal RoPE offset are the *complete* causal mechanism: the released reference

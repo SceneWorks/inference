@@ -5359,6 +5359,102 @@ fn s18_kv_tier_ab_from_accumulated_cells() {
     }
 }
 
+/// **CI gate on the recorded sc-17807 KV-tier A/B — and it is a RECORDED FAILURE.**
+///
+/// The measured answer to the story's question ("a cheaper cache that increases drift is not a
+/// win, and this sweep is the instrument that can say so") is that **Q8 KV costs coherence**. Both
+/// arms were measured on one host — rows A/B/C/D x seeds 7/11/23 at 640x384, 45 latent frames, q4
+/// weights — and the comparison returns `Err`:
+///
+/// | row | sink | per-seed Δ (q8 − bf16) | mean | 2*SEM | |
+/// |---|---|---|---|---|---|
+/// | A | 0 | +0.89, +7.36, −2.52 | +1.91 | 5.79 | unresolved |
+/// | B | 1 | +2.12, +2.15, −0.67 | +1.20 | 1.87 | unresolved |
+/// | C | 3 | +2.44, +3.59, +2.34 | **+2.79** | 0.80 | **RESOLVABLY WORSE** |
+/// | D | 0 | −0.62, +3.34, +3.87 | +2.20 | 2.83 | unresolved |
+///
+/// **Read it as one effect, not one bad row.** Every row's mean is positive, 9 of the 12 paired
+/// deltas are positive, and row C is simply the row whose paired scatter (2*SEM 0.80) is tight
+/// enough to *resolve* something the others cannot — their bounds only exclude regressions above
+/// 1.87–5.79/255. The consistent reading is a drift cost of roughly **+2/255** across the bounded
+/// rows, resolvable where the power exists. That it lands on the largest-sink row is *consistent
+/// with* — but does not establish — the mechanism you would guess: sink KV is quantized once and
+/// then attended for the whole clip, so its error never ages out the way a rolling tail's does.
+/// Distinguishing "an effect everywhere, resolved only on C" from "an effect concentrated on the
+/// sink" needs more seeds on A/B/D, not more prose.
+///
+/// The memory saving is real and simultaneous: peak 0.86x (A), 0.85x (B), 0.82x (C), 0.76x (D).
+/// So this is a **measured trade**, not a free win — which is exactly why
+/// [`KreaArConfig::kv_cache_quant`](mlx_gen_krea_realtime::KreaArConfig::kv_cache_quant) defaults
+/// to `None` and why nothing in the tree turns it on.
+///
+/// Provenance: `tests/fixtures/s18_kv_ab_{bf16,q8}_cells.tsv`, the verbatim `S18CELL` lines from
+/// twelve gated runs. Row F is absent by decision — see
+/// [`long_clip_coherence_under_the_bounded_window`].
+///
+/// This test asserts the **failure**. If a future change makes the A/B pass, that is either a real
+/// improvement or a weakened rule, and either way it must be re-argued here rather than silently
+/// flipping green.
+#[test]
+fn the_recorded_kv_tier_ab_records_a_resolvable_q8_regression() {
+    let arm_of = |src: &str, want: &str| {
+        let s = s18_sweep_from_accumulated(src, None).expect("the recorded arm must parse");
+        assert_eq!(s.kv, want, "the recorded arm carries its tier");
+        assert_eq!(s.cells.len(), 12, "4 bounded rows x 3 seeds");
+        s
+    };
+    let bf16 = arm_of(
+        include_str!("fixtures/s18_kv_ab_bf16_cells.tsv"),
+        KV_TIER_BF16,
+    );
+    let q8 = arm_of(include_str!("fixtures/s18_kv_ab_q8_cells.tsv"), "q8/g64");
+
+    // Both arms are structurally valid sweeps under the sweep's OWN rule before either is compared.
+    for (label, arm) in [("bf16", &bf16), ("q8", &q8)] {
+        arm.structural_checks()
+            .unwrap_or_else(|e| panic!("{label} arm: {e}"));
+        arm.verdict()
+            .unwrap_or_else(|e| panic!("{label} arm verdict: {e}"));
+    }
+
+    let err = q8
+        .kv_tier_comparison(&bf16)
+        .expect_err("the recorded A/B is a REGRESSION — see this test's doc before changing it");
+    assert!(err.contains("RESOLVABLY WORSE"), "{err}");
+    assert!(
+        err.contains("C +2.79/255"),
+        "row C's effect size is the published one: {err}"
+    );
+    // The memory saving is real and must stay reported alongside the regression — the finding is a
+    // trade, and an `Err` that dropped the saving would misrepresent it as a pure loss.
+    for saving in ["0.86x", "0.85x", "0.82x", "0.76x"] {
+        assert!(err.contains(saving), "missing peak ratio {saving}: {err}");
+    }
+
+    // Every row leans worse. This is what makes "one effect, resolved only where the power is"
+    // the honest reading rather than "row C is an outlier" — if a re-measurement ever makes the
+    // other rows negative, that reading has to change.
+    let mut positive = 0;
+    for row in ['A', 'B', 'C', 'D'] {
+        let (a, b) = (q8.mean(row).unwrap(), bf16.mean(row).unwrap());
+        assert!(a > b, "row {row}: q8 {a:.2} is not above bf16 {b:.2}");
+        positive += q8
+            .paired_deltas(&bf16, row)
+            .expect("matched seeds")
+            .iter()
+            .filter(|d| **d > 0.0)
+            .count();
+    }
+    assert_eq!(positive, 9, "9 of 12 paired deltas positive");
+
+    // The knob this evidence is about must still be OFF by default. A measured coherence cost that
+    // ships enabled would be the worst possible outcome of having measured it.
+    assert_eq!(
+        KreaRealtimeConfig::krea_realtime_14b().ar.kv_cache_quant,
+        None
+    );
+}
+
 /// **A mis-set KV tier must fail loudly, not silently measure the other arm.**
 ///
 /// The failure this closes costs hours and produces evidence that looks fine: `KREA_S18_KV_BITS=q8`
