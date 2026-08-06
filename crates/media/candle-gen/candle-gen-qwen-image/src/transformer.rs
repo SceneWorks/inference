@@ -157,7 +157,9 @@ fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor>
 /// i32-index limit). The Qwen MMDiT runs ONE joint attention over the `[txt, noise(, ref)]` sequence
 /// (24 heads); the dual-latent edit path grows fastest and at ≳1280² trips the guard. The
 /// `softmax_last_dim` closure keeps the exact fused softmax; each query row's softmax is independent, so
-/// the chunked result is byte-identical to the single pass. This crate does the head-merge here.
+/// the chunked result is *mathematically* equal to the single pass — not bitwise equal, since narrowing
+/// the query axis changes the GEMM `M` and so may change the f32 accumulation order (SC-15943). This
+/// crate does the head-merge here.
 fn attention(
     q: &Tensor,
     k: &Tensor,

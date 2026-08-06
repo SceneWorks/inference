@@ -161,7 +161,9 @@ pub fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
 /// scores tensor would exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) —
 /// broadcasting the `[B,1,1,Sk]` mask identically onto every chunk. The `softmax_last_dim` closure keeps
 /// the exact fused softmax; each query row's softmax is independent, so the chunked result is
-/// byte-identical to the single pass. This crate does the head-merge transpose/reshape here.
+/// *mathematically* equal to the single pass — not bitwise equal, since narrowing the query axis changes
+/// the GEMM `M` and so may change the f32 accumulation order (SC-15943). This crate does the head-merge
+/// transpose/reshape here.
 fn attention(
     q: &Tensor,
     k: &Tensor,

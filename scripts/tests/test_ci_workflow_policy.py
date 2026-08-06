@@ -1635,26 +1635,31 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
         """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.
 
-        Each of the 24 selections has to survive all three traps at once. `--exact` AFTER the `--`,
+        Each of the 25 selections has to survive all three traps at once. `--exact` AFTER the `--`,
         because cargo rejects it in its own argument position; a run-count assertion, because with
         `--exact` accepted a renamed test yields `0 passed; N filtered out` and cargo EXITS 0; and a
         NAME, because `--ignored` alone is a blanket that silently conscripts whatever `#[ignore]`
         test lands in the file next -- which is exactly how an 85-minute sweep joined a 20-minute
         regression lane in sc-17276.
 
-        That 24 is asserted against `selected` below rather than left as prose. The count in this
-        docstring went stale the moment sc-17518 wired a 21st test and nothing noticed, which is the
-        same "the record and the thing diverge" failure the whole epic exists to catch.
+        ONE test is deliberately absent and must stay absent, and the excluded tuple below is the
+        list -- `edit_lightning_user_lora_reference_repro`, a bug-repro harness needing a user LoRA
+        and a reference PPM that exist in no repository and on no Hub. A red weekly lane is ignored
+        within a month, so it is recorded with its reason in `release/real-weight-models.toml`
+        rather than wired red or quietly dropped.
 
-        Two tests are deliberately absent and must stay absent while their stories are open:
-        `fit_preview_rgb_factors` (sc-17515) FAILS on real weights, and
-        `edit_lightning_user_lora_reference_repro` needs a user LoRA and a reference PPM that exist
-        nowhere. A red weekly lane is ignored within a month, so they are recorded rather than
-        wired. Two others have graduated: `lightning_loras_apply_cleanly` (sc-17518 measured its
-        840 against the pinned lightx2v files -- 720, zero unmatched -- and fixed the assertion),
-        and `perf.rs` x2 (sc-17513 swept 18 shapes plus a depth and a conditioning control, found
-        the `max|D| == 0.0` residual to be this stack's amplification of a sub-ULP rounding
-        difference rather than a fusion defect, and replaced it with a peak-relative bound).
+        Keep this paragraph in step with both lists. FOUR names left it in the same week, and each
+        had been excluded on a number that measured the test rather than the code:
+        `fit_preview_rgb_factors` (sc-17515), whose R^2 = 0.0114 was its own host readback;
+        `lightning_loras_apply_cleanly` (sc-17518), whose 840 was a host-map target count against
+        pinned lightx2v files that apply 720 with zero unmatched; and `perf.rs` x2 (sc-17513), whose
+        `max|D| == 0.0` had never held on a 60-layer forward -- an 18-shape sweep plus a depth probe
+        and a conditioning control showed the residual to be this stack's amplification of a
+        sub-ULP rounding difference, not a fusion defect, and it now carries a peak-relative bound.
+        All four are selected below. The docstring outliving any of those changes would have made
+        THIS test -- the enforcement point for doc-vs-reality drift about what runs where -- an
+        instance of the defect class it exists to catch.
+
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
@@ -1694,6 +1699,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "routing_map_covers_full_fork_surface",
                 "kohya_matches_peft_on_real_tree",
                 "lightning_loras_apply_cleanly",
+                # sc-17515. Wired out of the exclusion list below: its R^2 = 0.0114 was the test's
+                # own host readback scrambling the samples, not the fit. It also scores the shipping
+                # `preview::RGB_FACTORS` unchanged, so it is a drift gate and belongs on the weekly
+                # schedule rather than in the dispatch-only producers job.
+                "fit_preview_rgb_factors",
+                # sc-17513. The sc-2963 compiled-glue rollout's only real-weight gate, wired out of
+                # the exclusion list once an 18-shape sweep established that its residual is this
+                # stack's amplification floor and replaced the bit-exactness assertion with a
+                # peak-relative bound.
                 "qwen_t2i_per_step_compiled_vs_eager",
                 "qwen_edit_per_step_compiled_vs_eager",
             ],
@@ -1706,16 +1720,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ],
             "mlx-qwen-image-producers": ["dump_runb_latents"],
         }
-        # Bind the docstring's count to the dict, so adding a selection without updating the prose
-        # (or the excluded-tests paragraph beneath it) fails here instead of quietly rotting.
-        documented = int(
-            re.search(r"Each of the (\d+) selections", self.test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count.__doc__).group(1)
+        # Bind the docstring's count to the list rather than to a maintainer's memory. The prose and
+        # the list drifted apart for exactly as long as the docstring also called
+        # `fit_preview_rgb_factors` excluded while the list above required it (sc-17515 review) --
+        # stale prose in the one test whose subject is doc-vs-reality drift. Either side moving alone
+        # now fails here instead of misinforming the next reader.
+        documented = re.search(
+            r"Each of the (\d+) selections",
+            type(self).test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count.__doc__,
         )
+        self.assertTrue(documented, "this test's docstring no longer states a selection count")
         self.assertEqual(
-            documented,
             sum(len(names) for names in selected.values()),
+            int(documented.group(1)),
             "this test's docstring names a selection count that no longer matches `selected`",
         )
+
         for job, names in selected.items():
             body = bodies[job]
             for name in names:
@@ -1761,12 +1781,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 f"{job}: every `--exact` selection needs its own run-count assertion",
             )
 
-        # Absent, and each with an open story. Over CODE only: the steps' comments have to NAME these
-        # tests to say why they are excluded, and prose can never select a test.
-        for name in (
-            "fit_preview_rgb_factors",
-            "edit_lightning_user_lora_reference_repro",
-        ):
+        # Absent, with an open story. Over CODE only: the steps' comments have to NAME this test to
+        # say why it is excluded, and prose can never select a test.
+        for name in ("edit_lightning_user_lora_reference_repro",):
             for job in jobs:
                 self.assertNotIn(
                     name,

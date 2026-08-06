@@ -181,43 +181,49 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 22 + 2 = 45:
+# The 45 account for exactly, and the arithmetic is the point — 21 + 23 + 1 = 45:
 #
-# WIRED, 22: 18 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3, compiled-glue
-# A/B x2), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All
-# measured passing on nax-macos — 19 of them 2026-08-04, `lightning_loras_apply_cleanly` 2026-08-06
-# (sc-17518), the two `perf.rs` arms 2026-08-06 (sc-17513).
+# WIRED, 23: 19 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3, preview fit,
+# compiled-glue A/B x2), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only
+# `mlx-qwen-image-producers`. All measured passing on nax-macos — 19 of them 2026-08-04, and the
+# four most recently wired 2026-08-06: `lightning_loras_apply_cleanly` (sc-17518), the preview fit
+# (sc-17515), and both `perf.rs` arms (sc-17513).
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 2. A lane that is red every week is ignored within a month
-# (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
-#   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
+# EXCLUDED WITH A MEASUREMENT, 1. A lane that is red every week is ignored within a month
+# (sc-16981), so it is recorded here rather than wired red or quietly dropped:
 #   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
 #     exist in no repository and on no Hub.
 #
-# TWO EXCLUSIONS GRADUATED, and neither by loosening a number to go green.
-#
-# `lightning_loras_apply_cleanly` (sc-17518) asserted `applied == 840` — the HOST map's 60 x 14
-# target count, never a measured application. Both pinned lightx2v files apply 60 x 12 = 720 with
-# zero unmatched; no published Lightning release has ever trained `img_mod.1`/`txt_mod.1`. Evidence
-# and the per-class assertion that replaced the raw count are in the test's doc comment.
-#
-# `perf.rs` x2 (sc-17513) asserted the compiled sc-2963 glue was BIT-identical to eager on the real
-# 60-layer forward — `assert_eq!(max_diff, 0.0)` — which had never held: sc-17284 measured max|D|
-# 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit). sc-17513 swept 18 shapes
-# across both arms (T2I bf16 128..1280 px, Edit q8 256..1024 px) and ran two controls that settle
-# what the residual IS: truncating the transformer to 1 layer makes compiled-vs-eager exactly 0.0 on
-# the same real weights (0.3 ULP at 2 layers), and perturbing the EAGER forward's own input by one
-# f32 ULP moves its output by the same 1e-4..2.5e-3 the whole compiled-vs-eager gap does. So it is
-# this stack's 1.3e3..2.2e4x amplification of a sub-ULP rounding difference, not a fusion defect —
-# which also explains why it is non-monotonic in sequence length (the amplification is). The gate is
-# now peak-RELATIVE at 1.6e-2, 7x the worst measured; a genuinely wrong fusion is O(1e-1) and still
-# trips it. The table and the derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL`.
+# This block held FIVE entries until 2026-08-06. Four were retired in the same week, and every one
+# had been excluded on a number that turned out to measure the test rather than the code:
+#   * `lightning_loras_apply_cleanly` (sc-17518) asserted `applied == 840` — the HOST map's
+#     60 x 14 target count, never a measured application. Both pinned lightx2v files apply
+#     60 x 12 = 720 with zero unmatched; no published Lightning release has ever trained
+#     `img_mod.1`/`txt_mod.1`. Evidence and the per-class assertion that replaced the raw count are
+#     in the test's doc comment.
+#   * `fit_preview_rgb_factors` (sc-17515) was excluded at R^2 = 0.0114 against its own 0.90 floor.
+#     That was a defect in the test's host readback — `mlx-rs` `as_slice` returns physical storage
+#     for a transpose view, so it regressed latent channel 0 against the red channel. With the
+#     contiguity pass it measures R^2 = 0.9521 (unclamped re-solve, the quantity the floor gates).
+#   * `perf.rs` x2 (sc-17513) asserted the compiled sc-2963 glue was BIT-identical to eager on the
+#     real 60-layer forward — `assert_eq!(max_diff, 0.0)` — which had never held: sc-17284 measured
+#     max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit). sc-17513
+#     swept 18 shapes across both arms (T2I bf16 128..1280 px, Edit q8 256..1024 px) and ran two
+#     controls that settle what the residual IS: truncating the transformer to 1 layer makes
+#     compiled-vs-eager exactly 0.0 on the same real weights (0.3 ULP at 2 layers), and perturbing
+#     the EAGER forward's own input by one f32 ULP moves its output by the same 1e-4..2.5e-3 the
+#     whole compiled-vs-eager gap does. So it is this stack's 1.3e3..2.2e4x amplification of a
+#     sub-ULP rounding difference, not a fusion defect — which also explains why it is
+#     non-monotonic in sequence length (the amplification is). The gate is now peak-RELATIVE at
+#     1.6e-2, 7x the worst measured; a genuinely wrong fusion is O(1e-1) and still trips it. The
+#     table and the derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL`.
+# All four are WIRED above. None weakened a gate to get there.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
 revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
@@ -331,10 +337,16 @@ expected_files = ["pid_flux_2kto4k.safetensors"]
 # that is not there. Deriving the dir from this pin is what keeps the revision CI verifies and the
 # revision the tests actually load identical; a second repository variable could only drift from it.
 #
-# No test hard-codes a revision. With the variable unset (local dev) the two suites fall back
-# differently: `adapter_real_weights` scans `snapshots/` and takes the sorted-first entry, while
-# `lightning_render_real_weights` takes whatever `read_dir` yields first — so only the former is
-# even run-to-run stable, and neither is this pin.
+# The T2I file has a THIRD consumer as of sc-17515: `fit_preview_rgb_factors` renders its fit corpus
+# through it, because the committed `preview::RGB_FACTORS` document an "8-step Lightning" fit and
+# `lightning_sigmas` alone is only the schedule half of that. Measured: without the LoRA the re-solve
+# lands 0.26 from the committed factors, with it 0.082.
+#
+# No test hard-codes a revision. With the variable unset (local dev) the three consumers fall back
+# on their own, and not identically: `adapter_real_weights` and `fit_preview_rgb_factors` each scan
+# `snapshots/` and take the sorted-first entry, while `lightning_render_real_weights` takes whatever
+# `read_dir` yields first — so two of the three are at least run-to-run stable, and none of them is
+# this pin.
 key = "qwen-image-lightning"
 repository = "lightx2v/Qwen-Image-Lightning"
 revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"

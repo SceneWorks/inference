@@ -80,8 +80,9 @@ fn wan_self_attn_budget() -> usize {
 /// scores' native **bf16** instead of the f32 upcast — the candle CUDA softmax kernel max-stabilizes
 /// and accumulates the sum in f32 regardless (`SOFTMAX_OP(__nv_bfloat16, float, …)`), so only the
 /// `exp`/probs carry bf16 rounding, which halves the per-chunk transient. Off by default (the f32
-/// upcast is numerically exact — the chunk lever alone is byte-identical to the un-chunked pass);
-/// gated on only after a parity A/B confirms the bf16 path stays within tolerance. Read once.
+/// upcast is numerically exact, and the chunk lever alone perturbs only the f32 rounding order — close
+/// to, but not bit-identical to, the un-chunked pass; see SC-15943 and [`sdpa_budgeted`]); gated on only
+/// after a parity A/B confirms the bf16 path stays within tolerance. Read once.
 fn wan_self_attn_bf16_softmax() -> bool {
     use std::sync::OnceLock;
     static BF16: OnceLock<bool> = OnceLock::new();
@@ -108,9 +109,12 @@ fn wan_self_attn_bf16_softmax() -> bool {
 /// before the first denoise step — chunking caps each block's transient near the budget instead. The
 /// budget is Wan's own reduced [`WAN_SELF_ATTN_SCORES_BUDGET`] (sc-12894): small enough that the
 /// per-chunk f32 scores + probs transient fits the denoise peak under 24 GiB, still ≪ `i32::MAX`. Each
-/// query row's softmax is over all keys and independent of the others, so the chunked result equals the
-/// single pass; the chunking engages only on the over-budget denoise self-attention and stays a no-op
-/// single pass for the small cross-attention (S_kv = text tokens) and every in-budget size.
+/// query row's softmax is over all keys and independent of the others, so the chunked result is
+/// *mathematically* equal to the single pass — but **not bitwise** equal to it: narrowing the query axis
+/// changes the GEMM `M`, so the f32 accumulation order may change (SC-15943). The
+/// chunking engages only on the over-budget denoise self-attention and stays a no-op single pass — that
+/// one byte-identical by construction, being literally the same call — for the small cross-attention
+/// (S_kv = text tokens) and every in-budget size.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     let dtype = q.dtype();
     let bf16 = wan_self_attn_bf16_softmax();
@@ -758,6 +762,53 @@ mod tests {
         WanTransformer::new(cfg, vb).unwrap()
     }
 
+    /// Max-abs bound for a **chunked-vs-un-chunked SDPA** comparison (SC-15943). Query-row chunking is
+    /// mathematically equivalent, never bitwise equal: it changes the GEMM `M` dimension, and candle's
+    /// CPU `gemm` and cuBLAS may pick a different tiling and accumulation order per `M`, so the f32
+    /// rounding differs. This is the metric + limit the parity-evidence rule asks for, not a "looks
+    /// similar" fudge.
+    ///
+    /// **Measured, on the host that exposed the defect** (macOS 26.x / Darwin 25.5.0, Apple silicon,
+    /// toolchain 1.96.0) — 1,000,000 random draws at this test's `[1,2,7,4]` shape, both budgets, i.e.
+    /// 2e6 tensor comparisons / ~3.8e7 differing elements:
+    ///
+    /// | quantity                                    | measured                  |
+    /// |---------------------------------------------|---------------------------|
+    /// | draws where `budget 42` differs from single  | 99.7 % (never 0.0)        |
+    /// | draws where `budget 1` differs from single   | 100 %                     |
+    /// | worst max\|Δ\| over 1e6 draws                | **1.31e-6**               |
+    /// | differing elements above `1e-6`             | 1 of 37,978,005           |
+    /// | differing elements above `2e-6`             | 0                         |
+    /// | `probs·v` alone, bit-identical inputs        | diverges (up to 2.4e-7)   |
+    ///
+    /// The last row is the mechanism isolated: feeding *bit-identical* `probs` and `v` and varying only
+    /// `M` already diverges, so this is GEMM shape — not the softmax and not the f32 upcast.
+    ///
+    /// Deliberately stated as an **absolute** bound rather than in ULP. The deltas land on
+    /// near-cancelling output elements, so a per-element ULP ratio is unbounded (a measured
+    /// 1.4e7 "ULP" at an element near zero) and describes nothing useful; against the tensor's own
+    /// scale (|out| ≲ 4.5 for unit-normal inputs) the same worst case is only ~3 ULP. Two references,
+    /// six orders apart, which is exactly why the assertion tests the absolute delta.
+    ///
+    /// `1e-5` sits ~8× above the measured worst case, and ~5 orders below what any real chunking
+    /// regression produces — a mis-narrowed offset, a mis-ordered `cat`, or a dropped softmax all move
+    /// whole rows, i.e. O(1); the two mutations run for SC-15943 gave 1.6e0 and 9.6e-1. It is also the
+    /// bound the shared kernel's own equivalence helper uses for this comparison
+    /// (`candle_gen::attention`'s `approx_eq`), so the two crates agree.
+    ///
+    /// Do **not** tighten this. `1e-6` — the bound SC-15943's own analysis first proposed, from a
+    /// 20k-draw sample whose worst case was 7.2e-7 — is *below* the measured 1e6-draw tail of 1.31e-6:
+    /// it does not merely flake, it fails. Do **not** "fix" this by seeding the RNG either; that hides
+    /// the tail behind one lucky draw and leaves a false invariant standing for the next `M`, host, or
+    /// BLAS version.
+    ///
+    /// **This host is the outlier, and no CI lane checks it.** On x86-64 Linux the same comparison is
+    /// exactly `0.0` — `Candle CPU packages (Linux)` is green on main while main still asserts
+    /// `== 0.0`. That lane (`ubuntu-latest`) is the only one that runs these lib tests; the macOS lane
+    /// reaches `candle-gen*` through Clippy alone, so on arm64 this test is compiled and never
+    /// executed. The invariant was never evaluated on the architecture that breaks it.
+    const CHUNK_PARITY_MAX_ABS: f32 = 1e-5;
+
     fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
         (a - b)
             .unwrap()
@@ -864,11 +915,20 @@ mod tests {
     }
 
     /// The ported sc-6217 query-row chunking (sc-12434): forcing a tiny scores budget must split the
-    /// query rows yet reproduce the single un-chunked pass — byte-for-byte (exact `0.0`), since each
-    /// query row's softmax is independent. This is the guarantee that stops the A14B self-attention
-    /// from materializing the whole `[B,H,S,S]` block. Counting softmax invocations **through the
-    /// production `sdpa_budgeted`** proves the render's own path chunks (one call per query block), so
-    /// a regression back to a single materialized pass fails here, not just a silently-slower one.
+    /// query rows yet reproduce the single un-chunked pass to within [`CHUNK_PARITY_MAX_ABS`], since
+    /// each query row's softmax is over all keys and independent of the other rows. This is the
+    /// guarantee that stops the A14B self-attention from materializing the whole `[B,H,S,S]` block.
+    /// Counting softmax invocations **through the production `sdpa_budgeted`** proves the render's own
+    /// path chunks (one call per query block), so a regression back to a single materialized pass fails
+    /// here, not just a silently-slower one.
+    ///
+    /// **Per-row independence is a statement about the math, not about the bits** (SC-15943). This
+    /// asserted exact `0.0` until SC-15943: narrowing the query axis changes the GEMM `M` dimension
+    /// (7 → 3/3/1 here), and candle's CPU `gemm` and cuBLAS are both free to select a different tiling
+    /// and accumulation order at a different `M`. A different summation order over f32 perturbs the low
+    /// bits, so bit-identity is not available on this path and never was — see [`CHUNK_PARITY_MAX_ABS`]
+    /// for the measured distribution and bound, and `candle_gen::sdpa_budgeted_bhsd`'s own contract,
+    /// which says the same thing.
     #[test]
     fn sdpa_chunks_query_rows_and_matches_single_pass() {
         use std::cell::Cell;
@@ -880,13 +940,26 @@ mod tests {
         let scale = (d as f64).powf(-0.5);
         let dtype = q.dtype();
 
-        // Production default budget (ATTN_SCORES_BUDGET ≫ this size) is a single un-chunked pass.
+        // Production default budget (ATTN_SCORES_BUDGET ≫ this size) is a single un-chunked pass. Pin
+        // that rather than assume it: `single` is the reference both tolerance checks below compare
+        // against, and the counting closure is wired only into the `sdpa_budgeted` calls, so nothing
+        // else would notice if `single` itself started chunking. `sdpa_bhsd_impl` takes the un-chunked
+        // branch iff `budget / (b·h·sk) >= sq`, i.e. `budget >= b·h·sk·sq` — so a `WAN_ATTN_SCORES_BUDGET`
+        // override small enough to chunk the reference fails here loudly instead of being absorbed by
+        // the tolerance (SC-15943).
+        assert!(
+            wan_self_attn_budget() >= b * h * s * s,
+            "the reference pass must be un-chunked: budget {} < b·h·sk·sq {}",
+            wan_self_attn_budget(),
+            b * h * s * s
+        );
         let single = sdpa(&q, &k, &v, scale).unwrap();
 
         // Drive the PRODUCTION `sdpa_budgeted` with a call-counting wrapper of the exact f32-upcast
         // softmax and tiny budgets. budget 42 → block = 42/(b·h·sk) = 42/14 = 3 → blocks 3,3,1 over
         // S=7 (3 calls); budget 1 → 7 single-row blocks (7 more calls). A regression that stopped
-        // chunking would report 1 and fail. Each chunked result is byte-identical to the single pass.
+        // chunking would report 1 and fail. Each chunked result matches the single pass to
+        // `CHUNK_PARITY_MAX_ABS` — a rounding-order difference, not a bit-identity (SC-15943).
         let calls = Cell::new(0usize);
         let counting = |scores: &Tensor| {
             calls.set(calls.get() + 1);
@@ -898,17 +971,17 @@ mod tests {
             3,
             "budget 42 must split S=7 into 3 query-row blocks (3,3,1)"
         );
-        assert_eq!(
-            max_abs(&single, &chunked),
-            0.0,
-            "chunked attention must be byte-identical to the single pass"
+        let d_chunked = max_abs(&single, &chunked);
+        assert!(
+            d_chunked < CHUNK_PARITY_MAX_ABS,
+            "chunked attention diverged from the single pass: max|Δ| {d_chunked:e} ≥ {CHUNK_PARITY_MAX_ABS:e}"
         );
         let block1 = sdpa_budgeted(&q, &k, &v, scale, 1, counting).unwrap();
         assert_eq!(calls.get(), 10, "budget 1 adds 7 single-row blocks (3 + 7)");
-        assert_eq!(
-            max_abs(&single, &block1),
-            0.0,
-            "single-row chunks must be byte-identical to the single pass"
+        let d_block1 = max_abs(&single, &block1);
+        assert!(
+            d_block1 < CHUNK_PARITY_MAX_ABS,
+            "single-row chunks diverged from the single pass: max|Δ| {d_block1:e} ≥ {CHUNK_PARITY_MAX_ABS:e}"
         );
 
         // The production budget genuinely engages at the story's 832x480 A14B proof geometry
@@ -930,11 +1003,12 @@ mod tests {
     }
 
     /// sc-12894 parity gate for the **bf16-softmax** lever (the `WAN_ATTN_SOFTMAX_BF16` knob). The
-    /// chunk lever is byte-exact (proven above); the bf16 softmax is not — it trades the f32 upcast for
-    /// half the per-chunk transient. This bounds that trade against the actual CUDA kernels (bf16 matmul
-    /// and softmax are CUDA-only — CPU has no bf16 matmul), so a regression that widened the gap (say a
-    /// bf16 sum accumulator) is caught here and the delta the GPU render's PSNR check corroborates is
-    /// quantified. The two paths must stay tightly correlated: the CUDA bf16 softmax still max-stabilizes
+    /// chunk lever is a rounding-order effect bounded by [`CHUNK_PARITY_MAX_ABS`] (`1e-5`); the bf16
+    /// softmax is a far coarser trade — it gives up the f32 upcast for half the per-chunk transient, so
+    /// its bound below is `0.05`, nearly four orders wider. This bounds that trade against the actual
+    /// CUDA kernels (bf16 matmul and softmax are CUDA-only — CPU has no bf16 matmul), so a regression
+    /// that widened the gap (say a bf16 sum accumulator) is caught here and the delta the GPU render's
+    /// PSNR check corroborates is quantified. The two paths must stay tightly correlated: the CUDA bf16 softmax still max-stabilizes
     /// and sums in f32, so only the `exp`/probs carry ~2^-8 bf16 rounding and the attention output — a
     /// convex combination of unit-scale values — tracks the f32 path to well within a distilled sampler's
     /// tolerance.
