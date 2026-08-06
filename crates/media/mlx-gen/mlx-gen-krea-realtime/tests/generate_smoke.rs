@@ -2737,6 +2737,23 @@ fn eviction_rolls(latent_frames: usize, frames_per_block: usize, window: i64) ->
 /// The bounded rows run at both buckets, and **both buckets are recorded** — see
 /// [`the_recorded_s18_sweep_is_what_the_docs_claim`].
 ///
+/// ⚠️ **Row F is a whole-host risk on a *shared* machine, not only on a CI runner (sc-17807).** The
+/// preflight's budget subtracts a fixed 60 GiB of non-MLX overhead, calibrated on a dedicated
+/// runner. A dev Mac with several agent worktrees building concurrently is not that box, and its
+/// real overhead is not knowable in advance. Running rows A/D/F unattended on one — after checking
+/// `uptime`, which reports load and says nothing about memory — OOM-crashed it, at row A's
+/// AR→VAE-decode transition where the footprint peaks (the AR peak plus the pinned 20 GiB decode
+/// budget). Check free memory (`vm_stat`, free + inactive), require roughly 2× the predicted peak,
+/// and re-check before every cell rather than once at the start.
+///
+/// **The sc-17807 KV-tier A/B therefore ran rows A and D only**, and that costs the comparison
+/// nothing structural: [`S18Sweep::kv_tier_comparison`] compares whatever rows are present in both
+/// arms, and [`S18Sweep::validate_window_dose_ladder`] returns early without F. What it does cost is
+/// the widest *dose* — the tier's saving grows with the window, so row F is where quantizing helps
+/// most, and it is exactly the row the A/B has no local measurement for. Its q8 prediction (~19 GiB
+/// of KV against 35.7 bf16, i.e. the row that killed `nax-macos-2` becoming affordable on it) stays
+/// a **prediction** until someone runs it on a host that can hold it.
+///
 /// ⚠️ Must be run on a tree that has sc-15325 (the tiled-decode fix). Before it, the decode injected an
 /// 8-output-frame-period artifact that a drift metric reads as AR drift; an earlier attempt at this
 /// exact measurement drew the wrong conclusion from it.
