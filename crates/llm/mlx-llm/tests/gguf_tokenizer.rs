@@ -28,6 +28,9 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::eos_token_ids;
 
+mod common;
+use common::{assert_fixture_is_a_guarded_entry, Fixture};
+
 /// A varied corpus exercising the pieces that distinguish a correct reconstruction from a vocab-only
 /// one: leading/internal spaces, digits (the digit-split families), punctuation, casing, unicode,
 /// newlines, code, and special-token strings.
@@ -44,11 +47,15 @@ const CORPUS: &[&str] = &[
     "Mixing<|im_start|>special tokens inline",
 ];
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mlx-llm-tok-test-{}-{label}", std::process::id()))
+/// A guarded output path for the converter (sc-17768) — see [`Fixture`]. Points inside a `TempDir`
+/// root because the converter refuses a pre-existing output directory.
+fn tmp_out(label: &str) -> Fixture {
+    Fixture::new(&format!("mlx-llm-tok-test-{label}-"), Some("out"))
 }
 
-fn convert_self_contained(gguf: &str) -> (std::path::PathBuf, TokenizerStatus) {
+/// Returns the fixture *with* the snapshot: the caller keeps reading the converted directory, so
+/// the guard has to reach it rather than dropping at the end of this helper.
+fn convert_self_contained(gguf: &str) -> (Fixture, TokenizerStatus) {
     let out = tmp_out("snap");
     // No --tokenizer: the snapshot must stand on its own.
     let report = convert_file(gguf, &out, ConvertOptions::default()).expect("convert failed");
@@ -109,7 +116,6 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
             ));
         }
     }
-    std::fs::remove_dir_all(&out).ok();
     assert!(
         mismatches.is_empty(),
         "{} / {} corpus lines diverged:\n  {}",
@@ -170,9 +176,15 @@ fn gguf_bpe_snapshot_runs_self_contained() {
         .decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
         .unwrap();
     println!("self-contained generation :: {}", text.replace('\n', " "));
-    std::fs::remove_dir_all(&out).ok();
     assert!(
         !text.trim().is_empty(),
         "self-contained snapshot produced no text"
     );
+}
+
+/// Drop-regression for this suite's fixture helper: the guarded root leaves with the value. Flip
+/// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+#[test]
+fn gguf_tokenizer_fixture_is_self_removing() {
+    assert_fixture_is_a_guarded_entry(tmp_out("guard"));
 }

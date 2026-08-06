@@ -16,6 +16,9 @@ use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::{load_for_model, LlamaProvider};
 
+mod common;
+use common::{assert_fixture_is_self_removing, Fixture};
+
 const VOCAB: usize = 32;
 
 fn randn(shape: &[i32], rng: &mut SplitMix64) -> Array {
@@ -42,9 +45,12 @@ fn tokenizer_json() -> String {
     )
 }
 
-fn write_snapshot() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mlx-llm-conformance-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+fn write_snapshot() -> Fixture {
+    // sc-17768: the fixture owns a `TempDir` guard, so the snapshot leaves on `Drop` — including
+    // out of a panicking test, which the trailing `remove_dir_all` lines never covered. Bind it for
+    // as long as the snapshot is read: MLX's `load_safetensors` is lazy, so a provider loaded from
+    // here is still bound to this directory.
+    let dir = Fixture::new("mlx-llm-conformance-", None);
     // eos_token_id outside the vocab so generation always runs to the token budget.
     let config = format!(
         r#"{{
@@ -103,29 +109,23 @@ fn llama_provider_passes_core_llm_conformance() {
 
     // Sanity: the provider id the suite checked is the registered one.
     assert_eq!(PROVIDER_ID, "mlx-llama");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 #[ignore = "needs an HF/GGUF model source via MLX_LLM_PREPARE_SOURCE"]
 fn real_snapshot_preparer_passes_core_llm_conformance() {
     let source = std::env::var("MLX_LLM_PREPARE_SOURCE").expect("set MLX_LLM_PREPARE_SOURCE");
-    let out_dir = std::env::temp_dir().join(format!(
-        "mlx-llm-prepare-conformance-{}",
-        std::process::id()
-    ));
-    std::fs::remove_dir_all(&out_dir).ok();
+    let out_dir = Fixture::new("mlx-llm-prepare-conformance-", Some("out"));
     check_snapshot_preparer(
         &SnapshotPreparerProfile {
             source: PathBuf::from(source),
-            out_dir: out_dir.clone(),
+            out_dir: out_dir.to_path_buf(),
             quantize: Some(core_llm::Quantize::Q4),
         },
         &mlx_llm::snapshot_preparer_registry().expect("MLX preparer registry"),
         &mlx_llm::text_registry().expect("MLX text registry"),
     )
     .expect("snapshot preparer conformance");
-    std::fs::remove_dir_all(&out_dir).ok();
 }
 
 #[test]
@@ -179,9 +179,8 @@ fn real_qwen35_passes_core_llm_conformance() {
 
 /// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
 /// is weightless and architecture-aware.
-fn write_config_only(name: &str, config: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mlx-llm-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+fn write_config_only(name: &str, config: &str) -> Fixture {
+    let dir = Fixture::new(&format!("mlx-llm-{name}-"), None);
     std::fs::write(dir.join("config.json"), config).unwrap();
     dir
 }
@@ -202,7 +201,6 @@ fn can_load_is_weightless_and_architecture_aware() {
         !mlx_llm::joycaption::can_load(&lspec),
         "vision provider must decline a text snapshot"
     );
-    let _ = std::fs::remove_dir_all(&llama);
 
     // An unsupported architecture is declined (no panic, no silent default).
     let unknown = write_config_only(
@@ -211,7 +209,6 @@ fn can_load_is_weightless_and_architecture_aware() {
     );
     let uspec = LoadSpec::dense(unknown.to_str().unwrap().to_string());
     assert!(!mlx_llm::provider::can_load(&uspec));
-    let _ = std::fs::remove_dir_all(&unknown);
 
     // A multimodal snapshot: the text provider declines (a `vision_config` is present even though
     // the nested text arch is llama), the vision provider claims it.
@@ -230,7 +227,6 @@ fn can_load_is_weightless_and_architecture_aware() {
         mlx_llm::joycaption::can_load(&vspec),
         "vision provider must claim a VLM"
     );
-    let _ = std::fs::remove_dir_all(&vlm);
 
     // A nonexistent path is declined gracefully.
     assert!(!mlx_llm::provider::can_load(&LoadSpec::dense(
@@ -253,7 +249,6 @@ fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
     let req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 4);
     let out = llm.complete(&req).expect("generate");
     assert!(!out.text.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -274,7 +269,6 @@ fn load_for_model_unknown_architecture_is_a_typed_error() {
         Err(e) => panic!("expected Unsupported, got error: {e}"),
         Ok(_) => panic!("expected Unsupported, got a loaded provider"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -314,4 +308,15 @@ fn load_for_model_round_trips_real_qwen3() {
                 .is_some_and(|t| !t.trim().is_empty()),
         "expected text on the answer or reasoning channel"
     );
+}
+
+/// Drop-regression for this suite's two fixture helpers: each takes its whole tree with it. Flip
+/// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+#[test]
+fn conformance_fixtures_are_self_removing() {
+    assert_fixture_is_self_removing(write_snapshot());
+    assert_fixture_is_self_removing(write_config_only(
+        "guard-config-only",
+        r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":8}"#,
+    ));
 }
