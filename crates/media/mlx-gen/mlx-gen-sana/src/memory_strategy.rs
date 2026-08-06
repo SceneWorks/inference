@@ -18,6 +18,15 @@
 //! only with the token count `N = (edge/32)²` — 6.14 Mi f32 scores at 1024², which is why the
 //! sibling families' 64 Mi operating point is inert here and SANA publishes its own budgets.
 //!
+//! **The exactness claim has a measured boundary.** Query-row chunking leaves each row's complete
+//! k/v and both reductions untouched, but it changes the query GEMM's `M` dimension, and at `M = 1`
+//! MLX dispatches a different (gemv) kernel whose accumulation order differs — measured at ~1e-6
+//! relative on this provider. So rung 3 is bit-exact **over its published domain**, not
+//! unconditionally: the narrowest chunk any published budget produces anywhere in the advertised
+//! 256..=1024 range is **174 query rows**, and
+//! `a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one` pins both halves of
+//! that — the degenerate case is not exact, and the domain cannot reach it.
+//!
 //! ## Rung 4's availability is a per-LOAD fact
 //!
 //! A window rebuilds trunk blocks from the snapshot, so it needs a **re-openable source**

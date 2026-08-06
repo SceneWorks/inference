@@ -198,6 +198,62 @@ mod tests {
         )
     }
 
+    fn run_budgeted(
+        block: &SanaBlock,
+        cfg: &SanaTransformerConfig,
+        budget: mlx_gen::attention::AttentionBudget,
+    ) -> Vec<f32> {
+        let (hidden, caption, temb) = inputs(cfg);
+        let out = block
+            .forward(&hidden, &caption, None, &temb, 2, 2, budget)
+            .unwrap();
+        out.as_slice::<f32>().to_vec()
+    }
+
+    /// **The block threads rung 3 down to `attn2`, and nothing else in the block sees it.**
+    ///
+    /// `chunked_cross_attention_is_bit_exact_and_actually_chunks` proves the kernel; this proves the
+    /// wiring one level up, which is a separate failure. A block that accepted the budget and then
+    /// called `attn2` with `UNBOUNDED` would pass every equivalence assertion in this crate — the
+    /// output is identical either way — so the chunk-count probe is what makes this able to fail.
+    ///
+    /// It also pins the `attn1` half of the architecture claim: SANA's ReLU-linear self-attention
+    /// has no score tensor, so it is never handed a budget and the block's output under a tight
+    /// budget is bit-identical rather than merely close.
+    #[test]
+    fn a_block_forward_threads_the_attention_budget_to_attn2() {
+        let cfg = cfg(false);
+        let dir = write_fixture("budget", &cfg);
+        let stream = SanaBlockStream::new(&dir, cfg.clone());
+        let mut view = stream.open().unwrap();
+        let block = stream.materialize(&mut view, 0).unwrap();
+
+        crate::transformer::reset_chunk_count();
+        let unbounded = run_budgeted(&block, &cfg, mlx_gen::attention::AttentionBudget::UNBOUNDED);
+        assert_eq!(crate::transformer::last_chunk_count(), 1);
+
+        // rows_per_query = B·H·Sk = 1·2·3 = 6, so a 12-element budget is TWO query rows per chunk.
+        // Deliberately not one: a single-row chunk moves the GEMM's M dimension into MLX's gemv
+        // regime and is NOT bit-exact — see
+        // `a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one`.
+        crate::transformer::reset_chunk_count();
+        let chunked = run_budgeted(
+            &block,
+            &cfg,
+            mlx_gen::attention::AttentionBudget::from_score_elements(12, true),
+        );
+        assert!(
+            crate::transformer::last_chunk_count() > 1,
+            "the block must hand its budget to attn2, got {} chunk(s)",
+            crate::transformer::last_chunk_count()
+        );
+        assert_eq!(
+            unbounded, chunked,
+            "rung 3 through a whole block must stay bit-exact"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn run(block: &SanaBlock, cfg: &SanaTransformerConfig) -> Vec<f32> {
         let (hidden, caption, temb) = inputs(cfg);
         let out = block

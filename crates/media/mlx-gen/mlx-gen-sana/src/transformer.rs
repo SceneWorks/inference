@@ -876,7 +876,11 @@ mod tests {
 
     /// A synthetic cross-attention with the production head geometry but a small token axis, so the
     /// rung-3 kernel is exercised without weights.
-    fn cross_attn(heads: i32, inner: i32, qk_norm: bool) -> (CrossAttn, SanaTransformerConfig) {
+    pub(super) fn cross_attn(
+        heads: i32,
+        inner: i32,
+        qk_norm: bool,
+    ) -> (CrossAttn, SanaTransformerConfig) {
         let cfg = SanaTransformerConfig {
             num_cross_attention_heads: heads,
             cross_attention_head_dim: inner / heads,
@@ -913,7 +917,7 @@ mod tests {
         (CrossAttn::load(&weights, "attn2", &cfg).unwrap(), cfg)
     }
 
-    fn tokens(b: i32, n: i32, inner: i32, seed: f32) -> Array {
+    pub(super) fn tokens(b: i32, n: i32, inner: i32, seed: f32) -> Array {
         Array::from_slice(
             &(0..b * n * inner)
                 .map(|k| (k as f32 * 0.007 + seed).cos())
@@ -1059,5 +1063,101 @@ mod tests {
         );
         assert!(SanaForwardPlan::RESIDENT.window.is_none());
         assert!(AttentionBudget::UNBOUNDED.is_unbounded());
+    }
+}
+
+#[cfg(test)]
+mod query_row_boundary_tests {
+    use super::*;
+    use crate::config::SanaTransformerConfig;
+
+    /// **A single-query-row chunk is NOT bit-exact, and the published domain cannot reach one.**
+    ///
+    /// This is the boundary of rung 3's exactness claim, measured rather than asserted. Query-row
+    /// chunking leaves each row's complete k/v and both reductions untouched, so the *arithmetic* is
+    /// identical — but it changes the query GEMM's `M` dimension, and at `M = 1` MLX dispatches a
+    /// different (gemv) kernel whose accumulation order differs. Measured on a synthetic block the
+    /// divergence is ~1e-6 relative: invisible in an image, and still a numerics change rather than a
+    /// memory schedule.
+    ///
+    /// `gen_core::attention_budget` says exactly this in the abstract — "query-row chunking changes
+    /// `M` and may move results by a few ULP" — and SANA is where it was measured. The response is
+    /// the epic's standard one: the DOMAIN excludes the degenerate case, and that exclusion is
+    /// checked over the whole advertised size range rather than at one convenient point.
+    #[test]
+    fn a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one() {
+        // The exactness boundary, on the smallest shape that exhibits it.
+        let (attn, _) = super::tests::cross_attn(4, 16, false);
+        let x = super::tests::tokens(1, 64, 16, 0.1);
+        let kv = super::tests::tokens(1, 12, 16, 0.2);
+        let full = attn
+            .forward(&x, &kv, None, AttentionBudget::UNBOUNDED)
+            .unwrap();
+        // rows_per_query = 1·4·12 = 48.
+        let one_row = attn
+            .forward(
+                &x,
+                &kv,
+                None,
+                AttentionBudget::from_score_elements(48, true),
+            )
+            .unwrap();
+        let two_rows = attn
+            .forward(
+                &x,
+                &kv,
+                None,
+                AttentionBudget::from_score_elements(96, true),
+            )
+            .unwrap();
+        assert_eq!(last_chunk_count(), 32, "96 scores must be two rows a chunk");
+        assert_eq!(
+            full.as_slice::<f32>(),
+            two_rows.as_slice::<f32>(),
+            "two query rows a chunk must stay bit-exact"
+        );
+        assert_ne!(
+            full.as_slice::<f32>(),
+            one_row.as_slice::<f32>(),
+            "a single-row chunk is expected NOT to be bit-exact — if MLX ever made it exact, this \
+             test is the place that records the change, and the domain guard below can relax"
+        );
+
+        // The domain guard: the tightest published budget over the whole advertised size range.
+        let cfg = SanaTransformerConfig::sana_1600m();
+        let heads = cfg.num_cross_attention_heads;
+        let caption = 300;
+        let tightest = AttentionBudget::from_score_elements(
+            u64::from(crate::memory_strategy::ATTENTION_CHUNK_SIZE),
+            true,
+        );
+        let mut narrowest = i32::MAX;
+        // SANA advertises 256..=1024 on a 32-pixel stride; every one of those is a reachable
+        // request, so every one of them is checked.
+        let mut edge = 256;
+        while edge <= 1024 {
+            let n = (edge / 32) * (edge / 32);
+            for budget in crate::memory_strategy::ATTENTION_CHUNK_SIZES {
+                let plan = AttentionBudget::from_score_elements(u64::from(*budget), true);
+                let block = plan.query_block(1, heads, n, caption);
+                assert!(
+                    block > 1,
+                    "budget {budget} degenerates to a {block}-row chunk at {edge}sq"
+                );
+                if block < n {
+                    narrowest = narrowest.min(block);
+                }
+            }
+            let _ = tightest;
+            edge += 32;
+        }
+        // Recorded, not merely bounded: the narrowest chunk any published budget produces anywhere in
+        // the advertised range is 174 query rows, three orders of magnitude clear of the degenerate
+        // case. A new budget that narrowed this would have to move this number.
+        assert_eq!(
+            narrowest, 174,
+            "the narrowest published chunk width moved; re-measure the exactness boundary before \
+             publishing the new budget"
+        );
     }
 }
