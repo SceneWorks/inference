@@ -40,6 +40,7 @@
 //! the guidance scalar is an embedded conditioning input), so its descriptor advertises NO
 //! `supported_guidance_methods`.
 
+pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod dc_ae;
@@ -126,7 +127,8 @@ mod explicit_registry_tests {
         let spec = LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/sana-memory-contract-fixture".into(),
         ))
-        .with_offload_policy(OffloadPolicy::Sequential);
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
 
         for provider_id in [super::MODEL_ID, super::SPRINT_MODEL_ID] {
             let contract = registry
@@ -135,34 +137,13 @@ mod explicit_registry_tests {
                 .expect("SANA provider should expose a memory contract");
 
             assert_eq!(contract.provider_id, provider_id);
-            assert_eq!(
-                contract
-                    .capability(MemoryStrategy::StagedResidency)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Implemented
-            );
-            assert_eq!(
-                contract
-                    .capability(MemoryStrategy::BoundedDecode)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Implemented
-            );
-            assert_eq!(
-                contract
-                    .capability(MemoryStrategy::BoundedAttention)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Missing
-            );
-            assert_eq!(
-                contract
-                    .capability(MemoryStrategy::BoundedTransformerResidency)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Missing
-            );
+            for strategy in MemoryStrategy::ALL {
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    MemoryStrategySupport::Implemented,
+                    "{provider_id} must publish {strategy:?} on the full-ladder route"
+                );
+            }
         }
     }
 }

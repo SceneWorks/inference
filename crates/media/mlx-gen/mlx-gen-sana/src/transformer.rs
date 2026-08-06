@@ -39,18 +39,82 @@
 
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{
-    add, clip, divide, matmul, multiply, softmax_axis, split_sections, subtract, sum_axes,
+    add, clip, concatenate_axis, divide, matmul, multiply, softmax_axis, split_sections, subtract,
+    sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::attention::AttentionBudget;
+use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
+use crate::block_stream::SanaBlockStream;
 use crate::config::SanaTransformerConfig;
 
 const F32: Dtype = Dtype::Float32;
+
+/// The two constrained rungs a single trunk forward may run under (SC-15523).
+///
+/// Rung 3 is [`Self::attention`] — the score budget SANA's `attn2` cross-attention chunks its query
+/// rows against. Rung 4 is [`Self::window`] — the block cadence the trunk materializes its
+/// `transformer_blocks` stack in. [`Self::resident`] is the historical path: an unbounded budget and
+/// no window, so a request that selects neither rung runs byte-for-byte the pre-SC-15523 forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SanaForwardPlan {
+    pub(crate) attention: AttentionBudget,
+    pub(crate) window: Option<BlockPlan>,
+}
+
+impl SanaForwardPlan {
+    /// The unbounded path — no attention chunking, no block window. Byte-for-byte the pre-SC-15523
+    /// forward.
+    pub(crate) const RESIDENT: Self = Self {
+        attention: AttentionBudget::UNBOUNDED,
+        window: None,
+    };
+}
+
+/// Test-only observation of how many query chunks the last [`CrossAttn::forward`] actually ran.
+///
+/// Without it every "chunked == unbounded" equivalence assertion in this crate passes with the
+/// chunking deleted, because the claim is trivially true when the lever never engages. Mirrors
+/// [`mlx_gen::attention`]'s probe. Compiled out entirely in release.
+#[cfg(test)]
+mod cross_attn_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Chunks run by the most recent cross-attention call (`1` = the unchunked path).
+    pub(crate) fn last_chunk_count() -> usize {
+        LAST_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset() {
+        LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) use cross_attn_probe::{last_chunk_count, reset as reset_chunk_count};
+
+#[cfg(test)]
+fn record_chunk_count(n: usize) {
+    cross_attn_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_chunk_count(_n: usize) {}
+
+/// Contiguous `[.., start..start+len, ..]` slice along `axis` via boundary splits — no host index
+/// vector and no gather, matching [`mlx_gen::attention`]'s own helper.
+fn slice_axis(a: &Array, axis: i32, start: i32, len: i32) -> Result<Array> {
+    Ok(a.split_axis(&[start, start + len], axis)?.swap_remove(1))
+}
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
@@ -284,7 +348,33 @@ impl CrossAttn {
     /// `x` (query) `[B, N, C]`, `kv` (caption) `[B, M, C]`, `kv_mask` (optional `[B, M]`, `1.0` real /
     /// `0.0` padding) — the caption padding mask diffusers passes as `encoder_attention_mask`. Applied
     /// additively to the pre-softmax logits so PAD keys contribute nothing.
-    fn forward(&self, x: &Array, kv: &Array, kv_mask: Option<&Array>) -> Result<Array> {
+    ///
+    /// ## Rung 3 (SC-15523): why the chunking lives here and not on the shared MLX kernel
+    ///
+    /// [`mlx_gen::attention::sdpa_budgeted_bhsd`] is the MLX kernel for the **fused**
+    /// `scaled_dot_product_attention`, which never materializes a score tensor — on that kernel the
+    /// only rung-3 lever is the per-chunk graph cut. SANA's `attn2` is the other case the shared
+    /// planner's module doc names explicitly: a hand-rolled `matmul → mask → softmax → matmul` that
+    /// **does** materialize `[B, H, N, M]` in f32. Routing it through the fused kernel would swap
+    /// SANA's arithmetic for Metal's fused one on the RESIDENT path too, which is a numerics change,
+    /// not a memory rung — so the kernel stays SANA's and only the **planner** is shared. That is
+    /// exactly the split [`gen_core::attention_budget`] prescribes (shared planner, per-backend and
+    /// per-shape kernel); no budget arithmetic is re-derived here.
+    ///
+    /// Chunking is along the query axis only. Each output row `n` depends on `q[.., n, ..]` and the
+    /// **complete** k/v, and both reductions (`hd` for the logits, `M` for the context) are untouched
+    /// by the split, so the chunked result is the unchunked result row for row.
+    ///
+    /// `attn1` is deliberately **not** chunked: SANA's ReLU-linear self-attention has no score tensor
+    /// at all (`num = (V·Kᵀ)·Q` collapses the key axis into a `[B, H, hd, hd]` gram matrix), so there
+    /// is nothing for a score budget to bound there.
+    fn forward(
+        &self,
+        x: &Array,
+        kv: &Array,
+        kv_mask: Option<&Array>,
+        budget: AttentionBudget,
+    ) -> Result<Array> {
         let xsh = x.shape();
         let (b, n) = (xsh[0], xsh[1]);
         let m = kv.shape()[1];
@@ -316,21 +406,47 @@ impl CrossAttn {
 
         // Softmax SDPA in f32 (caption seq is short; full attention).
         let qf = q.as_dtype(F32)?;
-        let kf = k.as_dtype(F32)?;
-        let scores = multiply(&matmul(&qf, &kf.transpose_axes(&[0, 1, 3, 2])?)?, &scale)?; // [B,H,N,M]
-                                                                                           // Additive caption padding mask: PAD keys (mask==0) get a large negative bias → ~0 after
-                                                                                           // softmax. Broadcast [B,M] → [B,1,1,M] over heads and query positions. Without this, a short
-                                                                                           // prompt (300 slots dominated by PAD) lets padding embeddings swamp the real conditioning.
-        let scores = match kv_mask {
-            Some(mask) => {
+        let kt = k.as_dtype(F32)?.transpose_axes(&[0, 1, 3, 2])?; // [B,H,hd,M]
+        let vf = v.as_dtype(F32)?; // [B,H,M,hd]
+                                   // Additive caption padding mask: PAD keys (mask==0) get a large negative bias → ~0 after
+                                   // softmax. Broadcast [B,M] → [B,1,1,M] over heads and query positions. Without this, a short
+                                   // prompt (300 slots dominated by PAD) lets padding embeddings swamp the real conditioning.
+                                   // It is broadcast over the query axis, so every chunk shares it unmodified.
+        let bias = kv_mask
+            .map(|mask| -> Result<Array> {
                 let mask = mask.as_dtype(F32)?.reshape(&[b, 1, 1, m])?; // 1.0 real / 0.0 pad
-                let bias = multiply(&subtract(scalar(1.0), &mask)?, scalar(-1e9))?; // 0 / -1e9
-                add(&scores, &bias)?
-            }
-            None => scores,
+                Ok(multiply(&subtract(scalar(1.0), &mask)?, scalar(-1e9))?) // 0 / -1e9
+            })
+            .transpose()?;
+        let attend = |q_rows: &Array| -> Result<Array> {
+            let scores = multiply(&matmul(q_rows, &kt)?, &scale)?; // [B,H,n,M]
+            let scores = match &bias {
+                Some(bias) => add(&scores, bias)?,
+                None => scores,
+            };
+            Ok(matmul(&softmax_axis(&scores, -1, None)?, &vf)?) // [B,H,n,hd]
         };
-        let probs = softmax_axis(&scores, -1, None)?;
-        let ctx = matmul(&probs, &v.as_dtype(F32)?)?; // [B,H,N,hd]
+
+        let block = budget.query_block(b, self.heads, n, m);
+        let ctx = if block >= n {
+            record_chunk_count(1);
+            attend(&qf)?
+        } else {
+            let mut outs: Vec<Array> = Vec::with_capacity(n.div_euclid(block) as usize + 1);
+            let mut start = 0;
+            while start < n {
+                let len = block.min(n - start);
+                let out = attend(&slice_axis(&qf, 2, start, len)?)?;
+                if budget.eval_per_chunk() {
+                    mlx_rs::transforms::eval([&out])?;
+                }
+                outs.push(out);
+                start += len;
+            }
+            record_chunk_count(outs.len());
+            let refs: Vec<&Array> = outs.iter().collect();
+            concatenate_axis(&refs, 2)?
+        };
 
         let ctx = ctx
             .transpose_axes(&[0, 2, 1, 3])?
@@ -378,7 +494,7 @@ impl GluMbConv {
 // SanaTransformerBlock.
 // ----------------------------------------------------------------------------------------------
 
-struct SanaBlock {
+pub(crate) struct SanaBlock {
     scale_shift_table: Array, // [6, dim]
     attn1: LinearSelfAttn,
     attn2: CrossAttn,
@@ -387,7 +503,7 @@ struct SanaBlock {
 }
 
 impl SanaBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> Result<Self> {
         Ok(Self {
             scale_shift_table: w.require(&format!("{prefix}.scale_shift_table"))?.clone(),
             attn1: LinearSelfAttn::load(w, &format!("{prefix}.attn1"), cfg)?,
@@ -398,8 +514,11 @@ impl SanaBlock {
     }
 
     /// `hidden` `[B, N, dim]` (N = H·W tokens), `caption` `[B, M, dim]`, `temb` `[B, 6·dim]`.
+    ///
+    /// `budget` is rung 3: [`AttentionBudget::UNBOUNDED`] (the default everywhere) keeps the
+    /// historical single-call cross-attention.
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden: &Array,
         caption: &Array,
@@ -407,6 +526,7 @@ impl SanaBlock {
         temb: &Array,
         h: i32,
         w: i32,
+        budget: AttentionBudget,
     ) -> Result<Array> {
         let dim = self.scale_shift_table.shape()[1];
         let b = hidden.shape()[0];
@@ -425,7 +545,7 @@ impl SanaBlock {
         let hidden = add(hidden, &multiply(&gate_msa, &attn_out)?)?;
 
         // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption, caption_mask)?;
+        let cross = self.attn2.forward(&hidden, caption, caption_mask, budget)?;
         let hidden = add(&cross, &hidden)?;
 
         // 4. Mix-FFN. norm2 → modulate → un-flatten to [B,H,W,dim] → GLUMBConv → flatten → gate.
@@ -463,6 +583,13 @@ pub struct SanaTransformer {
     blocks: Vec<SanaBlock>,
     scale_shift_table: Array, // [2, inner] (output modulated norm)
     proj_out: AdaptableLinear,
+    /// Rung 4 (SC-15523): the re-openable `transformer/` source a window rebuilds blocks from.
+    ///
+    /// `None` for a load with no re-openable source (nothing to stream from), and the contract
+    /// declares `BoundedTransformerResidency` unavailable for exactly those loads. The resident
+    /// [`Self::blocks`] stay lazy MLX handles until something evaluates them, so holding both costs
+    /// nothing: a windowed forward never touches the resident stack, and it never materializes.
+    block_stream: Option<SanaBlockStream>,
 }
 
 impl SanaTransformer {
@@ -508,7 +635,21 @@ impl SanaTransformer {
             scale_shift_table: w.require("scale_shift_table")?.clone(),
             proj_out: crate::quant::lin(w, "proj_out", true)?,
             cfg,
+            block_stream: None,
         })
+    }
+
+    /// Attach the rung-4 block stream. Called by the loader for a re-openable snapshot load; the
+    /// stream must describe the same stack this trunk just built, which
+    /// [`Self::forward_with_memory`] re-checks before it runs a window.
+    pub(crate) fn with_block_stream(mut self, stream: SanaBlockStream) -> Self {
+        self.block_stream = Some(stream);
+        self
+    }
+
+    /// The number of `transformer_blocks` this trunk runs — the rung-4 plan's `n_blocks`.
+    pub(crate) fn n_blocks(&self) -> usize {
+        self.blocks.len()
     }
 
     /// Forward one denoise step.
@@ -524,12 +665,7 @@ impl SanaTransformer {
         self.forward_with_guidance(latent_nchw, caption, timestep, None, None)
     }
 
-    /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint, sc-8490).
-    ///
-    /// * `guidance` — `[B]` (or `[1]`) the CFG-free guidance scalar (already multiplied by the
-    ///   `guidance_embeds_scale` by the caller). `Some` only for a Sprint-config trunk
-    ///   (`guidance_embeds = true`); `None` runs the base AdaLN-single path. Sprint feeds the scale
-    ///   as an embedded conditioning input — it is NOT classifier-free guidance (no uncond forward).
+    /// [`Self::forward_with_guidance`] on the historical unbounded path (no rung 3, no rung 4).
     pub fn forward_with_guidance(
         &self,
         latent_nchw: &Array,
@@ -537,6 +673,42 @@ impl SanaTransformer {
         timestep: &Array,
         guidance: Option<&Array>,
         caption_mask: Option<&Array>,
+    ) -> Result<Array> {
+        self.forward_with_memory(
+            latent_nchw,
+            caption,
+            timestep,
+            guidance,
+            caption_mask,
+            SanaForwardPlan::RESIDENT,
+            &CancelFlag::default(),
+        )
+    }
+
+    /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint, sc-8490).
+    ///
+    /// * `guidance` — `[B]` (or `[1]`) the CFG-free guidance scalar (already multiplied by the
+    ///   `guidance_embeds_scale` by the caller). `Some` only for a Sprint-config trunk
+    ///   (`guidance_embeds = true`); `None` runs the base AdaLN-single path. Sprint feeds the scale
+    ///   as an embedded conditioning input — it is NOT classifier-free guidance (no uncond forward).
+    ///
+    /// `plan` carries the two constrained rungs (SC-15523). Everything outside the block stack —
+    /// patchify, the timestep/guidance embedders, the caption projection, the output modulated norm,
+    /// `proj_out` and unpatchify — is byte-for-byte the resident path, and a streamed block is built
+    /// by the SAME [`SanaBlock::load`] constructor from the SAME on-disk tensors as its resident
+    /// twin (SANA's tiers are packed-detected, and adapters are refused at load, so there is no
+    /// per-block quantization or adapter replay that could diverge). Only *when the weights exist*
+    /// differs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_memory(
+        &self,
+        latent_nchw: &Array,
+        caption: &Array,
+        timestep: &Array,
+        guidance: Option<&Array>,
+        caption_mask: Option<&Array>,
+        plan: SanaForwardPlan,
+        cancel: &CancelFlag,
     ) -> Result<Array> {
         let cfg = &self.cfg;
         let dim = cfg.inner_dim();
@@ -591,9 +763,33 @@ impl SanaTransformer {
 
         // 4. Transformer blocks. The caption padding mask (if any) applies unchanged to every block's
         // attn2 — the per-token caption projection above preserves the M (=300) axis it indexes.
-        for block in &self.blocks {
-            hidden = block.forward(&hidden, &caption, caption_mask, &temb, ph, pw)?;
-        }
+        hidden = match plan.window {
+            None => {
+                for block in &self.blocks {
+                    hidden = block.forward(
+                        &hidden,
+                        &caption,
+                        caption_mask,
+                        &temb,
+                        ph,
+                        pw,
+                        plan.attention,
+                    )?;
+                }
+                hidden
+            }
+            Some(window) => self.run_windowed_blocks(
+                hidden,
+                &caption,
+                caption_mask,
+                &temb,
+                ph,
+                pw,
+                plan.attention,
+                window,
+                cancel,
+            )?,
+        };
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.
         let ss = self.scale_shift_table.reshape(&[1, 2, dim])?;
@@ -613,5 +809,255 @@ impl SanaTransformer {
         let out = out.reshape(&[b, ph, pw, p, p, oc])?;
         let out = out.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
         Ok(out.reshape(&[b, oc, ph * p, pw * p])?)
+    }
+
+    /// Rung 4: walk the 20 `transformer_blocks` in windows, rebuilding each window's weights from the
+    /// snapshot, running them, and releasing them before advancing.
+    ///
+    /// The lifecycle — open a fresh view → apply → **force evaluation of the carried activation** →
+    /// drop the view → release the allocator, with a cancellation check at every window boundary —
+    /// belongs entirely to [`mlx_gen::block_residency::run_windowed`]. Nothing is re-implemented
+    /// here: SC-15750 measured that hand-rolling the drop-before-eval order frees *nothing* on MLX
+    /// (238.4 MiB vs 8.0 MiB at window = 1) while still producing correct images, so a family-local
+    /// copy of the loop is a silent failure waiting to happen.
+    #[allow(clippy::too_many_arguments)]
+    fn run_windowed_blocks(
+        &self,
+        hidden: Array,
+        caption: &Array,
+        caption_mask: Option<&Array>,
+        temb: &Array,
+        h: i32,
+        w: i32,
+        budget: AttentionBudget,
+        window: BlockPlan,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "sana: bounded transformer residency was requested but this trunk has no \
+                 re-openable weights source; the contract declares rung 4 unavailable for such a \
+                 load"
+                    .to_owned(),
+            )
+        })?;
+        // The plan, the resident stack and the stream must all describe the same 20 blocks. A
+        // disagreement would silently skip or double-run layers, so it is an error, not a clamp.
+        if window.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "sana: block plan covers {} blocks and the stream {}, but the trunk has {}",
+                window.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window,
+            cancel,
+            hidden,
+            || stream.open(),
+            |state, view, range| {
+                let mut cur = state;
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    cur = block.forward(&cur, caption, caption_mask, temb, h, w, budget)?;
+                }
+                Ok(cur)
+            },
+            |state| Ok(mlx_rs::transforms::eval([state])?),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET;
+
+    /// A synthetic cross-attention with the production head geometry but a small token axis, so the
+    /// rung-3 kernel is exercised without weights.
+    fn cross_attn(heads: i32, inner: i32, qk_norm: bool) -> (CrossAttn, SanaTransformerConfig) {
+        let cfg = SanaTransformerConfig {
+            num_cross_attention_heads: heads,
+            cross_attention_head_dim: inner / heads,
+            num_attention_heads: heads,
+            attention_head_dim: inner / heads,
+            qk_norm,
+            ..SanaTransformerConfig::sana_1600m()
+        };
+        let mut map = std::collections::HashMap::new();
+        let fill = |n: i32, seed: f32, shape: &[i32]| {
+            Array::from_slice(
+                &(0..n)
+                    .map(|k| (k as f32 * 0.013 + seed).sin())
+                    .collect::<Vec<f32>>(),
+                shape,
+            )
+        };
+        for (i, leaf) in ["to_q", "to_k", "to_v", "to_out.0"].iter().enumerate() {
+            map.insert(
+                format!("attn2.{leaf}.weight"),
+                fill(inner * inner, i as f32, &[inner, inner]),
+            );
+            map.insert(
+                format!("attn2.{leaf}.bias"),
+                fill(inner, i as f32, &[inner]),
+            );
+        }
+        if qk_norm {
+            for leaf in ["norm_q", "norm_k"] {
+                map.insert(format!("attn2.{leaf}.weight"), fill(inner, 0.25, &[inner]));
+            }
+        }
+        let weights = Weights::from_map(map);
+        (CrossAttn::load(&weights, "attn2", &cfg).unwrap(), cfg)
+    }
+
+    fn tokens(b: i32, n: i32, inner: i32, seed: f32) -> Array {
+        Array::from_slice(
+            &(0..b * n * inner)
+                .map(|k| (k as f32 * 0.007 + seed).cos())
+                .collect::<Vec<f32>>(),
+            &[b, n, inner],
+        )
+    }
+
+    /// **The rung-3 kernel is bit-exact and the lever actually engages.**
+    ///
+    /// The equivalence half alone is worthless — it is trivially true when the chunking never runs —
+    /// so the chunk-count probe is asserted alongside it. Both `qk_norm` variants are covered because
+    /// the norm is applied before the head split and therefore before any chunk boundary.
+    #[test]
+    fn chunked_cross_attention_is_bit_exact_and_actually_chunks() {
+        for qk_norm in [false, true] {
+            let (attn, _cfg) = cross_attn(4, 16, qk_norm);
+            let x = tokens(1, 64, 16, 0.1);
+            let kv = tokens(1, 12, 16, 0.2);
+            let mask = Array::from_slice(
+                &(0..12)
+                    .map(|k| if k < 7 { 1.0f32 } else { 0.0 })
+                    .collect::<Vec<f32>>(),
+                &[1, 12],
+            );
+            for kv_mask in [None, Some(&mask)] {
+                reset_chunk_count();
+                let full = attn
+                    .forward(&x, &kv, kv_mask, AttentionBudget::UNBOUNDED)
+                    .unwrap();
+                assert_eq!(last_chunk_count(), 1, "the unbounded path must be one call");
+
+                // rows_per_query = B·H·Sk = 1·4·12 = 48, so a 480-score budget is 10 query rows.
+                reset_chunk_count();
+                let chunked = attn
+                    .forward(
+                        &x,
+                        &kv,
+                        kv_mask,
+                        AttentionBudget::from_score_elements(480, true),
+                    )
+                    .unwrap();
+                let chunks = last_chunk_count();
+                assert!(
+                    chunks > 1,
+                    "the budget must actually chunk (qk_norm={qk_norm}), got {chunks} chunk(s)"
+                );
+                assert_eq!(full.shape(), chunked.shape());
+                assert_eq!(
+                    full.as_slice::<f32>(),
+                    chunked.as_slice::<f32>(),
+                    "query-row chunking must be bit-exact (qk_norm={qk_norm}, mask={})",
+                    kv_mask.is_some()
+                );
+            }
+        }
+    }
+
+    /// **The masked path must narrow nothing.** SANA's caption mask is `[B, 1, 1, M]` — broadcast
+    /// over the query axis — so it is shared by every chunk. A kernel that sliced it along the query
+    /// axis would silently mask the wrong rows; a kernel that dropped it would let 300 PAD slots
+    /// swamp the conditioning. The bit-exactness assertion above covers the first; this pins that the
+    /// mask is load-bearing at all, so "bit-exact" is not being satisfied by two identical no-ops.
+    #[test]
+    fn the_caption_mask_changes_the_chunked_result() {
+        let (attn, _cfg) = cross_attn(4, 16, false);
+        let x = tokens(1, 64, 16, 0.1);
+        let kv = tokens(1, 12, 16, 0.2);
+        let mask = Array::from_slice(
+            &(0..12)
+                .map(|k| if k < 7 { 1.0f32 } else { 0.0 })
+                .collect::<Vec<f32>>(),
+            &[1, 12],
+        );
+        let budget = AttentionBudget::from_score_elements(480, true);
+        let masked = attn.forward(&x, &kv, Some(&mask), budget).unwrap();
+        let unmasked = attn.forward(&x, &kv, None, budget).unwrap();
+        assert_ne!(
+            masked.as_slice::<f32>(),
+            unmasked.as_slice::<f32>(),
+            "the caption padding mask must reach the chunked kernel"
+        );
+    }
+
+    /// **The sibling families' 64 Mi operating point is inert at every advertised SANA geometry.**
+    ///
+    /// This is the measurement that forced SANA to publish its own budgets, and it is arithmetic, so
+    /// it belongs in a weights-free test rather than in a comment. `attn2`'s domain is
+    /// `B · H · N · 300` with `N = (edge/32)²`.
+    #[test]
+    fn the_shared_64mi_budget_never_chunks_sana_and_the_published_ones_do() {
+        let cfg = SanaTransformerConfig::sana_1600m();
+        let heads = cfg.num_cross_attention_heads;
+        let caption = 300;
+        for edge in [256_i32, 512, 1024] {
+            let n = (edge / 32) * (edge / 32);
+            let shared = AttentionBudget::from_score_elements(CONSTRAINED_ATTN_SCORES_BUDGET, true);
+            assert_eq!(
+                shared.query_block(1, heads, n, caption),
+                n,
+                "64 Mi must not chunk SANA at {edge}²"
+            );
+        }
+        let default = AttentionBudget::from_score_elements(
+            u64::from(crate::memory_strategy::ATTENTION_CHUNK_SIZE),
+            true,
+        );
+        // The published default chunks at 512² and at the native 1024².
+        for (edge, expected_chunks) in [(512_i32, 2), (1024, 6)] {
+            let n = (edge / 32) * (edge / 32);
+            let block = default.query_block(1, heads, n, caption);
+            assert!(
+                block < n,
+                "the published default must chunk at {edge}² (block {block} of {n} rows)"
+            );
+            assert_eq!(
+                (n + block - 1) / block,
+                expected_chunks,
+                "chunk count at {edge}² moved"
+            );
+        }
+        // **And it is INERT at the 256² floor** — `8·8·20·300 = 384 Ki` scores is already inside
+        // every published budget. Recorded rather than papered over with a smaller budget: 1.5 MiB
+        // of f32 scratch is not a thing this rung exists to bound, and a budget that chunked it
+        // would be publishing an operating point with no measurement behind it.
+        let floor_tokens = (256 / 32) * (256 / 32);
+        assert_eq!(
+            (i64::from(heads) * i64::from(floor_tokens) * i64::from(caption)) as u64,
+            384_000
+        );
+        assert_eq!(
+            default.query_block(1, heads, floor_tokens, caption),
+            floor_tokens,
+            "no published budget chunks the 256² floor"
+        );
+    }
+
+    #[test]
+    fn the_resident_plan_is_the_historical_forward() {
+        assert_eq!(
+            SanaForwardPlan::RESIDENT.attention,
+            AttentionBudget::UNBOUNDED
+        );
+        assert!(SanaForwardPlan::RESIDENT.window.is_none());
+        assert!(AttentionBudget::UNBOUNDED.is_unbounded());
     }
 }

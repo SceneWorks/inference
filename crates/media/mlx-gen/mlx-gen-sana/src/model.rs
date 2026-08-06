@@ -292,10 +292,21 @@ pub(crate) fn build_residency(
 ) -> Result<Residency<SanaTextEncoder, SanaHeavy>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
+    // SC-15523: rung 4 rebuilds trunk blocks from the snapshot per window, so the trunk carries a
+    // re-openable stream only for a load that can actually execute one. The same predicate decides
+    // the contract's declaration, so "declared" and "constructed" cannot drift.
+    let streamable = crate::memory_strategy::is_streamable(spec);
     Residency::from_policy(
         spec.offload_policy,
         move || load_text_encoder_component(load_components(&spec_text, id)?),
-        move |needs_encoder| load_heavy(load_components(&spec_heavy, id)?, sprint, needs_encoder),
+        move |needs_encoder| {
+            load_heavy(
+                load_components(&spec_heavy, id)?,
+                sprint,
+                needs_encoder,
+                streamable,
+            )
+        },
     )
 }
 
@@ -311,8 +322,14 @@ fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
 /// path builds the same bundle up front. Components are independent of the text encoder (separate weight
 /// files, packed-detected quant — no RNG), so both residencies are byte-identical. The trunk is loaded
 /// first (mirroring the pre-seam `build_pipeline` order), then the DC-AE from the shared `vae/` source.
-fn load_heavy(root: &Path, sprint: bool, needs_encoder: bool) -> Result<SanaHeavy> {
-    let trunk_w = Weights::from_dir(root.join("transformer"))?;
+fn load_heavy(
+    root: &Path,
+    sprint: bool,
+    needs_encoder: bool,
+    streamable: bool,
+) -> Result<SanaHeavy> {
+    let transformer_dir = root.join("transformer");
+    let trunk_w = Weights::from_dir(&transformer_dir)?;
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
     // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
@@ -320,10 +337,26 @@ fn load_heavy(root: &Path, sprint: bool, needs_encoder: bool) -> Result<SanaHeav
     let encoder = needs_encoder
         .then(|| DcAeEncoder::from_weights(&vae_w, dcfg.clone()))
         .transpose()?;
+    // The stream carries the SAME config the trunk was built with, so a windowed block cannot be
+    // built under a different config than its resident twin — the silent "present but wrong" class
+    // SANA-Sprint's `qk_norm` gate would otherwise expose (see `crate::block_stream`).
+    let with_stream = |trunk: SanaTransformer, cfg: &SanaTransformerConfig| {
+        if streamable {
+            trunk.with_block_stream(crate::block_stream::SanaBlockStream::new(
+                &transformer_dir,
+                cfg.clone(),
+            ))
+        } else {
+            trunk
+        }
+    };
     if sprint {
         let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
         let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
-        let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
+        let trunk = with_stream(
+            SanaTransformer::from_weights(&trunk_w, trunk_cfg.clone())?,
+            &trunk_cfg,
+        );
         Ok(match encoder {
             Some(encoder) => {
                 SanaHeavy::new_sprint(trunk, encoder, decoder, dcfg, guidance_embeds_scale)
@@ -333,7 +366,11 @@ fn load_heavy(root: &Path, sprint: bool, needs_encoder: bool) -> Result<SanaHeav
             }
         })
     } else {
-        let trunk = SanaTransformer::from_weights(&trunk_w, SanaTransformerConfig::sana_1600m())?;
+        let trunk_cfg = SanaTransformerConfig::sana_1600m();
+        let trunk = with_stream(
+            SanaTransformer::from_weights(&trunk_w, trunk_cfg.clone())?,
+            &trunk_cfg,
+        );
         Ok(match encoder {
             Some(encoder) => SanaHeavy::new(trunk, encoder, decoder, dcfg),
             None => SanaHeavy::new_text_to_image(trunk, decoder, dcfg),
@@ -471,6 +508,17 @@ impl Sana {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        // SC-15523: a request-scoped memory selection is refused HERE, on the production path, not
+        // only at shared-contract admission — a caller that sets `req.memory` directly must not be
+        // able to execute an unmeasured tile edge, score budget or block cadence.
+        if let Some(memory) = &req.memory {
+            crate::memory_strategy::validate_request_memory(
+                self.descriptor.id,
+                &self.loaded_spec,
+                memory,
+            )
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        }
 
         // img2img (sc-10190): a single `Reference` conditioning, with a per-reference strength
         // overriding `req.strength`. Both render paths (base flow-match + Sprint SCM) seed the denoise
@@ -529,6 +577,9 @@ impl Sana {
             // Phase B produces and materializes every latent while the DiT is alive. Sequential then
             // sheds the DiT and optional encoder before phase-C decode; Resident borrows a warm view.
             |heavy: &SanaHeavy, cond, on_progress: &mut dyn FnMut(Progress)| {
+                // Rungs 3 and 4, resolved against the trunk that will actually run them.
+                let plan =
+                    crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
                 let mut latents = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let seed = base_seed.wrapping_add(n as u64);
@@ -552,6 +603,7 @@ impl Sana {
                         &req.cancel,
                         on_progress,
                         &req.preview,
+                        plan,
                     )?);
                 }
                 mlx_rs::transforms::eval(latents.iter())?;
