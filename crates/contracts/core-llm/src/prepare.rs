@@ -388,8 +388,9 @@ mod tests {
 
     #[test]
     fn missing_path_is_unsupported() {
+        // An entry inside the guard, never created: the guard's own root exists.
         let p_tmp = tempfile::tempdir().unwrap();
-        let p = p_tmp.path().to_path_buf();
+        let p = p_tmp.path().join("definitely-not-here-zzz");
         match detect_format(&p) {
             Err(Error::Unsupported(m)) => assert!(m.contains("does not exist"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),

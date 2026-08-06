@@ -694,7 +694,7 @@ mod tests {
         );
     }
 
-    fn assert_trained_lora_inference_roundtrip(dev: Device) {
+    fn assert_trained_lora_inference_roundtrip(dev: Device, tag: &str) {
         let cfg = tiny_cfg();
         let map = weights(&cfg, &dev);
         let mut train = LtxDiT::new(
@@ -721,7 +721,9 @@ mod tests {
         opt.step(&grads).unwrap();
 
         let path_tmp = tempfile::tempdir().unwrap();
-        let path = path_tmp.path().join("ltx_infer_lora_roundtrip.safetensors");
+        let path = path_tmp
+            .path()
+            .join(format!("ltx_infer_lora_roundtrip_{tag}.safetensors"));
         save_lora_peft(&set, "", &HashMap::new(), &path).unwrap();
         let spec = candle_gen::gen_core::AdapterSpec::new(
             path.clone(),
@@ -780,7 +782,7 @@ mod tests {
 
     #[test]
     fn trained_lora_reloads_into_inference_and_changes_velocity() {
-        assert_trained_lora_inference_roundtrip(Device::Cpu);
+        assert_trained_lora_inference_roundtrip(Device::Cpu, "cpu");
     }
 
     /// CUDA execution gate for the actual train→save→inference-load path. Ignored by default because
