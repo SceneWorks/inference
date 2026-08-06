@@ -1684,6 +1684,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "edit_lightning_render_is_coherent",
                 "routing_map_covers_full_fork_surface",
                 "kohya_matches_peft_on_real_tree",
+                # sc-17515. Wired out of the exclusion list below: its R^2 = 0.0114 was the test's
+                # own host readback scrambling the samples, not the fit. It also scores the shipping
+                # `preview::RGB_FACTORS` unchanged, so it is a drift gate and belongs on the weekly
+                # schedule rather than in the dispatch-only producers job.
+                "fit_preview_rgb_factors",
             ],
             "mlx-qwen-image-pid": [
                 "use_pid_without_loaded_pid_errors",
@@ -1744,7 +1749,6 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for name in (
             "qwen_t2i_per_step_compiled_vs_eager",
             "qwen_edit_per_step_compiled_vs_eager",
-            "fit_preview_rgb_factors",
             "lightning_loras_apply_cleanly",
             "edit_lightning_user_lora_reference_repro",
         ):

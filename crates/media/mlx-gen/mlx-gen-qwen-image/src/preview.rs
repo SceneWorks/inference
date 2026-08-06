@@ -34,6 +34,16 @@ use crate::pipeline::unpack_latents;
 /// who did not fit them. The original corpus is gone, so the producer reports its delta against
 /// these values rather than claiming to replay them.
 ///
+/// **These values are validated, not merely inherited.** sc-17515 scored them unchanged against
+/// `SceneWorks/qwen-image-mlx@8080a417` bf16 over 32,768 fresh samples: **R² = 0.9450, mean |ΔRGB|
+/// 12.58/255**, versus 0.9633 for an in-sample re-solve on the same corpus. The producer now asserts
+/// that number every run, so a VAE re-pin that moves the lineage out from under this block fails its
+/// lane instead of silently degrading previews. (The R² = 0.0114 that story opened on was a defect
+/// in the producer's host readback, not in these constants — `mlx-rs` `as_slice` returns physical
+/// storage for a transpose view. [`project_latents`](mlx_gen::preview::project_latents) is
+/// unaffected: it performs the same reshape/transpose but consumes it with a stride-aware `matmul`,
+/// and reads back only that op's contiguous output.)
+///
 /// A stale fit degrades preview colour only; it cannot affect the render, which never reads these.
 ///
 /// **These are not Qwen-Image-only.** `mlx-gen-krea` reuses [`QwenVae`](crate::QwenVae) directly, so

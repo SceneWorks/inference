@@ -181,25 +181,24 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 19 + 5 = 45:
+# The 45 account for exactly, and the arithmetic is the point — 21 + 20 + 4 = 45:
 #
-# WIRED, 19: 15 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2), 3 in
-# `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing on
-# nax-macos 2026-08-04.
+# WIRED, 20: 16 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2, preview fit),
+# 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing
+# on nax-macos: 2026-08-04, except the preview fit 2026-08-06 (sc-17515).
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 5. A lane that is red every week is ignored within a month
+# EXCLUDED WITH A MEASUREMENT, 4. A lane that is red every week is ignored within a month
 # (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
 #   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
 #     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
 #     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
 #     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
-#   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
 #   * `lightning_loras_apply_cleanly` x1 — FAILS: asserts 840 per-block modules, and the pinned
 #     lightx2v file carries 12 of 14 per block (no img/txt modulation) so it applies 720 with zero
 #     unmatched. Golden-free, so it joins the wired adapter step the moment sc-17518 settles it.
@@ -312,6 +311,11 @@ expected_files = ["pid_flux_2kto4k.safetensors"]
 # layout inside the tests, not from their own variable, so the lane derives the path from the models
 # root and the revision below rather than carrying a second repository variable that could drift out
 # of agreement with this pin.
+#
+# The T2I file has a THIRD consumer as of sc-17515: `fit_preview_rgb_factors` renders its fit corpus
+# through it, because the committed `preview::RGB_FACTORS` document an "8-step Lightning" fit and
+# `lightning_sigmas` alone is only the schedule half of that. Measured: without the LoRA the re-solve
+# lands 0.26 from the committed factors, with it 0.082.
 key = "qwen-image-lightning"
 repository = "lightx2v/Qwen-Image-Lightning"
 revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"

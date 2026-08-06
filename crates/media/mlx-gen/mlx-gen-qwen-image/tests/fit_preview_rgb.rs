@@ -34,14 +34,52 @@
 //! A large delta is a finding, not a failure: it means the committed fit does not describe this VAE
 //! at this configuration, and the printed block is what should replace it.
 //!
+//! # sc-17515: the first execution measured R² = 0.0114, and the fit was never the problem
+//!
+//! sc-17284 gave this file its first run anywhere and it failed its own floor by two orders of
+//! magnitude, with a re-solved intercept identical in all three channels to four decimals. Two
+//! causes were proposed — a degenerate corpus, or a moved VAE lineage — and **neither held**. The
+//! defect was in this file, on the two lines that read the samples back to the host:
+//!
+//! `mlx-rs` `as_slice` returns the array's **physical buffer, ignoring strides**, so a
+//! `transpose_axes`-terminated array reads back in its *pre-transpose* order. Both host reads below
+//! ended in a transpose. Sample *i* therefore paired 16 consecutive values of latent channel 0 with
+//! 3 consecutive pixels of the red channel — unrelated quantities, hence R² ≈ 0, and three targets
+//! drawn from one channel, hence the three identical intercepts. The flattening `reshape` that fixes
+//! it is the same one `mlx-gen-z-image`'s sibling producer already carried; of the seven MLX
+//! producers this was the only one that read a transpose-terminated array without it.
+//!
+//! Measured on nax-macos against `SceneWorks/qwen-image-mlx@8080a417` bf16, 32768 samples:
+//!
+//! | corpus | physical read (the bug) | logical read (fixed) |
+//! |---|---|---|
+//! | no LoRA, as this file shipped | 0.0114 | 0.9766 |
+//! | + 8-step Lightning LoRA | 0.0027 | 0.9521 |
+//!
+//! Applying the LoRA made the *broken* number worse, not better, which is what eliminated the
+//! degenerate-corpus theory outright; the renders were coherent photographs either way (std 48–77,
+//! 246–256 distinct levels). And the **committed** constants, scored unchanged on that corpus, come
+//! back at R² = 0.9450 — so the VAE has not moved out from under them either, and they were left
+//! alone. The `RGB_FACTORS` note in `src/preview.rs` carries the same figures.
+//!
+//! # The corpus applies the Lightning LoRA
+//!
+//! Both this file and `preview.rs` describe the fit as "8-step Lightning", but the corpus used to
+//! take only [`lightning_sigmas`] — the distilled *schedule* without the distillation *adapter*.
+//! That is not what the constants document, and it is measurable: without the LoRA the re-solve
+//! lands 0.26 from the committed factors, with it 0.082. Since both clear the floor, this is a
+//! fidelity fix rather than a way to go green.
+//!
 //! ```sh
-//! MLX_GEN_QWEN_SNAPSHOT=/path/to/Qwen-Image \
+//! MLX_GEN_QWEN_SNAPSHOT=/path/to/Qwen-Image/bf16 \
+//!   QWEN_LIGHTNING_SNAPSHOT=/path/to/models--lightx2v--Qwen-Image-Lightning/snapshots/<rev> \
 //!   cargo test -p mlx-gen-qwen-image --release --test fit_preview_rgb -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::{CancelFlag, PreviewSink};
+use mlx_gen::{AdapterKind, AdapterSpec, CancelFlag, PreviewSink};
+use mlx_gen_qwen_image::adapters::apply_qwen_adapters;
 use mlx_gen_qwen_image::pipeline::{encode_prompt, unpack_latents, LATENT_CHANNELS, SPATIAL_SCALE};
 use mlx_gen_qwen_image::sampler::lightning_sigmas;
 use mlx_gen_qwen_image::{create_noise, denoise_with_progress, loader};
@@ -118,6 +156,58 @@ fn snapshot() -> PathBuf {
     }))
 }
 
+/// The pinned 8-step lightx2v Lightning LoRA, which [`CORPUS`] renders through.
+///
+/// `QWEN_LIGHTNING_SNAPSHOT` wins when set — the same precedence, and for the same reason, as
+/// `lightning_render_real_weights`: `ensure_model_snapshot.py` verifies ONE revision, while the
+/// `MLX_GEN_MODELS_ROOT` fallback only knows which revisions are cached, not which one was verified.
+/// Without the override a lane can therefore verify the pin and then load a different revision
+/// sitting beside it (sc-17284). The fallback is a local-dev convenience; CI always sets the
+/// variable.
+///
+/// Panics rather than skipping on a missing variable. A producer that returns early on an unset
+/// variable reports `1 passed` in 0.00 s and gates nothing — the silent-skip shape sc-17250 found
+/// and sc-17284 removed from `perf.rs`.
+fn lightning_lora() -> PathBuf {
+    const FILE: &str = "Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors";
+    if let Ok(dir) = std::env::var("QWEN_LIGHTNING_SNAPSHOT") {
+        let path = PathBuf::from(dir).join(FILE);
+        assert!(
+            path.exists(),
+            "QWEN_LIGHTNING_SNAPSHOT is set but {} is missing",
+            path.display()
+        );
+        return path;
+    }
+    let root = std::env::var("MLX_GEN_MODELS_ROOT").unwrap_or_else(|_| {
+        panic!(
+            "set QWEN_LIGHTNING_SNAPSHOT (or MLX_GEN_MODELS_ROOT) so the corpus can render through \
+             the 8-step Lightning LoRA the committed fit documents; inference never self-fetches or \
+             derives a cache location (epic 13657)"
+        )
+    });
+    let snaps = PathBuf::from(root)
+        .join("models--lightx2v--Qwen-Image-Lightning")
+        .join("snapshots");
+    // Sorted, not `read_dir` order: with several revisions cached, taking whichever entry the
+    // filesystem yields first makes the corpus — and therefore every number this file prints —
+    // depend on directory iteration order. Sorted is at least run-to-run stable. It is still not
+    // this pin, which is why CI sets the variable rather than relying on this arm.
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&snaps)
+        .unwrap_or_else(|e| panic!("read {}: {e}; set QWEN_LIGHTNING_SNAPSHOT", snaps.display()))
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().join(FILE))
+        .filter(|path| path.exists())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next().unwrap_or_else(|| {
+        panic!(
+            "{FILE} not cached under {}; set QWEN_LIGHTNING_SNAPSHOT",
+            snaps.display()
+        )
+    })
+}
+
 /// One render's `(latent [n, 16], rgb [n, 3])` pair, host-side as f64 for the accumulation.
 struct Pair {
     latent: Vec<f64>,
@@ -126,8 +216,22 @@ struct Pair {
 }
 
 /// Render one corpus entry and return its aligned latent/RGB samples.
-fn render_pair(root: &Path, prompt: &str, seed: u64) -> Pair {
-    let tf = loader::load_transformer(root).unwrap();
+fn render_pair(root: &Path, lora: &Path, prompt: &str, seed: u64) -> Pair {
+    let mut tf = loader::load_transformer(root).unwrap();
+    // The distilled schedule needs its distillation adapter: `lightning_sigmas` alone is only half
+    // of the "8-step Lightning" configuration the committed fit records. 720 of the host's 840
+    // per-block targets is this file's full designed surface, not a partial install (sc-17518).
+    let report = apply_qwen_adapters(
+        &mut tf,
+        &[AdapterSpec::new(lora.to_path_buf(), 1.0, AdapterKind::Lora)],
+    )
+    .unwrap_or_else(|e| panic!("Lightning LoRA {} failed to apply: {e}", lora.display()));
+    assert!(
+        report.unmatched_paths.is_empty(),
+        "Lightning LoRA left {} unmatched target(s): {:?}",
+        report.unmatched_paths.len(),
+        report.unmatched_paths
+    );
     let te = loader::load_text_encoder(root).unwrap();
     let tok = loader::load_tokenizer(root).unwrap();
     let pos = encode_prompt(&tok, &te, prompt, "qwen_image").unwrap();
@@ -170,12 +274,19 @@ fn render_pair(root: &Path, prompt: &str, seed: u64) -> Pair {
     let c = LATENT_CHANNELS;
 
     // Latent [1, 16, lh, lw] -> [n, 16], the same reshape/transpose `project` performs.
+    //
+    // `project` then hands that straight to `matmul`, which is stride-aware, so it never needs what
+    // the trailing reshape below does. This file does, because it reads the samples to the host:
+    // `as_slice` exposes physical storage for a transpose view, and without flattening first the
+    // accumulation pairs latent channel 0 with the red channel and scores R² ≈ 0 (sc-17515).
     let x = unpacked
         .as_dtype(Dtype::Float32)
         .unwrap()
         .reshape(&[c, lh * lw])
         .unwrap()
         .transpose_axes(&[1, 0])
+        .unwrap()
+        .reshape(&[lh * lw * c])
         .unwrap();
 
     // Decode [1, 3, H, W] -> [0, 1] exactly as `decoded_to_image` denormalizes, then average-pool
@@ -196,6 +307,9 @@ fn render_pair(root: &Path, prompt: &str, seed: u64) -> Pair {
         .reshape(&[3, lh * lw])
         .unwrap()
         .transpose_axes(&[1, 0])
+        .unwrap()
+        // Same contiguity pass as `x` above, for the same reason.
+        .reshape(&[lh * lw * 3])
         .unwrap();
 
     let n = (lh * lw) as usize;
@@ -268,8 +382,10 @@ fn fit_preview_rgb_factors() {
     let mut total = 0usize;
     let mut pairs: Vec<Pair> = Vec::new();
 
+    let lora = lightning_lora();
+    eprintln!("  Lightning LoRA: {}", lora.display());
     for (prompt, seed) in CORPUS {
-        let pair = render_pair(&root, prompt, seed);
+        let pair = render_pair(&root, &lora, prompt, seed);
         eprintln!("  rendered seed {seed}: {} samples", pair.n);
         for i in 0..pair.n {
             let mut row = [0.0f64; 17];
@@ -369,10 +485,63 @@ fn fit_preview_rgb_factors() {
          equality)"
     );
 
+    // Score the SHIPPING projection unchanged on this corpus. This is the number the coefficient
+    // deltas above cannot give you: the latent channels are correlated, so OLS can move a
+    // coefficient a long way without moving a prediction, and |Δfactor| alone therefore cannot say
+    // whether a preview got worse. Clamped, because `project_latents` clamps before the 8-bit round
+    // — this scores what is actually drawn (sc-17515).
+    let mut committed_ss_res = [0.0f64; 3];
+    let mut abs_sum = 0.0f64;
+    for pair in &pairs {
+        for i in 0..pair.n {
+            let lat = &pair.latent[i * c..(i + 1) * c];
+            for k in 0..3 {
+                let mut pred = COMMITTED_BIAS[k] as f64;
+                for (j, &l) in lat.iter().enumerate() {
+                    pred += l * COMMITTED_FACTORS[j][k] as f64;
+                }
+                let d = pair.rgb[i * 3 + k] - pred.clamp(0.0, 1.0);
+                committed_ss_res[k] += d * d;
+                abs_sum += d.abs() * 255.0;
+            }
+        }
+    }
+    let committed_r2 = 1.0
+        - committed_ss_res.iter().sum::<f64>()
+            / (0..3)
+                .map(|k| {
+                    let mean = sum_y[k] / total as f64;
+                    sum_y2[k] - total as f64 * mean * mean
+                })
+                .sum::<f64>();
+    let mean_abs = abs_sum / (total * 3) as f64;
+    println!(
+        "\ncommitted constants, scored unchanged on this corpus: R^2 = {committed_r2:.4}, \
+         mean |ΔRGB| = {mean_abs:.2}/255"
+    );
+
     assert!(
         r2_overall > R2_FLOOR,
         "linear latent->RGB fit explains only R^2 = {r2_overall:.4} (floor {R2_FLOOR}); the \
          approximation itself has stopped working for this VAE, which needs a different projection \
          rather than new constants"
+    );
+
+    // The drift gate the module docs asked for and nothing implemented. The assertion above only
+    // asks whether SOME linear map fits; it passes just as happily after a VAE re-pin that leaves
+    // the shipping constants describing a model that no longer exists. This one asks whether the
+    // constants users actually get are still right, which is the question that reaches a preview.
+    //
+    // Same floor deliberately: a projection is either explaining most of the variance or it is not,
+    // and a second threshold would just be a number to argue about. Measured 0.9450 on
+    // `qwen-image-mlx@8080a417` bf16 (mean |ΔRGB| 12.58/255), against a 0.9633 in-sample refit — so
+    // the incumbent gives up 2.6/255 of mean error to a best-case re-solve, which is why sc-17515
+    // left it alone rather than re-baselining shipping constants onto a two-render sample.
+    assert!(
+        committed_r2 > R2_FLOOR,
+        "the COMMITTED preview constants explain only R^2 = {committed_r2:.4} (floor {R2_FLOOR}) \
+         on this snapshot — the VAE lineage has moved out from under `preview::RGB_FACTORS` and \
+         every live preview is being projected through a stale fit. Paste the block printed above \
+         into src/preview.rs"
     );
 }

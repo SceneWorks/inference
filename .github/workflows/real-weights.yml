@@ -1343,11 +1343,19 @@ jobs:
     #   control        3 + 3 + 3 + 15 =  24s      sampler       31 + 30       =  61s
     #   sequential   102 + 101 + 116 + 114 = 433s block residency             = 173s
     #   lightning     23 + 21        =  44s       adapter (golden-free) 0 + 1 =   1s
-    #                                             TOTAL COMPUTE               = 736s (12.3 min)
-    # The cap is 90, not ~25, because only the 12 minutes above is compute: the rest is the
+    #   preview fit (sc-17515, measured 2026-08-06, same box)          165-217s
+    #                                             TOTAL COMPUTE     = 901-953s (15.0-15.9 min)
+    # The cap is 90, not ~25, because only the 15 minutes above is compute: the rest is the
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
+    #
+    # sc-17515 added the preview-fit row and did NOT raise the cap: it is the single most expensive
+    # test here (two 1024^2 8-step renders plus a VAE decode each), and it still only moves compute
+    # from 12.3 to ~15 minutes against a cap that is a materialization budget. Its 165-217s spread is
+    # two runs of the SAME command on nax-macos minutes apart — contention on a box that also runs
+    # dev work — and nax-macos-2 measured a 4.4x spread on the producers job (sc-17284), so treat
+    # even 217s as the FAST host's figure.
     timeout-minutes: 90
     env:
       # Repo-variable names are deliberately NOT the test-facing names. `vars.QWEN_IMAGE_SNAPSHOT`
@@ -1437,9 +1445,11 @@ jobs:
       #      first. None of them has it — each panics on a missing variable. `perf.rs` DID have it
       #      (`eprintln!("skip: ...")` + `return`); this commit removed that, so those two tests now
       #      fail loudly. They are still not in this lane, for a different reason: they FAIL on real
-      #      weights and always have (sc-17513). Nor is `fit_preview_rgb_factors` (sc-17515) or
-      #      `lightning_loras_apply_cleanly` (sc-17518). A lane that is red every week is ignored
-      #      within a month; each exclusion is recorded with its measurement in the manifest.
+      #      weights and always have (sc-17513). Nor is `lightning_loras_apply_cleanly` (sc-17518).
+      #      A lane that is red every week is ignored within a month; each exclusion is recorded
+      #      with its measurement in the manifest. `fit_preview_rgb_factors` WAS on that list at
+      #      R² = 0.0114 and is now wired (last step of this job) — sc-17515 found the number was
+      #      the test's own host readback, not the fit.
       - name: Run Qwen-Image control-branch gates
         run: |
           set -o pipefail
@@ -1561,6 +1571,35 @@ jobs:
           }
           run_one routing_map_covers_full_fork_surface
           run_one kohya_matches_peft_on_real_tree
+      # sc-17515 — WIRED. This was in the manifest's "EXCLUDED WITH A MEASUREMENT" block at
+      # R² = 0.0114 against its own 0.90 floor; that number was a defect in the test's host readback
+      # (`mlx-rs` `as_slice` returns physical storage for a transpose view, so it was regressing
+      # latent channel 0 against the red channel). With the contiguity pass it measures R² = 0.9521.
+      #
+      # It is here rather than in `mlx-qwen-image-producers` because it is not only a producer. It
+      # now also scores the SHIPPING `preview::RGB_FACTORS` unchanged on the corpus (measured 0.9450,
+      # mean |ΔRGB| 12.58/255) and fails on the same floor — which makes it the only thing in the
+      # tree that can catch a snapshot re-pin moving the VAE lineage out from under constants every
+      # live preview reads. A drift gate belongs on the schedule; the printed paste-ready block is
+      # the by-product.
+      #
+      # Unlike every other step here it also needs QWEN_LIGHTNING_SNAPSHOT: the corpus renders
+      # through the 8-step Lightning LoRA, because "8-step Lightning" is what the committed fit
+      # documents and the schedule alone is only half of it. The materialization step above already
+      # exports that variable at the manifest-pinned revision.
+      - name: Run Qwen-Image preview-fit producer and drift gate
+        run: |
+          set -o pipefail
+          name=fit_preview_rgb_factors
+          out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
+            QWEN_LIGHTNING_SNAPSHOT="$QWEN_LIGHTNING_SNAPSHOT" \
+            cargo test --locked --release -p mlx-gen-qwen-image \
+            --test fit_preview_rgb \
+            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
 
   # sc-17284 — the integrated PiD (progressive-in-decoder) super-resolution decode seam, for BOTH
   # engines that have one. Split from the job above because it is the only place `FLUX_DEV_DIR` and
@@ -1671,8 +1710,13 @@ jobs:
   # the run then throws away. Dispatch-only keeps it reachable and reproducible without paying for it
   # every week; what it still gates, when run, is that the 50-step pipeline completes end to end.
   #
-  # `fit_preview_rgb_factors` is the other producer in this crate and is deliberately NOT here: it
-  # FAILS on the shipping snapshot (R² = 0.0114 against its own 0.90 floor). sc-17515.
+  # `fit_preview_rgb_factors` is the other producer in this crate and is deliberately NOT here
+  # either, but for the opposite reason to the one this comment used to give. It used to say the
+  # test FAILS (R² = 0.0114 against its own 0.90 floor); sc-17515 traced that to the test's host
+  # readback and it now measures 0.9521. It went to the WEEKLY `mlx-qwen-image` job rather than to
+  # this dispatch-only one because it gained a second job: it scores the shipping
+  # `preview::RGB_FACTORS` unchanged and fails on the same floor, so it is a drift gate on constants
+  # every live preview reads, not just a producer of a paste-ready block.
   mlx-qwen-image-producers:
     name: MLX Qwen-Image real-weight producers (operator dispatch)
     if: inputs.profile == 'qwen-image-producers'
