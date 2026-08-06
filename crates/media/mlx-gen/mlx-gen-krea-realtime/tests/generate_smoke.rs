@@ -4693,6 +4693,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
                 clip_mean: 0.0,
                 head_motion: 2.0,
                 tail_motion: 2.0,
+                ar_wall_ms: 0,
                 component: "luma-mean",
             });
         }
@@ -6227,6 +6228,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 2.3528,
         head_motion: 13.8854,
         tail_motion: 11.8398,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6242,6 +6244,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 4.1180,
         head_motion: 16.6477,
         tail_motion: 10.3963,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6257,6 +6260,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 2.4759,
         head_motion: 13.1568,
         tail_motion: 6.8421,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6272,6 +6276,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 2.7394,
         head_motion: 15.8696,
         tail_motion: 17.5720,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6287,6 +6292,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 5.9908,
         head_motion: 18.8493,
         tail_motion: 21.3614,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6302,6 +6308,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 3.2686,
         head_motion: 14.5934,
         tail_motion: 8.8424,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6317,6 +6324,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 4.0987,
         head_motion: 16.3794,
         tail_motion: 14.6675,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6332,6 +6340,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 5.3745,
         head_motion: 17.9580,
         tail_motion: 16.1059,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6347,6 +6356,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 2.6829,
         head_motion: 15.9028,
         tail_motion: 8.5545,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6362,6 +6372,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 0.6207,
         head_motion: 12.3112,
         tail_motion: 16.1128,
+        ar_wall_ms: 0,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -6377,6 +6388,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 3.7369,
         head_motion: 13.8205,
         tail_motion: 19.4322,
+        ar_wall_ms: 0,
         component: "spatial-sd",
     },
     S18Cell {
@@ -6392,6 +6404,7 @@ const MEASURED_832_SC17324: &[S18Cell] = &[
         clip_mean: 4.7098,
         head_motion: 10.1449,
         tail_motion: 13.8240,
+        ar_wall_ms: 0,
         component: "spatial-sd",
     },
 ];
@@ -6475,6 +6488,8 @@ fn the_sc17324_832_sweep_reports_its_rate_comparison() {
 
     let sweep = S18Sweep {
         bucket: "832x480".into(),
+        // sc-17324's record predates the sc-17807 KV knob, so it is the shipped bf16 cache.
+        kv: KV_TIER_BF16.to_string(),
         cells: MEASURED_832_SC17324.to_vec(),
     };
     println!("{}", sweep.summary());

@@ -640,8 +640,8 @@ mod tests {
             bits: 4,
             group_size: 32,
         });
-        let root = std::env::temp_dir().join(format!("krea_realtime_kvq_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::write(
             root.join("config.json"),
             serde_json::to_string_pretty(&cfg.to_json()).unwrap(),
@@ -672,8 +672,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ar.kv_cache_quant, None);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// **A malformed `kv_cache_quant` must be an ERROR, not a quiet fall back to bf16.**
@@ -722,9 +720,8 @@ mod tests {
         }
 
         // ...and the same strictness reaches `from_model_dir`, which is the surface a snapshot uses.
-        let root =
-            std::env::temp_dir().join(format!("krea_realtime_badkvq_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::write(
             root.join("config.json"),
             r#"{"kv_cache_quant": {"bits": 8}}"#,
@@ -734,7 +731,6 @@ mod tests {
             KreaRealtimeConfig::from_model_dir(&root).is_err(),
             "a snapshot naming a half-written KV tier must fail to load, not load as bf16"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
