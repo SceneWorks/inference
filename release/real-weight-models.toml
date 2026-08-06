@@ -254,12 +254,46 @@ expected_files = [
 # configs and tokenizer files, no `vae/`, no transformer shards), so pointing the test at it fails
 # to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
 #
-# WHAT "WIRED" DOES NOT MEAN HERE. `QWEN_IMAGE_EDIT_SNAPSHOT` also gates 19 tests this lane does not
-# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7) — plus one arm of
-# `perf.rs`. The gate is per-variable, so this row now reads as covered while those 19 still execute
-# nowhere; that is the same hazard recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and
-# it is accepted here rather than avoided because the sequential-residency Edit arm genuinely needs
-# this artifact. The 19 are tracked in sc-17519; do not read this row as evidence they run.
+# COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 23 tests and "wired" is per-name.
+# sc-17284 wired `QWEN_IMAGE_EDIT_SNAPSHOT` for the sequential-residency Edit arm, which satisfied
+# the per-VARIABLE gate while 19 further tests ran nowhere. sc-17519 executed all 19 on real weights
+# for the first time (2026-08-06, nax-macos, q8 tier resident). The 23 account for exactly, and the
+# arithmetic is the point — 3 + 18 + 2 = 23:
+#
+# NOT disjoint from the 45 on `qwen-image-mlx` above. Four tests here are dual-gated — they read a
+# T2I variable AND this one — so they are counted in both blocks on purpose: the two `mlx-qwen-image`
+# steps below, `edit_lightning_user_lora_reference_repro`, and the `perf.rs` Edit arm. The 19 in
+# `edit_real_weights.rs` + `vision_real_weights.rs` read ONLY this variable and are counted here alone.
+#
+# WIRED, 3, all in `mlx-qwen-image` on the schedule and all measured passing on nax-macos:
+# `edit_sequential_bounds_peak_and_is_byte_identical` and `edit_lightning_render_is_coherent`
+# (sc-17284), and `edit_generate_is_deterministic_rust` (sc-17519) — 34.19 / 35.80 / 44.11 s of
+# libtest time over three runs, peak RSS 35.0 GiB, reporting 0/3145728 bytes differing between two
+# renders of the same edit. It is the ONLY one of `edit_real_weights.rs` + `vision_real_weights.rs`
+# that resolves no golden, which is the only reason it was wirable now.
+#
+# BLOCKED ON THE ORACLE BUNDLE, 18: `edit_real_weights.rs` 11 and `vision_real_weights.rs` 7 read
+# 10 distinct artifacts under `tools/golden/`, which is gitignored by design — only one of the ten
+# (`qwen_image_edit_q8_golden`) has a checksum recorded at all. MEASURED: each fails at
+# `Weights::from_file` with `SafeTensors(NotFile)` in 0.02 s, before any weights load, so NONE of
+# their numeric assertions has ever been evaluated on real weights in any checkout. Do not read
+# their absence as evidence they would pass — of the 23 tests sc-17284 ran for the first time, four
+# failed. This is a SEPARATE bundle from the 21 T2I tests on `qwen-image-mlx`: those producers need
+# the ~60 GB `Qwen/Qwen-Image` (sc-17503), these seven need `Qwen/Qwen-Image-Edit-2511`, and neither
+# original is resident on nax-macos. Tracked in sc-17909.
+#
+# EXCLUDED WITH A MEASUREMENT, 2. A lane that is red every week is ignored within a month
+# (sc-16981), so each is recorded here rather than wired red or quietly dropped:
+#   * `perf.rs::qwen_edit_per_step_compiled_vs_eager` x1 — FAILS on real weights, and always has.
+#     sc-17284 ran it for the first time and measured max|D| 1.345e-3 against an
+#     `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound.
+#   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
+#     exist in no repository and on no Hub.
+#
+# The hazard this row recorded until 2026-08-06 — "wired" reading as whole-surface coverage when one
+# arm of one test was what ran — is retired by the arithmetic above rather than by the wiring: 18 of
+# the 23 still execute nowhere. That is the same shape recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on
+# `flux-1-dev`; the difference is that this row's blocked set now names its artifact and its story.
 key = "qwen-image-edit-2511-mlx"
 repository = "SceneWorks/qwen-image-edit-2511-mlx"
 revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"
