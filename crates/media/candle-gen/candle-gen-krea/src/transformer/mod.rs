@@ -858,20 +858,15 @@ mod tests {
     /// Fixture-driven `(resident, streamed, cfg, latent, timestep, context)` for the rung-4 tests.
     /// Six blocks so window 4 leaves a ragged 2-block tail.
     #[allow(clippy::type_complexity)]
-    fn streamed_pair() -> (
-        Krea2Transformer,
-        Krea2Transformer,
-        std::path::PathBuf,
-        Tensor,
-        Tensor,
-        Tensor,
-    ) {
-        let (resident, streamed, cfg, path) = crate::testfix::tiny_transformer_streamed_pair(6);
+    fn streamed_pair(
+        tmp: &tempfile::TempDir,
+    ) -> (Krea2Transformer, Krea2Transformer, Tensor, Tensor, Tensor) {
+        let (resident, streamed, cfg) = crate::testfix::tiny_transformer_streamed_pair(tmp, 6);
         let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
         let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
         let timestep = Tensor::from_vec(vec![0.3f32], 1, &Device::Cpu).unwrap();
         let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
-        (resident, streamed, path, latent, timestep, context)
+        (resident, streamed, latent, timestep, context)
     }
 
     /// **SC-15792's parity criterion.** The windowed trunk must produce the resident trunk's output
@@ -883,7 +878,8 @@ mod tests {
     /// mis-clamped — it would silently skip layers and still return a plausible tensor.
     #[test]
     fn streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window() {
-        let (resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let (resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
         let cancel = candle_gen::gen_core::CancelFlag::default();
 
         let want = resident
@@ -923,8 +919,6 @@ mod tests {
                 "window {window}: streaming must not change the math (max |delta| {max_delta})"
             );
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The parity assertion above is only worth its green if it can go red. A window that silently
@@ -936,7 +930,8 @@ mod tests {
     /// truncated to 4 of its 6 blocks must not coincidentally equal the full trunk.
     #[test]
     fn a_trunk_that_skipped_its_tail_would_not_match() {
-        let (resident, _streamed, path, latent, timestep, context) = streamed_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let (resident, _streamed, latent, timestep, context) = streamed_pair(&tmp);
         let cancel = candle_gen::gen_core::CancelFlag::default();
         let full = resident
             .forward_with_memory(
@@ -950,7 +945,7 @@ mod tests {
             .unwrap();
 
         // A 4-block trunk over the same weights = "window 4 dropped the ragged tail".
-        let (truncated, _, _, tpath) = crate::testfix::tiny_transformer_streamed_pair(4);
+        let (truncated, _, _) = crate::testfix::tiny_transformer_streamed_pair(&tmp, 4);
         let short = truncated
             .forward_with_memory(
                 &latent,
@@ -974,9 +969,6 @@ mod tests {
             delta > 0.0,
             "the parity test would be vacuous: a trunk missing two blocks matched the full one"
         );
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&tpath);
     }
 
     /// A cancel tripped mid-trunk surfaces as the TYPED `Canceled` through the streamed driver, and
@@ -985,7 +977,8 @@ mod tests {
     /// and the path now crosses two `From` conversions either of which could flatten it.
     #[test]
     fn streamed_cancel_is_typed_and_stops_inside_the_trunk() {
-        let (_resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
 
         let cancelled = candle_gen::gen_core::CancelFlag::default();
         cancelled.cancel();
@@ -1008,15 +1001,14 @@ mod tests {
             candle_gen::gen_core::Error::from(error),
             candle_gen::gen_core::Error::Canceled
         ));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A degenerate window is a typed error, not a hang. `BlockPlan::new` rejects 0, and the streamed
     /// arm must surface that rather than looping forever on a zero-length step.
     #[test]
     fn a_zero_window_is_rejected_rather_than_looping() {
-        let (_resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
         let error = streamed
             .forward_with_memory(
                 &latent,
@@ -1031,7 +1023,6 @@ mod tests {
             matches!(error, candle_gen::CandleError::Msg(ref m) if m.contains("window")),
             "{error:?}"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// **The CPU half of the rung's mutation check.** Every block in the window must be live at
@@ -1045,7 +1036,8 @@ mod tests {
     /// this one runs on every CI lane and needs no accelerator.
     #[test]
     fn a_window_materializes_every_block_before_any_of_them_runs() {
-        let (_resident, streamed, cfg, path) = crate::testfix::tiny_transformer_streamed_pair(6);
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, cfg) = crate::testfix::tiny_transformer_streamed_pair(&tmp, 6);
         let dit_plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
         let TransformerBlocks::Streamed(weights) = &streamed.blocks else {
             panic!("the fixture must produce a streamed trunk");
@@ -1067,8 +1059,6 @@ mod tests {
                 );
             }
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// **The configuration SC-15791 flagged as untested.** Its release-semantics arms all ran on one
@@ -1082,7 +1072,8 @@ mod tests {
     /// `rung4_block_window_real_weights.rs` has a compiled, exercised path to run.
     #[test]
     fn streamed_output_is_identical_when_driven_from_a_worker_thread() {
-        let (_resident, streamed, path, latent, timestep, context) = streamed_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
         let cancel = candle_gen::gen_core::CancelFlag::default();
 
         let run = |dit: &Krea2Transformer| {
@@ -1112,8 +1103,6 @@ mod tests {
             delta, 0.0,
             "materializing windows from a worker thread must not change the output"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1164,7 +1153,8 @@ mod tests {
     fn additive_surface_includes_all_seven_global_projections() {
         use crate::adapters::AdditiveDit;
 
-        let (mut dit, _cfg, path) = crate::testfix::tiny_transformer();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, _cfg) = crate::testfix::tiny_transformer(&tmp);
 
         let mut visited: Vec<String> = Vec::new();
         dit.visit_additive(&mut |p, _proj| {
@@ -1172,7 +1162,6 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let _ = std::fs::remove_file(&path);
 
         // All seven front-end/global projections must be on the surface. `time_mod_proj` is the leaf this
         // PR added (sc-14163); dropping it again would fail this assertion.
@@ -1267,7 +1256,8 @@ mod tests {
     fn edit_forward_honors_the_cancel_flag_per_block() {
         use candle_gen::gen_core::CancelFlag;
 
-        let (dit, cfg, path) = crate::testfix::tiny_transformer();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
         let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
         let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
         let timestep = Tensor::from_vec(vec![0.7f32], 1, &Device::Cpu).unwrap();
@@ -1317,7 +1307,5 @@ mod tests {
             candle_gen::gen_core::Error::from(error),
             candle_gen::gen_core::Error::Canceled
         ));
-
-        let _ = std::fs::remove_file(&path);
     }
 }

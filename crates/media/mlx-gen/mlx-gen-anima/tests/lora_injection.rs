@@ -268,8 +268,9 @@ fn turbo_checkpoint_is_not_base_plus_lora() {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot"]
 fn lokr_loads_and_applies_to_dit_and_conditioner() {
+    let tmp = tempfile::tempdir().unwrap();
     let mut c = load_base();
-    let spec = AdapterSpec::new(synth_lokr(), 1.0, AdapterKind::Lokr);
+    let spec = AdapterSpec::new(synth_lokr(&tmp), 1.0, AdapterKind::Lokr);
     let report = apply_anima_adapters(&mut c.dit, &mut c.conditioner, &[spec]).expect("apply LoKr");
     assert_eq!(
         report.applied, 2,
@@ -302,11 +303,12 @@ fn lokr_loads_and_applies_to_dit_and_conditioner() {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
 fn stacked_lora_plus_lokr_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
     // Apply the turbo LoRA (508 targets) AND the synthetic LoKr (2 targets) in one strict call.
     let mut c = load_base();
     let specs = vec![
         lora_spec(turbo_lora(), 1.0),
-        AdapterSpec::new(synth_lokr(), 1.0, AdapterKind::Lokr),
+        AdapterSpec::new(synth_lokr(&tmp), 1.0, AdapterKind::Lokr),
     ];
     let report =
         apply_anima_adapters(&mut c.dit, &mut c.conditioner, &specs).expect("apply stacked");

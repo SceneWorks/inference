@@ -495,13 +495,11 @@ mod tests {
     }
 
     fn vb_from_map(
+        tmp: &tempfile::TempDir,
         map: HashMap<String, Tensor>,
         tag: &str,
     ) -> (VarBuilder<'static>, std::path::PathBuf) {
-        let tmp = std::env::temp_dir().join(format!(
-            "sc10819_glm_{tag}_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp = tmp.path().join(format!("sc10819_glm_{tag}.safetensors"));
         candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: just-written file, untouched for the test's lifetime.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -552,14 +550,15 @@ mod tests {
     /// back — the packed-detect superset (sc-10819).
     #[test]
     fn packed_detect_fires_on_chatglm_layout() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = tiny_cfg();
-        let (vb_p, tmp_p) = vb_from_map(build_checkpoint(&cfg, true), "detect_packed");
+        let (vb_p, tmp_p) = vb_from_map(&tmp, build_checkpoint(&cfg, true), "detect_packed");
         let packed = ChatGlmModel::new_gs(cfg, vb_p, GS).unwrap();
         assert!(
             packed.all_projections_packed(),
             "every GLM projection must load packed on a `.scales` checkpoint"
         );
-        let (vb_d, tmp_d) = vb_from_map(build_checkpoint(&cfg, false), "detect_dense");
+        let (vb_d, tmp_d) = vb_from_map(&tmp, build_checkpoint(&cfg, false), "detect_dense");
         let dense = ChatGlmModel::new_gs(cfg, vb_d, GS).unwrap();
         assert!(
             !dense.all_projections_packed(),
@@ -574,9 +573,10 @@ mod tests {
     /// path is numerically faithful for BOTH Kolors conditioning outputs (penultimate context + pooled).
     #[test]
     fn packed_vs_dense_encode_parity() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = tiny_cfg();
-        let (vb_p, tmp_p) = vb_from_map(build_checkpoint(&cfg, true), "parity_packed");
-        let (vb_d, tmp_d) = vb_from_map(build_checkpoint(&cfg, false), "parity_dense");
+        let (vb_p, tmp_p) = vb_from_map(&tmp, build_checkpoint(&cfg, true), "parity_packed");
+        let (vb_d, tmp_d) = vb_from_map(&tmp, build_checkpoint(&cfg, false), "parity_dense");
         let packed = ChatGlmModel::new_gs(cfg, vb_p, GS).unwrap();
         let dense = ChatGlmModel::new_gs(cfg, vb_d, GS).unwrap();
         assert!(packed.all_projections_packed());

@@ -1026,8 +1026,9 @@ mod tests {
     // `transformer/config.json` marker, and the guard errors before any component weights load.
     #[test]
     fn tier_mismatch_errors_on_resident_and_sequential_load() {
+        let tmp = tempfile::tempdir().unwrap();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let root = loader::packed_snapshot_fixture("model-load", 8);
+            let root = loader::packed_snapshot_fixture(&tmp, "model-load", 8);
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                 .with_quant(mlx_gen::Quant::Q4)
                 .with_offload_policy(policy);
@@ -1046,12 +1047,13 @@ mod tests {
 
     #[test]
     fn load_heavy_runs_tier_guard_before_weights() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-009 (sc-12461): the heavy loader itself re-checks the tier guard — this is the seam the
         // Sequential path re-loads through on every generate, and the defense-in-depth for any
         // composition that reaches `load_heavy` without the `load_residency` entry guard. The
         // fixture has no weights at all, so reaching the transformer load would fail with a
         // missing-weights error instead — asserting on the tier message proves the guard runs first.
-        let root = loader::packed_snapshot_fixture("model-heavy", 8);
+        let root = loader::packed_snapshot_fixture(&tmp, "model-heavy", 8);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q4);
         let err = load_heavy(&spec, &root, false, false, MODEL_ID)
             .err()
@@ -1063,9 +1065,10 @@ mod tests {
 
     #[test]
     fn matching_packed_tier_passes_the_guard() {
+        let tmp = tempfile::tempdir().unwrap();
         // A Q8 request over a Q8-packed turnkey must get PAST the guard (and fail later on the
         // missing component weights, not on the tier) — the guard rejects mismatches only.
-        let root = loader::packed_snapshot_fixture("model-match", 8);
+        let root = loader::packed_snapshot_fixture(&tmp, "model-match", 8);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q8);
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(

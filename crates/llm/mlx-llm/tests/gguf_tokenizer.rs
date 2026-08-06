@@ -44,12 +44,16 @@ const CORPUS: &[&str] = &[
     "Mixing<|im_start|>special tokens inline",
 ];
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mlx-llm-tok-test-{}-{label}", std::process::id()))
+fn tmp_out(tmp: &tempfile::TempDir, label: &str) -> std::path::PathBuf {
+    tmp.path()
+        .join(format!("mlx-llm-tok-test-{}-{label}", std::process::id()))
 }
 
-fn convert_self_contained(gguf: &str) -> (std::path::PathBuf, TokenizerStatus) {
-    let out = tmp_out("snap");
+fn convert_self_contained(
+    tmp: &tempfile::TempDir,
+    gguf: &str,
+) -> (std::path::PathBuf, TokenizerStatus) {
+    let out = tmp_out(tmp, "snap");
     // No --tokenizer: the snapshot must stand on its own.
     let report = convert_file(gguf, &out, ConvertOptions::default()).expect("convert failed");
     (out, report.tokenizer)
@@ -62,6 +66,7 @@ fn convert_self_contained(gguf: &str) -> (std::path::PathBuf, TokenizerStatus) {
 #[test]
 #[ignore = "needs MLX_LLM_BPE_GGUF + MLX_LLM_TEST_MODEL"]
 fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
+    let tmp = tempfile::tempdir().unwrap();
     let (Ok(gguf), Ok(hf_dir)) = (
         std::env::var("MLX_LLM_BPE_GGUF"),
         std::env::var("MLX_LLM_TEST_MODEL"),
@@ -70,7 +75,7 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
         return;
     };
 
-    let (out, status) = convert_self_contained(&gguf);
+    let (out, status) = convert_self_contained(&tmp, &gguf);
     match &status {
         TokenizerStatus::Reconstructed(kind) => println!("reconstructed: {kind}"),
         other => panic!("expected a reconstructed tokenizer, got {other:?}"),
@@ -126,12 +131,13 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
 #[test]
 #[ignore = "needs MLX_LLM_BPE_GGUF + MLX_LLM_TEST_MODEL"]
 fn gguf_bpe_snapshot_runs_self_contained() {
+    let tmp = tempfile::tempdir().unwrap();
     let Ok(gguf) = std::env::var("MLX_LLM_BPE_GGUF") else {
         eprintln!("skip: set MLX_LLM_BPE_GGUF");
         return;
     };
 
-    let (out, status) = convert_self_contained(&gguf);
+    let (out, status) = convert_self_contained(&tmp, &gguf);
     assert!(
         matches!(status, TokenizerStatus::Reconstructed(_)),
         "tokenizer not reconstructed"

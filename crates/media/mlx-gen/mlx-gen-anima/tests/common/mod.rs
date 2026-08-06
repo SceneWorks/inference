@@ -243,8 +243,8 @@ pub fn write_raw_safetensors(
 /// Kronecker factors `lokr_w1`/`lokr_w2`) targeting one DiT and one conditioner module, and return its
 /// path. `alpha == rank` ⇒ scale 1.0 (PEFT). No official Anima LoKr exists, so this is a hand-built
 /// LoKr proving the path end to end; `a·b == out`, `c·d == in` per target.
-pub fn synth_lokr() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("anima_sc10521_lokr_{}", std::process::id()));
+pub fn synth_lokr(tmp: &tempfile::TempDir) -> PathBuf {
+    let dir = tmp.path().join("anima_sc10521_lokr");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("anima_synth_lokr.safetensors");
     // DiT blocks.1.self_attn.k_proj: W [2048,2048]; w1 [64,64] ⊗ w2 [32,32] → [2048,2048].
@@ -274,8 +274,8 @@ pub fn synth_lokr() -> PathBuf {
 /// NON-vacuous (unlike the turbo LoRA, whose 60 conditioner `lora_B` are all zero-initialized, so its
 /// conditioner leg could not distinguish any scale from any other). q_proj is `[1024, 1024]` (16 heads
 /// × 64 head_dim); rank 8.
-pub fn synth_conditioner_lora() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("anima_sc10521_cond_lora_{}", std::process::id()));
+pub fn synth_conditioner_lora(tmp: &tempfile::TempDir) -> PathBuf {
+    let dir = tmp.path().join("anima_sc10521_cond_lora");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("anima_synth_conditioner_lora.safetensors");
     let entries: &[(&str, &[usize])] = &[

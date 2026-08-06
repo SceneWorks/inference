@@ -2256,11 +2256,8 @@ mod tests {
             candle_gen::candle_core::safetensors::save(&m, te.join("model.safetensors")).unwrap();
             std::fs::write(te.join("config.json"), b"{}").unwrap();
         }
-        let base = std::env::temp_dir().join(format!(
-            "krea_te_store_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base = base_tmp.path().to_path_buf();
 
         let bf = base.join("bf16");
         write_te(&bf, DType::BF16);
@@ -2277,8 +2274,6 @@ mod tests {
             DType::F32,
             "non-bf16 TE → f32 store (never silently truncated)"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through

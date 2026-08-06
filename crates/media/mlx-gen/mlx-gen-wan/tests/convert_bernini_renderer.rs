@@ -60,9 +60,8 @@ fn assemble_real_bernini_renderer() {
         base.display()
     );
 
-    let out =
-        std::env::temp_dir().join(format!("bernini_renderer_mlx_test_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     assemble_bernini_renderer_snapshot(&out, &pkg, &base, None, true).expect("assemble");
 
     // Sidecar + loadable config present.

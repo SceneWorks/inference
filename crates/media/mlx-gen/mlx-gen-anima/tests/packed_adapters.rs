@@ -69,9 +69,11 @@ const DIT_Q_KEY: &str = "diffusion_model.blocks.0.self_attn.q_proj";
 ///
 /// Cached across runs — quantizing the 3.9 GB bf16 DiT takes real time, and the output is a pure
 /// function of (source checkpoint, bits, group_size).
-fn packed_split_files(bits: i32) -> PathBuf {
+fn packed_split_files(tmp: &tempfile::TempDir, bits: i32) -> PathBuf {
     let real = split_files().expect("Anima base snapshot");
-    let root = std::env::temp_dir().join(format!("anima_sc10578_q{bits}/split_files"));
+    let root = tmp
+        .path()
+        .join(format!("anima_sc10578_q{bits}/split_files"));
     let dit_dst = root
         .join("diffusion_models")
         .join(Variant::Base.dit_filename());
@@ -94,7 +96,8 @@ fn packed_split_files(bits: i32) -> PathBuf {
 }
 
 fn load_packed(bits: i32) -> AnimaComponents {
-    let root = packed_split_files(bits);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = packed_split_files(&tmp, bits);
     AnimaComponents::load(&WeightsSource::Dir(root), Variant::Base).expect("load packed components")
 }
 
@@ -240,7 +243,8 @@ fn packed_dit_lora_is_additive_over_packed_codes() {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (packs a 3.9 GB DiT)"]
 fn packed_dit_lokr_is_structured_while_dense_conditioner_stays_materialized() {
-    let lokr = synth_lokr();
+    let tmp = tempfile::tempdir().unwrap();
+    let lokr = synth_lokr(&tmp);
     let bits = 4;
     let mut c = load_packed(bits);
     assert_dit_is_packed(&mut c, bits);
@@ -342,11 +346,12 @@ fn write_ppm(path: &Path, pixels: &[u8], w: u32, h: u32) {
 #[test]
 #[ignore = "needs both Anima snapshots; VERY SLOW (packs a 3.9 GB DiT, then two 30-step 1024² denoises)"]
 fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
+    let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::runtime::CancelFlag;
     use mlx_gen::Progress;
     use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
 
-    let root = packed_split_files(4);
+    let root = packed_split_files(&tmp, 4);
     let opts = GenOptions {
         width: 1024,
         height: 1024,
@@ -376,8 +381,8 @@ fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
     let plain = gen(&[]);
     let styled = gen(&[lora_spec(style_lora(), 1.0)]);
 
-    let dir = std::env::temp_dir().join(format!("anima_sc10578_images_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     write_ppm(&dir.join("q4_plain.ppm"), &plain.pixels, 1024, 1024);
     write_ppm(&dir.join("q4_style_lora.ppm"), &styled.pixels, 1024, 1024);
     println!("[sc-10578] wrote images to {}", dir.display());

@@ -27,6 +27,10 @@ image = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 safetensors = { workspace = true }
 sha2 = { workspace = true }
 # Backend-neutral contract conformance suite (sc-4481): the macos-mlx lane runs z_image_turbo

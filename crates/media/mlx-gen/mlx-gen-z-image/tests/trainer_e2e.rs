@@ -46,7 +46,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs real Z-Image weights"]
 fn z_image_trainer_trains_and_writes_adapter() {
     // Tiny synthetic dataset: two solid-colour swatches + captions, written as PNGs.
-    let tmp = std::env::temp_dir().join(format!("z_image_trainer_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
@@ -185,7 +186,8 @@ fn z_image_trainer_trains_and_writes_adapter() {
 #[test]
 #[ignore = "needs real Z-Image weights"]
 fn z_image_trainer_lokr_trains_and_reloads() {
-    let tmp = std::env::temp_dir().join(format!("z_image_trainer_lokr_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 
@@ -315,10 +317,8 @@ fn z_image_trainer_lokr_trains_and_reloads() {
 #[test]
 #[ignore = "needs real Z-Image weights"]
 fn z_image_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join(format!(
-        "z_image_trainer_samples_e2e_{}",
-        std::process::id()
-    ));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 

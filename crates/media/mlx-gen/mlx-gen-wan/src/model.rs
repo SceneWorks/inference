@@ -1929,9 +1929,8 @@ mod tests {
 
     #[test]
     fn wan14b_adapter_residency_tracks_packed_folded_and_expert_routing() {
-        let root =
-            std::env::temp_dir().join(format!("wan14b-adapter-residency-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let shared = root.join("shared.safetensors");
         let low = root.join("low.safetensors");
         let high = root.join("high.safetensors");
@@ -1973,7 +1972,6 @@ mod tests {
             wan14b_adapter_bytes_per_expert(&missing, AdapterResidencyMode::Additive),
             None
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn wan_5b() -> Wan {
@@ -2083,11 +2081,8 @@ mod tests {
     /// invocation, so it rules out cross-*test* races but not cross-*process* ones — two concurrent
     /// `cargo test` runs on the same machine share `$TMPDIR`, and the `remove_dir_all` below would
     /// then delete the other run's fixtures mid-test.
-    fn sizing_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("mlx_gen_wan_dit_sizing_{}", std::process::id()))
-            .join(name);
-        let _ = std::fs::remove_dir_all(&d);
+    fn sizing_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let d = tmp.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -2100,7 +2095,8 @@ mod tests {
     /// blob target instead.
     #[test]
     fn dit_resident_bytes_dir_sums_symlinked_shards_at_target_size() {
-        let root = sizing_dir("symlinked_shards");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sizing_dir(&tmp, "symlinked_shards");
         let blobs = root.join("blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         let blob = blobs.join("blob0");
@@ -2129,7 +2125,8 @@ mod tests {
     /// contribute nothing, so the sizing matches what the loader will actually map.
     #[test]
     fn dit_resident_bytes_dir_skips_hidden_sidecars_and_non_safetensors() {
-        let shard_dir = sizing_dir("hidden_sidecars");
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = sizing_dir(&tmp, "hidden_sidecars");
         std::fs::write(shard_dir.join("model.safetensors"), vec![0u8; 1024]).unwrap();
         std::fs::write(shard_dir.join("._model.safetensors"), vec![0u8; 999]).unwrap();
         std::fs::write(shard_dir.join("config.json"), b"{}").unwrap();
@@ -2175,12 +2172,9 @@ mod tests {
         c
     }
 
-    fn tmp_dir() -> PathBuf {
+    fn tmp_dir(tmp: &tempfile::TempDir) -> PathBuf {
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let d = std::env::temp_dir().join(format!(
-            "mlx_gen_wan_model_site_test_{}",
-            std::process::id()
-        ));
+        let d = tmp.path().join("mlx_gen_wan_model_site_test");
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -2194,7 +2188,7 @@ mod tests {
     /// Build a tiny dense [`WanTransformer`] from synthesized weights matching [`tiny_cfg`]. Every
     /// tensor `from_weights` + `Block::load` requires is present; the per-block attn/ffn Linears carry
     /// `in = 64`/`128` so a subsequent `.quantize(bits)` packs them (group 64).
-    fn tiny_transformer(cfg: &WanModelConfig) -> WanTransformer {
+    fn tiny_transformer(tmp: &tempfile::TempDir, cfg: &WanModelConfig) -> WanTransformer {
         let dim = cfg.dim as i32;
         let ffn = cfg.ffn_dim as i32;
         let mut entries: Vec<(String, Array)> = Vec::new();
@@ -2276,7 +2270,7 @@ mod tests {
         lin(&mut entries, "blocks.0.ffn.fc1", ffn, dim, 1.5);
         lin(&mut entries, "blocks.0.ffn.fc2", dim, ffn, 1.6);
 
-        let path = tmp_dir().join("tiny_wan.safetensors");
+        let path = tmp_dir(tmp).join("tiny_wan.safetensors");
         let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         let w = Weights::from_file(&path).unwrap();
@@ -2300,8 +2294,9 @@ mod tests {
     /// `norm3_w` / `norm3_b` **directly** and shares no code with the routing match arms.
     #[test]
     fn wan_norm_diff_patch_targets_route_to_distinct_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         assert_eq!(
             WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.len(),
             6,
@@ -2358,7 +2353,7 @@ mod tests {
 
     /// A PEFT LoRA file targeting `blocks.0.self_attn.q` ([dim,dim]) — `diffusion_model.`-prefixed,
     /// A `[rank,dim]`, B `[dim,rank]`, no alpha.
-    fn tiny_lora(name: &str, dim: i32, rank: i32) -> PathBuf {
+    fn tiny_lora(tmp: &tempfile::TempDir, name: &str, dim: i32, rank: i32) -> PathBuf {
         let a = bf16(
             (0..rank * dim).map(|i| (i as f32 * 0.01).sin() * 0.03),
             &[rank, dim],
@@ -2367,7 +2362,7 @@ mod tests {
             (0..dim * rank).map(|i| (i as f32 * 0.007).cos() * 0.03),
             &[dim, rank],
         );
-        let path = tmp_dir().join(name);
+        let path = tmp_dir(tmp).join(name);
         Array::save_safetensors(
             vec![
                 ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &a),
@@ -2381,7 +2376,7 @@ mod tests {
     }
 
     /// A peft LoKr file (networkType=lokr) targeting `blocks.0.self_attn.q` ([64,64] = kron([8,8],[8,8])).
-    fn tiny_lokr(name: &str) -> PathBuf {
+    fn tiny_lokr(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         let w1 = Array::from_slice(
             &(0..64)
                 .map(|i| (i as f32 * 0.03).sin() * 0.1)
@@ -2399,7 +2394,7 @@ mod tests {
             ("alpha".to_string(), "8".to_string()),
             ("rank".to_string(), "8".to_string()),
         ]);
-        let path = tmp_dir().join(name);
+        let path = tmp_dir(tmp).join(name);
         Array::save_safetensors(
             vec![
                 ("blocks.0.self_attn.q.lokr_w1", &w1),
@@ -2432,7 +2427,7 @@ mod tests {
 
     /// Construct a bare pre-quantized `Wan` (5B) with a config that reports pre-quantized, so the
     /// generate path would route to the additive install. `bits` mirrors a Q4/Q8 snapshot.
-    fn wan_5b_prequant(adapters: Vec<AdapterSpec>) -> Wan {
+    fn wan_5b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan {
         let mut cfg = tiny_cfg();
         cfg.quantization = Some(crate::config::WanQuant {
             bits: 8,
@@ -2441,14 +2436,14 @@ mod tests {
         Wan {
             descriptor: descriptor(),
             config: cfg,
-            root: tmp_dir(),
+            root: tmp_dir(tmp),
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
         }
     }
 
-    fn wan_14b_prequant(adapters: Vec<AdapterSpec>) -> Wan14b {
+    fn wan_14b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan14b {
         let mut cfg = tiny_cfg();
         cfg.dual_model = true;
         cfg.quantization = Some(crate::config::WanQuant {
@@ -2458,7 +2453,7 @@ mod tests {
         Wan14b {
             descriptor: descriptor_t2v_14b(),
             config: cfg,
-            root: tmp_dir(),
+            root: tmp_dir(tmp),
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
@@ -2467,18 +2462,23 @@ mod tests {
 
     #[test]
     fn site_5b_packed_lora_installs_additively_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // 5B `Wan::install_adapters_additive`: a plain LoRA installs on a PACKED base with no error;
         // the base stays packed and the q forward-linear gains a residual.
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         dit.quantize(8, None).unwrap();
         assert!(q_is_quantized(&mut dit), "base packed before install");
 
-        let model = wan_5b_prequant(vec![lora_spec(tiny_lora(
-            "site5b.safetensors",
-            cfg.dim as i32,
-            8,
-        ))]);
+        let model = wan_5b_prequant(
+            &tmp,
+            vec![lora_spec(tiny_lora(
+                &tmp,
+                "site5b.safetensors",
+                cfg.dim as i32,
+                8,
+            ))],
+        );
         model
             .install_adapters_additive(&mut dit)
             .expect("plain LoRA on a packed 5B must install with no error");
@@ -2490,16 +2490,17 @@ mod tests {
 
     #[test]
     fn site_5b_packed_lokr_installs_structurally_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // 5B (sc-10050): LoKr on a packed base now installs via the structured deferred-Kronecker path
         // with NO error (the sc-10045 interim rejection is gone), and the base STAYS packed.
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         dit.quantize(8, None).unwrap();
         assert!(q_is_quantized(&mut dit), "base packed before install");
 
-        let mut spec = lora_spec(tiny_lokr("site5b_lokr.safetensors"));
+        let mut spec = lora_spec(tiny_lokr(&tmp, "site5b_lokr.safetensors"));
         spec.kind = AdapterKind::Lokr;
-        let model = wan_5b_prequant(vec![spec]);
+        let model = wan_5b_prequant(&tmp, vec![spec]);
         model
             .install_adapters_additive(&mut dit)
             .expect("LoKr on a packed 5B must install structurally with no error (sc-10050)");
@@ -2511,19 +2512,24 @@ mod tests {
 
     #[test]
     fn site_14b_packed_lora_installs_on_both_experts() {
+        let tmp = tempfile::tempdir().unwrap();
         // A14B `Wan14b::install_adapters_additive`: a shared plain LoRA installs onto BOTH packed
         // experts with no error; both bases stay packed.
         let cfg = tiny_cfg();
-        let mut low = tiny_transformer(&cfg);
-        let mut high = tiny_transformer(&cfg);
+        let mut low = tiny_transformer(&tmp, &cfg);
+        let mut high = tiny_transformer(&tmp, &cfg);
         low.quantize(4, None).unwrap();
         high.quantize(4, None).unwrap();
 
-        let model = wan_14b_prequant(vec![lora_spec(tiny_lora(
-            "site14b.safetensors",
-            cfg.dim as i32,
-            8,
-        ))]);
+        let model = wan_14b_prequant(
+            &tmp,
+            vec![lora_spec(tiny_lora(
+                &tmp,
+                "site14b.safetensors",
+                cfg.dim as i32,
+                8,
+            ))],
+        );
         model
             .install_adapters_additive(&mut low, &mut high)
             .expect("plain LoRA on packed A14B experts must install with no error");
@@ -2535,17 +2541,18 @@ mod tests {
 
     #[test]
     fn site_14b_packed_lokr_installs_structurally_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // A14B (sc-10050): a shared LoKr installs onto BOTH packed experts via the structured
         // deferred-Kronecker path with NO error; both bases stay packed.
         let cfg = tiny_cfg();
-        let mut low = tiny_transformer(&cfg);
-        let mut high = tiny_transformer(&cfg);
+        let mut low = tiny_transformer(&tmp, &cfg);
+        let mut high = tiny_transformer(&tmp, &cfg);
         low.quantize(4, None).unwrap();
         high.quantize(4, None).unwrap();
 
-        let mut spec = lora_spec(tiny_lokr("site14b_lokr.safetensors"));
+        let mut spec = lora_spec(tiny_lokr(&tmp, "site14b_lokr.safetensors"));
         spec.kind = AdapterKind::Lokr;
-        let model = wan_14b_prequant(vec![spec]);
+        let model = wan_14b_prequant(&tmp, vec![spec]);
         model.install_adapters_additive(&mut low, &mut high).expect(
             "LoKr on packed A14B experts must install structurally with no error (sc-10050)",
         );
@@ -2557,17 +2564,18 @@ mod tests {
 
     #[test]
     fn site_5b_packed_loha_is_explicit_typed_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // 5B: LoHa on a packed base is still rejected (LoHa is sc-10051, out of scope) — the actionable
         // error points at the bf16 tier + sc-10051, not a panic, not the old "not yet wired".
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         dit.quantize(8, None).unwrap();
 
         // A committed third-party LoHa fixture (detected by `hada_*` keys).
         let loha = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("tests/fixtures/sc3643_loha/linear.safetensors");
-        let model = wan_5b_prequant(vec![lora_spec(loha)]);
+        let model = wan_5b_prequant(&tmp, vec![lora_spec(loha)]);
         let err = model
             .install_adapters_additive(&mut dit)
             .expect_err("LoHa on a packed 5B must be rejected (sc-10051)");
@@ -2584,16 +2592,17 @@ mod tests {
 
     #[test]
     fn site_14b_dense_fold_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
         // Dense-path regression: `Wan14b::merge_adapters` (the fold path) still folds a plain LoRA onto
         // both dense expert weight maps, unchanged by sc-10045.
         let cfg = tiny_cfg();
-        let lora = tiny_lora("site14b_dense.safetensors", cfg.dim as i32, 8);
+        let lora = tiny_lora(&tmp, "site14b_dense.safetensors", cfg.dim as i32, 8);
         // Build the two dense expert weight maps from the tiny synthetic base.
         let base_path = {
             let mut c = cfg.clone();
             c.dual_model = true;
-            let _ = tiny_transformer(&c); // side-effect: writes tiny_wan.safetensors
-            tmp_dir().join("tiny_wan.safetensors")
+            let _ = tiny_transformer(&tmp, &c); // side-effect: writes tiny_wan.safetensors
+            tmp_dir(&tmp).join("tiny_wan.safetensors")
         };
         let mut low_w = Weights::from_file(&base_path).unwrap();
         let mut high_w = Weights::from_file(&base_path).unwrap();
@@ -2602,7 +2611,7 @@ mod tests {
             .unwrap()
             .clone();
 
-        let model = wan_14b_prequant(vec![lora_spec(lora)]);
+        let model = wan_14b_prequant(&tmp, vec![lora_spec(lora)]);
         // Use a DENSE config for the fold path (quantization None).
         let dense = Wan14b {
             config: {

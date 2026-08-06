@@ -195,8 +195,8 @@ mod explicit_registry_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn snapshot(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("z-image-{tag}-{}", std::process::id()));
+    fn snapshot(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
+        let root = tmp.path().join(format!("z-image-{tag}"));
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
@@ -235,13 +235,14 @@ mod explicit_registry_tests {
     /// builds the contract directly instead of going through the registry.
     #[test]
     fn every_variant_resolves_its_memory_strategy_contract_through_the_registry() {
+        let tmp = tempfile::tempdir().unwrap();
         use mlx_gen::gen_core::{LoadSpec, MemoryStrategy, MemoryStrategySupport, WeightsSource};
 
         let registry = super::provider_registry().unwrap();
         // SC-15998: rung 4 is declared per load — a re-openable snapshot dir with deferred
         // materialization, independent from phase residency.
         // The registry must hand back the same contract the direct builder produces for that load.
-        let root = snapshot("registry-memory");
+        let root = snapshot(&tmp, "registry-memory");
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         for id in [

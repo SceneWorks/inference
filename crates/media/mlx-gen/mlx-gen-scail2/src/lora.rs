@@ -291,10 +291,9 @@ mod tests {
     use mlx_rs::ops::{all_close, array_eq};
     use std::path::PathBuf;
 
-    fn tmp(name: &str) -> PathBuf {
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_scail2_lora_test_{}", std::process::id()));
+        let dir = tmp.path().join("mlx_gen_scail2_lora_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -308,8 +307,8 @@ mod tests {
     /// A small SCAIL-2-shaped dense weight map: one block projection (Linear + bias), one qk-RMSNorm
     /// (weight only), and a `patch_embedding` Conv stem (5-D weight + bias) standing in for the
     /// cross-architecture target — all the distinct diff-patch module shapes.
-    fn synthetic_dit() -> Weights {
-        let path = tmp("dit.safetensors");
+    fn synthetic_dit(tmp: &tempfile::TempDir) -> Weights {
+        let path = scratch_file(tmp, "dit.safetensors");
         let q_w = f32(
             (0..16 * 8).map(|i| i as f32 * 0.01 - 0.3).collect(),
             &[16, 8],
@@ -340,8 +339,8 @@ mod tests {
     /// A diff-patch LoRA over the synthetic DiT: the q projection gets low-rank factors + a `.diff_b`
     /// bias delta; norm_q gets a full-rank `.diff`; patch_embedding gets a shape-INCOMPATIBLE `.diff`
     /// (in_dim 6 vs 4) + a (shape-compatible) `.diff_b` — the cross-architecture case.
-    fn write_diff_patch(name: &str) -> PathBuf {
-        let path = tmp(name);
+    fn write_diff_patch(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = scratch_file(tmp, name);
         let rank = 4;
         let down = f32(
             (0..rank * 8)
@@ -388,10 +387,11 @@ mod tests {
 
     #[test]
     fn detects_diff_patch_file() {
-        let dp = write_diff_patch("detect.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "detect.safetensors");
         assert!(has_diff_patch_keys(&dp).unwrap());
         // A pure low-rank file (no .diff/.diff_b) is NOT a diff-patch file.
-        let plain = tmp("plain.safetensors");
+        let plain = scratch_file(&tmp, "plain.safetensors");
         let down = f32(vec![0.1; 4 * 8], &[4, 8]);
         let up = f32(vec![0.1; 16 * 4], &[16, 4]);
         Array::save_safetensors(
@@ -411,8 +411,9 @@ mod tests {
 
     #[test]
     fn merges_lora_diff_and_diffb_skips_cross_arch() {
-        let dp = write_diff_patch("merge.safetensors");
-        let mut w = synthetic_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "merge.safetensors");
+        let mut w = synthetic_dit(&tmp);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(dp.clone(), 1.0)]).unwrap();
 
         // q.weight (lora) + norm_q.weight (diff) merged; q.bias + norm... only q has diff_b → 1 bias.
@@ -427,7 +428,7 @@ mod tests {
         assert!(report.skipped_unmatched.is_empty());
 
         // patch_embedding stays bit-identical (skipped entirely — weight AND bias).
-        let base = synthetic_dit();
+        let base = synthetic_dit(&tmp);
         for k in ["patch_embedding.weight", "patch_embedding.bias"] {
             assert!(
                 array_eq(w.require(k).unwrap(), base.require(k).unwrap(), false)
@@ -478,9 +479,10 @@ mod tests {
 
     #[test]
     fn scale_zero_is_noop() {
-        let dp = write_diff_patch("zero.safetensors");
-        let mut w = synthetic_dit();
-        let base = synthetic_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "zero.safetensors");
+        let mut w = synthetic_dit(&tmp);
+        let base = synthetic_dit(&tmp);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(dp, 0.0)]).unwrap();
         // Still "merged" (folded a zero delta), but every touched weight is bit-identical to the base.
         assert_eq!(report.merged_weights, 2);
@@ -506,8 +508,9 @@ mod tests {
 
     #[test]
     fn report_errors_when_nothing_matched() {
+        let tmp = tempfile::tempdir().unwrap();
         // A diff-patch file whose only target isn't in the checkpoint → matched-nothing error.
-        let path = tmp("nomatch.safetensors");
+        let path = scratch_file(&tmp, "nomatch.safetensors");
         let diff = f32(vec![0.1; 8], &[8]);
         Array::save_safetensors(
             vec![("diffusion_model.blocks.99.unknown.diff", &diff)],
@@ -515,7 +518,7 @@ mod tests {
             &path,
         )
         .unwrap();
-        let mut w = synthetic_dit();
+        let mut w = synthetic_dit(&tmp);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(path, 1.0)]).unwrap();
         assert_eq!(report.merged_weights, 0);
         assert_eq!(

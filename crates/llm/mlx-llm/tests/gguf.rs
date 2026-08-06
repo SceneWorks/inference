@@ -134,8 +134,9 @@ fn greedy_tokens(model: &CausalLm, ids: &[i32], stop: &[i32], n: usize) -> Vec<i
         .tokens
 }
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mlx-llm-gguf-test-{}-{label}", std::process::id()))
+fn tmp_out(tmp: &tempfile::TempDir, label: &str) -> std::path::PathBuf {
+    tmp.path()
+        .join(format!("mlx-llm-gguf-test-{}-{label}", std::process::id()))
 }
 
 /// Every GGUF in the directory converts to a dense snapshot whose prefill logits track the HF load
@@ -145,6 +146,7 @@ fn tmp_out(label: &str) -> std::path::PathBuf {
 #[test]
 #[ignore = "needs MLX_LLM_GGUF_DIR + MLX_LLM_TEST_MODEL"]
 fn gguf_dense_conversion_tracks_hf() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(r) = load_ref() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
         return;
@@ -172,7 +174,7 @@ fn gguf_dense_conversion_tracks_hf() {
     let mut covered = 0usize;
     for path in &files {
         let label = path.file_stem().unwrap().to_string_lossy().to_string();
-        let out = tmp_out(&label);
+        let out = tmp_out(&tmp, &label);
         // A GGUF using a genuinely-unsupported type (sub-4-bit IQ) is reported and skipped, not
         // silently passed over — the suite covers every type it claims to and names the rest.
         let report = match convert_file(path, &out, ConvertOptions::default()) {
@@ -267,6 +269,7 @@ fn gguf_dense_conversion_tracks_hf() {
 #[test]
 #[ignore = "needs MLX_LLM_GGUF_DIR + MLX_LLM_TEST_MODEL"]
 fn gguf_requant_snapshot_loads_quantized() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(r) = load_ref() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
         return;
@@ -293,7 +296,7 @@ fn gguf_requant_snapshot_loads_quantized() {
         ("q8", QuantSpec::q8(), 0.99f32),
         ("q4", QuantSpec::q4(), 0.6),
     ] {
-        let out = tmp_out(&format!("requant-{tag}"));
+        let out = tmp_out(&tmp, &format!("requant-{tag}"));
         let report = convert_file(
             src,
             &out,
@@ -344,6 +347,7 @@ fn gguf_requant_snapshot_loads_quantized() {
 #[test]
 #[ignore = "needs MLX_LLM_GGUF_DIR + MLX_LLM_TEST_MODEL"]
 fn gguf_dequant_matches_hf_weights() {
+    let tmp = tempfile::tempdir().unwrap();
     let Ok(hf_dir) = std::env::var("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
         return;
@@ -377,7 +381,7 @@ fn gguf_dequant_matches_hf_weights() {
     let mut covered = 0usize;
     for path in &files {
         let label = path.file_stem().unwrap().to_string_lossy().to_string();
-        let out = tmp_out(&format!("wcos-{label}"));
+        let out = tmp_out(&tmp, &format!("wcos-{label}"));
         let report = match convert_file(path, &out, ConvertOptions::default()) {
             Ok(r) => r,
             Err(mlx_llm::error::Error::Unsupported(_)) => continue, // covered by the behavioral test's skip log
@@ -476,6 +480,7 @@ fn ggml_type_name(tag: u32) -> &'static str {
 #[test]
 #[ignore = "needs MLX_LLM_IQ_GGUF_DIR + MLX_LLM_TEST_MODEL"]
 fn gguf_iq_dequant_matches_hf_by_type() {
+    let tmp = tempfile::tempdir().unwrap();
     let Ok(hf_dir) = std::env::var("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
         return;
@@ -524,7 +529,7 @@ fn gguf_iq_dequant_matches_hf_by_type() {
             }
         }
 
-        let out = tmp_out(&format!("iqcos-{label}"));
+        let out = tmp_out(&tmp, &format!("iqcos-{label}"));
         let _report = convert_file(path, &out, ConvertOptions::default())
             .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
         let conv = Weights::from_dir(&out).unwrap();
@@ -621,6 +626,7 @@ fn gguf_iq_dequant_matches_hf_by_type() {
 #[test]
 #[ignore = "needs MLX_LLM_IQ_GGUF_DIR + MLX_LLM_TEST_MODEL"]
 fn gguf_iq_snapshot_generates() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(r) = load_ref() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
         return;
@@ -651,7 +657,7 @@ fn gguf_iq_snapshot_generates() {
     let mut failures: Vec<String> = Vec::new();
     for path in &files {
         let label = path.file_stem().unwrap().to_string_lossy().to_string();
-        let out = tmp_out(&format!("iqgen-{label}"));
+        let out = tmp_out(&tmp, &format!("iqgen-{label}"));
         convert_file(path, &out, ConvertOptions::default()).unwrap();
         let cfg = ModelConfig::from_dir(&out).unwrap();
         let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();

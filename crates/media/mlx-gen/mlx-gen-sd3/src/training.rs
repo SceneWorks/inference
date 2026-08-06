@@ -1523,8 +1523,8 @@ mod real_weight_repro {
 
         let root =
             snapshot().expect("set SD3_LARGE_DIR to the stable-diffusion-3.5-large snapshot root");
-        let tmp = std::env::temp_dir().join(format!("sd3_t2_smoke_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
 
         // --- tiny synthetic dataset: 2 solid-color 256² PNGs with captions ---
         let mk_png = |path: &std::path::Path, rgb: [u8; 3]| {
@@ -1672,8 +1672,8 @@ mod real_weight_repro {
 
         let root = medium_snapshot()
             .expect("set SD3_MEDIUM_DIR to the stable-diffusion-3.5-medium snapshot root");
-        let tmp = std::env::temp_dir().join(format!("sd3_t4_medium_smoke_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
 
         // --- tiny synthetic dataset: 2 solid-color 256² PNGs with captions ---
         let mk_png = |path: &std::path::Path, rgb: [u8; 3]| {

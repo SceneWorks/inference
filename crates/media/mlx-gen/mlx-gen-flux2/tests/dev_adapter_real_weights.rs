@@ -40,9 +40,11 @@ fn snapshot() -> PathBuf {
 /// Assemble (or reuse) a pre-quantized Q4 dev snapshot at a stable temp path — identical to the dev
 /// T2I/edit e2e tests, so a prior run's output is reused (DiT + Mistral TE pre-quantized, VAE +
 /// tokenizer symlinked from the source).
-fn prequantized_dev_snapshot() -> PathBuf {
+fn prequantized_dev_snapshot(tmp: &tempfile::TempDir) -> PathBuf {
     let src = snapshot();
-    let dst = std::env::temp_dir().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"));
+    let dst = tmp
+        .path()
+        .join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"));
 
     if !dst
         .join("transformer/diffusion_pytorch_model.safetensors")
@@ -102,7 +104,8 @@ fn lora_targets() -> Vec<String> {
 
 /// Probe each target's logical `[out, in]` on the (packed) real dev transformer.
 fn probe_shapes(targets: &[String]) -> Vec<(String, i32, i32)> {
-    let mut probe = load_transformer_dev(&prequantized_dev_snapshot()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut probe = load_transformer_dev(&prequantized_dev_snapshot(&tmp)).unwrap();
     targets
         .iter()
         .map(|p| {
@@ -123,7 +126,7 @@ fn det(seed: i32, n: i32, scale: f32) -> Vec<f32> {
 
 /// Write a peft-form dev LoRA (`transformer.‹path›.lora_A/lora_B`, `[r,in]`/`[out,r]`, alpha) at the
 /// real block dims. Returns the file path.
-fn write_lora(shapes: &[(String, i32, i32)]) -> PathBuf {
+fn write_lora(tmp: &tempfile::TempDir, shapes: &[(String, i32, i32)]) -> PathBuf {
     let none = None as Option<&std::collections::HashMap<String, String>>;
     let alpha = Array::from_slice(&[RANK as f32], &[1]);
     let mut arrays: Vec<(String, Array)> = Vec::new();
@@ -134,8 +137,7 @@ fn write_lora(shapes: &[(String, i32, i32)]) -> PathBuf {
         arrays.push((format!("transformer.{p}.lora_B.weight"), b));
         arrays.push((format!("transformer.{p}.alpha"), alpha.clone()));
     }
-    let dir =
-        std::env::temp_dir().join(format!("mlx_gen_flux2_dev_adapter_{}", std::process::id()));
+    let dir = tmp.path().join("mlx_gen_flux2_dev_adapter");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dev_lora.safetensors");
     Array::save_safetensors(
@@ -152,7 +154,7 @@ fn write_lora(shapes: &[(String, i32, i32)]) -> PathBuf {
 
 /// Write a peft-form dev LoKr (bare `‹path›.lokr_w1`/`lokr_w2_a`/`lokr_w2_b`, `networkType=lokr`) at
 /// the real block dims: `w1=[1,1]`, low-rank `w2 = w2_a@w2_b = [out,in]` → `kron(w1,w2)=[out,in]`.
-fn write_lokr(shapes: &[(String, i32, i32)]) -> PathBuf {
+fn write_lokr(tmp: &tempfile::TempDir, shapes: &[(String, i32, i32)]) -> PathBuf {
     let mut md = std::collections::HashMap::new();
     md.insert("networkType".to_string(), "lokr".to_string());
     md.insert("rank".to_string(), RANK.to_string());
@@ -166,8 +168,7 @@ fn write_lokr(shapes: &[(String, i32, i32)]) -> PathBuf {
         arrays.push((format!("{p}.lokr_w2_a"), w2a));
         arrays.push((format!("{p}.lokr_w2_b"), w2b));
     }
-    let dir =
-        std::env::temp_dir().join(format!("mlx_gen_flux2_dev_adapter_{}", std::process::id()));
+    let dir = tmp.path().join("mlx_gen_flux2_dev_adapter");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dev_lokr.safetensors");
     Array::save_safetensors(
@@ -183,7 +184,8 @@ fn write_lokr(shapes: &[(String, i32, i32)]) -> PathBuf {
 }
 
 fn render(adapter: Option<(&Path, AdapterKind, f32)>, size: u32, steps: u32, seed: u64) -> Vec<u8> {
-    let mut spec = LoadSpec::new(WeightsSource::Dir(prequantized_dev_snapshot()));
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(prequantized_dev_snapshot(&tmp)));
     if let Some((path, kind, scale)) = adapter {
         spec = spec.with_adapters(vec![AdapterSpec {
             path: path.to_path_buf(),
@@ -227,7 +229,8 @@ fn px_gt8(a: &[u8], b: &[u8]) -> f64 {
 #[test]
 #[ignore = "needs real FLUX.2-dev weights (~105 GB); assembles a Q4 snapshot in TMPDIR"]
 fn dev_routing_map_covers_real_tree() {
-    let mut t = load_transformer_dev(&prequantized_dev_snapshot()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut t = load_transformer_dev(&prequantized_dev_snapshot(&tmp)).unwrap();
     let resolves = |t: &mut _, p: &str| -> bool {
         let segs: Vec<&str> = p.split('.').collect();
         AdaptableHost::adaptable_mut(t, &segs).is_some()
@@ -292,6 +295,7 @@ fn dev_routing_map_covers_real_tree() {
 #[test]
 #[ignore = "needs real FLUX.2-dev weights (~105 GB); assembles a Q4 snapshot in TMPDIR"]
 fn dev_lora_and_lokr_visibly_affect_render() {
+    let tmp = tempfile::tempdir().unwrap();
     let size: u32 = std::env::var("MLX_GEN_FLUX2_DEV_ADAPTER_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -307,8 +311,8 @@ fn dev_lora_and_lokr_visibly_affect_render() {
         "probed {} dev targets across double {{0,3,7}} + single {{0,12,24,36,47}}",
         shapes.len()
     );
-    let lora = write_lora(&shapes);
-    let lokr = write_lokr(&shapes);
+    let lora = write_lora(&tmp, &shapes);
+    let lokr = write_lokr(&tmp, &shapes);
 
     let base = render(None, size, steps, 0);
 

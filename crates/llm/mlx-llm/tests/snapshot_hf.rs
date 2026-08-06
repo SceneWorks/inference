@@ -34,8 +34,8 @@ fn source_dir() -> Option<String> {
     }
 }
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mlx-llm-hfsnap-{label}-{}", std::process::id()))
+fn tmp_out(tmp: &tempfile::TempDir, label: &str) -> std::path::PathBuf {
+    tmp.path().join(format!("mlx-llm-hfsnap-{label}"))
 }
 
 fn greedy_request() -> TextLlmRequest {
@@ -56,6 +56,7 @@ fn greedy_request() -> TextLlmRequest {
 #[test]
 #[ignore = "needs an HF snapshot via MLX_LLM_TEST_MODEL"]
 fn hf_prepare_dense_q4_q8_loads_and_generates() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(source) = source_dir() else { return };
 
     // Reference: the source loaded directly through the provider.
@@ -73,7 +74,7 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
         ("q4", Some(QuantSpec::q4())),
         ("q8", Some(QuantSpec::q8())),
     ] {
-        let out = tmp_out(label);
+        let out = tmp_out(&tmp, label);
         let report = write_hf_snapshot(&source, &out, quantize).unwrap();
         assert_eq!(
             report.quantized, quantize,
@@ -125,8 +126,9 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
 #[test]
 #[ignore = "needs an HF snapshot via MLX_LLM_TEST_MODEL"]
 fn hf_dense_passthrough_is_bit_identical() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(source) = source_dir() else { return };
-    let out = tmp_out("parity");
+    let out = tmp_out(&tmp, "parity");
     write_hf_snapshot(&source, &out, None).unwrap();
 
     let src = Weights::from_dir(&source).unwrap();

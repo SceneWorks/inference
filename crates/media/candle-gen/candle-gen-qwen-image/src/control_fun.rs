@@ -358,9 +358,8 @@ mod tests {
 
     #[test]
     fn controlnet_file_resolution() {
-        let dir = std::env::temp_dir().join(format!("qwen_fun_cn_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // Empty dir → error.
         assert!(resolve_controlnet_files(&dir).is_err());
         // A single file path resolves to itself.
@@ -372,7 +371,6 @@ mod tests {
         std::fs::write(&g, b"y").unwrap();
         let got = resolve_controlnet_files(&dir).unwrap();
         assert_eq!(got, vec![f, g]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// This lane's control-image preprocessing goes through the shared [`control_common`] helper with
@@ -493,10 +491,8 @@ mod tests {
             Tensor::zeros((inner,), DType::F32, &dev)?,
         );
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9869_2512fun_packed_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9869_2512fun_packed.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written by this test, single reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -549,7 +545,6 @@ mod tests {
             "packed control_img_in vs affine grid cosine {cos:.6}"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 

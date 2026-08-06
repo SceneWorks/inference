@@ -2145,10 +2145,9 @@ mod tests {
         ));
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_flux_adapter_test_{}", std::process::id()));
+        let dir = tmp.path().join("mlx_gen_flux_adapter_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -2165,6 +2164,7 @@ mod tests {
     /// (the row-slice operates on the source factors, not the base), so this is a CI gate.
     #[test]
     fn bfl_fused_qkv_matches_diffusers_split() {
+        let tmp = tempfile::tempdir().unwrap();
         let none = None as Option<&HashMap<String, String>>;
         let (inner, inp, r) = (3072i32, 8i32, 2i32);
         let head = |seed: i32| -> Vec<f32> {
@@ -2189,7 +2189,7 @@ mod tests {
         );
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-        let bfl_path = tmp("bfl_qkv.safetensors");
+        let bfl_path = scratch_file(&tmp, "bfl_qkv.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2206,7 +2206,7 @@ mod tests {
             &bfl_path,
         )
         .unwrap();
-        let peft_path = tmp("bfl_qkv_split_peft.safetensors");
+        let peft_path = scratch_file(&tmp, "bfl_qkv_split_peft.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2286,6 +2286,7 @@ mod tests {
     /// split reconstructs byte-identically to the diffusers split-target file (the `Dims` boundaries).
     #[test]
     fn bfl_fused_single_linear1_matches_diffusers_split() {
+        let tmp = tempfile::tempdir().unwrap();
         let none = None as Option<&HashMap<String, String>>;
         let (r, inp) = (2i32, 8i32);
         let dims = [DIM, DIM, DIM, 4 * DIM]; // q,k,v,mlp
@@ -2312,7 +2313,7 @@ mod tests {
         );
         let alpha = Array::from_slice(&[8.0f32], &[1]);
 
-        let bfl_path = tmp("bfl_single.safetensors");
+        let bfl_path = scratch_file(&tmp, "bfl_single.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2344,7 +2345,7 @@ mod tests {
                 alpha.clone(),
             ));
         }
-        let peft_path = tmp("bfl_single_split_peft.safetensors");
+        let peft_path = scratch_file(&tmp, "bfl_single_split_peft.safetensors");
         Array::save_safetensors(
             peft.iter()
                 .map(|(k, v)| (k.as_str(), v))
@@ -2399,6 +2400,7 @@ mod tests {
     /// installs both; an off-surface target errors (strict no-silent-drop).
     #[test]
     fn scale_zero_noop_mixed_stack_and_strict() {
+        let tmp = tempfile::tempdir().unwrap();
         // scale-0: a no-op adapter installed on a resolved linear leaves its forward unchanged.
         let mut t = test_transformer(1, 0);
         let x = Array::from_slice(&[1.0f32], &[1, 1]);
@@ -2428,7 +2430,7 @@ mod tests {
         );
 
         // Mixed LoRA + LoKr spec list targeting two distinct FLUX.1 modules applies both.
-        let lora_path = tmp("mix_lora.safetensors");
+        let lora_path = scratch_file(&tmp, "mix_lora.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2448,7 +2450,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let lokr_path = tmp("mix_lokr.safetensors");
+        let lokr_path = scratch_file(&tmp, "mix_lokr.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2489,7 +2491,7 @@ mod tests {
         assert!(report.unmatched_paths.is_empty());
 
         // Strict no-silent-drop: an off-surface target errors.
-        let miss = tmp("miss.safetensors");
+        let miss = scratch_file(&tmp, "miss.safetensors");
         Array::save_safetensors(
             vec![
                 (

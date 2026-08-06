@@ -42,8 +42,8 @@ fn tokenizer_json() -> String {
     )
 }
 
-fn write_snapshot() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mlx-llm-conformance-{}", std::process::id()));
+fn write_snapshot(tmp: &tempfile::TempDir) -> PathBuf {
+    let dir = tmp.path().join("mlx-llm-conformance");
     std::fs::create_dir_all(&dir).unwrap();
     // eos_token_id outside the vocab so generation always runs to the token budget.
     let config = format!(
@@ -91,7 +91,8 @@ fn write_snapshot() -> PathBuf {
 
 #[test]
 fn llama_provider_passes_core_llm_conformance() {
-    let dir = write_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_snapshot(&tmp);
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
 
     // The closure loads a fresh provider; the suite drives it through every contract guarantee and
@@ -110,11 +111,8 @@ fn llama_provider_passes_core_llm_conformance() {
 #[ignore = "needs an HF/GGUF model source via MLX_LLM_PREPARE_SOURCE"]
 fn real_snapshot_preparer_passes_core_llm_conformance() {
     let source = std::env::var("MLX_LLM_PREPARE_SOURCE").expect("set MLX_LLM_PREPARE_SOURCE");
-    let out_dir = std::env::temp_dir().join(format!(
-        "mlx-llm-prepare-conformance-{}",
-        std::process::id()
-    ));
-    std::fs::remove_dir_all(&out_dir).ok();
+    let out_dir_tmp = tempfile::tempdir().unwrap();
+    let out_dir = out_dir_tmp.path().to_path_buf();
     check_snapshot_preparer(
         &SnapshotPreparerProfile {
             source: PathBuf::from(source),
@@ -125,7 +123,6 @@ fn real_snapshot_preparer_passes_core_llm_conformance() {
         &mlx_llm::text_registry().expect("MLX text registry"),
     )
     .expect("snapshot preparer conformance");
-    std::fs::remove_dir_all(&out_dir).ok();
 }
 
 #[test]
@@ -179,8 +176,8 @@ fn real_qwen35_passes_core_llm_conformance() {
 
 /// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
 /// is weightless and architecture-aware.
-fn write_config_only(name: &str, config: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mlx-llm-{name}-{}", std::process::id()));
+fn write_config_only(tmp: &tempfile::TempDir, name: &str, config: &str) -> PathBuf {
+    let dir = tmp.path().join(format!("mlx-llm-{name}"));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), config).unwrap();
     dir
@@ -188,8 +185,10 @@ fn write_config_only(name: &str, config: &str) -> PathBuf {
 
 #[test]
 fn can_load_is_weightless_and_architecture_aware() {
+    let tmp = tempfile::tempdir().unwrap();
     // A directory with ONLY config.json (no shards): if the probe read weights this would fail.
     let llama = write_config_only(
+        &tmp,
         "canload-llama",
         r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":8}"#,
     );
@@ -206,6 +205,7 @@ fn can_load_is_weightless_and_architecture_aware() {
 
     // An unsupported architecture is declined (no panic, no silent default).
     let unknown = write_config_only(
+        &tmp,
         "canload-unknown",
         r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
     );
@@ -216,6 +216,7 @@ fn can_load_is_weightless_and_architecture_aware() {
     // A multimodal snapshot: the text provider declines (a `vision_config` is present even though
     // the nested text arch is llama), the vision provider claims it.
     let vlm = write_config_only(
+        &tmp,
         "canload-vlm",
         r#"{"architectures":["LlavaForConditionalGeneration"],"model_type":"llava",
             "text_config":{"architectures":["LlamaForCausalLM"],"model_type":"llama"},
@@ -240,7 +241,8 @@ fn can_load_is_weightless_and_architecture_aware() {
 
 #[test]
 fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
-    let dir = write_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_snapshot(&tmp);
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
 
     // No provider id named: the resolver reads config.json, picks the mlx text provider via its
@@ -258,7 +260,9 @@ fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
 
 #[test]
 fn load_for_model_unknown_architecture_is_a_typed_error() {
+    let tmp = tempfile::tempdir().unwrap();
     let dir = write_config_only(
+        &tmp,
         "lfm-unknown",
         r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
     );

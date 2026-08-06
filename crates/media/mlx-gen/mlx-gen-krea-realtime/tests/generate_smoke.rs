@@ -442,11 +442,8 @@ fn smoke_request_is_within_the_advertised_surface() {
     // A per-process empty dir, not the shared `$TMPDIR` itself: the provider only needs the root to
     // exist, and this keeps whatever another concurrent `cargo test` process left in `$TMPDIR` out
     // of this weights root.
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_realtime_empty_weights_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let spec = LoadSpec::new(WeightsSource::Dir(dir));
     let gen = mlx_gen_krea_realtime::provider_registry()
         .unwrap()

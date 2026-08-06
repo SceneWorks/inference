@@ -1655,23 +1655,23 @@ mod tests {
     use candle_core::{IndexOp, Tensor};
     use std::io::{Seek, SeekFrom, Write};
 
-    struct TestDir(PathBuf);
+    /// A component directory that removes itself — including out of a panicking test, which the
+    /// hand-written `Drop` this replaces could do, but only alongside a `$TMPDIR` path a second
+    /// process could be handed again. The guard is the cleanup: one path, not two.
+    struct TestDir(tempfile::TempDir);
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let seq = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "candle-device-sidecar-{label}-{}-{seq}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("candle-device-sidecar-{label}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
-    }
 
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+        fn path(&self) -> &Path {
+            self.0.path()
         }
     }
 
@@ -1770,13 +1770,13 @@ mod tests {
     #[test]
     fn pre_cancelled_prepare_stops_before_creating_the_cache() -> Result<()> {
         let dir = TestDir::new("cancelled");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let source = open(&source_path)?;
         let cancel = CancelFlag::new();
         cancel.cancel();
         let error = PackedWeightSidecars::prepare_cancelable(
             &source,
-            &dir.0,
+            dir.path(),
             PackedConfig {
                 bits: 4,
                 group_size: 64,
@@ -1786,16 +1786,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
-        assert!(!dir.0.join(CACHE_DIR).exists());
+        assert!(!dir.path().join(CACHE_DIR).exists());
         Ok(())
     }
 
     #[test]
     fn cancellation_interrupts_waiting_for_the_cross_process_prepare_lock() -> Result<()> {
         let dir = TestDir::new("cancelled-lock");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let source = open(&source_path)?;
-        let cache_dir = dir.0.join(CACHE_DIR);
+        let cache_dir = dir.path().join(CACHE_DIR);
         fs::create_dir_all(&cache_dir)?;
         let held = fs::OpenOptions::new()
             .create(true)
@@ -1812,7 +1812,7 @@ mod tests {
         });
         let error = PackedWeightSidecars::prepare_cancelable(
             &source,
-            &dir.0,
+            dir.path(),
             PackedConfig {
                 bits: 4,
                 group_size: 64,
@@ -1840,28 +1840,31 @@ mod tests {
                 "cancel-warm-adjacent"
             });
             let external = TestDir::new("cancel-warm-root");
-            let source_path = write_multi_source(&component.0, 4)?;
+            let source_path = write_multi_source(component.path(), 4)?;
             let source = open(&source_path)?;
             if external_warm_cache {
                 // A regular file makes the adjacent cache unavailable on every platform, including
                 // root-capable CI, so the complete warm set is definitely external.
-                fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
+                fs::write(
+                    component.path().join(CACHE_DIR),
+                    b"immutable snapshot entry",
+                )?;
             }
             let first = PackedWeightSidecars::prepare_impl(
                 &source,
-                &component.0,
+                component.path(),
                 packed,
                 &Device::Cpu,
                 None,
                 None,
-                Some(&external.0),
+                Some(external.path()),
                 None,
             )?;
             assert_eq!(first.created_count(), 2, "fixture must be non-vacuous");
             assert!(first.contains("layers.0.proj"));
             assert!(first.contains("layers.1.proj"));
             assert_eq!(
-                first.cache_dir().starts_with(&external.0),
+                first.cache_dir().starts_with(external.path()),
                 external_warm_cache,
                 "test must exercise the intended warm-cache location"
             );
@@ -1877,12 +1880,12 @@ mod tests {
             CANCEL_VALIDATION_AFTER_CHUNKS.with(|remaining| remaining.set(Some(1)));
             let error = PackedWeightSidecars::prepare_impl(
                 &source,
-                &component.0,
+                component.path(),
                 packed,
                 &Device::Cpu,
                 Some(&cancel),
                 None,
-                Some(&external.0),
+                Some(external.path()),
                 None,
             )
             .unwrap_err();
@@ -1903,21 +1906,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TestDir::new("warm-read-only");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let source = open(&source_path)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let first = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let first = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
         let cache_dir = first.cache_dir().to_path_buf();
         let lock = cache_dir.join(PREPARE_LOCK);
         fs::remove_file(&lock)?;
 
         fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o555))?;
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o555))?;
-        let result = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu);
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555))?;
+        let result = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
         fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o755))?;
 
         let reused = result?;
@@ -1938,29 +1941,32 @@ mod tests {
 
         let component = TestDir::new("cold-read-only");
         let external = TestDir::new("external-root");
-        let source_path = write_source(&component.0, 4, 0.0)?;
+        let source_path = write_source(component.path(), 4, 0.0)?;
         let source = open(&source_path)?;
         // A chmod alone is still writable to root. Making the adjacent cache pathname a regular file
         // forces the same non-writable-cache branch under privileged CI while the chmod pins the real
         // deployment contract for ordinary users.
-        fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
-        fs::set_permissions(&component.0, fs::Permissions::from_mode(0o555))?;
+        fs::write(
+            component.path().join(CACHE_DIR),
+            b"immutable snapshot entry",
+        )?;
+        fs::set_permissions(component.path(), fs::Permissions::from_mode(0o555))?;
         let result = PackedWeightSidecars::prepare_with_external_cache_root(
             &source,
-            &component.0,
+            component.path(),
             PackedConfig {
                 bits: 4,
                 group_size: 64,
             },
             &Device::Cpu,
-            &external.0,
+            external.path(),
         );
-        fs::set_permissions(&component.0, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(component.path(), fs::Permissions::from_mode(0o755))?;
 
         let cache = result?;
         assert_eq!(cache.created_count(), 1);
-        assert!(cache.cache_dir().starts_with(&external.0));
-        assert!(component.0.join(CACHE_DIR).is_file());
+        assert!(cache.cache_dir().starts_with(external.path()));
+        assert!(component.path().join(CACHE_DIR).is_file());
         cache.load("layers.0.proj", &Device::Cpu)?;
         Ok(())
     }
@@ -1969,26 +1975,29 @@ mod tests {
     fn unchanged_external_cache_warm_reopen_hashes_zero_bytes() -> Result<()> {
         let component = TestDir::new("external-warm-component");
         let external = TestDir::new("external-warm-root");
-        let source_path = write_source(&component.0, 4, 0.0)?;
-        fs::write(component.0.join(CACHE_DIR), b"immutable snapshot entry")?;
+        let source_path = write_source(component.path(), 4, 0.0)?;
+        fs::write(
+            component.path().join(CACHE_DIR),
+            b"immutable snapshot entry",
+        )?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
         let (_, first) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
             std::slice::from_ref(&source_path),
-            &component.0,
+            component.path(),
             packed,
             &Device::Cpu,
-            &external.0,
+            external.path(),
         )?;
-        assert!(first.cache_dir().starts_with(&external.0));
+        assert!(first.cache_dir().starts_with(external.path()));
         let (_, warm) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
             std::slice::from_ref(&source_path),
-            &component.0,
+            component.path(),
             packed,
             &Device::Cpu,
-            &external.0,
+            external.path(),
         )?;
         assert_eq!(warm.source_bytes_hashed(), 0);
         assert_eq!(warm.payload_bytes_hashed(), 0);
@@ -2031,13 +2040,13 @@ mod tests {
 
     fn assert_q4_or_q8(bits: usize) -> Result<()> {
         let dir = TestDir::new(if bits == 4 { "q4" } else { "q8" });
-        let source_path = write_source(&dir.0, bits, 0.0)?;
+        let source_path = write_source(dir.path(), bits, 0.0)?;
         let packed = PackedConfig {
             bits: bits as i32,
             group_size: 64,
         };
 
-        let (source, cache) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (source, cache) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert_eq!(cache.created_count(), 1);
         assert_eq!(cache.reused_count(), 0);
         assert!(cache.source_bytes_hashed() > 0);
@@ -2045,7 +2054,7 @@ mod tests {
         assert!(cache.contains("layers.0.proj"));
         let sidecar_path = cache.path_for("layers.0.proj").unwrap();
         assert!(sidecar_path.is_file());
-        assert!(sidecar_path.starts_with(dir.0.join(CACHE_DIR)));
+        assert!(sidecar_path.starts_with(dir.path().join(CACHE_DIR)));
 
         let wq = source.load("layers.0.proj.weight", &Device::Cpu)?;
         let scales = source.load("layers.0.proj.scales", &Device::Cpu)?;
@@ -2064,7 +2073,7 @@ mod tests {
 
         // A second preparation reuses the atomically-published artifact. Repeated materializations
         // below accept no source tensors and therefore cannot regress to per-window conversion.
-        let (_, reused) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, reused) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert_eq!(reused.created_count(), 0);
         assert_eq!(reused.reused_count(), 1);
         assert_eq!(reused.source_bytes_hashed(), 0);
@@ -2095,7 +2104,7 @@ mod tests {
         let dense = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
         let (layer_w, layer_s, layer_b) = pack_mlx_affine(&dense, 4, 64)?;
         let (resident_w, resident_s, resident_b) = pack_mlx_affine(&dense, 4, 64)?;
-        let path = dir.0.join("model.safetensors");
+        let path = dir.path().join("model.safetensors");
         safetensors::save(
             &HashMap::from([
                 ("layers.0.proj.weight".to_owned(), layer_w),
@@ -2110,7 +2119,7 @@ mod tests {
         let source = open(&path)?;
         let cache = PackedWeightSidecars::prepare_prefix_cancelable(
             &source,
-            &dir.0,
+            dir.path(),
             PackedConfig {
                 bits: 4,
                 group_size: 64,
@@ -2129,11 +2138,11 @@ mod tests {
     fn rank3_moe_slices_are_independently_addressed_and_byte_exact() -> Result<()> {
         for bits in [4, 8] {
             let dir = TestDir::new(if bits == 4 { "moe-q4" } else { "moe-q8" });
-            let path = write_rank3_source(&dir.0, bits)?;
+            let path = write_rank3_source(dir.path(), bits)?;
             let source = open(&path)?;
             let cache = PackedWeightSidecars::prepare(
                 &source,
-                &dir.0,
+                dir.path(),
                 PackedConfig {
                     bits: bits as i32,
                     group_size: 64,
@@ -2168,16 +2177,16 @@ mod tests {
     fn source_byte_change_selects_a_different_content_address() -> Result<()> {
         let a = TestDir::new("hash-a");
         let b = TestDir::new("hash-b");
-        let a_path = write_source(&a.0, 4, 0.0)?;
-        let b_path = write_source(&b.0, 4, 0.125)?;
+        let a_path = write_source(a.path(), 4, 0.0)?;
+        let b_path = write_source(b.path(), 4, 0.125)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
         let a_source = open(&a_path)?;
         let b_source = open(&b_path)?;
-        let a_cache = PackedWeightSidecars::prepare(&a_source, &a.0, packed, &Device::Cpu)?;
-        let b_cache = PackedWeightSidecars::prepare(&b_source, &b.0, packed, &Device::Cpu)?;
+        let a_cache = PackedWeightSidecars::prepare(&a_source, a.path(), packed, &Device::Cpu)?;
+        let b_cache = PackedWeightSidecars::prepare(&b_source, b.path(), packed, &Device::Cpu)?;
         assert_ne!(
             a_cache.path_for("layers.0.proj").unwrap().file_name(),
             b_cache.path_for("layers.0.proj").unwrap().file_name(),
@@ -2190,17 +2199,17 @@ mod tests {
     fn legacy_mmap_with_a_different_component_dir_cannot_seed_a_false_memo_hit() -> Result<()> {
         let a = TestDir::new("mismatched-source-a");
         let b = TestDir::new("mismatched-source-b");
-        let a_path = write_source(&a.0, 4, 0.0)?;
-        let b_path = write_source(&b.0, 4, 0.5)?;
+        let a_path = write_source(a.path(), 4, 0.0)?;
+        let b_path = write_source(b.path(), 4, 0.5)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
         let a_source = open(&a_path)?;
-        let mismatched = PackedWeightSidecars::prepare(&a_source, &b.0, packed, &Device::Cpu)?;
+        let mismatched = PackedWeightSidecars::prepare(&a_source, b.path(), packed, &Device::Cpu)?;
         let mismatched_path = mismatched.path_for("layers.0.proj").unwrap().to_path_buf();
 
-        let (_, normal_b) = open_and_prepare_path(&b_path, &b.0, packed)?;
+        let (_, normal_b) = open_and_prepare_path(&b_path, b.path(), packed)?;
         assert!(normal_b.source_bytes_hashed() > 0);
         assert_ne!(
             normal_b.path_for("layers.0.proj").unwrap(),
@@ -2214,9 +2223,9 @@ mod tests {
     fn replacement_between_source_open_and_identity_check_is_rejected() -> Result<()> {
         let dir = TestDir::new("replace-during-open");
         let replacement_dir = TestDir::new("replace-during-open-new");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
-        let replacement_source = write_source(&replacement_dir.0, 4, 0.75)?;
-        let replacement = dir.0.join("replacement.safetensors");
+        let source_path = write_source(dir.path(), 4, 0.0)?;
+        let replacement_source = write_source(replacement_dir.path(), 4, 0.75)?;
+        let replacement = dir.path().join("replacement.safetensors");
         fs::copy(replacement_source, &replacement)?;
         let target = source_path.clone();
         AFTER_SOURCE_OPEN_HOOK.with(|hook| {
@@ -2228,13 +2237,13 @@ mod tests {
             bits: 4,
             group_size: 64,
         };
-        let error = match open_and_prepare_path(&source_path, &dir.0, packed) {
+        let error = match open_and_prepare_path(&source_path, dir.path(), packed) {
             Ok(_) => panic!("source replacement during mmap open must be rejected"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("changed while opening"));
 
-        let (_, reopened) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, reopened) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert!(reopened.source_bytes_hashed() > 0);
         Ok(())
     }
@@ -2242,12 +2251,12 @@ mod tests {
     #[test]
     fn same_size_same_mtime_atomic_artifact_replacement_invalidates_the_memo() -> Result<()> {
         let dir = TestDir::new("artifact-replacement-identity");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, first) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
         let metadata = fs::metadata(&artifact)?;
         let modified = metadata.modified()?;
@@ -2261,7 +2270,7 @@ mod tests {
         assert_eq!(replaced.len(), metadata.len());
         assert_eq!(replaced.modified()?, modified);
 
-        let (_, rebuilt) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, rebuilt) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert_eq!(rebuilt.created_count(), 1);
         assert!(rebuilt.source_bytes_hashed() > 0);
         assert!(rebuilt.payload_bytes_hashed() > 0);
@@ -2272,12 +2281,12 @@ mod tests {
     #[test]
     fn same_size_same_mtime_in_place_artifact_corruption_invalidates_the_memo() -> Result<()> {
         let dir = TestDir::new("artifact-in-place-identity");
-        let source_path = write_source(&dir.0, 8, 0.0)?;
+        let source_path = write_source(dir.path(), 8, 0.0)?;
         let packed = PackedConfig {
             bits: 8,
             group_size: 64,
         };
-        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, first) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
         let metadata = fs::metadata(&artifact)?;
         let modified = metadata.modified()?;
@@ -2292,7 +2301,7 @@ mod tests {
         assert_eq!(corrupted.len(), metadata.len());
         assert_eq!(corrupted.modified()?, modified);
 
-        let (_, rebuilt) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, rebuilt) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert_eq!(rebuilt.created_count(), 1);
         assert!(rebuilt.source_bytes_hashed() > 0);
         assert!(rebuilt.payload_bytes_hashed() > 0);
@@ -2303,16 +2312,16 @@ mod tests {
     #[test]
     fn same_source_path_generation_change_invalidates_the_process_memo() -> Result<()> {
         let dir = TestDir::new("same-path-source-change");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, first) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         let first_path = first.path_for("layers.0.proj").unwrap().to_path_buf();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_source(&dir.0, 4, 0.25)?;
-        let (_, changed) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        write_source(dir.path(), 4, 0.25)?;
+        let (_, changed) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert!(changed.source_bytes_hashed() > 0);
         assert_ne!(changed.path_for("layers.0.proj").unwrap(), first_path);
         Ok(())
@@ -2321,17 +2330,17 @@ mod tests {
     #[test]
     fn artifact_generation_change_forces_full_validation_before_reuse() -> Result<()> {
         let dir = TestDir::new("artifact-metadata-change");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let (_, first) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, first) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         let artifact = first.path_for("layers.0.proj").unwrap().to_path_buf();
         let bytes = fs::read(&artifact)?;
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&artifact, bytes)?;
-        let (_, reopened) = open_and_prepare_path(&source_path, &dir.0, packed)?;
+        let (_, reopened) = open_and_prepare_path(&source_path, dir.path(), packed)?;
         assert_eq!(reopened.created_count(), 0);
         assert_eq!(reopened.reused_count(), 1);
         assert!(reopened.source_bytes_hashed() > 0);
@@ -2342,16 +2351,16 @@ mod tests {
     #[test]
     fn corrupt_sidecar_is_rebuilt_before_use() -> Result<()> {
         let dir = TestDir::new("corrupt");
-        let source_path = write_source(&dir.0, 4, 0.0)?;
+        let source_path = write_source(dir.path(), 4, 0.0)?;
         let source = open(&source_path)?;
         let packed = PackedConfig {
             bits: 4,
             group_size: 64,
         };
-        let first = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let first = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
         let path = first.path_for("layers.0.proj").unwrap().to_path_buf();
         fs::write(&path, b"truncated generated cache")?;
-        let rebuilt = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let rebuilt = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
         assert_eq!(rebuilt.created_count(), 1);
         assert!(rebuilt.load("layers.0.proj", &Device::Cpu).is_ok());
         Ok(())
@@ -2360,13 +2369,13 @@ mod tests {
     #[test]
     fn concurrent_corrupt_recovery_serializes_and_keeps_a_valid_artifact() -> Result<()> {
         let dir = TestDir::new("concurrent-corrupt");
-        let source_path = write_source(&dir.0, 8, 0.0)?;
+        let source_path = write_source(dir.path(), 8, 0.0)?;
         let source = open(&source_path)?;
         let packed = PackedConfig {
             bits: 8,
             group_size: 64,
         };
-        let first = PackedWeightSidecars::prepare(&source, &dir.0, packed, &Device::Cpu)?;
+        let first = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
         let path = first.path_for("layers.0.proj").unwrap().to_path_buf();
         fs::write(&path, b"same corrupt entry observed by two preparers")?;
 
@@ -2375,7 +2384,7 @@ mod tests {
         for _ in 0..2 {
             let barrier = std::sync::Arc::clone(&barrier);
             let source_path = source_path.clone();
-            let component_dir = dir.0.clone();
+            let component_dir = dir.path().to_path_buf();
             threads.push(std::thread::spawn(move || -> Result<(usize, usize)> {
                 let source = open(&source_path)?;
                 barrier.wait();

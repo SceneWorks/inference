@@ -1723,13 +1723,8 @@ mod tests {
 
     #[test]
     fn native_load_valid_config_reaches_fail_closed_base_asset_sizing() {
-        let root = std::env::temp_dir().join(format!(
-            "krea-native-asset-stage-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
 
@@ -1747,7 +1742,6 @@ mod tests {
             "expected the post-config asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// Real-weight harness for the native single-file + adapter fold (sc-14119): the discriminating check
@@ -2074,13 +2068,8 @@ mod tests {
 
     #[test]
     fn shared_quant_guard_drives_load_time_and_effective_tiers() {
-        let root = std::env::temp_dir().join(format!(
-            "krea-shared-tier-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -2108,7 +2097,6 @@ mod tests {
 
         std::fs::write(root.join("transformer/config.json"), "{").unwrap();
         assert!(effective_base_quant_bits(&q8, &root, KREA_2_TURBO_ID).is_err());
-        std::fs::remove_dir_all(root).ok();
     }
 
     // ── Multi-phase request validation (epic 13879, sc-13884) ────────────────────────────────────

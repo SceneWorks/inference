@@ -531,8 +531,8 @@ fn kohya_matches_peft_on_real_tree() {
         peft.push((format!("transformer.{p}.lora_B.weight"), b));
         peft.push((format!("transformer.{p}.alpha"), alpha));
     }
-    let dir = std::env::temp_dir().join(format!("mlx_gen_qwen_kohya_test_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let (kpath, ppath) = (dir.join("kohya.safetensors"), dir.join("peft.safetensors"));
     Array::save_safetensors(
         kohya

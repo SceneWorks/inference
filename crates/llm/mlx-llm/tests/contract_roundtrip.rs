@@ -53,8 +53,8 @@ fn randn(shape: &[i32], rng: &mut SplitMix64) -> Array {
 }
 
 /// Write a tiny but complete snapshot directory and return its path.
-fn write_tiny_snapshot() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mlx-llm-contract-{}", std::process::id()));
+fn write_tiny_snapshot(tmp: &tempfile::TempDir) -> PathBuf {
+    let dir = tmp.path().join("mlx-llm-contract");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), CONFIG_JSON).unwrap();
     std::fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
@@ -108,7 +108,8 @@ fn text_request(max_new_tokens: u32) -> TextLlmRequest {
 
 #[test]
 fn provider_loads_and_streams_through_the_contract() {
-    let dir = write_tiny_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_tiny_snapshot(&tmp);
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap())).unwrap();
 
     // Descriptor identity.
@@ -150,7 +151,8 @@ fn provider_loads_and_streams_through_the_contract() {
 
 #[test]
 fn registry_routes_to_the_provider() {
-    let dir = write_tiny_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_tiny_snapshot(&tmp);
     // Go through the explicit MLX catalog by id.
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     assert_eq!(provider.descriptor().id, PROVIDER_ID);
@@ -163,7 +165,8 @@ fn registry_routes_to_the_provider() {
 
 #[test]
 fn greedy_generation_is_reproducible_through_the_contract() {
-    let dir = write_tiny_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_tiny_snapshot(&tmp);
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     let a = provider.complete(&text_request(8)).unwrap();
     let b = provider.complete(&text_request(8)).unwrap();
@@ -173,7 +176,8 @@ fn greedy_generation_is_reproducible_through_the_contract() {
 
 #[test]
 fn already_cancelled_request_errors_before_inference() {
-    let dir = write_tiny_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_tiny_snapshot(&tmp);
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     let req = text_request(8);
     req.cancel.cancel();
@@ -184,7 +188,8 @@ fn already_cancelled_request_errors_before_inference() {
 
 #[test]
 fn validate_rejects_unsupported_vision_input() {
-    let dir = write_tiny_snapshot();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_tiny_snapshot(&tmp);
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     let img = ImageRef::new(1, 1, vec![0, 0, 0]).unwrap();
     let req = TextLlmRequest {

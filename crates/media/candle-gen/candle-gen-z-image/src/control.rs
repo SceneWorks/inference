@@ -1531,15 +1531,13 @@ mod tests {
     /// The exact-name fast path + `File` passthrough (Turbo repo's single-file layout).
     #[test]
     fn control_file_resolution() {
-        let dir = std::env::temp_dir().join(format!("zimg_cn_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(resolve_control_file(&dir).is_err());
         let f = dir.join("Z-Image-Turbo-Fun-Controlnet-Union-2.1.safetensors");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(resolve_control_file(&dir).unwrap(), f);
         assert_eq!(resolve_control_file(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Deterministic overlay resolution (sc-8680): a **base** Fun-Controlnet-Union snapshot ships the full
@@ -1548,9 +1546,8 @@ mod tests {
     /// override during validation).
     #[test]
     fn control_file_resolution_prefers_union_over_tile_lite() {
-        let dir = std::env::temp_dir().join(format!("zimg_cn_union_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // The four files the real base repo ships (alphabetical order: Tile-lite sorts FIRST).
         let tile_lite = dir.join("Z-Image-Fun-Controlnet-Tile-2.1-lite.safetensors");
         let tile = dir.join("Z-Image-Fun-Controlnet-Tile-2.1.safetensors");
@@ -1566,7 +1563,6 @@ mod tests {
         // (union stem beats tile, and lite penalty is smaller than the tile penalty).
         std::fs::remove_file(&union).unwrap();
         assert_eq!(resolve_control_file(&dir).unwrap(), union_lite);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The scoring policy directly (GPU-/fs-free): union > union-lite > (no keyword) > tile-lite > tile.

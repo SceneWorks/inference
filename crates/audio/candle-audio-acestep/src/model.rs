@@ -889,7 +889,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
@@ -899,8 +900,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("acestep-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -915,7 +916,8 @@ mod tests {
 
     #[test]
     fn load_captures_the_optional_sft_cover_component() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // No component ⇒ loads fine (text2music / region-edit path); the Cover snapshot stays absent.
         assert!(load(&LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_ok());
         // A staged `sft_cover` Dir is accepted (path captured, no I/O at load).
@@ -943,8 +945,8 @@ mod tests {
         // message (naming the component) — before the base pipeline is built, and never self-fetches.
         // `root` is an empty temp dir with no real weights, so reaching the base load would panic/err;
         // the fail-fast guard means we never get there.
-        let dir = std::env::temp_dir().join("acestep-cover-no-component");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let err = g
             .generate(&edit_req(AudioEditMode::Cover, None), &mut |_| {})

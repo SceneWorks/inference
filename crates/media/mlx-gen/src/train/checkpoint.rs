@@ -191,9 +191,8 @@ mod tests {
         opt.step(&mut params, &grads).unwrap();
 
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let dir =
-            std::env::temp_dir().join(format!("mlxgen_resume_bundle_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let stem = "swatch";
         save_resume(&dir, stem, 4, 2, &opt, &params).unwrap();
 
@@ -227,7 +226,6 @@ mod tests {
         {
             assert!((x - y).abs() <= 1e-6, "resumed step diverged: {x} vs {y}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -239,18 +237,14 @@ mod tests {
         let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
         opt.set_lr_scaled(1.0);
         opt.step(&mut params, &grads).unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "mlxgen_resume_mismatch_test_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         save_resume(&dir, "s", 1, 1, &opt, &params).unwrap();
         let (found, _) = find_latest_resume(&dir, "s").unwrap();
 
         let mut rose = TrainOptimizer::from_config("rose", 1e-3, 0.0).unwrap();
         let err = load_resume(&found, &mut rose).unwrap_err().to_string();
         assert!(err.contains("optimizer 'adamw'"), "got: {err}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The wan dual-expert trainer snapshots each expert under a per-expert stem (`{stem}`,
@@ -258,12 +252,8 @@ mod tests {
     /// them: a lookup for the base stem must NOT match a suffixed expert's snapshot (F-125 / sc-9651).
     #[test]
     fn find_latest_resume_isolates_per_expert_stems() {
-        let dir = std::env::temp_dir().join(format!(
-            "mlxgen_resume_isolation_test_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let one = |v: f32| -> LoraParams {
             std::iter::once((Rc::from("blk.lora_A"), Array::from_slice(&[v], &[1]))).collect()
         };
@@ -290,6 +280,5 @@ mod tests {
                 "stem {stem} loaded the wrong expert's factors"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

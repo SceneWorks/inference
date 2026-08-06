@@ -193,13 +193,8 @@ mod tests {
 
     #[test]
     fn projection_is_recursive_checked_and_preserves_existing_packs() {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-asset-facts-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         write_file(
@@ -256,6 +251,5 @@ mod tests {
         std::fs::create_dir_all(&corrupt_dir).unwrap();
         std::fs::write(corrupt_dir.join("model.safetensors"), b"corrupt").unwrap();
         assert!(projected_safetensors_bytes(&corrupt_dir, |_| ResidentProjection::Stored).is_err());
-        std::fs::remove_dir_all(root).ok();
     }
 }

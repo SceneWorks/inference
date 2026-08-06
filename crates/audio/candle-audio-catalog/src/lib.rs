@@ -1171,9 +1171,8 @@ mod tests {
         assert_eq!((regs[0].backend)(), "candle");
 
         // A Kokoro-shaped snapshot dir is accepted by the lane probe...
-        let dir = std::env::temp_dir().join("audio-catalog-kokoro-probe");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::write(
             dir.join("config.json"),
             r#"{"istftnet": {}, "vocab": {"a": 1}}"#,
@@ -1183,8 +1182,8 @@ mod tests {
         let spec = super::core_llm::PrepareSpec::dense(&dir, dir.join("out"));
         assert!((regs[0].can_prepare)(&spec));
         // ...a MOSS-SoundEffect-shaped snapshot dir is accepted too (sc-12841)...
-        let moss = std::env::temp_dir().join("audio-catalog-moss-probe");
-        let _ = std::fs::remove_dir_all(&moss);
+        let moss_tmp = tempfile::tempdir().unwrap();
+        let moss = moss_tmp.path().to_path_buf();
         std::fs::create_dir_all(moss.join("transformer")).unwrap();
         std::fs::write(
             moss.join("model_index.json"),
@@ -1198,10 +1197,9 @@ mod tests {
         .unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&moss, moss.join("out"));
         assert!((regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&moss);
         // ...an ACE-Step snapshot dir is accepted too (sc-12842)...
-        let ace = std::env::temp_dir().join("audio-catalog-acestep-probe");
-        let _ = std::fs::remove_dir_all(&ace);
+        let ace_tmp = tempfile::tempdir().unwrap();
+        let ace = ace_tmp.path().to_path_buf();
         std::fs::create_dir_all(ace.join("transformer")).unwrap();
         std::fs::write(
             ace.join("model_index.json"),
@@ -1215,11 +1213,9 @@ mod tests {
         .unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&ace, ace.join("out"));
         assert!((regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&ace);
         // ...an OpenVoice V2 converter snapshot dir is accepted too (sc-13223)...
-        let ov = std::env::temp_dir().join("audio-catalog-openvoice-probe");
-        let _ = std::fs::remove_dir_all(&ov);
-        std::fs::create_dir_all(&ov).unwrap();
+        let ov_tmp = tempfile::tempdir().unwrap();
+        let ov = ov_tmp.path().to_path_buf();
         std::fs::write(
             ov.join("config.json"),
             r#"{"data":{"filter_length":1024},"model":{"gin_channels":256}}"#,
@@ -1228,31 +1224,25 @@ mod tests {
         std::fs::write(ov.join("checkpoint.pth"), b"stub").unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&ov, ov.join("out"));
         assert!((regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&ov);
         // ...a CLAP snapshot dir is accepted too (sc-12851)...
-        let clap = std::env::temp_dir().join("audio-catalog-clap-probe");
-        let _ = std::fs::remove_dir_all(&clap);
-        std::fs::create_dir_all(&clap).unwrap();
+        let clap_tmp = tempfile::tempdir().unwrap();
+        let clap = clap_tmp.path().to_path_buf();
         std::fs::write(clap.join("config.json"), r#"{"model_type": "clap"}"#).unwrap();
         std::fs::write(clap.join("pytorch_model.bin"), b"stub").unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&clap, clap.join("out"));
         assert!((regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&clap);
         // ...a Chatterbox clone-TTS snapshot dir is accepted too (sc-13239: t3 + s3gen + tokenizer)...
-        let cb = std::env::temp_dir().join("audio-catalog-chatterbox-probe");
-        let _ = std::fs::remove_dir_all(&cb);
-        std::fs::create_dir_all(&cb).unwrap();
+        let cb_tmp = tempfile::tempdir().unwrap();
+        let cb = cb_tmp.path().to_path_buf();
         std::fs::write(cb.join("t3_cfg.safetensors"), b"stub").unwrap();
         std::fs::write(cb.join("s3gen.safetensors"), b"stub").unwrap();
         std::fs::write(cb.join("tokenizer.json"), r#"{"model":{"type":"BPE"}}"#).unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&cb, cb.join("out"));
         assert!((regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&cb);
         // ...a MOSS-TTSD dialogue snapshot dir is accepted too (sc-13518: config.json naming
         // MossTTSDForCausalLM + model.safetensors)...
-        let mt = std::env::temp_dir().join("audio-catalog-moss-ttsd-probe");
-        let _ = std::fs::remove_dir_all(&mt);
-        std::fs::create_dir_all(&mt).unwrap();
+        let mt_tmp = tempfile::tempdir().unwrap();
+        let mt = mt_tmp.path().to_path_buf();
         std::fs::write(mt.join("model.safetensors"), b"stub").unwrap();
         std::fs::write(
             mt.join("config.json"),
@@ -1261,15 +1251,11 @@ mod tests {
         .unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&mt, mt.join("out"));
         assert!((regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&mt);
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
-        let empty = std::env::temp_dir().join("audio-catalog-empty-probe");
-        let _ = std::fs::remove_dir_all(&empty);
-        std::fs::create_dir_all(&empty).unwrap();
+        let empty_tmp = tempfile::tempdir().unwrap();
+        let empty = empty_tmp.path().to_path_buf();
         let spec = super::core_llm::PrepareSpec::dense(&empty, empty.join("out"));
         assert!(!(regs[0].can_prepare)(&spec));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&empty);
     }
 
     fn assert_sa3_snapshot_prepares(env: &str) {

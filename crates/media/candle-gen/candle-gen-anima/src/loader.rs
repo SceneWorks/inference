@@ -241,9 +241,8 @@ mod tests {
 
     #[test]
     fn detect_dit_prefix_covers_both_roots() {
-        let dir = std::env::temp_dir().join(format!("anima_prefix_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         for root in ["net", "model.diffusion_model"] {
             let path = write_anchor(&dir, root);
@@ -263,7 +262,5 @@ mod tests {
         let bad = dir.join("noanchor.safetensors");
         candle_gen::candle_core::safetensors::save(&m, &bad).unwrap();
         assert!(detect_dit_prefix(&bad).is_err(), "no anchor key ⇒ error");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

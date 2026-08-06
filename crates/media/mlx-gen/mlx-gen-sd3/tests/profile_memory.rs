@@ -119,12 +119,18 @@ fn snapshot(v: Variant) -> PathBuf {
 /// and every other component is symlinked back to the dense source — so the loader sees a full
 /// snapshot but loads the packed transformer directly (the pre-quantized-on-disk path). Returns the
 /// overlay root (the caller should not delete the source).
-fn prequant_overlay(src: &std::path::Path, v: Variant, bits: i32) -> PathBuf {
+fn prequant_overlay(
+    tmp: &tempfile::TempDir,
+    src: &std::path::Path,
+    v: Variant,
+    bits: i32,
+) -> PathBuf {
     let arch = match v {
         Variant::Large | Variant::Turbo => sd3::Sd3Arch::large(),
     };
-    let overlay =
-        std::env::temp_dir().join(format!("sd3_prequant_{}_{bits}", v.id().replace('/', "_")));
+    let overlay = tmp
+        .path()
+        .join(format!("sd3_prequant_{}_{bits}", v.id().replace('/', "_")));
     std::fs::create_dir_all(&overlay).ok();
     // Symlink every sibling component (text encoders / vae / tokenizers / *.json) from the source.
     for entry in std::fs::read_dir(src).expect("read source snapshot") {
@@ -156,7 +162,7 @@ fn prequant_overlay(src: &std::path::Path, v: Variant, bits: i32) -> PathBuf {
 
 /// One profiled run: load (load-time-quant OR pre-quantized-on-disk) + a 1024² generation, reporting
 /// the MLX-allocator peak (`get_peak_memory`) for load and for generate.
-fn profile_one(v: Variant, quant: Quant, prequant: bool, size: u32) {
+fn profile_one(tmp: &tempfile::TempDir, v: Variant, quant: Quant, prequant: bool, size: u32) {
     // Keep the profiled id honest.
     assert_eq!(sd3::MODEL_ID, "sd3_5_large");
 
@@ -174,7 +180,7 @@ fn profile_one(v: Variant, quant: Quant, prequant: bool, size: u32) {
     );
 
     let (root, spec) = if prequant {
-        let overlay = prequant_overlay(&src, v, bits);
+        let overlay = prequant_overlay(tmp, &src, v, bits);
         // No `with_quant`: the packed transformer is auto-detected by the loader.
         (overlay.clone(), LoadSpec::new(WeightsSource::Dir(overlay)))
     } else {
@@ -262,7 +268,9 @@ fn size_from_env() -> u32 {
 #[test]
 #[ignore = "needs the SD3.5 snapshots (set SD3_LARGE_SNAPSHOT / SD3_TURBO_SNAPSHOT) + Metal"]
 fn profile_memory_single() {
+    let tmp = tempfile::tempdir().unwrap();
     profile_one(
+        &tmp,
         variant_from_env(),
         quant_from_env(),
         prequant_from_env(),
@@ -276,10 +284,11 @@ fn profile_memory_single() {
 #[test]
 #[ignore = "needs the SD3.5 snapshots (set SD3_LARGE_SNAPSHOT / SD3_TURBO_SNAPSHOT) + Metal"]
 fn profile_memory_all() {
+    let tmp = tempfile::tempdir().unwrap();
     let size = size_from_env();
     for v in [Variant::Large, Variant::Turbo] {
         for q in [Quant::Q8, Quant::Q4] {
-            profile_one(v, q, false, size);
+            profile_one(&tmp, v, q, false, size);
         }
     }
 }

@@ -1312,17 +1312,22 @@ mod tests {
         }
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_wan_adapters_test_{}", std::process::id()));
+        let dir = tmp.path().join("mlx_gen_wan_adapters_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
 
     /// Write a PEFT LoRA file (`diffusion_model.‹stem›.lora_A/B.weight`) for the given stems, with
     /// A `[rank,in]`, B `[out,rank]`, no alpha (→ scale = 1). Values are deterministic per stem.
-    fn write_lora(name: &str, stems: &[(&str, i32, i32)], rank: i32, seed: f32) -> PathBuf {
+    fn write_lora(
+        tmp: &tempfile::TempDir,
+        name: &str,
+        stems: &[(&str, i32, i32)],
+        rank: i32,
+        seed: f32,
+    ) -> PathBuf {
         let mut entries: Vec<(String, Array)> = Vec::new();
         for (stem, out, inp) in stems {
             let a = Array::from_slice(
@@ -1344,15 +1349,15 @@ mod tests {
             entries.push((format!("diffusion_model.{stem}.lora_A.weight"), a));
             entries.push((format!("diffusion_model.{stem}.lora_B.weight"), b));
         }
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         path
     }
 
     /// A synthetic expert weight map with the two module weights the test LoRA targets, bf16.
-    fn synthetic_weights() -> Weights {
-        let path = tmp("base.safetensors");
+    fn synthetic_weights(tmp: &tempfile::TempDir) -> Weights {
+        let path = scratch_file(tmp, "base.safetensors");
         let q = Array::from_slice(
             &(0..16 * 8)
                 .map(|i| i as f32 * 0.01 - 0.3)
@@ -1393,7 +1398,7 @@ mod tests {
 
     /// Write a peft LoKr file for `blocks.0.self_attn.q` ([16,8] = kron(w1[4,2], w2[4,4])) with the
     /// given `alpha`/`rank` in metadata (sc-10044 additive tests). Deterministic factor values.
-    fn write_lokr(name: &str, alpha: f32, rank: f32) -> PathBuf {
+    fn write_lokr(tmp: &tempfile::TempDir, name: &str, alpha: f32, rank: f32) -> PathBuf {
         use std::collections::HashMap;
         let w1 = Array::from_slice(
             &(0..8)
@@ -1412,7 +1417,7 @@ mod tests {
             ("alpha".to_string(), alpha.to_string()),
             ("rank".to_string(), rank.to_string()),
         ]);
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(
             vec![
                 ("blocks.0.self_attn.q.lokr_w1", &w1),
@@ -1435,14 +1440,16 @@ mod tests {
 
     #[test]
     fn merge_folds_delta_bit_exact() {
+        let tmp = tempfile::tempdir().unwrap();
         // Reference merge: W += (B·A)·(alpha/rank·strength).astype(W.dtype), at the factor dtype.
         let lora = write_lora(
+            &tmp,
             "merge.safetensors",
             &[("blocks.0.self_attn.q", 16, 8), ("blocks.0.ffn.0", 24, 8)],
             4,
             0.1,
         );
-        let mut w = synthetic_weights();
+        let mut w = synthetic_weights(&tmp);
         let report =
             merge_wan_adapters(&mut w, &[spec(lora.clone(), 1.0, None)], MoeExpert::High).unwrap();
         assert_eq!(report.applied, 2);
@@ -1450,7 +1457,7 @@ mod tests {
 
         // Hand-compute the expected merge for the q weight.
         let lw = Weights::from_file(&lora).unwrap();
-        let base = synthetic_weights();
+        let base = synthetic_weights(&tmp);
         let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
         let a = lw
             .require("diffusion_model.blocks.0.self_attn.q.lora_A.weight")
@@ -1471,6 +1478,7 @@ mod tests {
 
     #[test]
     fn merge_honors_lora_adapter_metadata_alpha() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-5513: a diffusers / PEFT `save_lora_adapter` LoRA carries NO per-target `.alpha` tensor —
         // the scaling lives in the `lora_adapter_metadata` blob. With `lora_alpha = 16`, `r = 8` (the
         // factor's true rank) the Wan merge must fold `(16/8) = 2.0`, not the pre-sc-5513 `alpha = rank`
@@ -1494,7 +1502,7 @@ mod tests {
         )
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
-        let path = tmp("merge_meta_alpha.safetensors");
+        let path = scratch_file(&tmp, "merge_meta_alpha.safetensors");
         // Deliberately NO `.alpha` tensor — the scaling must come from the blob.
         let meta = HashMap::from([(
             "lora_adapter_metadata".to_string(),
@@ -1510,12 +1518,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut w = synthetic_weights();
+        let mut w = synthetic_weights(&tmp);
         let report = merge_wan_adapters(&mut w, &[spec(path, 1.0, None)], MoeExpert::High).unwrap();
         assert_eq!(report.applied, 1);
 
         // Reference: W += (B·A)·(alpha/rank = 2.0), folded at the factor dtype like the merge does.
-        let base = synthetic_weights();
+        let base = synthetic_weights(&tmp);
         let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
         let delta = matmul(&b, &a).unwrap();
         let two = scalar(2.0f32).as_dtype(delta.dtype()).unwrap();
@@ -1542,14 +1550,16 @@ mod tests {
 
     #[test]
     fn scale_zero_is_bit_exact_noop() {
+        let tmp = tempfile::tempdir().unwrap();
         let lora = write_lora(
+            &tmp,
             "zero.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
             4,
             0.3,
         );
-        let base = synthetic_weights();
-        let mut w = synthetic_weights();
+        let base = synthetic_weights(&tmp);
+        let mut w = synthetic_weights(&tmp);
         let report = merge_wan_adapters(&mut w, &[spec(lora, 0.0, None)], MoeExpert::Low).unwrap();
         assert_eq!(report.applied, 1); // still "applied" (folded a zero delta), like the reference.
         let got = w.require("blocks.0.self_attn.q.weight").unwrap();
@@ -1562,16 +1572,24 @@ mod tests {
 
     #[test]
     fn high_low_filter_selects_shared_plus_expert() {
+        let tmp = tempfile::tempdir().unwrap();
         let shared = write_lora(
+            &tmp,
             "shared.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
             4,
             0.2,
         );
-        let high_only = write_lora("highonly.safetensors", &[("blocks.0.ffn.0", 24, 8)], 4, 0.5);
+        let high_only = write_lora(
+            &tmp,
+            "highonly.safetensors",
+            &[("blocks.0.ffn.0", 24, 8)],
+            4,
+            0.5,
+        );
 
         // Building the LOW expert: the shared file applies, the high-only file does NOT.
-        let mut low = synthetic_weights();
+        let mut low = synthetic_weights(&tmp);
         let low_rep = merge_wan_adapters(
             &mut low,
             &[
@@ -1585,7 +1603,7 @@ mod tests {
         assert_eq!(low_rep.applied, 1);
 
         // Building the HIGH expert: both the shared and the high-only file apply.
-        let mut high = synthetic_weights();
+        let mut high = synthetic_weights(&tmp);
         let high_rep = merge_wan_adapters(
             &mut high,
             &[
@@ -1600,7 +1618,7 @@ mod tests {
 
         // The two experts' q weights differ from the bare base (visible effect) and the high expert's
         // ffn was merged while the low expert's was not.
-        let base = synthetic_weights();
+        let base = synthetic_weights(&tmp);
         let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
         let q_low = low.require("blocks.0.self_attn.q.weight").unwrap();
         assert!(!array_eq(q_low, q_base, false).unwrap().item::<bool>());
@@ -1616,20 +1634,23 @@ mod tests {
 
     #[test]
     fn accumulates_multiple_specs_on_one_module() {
+        let tmp = tempfile::tempdir().unwrap();
         // Two shared LoRAs on the same module accumulate (W + d1 + d2), order-preserving.
         let l1 = write_lora(
+            &tmp,
             "acc1.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
             4,
             0.1,
         );
         let l2 = write_lora(
+            &tmp,
             "acc2.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
             4,
             0.9,
         );
-        let mut w = synthetic_weights();
+        let mut w = synthetic_weights(&tmp);
         merge_wan_adapters(
             &mut w,
             &[spec(l1.clone(), 1.0, None), spec(l2.clone(), 1.0, None)],
@@ -1637,7 +1658,7 @@ mod tests {
         )
         .unwrap();
 
-        let base = synthetic_weights();
+        let base = synthetic_weights(&tmp);
         let mut want = base.require("blocks.0.self_attn.q.weight").unwrap().clone();
         for lpath in [&l1, &l2] {
             let lw = Weights::from_file(lpath).unwrap();
@@ -1661,6 +1682,7 @@ mod tests {
 
     #[test]
     fn lokr_merge_matches_reconstruct_and_scale_zero_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-2393: LoKr merges through the same in-place fold. `blocks.0.self_attn.q` is [16,8] =
         // kron(w1[4,2], w2[4,4]); the merged weight must equal W + (reconstruct·scale).astype(W.dtype),
         // and scale 0 must be a bit-exact no-op.
@@ -1684,7 +1706,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), alpha.to_string());
         meta.insert("rank".to_string(), rank.to_string());
-        let lokr_path = tmp("lokr.safetensors");
+        let lokr_path = scratch_file(&tmp, "lokr.safetensors");
         Array::save_safetensors(
             vec![
                 ("blocks.0.self_attn.q.lokr_w1", &w1),
@@ -1696,7 +1718,7 @@ mod tests {
         .unwrap();
 
         let scale = 0.5f32;
-        let mut w = synthetic_weights();
+        let mut w = synthetic_weights(&tmp);
         let report = merge_wan_adapters(
             &mut w,
             &[AdapterSpec {
@@ -1709,7 +1731,7 @@ mod tests {
         assert_eq!(report.applied, 1);
         assert!(report.skipped.is_empty());
 
-        let base = synthetic_weights();
+        let base = synthetic_weights(&tmp);
         let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
         let delta = reconstruct_lokr_delta(
             alpha,
@@ -1733,12 +1755,12 @@ mod tests {
         );
 
         // scale 0 → the merged weight is bit-identical to the base.
-        let mut w0 = synthetic_weights();
+        let mut w0 = synthetic_weights(&tmp);
         merge_wan_adapters(
             &mut w0,
             &[AdapterSpec {
                 kind: AdapterKind::Lokr,
-                ..spec(tmp("lokr.safetensors"), 0.0, None)
+                ..spec(scratch_file(&tmp, "lokr.safetensors"), 0.0, None)
             }],
             MoeExpert::High,
         )
@@ -1762,6 +1784,7 @@ mod tests {
     /// in for a Wan checkpoint module; `wan_module_table` resolves the `lycoris_proj` key to it.
     #[test]
     fn thirdparty_lycoris_merges_against_reference() {
+        let tmp = tempfile::tempdir().unwrap();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         for (dir, stem) in [
             ("sc3642_lokr", "linear_w1full_w2lr"),
@@ -1773,7 +1796,7 @@ mod tests {
             let want = exp.require("proj").unwrap();
             // Base weight map: a single f32 zero "proj.weight" of the delta's shape.
             let zero = Array::zeros::<f32>(want.shape()).unwrap();
-            let base_path = tmp(&format!("wan_tp_base_{stem}.safetensors"));
+            let base_path = scratch_file(&tmp, &format!("wan_tp_base_{stem}.safetensors"));
             Array::save_safetensors(vec![("proj.weight", &zero)], None, &base_path).unwrap();
             let mut w = Weights::from_file(&base_path).unwrap();
 
@@ -1808,8 +1831,8 @@ mod tests {
 
     /// A synthetic VACE (diffusers-layout) weight map: a base-block attn projection, a base-block
     /// FFN proj, and a vace-block hint projection — bf16, the modules the VACE LoRA tests target.
-    fn synthetic_vace_weights() -> Weights {
-        let path = tmp("vace_base.safetensors");
+    fn synthetic_vace_weights(tmp: &tempfile::TempDir) -> Weights {
+        let path = scratch_file(tmp, "vace_base.safetensors");
         let mk = |n: i32, scale: f32, bias: f32| {
             Array::from_slice(
                 &(0..n).map(|i| i as f32 * scale - bias).collect::<Vec<_>>(),
@@ -1836,9 +1859,11 @@ mod tests {
 
     #[test]
     fn merge_vace_folds_diffusers_named_delta_bit_exact() {
+        let tmp = tempfile::tempdir().unwrap();
         // A diffusers-named LoRA (the host layout) folds W += B·A on the matching VACE modules,
         // including a vace_blocks Linear. Bit-exact to the hand-computed merge.
         let lora = write_lora(
+            &tmp,
             "vace_diff.safetensors",
             &[
                 ("blocks.0.attn1.to_q", 16, 8),
@@ -1848,13 +1873,13 @@ mod tests {
             4,
             0.2,
         );
-        let mut w = synthetic_vace_weights();
+        let mut w = synthetic_vace_weights(&tmp);
         let report = merge_vace_adapters(&mut w, &[spec(lora.clone(), 1.0, None)]).unwrap();
         assert_eq!(report.applied, 3);
         assert!(report.skipped.is_empty());
 
         let lw = Weights::from_file(&lora).unwrap();
-        let base = synthetic_vace_weights();
+        let base = synthetic_vace_weights(&tmp);
         for stem in [
             "blocks.0.attn1.to_q",
             "blocks.0.ffn.net.0.proj",
@@ -1883,15 +1908,17 @@ mod tests {
 
     #[test]
     fn merge_vace_renames_native_named_lora_to_diffusers_host() {
+        let tmp = tempfile::tempdir().unwrap();
         // A native-Wan-named LoRA (self_attn.q / ffn.0 — what musubi / diffusion-pipe emit) resolves
         // onto the diffusers host modules (attn1.to_q / ffn.net.0.proj) and folds there.
         let lora = write_lora(
+            &tmp,
             "vace_native.safetensors",
             &[("blocks.0.self_attn.q", 16, 8), ("blocks.0.ffn.0", 24, 8)],
             4,
             0.4,
         );
-        let mut w = synthetic_vace_weights();
+        let mut w = synthetic_vace_weights(&tmp);
         let report = merge_vace_adapters(&mut w, &[spec(lora.clone(), 1.0, None)]).unwrap();
         assert_eq!(
             report.applied, 2,
@@ -1899,7 +1926,7 @@ mod tests {
         );
         assert!(report.skipped.is_empty());
 
-        let base = synthetic_vace_weights();
+        let base = synthetic_vace_weights(&tmp);
         // The diffusers host keys moved; the native key names are absent (they were renamed).
         let q = w.require("blocks.0.attn1.to_q.weight").unwrap();
         let q_base = base.require("blocks.0.attn1.to_q.weight").unwrap();
@@ -1910,6 +1937,7 @@ mod tests {
 
     #[test]
     fn merge_vace_lokr_matches_reconstruct_and_scale_zero_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-2393 LoKr on the diffusers host: `blocks.0.attn1.to_q` is [16,8] = kron(w1[4,2],w2[4,4]).
         // Merged weight must equal W + (reconstruct·scale).astype(W.dtype); scale 0 is a bit-exact no-op.
         use mlx_gen::adapters::reconstruct_lokr_delta;
@@ -1932,7 +1960,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), alpha.to_string());
         meta.insert("rank".to_string(), rank.to_string());
-        let lokr_path = tmp("vace_lokr.safetensors");
+        let lokr_path = scratch_file(&tmp, "vace_lokr.safetensors");
         Array::save_safetensors(
             vec![
                 ("blocks.0.attn1.to_q.lokr_w1", &w1),
@@ -1944,7 +1972,7 @@ mod tests {
         .unwrap();
 
         let scale = 0.5f32;
-        let mut w = synthetic_vace_weights();
+        let mut w = synthetic_vace_weights(&tmp);
         let report = merge_vace_adapters(
             &mut w,
             &[AdapterSpec {
@@ -1956,7 +1984,7 @@ mod tests {
         assert_eq!(report.applied, 1);
         assert!(report.skipped.is_empty());
 
-        let base = synthetic_vace_weights();
+        let base = synthetic_vace_weights(&tmp);
         let q_base = base.require("blocks.0.attn1.to_q.weight").unwrap();
         let delta = reconstruct_lokr_delta(
             alpha,
@@ -1980,7 +2008,7 @@ mod tests {
         );
 
         // scale 0 → bit-exact no-op.
-        let mut w0 = synthetic_vace_weights();
+        let mut w0 = synthetic_vace_weights(&tmp);
         merge_vace_adapters(
             &mut w0,
             &[AdapterSpec {
@@ -2003,9 +2031,11 @@ mod tests {
 
     #[test]
     fn merge_vace_reports_skipped_target_never_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
         // A LoRA module absent from the checkpoint is surfaced (skipped), never fatal — and a module
         // that IS present still merges in the same file.
         let lora = write_lora(
+            &tmp,
             "vace_skip.safetensors",
             &[
                 ("blocks.0.attn1.to_q", 16, 8),
@@ -2014,7 +2044,7 @@ mod tests {
             4,
             0.1,
         );
-        let mut w = synthetic_vace_weights();
+        let mut w = synthetic_vace_weights(&tmp);
         let report = merge_vace_adapters(&mut w, &[spec(lora, 1.0, None)]).unwrap();
         assert_eq!(report.applied, 1);
         assert_eq!(report.skipped, vec!["blocks.99.attn1.to_q".to_string()]);
@@ -2054,8 +2084,8 @@ mod tests {
     impl TinyWanHost {
         /// Build from the shared `synthetic_weights()` map (same `[16,8]` q + `[24,8]` fc1 the fold
         /// tests use), so an additive install and a folded merge start from the identical base.
-        fn from_synthetic() -> Self {
-            let w = synthetic_weights();
+        fn from_synthetic(tmp: &tempfile::TempDir) -> Self {
+            let w = synthetic_weights(tmp);
             Self {
                 q: AdaptableLinear::dense(
                     w.require("blocks.0.self_attn.q.weight").unwrap().clone(),
@@ -2082,10 +2112,12 @@ mod tests {
 
     #[test]
     fn additive_lora_matches_folded_merge_dense() {
+        let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE: the additive residual on a DENSE base == the folded merge, same output within
         // Metal matmul tolerance. Fold into a `Weights` map via `merge_wan_adapters`, build a dense
         // linear from the merged weight, and compare its forward to the additive-installed host's.
         let lora = write_lora(
+            &tmp,
             "additive_parity.safetensors",
             &[("blocks.0.self_attn.q", 16, 8), ("blocks.0.ffn.0", 24, 8)],
             4,
@@ -2094,7 +2126,7 @@ mod tests {
         let x = acts(3);
 
         // Folded reference.
-        let mut w = synthetic_weights();
+        let mut w = synthetic_weights(&tmp);
         let fold_report =
             merge_wan_adapters(&mut w, &[spec(lora.clone(), 0.75, None)], MoeExpert::High).unwrap();
         assert_eq!(fold_report.applied, 2);
@@ -2106,7 +2138,7 @@ mod tests {
             AdaptableLinear::dense(w.require("blocks.0.ffn.fc1.weight").unwrap().clone(), None);
 
         // Additive.
-        let mut host = TinyWanHost::from_synthetic();
+        let mut host = TinyWanHost::from_synthetic(&tmp);
         let add_report =
             apply_wan_adapters_additive(&mut host, &[spec(lora, 0.75, None)], MoeExpert::High)
                 .unwrap();
@@ -2127,7 +2159,7 @@ mod tests {
             );
             // Non-degenerate: the adapter actually changed the output vs the bare base.
             let bare = AdaptableLinear::dense(
-                synthetic_weights()
+                synthetic_weights(&tmp)
                     .require(&format!(
                         "blocks.0.{}.weight",
                         if name == "self_attn.q" {
@@ -2183,10 +2215,12 @@ mod tests {
 
     #[test]
     fn additive_lora_on_quantized_base_no_error_and_nondegenerate() {
+        let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE: a LoRA applies on a Q4/Q8 PACKED base with NO error (the old model.rs:614
         // rejection) and produces finite, non-zero output that differs from the no-adapter forward.
         // The base stays packed (never dequantized). The target is [128,64] so it is quantizable.
         let lora = write_lora(
+            &tmp,
             "additive_quant.safetensors",
             &[("blocks.0.self_attn.q", 128, 64)],
             8,
@@ -2245,12 +2279,13 @@ mod tests {
 
     #[test]
     fn additive_no_adapter_is_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE: with NO adapters installed the forward is byte-identical to the bare base — the
         // additive path adds nothing when empty (no regression to the no-adapter path).
         let x = acts(3);
-        let host = TinyWanHost::from_synthetic();
+        let host = TinyWanHost::from_synthetic(&tmp);
         let bare_q = AdaptableLinear::dense(
-            synthetic_weights()
+            synthetic_weights(&tmp)
                 .require("blocks.0.self_attn.q.weight")
                 .unwrap()
                 .clone(),
@@ -2264,7 +2299,7 @@ mod tests {
         );
 
         // And an EMPTY spec list is a no-op install (applied 0, output unchanged).
-        let mut host2 = TinyWanHost::from_synthetic();
+        let mut host2 = TinyWanHost::from_synthetic(&tmp);
         let report = apply_wan_adapters_additive(&mut host2, &[], MoeExpert::High).unwrap();
         assert_eq!(report.applied, 0);
         let host2_out = host2.q.forward(&x).unwrap();
@@ -2278,19 +2313,21 @@ mod tests {
 
     #[test]
     fn additive_scale_zero_is_bit_exact_noop() {
+        let tmp = tempfile::tempdir().unwrap();
         // A strength-0 additive LoRA is a bit-exact no-op (the residual is `0·…`), mirroring the
         // fold path's `scale_zero_is_bit_exact_noop`.
         let lora = write_lora(
+            &tmp,
             "additive_zero.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
             4,
             0.3,
         );
         let x = acts(3);
-        let bare = TinyWanHost::from_synthetic();
+        let bare = TinyWanHost::from_synthetic(&tmp);
         let want = bare.q.forward(&x).unwrap();
 
-        let mut host = TinyWanHost::from_synthetic();
+        let mut host = TinyWanHost::from_synthetic(&tmp);
         let report =
             apply_wan_adapters_additive(&mut host, &[spec(lora, 0.0, None)], MoeExpert::High)
                 .unwrap();
@@ -2304,13 +2341,14 @@ mod tests {
 
     #[test]
     fn additive_lokr_matches_folded_merge_dense() {
+        let tmp = tempfile::tempdir().unwrap();
         // The LoKr additive residual on a dense base matches the folded LoKr merge (same reconstructed
         // ΔW, one as `W+=δ`, the other as `x·δᵀ`). Reuses the fold tests' `write_lokr` helper.
-        let lokr = write_lokr("additive_lokr.safetensors", 8.0, 4.0);
+        let lokr = write_lokr(&tmp, "additive_lokr.safetensors", 8.0, 4.0);
         let x = acts(3);
 
         // Folded reference: merge onto the q weight, forward the merged dense linear.
-        let mut w = synthetic_weights();
+        let mut w = synthetic_weights(&tmp);
         let fold =
             merge_wan_adapters(&mut w, &[lokr_spec(lokr.clone(), 0.6)], MoeExpert::High).unwrap();
         assert_eq!(fold.applied, 1);
@@ -2320,7 +2358,7 @@ mod tests {
         );
 
         // Additive.
-        let mut host = TinyWanHost::from_synthetic();
+        let mut host = TinyWanHost::from_synthetic(&tmp);
         let add_report =
             apply_wan_adapters_additive(&mut host, &[lokr_spec(lokr, 0.6)], MoeExpert::High)
                 .unwrap();
@@ -2341,7 +2379,7 @@ mod tests {
     /// Write a peft LoKr for `blocks.0.self_attn.q` sized to a **quantizable** `[128,64]` base
     /// (`in = 64` is a multiple of the group size): `[128,64] = kron(w1[16,8], w2[8,8])`. `alpha`/`rank`
     /// in metadata. Deterministic factor values.
-    fn write_lokr_quant(name: &str, alpha: f32, rank: f32) -> PathBuf {
+    fn write_lokr_quant(tmp: &tempfile::TempDir, name: &str, alpha: f32, rank: f32) -> PathBuf {
         use std::collections::HashMap;
         let w1 = Array::from_slice(
             &(0..16 * 8)
@@ -2360,7 +2398,7 @@ mod tests {
             ("alpha".to_string(), alpha.to_string()),
             ("rank".to_string(), rank.to_string()),
         ]);
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(
             vec![
                 ("blocks.0.self_attn.q.lokr_w1", &w1),
@@ -2375,13 +2413,14 @@ mod tests {
 
     #[test]
     fn structured_lokr_on_quantized_matches_dense_and_stays_packed() {
+        let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE (sc-10050): a peft LoKr applies on a Q4/Q8 PACKED base with NO error, NO full
         // out×in delta materialized, the base STAYS packed, and its LoKr CONTRIBUTION (packed-with-LoKr
         // minus packed-baseline) matches the dense LoKr residual within tolerance. Comparing the
         // residual contribution — not the full output — isolates the adapter from the (much larger)
         // base-quantization error, which is what the vec-trick vs the materialized delta must agree on.
         // `[128,64]` target so `in` is a group-size multiple.
-        let lokr = write_lokr_quant("structured_quant_lokr.safetensors", 8.0, 4.0);
+        let lokr = write_lokr_quant(&tmp, "structured_quant_lokr.safetensors", 8.0, 4.0);
         let x = Array::from_slice(
             &(0..3 * 64)
                 .map(|i| (i as f32 * 0.017).sin() * 0.5)
@@ -2492,15 +2531,18 @@ mod tests {
 
     #[test]
     fn reject_loha_on_packed_passes_plain_lora_and_lokr() {
+        let tmp = tempfile::tempdir().unwrap();
         // Plain-LoRA AND LoKr spec lists are allowed on a packed tier (sc-10050): LoRA installs
         // additively, LoKr via the structured deferred-Kronecker path — the guard is a no-op for both.
         let l1 = write_lora(
+            &tmp,
             "packroute_lora1.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
             4,
             0.1,
         );
         let l2 = write_lora(
+            &tmp,
             "packroute_lora2.safetensors",
             &[("blocks.0.ffn.0", 24, 8)],
             4,
@@ -2513,7 +2555,7 @@ mod tests {
         .expect("plain LoRA files must pass the packed guard");
         // A peft LoKr file (networkType=lokr stamp) now ALSO passes — it installs via the structured
         // vec-trick (sc-10050), no longer rejected.
-        let lokr = write_lokr("packroute_lokr.safetensors", 8.0, 4.0);
+        let lokr = write_lokr(&tmp, "packroute_lokr.safetensors", 8.0, 4.0);
         reject_loha_on_packed("wan2_2_t2v_14b", &[lokr_spec(lokr, 0.6)])
             .expect("LoKr must pass the packed guard now that sc-10050 applies it structurally");
         // Third-party LoKr (no networkType stamp — detected by keys) likewise passes.
@@ -2586,9 +2628,11 @@ mod tests {
 
     #[test]
     fn additive_skips_target_absent_from_host() {
+        let tmp = tempfile::tempdir().unwrap();
         // A LoRA target outside the host's adaptable surface (a non-block / far-block module) is
         // surfaced (skipped), never fatal — mirroring the fold path's skip reporting.
         let lora = write_lora(
+            &tmp,
             "additive_skip.safetensors",
             &[
                 ("blocks.0.self_attn.q", 16, 8),
@@ -2597,7 +2641,7 @@ mod tests {
             4,
             0.1,
         );
-        let mut host = TinyWanHost::from_synthetic();
+        let mut host = TinyWanHost::from_synthetic(&tmp);
         let report =
             apply_wan_adapters_additive(&mut host, &[spec(lora, 1.0, None)], MoeExpert::High)
                 .unwrap();
@@ -2631,14 +2675,14 @@ mod tests {
     /// Write a PEFT LoRA file for `blocks.0.self_attn.q` whose factors are **1-D** (non-2-D) — a
     /// malformed adapter that would otherwise derive a degenerate rank and merge garbage (sc-11129,
     /// F-058). A true 0-size `lora_A` leading dim triggers the same guard but is not serializable.
-    fn write_lora_non_2d(name: &str) -> PathBuf {
+    fn write_lora_non_2d(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         let a = Array::from_slice(&[0.1f32; 8], &[8])
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
         let b = Array::from_slice(&[0.1f32; 16], &[16])
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(
             vec![
                 ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &a),
@@ -2653,12 +2697,13 @@ mod tests {
 
     #[test]
     fn fold_path_rejects_degenerate_factors_instead_of_nan_merge() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-058 (sc-11129): the fold path must reject degenerate factors with a typed error, exactly
         // like the additive twin's guard (`install_one_lora_additive`) — rather than deriving a
         // NaN/degenerate `alpha/rank` and silently replacing the whole base weight. Before the fix the
         // fold path had no such guard; the additive twin did (fixes-don't-travel).
-        let lora = write_lora_non_2d("f058_non2d.safetensors");
-        let mut w = synthetic_weights();
+        let lora = write_lora_non_2d(&tmp, "f058_non2d.safetensors");
+        let mut w = synthetic_weights(&tmp);
         let err = merge_wan_adapters(&mut w, &[spec(lora, 1.0, None)], MoeExpert::High)
             .expect_err("degenerate factors must be rejected on the fold path");
         match err {
@@ -2683,7 +2728,7 @@ mod tests {
 
     /// Write a synthetic third-party LyCORIS **LoHa** for `blocks.0.self_attn.q` at `[128,64]`
     /// (`(w1_a·w1_b) ⊙ (w2_a·w2_b)`, rank 4) — the shape `QuantWanHost` carries (sc-11129, F-060).
-    fn write_thirdparty_loha_q(name: &str) -> PathBuf {
+    fn write_thirdparty_loha_q(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         let r = 4;
         let wa = Array::from_slice(
             &(0..128 * r)
@@ -2697,7 +2742,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[r, 64],
         );
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(
             vec![
                 ("blocks.0.self_attn.q.hada_w1_a", &wa),
@@ -2714,11 +2759,12 @@ mod tests {
 
     #[test]
     fn loha_additive_installer_rejects_packed_base_per_target() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-060 (sc-11129): the LoHa additive installer must refuse a materialization on a PACKED base
         // per target (not rely solely on the call-site file-level `reject_loha_on_packed`). Install a
         // third-party LoHa directly via `apply_wan_adapters_additive` onto a packed q — it must return
         // the typed `Error::Unsupported`, and on a DENSE q the same file installs fine (guard parity).
-        let loha = write_thirdparty_loha_q("f060_loha.safetensors");
+        let loha = write_thirdparty_loha_q(&tmp, "f060_loha.safetensors");
 
         let mut packed = QuantWanHost::new();
         packed.q.quantize(8, Some(64)).unwrap();

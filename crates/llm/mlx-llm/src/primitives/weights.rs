@@ -115,8 +115,8 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("mlx-llm-weights-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("model.safetensors");
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         Array::save_safetensors([("w", &a)], None, &path).unwrap();
@@ -126,7 +126,5 @@ mod tests {
 
         let w2 = Weights::from_dir(&dir).unwrap();
         assert!(w2.contains("w"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

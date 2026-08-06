@@ -475,30 +475,30 @@ mod tests {
     /// a direct file is used as-is.
     #[test]
     fn image_encoder_resolution() {
-        let dir = std::env::temp_dir().join(format!("flux_ip_enc_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(resolve_image_encoder(&dir).is_err());
         let f = dir.join("model.safetensors");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(resolve_image_encoder(&dir).unwrap(), f);
         assert_eq!(resolve_image_encoder(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `detect_variant` keys off the DiT checkpoint filename and errors when neither is present.
     #[test]
     fn variant_detection() {
-        let dir = std::env::temp_dir().join(format!("flux_ip_var_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(detect_variant(&dir).is_err());
         std::fs::write(dir.join(Variant::Schnell.transformer_file()), b"x").unwrap();
         assert_eq!(detect_variant(&dir).unwrap(), Variant::Schnell);
         std::fs::write(dir.join(Variant::Dev.transformer_file()), b"x").unwrap();
         assert_eq!(detect_variant(&dir).unwrap(), Variant::Dev); // dev preferred if both
-        let _ = std::fs::remove_dir_all(&dir);
 
+        // Clear the checkpoint files so the next leg exercises the transformer/config.json
+        // route rather than re-reading the filenames above. A reset, not cleanup.
+        std::fs::remove_file(dir.join(Variant::Schnell.transformer_file())).unwrap();
+        std::fs::remove_file(dir.join(Variant::Dev.transformer_file())).unwrap();
         std::fs::create_dir_all(dir.join("transformer")).unwrap();
         std::fs::write(
             dir.join("transformer/config.json"),
@@ -512,6 +512,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detect_variant(&dir).unwrap(), Variant::Dev);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

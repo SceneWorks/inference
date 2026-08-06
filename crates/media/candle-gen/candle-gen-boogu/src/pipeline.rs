@@ -855,11 +855,8 @@ mod tests {
             candle_gen::candle_core::safetensors::save(&m, mllm.join("model.safetensors")).unwrap();
             std::fs::write(mllm.join("config.json"), b"{}").unwrap();
         }
-        let base = std::env::temp_dir().join(format!(
-            "boogu_te_store_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base = base_tmp.path().to_path_buf();
 
         let bf = base.join("bf16");
         write_te(&bf, DType::BF16);
@@ -874,8 +871,6 @@ mod tests {
             load_te_weights(&f, &Device::Cpu).unwrap().dtype(),
             DType::F32
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -257,7 +257,8 @@ mod tests {
     #[test]
     fn block_visitor_emits_canonical_paths() {
         let (e, h, hd, hidden) = (8usize, 2usize, 4usize, 16usize);
-        let dir = std::env::temp_dir().join(format!("sc11104_blk_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let w = weights_from(
             &dir,
             &[
@@ -295,6 +296,5 @@ mod tests {
                 "layers.0.adaln_modulation",
             ]
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

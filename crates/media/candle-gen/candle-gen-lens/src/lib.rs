@@ -2071,21 +2071,13 @@ mod explicit_registry_tests {
 mod integration_tests {
     use super::*;
 
-    fn packed_memory_spec(quant: Quant) -> (PathBuf, LoadSpec) {
+    fn packed_memory_spec(tmp: &tempfile::TempDir, quant: Quant) -> (PathBuf, LoadSpec) {
         let bits = match quant {
             Quant::Q4 => 4,
             Quant::Q8 => 8,
             other => panic!("packed memory fixture does not support {other:?}"),
         };
-        let root = std::env::temp_dir().join(format!(
-            "sc15800_lens_contract_{}_{}_{}",
-            std::process::id(),
-            bits,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = tmp.path().join(format!("sc15800_lens_contract_{bits}"));
         let text = root.join("text_encoder");
         std::fs::create_dir_all(&text).unwrap();
         std::fs::write(
@@ -2117,16 +2109,10 @@ mod integration_tests {
         (root, spec)
     }
 
-    fn mini_packed_inventory(complete: bool) -> (PathBuf, EncoderConfig) {
-        let root = std::env::temp_dir().join(format!(
-            "sc15800_lens_inventory_{}_{}_{}",
-            std::process::id(),
-            complete,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn mini_packed_inventory(tmp: &tempfile::TempDir, complete: bool) -> (PathBuf, EncoderConfig) {
+        let root = tmp
+            .path()
+            .join(format!("sc15800_lens_inventory_{complete}"));
         std::fs::create_dir_all(&root).unwrap();
         let mut cfg = EncoderConfig::gpt_oss_20b();
         cfg.num_hidden_layers = 2;
@@ -2172,8 +2158,9 @@ mod integration_tests {
 
     #[test]
     fn packed_inventory_requires_both_expert_projections_in_every_layer() {
+        let tmp = tempfile::tempdir().unwrap();
         for complete in [true, false] {
-            let (root, cfg) = mini_packed_inventory(complete);
+            let (root, cfg) = mini_packed_inventory(&tmp, complete);
             let files = vec![root.join("model.safetensors")];
             // SAFETY: immutable test fixture, alive for the duration of this assertion.
             let source = unsafe { MmapedSafetensors::multi(&files).unwrap() };
@@ -2187,14 +2174,8 @@ mod integration_tests {
 
     #[test]
     fn transformer_artifact_must_match_the_selected_numeric_tier() {
-        let root = std::env::temp_dir().join(format!(
-            "sc15800_lens_transformer_tier_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let component = root.join("transformer");
         std::fs::create_dir_all(&component).unwrap();
         std::fs::write(
@@ -2247,7 +2228,6 @@ mod integration_tests {
             !transformer_numeric_tier_matches(&spec, 4),
             "rung 4 requires a packed transformer whose blocks are transfer-ready"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -2731,14 +2711,8 @@ mod integration_tests {
     /// to garbage through the group-64 shared loaders. A dense/absent config skips the guard.
     #[test]
     fn packed_group_size_guard_rejects_non_default() {
-        let root = std::env::temp_dir().join(format!(
-            "sc9474_lens_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let sub_dir = root.join("transformer");
         std::fs::create_dir_all(&sub_dir).unwrap();
         let write_cfg = |json: &str| std::fs::write(sub_dir.join("config.json"), json).unwrap();
@@ -2772,8 +2746,6 @@ mod integration_tests {
         // An absent config dir ⇒ None ⇒ skipped (a dense snapshot with no packed config still loads).
         assert!(pipe().packed_group_size("text_encoder").is_none());
         assert!(pipe().guard_packed_group_size("text_encoder").is_ok());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2791,6 +2763,7 @@ mod integration_tests {
 
     #[test]
     fn text_window_requires_sequential_deferred_packed_load() {
+        let tmp = tempfile::tempdir().unwrap();
         let base = || LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
         assert!(!streams_text_encoder(&base()));
         assert!(!streams_text_encoder(
@@ -2809,7 +2782,7 @@ mod integration_tests {
                 .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
         ));
         for quant in [Quant::Q4, Quant::Q8] {
-            let (root, spec) = packed_memory_spec(quant);
+            let (root, spec) = packed_memory_spec(&tmp, quant);
             assert!(
                 !streams_text_encoder(&spec),
                 "a config plus one pseudo-triple must not advertise a 24-layer transfer-only encoder"
@@ -2836,10 +2809,11 @@ mod integration_tests {
 
     #[test]
     fn memory_contract_is_load_exact_and_dit_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
         use gen_core::{LoadShape, MemoryStrategy, MemoryStrategySupport, TransformerComponent};
 
         let base = || LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
-        let (eligible_root, eligible) = packed_memory_spec(Quant::Q4);
+        let (eligible_root, eligible) = packed_memory_spec(&tmp, Quant::Q4);
         let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&eligible, true);
         let _detected_contract = build_lens_memory_strategy_contract(MODEL_ID_BASE, &eligible);
         let base_contract =
@@ -2890,7 +2864,7 @@ mod integration_tests {
             contract.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
         );
-        let (q8_root, q8_spec) = packed_memory_spec(Quant::Q8);
+        let (q8_root, q8_spec) = packed_memory_spec(&tmp, Quant::Q8);
         let q8_contract =
             build_lens_turbo_memory_strategy_contract_with_eligibility(&q8_spec, true);
         assert_eq!(contract.calibration, q8_contract.calibration);
@@ -2936,7 +2910,8 @@ mod integration_tests {
 
     #[test]
     fn safety_check_rejects_stale_calibration_and_wrong_numeric_tier() {
-        let (root, spec) = packed_memory_spec(Quant::Q4);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = packed_memory_spec(&tmp, Quant::Q4);
         let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
         let calibration = contract.calibration.clone().unwrap();
         let generator = LensGenerator {
@@ -3013,9 +2988,10 @@ mod integration_tests {
 
     #[test]
     fn selected_dit_window_reaches_the_request_scope() {
+        let tmp = tempfile::tempdir().unwrap();
         use gen_core::MemoryRequestScope;
 
-        let (root, spec) = packed_memory_spec(Quant::Q4);
+        let (root, spec) = packed_memory_spec(&tmp, Quant::Q4);
         let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
         let tier = gen_core::MemoryNumericTier {
             precision: gen_core::Precision::Bf16,

@@ -89,8 +89,8 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         source.display()
     );
 
-    let out = std::env::temp_dir().join(format!("mlx-llm-joycaption-q4-{}", std::process::id()));
-    std::fs::remove_dir_all(&out).ok();
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     let prepared = PreparedSnapshot(out);
     let report = prepare_snapshot(&PrepareSpec::quantized(source, &prepared.0, Quantize::Q4))
         .expect("registered quantize-prepare of the pinned JoyCaption source must succeed");

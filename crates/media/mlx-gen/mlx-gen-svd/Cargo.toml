@@ -17,6 +17,10 @@ mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Save the e2e render frames for inspection (matches the workspace `image` version).
 image = { workspace = true }
 # Real-weight typed-cancellation conformance gate (story 6883): drives the registered svd_xt

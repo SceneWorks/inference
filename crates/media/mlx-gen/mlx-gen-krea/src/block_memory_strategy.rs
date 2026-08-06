@@ -514,10 +514,9 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn fixture() -> (std::path::PathBuf, LoadSpec) {
-        let root = std::env::temp_dir().join(format!(
-            "mlx_gen_krea_sc16352_{}_{}",
-            std::process::id(),
+    fn fixture(tmp: &tempfile::TempDir) -> (std::path::PathBuf, LoadSpec) {
+        let root = tmp.path().join(format!(
+            "mlx_gen_krea_sc16352_{}",
             FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         for component in ["text_encoder", "transformer", "vae"] {
@@ -548,7 +547,8 @@ mod tests {
 
     #[test]
     fn identical_fingerprint_is_separated_by_typed_load_shape() {
-        let (root, deferred_spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, deferred_spec) = fixture(&tmp);
         let deferred = memory_strategy_contract("krea_2_turbo", &deferred_spec).unwrap();
         let mut eager_spec = deferred_spec;
         eager_spec.load_shape = LoadShape::EagerMaterialization;
@@ -608,7 +608,8 @@ mod tests {
 
     #[test]
     fn prepacked_q4_without_an_override_binds_registration_to_the_actual_tier() {
-        let (root, mut spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, mut spec) = fixture(&tmp);
         spec.quantize = None;
         std::fs::write(
             root.join("transformer/config.json"),
@@ -636,7 +637,8 @@ mod tests {
 
     #[test]
     fn rung_four_declares_and_engages_staged_residency_in_the_same_request() {
-        let (root, spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
         let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
         assert_eq!(
             contract.engaged_composition(MemoryStrategy::BoundedTransformerResidency),
@@ -653,7 +655,8 @@ mod tests {
 
     #[test]
     fn base_family_declares_route_exact_decode_attention_domains() {
-        let (root, spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
         let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
         let routes = decode_routes("krea_2_turbo").unwrap();
         let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
@@ -739,7 +742,8 @@ mod tests {
 
     #[test]
     fn sequential_deferred_snapshot_advertises_the_exact_dit_window() {
-        let (root, spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
         let contract = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
         assert!(contract.conformance_errors().is_empty());
         let staged = contract
@@ -763,7 +767,8 @@ mod tests {
 
     #[test]
     fn missing_required_component_directory_fails_closed() {
-        let (root, spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
         std::fs::remove_dir_all(root.join("text_encoder")).unwrap();
         assert!(memory_strategy_contract("krea_2_turbo", &spec).is_err());
         assert!(weights_free_memory_strategy_contract("krea_2_turbo", &spec).is_ok());
@@ -772,7 +777,8 @@ mod tests {
 
     #[test]
     fn native_required_file_rejects_missing_empty_and_corrupt_sources() {
-        let (root, _) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
         let native = root.join("native.safetensors");
         let missing = native_memory_strategy_contract("krea_2_turbo", &native, &root)
             .unwrap_err()
@@ -793,7 +799,8 @@ mod tests {
 
     #[test]
     fn low_rank_overlay_is_admissible_but_dense_diff_patch_is_not() {
-        let (root, mut spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, mut spec) = fixture(&tmp);
         let low_rank = root.join("low-rank.safetensors");
         std::fs::write(&low_rank, [0_u8; 8]).unwrap();
         spec.adapters = vec![AdapterSpec::new(low_rank, 1.0, AdapterKind::Lora)];
@@ -816,7 +823,8 @@ mod tests {
 
     #[test]
     fn rung_four_resolves_load_time_quantization_instead_of_the_override_presence() {
-        let (root, spec) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
 
         for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
             std::fs::write(
@@ -885,7 +893,8 @@ mod tests {
 
     #[test]
     fn non_reopenable_or_wrong_loader_shapes_do_not_advertise_rung_four() {
-        let (root, base) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, base) = fixture(&tmp);
         let mut resident = base.clone();
         resident.offload_policy = OffloadPolicy::Resident;
         let mut eager = base.clone();
@@ -912,7 +921,8 @@ mod tests {
 
     #[test]
     fn native_i8_contract_counts_bf16_materialization_and_omits_source_companions() {
-        let (root, _) = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
         let native = root.join("native.safetensors");
         write_native_i8_safetensors(&native);
         let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();

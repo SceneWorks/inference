@@ -154,8 +154,8 @@ mod tests {
     use mlx_rs::Array;
     use serde_json::json;
 
-    fn unique_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+    fn unique_dir(tmp: &tempfile::TempDir, label: &str) -> PathBuf {
+        let dir = tmp.path().join(format!(
             "mlx-llm-prepare-{label}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -192,21 +192,23 @@ mod tests {
 
     #[test]
     fn can_prepare_accepts_hf_dir_and_rejects_unknown() {
-        let hf = unique_dir("canprep-hf");
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = unique_dir(&tmp, "canprep-hf");
         write_hf_dir(&hf);
         assert!(can_prepare(&PrepareSpec::dense(&hf, hf.join("out"))));
         std::fs::remove_dir_all(&hf).ok();
 
-        let empty = unique_dir("canprep-empty");
+        let empty = unique_dir(&tmp, "canprep-empty");
         assert!(!can_prepare(&PrepareSpec::dense(&empty, empty.join("out"))));
         std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
     fn dense_hf_is_a_no_rewrite_passthrough() {
-        let hf = unique_dir("passthrough-src");
+        let tmp = tempfile::tempdir().unwrap();
+        let hf = unique_dir(&tmp, "passthrough-src");
         write_hf_dir(&hf);
-        let out = unique_dir("passthrough-out");
+        let out = unique_dir(&tmp, "passthrough-out");
         std::fs::remove_dir_all(&out).ok();
 
         let report = prepare(&PrepareSpec::dense(&hf, &out)).unwrap();
@@ -221,7 +223,8 @@ mod tests {
 
     #[test]
     fn unknown_source_is_unsupported() {
-        let empty = unique_dir("unknown");
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = unique_dir(&tmp, "unknown");
         match prepare(&PrepareSpec::dense(&empty, empty.join("out"))) {
             Err(CoreError::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
@@ -231,8 +234,9 @@ mod tests {
 
     #[test]
     fn quantized_hf_writes_a_loadable_quantized_snapshot() {
-        let src = unique_dir("q-src");
-        let out = unique_dir("q-out");
+        let tmp = tempfile::tempdir().unwrap();
+        let src = unique_dir(&tmp, "q-src");
+        let out = unique_dir(&tmp, "q-out");
         std::fs::remove_dir_all(&out).ok();
 
         let (h, v, inter, qd, kvd) = (64i32, 4i32, 128i32, 64i32, 32i32);

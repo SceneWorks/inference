@@ -129,35 +129,33 @@ mod tests {
 
     #[test]
     fn probe_recognizes_a_chatterbox_snapshot_only() {
-        let dir = std::env::temp_dir().join("chatterbox-prepare-probe");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(!can_prepare(&spec(&dir))); // empty
         make_snapshot(&dir);
         assert!(can_prepare(&spec(&dir)));
         // Missing the S3Gen checkpoint → not recognized.
         std::fs::remove_file(dir.join(S3GEN_WEIGHTS_FILE)).unwrap();
         assert!(!can_prepare(&spec(&dir)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn prepare_passthrough_counts_tensors() {
-        let dir = std::env::temp_dir().join("chatterbox-prepare-pass");
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         make_snapshot(&dir);
         let report = prepare(&spec(&dir)).unwrap();
         assert!(report.passthrough);
         assert_eq!(report.num_tensors, 3); // 1 (T3) + 2 (S3Gen)
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn prepare_refuses_quantization_typed() {
-        let dir = std::env::temp_dir().join("chatterbox-prepare-quant");
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         make_snapshot(&dir);
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

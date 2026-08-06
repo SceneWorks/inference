@@ -1075,10 +1075,8 @@ mod packed_tests {
             dense(&mut map, &format!("{tb}.{n}.bias"), &[channels]);
         }
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9416_sdxl_st_packed_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9416_sdxl_st_packed.safetensors");
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -1118,6 +1116,5 @@ mod packed_tests {
             finite,
             "packed SpatialTransformer forward produced non-finite values"
         );
-        std::fs::remove_file(&tmp).ok();
     }
 }

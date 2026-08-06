@@ -508,9 +508,8 @@ mod tests {
 
         // Feed the independently unpermuted result through the streaming sink and pin every stored
         // BF16 value, rather than comparing two invocations of the same writer.
-        let dir =
-            std::env::temp_dir().join(format!("mlx-llm-gguf-qk-stream-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let key = "model.layers.0.self_attn.q_proj.weight".to_string();
         crate::snapshot::write_streaming_snapshot(
             &dir,
@@ -524,7 +523,6 @@ mod tests {
         let stored = Array::load_safetensors(dir.join("model.safetensors")).unwrap();
         let expected: Vec<half::bf16> = hf.iter().copied().map(half::bf16::from_f32).collect();
         assert_eq!(stored[&key].as_slice::<half::bf16>(), expected);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -547,12 +545,8 @@ mod tests {
         );
         let key = "model.layers.0.self_attn.q_proj.weight";
         for spec in [QuantSpec::q4(), QuantSpec::q8()] {
-            let out = std::env::temp_dir().join(format!(
-                "mlx-llm-full-gguf-q{}-{}",
-                spec.bits,
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&out);
+            let out_tmp = tempfile::tempdir().unwrap();
+            let out = out_tmp.path().to_path_buf();
             convert(
                 &gguf,
                 &out,
@@ -597,7 +591,6 @@ mod tests {
                     .unwrap();
             assert_eq!(config["hidden_size"], 64);
             assert_eq!(config["quantization"]["bits"], spec.bits);
-            std::fs::remove_dir_all(out).unwrap();
         }
     }
 

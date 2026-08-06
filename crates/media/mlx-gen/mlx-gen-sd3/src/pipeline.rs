@@ -435,9 +435,12 @@ mod tests {
     /// Written to a unique temp dir and loaded through the real [`ClipBpeTokenizer::from_dir`] path so
     /// this exercises production code (matching the crate's `std::env::temp_dir()` test convention).
     /// `pad_token` selects the config's pad string (`"!"` = bigG, `"<|endoftext|>"` = L).
-    fn synthetic_clip_tokenizer_dir(tag: &str, pad_token: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_sd3_clip_tok_{}_{tag}", std::process::id()));
+    fn synthetic_clip_tokenizer_dir(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+        pad_token: &str,
+    ) -> std::path::PathBuf {
+        let dir = tmp.path().join(format!("mlx_gen_sd3_clip_tok_{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         // Vocab: the two specials at their real CLIP ids, `!` at 0 (bigG's pad), plus a few
         // SINGLE-character `</w>` word tokens. The synthetic `merges.txt` has NO merges, so the
@@ -463,16 +466,17 @@ mod tests {
         dir
     }
 
-    fn synthetic_clip_tokenizer() -> ClipBpeTokenizer {
-        ClipBpeTokenizer::from_dir(synthetic_clip_tokenizer_dir("l", "<|endoftext|>")).unwrap()
+    fn synthetic_clip_tokenizer(tmp: &tempfile::TempDir) -> ClipBpeTokenizer {
+        ClipBpeTokenizer::from_dir(synthetic_clip_tokenizer_dir(tmp, "l", "<|endoftext|>")).unwrap()
     }
 
     #[test]
     fn empty_prompt_clip_ids_keep_bos_and_match_tokenize_path() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-004 (default-run, no real weights): the empty (uncond) prompt must NOT be special-cased.
         // The padded row must equal the padded `tokenize("")` path and begin with BOS (49406) then
         // EOS (49407) — NOT 77×EOS-with-no-BOS as the removed `is_empty() → Vec::new()` shortcut did.
-        let tok = synthetic_clip_tokenizer();
+        let tok = synthetic_clip_tokenizer(&tmp);
 
         // tokenize("") is [BOS, EOS].
         assert_eq!(tok.tokenize("").unwrap(), vec![49406, 49407]);
@@ -507,10 +511,11 @@ mod tests {
 
     #[test]
     fn resolve_clip_pad_reads_per_encoder_pad_token() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-9581: L resolves `<|endoftext|>` (49407); bigG resolves `!` (0). A `tokenizer_config.json`
         // with no `pad_token` (or an unknown token) falls back to eos.
-        let l_dir = synthetic_clip_tokenizer_dir("padl", "<|endoftext|>");
-        let g_dir = synthetic_clip_tokenizer_dir("padg", "!");
+        let l_dir = synthetic_clip_tokenizer_dir(&tmp, "padl", "<|endoftext|>");
+        let g_dir = synthetic_clip_tokenizer_dir(&tmp, "padg", "!");
         assert_eq!(
             resolve_clip_pad_id(&l_dir).unwrap(),
             49407,
@@ -523,11 +528,8 @@ mod tests {
         );
 
         // Fallback: a dir whose config lacks `pad_token` -> eos.
-        let f_dir = std::env::temp_dir().join(format!(
-            "mlx_gen_sd3_clip_tok_{}_nofallback",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&f_dir).unwrap();
+        let f_dir_tmp = tempfile::tempdir().unwrap();
+        let f_dir = f_dir_tmp.path().to_path_buf();
         std::fs::write(f_dir.join("tokenizer_config.json"), "{}").unwrap();
         assert_eq!(
             resolve_clip_pad_id(&f_dir).unwrap(),
@@ -560,9 +562,10 @@ mod tests {
 
     #[test]
     fn bigg_pads_with_bang_not_eos() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-9581 core regression: with a sub-77-token prompt, the bigG row must be padded with `!`
         // (0), NOT eos (49407). The pre-fix code shared one eos-padded row for both encoders.
-        let tok = synthetic_clip_tokenizer();
+        let tok = synthetic_clip_tokenizer(&tmp);
         // Single-char words only (`"a b"` -> [BOS, 320, 321, EOS], len 4) so the no-merges synthetic
         // BPE tokenizes without an OOV error; still a sub-77 prompt with a real pad region.
         let ids = clip_token_ids(&tok, "a b").unwrap();

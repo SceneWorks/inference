@@ -312,8 +312,8 @@ mod tests {
     /// silently falling back to defaults (which is indistinguishable from a damaged download).
     #[test]
     fn knobs_malformed_sidecar_errors() {
-        let dir = std::env::temp_dir().join(format!("bernini_cfg_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("bernini_renderer.json");
         std::fs::write(&path, b"{ this is not json ]").unwrap();
         let err = BerniniKnobs::from_dir(&dir).expect_err("malformed sidecar must error");
@@ -322,7 +322,6 @@ mod tests {
             msg.contains("bernini_renderer.json"),
             "names the file: {msg}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -332,8 +331,8 @@ mod tests {
             .unwrap()
             .is_none());
         // Present + valid → Ok(Some).
-        let dir = std::env::temp_dir().join(format!("bernini_roj_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let ok = dir.join("ok.json");
         std::fs::write(&ok, br#"{"a":1}"#).unwrap();
         assert!(read_optional_json(&ok, "x").unwrap().is_some());
@@ -342,7 +341,6 @@ mod tests {
         std::fs::write(&bad, b"nope").unwrap();
         let e = read_optional_json(&bad, "who").unwrap_err().to_string();
         assert!(e.contains("bad.json") && e.contains("who"), "{e}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// F-096: a conditioning mode with no source, and a text-only mode with a source, both reject.

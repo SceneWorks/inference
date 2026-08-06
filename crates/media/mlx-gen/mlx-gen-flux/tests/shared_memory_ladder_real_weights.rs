@@ -573,18 +573,14 @@ fn run_fault(generator: &dyn Generator) -> (usize, usize, Run) {
 
 #[test]
 fn snapshot_resolver_accepts_revision_or_q4_and_returns_the_bound_tier() {
-    let root = std::env::temp_dir().join(format!(
-        "flux1-ladder-root-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root = root_tmp.path().to_path_buf();
     let revision = root.join("snapshots").join(REVISION);
     let q4 = revision.join("q4");
     std::fs::create_dir_all(&q4).unwrap();
     let canonical_q4 = std::fs::canonicalize(&q4).unwrap();
     assert_eq!(bind_q4_snapshot(&revision), canonical_q4);
     assert_eq!(bind_q4_snapshot(&q4), canonical_q4);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

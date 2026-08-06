@@ -1029,12 +1029,8 @@ mod tests {
     /// makes every field here read `full + fp16` and the assert fails.
     #[test]
     fn component_footprint_sizes_the_selected_file_not_the_whole_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "sc12397_svd_footprint_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         // Both dtype variants side by side, as the real snapshot ships them.
         for (sub, stem, full, fp16) in [
             ("unet", "diffusion_pytorch_model", 6_000_u64, 3_000_u64),
@@ -1062,8 +1058,6 @@ mod tests {
         assert_eq!(fp.text_encoder, 2_500, "image_encoder: the f32 file");
         // …so the total is the load, not the directory. A dir sum would read 13_350.
         assert_eq!(fp.text_encoder + fp.dit + fp.vae, 8_900);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A component the loader cannot resolve contributes `0`, and never errors: the footprint is a

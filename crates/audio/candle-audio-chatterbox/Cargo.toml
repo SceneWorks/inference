@@ -38,6 +38,10 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Exposes resampler work counters only in tests; production keeps the counter-free default build.
 candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The real-weight conformance test generates its reference clips with Kokoro (the sanctioned

@@ -4,11 +4,8 @@ use mlx_llm::{load_for_model, prepare_snapshot};
 
 const PROMPT: &str = "The capital of France is";
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "mlx-llm-prepare-e2e-{label}-{}",
-        std::process::id()
-    ))
+fn tmp_out(tmp: &tempfile::TempDir, label: &str) -> std::path::PathBuf {
+    tmp.path().join(format!("mlx-llm-prepare-e2e-{label}"))
 }
 
 fn greedy_request() -> TextLlmRequest {
@@ -32,8 +29,9 @@ fn assert_loads_and_generates(out_dir: &std::path::Path) {
 
 #[test]
 fn unknown_input_is_unsupported() {
-    let src = tmp_out("unknown-src");
-    let out = tmp_out("unknown-out");
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp_out(&tmp, "unknown-src");
+    let out = tmp_out(&tmp, "unknown-out");
     std::fs::create_dir_all(&src).unwrap();
     match prepare_snapshot(&PrepareSpec::dense(&src, &out)) {
         Err(core_llm::Error::Unsupported(_)) => {}
@@ -46,8 +44,9 @@ fn unknown_input_is_unsupported() {
 #[test]
 #[ignore = "needs an HF snapshot via MLX_LLM_TEST_MODEL"]
 fn hf_q4_prepare_loads_and_generates() {
+    let tmp = tempfile::tempdir().unwrap();
     let source = std::env::var("MLX_LLM_TEST_MODEL").expect("set MLX_LLM_TEST_MODEL");
-    let out = tmp_out("hf-q4");
+    let out = tmp_out(&tmp, "hf-q4");
     std::fs::remove_dir_all(&out).ok();
     let report = prepare_snapshot(&PrepareSpec::quantized(&source, &out, Quantize::Q4)).unwrap();
     assert_eq!(report.quantized, Some(Quantize::Q4));
@@ -60,10 +59,11 @@ fn hf_q4_prepare_loads_and_generates() {
 #[test]
 #[ignore = "needs an HF snapshot via MLX_LLM_TEST_MODEL"]
 fn hf_dense_passthrough_returns_source_without_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
     let source = std::path::PathBuf::from(
         std::env::var("MLX_LLM_TEST_MODEL").expect("set MLX_LLM_TEST_MODEL"),
     );
-    let out = tmp_out("hf-passthrough-out");
+    let out = tmp_out(&tmp, "hf-passthrough-out");
     std::fs::remove_dir_all(&out).ok();
     let report = prepare_snapshot(&PrepareSpec::dense(&source, &out)).unwrap();
     assert!(report.passthrough);
@@ -76,9 +76,10 @@ fn hf_dense_passthrough_returns_source_without_rewrite() {
 #[test]
 #[ignore = "needs a GGUF file or dir via MLX_LLM_GGUF_SOURCE"]
 fn gguf_dense_and_q4_prepare_load_and_generate() {
+    let tmp = tempfile::tempdir().unwrap();
     let source = std::env::var("MLX_LLM_GGUF_SOURCE").expect("set MLX_LLM_GGUF_SOURCE");
     for (label, quantize) in [("dense", None), ("q4", Some(Quantize::Q4))] {
-        let out = tmp_out(&format!("gguf-{label}"));
+        let out = tmp_out(&tmp, &format!("gguf-{label}"));
         std::fs::remove_dir_all(&out).ok();
         let spec = PrepareSpec {
             source: source.clone().into(),

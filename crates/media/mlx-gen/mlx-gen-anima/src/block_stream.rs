@@ -205,14 +205,18 @@ mod tests {
         }
     }
 
-    fn fixture(tag: &str, prefix: &str, cfg: DitConfig) -> std::path::PathBuf {
+    fn fixture(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+        prefix: &str,
+        cfg: DitConfig,
+    ) -> std::path::PathBuf {
         let hidden = cfg.hidden_size() as i32;
         let adaln = cfg.adaln_lora_dim as i32;
         let ctx = cfg.text_embed_dim as i32;
         let head = cfg.attention_head_dim as i32;
         let ff = (hidden as f32 * cfg.mlp_ratio) as i32;
-        let dir =
-            std::env::temp_dir().join(format!("anima-block-stream-{tag}-{}", std::process::id()));
+        let dir = tmp.path().join(format!("anima-block-stream-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.safetensors");
         let mut named: Vec<(String, Array)> = Vec::new();
@@ -300,7 +304,8 @@ mod tests {
     /// second half asserts.
     #[test]
     fn block_stream_drains_exactly_what_the_block_read() {
-        let path = fixture("drain", "net", cfg());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "drain", "net", cfg());
         let stream = stream(&path, "net");
         let mut view = stream.open().unwrap();
         let before = view.len();
@@ -337,7 +342,8 @@ mod tests {
     /// accumulates.
     #[test]
     fn each_window_opens_an_independent_view() {
-        let path = fixture("reopen", "net", cfg());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "reopen", "net", cfg());
         let stream = stream(&path, "net");
         let mut first = stream.open().unwrap();
         let full = first.len();
@@ -357,7 +363,8 @@ mod tests {
     /// other two.
     #[test]
     fn the_detected_checkpoint_prefix_is_carried_into_the_stream() {
-        let path = fixture("prefix", "model.diffusion_model", cfg());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "prefix", "model.diffusion_model", cfg());
         let stream = stream(&path, "model.diffusion_model");
         let mut view = stream.open().unwrap();
         stream.materialize(&mut view, 1).unwrap();
@@ -381,7 +388,8 @@ mod tests {
 
     #[test]
     fn out_of_range_blocks_are_rejected() {
-        let path = fixture("range", "net", cfg());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "range", "net", cfg());
         let stream = stream(&path, "net");
         let mut view = stream.open().unwrap();
         let err = match stream.materialize(&mut view, 2) {
@@ -400,7 +408,8 @@ mod tests {
     /// working" with nothing in the logs.
     #[test]
     fn captured_adapters_are_reinstalled_per_block() {
-        let path = fixture("adapters", "net", cfg());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "adapters", "net", cfg());
         let mut stream = stream(&path, "net");
         let view = stream.open().unwrap();
         let mut resident: Vec<Block> = (0..2)

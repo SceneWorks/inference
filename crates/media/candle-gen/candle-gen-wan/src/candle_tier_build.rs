@@ -218,10 +218,8 @@ mod tests {
         let (packed_map, packed) = pack_transformer_component(map, 4)?;
         assert_eq!(packed, 1);
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc10026_component_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc10026_component.safetensors");
         candle_gen::candle_core::safetensors::save(&packed_map, &tmp)?;
         // SAFETY: freshly written, single-reader for the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -261,7 +259,6 @@ mod tests {
             "packed-load forward cosine {cos:.6} vs dense too low"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 

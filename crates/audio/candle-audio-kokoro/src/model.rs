@@ -477,7 +477,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.pth")));
         assert!(load(&spec).is_err());
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
@@ -487,8 +488,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("kokoro-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -506,8 +507,8 @@ mod tests {
     #[test]
     fn generate_on_a_missing_snapshot_fails_cleanly() {
         // A generator over an empty dir: generate must error (no weights), never panic.
-        let dir = std::env::temp_dir().join("kokoro-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let req = GenerationRequest {
             prompt: "hi".into(),

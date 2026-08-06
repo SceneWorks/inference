@@ -388,7 +388,8 @@ mod tests {
 
     #[test]
     fn missing_path_is_unsupported() {
-        let p = std::env::temp_dir().join("core-llm-prepare-definitely-not-here-zzz");
+        let p_tmp = tempfile::tempdir().unwrap();
+        let p = p_tmp.path().to_path_buf();
         match detect_format(&p) {
             Err(Error::Unsupported(m)) => assert!(m.contains("does not exist"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),

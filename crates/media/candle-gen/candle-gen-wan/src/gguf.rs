@@ -361,14 +361,14 @@ mod tests {
     }
 
     /// Write `tensors` to a fresh `.gguf` at a unique temp path and return it.
-    fn write_gguf(tensors: &HashMap<String, QTensor>, tag: &str) -> PathBuf {
+    fn write_gguf(
+        tmp: &tempfile::TempDir,
+        tensors: &HashMap<String, QTensor>,
+        tag: &str,
+    ) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let uniq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sc12735_{tag}_{}_{}.gguf",
-            std::process::id(),
-            uniq
-        ));
+        let path = tmp.path().join(format!("sc12735_{tag}_{}.gguf", uniq));
         let refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let mut f = std::fs::File::create(&path).unwrap();
         // A minimal metadata table (the DiT config comes from `TransformerConfig`, not the GGUF here).
@@ -472,9 +472,10 @@ mod tests {
     /// dense companion. The resident-not-dense guarantee — a naive `dequantize`-at-load would fail this.
     #[test]
     fn loader_keeps_kquant_resident_and_remaps() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = gguf_cfg();
         let tensors = native_wan_tensors(&cfg);
-        let path = write_gguf(&tensors, "resident");
+        let path = write_gguf(&tmp, &tensors, "resident");
         let dit = GgufDit::open(&path, &Device::Cpu, DType::BF16).unwrap();
 
         // The native `blocks.0.self_attn.q` is reachable at the diffusers `blocks.0.attn1.to_q`.
@@ -503,10 +504,11 @@ mod tests {
     /// the sc-12735 fail-loud contract. Drop `blocks.0.self_attn.q.weight` and the diffusers lookup errors.
     #[test]
     fn loader_missing_key_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = gguf_cfg();
         let mut tensors = native_wan_tensors(&cfg);
         tensors.remove("blocks.0.self_attn.q.weight");
-        let path = write_gguf(&tensors, "missing");
+        let path = write_gguf(&tmp, &tensors, "missing");
         let dit = GgufDit::open(&path, &Device::Cpu, DType::BF16).unwrap();
         // `AdaptLinear` isn't `Debug`, so match rather than `expect_err`.
         let err = match dit.qlinear("blocks.0.attn1.to_q", cfg.dim, cfg.dim, true) {
@@ -529,9 +531,10 @@ mod tests {
     /// forward (the dequant-on-matmul path executes end-to-end).
     #[test]
     fn from_gguf_builds_fully_resident_dit_and_forwards() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = gguf_cfg();
         let tensors = native_wan_tensors(&cfg);
-        let path = write_gguf(&tensors, "full");
+        let path = write_gguf(&tmp, &tensors, "full");
         // F32 compute dtype so the CPU forward runs (CPU has no bf16 matmul); the k-quant weights stay
         // Q4_K resident regardless of the compute dtype — only the activation/sidecar dtype changes. On
         // CUDA the production path uses bf16 (DIT_DTYPE); this asserts the resident-QTensor mechanism.

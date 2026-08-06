@@ -646,8 +646,8 @@ mod tests {
                 vec!["to_q".to_string()]
             }
         }
-        let dir = std::env::temp_dir().join(format!("sc14057-meta-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let extra = [("family", "mage_flow"), ("networkType", "IGNORED")];
 
         for (kind, file) in [("lora", "a.safetensors"), ("lokr", "b.safetensors")] {
@@ -681,7 +681,6 @@ mod tests {
             );
             assert_eq!(w.metadata("rank"), Some("4"));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

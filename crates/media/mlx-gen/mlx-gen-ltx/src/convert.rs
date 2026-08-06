@@ -722,8 +722,9 @@ mod tests {
     /// FFN / `to_out` / adaLN-linear renames.
     #[test]
     fn sanitize_transformer_renames_and_drops_connector() {
+        let tmp = tempfile::tempdir().unwrap();
         let ones = |r: i32, c: i32| Array::ones::<f32>(&[r, c]).unwrap();
-        let mut w = Weights::from_file(write_tmp(&[
+        let mut w = Weights::from_file(write_tmp(&tmp, &[
             ("model.diffusion_model.transformer_blocks.0.attn1.to_out.0.weight", ones(4, 4)),
             ("model.diffusion_model.transformer_blocks.0.ff.net.0.proj.weight", ones(8, 4)),
             ("model.diffusion_model.transformer_blocks.0.ff.net.2.weight", ones(4, 8)),
@@ -756,8 +757,9 @@ mod tests {
     /// `build_connector` keeps the two connectors (prefix-stripped, raw naming) + text projection.
     #[test]
     fn connector_keeps_raw_naming() {
+        let tmp = tempfile::tempdir().unwrap();
         let ones = |r: i32, c: i32| Array::ones::<f32>(&[r, c]).unwrap();
-        let w = Weights::from_file(write_tmp(&[
+        let w = Weights::from_file(write_tmp(&tmp, &[
             ("model.diffusion_model.video_embeddings_connector.transformer_1d_blocks.0.attn1.to_out.0.weight", ones(4, 4)),
             ("model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.0.ff.net.0.proj.weight", ones(4, 4)),
             ("model.diffusion_model.transformer_blocks.0.attn1.to_q.weight", ones(4, 4)),
@@ -806,13 +808,14 @@ mod tests {
     }
 
     /// Write tensors to a unique temp safetensors file and return its path.
-    fn write_tmp(entries: &[(&str, Array)]) -> PathBuf {
+    fn write_tmp(tmp: &tempfile::TempDir, entries: &[(&str, Array)]) -> PathBuf {
         // `tag` separates the cases within a run; the pid separates two *concurrent* `cargo test`
         // processes, which share `$TMPDIR` and would otherwise rewrite each other's fixture.
         let tag: usize = entries.iter().map(|(k, _)| k.len()).sum::<usize>() + entries.len();
         let pid = std::process::id();
-        let path =
-            std::env::temp_dir().join(format!("mlx_gen_ltx_convert_test_{tag}_{pid}.safetensors"));
+        let path = tmp
+            .path()
+            .join(format!("mlx_gen_ltx_convert_test_{tag}_{pid}.safetensors"));
         Array::save_safetensors(
             entries.iter().map(|(k, v)| (*k, v)),
             None::<&HashMap<String, String>>,

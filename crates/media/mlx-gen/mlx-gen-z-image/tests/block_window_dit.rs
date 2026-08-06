@@ -92,8 +92,8 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(tag: &str, fixture: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+    fn new(tmp: &tempfile::TempDir, tag: &str, fixture: &str) -> Self {
+        let dir = tmp.path().join(format!(
             "zimage-block-window-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -171,7 +171,8 @@ fn base_model(scratch: &Scratch) -> (ZImageTransformer, Array, Array) {
 
 #[test]
 fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
-    let scratch = Scratch::new("base", BASE_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new(&tmp, "base", BASE_FIXTURE);
     let (model, x, cap) = base_model(&scratch);
     let cancel = CancelFlag::default();
 
@@ -218,7 +219,8 @@ fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
 /// boundary and is unaffected.
 #[test]
 fn a_tripped_cancel_aborts_a_windowed_forward_but_not_a_resident_one() {
-    let scratch = Scratch::new("cancel", BASE_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new(&tmp, "cancel", BASE_FIXTURE);
     let (model, x, cap) = base_model(&scratch);
 
     let cancel = CancelFlag::default();
@@ -270,7 +272,8 @@ fn a_sourceless_transformer_refuses_a_window_instead_of_running_resident() {
 /// be load-bearing, so the second half asserts that WITHOUT it the outputs diverge.
 #[test]
 fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
-    let scratch = Scratch::new("lora", BASE_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new(&tmp, "lora", BASE_FIXTURE);
     let cancel = CancelFlag::default();
     let dim = base_cfg().dim;
     let rank = 4;
@@ -346,7 +349,8 @@ fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
 /// attention budget, and both must be active in the same forward.
 #[test]
 fn the_window_composes_with_the_attention_budget() {
-    let scratch = Scratch::new("compose", BASE_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new(&tmp, "compose", BASE_FIXTURE);
     let (model, x, cap) = base_model(&scratch);
     let cancel = CancelFlag::default();
     let budget = mlx_gen::attention::AttentionBudget::from_score_elements(2048, true);
@@ -384,7 +388,8 @@ fn the_window_composes_with_the_attention_budget() {
 /// unchanged. This is the second half of the correctness risk SC-15750 left open.
 #[test]
 fn windowed_control_dit_preserves_the_hint_injection() {
-    let scratch = Scratch::new("control", CONTROL_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new(&tmp, "control", CONTROL_FIXTURE);
     let w = Weights::from_file(&scratch.file).unwrap();
     let base = ZImageTransformer::from_weights(&w, "w", control_cfg())
         .unwrap()
@@ -464,7 +469,8 @@ fn windowed_control_dit_preserves_the_hint_injection() {
 /// running a half-bounded forward with 15 resident control blocks.
 #[test]
 fn a_half_streamable_control_transformer_refuses_the_window() {
-    let scratch = Scratch::new("half", CONTROL_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new(&tmp, "half", CONTROL_FIXTURE);
     let w = Weights::from_file(&scratch.file).unwrap();
     // Base armed, control NOT armed.
     let base = ZImageTransformer::from_weights(&w, "w", control_cfg())
@@ -497,12 +503,13 @@ fn a_half_streamable_control_transformer_refuses_the_window() {
 /// or a different backward. Disarming makes that a typed refusal instead.
 #[test]
 fn a_training_mutation_disarms_the_window_rather_than_streaming_stale_weights() {
+    let tmp = tempfile::tempdir().unwrap();
     for mutate in [
         &(|m: &mut ZImageTransformer| m.cast_weights(Dtype::Bfloat16).unwrap())
             as &dyn Fn(&mut ZImageTransformer),
         &|m: &mut ZImageTransformer| m.set_sdpa_checkpoint(true, true),
     ] {
-        let scratch = Scratch::new("training", BASE_FIXTURE);
+        let scratch = Scratch::new(&tmp, "training", BASE_FIXTURE);
         let (mut model, x, cap) = base_model(&scratch);
         // Armed before the mutation...
         assert!(model
@@ -545,10 +552,11 @@ fn a_training_mutation_disarms_the_window_rather_than_streaming_stale_weights() 
 /// the second half fail, because the resident stack does not re-read the file.
 #[test]
 fn the_denoise_loop_threads_the_window_through_to_the_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::attention::AttentionBudget;
     use mlx_gen::{FlowMatchEuler, Progress};
 
-    let scratch = Scratch::new("plumbing", BASE_FIXTURE);
+    let scratch = Scratch::new(&tmp, "plumbing", BASE_FIXTURE);
     let (model, x, cap) = base_model(&scratch);
     let cancel = CancelFlag::default();
     let scheduler = FlowMatchEuler {
@@ -608,8 +616,8 @@ fn the_denoise_loop_threads_the_window_through_to_the_blocks() {
 fn the_z_image_adapter_path_never_folds_a_diff_patch_into_the_base() {
     use mlx_gen::runtime::AdapterSpec;
 
-    let dir = std::env::temp_dir().join(format!("zimage-diffpatch-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let file = dir.join("diffpatch.safetensors");
     // A ComfyUI-style diff-patch file: `.diff` / `.diff_b` keys and nothing low-rank.
     let delta = Array::from_slice(
@@ -634,7 +642,6 @@ fn the_z_image_adapter_path_never_folds_a_diff_patch_into_the_base() {
          streamed block silently diverges from its resident twin and `block_stream`'s \
          capture-and-replay is no longer faithful. Teach `ZImageBlockStream` about it first."
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// SC-15754's request plumbing reaches the DiT through **four** denoise entry points, one per
@@ -647,10 +654,11 @@ fn the_z_image_adapter_path_never_folds_a_diff_patch_into_the_base() {
 /// or the bound is half-applied for the whole of a base render.
 #[test]
 fn every_denoise_entry_point_threads_the_window_through_to_the_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::attention::AttentionBudget;
     use mlx_gen::{FlowMatchEuler, Progress};
 
-    let scratch = Scratch::new("entrypoints", CONTROL_FIXTURE);
+    let scratch = Scratch::new(&tmp, "entrypoints", CONTROL_FIXTURE);
     let w = Weights::from_file(&scratch.file).unwrap();
     let base = ZImageTransformer::from_weights(&w, "w", control_cfg())
         .unwrap()

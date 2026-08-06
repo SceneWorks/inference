@@ -780,24 +780,16 @@ pub fn registered_begin_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn spec() -> LoadSpec {
-        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        let root = ROOT.get_or_init(|| {
-            let root = std::env::temp_dir().join(format!(
-                "sc15813-mage-packed-contract-{}",
-                std::process::id()
-            ));
-            let transformer = root.join("transformer");
-            std::fs::create_dir_all(&transformer).unwrap();
-            std::fs::write(
-                transformer.join("config.json"),
-                r#"{"quantization":{"bits":4,"group_size":64}}"#,
-            )
-            .unwrap();
-            root
-        });
+    fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("sc15813-mage-packed-contract");
+        let transformer = root.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec
@@ -805,9 +797,10 @@ mod tests {
 
     #[test]
     fn every_route_has_a_distinct_conformant_contract() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut fingerprints = std::collections::BTreeSet::new();
         for id in PROVIDER_IDS {
-            let contract = provider_contract_for(id, &spec()).unwrap();
+            let contract = provider_contract_for(id, &spec(&tmp)).unwrap();
             assert!(
                 contract.conformance_errors().is_empty(),
                 "{id}: {:?}",
@@ -826,7 +819,8 @@ mod tests {
 
     #[test]
     fn candidate_domains_and_block_geometry_are_exact() {
-        let contract = contract_rl(&spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract_rl(&spec(&tmp)).unwrap();
         assert_eq!(TRANSFORMER_BLOCKS, 12);
         assert_eq!(
             contract
@@ -856,14 +850,16 @@ mod tests {
 
     #[test]
     fn t2i_and_edit_contexts_do_not_cross_authorize() {
-        let t2i = contract_rl(&spec()).unwrap();
-        let edit = contract_edit(&spec()).unwrap();
-        let t2i_context = registered_valid_fixture(&spec(), &t2i, MemoryStrategy::StagedResidency)
-            .unwrap()
-            .remove(0)
-            .context;
+        let tmp = tempfile::tempdir().unwrap();
+        let t2i = contract_rl(&spec(&tmp)).unwrap();
+        let edit = contract_edit(&spec(&tmp)).unwrap();
+        let t2i_context =
+            registered_valid_fixture(&spec(&tmp), &t2i, MemoryStrategy::StagedResidency)
+                .unwrap()
+                .remove(0)
+                .context;
         let edit_context =
-            registered_valid_fixture(&spec(), &edit, MemoryStrategy::StagedResidency)
+            registered_valid_fixture(&spec(&tmp), &edit, MemoryStrategy::StagedResidency)
                 .unwrap()
                 .remove(0)
                 .context;
@@ -875,7 +871,8 @@ mod tests {
 
     #[test]
     fn stale_fingerprint_and_resident_streaming_fail_closed() {
-        let mut eager = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut eager = spec(&tmp);
         eager.load_shape = LoadShape::EagerMaterialization;
         let contract = contract_rl(&eager).unwrap();
         assert_eq!(
@@ -886,25 +883,23 @@ mod tests {
             MemoryStrategySupport::Missing
         );
 
-        let contract = contract_rl(&spec()).unwrap();
+        let contract = contract_rl(&spec(&tmp)).unwrap();
         let mut context =
-            registered_valid_fixture(&spec(), &contract, MemoryStrategy::BoundedAttention)
+            registered_valid_fixture(&spec(&tmp), &contract, MemoryStrategy::BoundedAttention)
                 .unwrap()
                 .remove(0)
                 .context;
         context.calibration_fingerprint.push_str(":stale");
         assert!(matches!(
-            registered_safety_check(&spec(), &contract, &context),
+            registered_safety_check(&spec(&tmp), &contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
     }
 
     #[test]
     fn dense_quantized_directory_does_not_advertise_device_format_streaming() {
-        let root = std::env::temp_dir().join(format!(
-            "sc15813-mage-dense-contract-{}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
         let mut dense = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
@@ -919,14 +914,14 @@ mod tests {
             MemoryStrategySupport::Missing
         );
         assert!(!contract.lifecycle.transformer_window_materialization);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn full_edge_decode_rejects_geometry_beyond_1024() {
-        let contract = contract_rl(&spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract_rl(&spec(&tmp)).unwrap();
         let mut context =
-            registered_valid_fixture(&spec(), &contract, MemoryStrategy::BoundedDecode)
+            registered_valid_fixture(&spec(&tmp), &contract, MemoryStrategy::BoundedDecode)
                 .unwrap()
                 .remove(0)
                 .context;
@@ -946,11 +941,13 @@ mod tests {
 
     #[test]
     fn request_binding_rejects_pid_and_phase_mutation_before_or_after_configuration() {
-        let contract = contract_rl(&spec()).unwrap();
-        let context = registered_valid_fixture(&spec(), &contract, MemoryStrategy::StagedResidency)
-            .unwrap()
-            .remove(0)
-            .context;
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract_rl(&spec(&tmp)).unwrap();
+        let context =
+            registered_valid_fixture(&spec(&tmp), &contract, MemoryStrategy::StagedResidency)
+                .unwrap()
+                .remove(0)
+                .context;
 
         let assert_mutation_rejected = |mutate: fn(&mut GenerationRequest)| {
             let admission = AdmissionRegistry::new(config::MODEL_ID);

@@ -51,7 +51,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs real Wan2.2-T2V-A14B weights (WAN_T2V_14B_SNAPSHOT or HF cache) + a CUDA GPU; run with --features cuda --ignored"]
 fn wan_t2v_14b_trainer_satisfies_gen_core_contract() {
     assert_eq!(candle_gen_wan::config::MODEL_ID_T2V_14B, "wan2_2_t2v_14b");
-    let tmp = std::env::temp_dir().join("candle_wan_trainer_conformance");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp.join("data"));
     let mut profile = TrainerProfile::cheap(items, tmp.join("out"));
     // Two 14B experts at f32 (the cheap default) would be ~56 GB; train at the model's native bf16.

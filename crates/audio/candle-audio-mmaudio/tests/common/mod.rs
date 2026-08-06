@@ -167,7 +167,8 @@ pub fn vocoder_44k_source() -> WeightsSource {
 /// A placeholder base `weights` for the spec. mmaudio consumes only the five named components and
 /// ignores `spec.weights`, so this is never read.
 fn placeholder_weights() -> WeightsSource {
-    WeightsSource::Dir(std::env::temp_dir().join("mmaudio-unused-base"))
+    // Never opened, so it needs no directory at all — pointing it at `$TMPDIR` only implied one.
+    WeightsSource::Dir(std::path::PathBuf::from("mmaudio-unused-base"))
 }
 
 /// The `mmaudio_small_16k` [`LoadSpec`] with all five components staged from the required env vars.

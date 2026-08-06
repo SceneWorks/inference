@@ -1303,7 +1303,6 @@ mod parity_tests {
         Config, ZImageTransformer2DModel as StockModel,
     };
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     /// A tiny Z-Image-shaped config (`head_dim` locked to 128 by `axes_dims=[32,48,48]`): a single head
     /// at `dim=128`, 2 main layers + 1 refiner each — exercises every vendored path cheaply on CPU.
@@ -1319,23 +1318,22 @@ mod parity_tests {
         cfg
     }
 
-    struct SidecarFixture(PathBuf);
+    /// Owns its component directory outright. The hand-written `Drop` this replaces skipped a
+    /// panicking test and drew its name from a recyclable PID; the guard does neither.
+    struct SidecarFixture(tempfile::TempDir);
 
     impl SidecarFixture {
         fn new(bits: usize) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "z-image-sc16510-sidecar-{}-{bits}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("z-image-sc16510-sidecar-{bits}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
-    }
 
-    impl Drop for SidecarFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+        fn path(&self) -> &std::path::Path {
+            self.0.path()
         }
     }
 
@@ -1347,7 +1345,7 @@ mod parity_tests {
         let dense = Tensor::from_vec(values, (4, 64), &Device::Cpu)?;
         let (weight, scales, biases) = pack_mlx_affine(&dense, bits, 64)?;
         let bias = Tensor::from_vec(vec![0.25f32, -0.5, 0.75, -1.0], 4, &Device::Cpu)?;
-        let source_path = fixture.0.join("model.safetensors");
+        let source_path = fixture.path().join("model.safetensors");
         candle_gen::candle_core::safetensors::save(
             &HashMap::from([
                 ("layers.0.attention.to_q.weight".to_owned(), weight),
@@ -1361,7 +1359,7 @@ mod parity_tests {
         let source = unsafe { MmapedSafetensors::new(&source_path)? };
         let sidecars = PackedWeightSidecars::prepare_prefix_cancelable(
             &source,
-            &fixture.0,
+            fixture.path(),
             PackedConfig {
                 bits: bits as i32,
                 group_size: 64,
@@ -1714,17 +1712,14 @@ mod parity_tests {
                 Tensor::randn(0f32, 0.5f32, (out_dim, rank), &dev).unwrap(),
             );
         }
-        let tmp = std::env::temp_dir().join(format!(
-            "sc11105_install_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc11105_install.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
         let report = crate::adapters::install_additive(
             &mut adapted,
             &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
         )
         .unwrap();
-        std::fs::remove_file(&tmp).ok();
         assert_eq!(report.applied, 2, "both to_q + to_v residuals installed");
         assert!(
             report.skipped_targets.is_empty(),
@@ -1788,8 +1783,8 @@ mod parity_tests {
             "layers.99.attention.to_q.lora_B.weight".into(),
             Tensor::zeros((cfg.dim, 2), DType::F32, &dev).unwrap(),
         );
-        let tmp1 =
-            std::env::temp_dir().join(format!("sc11105_off_{}.safetensors", std::process::id()));
+        let tmp1_tmp = tempfile::tempdir().unwrap();
+        let tmp1 = tmp1_tmp.path().join("sc11105_off.safetensors");
         candle_gen::candle_core::safetensors::save(&off, &tmp1).unwrap();
         let r = crate::adapters::install_additive(
             &mut dit,
@@ -1811,8 +1806,8 @@ mod parity_tests {
                 Tensor::zeros((cfg.dim, 1), DType::F32, &dev).unwrap(),
             );
         }
-        let tmp2 =
-            std::env::temp_dir().join(format!("sc11105_loha_{}.safetensors", std::process::id()));
+        let tmp2_tmp = tempfile::tempdir().unwrap();
+        let tmp2 = tmp2_tmp.path().join("sc11105_loha.safetensors");
         candle_gen::candle_core::safetensors::save(&loha, &tmp2).unwrap();
         let r2 = crate::adapters::install_additive(
             &mut dit2,
