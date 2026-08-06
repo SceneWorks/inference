@@ -862,6 +862,82 @@ mod tests {
         );
     }
 
+    /// **An evidence record built the way the harness builds one actually serializes.**
+    ///
+    /// `MemoryEvidenceLogRecord::to_json_line` refuses a record that fails any of a dozen
+    /// validations — a malformed calibration fingerprint, a declared/observed identity mismatch, a
+    /// non-canonical engaged composition. Every one of those is a property of THIS provider's
+    /// contract, and discovering one of them from a real-weight run is discovering it after the
+    /// expensive part. This asserts the shape without weights so the sweep cannot be wasted, and it
+    /// covers both the Resident-load identity and the Sequential one, which differ.
+    #[test]
+    fn the_evidence_record_this_provider_produces_is_serializable() {
+        use mlx_gen::gen_core::{
+            MemoryBackend, MemoryEvidenceKey, MemoryEvidenceLogRecord, MemoryGeometry,
+            MemoryParityContract, MemoryParityResult, MemoryStrategyParameters,
+        };
+
+        for (policy, shape, strategy) in [
+            (
+                OffloadPolicy::Resident,
+                LoadShape::EagerMaterialization,
+                MemoryStrategy::Resident,
+            ),
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+                MemoryStrategy::BoundedTransformerResidency,
+            ),
+        ] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/sana-evidence".into()))
+                .with_offload_policy(policy)
+                .with_load_shape(shape);
+            let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+            let record = MemoryEvidenceLogRecord {
+                key: MemoryEvidenceKey {
+                    resolved_route: crate::MODEL_ID.to_owned(),
+                    backend: MemoryBackend::Mlx,
+                    tier: MemoryNumericTier {
+                        precision: spec.precision,
+                        quant: spec.quantize,
+                        component_precision_floors: &[],
+                    },
+                    load_shape: spec.load_shape,
+                    mode: mlx_gen::gen_core::MemoryMode::TextToImage,
+                    overlay: None,
+                    geometry: MemoryGeometry {
+                        width: 1024,
+                        height: 1024,
+                        batch: 1,
+                        frames: 1,
+                        reference_count: 0,
+                    },
+                    strategy,
+                    engaged_composition: contract.engaged_composition(strategy),
+                    parameters: MemoryStrategyParameters::default(),
+                },
+                declared_calibration: MemoryCalibrationIdentity::new(
+                    calibration_fingerprint(spec.offload_policy),
+                    spec.load_shape,
+                ),
+                observed_calibration: contract.calibration.clone().unwrap(),
+                predicted_peak_bytes: 5_000_000_000,
+                observed_peak_bytes: 5_000_000_000,
+                inference_revision: "a".repeat(40),
+                sceneworks_revision: "b".repeat(40),
+                model_revision: "c".repeat(40),
+                model_inventory_sha256: "d".repeat(64),
+                harness_version: "inference-sana-memory-ladder-v1".to_owned(),
+                output_sha256: "e".repeat(64),
+                parity: MemoryParityContract::Exact,
+                parity_result: MemoryParityResult::NotRun,
+            };
+            record.to_json_line().unwrap_or_else(|error| {
+                panic!("{policy:?}/{shape:?} evidence record must serialize: {error}")
+            });
+        }
+    }
+
     #[test]
     fn decode_domain_and_rejection_set_are_pinned() {
         assert_eq!(DECODE_TILE_EDGES, &[512, 384, 256, 192]);
