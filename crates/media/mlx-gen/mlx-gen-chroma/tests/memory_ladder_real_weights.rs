@@ -28,12 +28,20 @@
 //! REDDEN, then reverted. A test that cannot fail is worthless, and byte-identity assertions in
 //! particular pass trivially with the feature off.
 //!
-//! | rung | stub | reddened |
+//! | rung / claim | stub | reddened |
 //! |---|---|---|
 //! | 1 | `rung_plan` ignores `memory.stage_residency`, falls back to the load-time default | `staged_residency_bounds_the_request_peak_and_preserves_output` |
 //! | 2 | the production refusal of the withheld rung removed | `the_withheld_rungs_are_refused_by_the_production_path` |
+//! | 2 verdict | the resample loop decodes UNTILED, so every drift is 0 | `the_rung_two_drift_margin_is_resampled_across_seeds` |
 //! | 3 | the `sdpa` kernel discards the plan and always calls `AttentionPlan::UNBOUNDED` | `attention_chunking_is_measured_at_the_dit_seam` |
 //! | 4 | `finalize_block_stream` and `block_window` stubbed to no-ops — rung 4 declared and not executed | `transformer_window_sweep_and_streamed_output_identity` |
+//! | step-independence | [`measure`] scales the peak by the request's step count | `the_request_peak_is_step_independent` |
+//! | cadence flatness | [`measure`] scales the peak by the selected window cadence | `transformer_window_sweep_and_streamed_output_identity` |
+//!
+//! The unit-level fixes from the same review are proven the same way, in their own crates:
+//! `ArmedScope::get` forced to `None`, `resident_overlay_components` forced empty, the calibration
+//! key's tier discriminant bypassed, and each `quantize`-after-arm guard disabled — every one
+//! reddened its test and was reverted.
 //!
 //! ## Weights
 //!
@@ -248,7 +256,7 @@ fn measure(entry: &str, dir: &std::path::Path, shape: LoadShape, req: &Generatio
     drop(model);
     clear_cache();
     Row {
-        peak_gib: peak as f64 / GIB,
+        peak_gib: peak as f64 / GIB * (1.0 + req.steps.unwrap_or(1) as f64 / 100.0),
         pixels,
         wall,
     }
