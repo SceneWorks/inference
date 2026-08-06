@@ -311,10 +311,15 @@ expected_files = ["pid_flux_2kto4k.safetensors"]
 # The lightx2v 8-step Lightning distillation LoRAs for T2I and Edit-2511. Only the one file each
 # suite loads is fetched (~0.85 GB apiece), not the repos' full variant matrices.
 #
-# These resolve through MLX_GEN_MODELS_ROOT + a HARD-CODED `models--<org>--<repo>/snapshots/<rev>`
-# layout inside the tests, not from their own variable, so the lane derives the path from the models
-# root and the revision below rather than carrying a second repository variable that could drift out
-# of agreement with this pin.
+# Neither carries a repository variable of its own. The LANE derives
+# `$MLX_GEN_MODELS_ROOT/models--<org>--<repo>/snapshots/<rev>` from the revision pinned below,
+# exports it as the environment name in this record via `$GITHUB_ENV`, and verifies THAT dir with
+# `ensure_model_snapshot.py`; the tests read the variable and fail loudly if it points at a file
+# that is not there. Deriving the dir from this pin is what keeps the revision CI verifies and the
+# revision the tests actually load identical; a second repository variable could only drift from it.
+#
+# No test hard-codes a revision. With the variable unset (local dev) both resolution paths scan
+# `snapshots/` and take the first entry in sorted order, which is deterministic but is NOT this pin.
 key = "qwen-image-lightning"
 repository = "lightx2v/Qwen-Image-Lightning"
 revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"

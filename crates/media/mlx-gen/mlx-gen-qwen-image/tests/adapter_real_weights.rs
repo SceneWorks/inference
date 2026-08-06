@@ -31,14 +31,28 @@ fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/golden")
 }
 
-/// Locate a file inside an HF-cache repo's `snapshots/<hash>/` dir (the first snapshot that has it).
+/// Locate `filename` in the PINNED lightx2v snapshot dir named by `env`, else in the first cached
+/// `snapshots/<hash>/` under `MLX_GEN_MODELS_ROOT`.
 ///
-/// The snapshot hash is NOT pinned here — it comes from whatever the operator provisioned under
-/// `MLX_GEN_MODELS_ROOT` (`release/real-weight-models.toml` is what pins it, and the lane derives
-/// the directory from that revision). `read_dir` order is arbitrary, so the candidates are sorted:
-/// on a box holding two revisions of the same repo the resolution would otherwise vary run to run.
-/// Callers print the resolved path, which is the only record of WHICH file a measurement came from.
-fn hf_cache_file(repo_dir: &str, filename: &str) -> Option<PathBuf> {
+/// `env` wins when set, and that is the CI contract rather than a convenience. The lane derives
+/// `<MLX_GEN_MODELS_ROOT>/<repo_dir>/snapshots/<rev>` from the revision pinned in
+/// `release/real-weight-models.toml`, exports it as `QWEN_LIGHTNING_SNAPSHOT` /
+/// `QWEN_EDIT_LIGHTNING_SNAPSHOT` through `$GITHUB_ENV`, and verifies THAT dir with
+/// `ensure_model_snapshot.py`. Without the override a lane can verify the pin and then load a
+/// different revision that happens to be cached beside it (sc-17284) — the same hazard
+/// `lightning_render_real_weights::lightx2v_file` documents, resolved the same way, so both steps
+/// of one job resolve the same LoRA by the same rule. Set-but-missing is a hard error, never a
+/// silent fall back to an unpinned sibling.
+///
+/// Unpinned (local dev, variable unset) the candidates are scanned and SORTED, so a box holding two
+/// revisions at least resolves the same one run to run — but that is NOT the pin. Callers print the
+/// resolved path, which is the only record of WHICH file a measurement came from.
+fn hf_cache_file(env: &str, repo_dir: &str, filename: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var(env) {
+        let p = PathBuf::from(dir).join(filename);
+        assert!(p.exists(), "{env} is set but {} is missing", p.display());
+        return Some(p);
+    }
     let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
     let snaps = PathBuf::from(home).join(format!("{repo_dir}/snapshots"));
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(&snaps)
@@ -51,23 +65,34 @@ fn hf_cache_file(repo_dir: &str, filename: &str) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
-/// The cached lightx2v Lightning LoRAs to probe — the 8-step T2I and Edit-2511 variants (the 4-step
-/// variants share the identical per-block key structure). Skips any that aren't cached.
-fn lightning_loras() -> Vec<(&'static str, PathBuf)> {
-    let mut v = Vec::new();
-    if let Some(p) = hf_cache_file(
+/// The lightx2v Lightning LoRAs to probe — the 8-step T2I and Edit-2511 variants (the 4-step
+/// variants share the identical per-block key structure). `(label, pinned-snapshot-dir variable,
+/// HF-cache repo dir, filename)`; both variables are exported by the lane from the manifest pin.
+const LIGHTNING_LORAS: [(&str, &str, &str, &str); 2] = [
+    (
+        "qwen-image-lightning-8step",
+        "QWEN_LIGHTNING_SNAPSHOT",
         "models--lightx2v--Qwen-Image-Lightning",
         "Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors",
-    ) {
-        v.push(("qwen-image-lightning-8step", p));
-    }
-    if let Some(p) = hf_cache_file(
+    ),
+    (
+        "qwen-image-edit-2511-lightning-8step",
+        "QWEN_EDIT_LIGHTNING_SNAPSHOT",
         "models--lightx2v--Qwen-Image-Edit-2511-Lightning",
         "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
-    ) {
-        v.push(("qwen-image-edit-2511-lightning-8step", p));
-    }
-    v
+    ),
+];
+
+/// Resolve every entry of `LIGHTNING_LORAS`, dropping any that is neither pinned nor cached. The
+/// caller asserts the FULL set came back, so an absent file names itself instead of quietly
+/// shrinking the gate to whatever happened to resolve.
+fn lightning_loras() -> Vec<(&'static str, PathBuf)> {
+    LIGHTNING_LORAS
+        .iter()
+        .filter_map(|(label, env, repo_dir, filename)| {
+            hf_cache_file(env, repo_dir, filename).map(|p| (*label, p))
+        })
+        .collect()
 }
 
 /// Qwen-Image's transformer depth, and the per-block adapter targets the host map reaches — the
@@ -103,7 +128,11 @@ const LIGHTNING_TRAINED_MODULES: [&str; 12] = [
 /// sc-17518 — this asserted `applied == 840` from sc-2909 until 2026-08. That number is the HOST
 /// map's target count (`60 x 14`, what `routing_map_covers_full_fork_surface` gates), never a
 /// measured application: the published files carry `60 x 12 = 720`, with `unmatched_paths` empty.
-/// Evidence, all gathered against the pinned revisions in `release/real-weight-models.toml`:
+///
+/// Evidence, all gathered against the pinned revisions in `release/real-weight-models.toml` — and
+/// the resolution below now HONORS that pin (`hf_cache_file` prefers the lane-exported
+/// `QWEN_LIGHTNING_SNAPSHOT` / `QWEN_EDIT_LIGHTNING_SNAPSHOT`), so the numbers keep describing the
+/// file the assertion measures even on a box that later caches a second revision beside it:
 ///
 /// * `Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors` @ `e74da8d4` has 2160 tensors —
 ///   60 blocks x 12 modules x {`lora_down.weight`, `lora_up.weight`, `alpha`}. No modulation stems.
@@ -124,9 +153,16 @@ const LIGHTNING_TRAINED_MODULES: [&str; 12] = [
 #[ignore = "needs real Qwen-Image weights + the cached lightx2v Lightning LoRAs"]
 fn lightning_loras_apply_cleanly() {
     let loras = lightning_loras();
-    assert!(
-        !loras.is_empty(),
-        "no cached Lightning LoRAs found — download e.g. lightx2v/Qwen-Image-Lightning"
+    // Not a floor: sc-17518 requires BOTH published surfaces to be measured, and a `!is_empty()`
+    // check would report `1 passed` off the T2I file alone if the Edit-2511 one were absent.
+    let resolved: Vec<&str> = loras.iter().map(|(label, _)| *label).collect();
+    let expected: Vec<&str> = LIGHTNING_LORAS.iter().map(|(label, ..)| *label).collect();
+    assert_eq!(
+        resolved, expected,
+        "every pinned Lightning LoRA must be measured, but only {resolved:?} resolved — set \
+         QWEN_LIGHTNING_SNAPSHOT / QWEN_EDIT_LIGHTNING_SNAPSHOT to the snapshot dirs for the \
+         revisions pinned in release/real-weight-models.toml, or cache both repos under \
+         MLX_GEN_MODELS_ROOT",
     );
     let expected_applied = QWEN_BLOCKS * LIGHTNING_TRAINED_MODULES.len();
     for (label, path) in loras {

@@ -1532,8 +1532,12 @@ jobs:
       # asserted `applied == 840` — the HOST map's target count, never a measured application. Both
       # pinned lightx2v files carry 60 x 12 = 720 with zero unmatched (no img/txt modulation is
       # trained, in any published Lightning release), so the assertion now pins the FILE's surface
-      # per module class. It is the only step here that reads MLX_GEN_MODELS_ROOT: the test resolves
-      # both LoRAs from it, and fails loudly (never skips) when it is unset.
+      # per module class. It is the only step here that needs a LoRA: it resolves both from the
+      # QWEN_LIGHTNING_SNAPSHOT / QWEN_EDIT_LIGHTNING_SNAPSHOT dirs the materialize step derived
+      # from the manifest pin and exported through $GITHUB_ENV — the SAME dirs
+      # `ensure_model_snapshot.py` verified, so the gate cannot measure a revision merely cached
+      # beside the pinned one (sc-17284). It asserts BOTH resolved, and fails loudly (never skips)
+      # if either file is absent.
       - name: Run Qwen-Image adapter-surface gates (golden-free)
         run: |
           set -o pipefail
