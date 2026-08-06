@@ -1566,8 +1566,8 @@ jobs:
     #   sequential   102 + 101 + 116 + 114 = 433s block residency             = 173s
     #   lightning     23 + 21        =  44s       adapter (golden-free) 0 + 1 =   1s
     #   preview fit (sc-17515, measured 2026-08-06, same box)           75-217s
-    #   compiled-glue A/B (sc-17513, measured 2026-08-06, same box)    224-237s
-    #                                             TOTAL COMPUTE   = 1035-1190s (17.3-19.8 min)
+    #   compiled-glue A/B (sc-17513, measured 2026-08-06, same box)    225-244s
+    #                                             TOTAL COMPUTE   = 1036-1197s (17.3-20.0 min)
     # The cap is 90, not ~25, because only the 17-20 minutes above is compute: the rest is the
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
@@ -1592,8 +1592,8 @@ jobs:
     # test transfers no bytes the lane did not already pull.
     #
     # sc-17513 added the compiled-glue A/B row, which is NOT inside anyone's rounding: MEASURED
-    # 2026-08-06 on nax-macos over two runs, weights resident — T2I 55-59s + Edit 170-178s =
-    # 224-237s. The Edit arm dominates because it times 16 warm forwards over an 8192-token
+    # 2026-08-06 on nax-macos over three runs, weights resident — T2I 55-59s + Edit 170-185s =
+    # 225-244s. The Edit arm dominates because it times 16 warm forwards over an 8192-token
     # dual-latent sequence. The cap stays 90 for the same reason every row above kept it there: it
     # is the materialization budget, and these two tests transfer no bytes this lane did not
     # already pull. Even at the top of the range, 90 minutes is ~4.5x the warm compute, which
@@ -1880,8 +1880,8 @@ jobs:
       # at a time rather than together: a single invocation of the `perf` binary would hold 38 GiB
       # (T2I bf16) and 20 GiB (Edit q8) of weights live in one process.
       #
-      # MEASURED 2026-08-06 on nax-macos with both tiers resident, over two runs: T2I 55-59s, Edit
-      # 170-178s = 224-237s of test time (peak RSS 40.8 GB and 21.7 GB respectively). That is +4 min
+      # MEASURED 2026-08-06 on nax-macos with both tiers resident, over three runs: T2I 55-59s, Edit
+      # 170-185s = 225-244s of test time (peak RSS 40.8 GB and 21.7 GB respectively). That is +4 min
       # on this job's 736s of compute; `timeout-minutes: 90` is sized by the ~131 GiB first-run
       # materialization budget, not by compute, so it is unchanged — see the job header.
       - name: Run Qwen-Image compiled-glue vs eager per-step A/B
