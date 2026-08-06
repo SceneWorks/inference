@@ -95,9 +95,8 @@ fn packed_split_files(tmp: &tempfile::TempDir, bits: i32) -> PathBuf {
     root
 }
 
-fn load_packed(bits: i32) -> AnimaComponents {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = packed_split_files(&tmp, bits);
+fn load_packed(tmp: &tempfile::TempDir, bits: i32) -> AnimaComponents {
+    let root = packed_split_files(tmp, bits);
     AnimaComponents::load(&WeightsSource::Dir(root), Variant::Base).expect("load packed components")
 }
 
@@ -132,10 +131,11 @@ fn assert_dit_is_packed(c: &mut AnimaComponents, bits: i32) {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots; SLOW (packs a 3.9 GB DiT)"]
 fn packed_dit_lora_is_additive_over_packed_codes() {
+    let tmp = tempfile::tempdir().unwrap();
     let lw = Weights::from_file(style_lora()).expect("style LoRA");
 
     for bits in [4, 8] {
-        let mut c = load_packed(bits);
+        let mut c = load_packed(&tmp, bits);
         assert_dit_is_packed(&mut c, bits);
 
         // Capture the PACKED base forward AND the packed triple before injection. Force-eval: the
@@ -208,7 +208,7 @@ fn packed_dit_lora_is_additive_over_packed_codes() {
         // MUTATION: at scale 0 the residual vanishes, so the forward must return to the packed base
         // exactly. If this does not hold, `y_base` was not really the pre-injection packed forward and
         // the assertion above is measuring nothing.
-        let mut c0 = load_packed(bits);
+        let mut c0 = load_packed(&tmp, bits);
         let y0_base = c0
             .dit
             .adaptable_mut(DIT_Q_PATH)
@@ -246,7 +246,7 @@ fn packed_dit_lokr_is_structured_while_dense_conditioner_stays_materialized() {
     let tmp = tempfile::tempdir().unwrap();
     let lokr = synth_lokr(&tmp);
     let bits = 4;
-    let mut c = load_packed(bits);
+    let mut c = load_packed(&tmp, bits);
     assert_dit_is_packed(&mut c, bits);
 
     // The converter keeps the bundled conditioner dense (sc-10517 policy) — verify, don't assume.

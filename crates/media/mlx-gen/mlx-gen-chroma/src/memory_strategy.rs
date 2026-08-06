@@ -955,8 +955,8 @@ mod tests {
     /// A snapshot root whose `transformer/config.json` declares a packed width — the discriminant
     /// `production_calibration_fingerprint` keys the measured tier on. `None` writes a dense tier
     /// (no `quantization` marker), which is what a `bf16` tier looks like on disk.
-    fn tier_root(tag: &str, bits: Option<i32>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
+    fn tier_root(tmp: &tempfile::TempDir, tag: &str, bits: Option<i32>) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
             "chroma-tier-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -980,6 +980,7 @@ mod tests {
 
     #[test]
     fn every_entry_publishes_the_same_ladder_and_is_internally_coherent() {
+        let tmp = tempfile::tempdir().unwrap();
         for provider in [
             crate::CHROMA1_HD_ID,
             crate::CHROMA1_BASE_ID,
@@ -1009,7 +1010,7 @@ mod tests {
         }
         // Sibling entries must not be Verified by sharing code: only the measured entry, at the
         // measured tier, carries a production calibration identity.
-        let measured = tier_root("measured", Some(CALIBRATED_QUANT_BITS));
+        let measured = tier_root(&tmp, "measured", Some(CALIBRATED_QUANT_BITS));
         assert_eq!(
             production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&measured)),
             Some(MEMORY_CALIBRATION_FINGERPRINT)
@@ -1022,7 +1023,8 @@ mod tests {
 
     #[test]
     fn the_calibration_key_is_exact_and_every_other_axis_fails_closed() {
-        let measured = tier_root("exact", Some(CALIBRATED_QUANT_BITS));
+        let tmp = tempfile::tempdir().unwrap();
+        let measured = tier_root(&tmp, "exact", Some(CALIBRATED_QUANT_BITS));
         let exact = tier_spec(&measured);
         assert_eq!(
             production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &exact),
@@ -1034,7 +1036,7 @@ mod tests {
         // with `quantize == None`: without this discriminant a q8 or bf16 request would inherit the
         // q4-measured key and could select an optimized fit on evidence never taken for it.
         for (tag, bits) in [("q8", Some(8)), ("bf16", None)] {
-            let other = tier_root(tag, bits);
+            let other = tier_root(&tmp, tag, bits);
             assert!(
                 production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&other))
                     .is_none(),
@@ -1098,14 +1100,8 @@ mod tests {
     /// under-predict peak by the whole student plus its caption encoder.
     #[test]
     fn a_resident_pid_overlay_is_priced_and_a_sequential_one_is_not() {
-        let root = std::env::temp_dir().join(format!(
-            "chroma-overlay-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let student = root.join("pid/student.safetensors");
         let gemma = root.join("gemma");
         tiny_safetensors(&student, 64);
@@ -1184,7 +1180,6 @@ mod tests {
         assert!(resident_overlay_components(&sequential_spec())
             .unwrap()
             .is_empty());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

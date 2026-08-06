@@ -223,14 +223,14 @@ fn viability_adapter_path(tmp: &tempfile::TempDir) -> PathBuf {
 
 /// Train a real LoRA on Raw over `images`/`caption` for `steps` steps at `rank` (512², grad-checkpointed).
 fn train_concept_lora(
+    tmp: &tempfile::TempDir,
     raw: &std::path::Path,
     images: &[PathBuf],
     caption: &str,
     rank: u32,
     steps: u32,
 ) -> PathBuf {
-    let tmp = tempfile::tempdir().unwrap();
-    let final_adapter = viability_adapter_path(&tmp);
+    let final_adapter = viability_adapter_path(tmp);
     let staging =
         atomic_cache::prepare_staging(&final_adapter).expect("prepare viability adapter staging");
     let mut trainer =
@@ -305,6 +305,7 @@ fn render_turbo_prompt(turbo: &std::path::Path, adapters: Vec<AdapterSpec>, prom
 #[test]
 #[ignore = "viability (sc-7579): real Raw+Turbo + a Mac; ~160-step train — run as its own process"]
 fn raw_lora_visibly_shifts_turbo_toward_concept() {
+    let tmp = tempfile::tempdir().unwrap();
     let (Some(raw), Some(turbo)) = (
         snapshot("KREA_RAW_DIR", "models--krea--Krea-2-Raw"),
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
@@ -313,9 +314,7 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         return;
     };
 
-    let tmp_guard = tempfile::tempdir().unwrap();
-    let tmp = tmp_guard.path().to_path_buf();
-    let images = write_solid_images(&tmp, 5, [230, 30, 230]);
+    let images = write_solid_images(tmp.path(), 5, [230, 30, 230]);
     let steps: u32 = std::env::var("KREA_LORA_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -325,7 +324,14 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
 
-    let adapter = train_concept_lora(&raw, &images, "a solid magenta color field", 16, steps);
+    let adapter = train_concept_lora(
+        &tmp,
+        &raw,
+        &images,
+        "a solid magenta color field",
+        16,
+        steps,
+    );
     // A PERMISSIVE prompt: the few-step distilled Turbo adheres strongly to prompt, so it resists a
     // LoRA that tries to OVERRIDE a strongly-described scene (e.g. "snowy mountain" stays a mountain);
     // a loosely-constrained backdrop gives the learned concept room to express, which is the fair

@@ -674,8 +674,11 @@ mod tests {
     /// A snapshot with the trunk as well as the two block stacks, so a whole
     /// [`crate::transformer::ChromaTransformer`] can be built without the 14 GB tier. Shapes are
     /// nominal — `from_weights` validates presence and the pruned-adaLN invariant, not dimensions.
-    fn trunk_fixture(tag: &str) -> (std::path::PathBuf, ChromaTransformerConfig) {
-        let path = fixture(tag);
+    fn trunk_fixture(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+    ) -> (std::path::PathBuf, ChromaTransformerConfig) {
+        let path = fixture(tmp, tag);
         let mut cfg = cfg();
         cfg.approximator_layers = 2;
         cfg.approximator_hidden_dim = 16;
@@ -737,7 +740,8 @@ mod tests {
     /// streamed block was rebuilt dense from a snapshot the caller believes it quantized.
     #[test]
     fn quantizing_after_the_stream_is_armed_is_refused() {
-        let (path, cfg) = trunk_fixture("quant-order");
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, cfg) = trunk_fixture(&tmp, "quant-order");
         let build = || {
             let view = mlx_gen::weights::Weights::from_file(&path).unwrap();
             crate::transformer::ChromaTransformer::from_weights(view, cfg)

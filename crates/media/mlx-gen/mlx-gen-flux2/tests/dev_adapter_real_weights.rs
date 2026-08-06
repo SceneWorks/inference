@@ -103,9 +103,8 @@ fn lora_targets() -> Vec<String> {
 }
 
 /// Probe each target's logical `[out, in]` on the (packed) real dev transformer.
-fn probe_shapes(targets: &[String]) -> Vec<(String, i32, i32)> {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut probe = load_transformer_dev(&prequantized_dev_snapshot(&tmp)).unwrap();
+fn probe_shapes(tmp: &tempfile::TempDir, targets: &[String]) -> Vec<(String, i32, i32)> {
+    let mut probe = load_transformer_dev(&prequantized_dev_snapshot(tmp)).unwrap();
     targets
         .iter()
         .map(|p| {
@@ -183,9 +182,14 @@ fn write_lokr(tmp: &tempfile::TempDir, shapes: &[(String, i32, i32)]) -> PathBuf
     path
 }
 
-fn render(adapter: Option<(&Path, AdapterKind, f32)>, size: u32, steps: u32, seed: u64) -> Vec<u8> {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut spec = LoadSpec::new(WeightsSource::Dir(prequantized_dev_snapshot(&tmp)));
+fn render(
+    tmp: &tempfile::TempDir,
+    adapter: Option<(&Path, AdapterKind, f32)>,
+    size: u32,
+    steps: u32,
+    seed: u64,
+) -> Vec<u8> {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(prequantized_dev_snapshot(tmp)));
     if let Some((path, kind, scale)) = adapter {
         spec = spec.with_adapters(vec![AdapterSpec {
             path: path.to_path_buf(),
@@ -306,7 +310,7 @@ fn dev_lora_and_lokr_visibly_affect_render() {
         .unwrap_or(6);
 
     let targets = lora_targets();
-    let shapes = probe_shapes(&targets);
+    let shapes = probe_shapes(&tmp, &targets);
     println!(
         "probed {} dev targets across double {{0,3,7}} + single {{0,12,24,36,47}}",
         shapes.len()
@@ -314,9 +318,9 @@ fn dev_lora_and_lokr_visibly_affect_render() {
     let lora = write_lora(&tmp, &shapes);
     let lokr = write_lokr(&tmp, &shapes);
 
-    let base = render(None, size, steps, 0);
+    let base = render(&tmp, None, size, steps, 0);
 
-    let lora_px = render(Some((&lora, AdapterKind::Lora, 1.0)), size, steps, 0);
+    let lora_px = render(&tmp, Some((&lora, AdapterKind::Lora, 1.0)), size, steps, 0);
     let lora_effect = px_gt8(&lora_px, &base);
     println!("dev LoRA effect vs no-adapter: {lora_effect:.2}% px>8");
     assert!(
@@ -324,7 +328,7 @@ fn dev_lora_and_lokr_visibly_affect_render() {
         "dev LoRA had no visible effect ({lora_effect:.2}% px>8) — silently dropped?"
     );
 
-    let lokr_px = render(Some((&lokr, AdapterKind::Lokr, 1.0)), size, steps, 0);
+    let lokr_px = render(&tmp, Some((&lokr, AdapterKind::Lokr, 1.0)), size, steps, 0);
     let lokr_effect = px_gt8(&lokr_px, &base);
     println!("dev LoKr effect vs no-adapter: {lokr_effect:.2}% px>8");
     assert!(
@@ -333,7 +337,7 @@ fn dev_lora_and_lokr_visibly_affect_render() {
     );
 
     // A scale-0 LoRA is a bit-exact no-op (the residual is multiplied by 0).
-    let zero = render(Some((&lora, AdapterKind::Lora, 0.0)), size, steps, 0);
+    let zero = render(&tmp, Some((&lora, AdapterKind::Lora, 0.0)), size, steps, 0);
     let differ = base.iter().zip(&zero).filter(|(a, b)| a != b).count();
     println!("dev scale-0 LoRA no-op: {differ} px differ from the no-adapter render");
     assert_eq!(differ, 0, "scale-0 adapter must be a bit-exact no-op");
