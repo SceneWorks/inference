@@ -330,8 +330,8 @@ mod tests {
     /// [`crate::model::load_fast`]'s existence check finds it.
     #[test]
     fn merge_marker_writes_named_provenance_json() {
-        let tmp = std::env::temp_dir().join(format!("sn-marker-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let lora = std::path::PathBuf::from("/some/where").join(DISTILL_LORA_FILE);
         write_merge_marker(&tmp, &lora, 4, 296).unwrap();
         let marker = tmp.join(DISTILL_MERGED_MARKER);
@@ -349,6 +349,5 @@ mod tests {
         assert!(std::fs::read_to_string(&marker)
             .unwrap()
             .contains("\"tier\": \"bf16\""));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

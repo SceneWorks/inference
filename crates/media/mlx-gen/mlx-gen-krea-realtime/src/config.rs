@@ -747,8 +747,8 @@ mod tests {
     fn from_model_dir_overlays_present_ar_keys_and_keeps_defaults_for_absent() {
         // A config.json carrying a *subset* of the AR knobs. Keys present in the JSON must overlay the
         // shipped defaults; keys absent from the JSON must retain them.
-        let root = std::env::temp_dir().join(format!("krea_realtime_cfg_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let json = r#"{
             "local_attn_size": 6,
             "sink_size": 1,
@@ -774,8 +774,6 @@ mod tests {
         // The Wan half is forced to the dense 2.1 identity regardless of what the JSON implies.
         assert_eq!(cfg.wan.model_version, "2.1");
         assert!(!cfg.wan.dual_model);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -805,9 +803,8 @@ mod tests {
         cfg.ar.context_noise = 0.25;
         cfg.ar.denoising_step_list = vec![900, 500, 0];
 
-        let root =
-            std::env::temp_dir().join(format!("krea_realtime_tojson_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::write(
             root.join("config.json"),
             serde_json::to_string_pretty(&cfg.to_json()).unwrap(),
@@ -828,17 +825,14 @@ mod tests {
         // A bf16 tier emits no `quantization` block at all (so a dense snapshot never reads as packed).
         let dense = KreaRealtimeConfig::krea_realtime_14b();
         assert!(dense.to_json().get("quantization").is_none());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn from_model_dir_without_config_json_is_the_shipped_preset() {
         // No config.json at all → the untouched shipped preset.
-        let root = std::env::temp_dir().join(format!("krea_realtime_nocfg_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let cfg = KreaRealtimeConfig::from_model_dir(&root).unwrap();
         assert_eq!(cfg, KreaRealtimeConfig::krea_realtime_14b());
-        std::fs::remove_dir_all(&root).ok();
     }
 }

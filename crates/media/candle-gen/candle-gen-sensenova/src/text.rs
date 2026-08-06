@@ -210,10 +210,8 @@ mod tests {
     use super::*;
 
     /// A pid-scoped scratch dir (this crate carries no `tempfile` dep — see `quant.rs`).
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("sensenova-tok-{}-{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn scratch(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+        let dir = tmp.path().join(format!("sensenova-tok-{}", tag));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -228,7 +226,8 @@ mod tests {
     /// `None` (a loud error at the call site, never a wrong-model tokenizer).
     #[test]
     fn resolve_tokenizer_path_prefers_own_then_borrows_a_sibling_tier() {
-        let snap = scratch("resolve");
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = scratch(&tmp, "resolve");
 
         // q4 has its own → own wins even with a sibling present.
         touch(&snap.join("q4/tokenizer.json"));
@@ -246,7 +245,7 @@ mod tests {
         );
 
         // No sibling carries one → None (a flat/torn snapshot with nothing to borrow).
-        let bare = scratch("bare");
+        let bare = scratch(&tmp, "bare");
         std::fs::create_dir_all(bare.join("q4")).unwrap();
         assert_eq!(resolve_tokenizer_path(&bare.join("q4")), None);
     }

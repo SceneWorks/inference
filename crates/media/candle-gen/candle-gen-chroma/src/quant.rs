@@ -137,6 +137,7 @@ mod tests {
     /// biased forward must reproduce the affine grid (+ bias) bit-exactly.
     #[test]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim, 64);
@@ -162,8 +163,7 @@ mod tests {
             Tensor::zeros((out_dim,), DType::F32, &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9409_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9409_detect.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -188,7 +188,6 @@ mod tests {
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -197,6 +196,7 @@ mod tests {
     /// trips through the packed forward, proving the group size is honored end to end.
     #[test]
     fn linear_detect_gs_threads_group_size() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (32usize, 64usize);
         // group 32 fixture: 2 groups per row.
@@ -237,8 +237,7 @@ mod tests {
             Tensor::from_vec(biases, (out_dim, gpr), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9409_gs_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9409_gs.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -254,7 +253,6 @@ mod tests {
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

@@ -318,12 +318,18 @@ mod tests {
         Ok(())
     }
 
-    /// The im2col chunker ([`chunked_conv2d_budgeted`]) is bit-identical to a plain `conv2d` across every
-    /// kernel/pad/stride the Wan VAE uses — the `CausalConv3d` 3×3 "same" tap (pad 1, stride 1), the z16
-    /// encoder `SpatialDown` (pad 0, stride 2; its asymmetric pad is applied by the caller), and the 1×1
-    /// taps (pad 0, stride 1) — with budgets that force each internal path: the single-frame output-row
-    /// fallback, the merged-batch split, and the at-budget single pass (sc-12773 / the SeedVR2 sc-10083
-    /// pattern). This is the mutation witness: an off-by-one in the row/batch stitch craters `max_err`.
+    /// The im2col chunker ([`chunked_conv2d_budgeted`]) matches a plain `conv2d` to `1e-4` max-abs across
+    /// every kernel/pad/stride the Wan VAE uses — the `CausalConv3d` 3×3 "same" tap (pad 1, stride 1), the
+    /// z16 encoder `SpatialDown` (pad 0, stride 2; its asymmetric pad is applied by the caller), and the
+    /// 1×1 taps (pad 0, stride 1) — with budgets that force each internal path: the single-frame
+    /// output-row fallback, the merged-batch split, and the at-budget single pass (sc-12773 / the SeedVR2
+    /// sc-10083 pattern). This is the mutation witness: an off-by-one in the row/batch stitch craters
+    /// `max_err`.
+    ///
+    /// A **tolerance, not bit-identity**, and deliberately so (SC-15943): banding the output rows changes
+    /// the im2col GEMM's `M`, which lets the BLAS pick a different accumulation order. Only the
+    /// at-or-below-budget path is exact — `chunked_conv2d_below_budget_is_single_pass` asserts that one
+    /// with `assert_eq!` because it runs the identical single `conv2d` call.
     #[test]
     fn chunked_conv2d_matches_plain_conv2d() -> Result<()> {
         let dev = Device::Cpu;

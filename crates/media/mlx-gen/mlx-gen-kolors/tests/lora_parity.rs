@@ -102,8 +102,8 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_inference_lora_scale0_is_base_and_scale1_has_effect() {
-    let tmp = std::env::temp_dir().join(format!("kolors_lora_parity_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let adapter = train_lora(&tmp);
 
     let spec = |scale: f32| AdapterSpec {

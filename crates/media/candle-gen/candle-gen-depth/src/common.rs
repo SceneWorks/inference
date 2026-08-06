@@ -296,12 +296,8 @@ mod tests {
         safetensors::save(&m, path).unwrap();
     }
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "candle_gen_depth_common_{tag}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
+    fn scratch_dir(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
+        let d = tmp.path().join(format!("candle_gen_depth_common_{tag}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -310,7 +306,8 @@ mod tests {
     /// normal sharded-checkpoint path is preserved byte-for-byte (F-064 / sc-9050).
     #[test]
     fn from_dir_merges_disjoint_shards_into_key_union() {
-        let dir = scratch_dir("union");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "union");
         write_shard(
             &dir.join("model-00001-of-00002.safetensors"),
             "a.weight",
@@ -338,7 +335,8 @@ mod tests {
     /// the offending key and shard file, instead of silently overwriting (F-064 / sc-9050).
     #[test]
     fn from_dir_errors_on_cross_shard_duplicate_key() {
-        let dir = scratch_dir("dup");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "dup");
         write_shard(
             &dir.join("model-00001-of-00002.safetensors"),
             "dup.weight",

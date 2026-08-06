@@ -11,8 +11,8 @@ use candle_gen::gen_core::{LoadSpec, Modality, Quant, WeightsSource};
 use candle_gen_mochi::MODEL_ID;
 
 /// A throwaway empty model dir (an incomplete snapshot — no `vae/config.json`).
-fn temp_model_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mochi_candle_reg_{}_{}", std::process::id(), tag));
+fn temp_model_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+    let dir = tmp.path().join(format!("mochi_candle_reg_{}", tag));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -21,9 +21,8 @@ fn temp_model_dir(tag: &str) -> PathBuf {
 /// `split_model.json` (the tier marker) + `quantize_config.json` (bits 4, group 64), plus a
 /// `<root>/text_encoder/` so the shared-root resolves to the parent. Enough for the lazy `load` seam to
 /// detect the tier and run the assert-against-manifest, without any model weights. Returns the tier dir.
-fn synthetic_q4_tier(tag: &str) -> PathBuf {
-    let root =
-        std::env::temp_dir().join(format!("mochi_candle_tier_{}_{}", std::process::id(), tag));
+fn synthetic_q4_tier(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+    let root = tmp.path().join(format!("mochi_candle_tier_{}", tag));
     let tier = root.join("q4");
     std::fs::create_dir_all(tier.join("transformer")).unwrap();
     std::fs::create_dir_all(root.join("text_encoder")).unwrap();
@@ -68,7 +67,8 @@ fn mochi_is_registered_as_candle_video() {
 
 #[test]
 fn load_rejects_single_file_source() {
-    let dir = temp_model_dir("single");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "single");
     assert!(
         candle_gen_mochi::provider_registry()
             .unwrap()
@@ -84,7 +84,8 @@ fn load_rejects_single_file_source() {
 
 #[test]
 fn load_rejects_on_the_fly_quant() {
-    let dir = temp_model_dir("quant");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "quant");
     assert!(
         candle_gen_mochi::provider_registry()
             .unwrap()
@@ -103,7 +104,8 @@ fn load_rejects_on_the_fly_quant() {
 /// assert-against-manifest, A6 sc-11990) — the blanket on-the-fly-requant reject no longer blocks a tier.
 #[test]
 fn load_accepts_tier_dir_and_matching_quant() {
-    let tier = synthetic_q4_tier("match");
+    let tmp = tempfile::tempdir().unwrap();
+    let tier = synthetic_q4_tier(&tmp, "match");
     let reg = candle_gen_mochi::provider_registry().unwrap();
     // The dir alone (no quant knob) is a valid tier selection.
     assert!(
@@ -127,7 +129,8 @@ fn load_accepts_tier_dir_and_matching_quant() {
 /// run) — Q8 requested against a q4 tier fails the assert-against-manifest.
 #[test]
 fn load_rejects_tier_quant_bits_mismatch() {
-    let tier = synthetic_q4_tier("mismatch");
+    let tmp = tempfile::tempdir().unwrap();
+    let tier = synthetic_q4_tier(&tmp, "mismatch");
     let reg = candle_gen_mochi::provider_registry().unwrap();
     assert!(
         reg.load(
@@ -145,8 +148,9 @@ fn load_rejects_tier_quant_bits_mismatch() {
 /// (no `text_encoder/`, `transformer/`, `vae/`).
 #[test]
 fn generate_requires_full_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
     use candle_gen::gen_core::GenerationRequest;
-    let dir = temp_model_dir("incomplete");
+    let dir = temp_model_dir(&tmp, "incomplete");
     let g = candle_gen_mochi::provider_registry()
         .unwrap()
         .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))

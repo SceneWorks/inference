@@ -596,10 +596,8 @@ mod tests {
 
     /// Write a component dir holding only a `config.json` — enough for the packed-source guard,
     /// which reads the marker and nothing else. No weights, no device, no GPU.
-    fn component_dir(name: &str, config: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_flux2_guard_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn component_dir(tmp: &tempfile::TempDir, name: &str, config: &str) -> PathBuf {
+        let dir = tmp.path().join(format!("mlx_gen_flux2_guard_{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), config).unwrap();
         dir
@@ -610,13 +608,14 @@ mod tests {
     /// wrong subsystem. Refuse it up front, naming both tiers and the fix.
     #[test]
     fn prequantizing_a_packed_source_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         let src = component_dir(
+            &tmp,
             "packed",
             r#"{"quantization": {"bits": 8, "group_size": 64}}"#,
         );
-        let dst =
-            std::env::temp_dir().join(format!("mlx_gen_flux2_guard_out_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dst);
+        let dst_tmp = tempfile::tempdir().unwrap();
+        let dst = dst_tmp.path().join("dst");
 
         let err = quantize_flux2_dit(&src, &dst, 4, 64)
             .unwrap_err()
@@ -640,21 +639,23 @@ mod tests {
     /// different error and proves the guard let it through.)
     #[test]
     fn a_dense_source_passes_the_guard() {
-        let dense = component_dir("dense", r#"{"_class_name": "Flux2Transformer2DModel"}"#);
+        let tmp = tempfile::tempdir().unwrap();
+        let dense = component_dir(
+            &tmp,
+            "dense",
+            r#"{"_class_name": "Flux2Transformer2DModel"}"#,
+        );
         assert!(mlx_gen::quant::packed_quant_bits_at(&dense)
             .unwrap()
             .is_none());
 
-        let no_config =
-            std::env::temp_dir().join(format!("mlx_gen_flux2_guard_bare_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&no_config);
-        std::fs::create_dir_all(&no_config).unwrap();
+        let no_config_tmp = tempfile::tempdir().unwrap();
+        let no_config = no_config_tmp.path().to_path_buf();
         assert!(mlx_gen::quant::packed_quant_bits_at(&no_config)
             .unwrap()
             .is_none());
 
         std::fs::remove_dir_all(&dense).unwrap();
-        std::fs::remove_dir_all(&no_config).unwrap();
     }
 
     /// Exact (bit-equal) array comparison via `all_close` with zero tolerance.
@@ -667,16 +668,14 @@ mod tests {
     #[test]
     fn header_shapes_reads_header_without_body() {
         use std::io::Write;
-        // Process-unique fixture names: a fixed `$TMPDIR` name is shared with any other concurrent
-        // `cargo test` process running this same test, which truncates/removes it mid-read.
-        let pid = std::process::id();
         let header =
             br#"{"w":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"__metadata__":{"a":"b"}}"#;
         let mut buf = Vec::new();
         buf.extend_from_slice(&(header.len() as u64).to_le_bytes());
         buf.extend_from_slice(header);
         buf.extend_from_slice(&[7u8; 24]); // the "weights" body — must not be needed.
-        let path = std::env::temp_dir().join(format!("mlx_gen_flux2_hdr_ok_{pid}.safetensors"));
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("mlx_gen_flux2_hdr_ok.safetensors");
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&buf)
@@ -691,8 +690,10 @@ mod tests {
         let mut bad = Vec::new();
         bad.extend_from_slice(&(1u64 << 40).to_le_bytes()); // claims a 1 TiB header
         bad.extend_from_slice(b"{}");
-        let bad_path =
-            std::env::temp_dir().join(format!("mlx_gen_flux2_hdr_bad_{pid}.safetensors"));
+        let bad_path_tmp = tempfile::tempdir().unwrap();
+        let bad_path = bad_path_tmp
+            .path()
+            .join("mlx_gen_flux2_hdr_bad.safetensors");
         std::fs::File::create(&bad_path)
             .unwrap()
             .write_all(&bad)
@@ -761,23 +762,27 @@ mod tests {
     /// split and adaLN swap applied. No real weights — exercises the pure remap.
     #[test]
     fn build_target_state_dict_synthetic_layout() {
+        let tmp = tempfile::tempdir().unwrap();
         use std::collections::HashSet;
 
         // Minimal synthetic dims: d=4 (so qkv = 3·4 = 12 rows, adaLN = 2·4 = 8 rows), 2 double +
         // 1 single block. Shapes need only be split-compatible on axis 0.
         let d = 4i32;
         let ones = |rows: i32, cols: i32| Array::ones::<f32>(&[rows, cols]).unwrap();
-        let mut src = Weights::from_file(write_tmp_weights(&[
-            ("img_in.weight", ones(d, 8)),
-            ("txt_in.weight", ones(d, 8)),
-            ("time_in.in_layer.weight", ones(d, 8)),
-            ("time_in.out_layer.weight", ones(d, d)),
-            ("double_stream_modulation_img.lin.weight", ones(d, d)),
-            ("double_stream_modulation_txt.lin.weight", ones(d, d)),
-            ("single_stream_modulation.lin.weight", ones(d, d)),
-            ("final_layer.linear.weight", ones(d, d)),
-            ("final_layer.adaLN_modulation.1.weight", ones(2 * d, d)),
-        ]))
+        let mut src = Weights::from_file(write_tmp_weights(
+            &tmp,
+            &[
+                ("img_in.weight", ones(d, 8)),
+                ("txt_in.weight", ones(d, 8)),
+                ("time_in.in_layer.weight", ones(d, 8)),
+                ("time_in.out_layer.weight", ones(d, d)),
+                ("double_stream_modulation_img.lin.weight", ones(d, d)),
+                ("double_stream_modulation_txt.lin.weight", ones(d, d)),
+                ("single_stream_modulation.lin.weight", ones(d, d)),
+                ("final_layer.linear.weight", ones(d, d)),
+                ("final_layer.adaLN_modulation.1.weight", ones(2 * d, d)),
+            ],
+        ))
         .unwrap();
         for i in 0..2 {
             for (suf, rows, cols) in [
@@ -975,15 +980,14 @@ mod tests {
 
     /// Write tensors to a unique temp safetensors file and return its path (the test loads it back
     /// through `Weights::from_file`, the same entry the real converter uses).
-    fn write_tmp_weights(entries: &[(&str, Array)]) -> PathBuf {
+    fn write_tmp_weights(tmp: &tempfile::TempDir, entries: &[(&str, Array)]) -> PathBuf {
         // A content-derived suffix keeps test cases from colliding without `Date`/`rand` (both
         // unavailable in this crate's MLX build); the pid additionally keeps two *concurrent*
         // `cargo test` processes, which share `$TMPDIR`, off each other's fixtures.
         let tag: usize = entries.iter().map(|(k, _)| k.len()).sum();
-        let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!(
-            "mlx_gen_flux2_convert_test_{tag}_{pid}.safetensors"
-        ));
+        let path = tmp
+            .path()
+            .join(format!("mlx_gen_flux2_convert_test_{tag}.safetensors"));
         Array::save_safetensors(
             entries.iter().map(|(k, v)| (*k, v)),
             None::<&HashMap<String, String>>,

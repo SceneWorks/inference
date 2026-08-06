@@ -12,11 +12,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen_z_image::{FinalLayer, TimestepEmbedder};
 use mlx_rs::Array;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_z_image_routing_test_{}",
-        std::process::id()
-    ));
+fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+    let dir = tmp.path().join("mlx_gen_z_image_routing_test");
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }
@@ -37,10 +34,11 @@ fn write(path: &PathBuf, arrays: Vec<(&str, &Array)>) {
 
 #[test]
 fn timestep_embedder_routes_mlp_indices() {
+    let tmp = tempfile::tempdir().unwrap();
     // linear1: [out=8, in=freq=8], linear2: [out=8, in=8]; bias [out].
     let w8 = Array::from_slice(&vec![0.1f32; 64], &[8, 8]);
     let b8 = Array::from_slice(&[0.0f32; 8], &[8]);
-    let path = tmp("t_embedder.safetensors");
+    let path = scratch_file(&tmp, "t_embedder.safetensors");
     write(
         &path,
         vec![
@@ -63,10 +61,11 @@ fn timestep_embedder_routes_mlp_indices() {
 
 #[test]
 fn final_layer_routes_adaln_index_one() {
+    let tmp = tempfile::tempdir().unwrap();
     // linear: [16, 8], adaLN_modulation.0 (the Linear): [16, 8]; bias [16].
     let w = Array::from_slice(&vec![0.1f32; 128], &[16, 8]);
     let b = Array::from_slice(&[0.0f32; 16], &[16]);
-    let path = tmp("final_layer.safetensors");
+    let path = scratch_file(&tmp, "final_layer.safetensors");
     write(
         &path,
         vec![

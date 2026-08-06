@@ -49,8 +49,8 @@ const EROS_EMBEDDED_CONFIG: &str = r#"{
 }"#;
 
 /// A throwaway model dir holding just `embedded_config.json` (S0 `load` only reads config).
-fn temp_model_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ltx_s0_{}_{}", std::process::id(), tag));
+fn temp_model_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+    let dir = tmp.path().join(format!("ltx_s0_{}", tag));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("embedded_config.json"), EROS_EMBEDDED_CONFIG).unwrap();
     dir
@@ -78,11 +78,12 @@ fn ltx_is_registered() {
 
 #[test]
 fn load_requires_full_model() {
+    let tmp = tempfile::tempdir().unwrap();
     // S6: `load` assembles every component (Gemma TE + connector + transformer + upsampler + VAE),
     // so a config-only dir (no weight files) errors rather than returning a stub. (The full-model
     // load + generate is exercised by the real-weights `e2e_parity` gate; request validation is
     // unit-tested weight-free in `model.rs`.)
-    let dir = temp_model_dir("load");
+    let dir = temp_model_dir(&tmp, "load");
     assert!(
         mlx_gen_ltx::provider_registry()
             .unwrap()
@@ -95,7 +96,8 @@ fn load_requires_full_model() {
 
 #[test]
 fn load_rejects_unwired_features() {
-    let dir = temp_model_dir("reject");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "reject");
     // Single-file source.
     assert!(mlx_gen_ltx::provider_registry()
         .unwrap()

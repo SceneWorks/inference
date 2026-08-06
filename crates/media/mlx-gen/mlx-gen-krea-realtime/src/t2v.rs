@@ -454,6 +454,10 @@ pub fn decode_latents_to_video(
 /// ~1.9×. Row Z cannot be lengthened either — the shipped 6-latent-frame window evicts as soon as a
 /// clip passes 6 latent frames. "Past the budget" therefore means past an absolute number pinned by
 /// synthetic stimuli, not past a measured baseline of the same content.
+///
+/// Those figures are 640×384; sc-17324 later measured row Z at the shipping 832×480 bucket for the
+/// first time and it replicates — Z 38.29/100f against row A's 18.82, A/Z = 0.49 — so the absent
+/// floor is a property of the comparison, not of the smaller bucket.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
@@ -1385,10 +1389,9 @@ mod tests {
         root
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "krea_te_quant_{}_{name}_{}",
-            std::process::id(),
+    fn scratch(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let d = tmp.path().join(format!(
+            "krea_te_quant_{name}_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1407,6 +1410,7 @@ mod tests {
     /// case must be `None`, so "always Q8" fails too.
     #[test]
     fn te_quant_is_probed_off_the_snapshot_and_floors_at_q8() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = tiny_te_cfg();
         let q8 = Some(WanQuant {
             bits: 8,
@@ -1416,7 +1420,8 @@ mod tests {
         // A pre-quantized snapshot: the tier comes from the WEIGHTS (this cfg declares no
         // `quantization`, so anything reading the manifest instead would answer `None`).
         for dit_bits in [4, 8] {
-            let root = write_probe_snapshot(&scratch("packed"), "dit.safetensors", Some(dit_bits));
+            let root =
+                write_probe_snapshot(&scratch(&tmp, "packed"), "dit.safetensors", Some(dit_bits));
             assert_eq!(
                 resolve_te_quant(&root, &cfg, None).unwrap(),
                 q8,
@@ -1428,7 +1433,7 @@ mod tests {
         }
 
         // A dense bf16 snapshot with no request: the encoder stays dense.
-        let dense = write_probe_snapshot(&scratch("dense"), "dit.safetensors", None);
+        let dense = write_probe_snapshot(&scratch(&tmp, "dense"), "dit.safetensors", None);
         assert_eq!(resolve_te_quant(&dense, &cfg, None).unwrap(), None);
         // …but a load-time Q4 request over that same dense snapshot still floors the TE at Q8.
         assert_eq!(resolve_te_quant(&dense, &cfg, Some(Quant::Q4)).unwrap(), q8);
@@ -1441,7 +1446,7 @@ mod tests {
 
         // The sharded `transformer/` layout is probed identically to the single-file one.
         let sharded = write_probe_snapshot(
-            &scratch("sharded"),
+            &scratch(&tmp, "sharded"),
             "transformer/shard-00001.safetensors",
             Some(4),
         );
@@ -1449,7 +1454,7 @@ mod tests {
 
         // A root with neither layout errors loudly (rather than silently answering "dense bf16" and
         // letting the whole run proceed on a snapshot that has no transformer at all).
-        let empty = scratch("empty");
+        let empty = scratch(&tmp, "empty");
         let err = resolve_te_quant(&empty, &cfg, None)
             .expect_err("a root with no transformer weights must fail");
         assert!(
@@ -1467,7 +1472,8 @@ mod tests {
     /// snapshot fails here rather than after the ~11 GB encoder has been staged.
     #[test]
     fn te_quant_probe_surfaces_a_snapshot_config_mismatch() {
-        let root = write_probe_snapshot(&scratch("mismatch"), "dit.safetensors", Some(4));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = write_probe_snapshot(&scratch(&tmp, "mismatch"), "dit.safetensors", Some(4));
         // The same packed file read under a config that declares a different tier.
         let mut cfg = tiny_te_cfg();
         cfg.wan.quantization = Some(WanQuant {

@@ -462,7 +462,8 @@ mod tests {
         // platform-to-platform; the 60-step budget then buys a large, unambiguous drop (see the
         // relative-floor assert below) so this still fails hard if the trainer stops learning.
         let mut rng = StdRng::seed_from_u64(10794);
-        let (dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         // Nudge off the zero-init identity so there's a signal to descend (as the control tests do).
@@ -488,7 +489,8 @@ mod tests {
             resolution: 64,
             ..Default::default()
         };
-        let out = std::env::temp_dir().join("krea-control-trainer-test");
+        let out_tmp = tempfile::tempdir().unwrap();
+        let out = out_tmp.path().to_path_buf();
         let mut tr = ControlTrainer::new(dit, branch, samples, cfg, out, 0, dev).unwrap();
 
         let eval = |tr: &ControlTrainer| -> f32 {

@@ -413,14 +413,12 @@ mod tests {
     /// missing dir errors loudly.
     #[test]
     fn image_encoder_resolution() {
-        let dir = std::env::temp_dir().join(format!("candle_kolors_ip_enc_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(resolve_image_encoder(&dir).is_err());
         let f = dir.join("model.safetensors");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(resolve_image_encoder(&dir).unwrap(), f);
         assert_eq!(resolve_image_encoder(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

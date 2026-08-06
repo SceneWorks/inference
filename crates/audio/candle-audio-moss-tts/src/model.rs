@@ -609,9 +609,8 @@ mod tests {
         // generate() now renders real audio (the XY_Tokenizer codec is ported, sc-13518). With no
         // weights on disk it must surface a typed error while loading the AR snapshot — never panic,
         // never fabricate audio.
-        let dir = std::env::temp_dir().join("moss-ttsd-no-weights");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load_generator(&spec_with_codec(dir)).unwrap();
         let req = audio_req(AudioParams {
             sample_rate: Some(24_000),
@@ -625,8 +624,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled() {
-        let dir = std::env::temp_dir().join("moss-ttsd-cancel");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load_generator(&spec_with_codec(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -642,7 +641,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = spec_with_codec(dir.clone());
@@ -655,8 +655,8 @@ mod tests {
     /// never fetched mid-render (epic 13657). Driven through the real `load` by the shared testkit.
     #[test]
     fn missing_codec_component_fails_at_load() {
-        let dir = std::env::temp_dir().join("moss-ttsd-load-gate");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let base = spec_with_codec(dir);
         // The fully-provisioned spec loads (the codec is lazy — no path read yet).
         assert!(

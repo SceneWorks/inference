@@ -579,9 +579,8 @@ mod tests {
     /// falls back to eos. The pre-fix hardcoded-eos behaviour padded bigG with 49407 (wrong).
     #[test]
     fn resolve_clip_pad_id_reads_per_encoder_pad_token() {
-        let dir = std::env::temp_dir().join(format!("sd3_pad_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let tok = tiny_tokenizer(&dir, &[("<unk>", 1), ("!", 0), ("<|endoftext|>", 49407)]);
 
         // bigG-style config: pad_token = "!" (a bare string) -> id 0.
@@ -640,8 +639,6 @@ mod tests {
                 message.contains("read") && message.contains("tokenizer_config.json")),
             "a present unreadable config must return a contextual read error, got: {error}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `fit_clip_tokens` pads short rows to 77 and hard-truncates long rows, keeping an EOS in the

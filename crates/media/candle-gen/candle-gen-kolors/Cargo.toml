@@ -46,6 +46,10 @@ metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # `examples/kolors-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to

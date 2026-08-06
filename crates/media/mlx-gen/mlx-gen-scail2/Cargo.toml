@@ -21,6 +21,10 @@ mlx-rs = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Real-weight typed-cancellation conformance gate (story 6883): drives the registered scail2_14b
 # Generator through the testkit cancellation check. Weight-gated (#[ignore]).
 sceneworks-gen-core-testkit = { workspace = true }

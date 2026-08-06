@@ -729,7 +729,11 @@ mod tests {
 
     /// Build a packed [`AdaptLinear`] via [`AdaptLinear::detect`] on a written `.weight`/`.scales`/
     /// `.biases` triple (the round-trip the DiT loader takes) plus the affine grid it represents.
-    fn packed_adapt(out_dim: usize, in_dim: usize) -> (AdaptLinear, Tensor) {
+    fn packed_adapt(
+        tmp: &tempfile::TempDir,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> (AdaptLinear, Tensor) {
         let dev = Device::Cpu;
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
         let mut map: HashMap<String, Tensor> = HashMap::new();
@@ -737,17 +741,12 @@ mod tests {
         map.insert("p.scales".into(), s);
         map.insert("p.biases".into(), b);
         let uniq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!(
-            "adapt_core_{}_{}.safetensors",
-            std::process::id(),
-            uniq
-        ));
+        let tmp = tmp.path().join(format!("adapt_core_{}.safetensors", uniq));
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: freshly written, single-reader for the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
         let lin = AdaptLinear::detect(&vb, "p").unwrap();
-        std::fs::remove_file(&tmp).ok();
         (
             lin,
             Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap(),
@@ -1063,8 +1062,9 @@ mod tests {
     /// `detect` recovers the logical dims from the packed `scales` shape and keeps the base packed.
     #[test]
     fn detect_recovers_dims_and_stays_packed() {
+        let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (64usize, 128usize); // in divisible by group 64
-        let (lin, _grid) = packed_adapt(out_dim, in_dim);
+        let (lin, _grid) = packed_adapt(&tmp, out_dim, in_dim);
         assert!(lin.is_packed(), "`.scales` ⇒ packed base");
         assert_eq!(
             lin.base_shape(),
@@ -1093,11 +1093,10 @@ mod tests {
         map.insert("p.scales".into(), s);
         map.insert("p.biases".into(), b);
         let uniq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!(
-            "adapt_detect_{}_{}.safetensors",
-            std::process::id(),
-            uniq
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard
+            .path()
+            .join(format!("adapt_core_{}.safetensors", uniq));
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -1125,7 +1124,6 @@ mod tests {
             packed.is_packed(),
             "`.scales` ⇒ packed load, not a silent dense fallback"
         );
-        std::fs::remove_file(&tmp).ok();
     }
 
     /// The additive LoRA residual `scale·((x·a)·b)` reproduces the **folded** `x·(W + δ)ᵀ` with
@@ -1169,12 +1167,13 @@ mod tests {
     /// residual is an exact no-op (the mutation anchor: break the scale and this equality breaks).
     #[test]
     fn additive_lora_on_packed_shifts_stays_packed_and_scale0_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank) = (64usize, 128usize, 8usize);
-        let (packed_base, _grid) = packed_adapt(out_dim, in_dim);
+        let (packed_base, _grid) = packed_adapt(&tmp, out_dim, in_dim);
         assert!(packed_base.is_packed());
 
-        let (mut adapted, _) = packed_adapt(out_dim, in_dim);
+        let (mut adapted, _) = packed_adapt(&tmp, out_dim, in_dim);
         let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
         adapted.push_lora(a.clone(), b.clone(), 1.0);
@@ -1207,7 +1206,7 @@ mod tests {
         );
 
         // scale 0 ⇒ exact no-op vs the un-adapted packed base.
-        let (mut zero, _) = packed_adapt(out_dim, in_dim);
+        let (mut zero, _) = packed_adapt(&tmp, out_dim, in_dim);
         zero.push_lora(a, b, 0.0);
         let zero_dev = (zero.forward(&x).unwrap().sub(&base_y).unwrap())
             .abs()
@@ -1293,10 +1292,11 @@ mod tests {
     /// (never folded into a re-quantized dense weight).
     #[test]
     fn additive_on_packed_adds_exact_residual_over_base() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
-        let (base, _grid) = packed_adapt(out_dim, in_dim);
-        let (mut adapted, _grid) = packed_adapt(out_dim, in_dim); // bit-identical packed base
+        let (base, _grid) = packed_adapt(&tmp, out_dim, in_dim);
+        let (mut adapted, _grid) = packed_adapt(&tmp, out_dim, in_dim); // bit-identical packed base
         let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
         let scale = 0.7f64;
@@ -1546,12 +1546,13 @@ mod tests {
     /// scale-0 LoKr is an exact no-op.
     #[test]
     fn structured_lokr_on_packed_matches_folded_and_stays_packed() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         // in = c·d = 8·16 = 128 (divisible by group 64); out = a·b = 4·16 = 64.
         let (a, b, c, d) = (4usize, 16, 8, 16);
         let (out_dim, in_dim) = (a * b, c * d);
-        let (base, _grid) = packed_adapt(out_dim, in_dim);
-        let (mut adapted, _grid) = packed_adapt(out_dim, in_dim); // bit-identical packed base
+        let (base, _grid) = packed_adapt(&tmp, out_dim, in_dim);
+        let (mut adapted, _grid) = packed_adapt(&tmp, out_dim, in_dim); // bit-identical packed base
         assert!(base.is_packed() && adapted.is_packed());
 
         let w1 = (Tensor::randn(0f32, 1f32, (a, c), &dev).unwrap() * 0.1).unwrap();
@@ -1603,7 +1604,7 @@ mod tests {
         );
 
         // Mutation: a scale-0 structured LoKr is an exact no-op over the packed base.
-        let (mut zero, _) = packed_adapt(out_dim, in_dim);
+        let (mut zero, _) = packed_adapt(&tmp, out_dim, in_dim);
         let f0 = LokrFactors::build(
             0.0,
             (out_dim, in_dim),

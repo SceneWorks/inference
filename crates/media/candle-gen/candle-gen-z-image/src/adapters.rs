@@ -913,10 +913,10 @@ mod tests {
 
         // Write the real PEFT file the DiT trainer emits (empty prefix → bare dotted keys), then
         // merge it through the public entry point.
-        let file = std::env::temp_dir().join(format!(
-            "candle_zimage_lora_roundtrip_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp
+            .path()
+            .join("candle_zimage_lora_roundtrip.safetensors");
         save_lora_peft(&set, "", &HashMap::new(), &file).unwrap();
 
         let mut map = HashMap::new();

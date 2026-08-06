@@ -400,7 +400,8 @@ mod tests {
     /// weights, GPU-free.
     #[test]
     fn transformer_group_size_reads_quantization_block() {
-        let tmp = std::env::temp_dir().join(format!("sc9409_gs_pipe_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let dir = tmp.join("transformer");
         std::fs::create_dir_all(&dir).ok();
         let pipe = Pipeline::load(ChromaVariant::Base, &tmp, &Device::Cpu, None);
@@ -440,8 +441,6 @@ mod tests {
             pipe.transformer_group_size(&tmp.join("missing")),
             candle_gen::quant::MLX_GROUP_SIZE
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// HD's static shift moves the interior sigmas but keeps a descending 1→0 schedule of length N+1.

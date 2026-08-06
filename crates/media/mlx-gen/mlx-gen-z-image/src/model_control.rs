@@ -634,8 +634,9 @@ mod tests {
     // otherwise produce a missing-weights error, not the tier message).
     #[test]
     fn control_tier_mismatch_errors_on_resident_and_sequential_load() {
+        let tmp = tempfile::tempdir().unwrap();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let root = loader::packed_snapshot_fixture("control-load", 8);
+            let root = loader::packed_snapshot_fixture(&tmp, "control-load", 8);
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                 .with_control(WeightsSource::File(
                     "/nonexistent/z-image-control-overlay.safetensors".into(),
@@ -657,11 +658,12 @@ mod tests {
 
     #[test]
     fn load_control_heavy_runs_tier_guard_before_weights() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-009 (sc-12461): the heavy control loader itself re-checks the tier guard — the seam the
         // Sequential path re-loads through on every generate. The fixture has no weights, so
         // reaching the base/control load would fail with a missing-weights error instead —
         // asserting on the tier message proves the guard runs first.
-        let root = loader::packed_snapshot_fixture("control-heavy", 8);
+        let root = loader::packed_snapshot_fixture(&tmp, "control-heavy", 8);
         let control =
             WeightsSource::File("/nonexistent/z-image-control-overlay.safetensors".into());
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))

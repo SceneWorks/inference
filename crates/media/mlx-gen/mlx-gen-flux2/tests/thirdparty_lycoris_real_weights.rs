@@ -54,11 +54,8 @@ fn thirdparty_loha_and_lokr_apply_on_real_tree() {
         shapes.iter().map(|(p, s)| (p, s)).collect::<Vec<_>>()
     );
 
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_flux2_thirdparty_rw_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let r = 2i32;
 
     // ---- third-party LoHa: lycoris keys, per-module .alpha (scale = alpha/rank = 1), NO metadata.

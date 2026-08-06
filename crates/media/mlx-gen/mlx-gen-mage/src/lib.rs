@@ -217,8 +217,8 @@ mod explicit_registry_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn snapshot() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("mage-registry-{}", std::process::id()));
+    fn snapshot(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = tmp.path().join("mage-registry");
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
@@ -231,6 +231,7 @@ mod explicit_registry_tests {
 
     #[test]
     fn explicit_catalog_has_stable_surface() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = provider_registry().unwrap();
         let generators: Vec<String> = registry
             .generators()
@@ -258,7 +259,7 @@ mod explicit_registry_tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
-        let root = snapshot();
+        let root = snapshot(&tmp);
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
         for id in MODEL_IDS {
             assert!(registry

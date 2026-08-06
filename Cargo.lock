@@ -181,6 +181,7 @@ dependencies = [
  "libc",
  "sceneworks-gen-core",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -196,6 +197,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -217,6 +219,7 @@ dependencies = [
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-llm",
+ "tempfile",
 ]
 
 [[package]]
@@ -233,6 +236,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -243,6 +247,7 @@ dependencies = [
  "candle-audio",
  "candle-audio-kokoro",
  "candle-nn",
+ "tempfile",
 ]
 
 [[package]]
@@ -254,6 +259,7 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -270,6 +276,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "zip 7.2.0",
 ]
 
@@ -284,6 +291,7 @@ dependencies = [
  "rand_distr",
  "regex",
  "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
@@ -298,6 +306,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -312,6 +321,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -328,6 +338,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -342,6 +353,7 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -373,6 +385,7 @@ dependencies = [
  "core-llm",
  "rand",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -449,6 +462,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -461,6 +475,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -475,6 +490,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -531,6 +547,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -543,6 +560,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-nn",
  "candle-transformers",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -553,6 +571,7 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-nn",
+ "tempfile",
 ]
 
 [[package]]
@@ -581,6 +600,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -597,6 +617,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -614,6 +635,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -652,6 +674,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -670,6 +693,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -686,6 +710,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -698,6 +723,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -716,6 +742,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -728,6 +755,7 @@ dependencies = [
  "image",
  "rand",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -756,6 +784,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -771,6 +800,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -780,6 +810,7 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-nn",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -793,6 +824,7 @@ dependencies = [
  "rand",
  "safetensors 0.4.5",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -825,6 +857,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -844,6 +877,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
  "tracing",
 ]
@@ -871,6 +905,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -883,6 +918,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
@@ -915,6 +951,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -2105,6 +2142,7 @@ dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
 ]
@@ -2120,6 +2158,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2132,6 +2171,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "tokenizers 0.21.4",
 ]
 
@@ -2146,6 +2186,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2202,6 +2243,7 @@ dependencies = [
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2243,6 +2285,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2257,6 +2300,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2269,6 +2313,7 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2304,6 +2349,7 @@ dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2318,6 +2364,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2328,6 +2375,7 @@ dependencies = [
  "mlx-gen-wan",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2341,6 +2389,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2351,6 +2400,7 @@ dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2363,6 +2413,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2374,6 +2425,7 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2396,6 +2448,7 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2407,6 +2460,7 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2415,6 +2469,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
+ "tempfile",
 ]
 
 [[package]]
@@ -2433,6 +2488,8 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2444,6 +2501,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2459,6 +2517,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2472,6 +2531,7 @@ dependencies = [
  "regex",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2482,6 +2542,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2493,6 +2554,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2504,6 +2566,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
@@ -2514,6 +2577,7 @@ dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
  "unicode-normalization",
  "zip 8.6.0",
 ]
@@ -2530,6 +2594,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -3244,6 +3309,7 @@ name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
 dependencies = [
  "sceneworks-gen-core",
+ "tempfile",
 ]
 
 [[package]]

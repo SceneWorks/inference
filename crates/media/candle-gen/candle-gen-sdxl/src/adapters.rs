@@ -1360,10 +1360,10 @@ mod tests {
         set.vars[1].set(&up_randn).unwrap(); // vars = [down(A), up(B)]
 
         // Write the real PEFT file the trainer emits, then merge it through the public entry point.
-        let file = std::env::temp_dir().join(format!(
-            "candle_sdxl_lora_roundtrip_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp
+            .path()
+            .join("candle_sdxl_lora_roundtrip.safetensors");
         save_lora_peft(&set, SDXL_PEFT_PREFIX, &HashMap::new(), &file).unwrap();
 
         let mut map = HashMap::new();
@@ -1624,6 +1624,7 @@ mod tests {
     /// return `(file, ΔW at scale 1.0)`. Reuses the actual trainer save path so the install consumes the
     /// on-disk format, not hand-built tensors (rank 2, alpha 4 ⇒ ratio 2.0).
     fn write_peft_lora(
+        tmp: &tempfile::TempDir,
         path: &str,
         in_dim: usize,
         out_dim: usize,
@@ -1642,8 +1643,7 @@ mod tests {
         let set = build_lora_targets(&mut host, &[leaf], 2, 4.0, 7, &dev).unwrap();
         let up = Tensor::randn(0f32, 1f32, (out_dim, 2), &dev).unwrap();
         set.vars[1].set(&up).unwrap(); // vars = [down(A), up(B)]; force B nonzero
-        let file =
-            std::env::temp_dir().join(format!("sc11103_{tag}_{}.safetensors", std::process::id()));
+        let file = tmp.path().join(format!("sc11103_{tag}.safetensors"));
         save_lora_peft(&set, SDXL_PEFT_PREFIX, &HashMap::new(), &file).unwrap();
         let delta = reconstruct_lora_delta(
             set.vars[0].as_tensor(),
@@ -1674,13 +1674,14 @@ mod tests {
     /// base stays **packed** (footprint survives) and the residual actually shifts the output.
     #[test]
     fn packed_additive_install_matches_dense_fold_and_stays_packed() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let qp = "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q";
         let ([wq, s, b], grid) = synth_q4(64, 64);
         let q = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
         let mut host = OneLeaf(LoraLinear::from_qlinear(q, 64, 64, qp.into()));
 
-        let (file, delta) = write_peft_lora(qp, 64, 64, "parity");
+        let (file, delta) = write_peft_lora(&tmp, qp, 64, 64, "parity");
         // (i) packed additive install (PEFT keys resolve without a kohya table).
         let report = install_additive(
             &mut host,
@@ -1763,10 +1764,8 @@ mod tests {
             format!("{qp}.lora_B.weight"),
             Tensor::randn(0f32, 1f32, (64, 2), &dev).unwrap(),
         );
-        let file = std::env::temp_dir().join(format!(
-            "sc11103_convsplit_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp.path().join("sc11103_convsplit.safetensors");
         ct_safetensors::save(&af, &file).unwrap();
 
         let table = build_sdxl_kohya_table(&map);
@@ -1828,8 +1827,10 @@ mod tests {
                 Tensor::randn(0f32, 1f32, (64, 2), &dev).unwrap(),
             );
         }
-        let file =
-            std::env::temp_dir().join(format!("sc11103_loha_{}.safetensors", std::process::id()));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp
+            .path()
+            .join("candle_sdxl_lora_roundtrip.safetensors");
         ct_safetensors::save(&af, &file).unwrap();
         let err = install_additive(
             &mut host,

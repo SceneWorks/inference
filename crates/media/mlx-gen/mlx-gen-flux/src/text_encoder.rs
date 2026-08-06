@@ -837,15 +837,8 @@ mod tests {
     #[test]
     fn quantizing_after_the_encoder_stream_is_armed_is_refused() {
         use mlx_gen::WeightsSource;
-        let dir = std::env::temp_dir().join(format!(
-            "t5-stream-order-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let stream =
             T5BlockStream::new(WeightsSource::Dir(dir.clone()), "", GROUP_SIZE).expect("stream");
         assert_eq!(stream.n_blocks(), T5_BLOCKS);
@@ -883,7 +876,6 @@ mod tests {
             error.contains("after the encoder block stream is armed"),
             "the refusal must name the ordering, got: {error}"
         );
-        std::fs::remove_dir_all(dir).ok();
     }
     use super::*;
 

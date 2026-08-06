@@ -196,10 +196,10 @@ fn projector_diff_patch_folds_into_dense_base() {
 
     // The ComfyUI native key (`diffusion_model.` + the `txtfusion` container alias).
     let delta = Array::from_slice(&[0.5f32, -0.5, 1.0], &[1, 3]);
-    let path = std::env::temp_dir().join(format!(
-        "krea_projector_diff_patch_{}.safetensors",
-        std::process::id()
-    ));
+    let path_tmp = tempfile::tempdir().unwrap();
+    let path = path_tmp
+        .path()
+        .join("krea_projector_diff_patch.safetensors");
     Array::save_safetensors(
         vec![("diffusion_model.txtfusion.projector.diff", &delta)],
         None,

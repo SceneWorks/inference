@@ -226,7 +226,13 @@ fn record_chunk_count(_n: usize) {}
 
 /// Contiguous `[.., start..start+len, ..]` slice along `axis`, via boundary splits (no host index
 /// vector and no gather, unlike `take_axis`).
-fn slice_axis(a: &Array, axis: i32, start: i32, len: i32) -> Result<Array> {
+///
+/// `pub` because it is genuinely shared: it is numerics-neutral plumbing every query-row chunker
+/// needs, and a provider whose attention kernel cannot be this one (SANA's `attn2` materializes its
+/// scores, so routing it through the fused kernel above would change resident-path numerics) still
+/// needs to slice its query axis the same way. Forking THAT would be a fork with no arithmetic
+/// reason behind it.
+pub fn slice_axis(a: &Array, axis: i32, start: i32, len: i32) -> Result<Array> {
     Ok(a.split_axis(&[start, start + len], axis)?.swap_remove(1))
 }
 

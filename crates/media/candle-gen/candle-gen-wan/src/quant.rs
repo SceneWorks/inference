@@ -149,6 +149,7 @@ mod tests {
     /// repack + dequant-on-forward). The residual-capable shared `AdaptLinear` load path.
     #[test]
     fn linear_detect_packed_on_dit_key_layout() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
@@ -170,8 +171,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim,), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc10025_dit_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc10025_dit.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader for the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -202,7 +202,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -211,6 +210,7 @@ mod tests {
     /// `Wan-AI/*-Diffusers` checkpoint path is untouched.
     #[test]
     fn linear_detect_dense_path_unchanged() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (32usize, 64usize);
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
@@ -219,8 +219,7 @@ mod tests {
         let mut map: HashMap<String, Tensor> = HashMap::new();
         map.insert("proj.weight".into(), w.clone());
         map.insert("proj.bias".into(), b.clone());
-        let tmp =
-            std::env::temp_dir().join(format!("sc10025_dense_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc10025_dense.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -240,7 +239,6 @@ mod tests {
             "dense arm deviates from the legacy linear read"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -249,6 +247,7 @@ mod tests {
     /// the loader the UMT5 encoder uses for its `shared` embedding.
     #[test]
     fn shared_embedding_packed_detect_on_umt5_layout() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (vocab, hidden) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(vocab, hidden);
@@ -261,8 +260,7 @@ mod tests {
             "dense_shared.weight".into(),
             Tensor::from_vec(grid.clone(), (vocab, hidden), &dev)?,
         );
-        let tmp =
-            std::env::temp_dir().join(format!("sc10025_emb_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc10025_emb.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -283,7 +281,6 @@ mod tests {
             );
         }
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -310,6 +307,7 @@ mod tests {
     /// silently load u32-code garbage.
     #[test]
     fn guard_dense_errors_on_packed_conv() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (wq, s, b, _grid) = q4_packed(16, 64);
 
@@ -321,8 +319,7 @@ mod tests {
             "conv_out.weight".into(),
             Tensor::randn(0f32, 1f32, (8, 8), &dev)?,
         );
-        let tmp =
-            std::env::temp_dir().join(format!("sc10025_guard_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc10025_guard.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -340,7 +337,6 @@ mod tests {
         );
         guard_dense(&vb.pp("conv_out"))?; // clean dense leaf passes
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

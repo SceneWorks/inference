@@ -18,5 +18,11 @@ mlx-rs = { workspace = true }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Persist fit comparisons and real-route preview strips in ignored acceptance tests.
 image = { workspace = true }
+# Bind each `MEMORY_EVIDENCE_V1` record to the exact pixels it was measured over (sc-15523).
+sha2 = { workspace = true }

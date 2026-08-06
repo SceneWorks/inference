@@ -422,10 +422,9 @@ mod tests {
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn fixture(bits: Option<i32>) -> (std::path::PathBuf, LoadSpec) {
-        let root = std::env::temp_dir().join(format!(
-            "mlx_gen_lens_sc15800_{}_{}",
-            std::process::id(),
+    fn fixture(tmp: &tempfile::TempDir, bits: Option<i32>) -> (std::path::PathBuf, LoadSpec) {
+        let root = tmp.path().join(format!(
+            "mlx_gen_lens_sc15800_{}",
             FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         for component in ["text_encoder", "transformer", "vae"] {
@@ -447,13 +446,17 @@ mod tests {
         (root, spec)
     }
 
-    fn dense_legacy_spec() -> (std::path::PathBuf, LoadSpec) {
-        let (root, spec) = fixture(None);
+    fn dense_legacy_spec(tmp: &tempfile::TempDir) -> (std::path::PathBuf, LoadSpec) {
+        let (root, spec) = fixture(tmp, None);
         (root, spec.with_offload_policy(OffloadPolicy::Sequential))
     }
 
-    fn packed_spec(bits: i32, quant: Quant) -> (std::path::PathBuf, LoadSpec) {
-        let (root, mut spec) = fixture(Some(bits));
+    fn packed_spec(
+        tmp: &tempfile::TempDir,
+        bits: i32,
+        quant: Quant,
+    ) -> (std::path::PathBuf, LoadSpec) {
+        let (root, mut spec) = fixture(tmp, Some(bits));
         spec.quantize = Some(quant);
         (root, spec)
     }
@@ -476,7 +479,8 @@ mod tests {
 
     #[test]
     fn exact_q4_lens_route_publishes_the_measured_full_ladder() {
-        let (root, spec) = packed_spec(4, Quant::Q4);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = packed_spec(&tmp, 4, Quant::Q4);
         let contract = memory_strategy_contract("lens", &spec).unwrap();
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(
@@ -534,7 +538,8 @@ mod tests {
 
     #[test]
     fn legacy_dense_lens_turbo_te_only_identity_remains_separate() {
-        let (root, spec) = dense_legacy_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = dense_legacy_spec(&tmp);
         let contract = memory_strategy_contract("lens_turbo", &spec).unwrap();
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(
@@ -571,13 +576,14 @@ mod tests {
 
     #[test]
     fn provider_tier_and_load_shape_mutations_do_not_fan_out_evidence() {
-        let (q4_root, q4) = packed_spec(4, Quant::Q4);
+        let tmp = tempfile::tempdir().unwrap();
+        let (q4_root, q4) = packed_spec(&tmp, 4, Quant::Q4);
         assert_unmeasured(&memory_strategy_contract("lens_turbo", &q4).unwrap());
 
-        let (q8_root, q8) = packed_spec(8, Quant::Q8);
+        let (q8_root, q8) = packed_spec(&tmp, 8, Quant::Q8);
         assert_unmeasured(&memory_strategy_contract("lens", &q8).unwrap());
 
-        let (dense_root, dense) = dense_legacy_spec();
+        let (dense_root, dense) = dense_legacy_spec(&tmp);
         assert_unmeasured(&memory_strategy_contract("lens", &dense).unwrap());
 
         let mut eager = q4.clone();
@@ -650,7 +656,8 @@ mod tests {
 
     #[test]
     fn selected_contract_scope_reaches_the_generation_request_and_pid_fails_closed() {
-        let (root, spec) = packed_spec(4, Quant::Q4);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = packed_spec(&tmp, 4, Quant::Q4);
         let contract = memory_strategy_contract("lens", &spec).unwrap();
         let context = rung_four_context();
         let mut scope = registered_begin_request("lens", &spec, &contract, &context)

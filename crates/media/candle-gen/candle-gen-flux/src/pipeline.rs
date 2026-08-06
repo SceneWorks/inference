@@ -1639,7 +1639,8 @@ mod tests {
     /// dense path (sc-9426, F-073 sibling). GPU-free (writes/reads a small JSON file).
     #[test]
     fn component_is_packed_detects_quantization_block() -> Result<()> {
-        let tmp = std::env::temp_dir().join(format!("sc9407_pkg_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let packed_dir = tmp.join("transformer");
         let dense_dir = tmp.join("vae");
         std::fs::create_dir_all(&packed_dir).ok();
@@ -1683,7 +1684,6 @@ mod tests {
             "the error should name the offending file, got: {err}"
         );
 
-        std::fs::remove_dir_all(&tmp).ok();
         Ok(())
     }
 
@@ -1696,7 +1696,8 @@ mod tests {
     /// files).
     #[test]
     fn uses_diffusers_layout_distinguishes_all_three_tiers() -> Result<()> {
-        let base = std::env::temp_dir().join(format!("sc10888_layout_{}", std::process::id()));
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base = base_tmp.path().to_path_buf();
         let mk_transformer_config = |dir: &Path, body: &str| -> Result<()> {
             std::fs::create_dir_all(dir.join("transformer")).ok();
             std::fs::write(dir.join("transformer").join("config.json"), body)
@@ -1754,7 +1755,6 @@ mod tests {
             "a full BFL snapshot (root checkpoint present) must stay stock even with diffusers subdirs"
         );
 
-        std::fs::remove_dir_all(&base).ok();
         Ok(())
     }
 

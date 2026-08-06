@@ -658,8 +658,8 @@ mod tests {
     #[test]
     fn convert_and_assemble_remaps_keys_and_borrows() {
         let d = 4usize; // inner width; all 2-D weights are [out, in] over this.
-        let tmp = std::env::temp_dir().join(format!("cg_flux2_convert_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let src_dir = tmp.join("src");
         let base = tmp.join("base");
         let out = tmp.join("out");
@@ -873,8 +873,6 @@ mod tests {
         }
         assert!(out.join("model_index.json").is_file());
         assert!(out.join("transformer").join("config.json").is_file());
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A scalar (rank-0) F32 tensor — the shape the inline-scale `.weight_scale`/`.input_scale`
@@ -1016,8 +1014,8 @@ mod tests {
     #[test]
     fn build_comfyui_dit_map_dequants_and_remaps() {
         let d = 4usize;
-        let tmp = std::env::temp_dir().join(format!("cg_flux2_comfyui_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let (file, expect) = write_comfyui_fixture(&tmp, d, true);
 
         // SAFETY: read-only mmap of the fixture we just wrote.
@@ -1060,15 +1058,13 @@ mod tests {
         );
         // The qkv row-split still runs (BF16, no dequant): q is the first third of the fused img qkv.
         assert!(map.contains_key("transformer_blocks.0.attn.to_q.weight"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn build_comfyui_dit_map_rejects_missing_weight_scale() {
         let d = 4usize;
-        let tmp = std::env::temp_dir().join(format!("cg_flux2_comfyui_bad_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         // Omit `single_blocks.0.linear1.weight_scale` → the fp8 weight has no scale sibling.
         let (file, _) = write_comfyui_fixture(&tmp, d, false);
         let mmap = unsafe { MmapedSafetensors::new(&file).unwrap() };
@@ -1080,6 +1076,5 @@ mod tests {
             msg.contains("weight_scale") && msg.contains("linear1"),
             "the reject must name the missing scale sibling, got: {msg}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

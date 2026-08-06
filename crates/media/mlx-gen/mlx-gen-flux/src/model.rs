@@ -1440,12 +1440,14 @@ mod tests {
         );
     }
 
-    fn exact_runtime_inventory() -> (
+    fn exact_runtime_inventory(
+        tmp: &tempfile::TempDir,
+    ) -> (
         std::path::PathBuf,
         LoadSpec,
         crate::artifact_inventory::PackedArtifactInventory,
     ) {
-        let root = std::env::temp_dir().join(format!(
+        let root = tmp.path().join(format!(
             "flux-runtime-stream-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -1462,7 +1464,8 @@ mod tests {
 
     #[test]
     fn runtime_window_gate_is_exact_and_generation_boundary_rechecks_inventory() {
-        let (root, spec, inventory) = exact_runtime_inventory();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec, inventory) = exact_runtime_inventory(&tmp);
         let mut model = Flux1::new_for_tests(FluxVariant::Dev);
         model.memory_strategy = crate::memory_strategy::memory_strategy_contract_with_inventory(
             crate::FLUX1_DEV_ID,

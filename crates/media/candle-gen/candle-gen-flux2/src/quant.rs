@@ -235,6 +235,7 @@ mod tests {
     /// forward flux2 uses (no dense staging) — and its forward must match the affine grid.
     #[test]
     fn linear_detect_packed_survives_to_out_remap() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
@@ -250,8 +251,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9087_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9087_detect.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -280,7 +280,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -317,6 +316,7 @@ mod tests {
     /// rows (the dev Mistral TE `embed_tokens` is packed in the q4/q8 tiers).
     #[test]
     fn embedding_detect_packed() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (vocab, hidden) = (32usize, 128usize);
         let (wq, s, b, grid) = q4_packed(vocab, hidden);
@@ -325,8 +325,7 @@ mod tests {
         map.insert("embed_tokens.weight".into(), wq);
         map.insert("embed_tokens.scales".into(), s);
         map.insert("embed_tokens.biases".into(), b);
-        let tmp =
-            std::env::temp_dir().join(format!("sc9087_emb_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9087_emb.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -348,7 +347,6 @@ mod tests {
             "packed embedding deviates from the affine grid"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

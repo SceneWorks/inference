@@ -544,13 +544,10 @@ mod tests {
         assert!(*out.iter().max().unwrap() < cfg.num_layers);
     }
 
-    fn te_snapshot_tmp(name: &str) -> std::path::PathBuf {
-        let tmp = std::env::temp_dir().join(format!(
-            "krea_te_{name}_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn te_snapshot_tmp(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let tmp = tmp
+            .path()
+            .join(format!("krea_te_{name}_{:?}", std::thread::current().id()));
         std::fs::create_dir_all(tmp.join("text_encoder")).unwrap();
         // A minimal valid text_encoder/config.json (missing scalars default to qwen3_vl_4b).
         std::fs::write(
@@ -563,16 +560,17 @@ mod tests {
 
     #[test]
     fn from_snapshot_defaults_select_when_model_index_absent() {
+        let tmp = tempfile::tempdir().unwrap();
         // No model_index.json → keep the reference select_hidden default.
-        let tmp = te_snapshot_tmp("idx_absent");
+        let tmp = te_snapshot_tmp(&tmp, "idx_absent");
         let cfg = KreaTeConfig::from_snapshot(&tmp).unwrap();
         assert_eq!(cfg.select_hidden, KreaTeConfig::qwen3_vl_4b().select_hidden);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn from_snapshot_reads_present_select_layers() {
-        let tmp = te_snapshot_tmp("idx_present");
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = te_snapshot_tmp(&tmp, "idx_present");
         std::fs::write(
             tmp.join("model_index.json"),
             br#"{"text_encoder_select_layers": [1, 2, 3]}"#,
@@ -580,16 +578,15 @@ mod tests {
         .unwrap();
         let cfg = KreaTeConfig::from_snapshot(&tmp).unwrap();
         assert_eq!(cfg.select_hidden, vec![1, 2, 3]);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn from_snapshot_errors_on_corrupt_model_index() {
+        let tmp = tempfile::tempdir().unwrap();
         // model_index.json present but malformed (partial download) → error, NOT silent default.
-        let tmp = te_snapshot_tmp("idx_corrupt");
+        let tmp = te_snapshot_tmp(&tmp, "idx_corrupt");
         std::fs::write(tmp.join("model_index.json"), b"{ not json").unwrap();
         assert!(KreaTeConfig::from_snapshot(&tmp).is_err());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -692,12 +689,12 @@ mod tests {
     }
 
     fn save_tiny_te(
+        tmp: &tempfile::TempDir,
         map: &std::collections::HashMap<String, Tensor>,
         tag: &str,
     ) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "krea_te_bf16_{tag}_{}_{:?}.safetensors",
-            std::process::id(),
+        let path = tmp.path().join(format!(
+            "krea_te_bf16_{tag}_{:?}.safetensors",
             std::thread::current().id()
         ));
         candle_gen::candle_core::safetensors::save(map, &path).unwrap();
@@ -712,8 +709,9 @@ mod tests {
     /// ripped out. Runs on CPU precisely because the compute never leaves f32 (no bf16 matmul).
     #[test]
     fn bf16_store_forward_is_bit_identical_to_f32_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let (map, cfg) = tiny_te_map();
-        let path = save_tiny_te(&map, "biteq");
+        let path = save_tiny_te(&tmp, &map, "biteq");
         let ids = Tensor::from_vec(vec![1u32, 5, 3, 9], (1, 4), &Device::Cpu).unwrap();
 
         let w_f32 = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
@@ -751,9 +749,10 @@ mod tests {
     /// vision-embed splice + deepstack injection on the f32 hidden. Pins that the edit encode stays f32.
     #[test]
     fn bf16_store_grounded_is_bit_identical_to_f32_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let (map, mut cfg) = tiny_te_map();
         cfg.image_token_id = 0; // in-vocab (vocab 12) so the tiny embed table is valid
-        let path = save_tiny_te(&map, "grounded");
+        let path = save_tiny_te(&tmp, &map, "grounded");
         let dev = Device::Cpu;
 
         // 1 text, a 4-token image block (id 0, a 2×2 merged grid → grid [1,4,4]), 1 text. S=6 > prefix 1.

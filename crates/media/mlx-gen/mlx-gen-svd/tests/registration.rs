@@ -31,8 +31,8 @@ fn svd_is_registered() {
 
 #[test]
 fn load_rejects_single_file() {
-    let dir = std::env::temp_dir().join(format!("svd_reg_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let f = dir.join("model.safetensors");
     std::fs::write(&f, b"not a real checkpoint").unwrap();
     assert!(
@@ -42,7 +42,6 @@ fn load_rejects_single_file() {
             .is_err(),
         "svd_xt must require a checkpoint directory, not a single file"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// End-to-end provider smoke (real weights): load via the registry, generate a tiny clip from a

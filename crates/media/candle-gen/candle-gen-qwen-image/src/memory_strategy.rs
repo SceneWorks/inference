@@ -520,7 +520,6 @@ pub(crate) fn registered_begin_request(
 mod tests {
     use super::*;
     use gen_core::{MemorySelection, MemoryStrategyParameters};
-    use std::sync::OnceLock;
 
     fn write_control(path: &std::path::Path) {
         let mut header =
@@ -535,18 +534,13 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn spec() -> LoadSpec {
-        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let root = ROOT.get_or_init(|| {
-            let root = std::env::temp_dir()
-                .join(format!("qwen-candle-memory-spec-{}", std::process::id()));
-            for component in ["text_encoder", "transformer", "vae"] {
-                let dir = root.join(component);
-                std::fs::create_dir_all(&dir).unwrap();
-                write_control(&dir.join("model.safetensors"));
-            }
-            root
-        });
+    fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("qwen-candle-memory-spec");
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_control(&dir.join("model.safetensors"));
+        }
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
@@ -586,8 +580,9 @@ mod tests {
 
     #[test]
     fn qwen_base_and_edit_publish_the_full_candle_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
         for id in ["qwen_image", "qwen_image_edit"] {
-            let contract = provider_contract(id, &spec()).unwrap();
+            let contract = provider_contract(id, &spec(&tmp)).unwrap();
             assert!(contract.conformance_errors().is_empty());
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
             assert_eq!(
@@ -619,10 +614,8 @@ mod tests {
 
     #[test]
     fn evidence_identity_and_tier_match_the_executable_contract_and_packed_snapshot() {
-        let root = std::env::temp_dir().join(format!(
-            "qwen-evidence-identity-tier-{}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let transformer = root.join("transformer");
         std::fs::create_dir_all(&transformer).unwrap();
         std::fs::write(
@@ -640,13 +633,12 @@ mod tests {
             assert_eq!(tier.precision, Precision::Bf16);
             assert_eq!(tier.quant, Some(Quant::Q4));
         }
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn weights_free_behavior_configures_and_finishes_the_exact_request_scope() {
-        let spec = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
         let contract = provider_contract("qwen_image_edit", &spec).unwrap();
         let mut fixture = registered_valid_fixture(
             &spec,
@@ -691,7 +683,8 @@ mod tests {
 
     #[test]
     fn stale_calibration_fingerprint_is_rejected_before_execution() {
-        let spec = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
         let contract = provider_contract("qwen_image", &spec).unwrap();
         let mut fixture =
             registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedAttention)
@@ -707,7 +700,8 @@ mod tests {
 
     #[test]
     fn every_optimized_selection_is_staged_and_exactly_parameterized() {
-        let contract = provider_contract("qwen_image", &spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = provider_contract("qwen_image", &spec(&tmp)).unwrap();
         for strategy in [
             MemoryStrategy::StagedResidency,
             MemoryStrategy::BoundedDecode,
@@ -743,13 +737,14 @@ mod tests {
 
     #[test]
     fn adapters_and_eager_loads_do_not_overstate_block_streaming() {
-        let mut adapted = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut adapted = spec(&tmp);
         adapted.adapters.push(gen_core::AdapterSpec::new(
             "lightning.safetensors".into(),
             1.0,
             gen_core::AdapterKind::Lora,
         ));
-        let mut eager = spec();
+        let mut eager = spec(&tmp);
         eager.load_shape = LoadShape::EagerMaterialization;
         for candidate in [adapted, eager] {
             let contract = provider_contract("qwen_image_edit", &candidate).unwrap();

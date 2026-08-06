@@ -804,6 +804,7 @@ mod tests {
     /// Write a PEFT LoRA `.safetensors` targeting `paths` (each `[out,in]` = `[dim,dim]`), rank `r`,
     /// per-target `.alpha`.
     fn write_lora(
+        tmp: &tempfile::TempDir,
         paths: &[&str],
         dim: usize,
         r: usize,
@@ -826,10 +827,7 @@ mod tests {
                 Tensor::from_vec(vec![alpha], (1,), &dev).unwrap(),
             );
         }
-        let path = std::env::temp_dir().join(format!(
-            "sc10094_lora_{tag}_{}.safetensors",
-            std::process::id()
-        ));
+        let path = tmp.path().join(format!("sc10094_lora_{tag}.safetensors"));
         cst::save(&m, &path).unwrap();
         path
     }
@@ -839,6 +837,7 @@ mod tests {
     /// additive==folded acceptance, end-to-end through the vendored DiT (not just the bare `QLinear`).
     #[test]
     fn install_additive_matches_merge_fold() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let base = random_base_map(&cfg, &dev);
@@ -849,7 +848,7 @@ mod tests {
             "blocks.1.attn2.to_v",
             "blocks.1.attn1.to_k",
         ];
-        let lora = write_lora(&targets, cfg.dim, 4, 8.0, "parity");
+        let lora = write_lora(&tmp, &targets, cfg.dim, 4, 8.0, "parity");
         let specs = vec![AdapterSpec::new(lora.clone(), 0.8, AdapterKind::Lora)];
 
         // Additive: build from the base, install forward-time residuals.
@@ -879,11 +878,12 @@ mod tests {
     /// (same inputs); the report accounts for every target with no host miss.
     #[test]
     fn install_additive_applies_and_shifts() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let base = random_base_map(&cfg, &dev);
         let targets = ["blocks.0.attn1.to_q", "blocks.1.attn2.to_v"];
-        let lora = write_lora(&targets, cfg.dim, 4, 8.0, "shift");
+        let lora = write_lora(&tmp, &targets, cfg.dim, 4, 8.0, "shift");
         let specs = vec![AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)];
 
         let dit_base = dit_from_map(&cfg, base.clone(), &dev);
@@ -905,10 +905,11 @@ mod tests {
     /// targets when installed for the High expert.
     #[test]
     fn install_additive_moe_routing() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let base = random_base_map(&cfg, &dev);
-        let lora = write_lora(&["blocks.0.attn1.to_q"], cfg.dim, 4, 4.0, "moe");
+        let lora = write_lora(&tmp, &["blocks.0.attn1.to_q"], cfg.dim, 4, 4.0, "moe");
         let specs =
             vec![AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)
                 .with_moe_expert(MoeExpert::High)];
@@ -942,8 +943,8 @@ mod tests {
             "blocks.0.attn1.to_q.lokr_w2".into(),
             Tensor::from_vec(vec![1.0f32], (1, 1), &dev).unwrap(),
         );
-        let path =
-            std::env::temp_dir().join(format!("sc10094_lokr_{}.safetensors", std::process::id()));
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("sc10094_lora.safetensors");
         cst::save(&m, &path).unwrap();
         let specs = vec![AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lokr)];
 

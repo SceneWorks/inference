@@ -1293,8 +1293,8 @@ mod tests {
     struct Snapshot(std::path::PathBuf);
 
     impl Snapshot {
-        fn new(tag: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
+        fn new(tmp: &tempfile::TempDir, tag: &str) -> Self {
+            let root = tmp.path().join(format!(
                 "kolors-assetfacts-{tag}-{}-{:?}",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -1373,7 +1373,8 @@ mod tests {
     /// assertion is the factor, not a literal: it is the thing that was wrong.
     #[test]
     fn the_decoder_is_priced_at_its_resident_f32_width_not_its_stored_fp16_one() {
-        let snapshot = Snapshot::new("vae").with_base();
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&tmp, "vae").with_base();
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()));
         let components = crate::registry::component_footprint(&spec).unwrap();
 
@@ -1418,7 +1419,8 @@ mod tests {
     /// file `load_vae` opens, and it prefers the f32 master.
     #[test]
     fn the_decoder_footprint_sizes_the_file_the_loader_opens_not_the_whole_vae_dir() {
-        let snapshot = Snapshot::new("vae-both").with_base();
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&tmp, "vae-both").with_base();
         snapshot.write(
             "vae/diffusion_pytorch_model.safetensors",
             "decoder.conv_in.weight",
@@ -1443,7 +1445,8 @@ mod tests {
     /// admitted for such a load under-predicted the peak by the whole overlay set.
     #[test]
     fn the_resident_overlays_are_declared_priced_and_attributable() {
-        let snapshot = Snapshot::new("overlays").with_base();
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&tmp, "overlays").with_base();
         snapshot.write(
             "control/diffusion_pytorch_model.safetensors",
             "controlnet_cond_embedding.conv_in.weight",
@@ -1547,7 +1550,8 @@ mod tests {
     /// a value that never varies.
     #[test]
     fn a_plain_load_declares_no_overlay_and_keeps_the_phase_envelope() {
-        let snapshot = Snapshot::new("plain").with_base();
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&tmp, "plain").with_base();
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.0.clone()))
             .with_load_shape(LoadShape::DeferredMaterialization);
         let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
@@ -1570,7 +1574,8 @@ mod tests {
     /// because a blanket carve-out (what the sibling providers do) is wrong in one of them.
     #[test]
     fn the_pid_overlay_is_priced_where_the_policy_makes_it_unconditional() {
-        let snapshot = Snapshot::new("pid").with_base();
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&tmp, "pid").with_base();
         snapshot.write(
             "pid/student.safetensors",
             "net.blocks.0.weight",
@@ -1633,7 +1638,8 @@ mod tests {
     /// gate is built from.
     #[test]
     fn a_mixed_snapshot_still_repacks_the_encoder_each_generate() {
-        let snapshot = Snapshot::new("mixed").with_base();
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&tmp, "mixed").with_base();
         // Packed `unet/`, dense `text_encoder/` — the shape that slipped through.
         std::fs::write(
             snapshot.path("unet/config.json"),

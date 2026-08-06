@@ -292,9 +292,8 @@ mod tests {
     /// A tiny two-block SDXL `Transformer2D` sub-stack written to a temp `.safetensors`, so the
     /// stream can be exercised without the 6.6 GB snapshot. Widths are group-64-divisible so the
     /// quantization replay test can pack them.
-    fn fixture(tag: &str, n_blocks: usize) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("sdxl-block-stream-{tag}-{}", std::process::id()));
+    fn fixture(tmp: &tempfile::TempDir, tag: &str, n_blocks: usize) -> std::path::PathBuf {
+        let dir = tmp.path().join(format!("sdxl-block-stream-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.safetensors");
         let mut named: Vec<(String, Array)> = Vec::new();
@@ -361,7 +360,8 @@ mod tests {
     /// visible, which is what the second half asserts.
     #[test]
     fn block_stream_drains_exactly_what_the_block_read() {
-        let path = fixture("drain", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "drain", 2);
         let s = stream(&path, 2);
         let mut view = s.open().unwrap();
         let before = view.len();
@@ -406,7 +406,8 @@ mod tests {
     /// accumulates. Re-opening returns the full key set every time.
     #[test]
     fn each_window_opens_an_independent_view() {
-        let path = fixture("reopen", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "reopen", 2);
         let s = stream(&path, 2);
         let mut first = s.open().unwrap();
         let full = first.len();
@@ -419,7 +420,8 @@ mod tests {
 
     #[test]
     fn out_of_range_blocks_are_rejected() {
-        let path = fixture("range", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "range", 2);
         let s = stream(&path, 2);
         let mut view = s.open().unwrap();
         let err = match s.materialize(&mut view, 2) {
@@ -435,7 +437,8 @@ mod tests {
     /// a different tier or group size.
     #[test]
     fn a_materialized_block_replays_the_recorded_quantization() {
-        let path = fixture("quant", 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "quant", 1);
         let mut s = stream(&path, 1);
 
         let mut view = s.open().unwrap();
@@ -489,7 +492,8 @@ mod tests {
     /// block 1 must NOT appear on block 0.
     #[test]
     fn captured_adapters_are_reinstalled_per_block() {
-        let path = fixture("adapters", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "adapters", 2);
         let mut s = stream(&path, 2);
         let mut twin = resident(&s, 2);
         let a = Array::from_slice(&vec![0.5f32; (DIMS * 2) as usize], &[DIMS, 2]);
@@ -528,7 +532,8 @@ mod tests {
     /// error, and no memory assertion that would notice. This proves the stream refuses instead.
     #[test]
     fn a_streamed_block_missing_its_ip_pair_errors_loudly() {
-        let path = fixture("ip", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "ip", 2);
         let mut s = stream(&path, 2);
         let mut twin = resident(&s, 2);
         // Install an IP pair on block 0 ONLY, exactly the partial state the guard exists for.
@@ -570,7 +575,8 @@ mod tests {
     /// directions are checked.
     #[test]
     fn block_adapter_paths_all_resolve() {
-        let path = fixture("paths", 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "paths", 1);
         let s = stream(&path, 1);
         let mut twin = resident(&s, 1);
         let listed = twin[0].adaptable_paths();
@@ -601,7 +607,8 @@ mod tests {
     /// ordinary no-IP path (the mutation-discriminating other half of the test above).
     #[test]
     fn no_ip_installed_means_no_ip_guard() {
-        let path = fixture("noip", 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(&tmp, "noip", 2);
         let mut s = stream(&path, 2);
         let mut twin = resident(&s, 2);
         s.capture_from(&mut twin);

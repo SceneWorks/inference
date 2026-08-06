@@ -887,7 +887,8 @@ mod tests {
     #[test]
     fn zero_init_branch_is_identity() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
 
@@ -914,7 +915,8 @@ mod tests {
         let dev = Device::Cpu;
         // ≥2 main blocks + a nudged branch so both the base attention and the injected branch
         // attention actually contribute (a zero-init branch would leave only the base to compare).
-        let (mut dit, c, path) = tiny_dit_layers(2);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit_layers(&tmp, 2);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let mut branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -948,7 +950,8 @@ mod tests {
     #[test]
     fn scale_zero_is_base_forward() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -981,7 +984,8 @@ mod tests {
         // assert below). Seed is 10794-adjacent but distinct from the sibling tests so they don't
         // share a trajectory.
         let mut rng = StdRng::seed_from_u64(10795);
-        let (dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         // Seeded twin of `nudge_vars`: nudge off the zero-init identity so there's a signal to
@@ -1054,7 +1058,8 @@ mod tests {
     #[test]
     fn dense_and_checkpoint_grads_match_control() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -1124,14 +1129,13 @@ mod tests {
     #[test]
     fn train_and_infer_branch_paths_match() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let train_b = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&train_b, &dev);
-        let ckpt = std::env::temp_dir().join(format!(
-            "krea_ctrl_parity_{}.safetensors",
-            std::process::id()
-        ));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_parity.safetensors");
         train_b.save(&ckpt).unwrap();
         let mut infer_b = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
         infer_b.freeze();
@@ -1162,7 +1166,6 @@ mod tests {
         assert!(report[0].0.is_finite() && report[0].1 > 0.0);
         // Nudged (nonzero) projections => the branched velocity differs from base.
         assert_ne!(flat(&v_base), v_infer);
-        let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1173,7 +1176,8 @@ mod tests {
     #[test]
     fn residual_clamp_caps_swamping() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
 
         // Blow the projections up: residuals many times the stream norm.
@@ -1273,13 +1277,14 @@ mod tests {
     #[test]
     fn checkpoint_roundtrip() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
 
-        let ckpt =
-            std::env::temp_dir().join(format!("krea_ctrl_ckpt_{}.safetensors", std::process::id()));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_parity.safetensors");
         branch.save(&ckpt).unwrap();
         let mut loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
         // Inference mode (detached weight reads) must not change values — only graph tracking.
@@ -1315,14 +1320,13 @@ mod tests {
     #[test]
     fn checkpoint_empty_inject_offset_is_typed_error() {
         let dev = Device::Cpu;
-        let (_dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
 
-        let ckpt = std::env::temp_dir().join(format!(
-            "krea_ctrl_ckpt_empty_{}.safetensors",
-            std::process::id()
-        ));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_ckpt_empty.safetensors");
         branch.save(&ckpt).unwrap();
 
         // Corrupt just the scalar meta tensor to size-0, re-save, and reload.
@@ -1338,7 +1342,6 @@ mod tests {
             loaded.is_err(),
             "size-0 inject_offset must be a typed error, not a panic"
         );
-        let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1350,7 +1353,8 @@ mod tests {
     #[test]
     fn inject_offset_topology() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit_layers(2);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_layers(&tmp, 2);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
 
         // offset + n must fit in the main stack.
@@ -1409,8 +1413,8 @@ mod tests {
         }
 
         // The offset is persisted and the reloaded forward matches.
-        let ckpt =
-            std::env::temp_dir().join(format!("krea_ctrl_off_{}.safetensors", std::process::id()));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_ckpt_empty.safetensors");
         branch.save(&ckpt).unwrap();
         let loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
         assert_eq!(loaded.inject_offset(), 1);
@@ -1435,7 +1439,8 @@ mod tests {
     fn from_checkpoint_quantized_preserves_branch_direction() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(11743);
-        let (dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         // Nudge off the zero-init identity (seeded) so there is a residual to preserve.
@@ -1443,10 +1448,8 @@ mod tests {
             v.set(&randn_seeded(&mut rng, 0.0, 0.02, v.as_tensor().dims()))
                 .unwrap();
         }
-        let ckpt = std::env::temp_dir().join(format!(
-            "krea_ctrl_quant_{}.safetensors",
-            std::process::id()
-        ));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_quant.safetensors");
         branch.save(&ckpt).unwrap();
 
         let (x0, cap, _) = tiny_batch_seeded(&c, &mut rng);
@@ -1501,7 +1504,6 @@ mod tests {
             "Q4 branch residual must stay correlated with bf16: cos {c4}"
         );
 
-        let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1511,12 +1513,13 @@ mod tests {
     #[test]
     fn quantized_zero_init_is_identity() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         // Zero-init branch (untouched `from_base` — proj_out zeros), saved and reloaded quantized.
         let zero = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
-        let ckpt =
-            std::env::temp_dir().join(format!("krea_ctrl_qid_{}.safetensors", std::process::id()));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_quant.safetensors");
         zero.save(&ckpt).unwrap();
         let q4 = ControlBranch::from_checkpoint_quantized(&ckpt, &c, &dev, Quant::Q4).unwrap();
 
