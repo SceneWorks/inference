@@ -1436,6 +1436,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         preflight = job.split("- name: S18 memory preflight", 1)[1].split("- name:", 1)[0]
         self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", preflight)
         self.assertNotIn("continue-on-error", preflight)
+        # The guard and the run must read the SAME geometry, or the preflight clears one bucket
+        # while the sweep measures another — which is precisely the hole that let an unguarded
+        # row F reach the runner. Both steps take it from the one dispatch input.
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", preflight)
+        sweep = job.split("- name: Run the S18 coherence sweep", 1)[1]
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", sweep)
+        self.assertNotIn('KREA_SMOKE_W: "832"', job)
+        self.assertEqual(inputs["krea_s18_geometry"]["default"], "832x480")
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
