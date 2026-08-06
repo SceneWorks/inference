@@ -334,9 +334,13 @@ pub const T5_BLOCKS: usize = 24;
 ///
 /// | rung-4 scope | request peak | vs control |
 /// |---|---:|---:|
-/// | control (no window) | 19.2071 GiB | — |
-/// | `TextEncoder` | 19.2071 GiB | **−0.00%** |
+/// | control (no window) | 19.2065 GiB | — |
+/// | `TextEncoder` | 19.2065 GiB | **−0.00%** |
 /// | `Dit` | 14.6932 GiB | −23.50% |
+///
+/// (The first two rows previously read 19.2071 GiB, which is `chroma1_hd`'s staged peak rather than
+/// the Base one this table is labelled with. Re-taken on Base: 19.2065 GiB. The percentages and the
+/// `Dit` row are unchanged — sc-15520 review round 2.)
 ///
 /// Ladder rung 1 already sheds the encoder before the heavy phase loads, so the request peak *is*
 /// the heavy phase, and bounding a phase that is not the binding one is not a saving. Chroma

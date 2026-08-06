@@ -229,10 +229,16 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 ///
 /// | scope | request peak | vs control | ms/step |
 /// |---|---:|---:|---:|
-/// | control (no window) | 19.2071 GiB | — | 7020 |
-/// | `TextEncoder` | 19.2071 GiB | **−0.00%** | 8200 |
-/// | `Dit` | **14.6932 GiB** | **−23.50%** | 10090 |
-/// | `Both` | 14.6932 GiB | −23.50% | 12279 |
+/// | control (no window) | 19.2065 GiB | — | 10033 |
+/// | `TextEncoder` | 19.2065 GiB | **−0.00%** | 9081 |
+/// | `Dit` | **14.6932 GiB** | **−23.50%** | 12243 |
+/// | `Both` | 14.6932 GiB | −23.50% | 10963 |
+///
+/// The control and `TextEncoder` rows previously read 19.2071 GiB. That is `chroma1_hd`'s staged
+/// peak, not `chroma1_base`'s — the two differ by 0.0006 GiB, and this table is labelled Base. HD
+/// re-took this comparison, so the figure was real but attributed to the wrong entry. Re-taken on
+/// Base at the current pin it is 19.2065 GiB, which is exactly what this family's own rung-1 row
+/// publishes. The percentages and both `Dit` rows are unchanged (sc-15520 review round 2).
 ///
 /// All three render a byte-identical image; only one moves the request peak. The reason
 /// `TextEncoder` is *exactly* inert here is worth stating, because the naive reading of the phase
