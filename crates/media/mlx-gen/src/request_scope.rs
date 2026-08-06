@@ -496,6 +496,11 @@ mod tests {
                 include_str!("../mlx-gen-mage/src/model.rs"),
                 "MageFlowConfig::mage_flow().depth",
             ),
+            (
+                "sana",
+                include_str!("../mlx-gen-sana/src/memory_strategy.rs"),
+                "SanaTransformerConfig::sana_1600m().num_layers",
+            ),
             // sc-15528. The marker is the DUAL-expert derivation: Bernini's rung-4 window covers
             // both experts in one global index space, so the count handed to this core is
             // `2 * num_layers`. A regression to one expert's depth would silently admit a window at
