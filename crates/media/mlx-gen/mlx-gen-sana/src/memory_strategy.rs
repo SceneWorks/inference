@@ -100,7 +100,8 @@ pub const ATTENTION_CHUNK_SIZES_REJECTED: &[u32] = &[67_108_864];
 /// account for it is the **Gemma-2 caption encoder at 2211.4 MiB** plus its conditioning
 /// activations. SC-15969's own survey noted that a TextEncoder-scoped window is structurally
 /// available for this family; that scope, not the DiT one, is what would move SANA's peak — tracked
-/// as its own story because the encoder lives in `mlx-gen-pid` and is shared with PiD and LTX.
+/// as **sc-17859**, its own story because the encoder lives in `mlx-gen-pid` and is shared with PiD
+/// and LTX, so windowing it is a change to a component three families load.
 ///
 /// The implementation is retained deliberately: it is correct, it is exercised by the weights-free
 /// block-stream and windowed-forward tests, and it is the foundation the TextEncoder scope builds
