@@ -1329,6 +1329,12 @@ jobs:
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
+    #
+    # sc-17518 added a third test to the golden-free adapter step. MEASURED 2026-08-06 on nax-macos,
+    # weights resident: `lightning_loras_apply_cleanly` 0.29-0.51s of libtest time over three runs
+    # (it installs adapters onto a lazily-loaded tree and renders nothing), so the step is ~3s and
+    # the 736s total above is unchanged to the minute. The 90-minute cap is untouched: it is sized
+    # by the materialization budget, and this test transfers no bytes the lane did not already pull.
     timeout-minutes: 90
     env:
       # Repo-variable names are deliberately NOT the test-facing names. `vars.QWEN_IMAGE_SNAPSHOT`
@@ -1418,9 +1424,9 @@ jobs:
       #      first. None of them has it — each panics on a missing variable. `perf.rs` DID have it
       #      (`eprintln!("skip: ...")` + `return`); this commit removed that, so those two tests now
       #      fail loudly. They are still not in this lane, for a different reason: they FAIL on real
-      #      weights and always have (sc-17513). Nor is `fit_preview_rgb_factors` (sc-17515) or
-      #      `lightning_loras_apply_cleanly` (sc-17518). A lane that is red every week is ignored
-      #      within a month; each exclusion is recorded with its measurement in the manifest.
+      #      weights and always have (sc-17513). Nor is `fit_preview_rgb_factors` (sc-17515). A lane
+      #      that is red every week is ignored within a month; each exclusion is recorded with its
+      #      measurement in the manifest.
       - name: Run Qwen-Image control-branch gates
         run: |
           set -o pipefail
@@ -1516,16 +1522,18 @@ jobs:
           }
           run_one lightning_render_is_coherent
           run_one edit_lightning_render_is_coherent
-      # Two of `adapter_real_weights.rs`'s nine tests resolve NO golden — they only need the real
+      # Three of `adapter_real_weights.rs`'s nine tests resolve NO golden — they only need the real
       # 60-block tree — so they do not wait on the sc-17503 oracle bundle the other six do.
       # `routing_map_covers_full_fork_surface` proves the host LoRA map reaches all 60 x 14 fork
       # targets and refuses the paths it should; `kohya_matches_peft_on_real_tree` proves the two
       # adapter naming conventions produce byte-identical results across all 840 modules.
       #
-      # `lightning_loras_apply_cleanly` is the third golden-free one and is NOT here: it asserts
-      # `applied == 840`, and the pinned `Qwen-Image-Lightning-8steps-V1.1-bf16` file carries only
-      # 12 of the 14 per-block modules (no img/txt modulation), so it applies 720 with zero
-      # unmatched. sc-17518.
+      # `lightning_loras_apply_cleanly` joins them here as of sc-17518. It was excluded because it
+      # asserted `applied == 840` — the HOST map's target count, never a measured application. Both
+      # pinned lightx2v files carry 60 x 12 = 720 with zero unmatched (no img/txt modulation is
+      # trained, in any published Lightning release), so the assertion now pins the FILE's surface
+      # per module class. It is the only step here that reads MLX_GEN_MODELS_ROOT: the test resolves
+      # both LoRAs from it, and fails loudly (never skips) when it is unset.
       - name: Run Qwen-Image adapter-surface gates (golden-free)
         run: |
           set -o pipefail
@@ -1542,6 +1550,7 @@ jobs:
           }
           run_one routing_map_covers_full_fork_surface
           run_one kohya_matches_peft_on_real_tree
+          run_one lightning_loras_apply_cleanly
 
   # sc-17284 — the integrated PiD (progressive-in-decoder) super-resolution decode seam, for BOTH
   # engines that have one. Split from the job above because it is the only place `FLUX_DEV_DIR` and

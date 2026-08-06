@@ -181,30 +181,33 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 19 + 5 = 45:
+# The 45 account for exactly, and the arithmetic is the point — 21 + 20 + 4 = 45:
 #
-# WIRED, 19: 15 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2), 3 in
+# WIRED, 20: 16 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3), 3 in
 # `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing on
-# nax-macos 2026-08-04.
+# nax-macos — 19 of them 2026-08-04, `lightning_loras_apply_cleanly` 2026-08-06 (sc-17518).
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 5. A lane that is red every week is ignored within a month
+# EXCLUDED WITH A MEASUREMENT, 4. A lane that is red every week is ignored within a month
 # (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
 #   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
 #     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
 #     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
 #     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
 #   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
-#   * `lightning_loras_apply_cleanly` x1 — FAILS: asserts 840 per-block modules, and the pinned
-#     lightx2v file carries 12 of 14 per block (no img/txt modulation) so it applies 720 with zero
-#     unmatched. Golden-free, so it joins the wired adapter step the moment sc-17518 settles it.
 #   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
 #     exist in no repository and on no Hub.
+#
+# `lightning_loras_apply_cleanly` was the fifth exclusion until sc-17518 and is now WIRED above. It
+# asserted `applied == 840` — the HOST map's 60 x 14 target count, never a measured application.
+# Both pinned lightx2v files apply 60 x 12 = 720 with zero unmatched; no published Lightning release
+# has ever trained `img_mod.1`/`txt_mod.1`. Evidence and the per-class assertion that replaced the
+# raw count are in the test's doc comment.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
 revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
