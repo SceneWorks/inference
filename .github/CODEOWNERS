@@ -1,12 +1,26 @@
 # The current canonical repository maintainer owns every surface. Keep the
 # category entries explicit so ownership can move to dedicated SceneWorks teams
 # without changing the release topology.
-* @zakkeown
+#
+# This file was previously assigned to an account that does not exist, so every line
+# failed validation as "Unknown owner" and the file did nothing at all — no reviewer was
+# ever requested. Verify with `gh api repos/SceneWorks/inference/codeowners/errors` after
+# editing; an owner needs write access to the repository or its line is silently dropped.
+#
+# Ownership here is deliberately NOT enforced by ruleset 20481541
+# (`require_code_owner_review: false`). This repository is public but has a single
+# collaborator, and GitHub forbids approving your own pull request — enforcing code-owner
+# review would block every maintainer-authored PR on an approval no account exists to give.
+# What this file provides instead is automatic review requests, and GitHub never requests
+# review from a PR's own author: maintainer PRs pass untouched while outside fork
+# contributions raise a review request. Outside contributions cannot merge regardless, since
+# merging and queueing both require write access.
+* @michaeltrefry
 
-/crates/contracts/ @zakkeown
-/crates/bundles/ @zakkeown
-/crates/llm/ @zakkeown
-/crates/media/ @zakkeown
-/scripts/ci/ @zakkeown
-/scripts/release/ @zakkeown
-/.github/ @zakkeown
+/crates/contracts/ @michaeltrefry
+/crates/bundles/ @michaeltrefry
+/crates/llm/ @michaeltrefry
+/crates/media/ @michaeltrefry
+/scripts/ci/ @michaeltrefry
+/scripts/release/ @michaeltrefry
+/.github/ @michaeltrefry
