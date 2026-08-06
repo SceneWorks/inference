@@ -2005,6 +2005,17 @@ jobs:
       # `timeout-minutes: 120`, and using it here would stop recording ~2h into a run this job is
       # allowed 480 minutes for — silently, and in the half of the run where accumulated pressure
       # is most likely. The figure is over this job's own cap so the sampler cannot expire first.
+      # sc-17324 — REFUSE a row this box cannot hold, before spending any GPU time on it.
+      # Two runner deaths (30948568453, 31051413212) were both row F at 832x480: ~49 GiB of MLX
+      # active peak on a ~101 GiB host, which is not a flake but arithmetic. A dying runner takes
+      # the `always()` steps with it, so the cost of finding out the hard way is the whole run's
+      # evidence, not just the row. Deliberately NOT `continue-on-error` — refusing is the point.
+      - name: S18 memory preflight
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}
+        run: python3.12 scripts/ci/s18_memory_preflight.py
       - name: Start GPU fault evidence
         continue-on-error: true
         run: scripts/ci/gpu_fault_evidence.sh start 30000

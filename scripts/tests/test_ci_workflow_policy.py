@@ -1420,6 +1420,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "-s${{ inputs.krea_s18_seeds }}",
             job,
         )
+        # sc-17324: the memory preflight must run, must see the rows actually dispatched, and must
+        # NOT be continue-on-error — refusing a row this host cannot hold is its entire purpose.
+        # It replaces two runner deaths, both row F at 832x480, both of which destroyed every cell
+        # measured up to that point because a dying runner takes the `always()` steps with it.
+        self.assertIn("scripts/ci/s18_memory_preflight.py", job)
+        preflight = job.split("- name: S18 memory preflight", 1)[1].split("- name:", 1)[0]
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", preflight)
+        self.assertNotIn("continue-on-error", preflight)
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
