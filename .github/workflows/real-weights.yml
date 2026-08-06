@@ -797,7 +797,7 @@ jobs:
               *) echo "::error::chroma_ladder_tiers names '$tier'; valid tiers are q4 q8 bf16" >&2; exit 1 ;;
             esac
           done
-          if [[ -z "$(tr -s ' ' '\n' <<<"$CHROMA_LADDER_TIERS" | grep -c .)" || "$(tr -s ' ' '\n' <<<"$CHROMA_LADDER_TIERS" | grep -cx q4)" -ne 1 ]]; then
+          if ! tr ' ' '\n' <<<"$CHROMA_LADDER_TIERS" | grep -qx q4; then
             echo "::error::chroma_ladder_tiers must include q4 — DEFAULT_TIER is what every asserted row measures" >&2
             exit 1
           fi
