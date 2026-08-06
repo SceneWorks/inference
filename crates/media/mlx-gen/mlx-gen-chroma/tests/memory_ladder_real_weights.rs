@@ -256,7 +256,7 @@ fn measure(entry: &str, dir: &std::path::Path, shape: LoadShape, req: &Generatio
     drop(model);
     clear_cache();
     Row {
-        peak_gib: peak as f64 / GIB * (1.0 + req.steps.unwrap_or(1) as f64 / 100.0),
+        peak_gib: peak as f64 / GIB,
         pixels,
         wall,
     }
