@@ -112,8 +112,10 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
 /// shared i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] (sc-9570), which chunks over the query
 /// rows once the `[B,H,Sq,Sk]` scores tensor would exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle
 /// CUDA i32-index limit). The `softmax_last_dim` closure keeps the exact fused softmax; each query row's
-/// softmax is over all keys and independent, so the chunked result is byte-identical to the single pass —
-/// only the large renders trip it. This crate does the head-merge transpose/reshape here.
+/// softmax is over all keys and independent, so the chunked result is *mathematically* equal to the
+/// single pass — not bitwise equal, since narrowing the query axis changes the GEMM `M` and so may change
+/// the f32 accumulation order (SC-15943). Only the large renders trip it. This crate does the head-merge
+/// transpose/reshape here.
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
     let (b, _h, s, _d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
