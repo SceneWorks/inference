@@ -47,7 +47,29 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(pipeline::RENDERER_REGISTRATION)
+        .register_memory_strategy(memory_strategy::RENDERER_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: memory_strategy::RENDERER_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    memory_strategy::RENDERER_ID,
+                    spec,
+                )
+            },
+        })
+        .register_memory_behavior(memory_strategy::RENDERER_MEMORY_BEHAVIOR)
         .register_generator(bernini::FULL_REGISTRATION)
+        .register_memory_strategy(memory_strategy::FULL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: memory_strategy::FULL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    memory_strategy::FULL_ID,
+                    spec,
+                )
+            },
+        })
+        .register_memory_behavior(memory_strategy::FULL_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX Bernini provider catalog.

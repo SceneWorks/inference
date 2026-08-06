@@ -41,6 +41,7 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::media::Image;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
@@ -53,13 +54,13 @@ use mlx_gen::{
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
-use mlx_gen_wan::{WanTransformer, WanVae};
+use mlx_gen_wan::{WanBlockStream, WanTransformer, WanVae};
 
 use crate::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use crate::clip_diff::DiffLossFm;
 use crate::config::{validate_bernini_geometry, BerniniKnobs};
 use crate::connector::MlpConnector;
-use crate::forward::{PackedForward, VitGuidanceParams, VitMode};
+use crate::forward::{PackedForward, Trunk, VitGuidanceParams, VitMode};
 use crate::mar::{
     mar_schedule, post_process_input_embeds, sample_vit_embed, SampledStreams, StreamState, VitCfg,
 };
@@ -923,20 +924,50 @@ impl Bernini {
         // Load each expert and (if quantizing) quantize-then-free it before loading the next, so only
         // one expert's bf16 transient is resident at a time (sc-5360 — `WanTransformer::quantize`
         // eval-frees the bf16 dequant). Without quant this just loads both bf16.
-        let load_expert = |name: &str| -> Result<WanTransformer> {
-            let w = Weights::from_file(self.root.join(name))?;
-            let mut dit = WanTransformer::from_weights(&w, cfg)?;
-            if let Some(q) = self.quant {
-                dit.quantize(q.bits(), None)?;
+        // ── Ladder rungs 3 + 4 (sc-15528) ────────────────────────────────────────────────────
+        // Rung 4 is per-request: when a window is selected the expert's block stack is NEVER
+        // materialized (`from_weights_deferred` holds zero blocks) and the stream rebuilds
+        // `plan.window()` blocks at a time. On a DUAL-expert config that is the whole point --
+        // sc-16354's finding is that a naive per-expert window leaves the idle expert's 40 blocks
+        // resident, and a stack that was never materialized has no idle half to pay for. Both
+        // experts are deferred here, so the bound is over the full 80-block trunk, not one expert.
+        let window = crate::memory_strategy::transformer_window_size(req)?;
+        let attn_budget = crate::memory_strategy::attention_budget(req);
+        let plan = window
+            .map(|size| BlockPlan::new(cfg.num_layers, size))
+            .transpose()?;
+        let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
+            let path = self.root.join(name);
+            let w = Weights::from_file(&path)?;
+            if window.is_some() {
+                let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
+                // No adapters can reach here (`supports_lora: false`), and the stream refuses an
+                // adapted load anyway -- Wan MERGES deltas at load, so a streamed block re-read from
+                // the snapshot would silently carry none of them.
+                let mut stream = WanBlockStream::new(WeightsSource::File(path), cfg.clone(), &[])?;
+                if let Some(q) = self.quant {
+                    // Replayed per materialized block so the streamed weights are byte-identical to
+                    // the resident ones. A pre-packed tier takes this through `cfg.quantization`
+                    // inside the block constructor instead, exactly as the resident path does.
+                    stream.set_quant_bits(q.bits());
+                }
+                stream.set_attention_budget(attn_budget);
+                Ok((dit, Some(stream)))
+            } else {
+                let mut dit = WanTransformer::from_weights(&w, cfg)?;
+                if let Some(q) = self.quant {
+                    dit.quantize(q.bits(), None)?;
+                }
+                dit.set_attention_budget(attn_budget);
+                Ok((dit, None))
             }
-            Ok(dit)
         };
         let latents = {
-            let low_dit = load_expert("low_noise_model.safetensors")?;
+            let (low_dit, low_stream) = load_expert("low_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let high_dit = load_expert("high_noise_model.safetensors")?;
+            let (high_dit, high_stream) = load_expert("high_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
@@ -946,8 +977,14 @@ impl Bernini {
                 &pe_wotxt_wvit,
                 &pe_wotxt_wovit,
             ];
-            let low = BVitExpert::build(&low_dit, streams4)?;
-            let high = BVitExpert::build(&high_dit, streams4)?;
+            let low = BVitExpert::build(
+                Trunk::for_load(&low_dit, low_stream.as_ref(), plan.as_ref(), &req.cancel),
+                streams4,
+            )?;
+            let high = BVitExpert::build(
+                Trunk::for_load(&high_dit, high_stream.as_ref(), plan.as_ref(), &req.cancel),
+                streams4,
+            )?;
             let pf = PackedForward::new(
                 cfg.dim / cfg.num_heads,
                 cfg.out_dim,
@@ -986,7 +1023,15 @@ impl Bernini {
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
         let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        // Ladder rung 2 (sc-15528): an explicit request geometry REPLACES the shipped `auto`
+        // heuristic. Note what the A/B is here -- `auto` already tiles a large decode, so rung 2 is
+        // "this tile edge" versus "the heuristic's tile edge", not "tiled" versus "untiled". A
+        // harness that compared against an untiled decode would be measuring a composition that
+        // never shipped.
+        let tiling = match crate::memory_strategy::decode_tiling(req)? {
+            Some(explicit) => Some(explicit),
+            None => TilingConfig::auto(height as i32, width as i32, out_frames),
+        };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;

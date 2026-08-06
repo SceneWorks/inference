@@ -13,9 +13,9 @@
 //! | Rung | Support | Executable seam |
 //! |---|---|---|
 //! | 0 Resident | Implemented | Both experts co-resident for the whole denoise — today's shipped behaviour |
-//! | 1 Staged residency | Implemented (request-scoped) | **Sequential expert residency**: high expert → boundary → drop + `clear_cache` → low expert |
+//! | 1 Staged residency | Implemented (**unconditional**) | Every completed phase dropped + `clear_cache`d before the next: conditioning → source VAE → experts → decode |
 //! | 2 Bounded decode | Implemented | [`TilingConfig::spatial_only`] over the [`DECODE_TILE_EDGES`] ladder, replacing `TilingConfig::auto` |
-//! | 3 Bounded attention | Implemented | [`mlx_gen::attention::sdpa_budgeted_bhsd`] through both trunk SDPA seams and the planner's hand-rolled softmax |
+//! | 3 Bounded attention | Implemented (trunk) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] through both trunk SDPA seams, on both experts |
 //! | 4 Bounded transformer residency | Implemented (deferred-materialization loads) | [`mlx_gen::block_residency::run_windowed`] over the **80-block** trunk |
 //!
 //! ## Why the trunk is 80 blocks and not 40 (sc-16354)
@@ -39,12 +39,10 @@
 //! window size must divide 40**. [`TRANSFORMER_WINDOW_SIZES`] is exactly the set of proper divisors
 //! of 40, and [`the_published_window_sizes_all_divide_one_expert`](self) pins it.
 //!
-//! Rung 1 attacks the same residency from the cheap side. The expert switch is monotone — `denoise`
-//! latches `switched` and never returns to the high expert — so the high expert is *dead* after the
-//! boundary and the low expert is dead before it. Staging them sequentially costs one extra
-//! sequential file read and bounds the denoise phase to ONE expert. Rung 4's saving is strictly
-//! larger and its cost is strictly higher; the two are independent levers on the same fact, which is
-//! why rung 4 does **not** declare rung 1 as a prerequisite here.
+//! The cheap half of the same problem — releasing the *high* expert at the monotone boundary switch
+//! so only one expert is resident during the denoise — is NOT landed here and is not claimed: see
+//! `_RUNG_ONE_IS_UNCONDITIONAL`. Rung 4 achieves strictly more (zero blocks of both experts), so
+//! nothing in this ladder depends on it.
 //!
 //! ## The cost side of rung 4, priced honestly
 //!
@@ -59,10 +57,9 @@
 //!
 //! ## Disclosure: an optimized request may EVICT the warm cross-request cache
 //!
-//! Rungs 1 and 4 are request-scoped. Rung 1 releases the high expert mid-denoise, so a warm generator
-//! serving a subsequent resident request re-reads it. Rung 4 never materializes a block at all, so
-//! there is nothing warm to inherit. Both are stated here rather than discovered as a latency
-//! regression.
+//! Rung 4 is request-scoped and never materializes a block at all, so a warm generator that served a
+//! windowed request has no block residency to hand the next one — every subsequent request re-reads
+//! the stack it needs. Stated here rather than discovered as a latency regression.
 //!
 //! ## What is NOT declared, and why
 //!
@@ -77,10 +74,10 @@
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
-    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
@@ -563,7 +560,7 @@ pub(crate) fn registered_begin_request(
     )
 }
 
-pub(crate) fn begin_request(
+pub fn begin_request(
     provider_id: &'static str,
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -618,25 +615,59 @@ fn begin_with_cleanup(
     )))
 }
 
-// ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────
-
-/// Rung 3: the bounded-attention plan for this request. Cancellation is threaded so a per-chunk
-/// `eval` observes a cancel promptly rather than at the next step boundary.
-pub(crate) fn attention_plan(req: &GenerationRequest) -> mlx_gen::attention::AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => mlx_gen::attention::AttentionPlan::budgeted(
-            mlx_gen::attention::AttentionBudget::CONSTRAINED,
-        )
-        .with_cancel(&req.cancel),
-        _ => mlx_gen::attention::AttentionPlan::UNBOUNDED,
-    }
+/// The registry rows for one adopting provider.
+///
+/// Both providers get the full set — contract, safety check, weights-free contract fixture and
+/// behaviour — because a half-registered family is exactly the "declaration is not reachability"
+/// hazard: a contract nothing resolves through cannot be walked by registry conformance, and a
+/// behaviour registration without a contract fixture cannot be exercised weights-free.
+macro_rules! memory_registration {
+    ($registration:ident, $behavior:ident, $provider_id:expr) => {
+        pub(crate) const $registration: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| {
+                    crate::memory_strategy::memory_strategy_contract($provider_id, spec)
+                },
+                safety_check: crate::memory_strategy::safety_check,
+            };
+        pub(crate) const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+                begin_request: |spec, contract, context| {
+                    crate::memory_strategy::registered_begin_request(
+                        $provider_id,
+                        spec,
+                        contract,
+                        context,
+                    )
+                },
+            };
+    };
 }
 
-/// Rung 3, trunk half: the budget replayed onto every materialized block.
+memory_registration!(
+    RENDERER_MEMORY_REGISTRATION,
+    RENDERER_MEMORY_BEHAVIOR,
+    RENDERER_ID
+);
+memory_registration!(FULL_MEMORY_REGISTRATION, FULL_MEMORY_BEHAVIOR, FULL_ID);
+
+// ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────
+
+/// Rung 3: the budget applied to every trunk SDPA seam.
 ///
-/// The trunk carries a budget rather than a plan because a `WanBlockStream` outlives the borrow a
-/// plan's cancel flag would need. The denoise loop already checks cancellation once per step, and a
-/// rung-3 chunk is far shorter than a step, so nothing is lost.
+/// A budget rather than an `AttentionPlan` because a `WanBlockStream` outlives the borrow a plan's
+/// cancel flag would need. The denoise loop already checks cancellation once per step and a rung-3
+/// chunk is far shorter than a step, so nothing is lost.
+///
+/// **Scope, stated precisely.** This covers both per-block SDPA seams of the denoise trunk — the
+/// self-attention over the packed `[sources…, target]` sequence and the cross-attention over the
+/// prompt streams — on both experts, resident or windowed. It does **not** cover the planner's
+/// hand-rolled softmax (`qwen2_5_vl.rs`, `vision.rs`): those run in the conditioning phase, which is
+/// fully released before either expert loads, so bounding them cannot move the request peak the way
+/// bounding the trunk can. Tracked separately; see the story linked on sc-15528.
 pub(crate) fn attention_budget(req: &GenerationRequest) -> mlx_gen::attention::AttentionBudget {
     match req.memory {
         Some(memory) if memory.chunk_attention => mlx_gen::attention::AttentionBudget::CONSTRAINED,
@@ -693,15 +724,25 @@ pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<T
     )))
 }
 
-/// Rung 1: whether this request stages its expert residency.
+/// Rung 1 has **no request-side resolver, deliberately**, and this note is the declaration.
 ///
-/// The lever is the **expert sequencing**, not the cross-phase staging: `generate_impl` already drops
-/// every conditioning network before the experts load, unconditionally, on both providers. What this
-/// selects is whether the high expert is released at the boundary switch instead of sitting resident
-/// beside the low one for the rest of the denoise.
-pub(crate) fn stage_residency(req: &GenerationRequest) -> bool {
-    req.memory.is_some_and(|memory| memory.stage_residency)
-}
+/// Both `generate_impl`s release every completed phase unconditionally: the UMT5 encoder is dropped
+/// and `clear_cache`d before the source-VAE encode, the source-VAE encoder before the experts, and
+/// the experts before the decode. `GenerationMemory::stage_residency` therefore selects nothing —
+/// the provider is *structurally* always-staged, which is why both descriptors already advertise
+/// `supports_sequential_offload` and why `advertises_sequential_offload` pins it on each.
+///
+/// A resolver that branched on the flag would be a lever over behaviour that does not vary, i.e. a
+/// declaration with no enforcement behind it. The rung is `Implemented` because the synchronized
+/// phase release is real and executed, not because a flag is read.
+///
+/// **What this does NOT include**, stated so it is not read as covered: releasing the *high* expert
+/// at the boundary switch so only one expert is resident during the denoise. The switch is monotone,
+/// so that is sound, and sc-16354 identifies it as the cheap half of the dual-expert problem — but it
+/// needs `BVitExpert`/`BExpert` to own their transformer rather than borrow it, which is a larger
+/// refactor than this story lands. Rung 4 already achieves strictly more (zero blocks of BOTH
+/// experts), so nothing here depends on it. Tracked separately; see the story linked on sc-15528.
+const _RUNG_ONE_IS_UNCONDITIONAL: () = ();
 
 /// The strategy parameters this provider accepts, for a caller that wants the whole domain in one
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
@@ -880,7 +921,6 @@ mod tests {
         // Absent memory block: every lever off, nothing rejected.
         assert!(decode_tiling(&base).expect("no memory").is_none());
         assert!(transformer_window_size(&base).expect("no memory").is_none());
-        assert!(!stage_residency(&base));
         assert!(attention_budget(&base).is_unbounded());
 
         let with = |memory: GenerationMemory| GenerationRequest {
@@ -941,12 +981,8 @@ mod tests {
             Some(TRANSFORMER_WINDOW_SIZE as usize)
         );
 
-        // Rungs 1 and 3 are plain switches.
-        let staged = with(GenerationMemory {
-            stage_residency: true,
-            ..Default::default()
-        });
-        assert!(stage_residency(&staged));
+        // Rung 3 is a plain switch. Rung 1 has no resolver by design — see
+        // `_RUNG_ONE_IS_UNCONDITIONAL`.
         let chunked = with(GenerationMemory {
             chunk_attention: true,
             ..Default::default()
