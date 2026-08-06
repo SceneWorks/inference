@@ -1229,3 +1229,54 @@ profiles = ["media-macos"]
 environment = ["KREA_DISTILL_LORA_SNAPSHOT"]
 download_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
 expected_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+
+[[models]]
+# SANA-1.6B 1024px, the SceneWorks MLX re-host (epic 8485, memory ladder SC-15523). The pin exists so
+# the SC-15523 rung-3/rung-4 evidence records can name the exact bytes they were measured over:
+# `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on disk into the
+# `model_revision` + `model_inventory_sha256` pair every `MEMORY_EVIDENCE_V1` record carries, and
+# without it those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 turnkey tier, the tier both SANA entries ship and the one the ladder
+# was measured at; bf16/ and q8/ are siblings under the same revision and are inventoried when
+# present, so a later per-tier sweep changes the inventory sha rather than silently reusing this one.
+key = "sana-1600m-mlx"
+repository = "SceneWorks/Sana_1600M_1024px_mlx"
+revision = "ac421696dd6eb0b41f446f4c45a53ccc057d82a1"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_1600M"]
+# The image memory-ladder harnesses are operator-run on authoritative Apple hardware, not CI-wired —
+# the same posture as every sibling family on epic 15448 (Chroma's CHROMA_LADDER_*, SDXL's
+# SDXL_LADDER_*, Kolors'), none of which has a real-weights lane either. A rung-4 sweep re-materializes
+# the trunk once per block per step, so a hosted lane would be hours per entry. This entry exists for
+# the evidence binding above; wiring a lane is a separate, family-wide decision (sc-17848).
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]
+
+[[models]]
+# SANA-Sprint 1.6B 1024px — the CFG-free, continuous-time-consistency-distilled few-step variant
+# (sc-8490). Same Linear-DiT backbone and the same DC-AE, a different checkpoint and a different
+# sampler, which is exactly why it owes its own memory-ladder evidence rather than inheriting the
+# base entry's. It is the SC-15523 representative for the multi-row sweeps: 2 CFG-free steps against
+# base SANA's 40 trunk forwards per image.
+key = "sana-sprint-1600m-mlx"
+repository = "SceneWorks/Sana_Sprint_1.6B_1024px_mlx"
+revision = "0b0d18484cac2fb515e76d25a09a5911ae4ab58e"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_SPRINT"]
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]

@@ -54,6 +54,12 @@
 //! | `SANA_LADDER_1600M` | `sana_1600m` |
 //! | `SANA_LADDER_SPRINT` | `sana_sprint_1600m` — the representative entry for the heavy sweeps (2 CFG-free steps against base SANA's 40 trunk forwards per image) |
 //!
+//! Evidence minting additionally requires `INFERENCE_REVISION`, `SCENEWORKS_REVISION`, and — **per
+//! entry**, because the two entries are two different HF repositories — `<VAR>_MODEL_REVISION` and
+//! `<VAR>_INVENTORY_SHA256`, both taken from
+//! `scripts/release/verify_model_snapshot.py --model sana-1600m-mlx --snapshot <root>
+//! --inventory-output <json>` against the pin in `release/real-weight-models.toml`.
+//!
 //! ```text
 //! SANA_LADDER_1600M=<root containing q4/> SANA_LADDER_SPRINT=<root containing q4/> \
 //!   cargo test -p mlx-gen-sana --release --test memory_ladder_real_weights \
@@ -828,7 +834,7 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
             }
             previous = Some((strategy, row.peak_gib));
 
-            let record = evidence(entry, &load, &contract, strategy, memory, edge, &row);
+            let record = evidence(entry, var, &load, &contract, strategy, memory, edge, &row);
             println!("{}", record.to_json_line().expect("serialize evidence"));
             minted += 1;
         }
@@ -840,8 +846,10 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evidence(
     entry: &str,
+    var: &str,
     load: &LoadSpec,
     contract: &mlx_gen::gen_core::MemoryProviderContract,
     strategy: MemoryStrategy,
@@ -912,8 +920,14 @@ fn evidence(
         observed_peak_bytes: row.peak_bytes,
         inference_revision: required_revision("INFERENCE_REVISION"),
         sceneworks_revision: required_revision("SCENEWORKS_REVISION"),
-        model_revision: required_revision("MEMORY_MODEL_REVISION"),
-        model_inventory_sha256: required_sha256("MEMORY_MODEL_INVENTORY_SHA256"),
+        // PER ENTRY, not global. The two entries are two different HF repositories at two
+        // different revisions, so a single `MEMORY_MODEL_REVISION` would make one of the two
+        // records name weights it was not measured over — the exact "mismatched evidence" this
+        // story's last acceptance criterion is about. Both values come from
+        // `scripts/release/verify_model_snapshot.py --inventory-output` over the entry's own
+        // snapshot, which is the only tool that binds a pinned fixture to the bytes on disk.
+        model_revision: required_revision(&format!("{var}_MODEL_REVISION")),
+        model_inventory_sha256: required_sha256(&format!("{var}_INVENTORY_SHA256")),
         harness_version: "inference-sana-memory-ladder-v1".to_owned(),
         output_sha256: format!("{:x}", Sha256::digest(&row.pixels)),
         parity: MemoryParityContract::Exact,
