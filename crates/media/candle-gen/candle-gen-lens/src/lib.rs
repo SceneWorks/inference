@@ -557,6 +557,18 @@ impl Pipeline {
         };
         let attention_plan = gen_core::attention_budget::AttentionPlan::budgeted(attention_budget)
             .with_cancel(cancel);
+        // sc-17719 — an all-valid mask makes `build_joint_mask` an all-zero additive term that is then
+        // broadcast onto the FULL score matrix `[B, heads, q, k]` in every block, every step. At 2048²
+        // that matrix is ~16.4k × 16.4k per head, so adding a known zero to it is the largest piece of
+        // pure waste in the denoise. `forward` documents `text_valid: None` as the skip path. After
+        // sc-8993's CFG-off gate the all-valid case is the common one (a single unpadded prompt, or a
+        // cond-only encode); zeros appear only when the two prompts differ in length and the shorter
+        // one is padded. Resolved once here — one host sync per render, never per step.
+        let text_valid = if mask.min_all()?.to_scalar::<f32>()? == 1.0 {
+            None
+        } else {
+            Some(mask)
+        };
         let transformer_window = if memory.stream_transformer_blocks {
             memory.transformer_window_size.ok_or_else(|| {
                 CandleError::Msg("lens: streamed DiT is missing its window size".into())
@@ -580,7 +592,7 @@ impl Pipeline {
                     return comps.transformer.forward_with_memory(
                         latents,
                         features,
-                        Some(mask),
+                        text_valid,
                         sigma,
                         1,
                         latent_h,
@@ -595,7 +607,7 @@ impl Pipeline {
                 let noise = comps.transformer.forward_with_memory(
                     &hidden,
                     features,
-                    Some(mask),
+                    text_valid,
                     sigma,
                     1,
                     latent_h,

@@ -11,8 +11,6 @@
 //! below (and by the Qwen3 conformance run in `conformance.rs`, now thinking-aware).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use candle_core::{DType, Device, Tensor};
 
@@ -22,7 +20,6 @@ use core_llm::{Channel, LoadSpec, Message, StreamEvent, TextLlm, TextLlmRequest,
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
 const VOCAB: usize = 32;
-static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// A ChatML-style Jinja template that **gates `enable_thinking`** (so the provider advertises a
 /// thinking mode) and, in no-think mode, injects the model's closed `<think></think>` generation
@@ -52,11 +49,14 @@ fn tokenizer_json() -> String {
     )
 }
 
-fn write_thinking_snapshot() -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("candle-llm-thinking-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+/// sc-17755: returns the `TempDir` guard rather than a bare `PathBuf`. Callers load from the
+/// snapshot after this returns, so the guard must stay bound; the tree then leaves on `Drop`.
+fn write_thinking_snapshot() -> tempfile::TempDir {
+    let guard = tempfile::Builder::new()
+        .prefix("candle-llm-thinking-")
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
     std::fs::write(
         dir.join("config.json"),
         r#"{ "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
@@ -97,12 +97,13 @@ fn write_thinking_snapshot() -> PathBuf {
         arrays.insert(p("mlp.down_proj.weight"), randn((h, inter), &mut rng));
     }
     candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
-    dir
+    guard
 }
 
 #[test]
 fn thinking_provider_passes_core_llm_conformance() {
-    let dir = write_thinking_snapshot();
+    let guard = write_thinking_snapshot();
+    let dir = guard.path();
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
 
     // The template gates `enable_thinking`, so the provider advertises a thinking mode.
@@ -118,7 +119,6 @@ fn thinking_provider_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load thinking provider")),
         &TextLlmProfile::cheap(),
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A model that *actually reasons*: Qwen3's chat template gates `enable_thinking`, so an Enabled

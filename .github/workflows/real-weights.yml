@@ -8,8 +8,8 @@ name: Real-weight validation
 # keep moving, and it should not cost a workflow PR each time.
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos
-#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   BOTH boxes
+#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  BOTH boxes
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
 #   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
@@ -28,26 +28,45 @@ name: Real-weight validation
 # ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
 # measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
 #
-# `rw-mage` is pinned to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB
-# frozen-Torch oracle bundle behind `MAGE_ORACLE_SEED_DIR`, which exists on no Hub and which this
-# workflow deliberately refuses to regenerate in Actions. Every other set self-provisions on first
-# use, so its label can move freely.
+# `rw-mage` IS NOT PINNED — it is registered on BOTH boxes. This block used to claim it was "pinned
+# to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB frozen-Torch oracle bundle
+# behind `MAGE_ORACLE_SEED_DIR`". A label is not a pin, and this one is on both: observed 2026-08-05
+# (sc-17284) when `mlx-qwen-image-producers` ran on `nax-macos-2` with
+# `labels=self-hosted,macOS,ARM64,rw-mage`, which a runner cannot accept unless it carries every
+# requested label.
 #
+# What IS true about the bundle is the invariant that replaces the pin. `MAGE_ORACLE_SEED_DIR` is
+# `~/Library/Application Support/SceneWorks/oracles/sc-14052-mage-flow` — a `~/`-relative value
+# resolved per-runner by `resolve_snapshot_paths.py`, so it is ONE setting naming a DIFFERENT
+# directory on each box. It exists on no Hub and this workflow deliberately refuses to regenerate it
+# in Actions, so it cannot self-heal. Therefore: **every box carrying `rw-mage` must have the bundle
+# provisioned by hand, and adding the label to a box without it is what actually breaks `mlx-media`
+# — not moving the label around.**
+#
+# Both boxes have the bundle, confirmed 2026-08-05. `nax-macos` was checked from a shell on the box:
+# 461 MB, all 18 required files present as regular non-symlink files, which is exactly what `Require
+# operator-provisioned Mage oracle seed` demands. `nax-macos-2` was confirmed by direct operator
+# inspection, which is the strongest check available — no job or script in this repo can read that
+# box's filesystem. That step remains the enforcement: it fails closed with a named error on a cache
+# miss, so a box that quietly loses its copy surfaces as a red `mlx-media`, never a wrong oracle.
+
 # `rw-sa3` stores nothing between runs (it materializes into `RUNNER_TEMP`), so it is the free
 # rebalancing knob: move it to shift ~83 min of wall clock without moving a single stored byte.
 # It does need the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
 #
-# The sc-17284 Qwen/FLUX set is the largest row here. It transferred almost nothing onto the box —
-# all of it but the two ~0.85 GB Lightning LoRAs was already resident on nax-macos, and it is a large
-# part of why that box is at 98% (sc-17271). But "already there" is not "free": these bytes were
-# opportunistic app/dev cache that could be reclaimed, and wiring them makes them CI-REQUIRED. The
-# 31.4 GiB FLUX.1-dev snapshot in particular changes status here, because `flux-1-dev` gains
-# `media-macos`. Measured 2026-08-04 with `du -sh` over the nine `models--*` repo dirs; the two jobs
-# together consume ~131 GiB of that (the `q4` Qwen tier is stored but no wired test selects it).
+# The sc-17284 Qwen/FLUX set is the largest row here and it transferred almost nothing: all of it
+# but the two ~0.85 GB Lightning LoRAs was already resident. "Already there" is still not "free" —
+# these were opportunistic app/dev cache that could be reclaimed, and wiring them makes them
+# CI-REQUIRED; the 31.4 GiB FLUX.1-dev snapshot in particular changes status because `flux-1-dev`
+# gains `media-macos`. Measured 2026-08-04 with `du -sh` over the nine `models--*` repo dirs on
+# `nax-macos`; the two scheduled jobs consume ~131 GiB of that (`q4` is stored, no wired test
+# selects it).
 #
-# It shares `rw-mage` rather than taking an `rw-qwen` of its own only because a label no runner
-# carries queues silently (see below) — the set has no oracle-bundle pin, so splitting it out is a
-# one-line change here plus an org-settings change the moment the budget wants it on the other box.
+# THE TWO BOXES ARE NOT EQUALLY TIGHT, so read that cost per host. `nax-macos` is the 98% box
+# (sc-17271). `nax-macos-2` reported 1.0 TiB free at 45% capacity on 2026-08-05, with the 85 GiB
+# `qwen-image-mlx` re-host already resident there too — measured by this lane's own
+# `report_runner_disk_headroom.sh` step, which is what that step is for. The other six models in
+# the set are NOT confirmed on `nax-macos-2`; a job landing there materializes whatever is missing.
 #
 # A LABEL NO RUNNER CARRIES DOES NOT FAIL — IT QUEUES, SILENTLY, UNTIL THE RUN IS CANCELLED.
 # Retiring a box means moving its labels first.
@@ -93,6 +112,11 @@ on:
         type: string
         required: false
         default: ""
+      migrate_mage_edit_variant_manifest:
+        description: Migrate only the copied Mage edit-variant manifest after strict legacy verification (media only)
+        type: boolean
+        required: false
+        default: false
       publish_chroma_artifacts:
         description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
         type: boolean
@@ -109,6 +133,46 @@ on:
         required: false
         default: all
         options: [all, chroma1_base, chroma1_hd, chroma1_flash]
+      # sc-17655 — the S18 sweep in row-sized pieces. The whole seven-row sweep is ~4.3 h and
+      # `rw-krea` shares nax-macos-2 with `rw-audio`, `rw-llm` and `rw-chroma` one at a time, so an
+      # indivisible run head-of-line-blocks them for half a night (sc-16981). sc-17324 needed TWO
+      # powered dispatches to learn this: run 30948568453 lost the runner outright 2h42m in, and its
+      # replacement 30964561686 was cancelled by hand at 54m precisely because it was blocking the
+      # box. One row is 3-53 min. The defaults are the full sweep, so an
+      # operator who ignores these gets exactly the previous behaviour.
+      #
+      # A subset that is not the whole A/D/F dose ladder measures its cells and DELIBERATELY prints no
+      # verdict — re-aggregate the uploaded `s18-cells.tsv` files afterwards with
+      # `s18_verdict_from_accumulated_cells`, which applies the same rule to the assembled evidence.
+      krea_s18_rows:
+        description: "S18 sweep rows (krea-s18-sweep only): subset of ABCDFEZ, e.g. AD for one dispatch"
+        type: string
+        required: false
+        # NOT ABCDFEZ — F and E do not fit on this lane's runner at the pinned 832x480, and the
+        # preflight refuses them, so a default of all seven would be a default that always fails.
+        # sc-17324, from measurement:
+        #   * F (30-frame window, 46,800 tokens, ~49 GiB) killed nax-macos-2 twice. Run it at
+        #     KREA_SMOKE_W=640 KREA_SMOKE_H=384, where it needs ~34 GiB — the bucket the recorded
+        #     sc-15127 sweep already used for it.
+        #   * E (global window, 70,200 tokens, ~63-69 GiB) is UNMEASURABLE on this infrastructure.
+        #     It fit the 128 GiB dev Mac by 0.3 GiB and fills a boot volume with swap even at
+        #     640x384 (sc-15571). It is a reference row the verdict rule explicitly refuses to use
+        #     as attribution evidence, so nothing downstream depends on having it.
+        default: ABCDZ
+      krea_s18_seeds:
+        description: "S18 sweep seeds (krea-s18-sweep only): comma-separated; 2+ for a between-seed spread"
+        type: string
+        required: false
+        default: "7,11,23"
+      # WxH as one input because `workflow_dispatch` is capped at 10 and this dispatcher already
+      # carries 8. Needed because row F does not fit at the default 832x480 on this lane's runner
+      # (~49 GiB, two dead runners) but does at 640x384 (~34 GiB) — without this the fallback bucket
+      # is unreachable and row F is simply unrunnable, which is not the same thing as unmeasurable.
+      krea_s18_geometry:
+        description: "S18 sweep geometry (krea-s18-sweep only), WxH — use 640x384 for row F"
+        type: string
+        required: false
+        default: 832x480
 
 permissions:
   contents: read
@@ -961,6 +1025,9 @@ jobs:
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      # sc-17739 — the Lens snapshot. `mlx-gen-lens` ships in the macOS catalog but had no real-weight
+      # coverage at all until this lane; see the `lens-turbo` row in release/real-weight-models.toml.
+      LENS_SNAPSHOT: ${{ vars.LENS_SNAPSHOT }}
       MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -972,7 +1039,7 @@ jobs:
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
           ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
-          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT
+          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT LENS_SNAPSHOT
       # actions/setup-python's Darwin package hard-codes /Users/runner during installation, which is
       # not writable on this self-hosted runner. uv installs the exact interpreter wholly in temp.
       - name: Install pinned reference Python
@@ -1002,11 +1069,12 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
-          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT
+          MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT LENS_SNAPSHOT
       - name: Materialize and verify immutable snapshot
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model lens-turbo --snapshot "$LENS_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
@@ -1084,6 +1152,28 @@ jobs:
             install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
           done
           echo "imported=true" >> "$GITHUB_OUTPUT"
+      - name: Migrate only the copied Mage edit-variant manifest
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: |
+          golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"
+          runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"
+          if [[ "$golden_root" != "$runner_root/"* ]]; then
+            echo "Mage manifest migration output must remain under RUNNER_TEMP" >&2
+            exit 1
+          fi
+          if [[ "$golden_root" == "$seed_root" || \
+                "$MAGE_GOLDEN_DIR/mage_edit_variants_manifest.json" -ef "$MAGE_ORACLE_SEED_DIR/mage_edit_variants_manifest.json" ]]; then
+            echo "Mage manifest migration must never mutate the persistent operator seed" >&2
+            exit 1
+          fi
+          python3.12 scripts/release/provision_mage_edit_variants.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --migrate-reference-environment-manifest-only
       # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
       # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
       # different backend/process from the Candle implementation and transferred as an immutable
@@ -1138,6 +1228,20 @@ jobs:
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
           z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+      # sc-17739 — the first real-weight gate `mlx-gen-lens` has ever had. Run as TWO cargo
+      # invocations, deliberately: each conformance run holds a ~21 GiB model resident across ~8
+      # renders, and running both ids in one process was SIGKILLed on the dev Mac. Separate processes
+      # bound the peak to one model at a time. `lens_turbo` is the pointed arm — its default guidance
+      # is 1.0, so sc-17418's `check_cfg_off_render` exercises the production default path; `lens`
+      # covers the guided `[pos; neg]` path. Both resolve from the one snapshot.
+      - name: Run Lens provider conformance (turbo — the CFG-off default path)
+        run: >-
+          cargo test --locked --release -p mlx-gen-lens --test conformance
+          lens_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+      - name: Run Lens provider conformance (base — the guided path)
+        run: >-
+          cargo test --locked --release -p mlx-gen-lens --test conformance
+          lens_base_satisfies_gen_core_contract -- --ignored --nocapture
       # sc-14038 DoD gate — the ONLY automatic run of the Qwen3-VL text-encoder parity suite. It
       # needs both the 8.875 GB `text_encoder/` component and the CPU-dumped boundary golden,
       # neither of which the PR lanes have. It also carries the self-invalidating assertion that
@@ -1573,8 +1677,15 @@ jobs:
     name: MLX Qwen-Image real-weight producers (operator dispatch)
     if: inputs.profile == 'qwen-image-producers'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    # Measured 485s. Same first-run materialization allowance as the regression lane, halved: this
-    # one needs only the bf16 tier.
+    # MEASURED IN CI TWICE, on different boxes, and the spread is the point:
+    #   nax-macos    1618 s of test time / 32m32s job   (run 30959809619)
+    #   nax-macos-2   370 s of test time /  6m43s job   (run 31050459516)
+    # Same test, same tier, same resident weights — a 4.4x spread that is HOST variance, not cold
+    # cache. `rw-mage` is carried by both boxes, so this job's wall clock depends on which one takes
+    # it and on what else that machine is doing (nax-macos also runs dev work outside Actions). Size
+    # the cap against the SLOW host: 60 leaves 1.8x headroom over 32m32s, the thinnest of the three
+    # jobs. If any of them ever brushes its cap, raise this one first — it is a producer, so the
+    # cost of a generous cap here is low.
     timeout-minutes: 60
     env:
       QWEN_IMAGE_MLX_SNAPSHOT: ${{ vars.QWEN_IMAGE_MLX_SNAPSHOT }}
@@ -1831,6 +1942,38 @@ jobs:
   # here is the within-regime attribution" is a passing outcome, because the drift itself is
   # sc-15571's open question, not this lane's. What it does gate is that the sweep still runs, still
   # produces a resolvable verdict, and that no row freezes or blows highlights.
+  #
+  # STANDING CADENCE: dispatch-only, permanently. sc-17324 was asked to choose between this and "its
+  # own cron on a night the weekly does not run", and settled it on two measurements — do not re-open
+  # it without new ones.
+  #
+  #   1. A second `cron:` entry cannot be scoped to this job as the workflow is written. THIRTY-ONE
+  #      jobs here gate on a bare `github.event_name == 'schedule'`, so any cron added to `on:` fires
+  #      the entire real-weight suite, not the sweep. Scoping it would mean rewriting all thirty-one
+  #      to `github.event.schedule == '0 2 * * 1'` — and the failure mode of missing one is a lane
+  #      that silently stops running weekly, which is strictly worse than the gap being closed.
+  #   2. A calendar is the wrong trigger anyway. These numbers move when the AR loop, the KV
+  #      window/sink, the scheduler or the decode path moves — not when a week passes. Re-running an
+  #      unchanged tree at 4.3 h a go buys a re-measurement of the same 21 cells.
+  #
+  # Point 1 is about THIS file, and there is an obvious way around it: lift the job into its own
+  # workflow with its own `on: schedule`. That was considered and NOT taken, because point 2 does not
+  # go away with it — a separate file still buys a scheduled re-measurement of an unchanged tree, at
+  # 4.3 h of a box that runs four `rw-*` pools one at a time, and it splits one real-weight lane
+  # across two files and two policy-test fixtures for that. If a cron is ever actually wanted, the
+  # separate workflow is the right shape for it; the reason to want one is not "coverage is zero",
+  # it is a specific question a scheduled run would answer that a triggered one would not.
+  #
+  # What actually holds the sweep together between dispatches is CI, not the clock: the decision rule
+  # and the recorded evidence are covered by seven NON-ignored tests in `generate_smoke.rs` that need
+  # no weights and run in every `cargo test` — `the_s18_verdict_rule_distinguishes_its_outcomes`,
+  # `the_recorded_s18_sweep_is_what_the_docs_claim`, `the_withdrawn_s18_claims_do_not_survive_in_crate_prose`,
+  # `the_s18_bounded_dose_ladder_spans_thirteen_ten_and_five_rolls`,
+  # `an_s18_cell_retains_tail_motion_from_the_live_sweep`, and the two drift-metric shape gates. A
+  # rename or a rule change goes red there, in minutes, without a runner.
+  #
+  # So: DISPATCH THIS when the thing it measures changes — the AR rollout, `local_attn_size`/`sink_size`,
+  # the sigma schedule across chunks, the VAE decode path — or before closing sc-15571. Not on a date.
   mlx-krea-realtime-s18-sweep:
     name: MLX Krea Realtime S18 coherence sweep (operator dispatch)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'krea-s18-sweep'
@@ -1881,6 +2024,22 @@ jobs:
       # `timeout-minutes: 120`, and using it here would stop recording ~2h into a run this job is
       # allowed 480 minutes for — silently, and in the half of the run where accumulated pressure
       # is most likely. The figure is over this job's own cap so the sampler cannot expire first.
+      # sc-17324 — REFUSE a row this box cannot hold, before spending any GPU time on it.
+      # Two runner deaths (30948568453, 31051413212) were both row F at 832x480: ~49 GiB of MLX
+      # active peak on a ~101 GiB host, which is not a flake but arithmetic. A dying runner takes
+      # the `always()` steps with it, so the cost of finding out the hard way is the whole run's
+      # evidence, not just the row. Deliberately NOT `continue-on-error` — refusing is the point.
+      - name: S18 memory preflight
+        env:
+          KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}
+          KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}
+        run: |
+          if [[ ! "$KREA_S18_GEOMETRY" =~ ^[0-9]+x[0-9]+$ ]]; then
+            echo "::error::krea_s18_geometry='$KREA_S18_GEOMETRY' must be WxH, e.g. 832x480" >&2
+            exit 1
+          fi
+          KREA_SMOKE_W="${KREA_S18_GEOMETRY%x*}" KREA_SMOKE_H="${KREA_S18_GEOMETRY#*x}" \
+            python3.12 scripts/ci/s18_memory_preflight.py
       - name: Start GPU fault evidence
         continue-on-error: true
         run: scripts/ci/gpu_fault_evidence.sh start 30000
@@ -1888,22 +2047,75 @@ jobs:
       # run-count assertion: name-selection alone turns a rename into "0 passed; N filtered out" and
       # a green step, which on a four-hour job would be an expensive way to gate nothing (sc-17250).
       #
-      # `KREA_S18_ROWS` is set even though it matches the Rust-side default, because the 21 below is
-      # rows x seeds and this job must own both factors — otherwise a change to the default row set
-      # silently turns the count assertion into a false red (or, at a wider default, a false green).
-      - name: Run the S18 coherence sweep (three seeds)
+      # `KREA_S18_ROWS`/`KREA_S18_SEEDS` are set explicitly rather than left to the Rust-side defaults
+      # because the cell-count assertion below is their product and this job must own both factors —
+      # otherwise a change to the default row set silently turns the count into a false red (or, at a
+      # wider default, a false green). Since sc-17655 they come from dispatch inputs, so the count is
+      # DERIVED (`n_rows * n_seeds`) instead of the literal 21 that only held for the full sweep.
+      - name: Run the S18 coherence sweep
         env:
-          KREA_SMOKE_W: "832"
-          KREA_SMOKE_H: "480"
-          KREA_S18_ROWS: ABCDFEZ
-          KREA_S18_SEEDS: "7,11,23"
+          KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}
+          KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}
+          KREA_S18_SEEDS: ${{ inputs.krea_s18_seeds }}
         run: |
           set -o pipefail
           name=long_clip_coherence_under_the_bounded_window
+          # Same split as the preflight above, so the guard and the run cannot disagree about which
+          # geometry is being measured.
+          export KREA_SMOKE_W="${KREA_S18_GEOMETRY%x*}" KREA_SMOKE_H="${KREA_S18_GEOMETRY#*x}"
+          # The run-count assertion below is rows x seeds, and BOTH now come from dispatch inputs
+          # (sc-17655), so validate them here rather than letting a typo become a confusing count
+          # mismatch 4 hours later. `ABCDFEZ` is the row alphabet; a repeated letter selects one row
+          # but would inflate the expected count, so reject duplicates too.
+          if [[ ! "$KREA_S18_ROWS" =~ ^[ABCDFEZ]+$ ]]; then
+            echo "::error::KREA_S18_ROWS='$KREA_S18_ROWS' is not a non-empty subset of ABCDFEZ" >&2
+            exit 1
+          fi
+          if [[ -n "$(tr -d '[:space:]' <<<"$KREA_S18_ROWS" | fold -w1 | sort | uniq -d)" ]]; then
+            echo "::error::KREA_S18_ROWS='$KREA_S18_ROWS' repeats a row" >&2
+            exit 1
+          fi
+          # Count seeds the way the Rust side parses them: comma-separated, whitespace tolerated.
+          # The `|| true` is load-bearing: `grep -c` exits 1 when it counts zero, and under this
+          # step's `bash -e` plus `set -o pipefail` that kills the shell AT THE ASSIGNMENT — so
+          # without it the `-lt 1` branch below is unreachable and a bad seed list fails the step
+          # with no ::error:: line at all. Verified against `KREA_S18_SEEDS=abc`.
+          n_rows=${#KREA_S18_ROWS}
+          # EVERY non-blank field must be countable, not merely one of them — this shell and Rust's
+          # `u64::from_str` must agree on the seed COUNT or the assertion at the end of the run is
+          # measuring a different sweep than the one that ran. They disagree on more than junk:
+          # `+7` parses in Rust and is rejected here, and a value above u64::MAX is rejected there
+          # and accepted by a naive `[0-9]+`. So count the fields and the valid seeds separately and
+          # require they match, rather than silently skipping what this regex cannot read.
+          # `{1,19}` keeps every accepted value inside u64 (u64::MAX has 20 digits).
+          n_fields="$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | grep -cE '[^[:blank:]]' || true)"
+          n_seeds="$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | grep -cE '^[[:blank:]]*[0-9]{1,19}[[:blank:]]*$' || true)"
+          if [[ "$n_seeds" -lt 1 ]]; then
+            echo "::error::KREA_S18_SEEDS='$KREA_S18_SEEDS' parsed to no seeds" >&2
+            exit 1
+          fi
+          if [[ "$n_seeds" -ne "$n_fields" ]]; then
+            echo "::error::KREA_S18_SEEDS='$KREA_S18_SEEDS' has $n_fields values but only $n_seeds this job can count as seeds (plain decimal, at most 19 digits) — the cell-count assertion would not match what the sweep runs" >&2
+            exit 1
+          fi
+          # Seeds get the same duplicate check as rows: `7,7` measures one configuration twice, which
+          # counts as two cells here but reaches the verdict rule as a duplicate (row, seed) and is
+          # rejected there — better to say so before the run than after it.
+          # `[:blank:]` (space and tab), NOT `[:space:]` — the latter includes the newlines that
+          # separate the seeds, so it collapses `7,7` to a single `77` and the duplicate check
+          # silently never fires. Verified.
+          # Leading zeros are stripped first: `07` and `7` are the same seed to Rust, so comparing
+          # them textually would let a duplicate through to a late ladder panic.
+          if [[ -n "$(tr ',' '\n' <<<"$KREA_S18_SEEDS" | tr -d '[:blank:]' | sed -E 's/^0+([0-9])/\1/' | sort | uniq -d)" ]]; then
+            echo "::error::KREA_S18_SEEDS='$KREA_S18_SEEDS' repeats a seed" >&2
+            exit 1
+          fi
+          expected_cells=$(( n_rows * n_seeds ))
+          echo "expecting $expected_cells cells ($n_rows rows x $n_seeds seeds)"
           # Streamed to a FILE as well as the log, because the evidence extraction below has to survive
           # this command failing. `bash -e` kills the step at this assignment on a non-zero cargo exit,
           # and the sweep's own verdict rule panics on evidence it judges unresolvable — precisely the
-          # run whose 21 cells someone needs to read. Extraction and upload are separate `always()`
+          # run whose measured cells someone needs to read. Extraction and upload are separate `always()`
           # steps for the same reason.
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
             cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
@@ -1914,8 +2126,8 @@ jobs:
             exit 1
           fi
           cells="$(grep -c '^S18CELL' "$RUNNER_TEMP/s18-sweep.log" || true)"
-          if [[ "$cells" -ne 21 ]]; then
-            echo "::error::expected 21 S18CELL rows (the ${KREA_S18_ROWS} rows x the three seeds above), captured $cells — the sweep did not measure what this job claims" >&2
+          if [[ "$cells" -ne "$expected_cells" ]]; then
+            echo "::error::expected $expected_cells S18CELL rows (${KREA_S18_ROWS} x ${KREA_S18_SEEDS}), captured $cells — the sweep did not measure what this job claims" >&2
             exit 1
           fi
       # sc-17355 — before the upload below, so the sampler is stopped and its CSV is final when the
@@ -1926,8 +2138,32 @@ jobs:
         run: scripts/ci/gpu_fault_evidence.sh report
       # The sweep's product is its per-cell evidence, not the green check: every (row, seed) emits one
       # `S18CELL` TSV line precisely so a run can be re-aggregated without the log. `always()` because
-      # a four-hour run that ends in an unresolvable verdict still measured 21 real cells, and throwing
+      # a long run that ends in an unresolvable verdict still measured real cells, and throwing
       # them away would mean paying for the sweep twice to read them.
+      #
+      # KNOWN LIMIT of that guarantee, measured — it covers a FAILING SWEEP, not a DYING RUNNER.
+      # `always()` schedules these steps when the sweep step fails; it cannot schedule them when the
+      # job itself stops existing. sc-17324's first powered dispatch (run 30948568453) lost
+      # `nax-macos-2` 2 h 42 m in — "The self-hosted runner lost communication with the server" — and
+      # because the runner died, these two steps never ran, no artifact was produced, and GitHub kept
+      # no partial log (the run's log zip is empty). Every cell measured up to that point was lost.
+      #
+      # NOT row E's memory, which is the obvious suspect and was checked: at the per-row wall clock
+      # measured in run 30787887176, three seeds each of A/B/C/D reach 146.8 min and row F ends at
+      # 200.2, so 162 min of job wall (~154 of sweep, after the build and snapshot verify) puts the
+      # death inside row F seed 7 — row E had not started and was ~46 min away. Row E's own peak at
+      # this bucket is 63.32 GiB, measured, and it COMPLETED; see the correction on
+      # `long_clip_coherence_under_the_bounded_window`.
+      # MITIGATION, not a fix — sc-17655 made the sweep divisible rather than making one long run
+      # survivable. Dispatch it in row-sized pieces (`krea_s18_rows`) and each piece uploads its own
+      # cells when it finishes, so a runner loss costs one row instead of everything; re-aggregate
+      # afterwards with `s18_verdict_from_accumulated_cells`. A single ABCDFEZ dispatch is still
+      # all-or-nothing against a dying runner, and that is a deliberate trade: the alternative is
+      # streaming uploads mid-step, which Actions does not do without a lot of machinery.
+      #
+      # The same limit applies to sc-17355's `Report GPU fault evidence` step above — it is `always()`
+      # too, so it reports a fault the sweep survived, not one that took the runner with it. That is
+      # the case worth knowing about here, so do not read its presence as coverage for this hole.
       - name: Extract the S18 cell evidence
         if: always()
         run: |
@@ -1938,7 +2174,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: krea-s18-sweep-${{ github.sha }}
+          # Rows and seeds in the NAME (sc-17655): every piece of a split sweep uploads from the
+          # same sha and the file inside is always `s18-cells.tsv`, so without this the pieces are
+          # indistinguishable — which is how the same piece ends up concatenated twice at
+          # re-aggregation. The ingest rejects that now, but an artifact you cannot identify is
+          # still evidence you cannot use.
+          name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/s18-cells.tsv

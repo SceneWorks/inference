@@ -3075,19 +3075,38 @@ mod tests {
     }
 
     /// Build a synthetic diffusers-style snapshot with a `bytes`-sized `model.safetensors` under each
-    /// named subdir, returning the root. The caller cleans it up.
-    fn synthetic_snapshot(tag: &str, subdirs: &[(&str, usize)]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "gencore_footprint_{tag}_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+    /// named subdir.
+    ///
+    /// Returns the `TempDir` guard, not a bare `PathBuf` (sc-17755): the tree leaves on `Drop`,
+    /// including out of a panicking test, which the trailing `remove_dir_all(..).ok()` lines this
+    /// replaced could not do. Callers bind it for the whole test and read `tmp.path()`.
+    fn synthetic_snapshot(tag: &str, subdirs: &[(&str, usize)]) -> tempfile::TempDir {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("gencore_footprint_{tag}_"))
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = tmp.path();
         for (sub, bytes) in subdirs {
             let dir = root.join(sub);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("model.safetensors"), vec![0u8; *bytes]).unwrap();
         }
-        root
+        tmp
+    }
+
+    /// Guards the sc-17755 fix for [`synthetic_snapshot`]: the assembled tree leaves with the guard.
+    /// Revert it to a bare `create_dir_all` on a `temp_dir()` join and this goes RED.
+    #[test]
+    fn synthetic_snapshot_is_removed_on_drop() {
+        let (root, shard) = {
+            let tmp = synthetic_snapshot("drop-guard", &[("transformer", 16)]);
+            let root = tmp.path().to_path_buf();
+            let shard = root.join("transformer/model.safetensors");
+            assert!(shard.is_file(), "snapshot shard not written");
+            (root, shard)
+        };
+        assert!(!shard.exists(), "shard survived: {}", shard.display());
+        assert!(!root.exists(), "snapshot root survived: {}", root.display());
     }
 
     /// sc-10894: a provider that declared a footprint returns the per-component on-disk split, resolved
@@ -3099,7 +3118,7 @@ mod tests {
             "split",
             &[("mllm", 1500), ("transformer", 9000), ("vae", 400)],
         );
-        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
 
         let fp = dummy_registry()
             .footprint("dummy_footprint_model", &spec)
@@ -3115,8 +3134,6 @@ mod tests {
         );
         // The whole point: the text encoder is NON-zero even though it is not under `text_encoder*`.
         assert!(fp.text_encoder > 0, "mllm/ text encoder must be measured");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A registered generator that declares NO footprint yields `Ok(None)` (the consumer falls back);
@@ -3145,7 +3162,7 @@ mod tests {
                 ("vae", 300),
             ],
         );
-        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
         let fp = PerComponentBytes::from_spec_subdirs(
             &spec,
             &["text_encoder", "text_encoder_2", "text_encoder_3"],
@@ -3165,13 +3182,11 @@ mod tests {
 
         // A single-file source has no component tree → Err (consumer falls back to whole-file).
         let file_spec = LoadSpec::new(WeightsSource::File(
-            root.join("transformer/model.safetensors"),
+            root.path().join("transformer/model.safetensors"),
         ));
         assert!(
             PerComponentBytes::from_spec_subdirs(&file_spec, &["te"], &["dit"], &["vae"]).is_err()
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// sc-10894: `from_root_subdirs` sums a component named by a flat FILE (the bernini/anima layout —
@@ -3179,12 +3194,11 @@ mod tests {
     /// an already-resolved root.
     #[test]
     fn per_component_bytes_from_root_subdirs_handles_flat_files() {
-        let root = std::env::temp_dir().join(format!(
-            "gencore_footprint_flat_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("gencore_footprint_flat_")
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = tmp.path();
         // bernini-style flat component files at the root.
         std::fs::write(root.join("t5_encoder.safetensors"), vec![0u8; 2000]).unwrap();
         std::fs::write(root.join("low_noise_model.safetensors"), vec![0u8; 6000]).unwrap();
@@ -3192,7 +3206,7 @@ mod tests {
         std::fs::write(root.join("vae.safetensors"), vec![0u8; 500]).unwrap();
 
         let fp = PerComponentBytes::from_root_subdirs(
-            &root,
+            root,
             &["t5_encoder.safetensors"],
             &[
                 "low_noise_model.safetensors",
@@ -3208,7 +3222,5 @@ mod tests {
                 vae: 500,
             }
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 }

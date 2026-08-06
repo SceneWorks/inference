@@ -59,3 +59,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8"]
 # NOTE: a `flash-attn` feature was removed in sc-9032 — it was a pure no-op (`flash-attn = ["cuda"]`,
 # forwarded crate-to-crate) that wired no fused kernels. When the `candle-flash-attn` slice is
 # scheduled, reintroduce it here (and its forwards) behind real gated code, not as a bare alias.
+
+[dev-dependencies]
+# Self-removing fixture roots for the training-driver tests (sc-17704).
+tempfile = { workspace = true }

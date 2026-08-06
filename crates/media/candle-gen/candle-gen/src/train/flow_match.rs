@@ -838,7 +838,7 @@ mod tests {
     use candle_nn::Linear;
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use tempfile::TempDir;
 
     /// `sample_unit_timestep` is deterministic in its seed, lands in `[1e-3, 1−1e-3]`, and the bias
     /// tilts shift the mass the documented way (`low` ⇒ smaller t than neutral than `high`, on
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn request_fingerprint_covers_resolution_order_caption_paths_and_contents() {
-        let req = mock_request(2, 1, 1, 0, CancelFlag::new());
+        let (_fixture, req) = mock_request(2, 1, 1, 0, CancelFlag::new());
         let original = request_fingerprint(&req).unwrap();
         assert_eq!(original, request_fingerprint(&req).unwrap());
 
@@ -1113,28 +1113,39 @@ mod tests {
         }
     }
 
+    /// Build a driver request over a throwaway on-disk dataset.
+    ///
+    /// Returns the fixture root's `TempDir` guard alongside the request: the request only holds
+    /// *paths* into that root, and the driver reads them (fingerprint hashing, dataset load) and
+    /// writes adapters back into `output_dir` well after this function returns — so the guard has to
+    /// stay bound for the rest of the test. Callers do that with `let (_fixture, req) = …`.
+    ///
+    /// sc-17704: this used to `create_dir_all` a bare
+    /// `temp_dir().join(format!("candle_flow_match_driver_{pid}_{n}"))` and never remove it, leaking a
+    /// directory per call forever (hundreds had piled up on the CUDA box before this fix). `TempDir`
+    /// removes the tree on `Drop`, including out of a panicking test — which is exactly the run whose
+    /// leftovers used to accumulate — and names it with an OS-seeded random suffix made unique by an
+    /// exclusive create-and-retry loop, rather than a PID a later run can be handed again. The
+    /// process-local `AtomicU64` counter this replaced could not keep two runs apart once that happened.
     fn mock_request(
         items: usize,
         steps: u32,
         accum: u32,
         save_every: u32,
         cancel: CancelFlag,
-    ) -> TrainingRequest {
-        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
-        let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-        let fixture_dir = std::env::temp_dir().join(format!(
-            "candle_flow_match_driver_{}_{}",
-            std::process::id(),
-            id
-        ));
-        std::fs::create_dir_all(&fixture_dir).unwrap();
+    ) -> (TempDir, TrainingRequest) {
+        let fixture = tempfile::Builder::new()
+            .prefix("candle_flow_match_driver_")
+            .tempdir()
+            .expect("fixture temp dir");
+        let fixture_dir = fixture.path().to_path_buf();
         let config = TrainingConfig {
             steps,
             gradient_accumulation: accum,
             save_every,
             ..TrainingConfig::default()
         };
-        TrainingRequest {
+        let request = TrainingRequest {
             items: (0..items)
                 .map(|i| {
                     let image_path = fixture_dir.join(format!("img{i}.png"));
@@ -1151,7 +1162,51 @@ mod tests {
             file_name: "a.safetensors".into(),
             trigger_words: vec![],
             cancel,
-        }
+        };
+        (fixture, request)
+    }
+
+    /// Guards the sc-17704 fix itself: the fixture root (and the dataset files written into it) leave
+    /// with the guard. Drop the `TempDir` back for a bare `create_dir_all` and this goes RED.
+    #[test]
+    fn mock_request_fixture_dir_is_removed_on_drop() {
+        let (fixture, req) = mock_request(2, 1, 1, 0, CancelFlag::new());
+        let dir = req.output_dir.clone();
+        let image = req.items[0].image_path.clone();
+        assert!(image.is_file(), "fixture dataset not written");
+        drop(fixture);
+        assert!(
+            !image.exists(),
+            "dataset file survived: {}",
+            image.display()
+        );
+        assert!(!dir.exists(), "fixture root survived: {}", dir.display());
+    }
+
+    /// The same guarantee *after the driver has run*. `TempDir::drop` swallows its removal error, and
+    /// on Windows a directory with any still-open handle cannot be removed — so a driver that leaked a
+    /// dataset or checkpoint handle would silently resurrect the sc-17704 leak with
+    /// [`mock_request_fixture_dir_is_removed_on_drop`] (which never runs the driver) still green.
+    #[test]
+    fn fixture_dir_is_removed_after_a_full_training_run() {
+        let model = MockTrainer {
+            device: Device::Cpu,
+            steps_seen: Cell::new(0),
+            saves: Cell::new(0),
+            cache_len: 2,
+        };
+        // `save_every = 2` so the run also writes intermediate checkpoints into `output_dir`, not just
+        // the final adapter — the handles most likely to outlive the run.
+        let (fixture, req) = mock_request(2, 5, 1, 2, CancelFlag::new());
+        let dir = req.output_dir.clone();
+        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        drop(req);
+        drop(fixture);
+        assert!(
+            !dir.exists(),
+            "fixture root survived a completed training run: {}",
+            dir.display()
+        );
     }
 
     /// The driver runs all steps, reports the right `steps`, and saves exactly once (the final adapter)
@@ -1164,7 +1219,7 @@ mod tests {
             saves: Cell::new(0),
             cache_len: 3,
         };
-        let req = mock_request(3, 5, 1, 0, CancelFlag::new());
+        let (_fixture, req) = mock_request(3, 5, 1, 0, CancelFlag::new());
         let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
         assert_eq!(out.steps, 5);
         assert_eq!(model.steps_seen.get(), 5);
@@ -1183,7 +1238,7 @@ mod tests {
             cache_len: 2,
         };
         // steps 1..=6, save_every 2 → checkpoints at 2 and 4 (6 is the final step, excluded) + 1 final.
-        let req = mock_request(2, 6, 1, 2, CancelFlag::new());
+        let (_fixture, req) = mock_request(2, 6, 1, 2, CancelFlag::new());
         let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
         assert_eq!(out.steps, 6);
         assert_eq!(model.saves.get(), 3, "2 checkpoints + 1 final");
@@ -1200,7 +1255,7 @@ mod tests {
             saves: Cell::new(0),
             cache_len: 2,
         };
-        let mut req = mock_request(2, 5, 1, 0, cancel);
+        let (_fixture, mut req) = mock_request(2, 5, 1, 0, cancel);
         // Cancellation must win over fingerprint I/O: this deliberately missing path is never opened.
         req.items[0].image_path = req.output_dir.join("does-not-exist.png");
         let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
@@ -1220,7 +1275,7 @@ mod tests {
             cancel: cancel.clone(),
             built_dit: Rc::clone(&built_dit),
         };
-        let req = mock_request(2, 5, 1, 0, cancel);
+        let (_fixture, req) = mock_request(2, 5, 1, 0, cancel);
         let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
         assert!(matches!(err, CandleError::Canceled), "{err:?}");
         assert!(
@@ -1333,7 +1388,7 @@ mod tests {
             cache_len: 3,
         };
         // steps=7, accum=4 → windows [1..4] full, [5..7] partial (3 micros) flushed at the end.
-        let req = mock_request(3, 7, 4, 0, CancelFlag::new());
+        let (_fixture, req) = mock_request(3, 7, 4, 0, CancelFlag::new());
         let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
         assert_eq!(out.steps, 7);
         assert!(out.final_loss.is_finite());
@@ -1348,7 +1403,7 @@ mod tests {
             saves: Cell::new(0),
             cache_len: 0,
         };
-        let req = mock_request(0, 5, 1, 0, CancelFlag::new());
+        let (_fixture, req) = mock_request(0, 5, 1, 0, CancelFlag::new());
         let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
         match err {
             CandleError::Msg(m) => assert!(m.contains("no usable dataset items"), "got {m}"),
@@ -1474,11 +1529,12 @@ mod tests {
         }
     }
 
-    fn preview_request(steps: u32, sample_every: u32) -> TrainingRequest {
-        let mut req = mock_request(1, steps, 1, 0, CancelFlag::new());
+    /// Same guard contract as [`mock_request`]: the `TempDir` must outlive the returned request.
+    fn preview_request(steps: u32, sample_every: u32) -> (TempDir, TrainingRequest) {
+        let (fixture, mut req) = mock_request(1, steps, 1, 0, CancelFlag::new());
         req.config.sample_every = sample_every;
         req.config.sample_prompts = vec!["a preview".into()];
-        req
+        (fixture, req)
     }
 
     /// After a preview whose render ERRORS, the thaw pass still runs, so the adapter is restored to its
@@ -1496,7 +1552,7 @@ mod tests {
             render_errors: true, // render fails; the thaw must still run
         };
         // steps=2, sample_every=1 → the preview block runs each step (freeze + thaw = 2 passes/cadence).
-        let req = preview_request(2, 1);
+        let (_fixture, req) = preview_request(2, 1);
         let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
         assert_eq!(out.steps, 2);
         assert!(
@@ -1524,7 +1580,7 @@ mod tests {
             fail_on_pass: Some(2),
             render_errors: false,
         };
-        let req = preview_request(1, 1);
+        let (_fixture, req) = preview_request(1, 1);
         let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
         match err {
             CandleError::Msg(m) => {
@@ -1547,7 +1603,7 @@ mod tests {
             fail_on_pass: Some(1), // pass 1 = freeze fails
             render_errors: false,
         };
-        let req = preview_request(1, 1);
+        let (_fixture, req) = preview_request(1, 1);
         let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
         match err {
             CandleError::Msg(m) => {

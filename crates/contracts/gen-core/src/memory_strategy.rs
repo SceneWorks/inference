@@ -2806,9 +2806,13 @@ mod tests {
 
     #[test]
     fn adapter_residency_distinguishes_folded_additive_and_missing_evidence() {
-        let root =
-            std::env::temp_dir().join(format!("gen-core-adapter-residency-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // sc-17755: a `TempDir` guard, so the tree leaves on `Drop` even when an assertion below
+        // panics — the trailing `remove_dir_all` this replaced never ran on a failing test.
+        let tmp = tempfile::Builder::new()
+            .prefix("gen-core-adapter-residency-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = tmp.path();
         let first = root.join("first.safetensors");
         let second = root.join("second.safetensors");
         std::fs::write(&first, vec![0_u8; 11]).unwrap();
@@ -2836,7 +2840,6 @@ mod tests {
             adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
             None
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn mlx_backend() -> MemoryBackendRealization {

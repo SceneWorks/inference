@@ -156,6 +156,7 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::VarBuilder;
+    use tempfile::TempDir;
 
     /// A deliberately tiny UMT5 config (1 layer, small dims) that keeps the load-bearing
     /// `max_length = 512` so the pad-to-512 path is exercised. `vocab_size` covers the tiny
@@ -217,7 +218,7 @@ mod tests {
     #[test]
     fn pads_to_max_length() {
         let tmp = tempdir();
-        let (cfg, te, tok) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(tmp.path());
         let out = umt5_encode_padded(
             &tok,
             &cfg,
@@ -237,7 +238,7 @@ mod tests {
     #[test]
     fn empty_prompt_produces_valid_padded_uncond() {
         let tmp = tempdir();
-        let (cfg, te, tok) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(tmp.path());
         // The empty-prompt path (sc-7078): must NOT build a 0-length sequence, must still pad to 512.
         let out = umt5_encode_padded(&tok, &cfg, &te, "", &Device::Cpu, DType::F32, "t")
             .expect("empty encode");
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn deterministic_for_fixed_prompt() {
         let tmp = tempdir();
-        let (cfg, te, tok) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(tmp.path());
         let a = umt5_encode_padded(
             &tok,
             &cfg,
@@ -281,7 +282,7 @@ mod tests {
         // The trainer loads the encoder at bf16 and upcasts to f32; here we exercise the dtype param
         // directly: an f32 encoder cast to bf16 output yields a bf16, 512-padded tensor.
         let tmp = tempdir();
-        let (cfg, te, tok) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(tmp.path());
         let out =
             umt5_encode_padded(&tok, &cfg, &te, "hello", &Device::Cpu, DType::BF16, "t").unwrap();
         assert_eq!(out.dtype(), DType::BF16);
@@ -294,9 +295,9 @@ mod tests {
         // per-encode `from_file` load — caching only removes the redundant re-parse, never changes the
         // tokenization output. Cover a normal prompt AND the empty (uncond) short-circuit.
         let tmp = tempdir();
-        let (cfg, _te, cached) = tiny_encoder(&tmp);
+        let (cfg, _te, cached) = tiny_encoder(tmp.path());
         for prompt in ["hello world", ""] {
-            let fresh = build_umt5_tokenizer(&tmp, &cfg, "t").expect("fresh tokenizer");
+            let fresh = build_umt5_tokenizer(tmp.path(), &cfg, "t").expect("fresh tokenizer");
             let cached_ids = cached.tokenize(prompt).unwrap().ids;
             let fresh_ids = fresh.tokenize(prompt).unwrap().ids;
             assert_eq!(cached_ids, fresh_ids, "prompt {prompt:?}");
@@ -308,7 +309,7 @@ mod tests {
         let tmp = tempdir();
         // `VarBuilder` is not `Debug`, so match the error out rather than `unwrap_err()`.
         let msg = match component_vb(
-            &tmp,
+            tmp.path(),
             "transformer",
             DType::F32,
             &Device::Cpu,
@@ -322,22 +323,38 @@ mod tests {
         assert!(msg.contains("Wan2.2-TI2V-5B diffusers"), "msg: {msg}");
     }
 
-    fn tempdir() -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "wan-text-encode-test-{}-{}",
-            std::process::id(),
-            fastrand_u64()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        base
+    /// A fixture root that removes itself on `Drop` (sc-17704).
+    ///
+    /// This used to be a hand-rolled `temp_dir().join(format!("wan-text-encode-test-{pid}-{nanos}"))`
+    /// with no cleanup, so every call leaked a directory forever (hundreds had piled up on the CUDA
+    /// box before this fix). `TempDir` removes the tree on `Drop` — including out of a panicking test,
+    /// which is exactly the run whose leftovers used to accumulate — and names it with an OS-seeded
+    /// random suffix made unique by an exclusive create-and-retry loop, rather than a PID a later run
+    /// can be handed again. Callers must bind the guard (`let tmp = tempdir();`) for the whole test:
+    /// an unbound `tempdir().path()` is dropped at the end of the enclosing statement, so the fixture
+    /// is gone by the time anything reads it back.
+    fn tempdir() -> TempDir {
+        tempfile::Builder::new()
+            .prefix("wan-text-encode-test-")
+            .tempdir()
+            .expect("fixture temp dir")
     }
 
-    // Tiny non-crypto unique suffix (avoid pulling a dep just for tests).
-    fn fastrand_u64() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+    #[test]
+    fn fixture_tempdir_is_removed_on_drop() {
+        // Guards the sc-17704 fix itself: without the `TempDir` (i.e. back to a bare `create_dir_all`
+        // on a `temp_dir()` join) the tree survives the scope and this goes RED.
+        let path = {
+            let tmp = tempdir();
+            let path = tmp.path().to_path_buf();
+            let (_cfg, _te, _tok) = tiny_encoder(&path);
+            assert!(path.join("tokenizer/tokenizer.json").is_file());
+            path
+        };
+        assert!(
+            !path.exists(),
+            "fixture root survived the guard's scope: {}",
+            path.display()
+        );
     }
 }

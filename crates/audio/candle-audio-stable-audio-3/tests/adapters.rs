@@ -110,15 +110,17 @@ fn real_key_shapes() -> BTreeMap<String, Vec<usize>> {
     map
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sa3-adapters-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// A scratch adapter directory that removes itself on `Drop` (sc-17755).
+///
+/// The old `(pid, ThreadId)` path was unique per test *thread*, not per call, and its
+/// `remove_dir_all` prelude only made it idempotent within one process — so each new PID left another
+/// tree behind (380 `sa3-*` directories under `%TEMP%` on the CUDA box). Callers bind the guard and
+/// read `.path()`; letting it drop early would delete the adapters under the test.
+fn scratch(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("sa3-adapters-{tag}-"))
+        .tempdir()
+        .expect("scratch dir")
 }
 
 fn f32_tensor(values: Vec<f32>, shape: (usize, usize)) -> Tensor {
@@ -367,7 +369,8 @@ const TARGET: &str = "model.model.transformer.layers.0.cross_attn.to_q.weight";
 /// raw F32 bytes, so it cannot be satisfied by a near-miss.
 #[test]
 fn all_eight_types_load_fold_and_produce_pairwise_distinct_weights() {
-    let dir = scratch("family");
+    let guard = scratch("family");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (6usize, 5usize, 3usize);
     let base = f32_tensor(
@@ -457,7 +460,8 @@ fn the_legacy_dora_alias_resolves_by_magnitude_shape_defaulting_to_rows() {
     assert!(resolve_adapter_type("", false, false).is_err());
 
     // An end-to-end alias file: written as `dora`, loaded as `dora-cols` purely from its tensors.
-    let dir = scratch("alias");
+    let guard = scratch("alias");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let path = dir.join("alias.safetensors");
     AdapterRecipe::new("dora", rank, 1.0)
@@ -561,7 +565,8 @@ fn a_module_less_adapter_is_refused_by_build() {
 /// shipped path — not a call back into it.
 #[test]
 fn classic_lora_folds_exactly_alpha_over_rank_times_scale_times_b_at_a() {
-    let dir = scratch("lora-math");
+    let guard = scratch("lora-math");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (2usize, 3usize, 1usize);
     let path = dir.join("lora.safetensors");
     // A = [[1, 2, 3]], B = [[2], [-1]]  ⇒  B@A = [[2, 4, 6], [-1, -2, -3]]
@@ -604,7 +609,8 @@ fn classic_lora_folds_exactly_alpha_over_rank_times_scale_times_b_at_a() {
 /// the linearity gate is stated for classic LoRA specifically.
 #[test]
 fn classic_lora_delta_norm_is_exactly_linear_in_the_requested_strength() {
-    let dir = scratch("lora-linearity");
+    let guard = scratch("lora-linearity");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 5usize, 2usize);
     let path = dir.join("lora.safetensors");
     AdapterRecipe::new("lora", rank, 3.0)
@@ -672,7 +678,8 @@ fn classic_lora_delta_norm_is_exactly_linear_in_the_requested_strength() {
 /// the base weight, which is asserted separately so the case cannot pass on a no-op.
 #[test]
 fn dora_rows_normalizes_rows_and_rescales_by_magnitude_r() {
-    let dir = scratch("dora-rows");
+    let guard = scratch("dora-rows");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 5usize, 2usize);
     let magnitudes: Vec<f32> = vec![0.5, 1.25, 2.0, 3.5];
     let path = dir.join("dora-rows.safetensors");
@@ -727,7 +734,8 @@ fn dora_rows_normalizes_rows_and_rescales_by_magnitude_r() {
 /// cannot tell `dora-rows` from `dora-cols`.
 #[test]
 fn dora_cols_normalizes_columns_and_rescales_by_magnitude_c() {
-    let dir = scratch("dora-cols");
+    let guard = scratch("dora-cols");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 3usize, 2usize);
     let magnitudes: Vec<f32> = vec![0.75, 1.5, 2.25];
     let path = dir.join("dora-cols.safetensors");
@@ -777,7 +785,8 @@ fn dora_cols_normalizes_columns_and_rescales_by_magnitude_c() {
 /// `dora-cols` exactly, and it is asserted not to be.
 #[test]
 fn bora_applies_rows_then_columns_and_is_not_dora_cols() {
-    let dir = scratch("bora");
+    let guard = scratch("bora");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 3usize, 2usize);
     let row_magnitudes: Vec<f32> = vec![0.5, 1.0, 1.5, 2.0];
     let col_magnitudes: Vec<f32> = vec![0.75, 1.5, 2.25];
@@ -866,7 +875,8 @@ fn bora_applies_rows_then_columns_and_is_not_dora_cols() {
 /// a bound. Ordering drift, truncation drift and sign drift each break it visibly.
 #[test]
 fn lora_xs_reconstructs_through_the_base_weights_own_singular_bases() {
-    let dir = scratch("lora-xs");
+    let guard = scratch("lora-xs");
+    let dir = guard.path();
     let rank = 2usize;
     let path = dir.join("xs.safetensors");
     AdapterRecipe::new("lora-xs", rank, 2.0)
@@ -904,7 +914,8 @@ fn lora_xs_reconstructs_through_the_base_weights_own_singular_bases() {
 /// entries come out with the wrong sign, which this asserts against directly.
 #[test]
 fn xs_sign_canonicalization_propagates_from_u_to_v() {
-    let dir = scratch("xs-sign");
+    let guard = scratch("xs-sign");
+    let dir = guard.path();
     let rank = 2usize;
     let path = dir.join("xs-sign.safetensors");
     AdapterRecipe::new("lora-xs", rank, 2.0)
@@ -947,7 +958,8 @@ fn xs_sign_canonicalization_propagates_from_u_to_v() {
 /// with the image lane.
 #[test]
 fn dora_stacks_do_not_commute_and_classic_lora_stacks_do() {
-    let dir = scratch("order");
+    let guard = scratch("order");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let base = f32_tensor(
@@ -1044,7 +1056,8 @@ fn dora_stacks_do_not_commute_and_classic_lora_stacks_do() {
 /// one-element slice is a no-op — so the comparison cannot agree with itself.
 #[test]
 fn a_two_deep_stack_folds_the_first_adapter_first() {
-    let dir = scratch("absolute-order");
+    let guard = scratch("absolute-order");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let base = f32_tensor(
@@ -1113,7 +1126,8 @@ fn a_two_deep_stack_folds_the_first_adapter_first() {
 /// is `n - 1`, for a three-deep stack.
 #[test]
 fn the_plan_preserves_request_order_at_both_ends() {
-    let dir = scratch("order-index");
+    let guard = scratch("order-index");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let targets = small_targets(TARGET, out_features, in_features);
     let mut specs = Vec::new();
@@ -1157,7 +1171,8 @@ fn the_plan_preserves_request_order_at_both_ends() {
 /// only live adapters, so the suppression is invisible to them and the bug is unobservable there.
 #[test]
 fn adapter_index_survives_zero_scale_op_suppression() {
-    let dir = scratch("index-filter");
+    let guard = scratch("index-filter");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let targets = small_targets(TARGET, out_features, in_features);
 
@@ -1216,7 +1231,8 @@ fn adapter_index_survives_zero_scale_op_suppression() {
 /// produce non-finite values), so the fast path is shown to be load-bearing rather than cosmetic.
 #[test]
 fn a_zero_scale_stack_validates_fully_and_then_mutates_nothing() {
-    let dir = scratch("zero");
+    let guard = scratch("zero");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let base = f32_tensor(
@@ -1298,7 +1314,8 @@ fn a_zero_scale_stack_validates_fully_and_then_mutates_nothing() {
 /// result is byte-identical to requesting the live one alone.
 #[test]
 fn a_zero_scale_member_of_a_mixed_stack_contributes_nothing() {
-    let dir = scratch("zero-mixed");
+    let guard = scratch("zero-mixed");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let base = f32_tensor(
@@ -1409,7 +1426,8 @@ fn only_dit_and_conditioner_linear_and_conv1d_weights_are_targets() {
 /// `the_adapter_backend_serves_unplanned_keys_untouched` below.
 #[test]
 fn same_and_t5gemma_keys_are_refused_as_no_target_matched() {
-    let dir = scratch("forbidden");
+    let guard = scratch("forbidden");
+    let dir = guard.path();
     let targets = adaptable_targets(&real_key_shapes());
     for forbidden in [
         // SAME — present in the very file the wrapper serves, and excluded by prefix.
@@ -1443,7 +1461,8 @@ fn same_and_t5gemma_keys_are_refused_as_no_target_matched() {
 /// aggregate measurement.
 #[test]
 fn the_seconds_total_conditioner_linear_is_an_adapter_target() {
-    let dir = scratch("conditioner");
+    let guard = scratch("conditioner");
+    let dir = guard.path();
     let key = "conditioner.conditioners.seconds_total.embedder.embedding.1.weight";
     let targets = adaptable_targets(&real_key_shapes());
     let (out_features, in_features, rank) = (768usize, 256usize, 2usize);
@@ -1479,7 +1498,8 @@ fn the_seconds_total_conditioner_linear_is_an_adapter_target() {
 /// arithmetic, so a transposed restore fails.
 #[test]
 fn conv1d_targets_flatten_apply_and_restore_exactly() {
-    let dir = scratch("conv1d");
+    let guard = scratch("conv1d");
+    let dir = guard.path();
     let key = "model.model.preprocess_conv.weight";
     let (out_channels, in_channels, kernel, rank) = (3usize, 2usize, 2usize, 1usize);
     let flat_in = in_channels * kernel;
@@ -1550,7 +1570,8 @@ fn conv1d_targets_flatten_apply_and_restore_exactly() {
 #[test]
 fn every_pickle_container_extension_is_refused_with_a_typed_message() {
     // ⚠ The scratch tag is deliberately NOT "pickle" — see the doc comment above.
-    let dir = scratch("containers");
+    let guard = scratch("containers");
+    let dir = guard.path();
     for extension in ["ckpt", "pt", "pth", "bin", "PT", "Ckpt"] {
         let path = dir.join(format!("adapter.{extension}"));
         std::fs::write(&path, b"\x80\x04not-really-a-pickle").unwrap();
@@ -1589,7 +1610,8 @@ fn every_pickle_container_extension_is_refused_with_a_typed_message() {
 
 #[test]
 fn a_peft_directory_round_trips_the_whole_family() {
-    let dir = scratch("peft");
+    let guard = scratch("peft");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let base = f32_tensor(
@@ -1642,7 +1664,8 @@ fn a_peft_directory_round_trips_the_whole_family() {
 /// are green without this case.
 #[test]
 fn a_malformed_peft_config_is_refused_rather_than_defaulted() {
-    let dir = scratch("peft-config");
+    let guard = scratch("peft-config");
+    let dir = guard.path();
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
 
     // One valid PEFT directory, re-used by rewriting only `adapter_config.json` each time, so each
@@ -1753,7 +1776,8 @@ fn a_malformed_peft_config_is_refused_rather_than_defaulted() {
 /// would silently retarget the module. The check is green to delete without this case.
 #[test]
 fn a_native_adapter_index_segment_must_be_an_integer() {
-    let dir = scratch("native-index");
+    let guard = scratch("native-index");
+    let dir = guard.path();
     let path = dir.join("bad-index.safetensors");
 
     // Written by hand rather than through `AdapterRecipe`, which always emits the well-formed `.0.`
@@ -1903,7 +1927,8 @@ impl TwoReaderRefusal {
 /// a row asserts it on both parsers by construction.
 #[test]
 fn both_readers_enforce_the_same_tensor_level_rules() {
-    let dir = scratch("two-reader");
+    let guard = scratch("two-reader");
+    let dir = guard.path();
     let stem = TARGET.strip_suffix(".weight").expect("target stem");
 
     let a = (vec![2usize, 4usize], fill(2, 4, 1.0));
@@ -2068,7 +2093,7 @@ fn both_readers_enforce_the_same_tensor_level_rules() {
             expect: "unknown Stable Audio 3 adapter type",
         },
     ] {
-        case.assert_refused_by_both_readers(&dir);
+        case.assert_refused_by_both_readers(dir);
     }
 
     // The control: the same two spellings, well formed, load from both readers — so every refusal
@@ -2094,7 +2119,8 @@ fn both_readers_enforce_the_same_tensor_level_rules() {
 /// has, and dropping `adapter_type` from a native file was green without this.
 #[test]
 fn native_metadata_declarations_are_required_not_defaulted() {
-    let dir = scratch("native-metadata");
+    let guard = scratch("native-metadata");
+    let dir = guard.path();
     let stem = TARGET.strip_suffix(".weight").expect("target stem");
     let path = dir.join("metadata.safetensors");
     let tensors = vec![
@@ -2268,7 +2294,8 @@ fn bracket_ranges_expand_and_malformed_ones_are_refused() {
 /// contradiction in the file rather than a caller's subsetting choice — so it fails loudly.
 #[test]
 fn include_and_exclude_filters_are_honored_and_orphaned_modules_fail_loudly() {
-    let dir = scratch("filters");
+    let guard = scratch("filters");
+    let dir = guard.path();
     let device = Device::Cpu;
     let mut targets = BTreeMap::new();
     for layer in 0..4 {
@@ -2348,7 +2375,8 @@ fn include_and_exclude_filters_are_honored_and_orphaned_modules_fail_loudly() {
 /// refusals.
 #[test]
 fn every_adapter_tensor_must_be_consumed_exactly_once() {
-    let dir = scratch("consumed");
+    let guard = scratch("consumed");
+    let dir = guard.path();
     let device = Device::Cpu;
     let targets = small_targets(TARGET, 4, 4);
 
@@ -2404,7 +2432,8 @@ fn every_adapter_tensor_must_be_consumed_exactly_once() {
 /// Shape and rank disagreements are refused before any weight is touched.
 #[test]
 fn shape_and_rank_mismatches_are_refused_at_plan_time() {
-    let dir = scratch("shapes");
+    let guard = scratch("shapes");
+    let dir = guard.path();
     let device = Device::Cpu;
     let targets = small_targets(TARGET, 4, 6);
 
@@ -2443,7 +2472,8 @@ fn shape_and_rank_mismatches_are_refused_at_plan_time() {
 /// Non-finite factors and non-finite metadata are refused rather than folded into the checkpoint.
 #[test]
 fn non_finite_adapter_values_are_refused() {
-    let dir = scratch("finite");
+    let guard = scratch("finite");
+    let dir = guard.path();
     let device = Device::Cpu;
 
     let nan = dir.join("nan.safetensors");
@@ -2538,7 +2568,8 @@ fn ltx_and_wan_specific_adapter_knobs_are_refused_by_name() {
 fn the_adapter_backend_serves_unplanned_keys_untouched() {
     use candle_nn::var_builder::SimpleBackend;
 
-    let dir = scratch("backend");
+    let guard = scratch("backend");
+    let dir = guard.path();
     let device = Device::Cpu;
     let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
     let targets = small_targets(TARGET, out_features, in_features);
@@ -2650,7 +2681,8 @@ fn the_adapter_backend_serves_unplanned_keys_untouched() {
 /// shapes would make every adapter fail — or, worse, make a Conv1d look 2-D.
 #[test]
 fn the_target_set_is_read_from_a_real_safetensors_header() {
-    let dir = scratch("header");
+    let guard = scratch("header");
+    let dir = guard.path();
     let path = dir.join("model.safetensors");
 
     let mut owned: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
@@ -2712,7 +2744,8 @@ fn an_empty_plan_is_empty_and_folds_nothing() {
 
 #[test]
 fn a_resolved_plan_moves_factor_tensors_without_reloading_or_replanning() {
-    let dir = scratch("plan-device-transfer");
+    let guard = scratch("plan-device-transfer");
+    let dir = guard.path();
     let path = dir.join("adapter.safetensors");
     recipe_for(AdapterType::Lora, TARGET, 4, 4, 2, 4.0, 3.0).write_native(&path);
     let plan = plan_for(
@@ -2891,7 +2924,8 @@ fn render(generator: &dyn candle_audio::gen_core::Generator, prompt: &str, seed:
 #[ignore = "requires the pinned small-music snapshot; set SA3_SMALL_MUSIC_SNAPSHOT"]
 fn first_generate_does_not_reload_or_replan_an_adapter() {
     let root = snapshot_root("SA3_SMALL_MUSIC_SNAPSHOT");
-    let dir = scratch("single-adapter-load");
+    let guard = scratch("single-adapter-load");
+    let dir = guard.path();
     let path = dir.join("one-load.safetensors");
     write_real_adapter(&path, AdapterType::Lora, &real_targets(&root, 1), 17.0);
     let mut load_spec =
@@ -2910,7 +2944,8 @@ fn first_generate_does_not_reload_or_replan_an_adapter() {
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn real_adapters_change_the_render_and_a_zero_scale_one_changes_nothing() {
-    let dir = scratch("real");
+    let guard = scratch("real");
+    let dir = guard.path();
     for case in REAL_CASES {
         let root = snapshot_root(case.env);
         let targets = real_targets(&root, 3);
@@ -2964,7 +2999,8 @@ fn real_adapters_change_the_render_and_a_zero_scale_one_changes_nothing() {
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn real_stacked_dora_adapters_are_order_dependent() {
-    let dir = scratch("real-order");
+    let guard = scratch("real-order");
+    let dir = guard.path();
     for case in REAL_CASES {
         let root = snapshot_root(case.env);
         let targets = real_targets(&root, 2);
@@ -3012,7 +3048,8 @@ fn real_stacked_dora_adapters_are_order_dependent() {
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn real_lora_xs_folds_through_the_host_svd() {
-    let dir = scratch("real-xs");
+    let guard = scratch("real-xs");
+    let dir = guard.path();
     for case in REAL_CASES {
         let root = snapshot_root(case.env);
         let id = case.variant.model_id();
@@ -3069,7 +3106,8 @@ fn real_lora_xs_folds_through_the_host_svd() {
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn a_key_mismatched_adapter_is_refused_at_load_variant_not_at_first_generate() {
-    let dir = scratch("real-mismatch");
+    let guard = scratch("real-mismatch");
+    let dir = guard.path();
     // A well-formed adapter naming a layer index the DiT does not have. Everything about the file
     // is valid — type, rank, alpha, finite factors, consistent shapes — so the *only* thing that can
     // reject it is matching its key against the checkpoint's adaptable target set.
@@ -3130,4 +3168,27 @@ fn a_key_mismatched_adapter_is_refused_at_load_variant_not_at_first_generate() {
         load(vec![spec(&valid, 1.0)])
             .unwrap_or_else(|error| panic!("{id}: the valid control adapter was refused: {error}"));
     }
+}
+
+/// Guards the sc-17755 fix for [`scratch`]: the adapter directory leaves with the guard. Without it
+/// (a bare `create_dir_all` on a `temp_dir()` join, as before) this goes RED.
+#[test]
+fn scratch_dir_is_removed_on_drop() {
+    let (root, file) = {
+        let guard = scratch("drop-guard");
+        let root = guard.path().to_path_buf();
+        let file = root.join("adapter.safetensors");
+        std::fs::write(&file, b"bytes").expect("write adapter");
+        assert!(file.is_file());
+        (root, file)
+    };
+    assert!(!file.exists(), "adapter survived: {}", file.display());
+    assert!(!root.exists(), "scratch root survived: {}", root.display());
+}
+
+/// Two scratch dirs with the same tag are distinct — the old `(pid, ThreadId)` name was not.
+#[test]
+fn scratch_dirs_with_the_same_tag_do_not_collide() {
+    let (a, b) = (scratch("dup"), scratch("dup"));
+    assert_ne!(a.path(), b.path());
 }

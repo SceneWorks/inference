@@ -34,6 +34,8 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # Run the registered LlamaProvider through the backend-neutral contract checks.
 core-llm-testkit = { workspace = true }
+# Self-removing fixture roots for the test suites (sc-17755).
+tempfile = { workspace = true }
 
 [features]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).

@@ -23,3 +23,11 @@ serde_json = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-5148) — the trainer center-crops + hands the
 # Image to the Flux.2 VAE preprocess. PNG + JPEG cover the SceneWorks dataset formats (mirrors z-image).
 image = { workspace = true }
+
+[dev-dependencies]
+# Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed
+# cancellation / seed determinism / CFG-off render) — the sc-4481 standard every shipped family meets.
+# Lens was the one shipped mlx image family never wired to it, so sc-17418's `check_cfg_off_render`
+# arm never actually ran here despite covering the axis lens is most sensitive to (sc-17616).
+# Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

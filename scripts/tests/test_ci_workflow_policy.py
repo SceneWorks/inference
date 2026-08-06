@@ -10,6 +10,8 @@ import sys
 import textwrap
 import tomllib
 import unittest
+
+import yaml
 from pathlib import Path
 
 
@@ -926,6 +928,27 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}",
             workflow,
         )
+        self.assertIn("migrate_mage_edit_variant_manifest:", workflow)
+        self.assertIn(
+            "default: false",
+            workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
+        )
+        migration = workflow[
+            workflow.index("\n      - name: Migrate only the copied Mage edit-variant manifest") :
+            workflow.index(
+                "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
+            )
+        ]
+        self.assertIn("inputs.profile == 'media'", migration)
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest", migration)
+        self.assertIn('golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"', migration)
+        self.assertIn('runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"', migration)
+        self.assertIn('seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"', migration)
+        self.assertIn('"$golden_root" != "$runner_root/"*', migration)
+        self.assertIn('"$golden_root" == "$seed_root"', migration)
+        self.assertIn(" -ef ", migration)
+        self.assertIn("--migrate-reference-environment-manifest-only", migration)
+        self.assertNotIn("dump_mage_flow_golden.py", migration)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
         self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
         self.assertIn(
@@ -967,7 +990,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
         self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
-        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 2)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 3)
         self.assertLess(
             workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
             workflow.index("Save verified Mage oracle cache"),
@@ -1323,8 +1346,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         head-of-line block); it must carry the seeds WITHOUT WHICH THE TEST CANNOT PASS AT ALL, since
         the verdict rule refuses to rank configs with no between-seed variance estimate; and it must
         surrender its per-cell evidence even when the run fails, because an unresolvable verdict is
-        exactly the outcome whose 21 cells someone needs to read and re-running costs another
-        4.3 hours.
+        exactly the outcome whose measured cells someone needs to read, and re-running costs
+        hours.
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("  mlx-krea-realtime-s18-sweep:")
@@ -1342,13 +1365,85 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Over GitHub's 360-minute default, which killed a long macOS lane mid-run in sc-16981.
         self.assertIn("timeout-minutes: 480", job)
         # Rows AND seeds: the run-count assertion below is their product, so the job owns both.
-        self.assertIn('KREA_S18_ROWS: ABCDFEZ', job)
-        self.assertIn('KREA_S18_SEEDS: "7,11,23"', job)
+        # sc-17655 made them dispatch inputs so the sweep can be run in row-sized pieces instead of
+        # one indivisible 4.3 h block, which means the count is DERIVED rather than the literal 21
+        # that only ever held for the full seven-row sweep. Both halves are pinned: the job must read
+        # the inputs, and the inputs must still DEFAULT to the full recorded sweep, or a bare
+        # dispatch would quietly measure something narrower than this lane claims.
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", job)
+        self.assertIn("KREA_S18_SEEDS: ${{ inputs.krea_s18_seeds }}", job)
+        # PARSED, not string-matched. Substring assertions over the pre-`jobs:` text were tried and
+        # are false greens twice over: `assertIn("krea_s18_rows:", ...)` matches the key inside a
+        # `#` comment, and `assertIn("default: ABCDFEZ", ...)` is unanchored, so swapping the two
+        # defaults between the rows and seeds inputs still passed. Both were demonstrated.
+        inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
+            "workflow_dispatch"
+        ]["inputs"]
+        # NOT the full ABCDFEZ. sc-17324 established by measurement that two rows cannot run on
+        # this lane's runner at the pinned 832x480: F (~49 GiB) took nax-macos-2 down twice and
+        # belongs at 640x384, and E (~63-69 GiB) is unmeasurable on this infrastructure at either
+        # bucket. The memory preflight refuses both, so defaulting to all seven would be a default
+        # that always fails. Pinned so the convenience of "just put them back" has to argue with
+        # two crashed runners first.
+        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDZ")
+        self.assertNotIn("E", inputs["krea_s18_rows"]["default"])
+        self.assertNotIn("F", inputs["krea_s18_rows"]["default"])
+        self.assertEqual(inputs["krea_s18_seeds"]["default"], "7,11,23")
         # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
         self.assertIn("set -o pipefail", job)
         self.assertIn("-- --exact --ignored --nocapture", job)
         self.assertIn('grep -qE "test result: ok\\. 1 passed"', job)
-        self.assertIn('"$cells" -ne 21', job)
+        self.assertIn("expected_cells=$(( n_rows * n_seeds ))", job)
+        self.assertIn('"$cells" -ne "$expected_cells"', job)
+        # A free-text row list is a new way to make the count assertion vacuous: a typo'd letter
+        # selects fewer rows than it counts, and a repeated one counts a row twice. Both are
+        # rejected before the four-hour cargo invocation rather than after it.
+        self.assertIn("=~ ^[ABCDFEZ]+$", job)
+        self.assertIn("repeats a row", job)
+        # Three shell details that were each a live bug in this step, pinned because every one of
+        # them fails SILENTLY — the step still exits non-zero, just with no ::error:: line and no
+        # explanation, four hours in:
+        #   * `|| true` on the seed count. `grep -c` exits 1 when it counts zero, and under
+        #     `bash -e` + `set -o pipefail` that kills the shell at the assignment, making the
+        #     "parsed to no seeds" branch unreachable.
+        #   * `[:blank:]`, not `[:space:]`, in the duplicate-seed check: `[:space:]` deletes the
+        #     newlines separating the seeds, collapsing `7,7` to `77` so the check never fires.
+        #   * field-vs-seed count parity, so a value this shell cannot read the way Rust parses it
+        #     (`+7`, or one wider than u64) fails now rather than as a cell-count mismatch later.
+        # Anchored to the seed-count line: a bare `|| true` also appears on the `cells=` line
+        # below, so the loose form still passed with this one deleted (demonstrated).
+        self.assertIn("[0-9]{1,19}[[:blank:]]*$' || true)\"", job)
+        # Same class, pre-dating sc-17655 and previously unpinned: a sweep that emits ZERO cells
+        # makes this `grep -c` exit 1 too, so without `|| true` the step dies before it can report
+        # "captured 0" — the one diagnosis that matters when nothing was measured.
+        self.assertIn("'^S18CELL' \"$RUNNER_TEMP/s18-sweep.log\" || true)\"", job)
+        self.assertIn("tr -d '[:blank:]'", job)
+        self.assertIn('"$n_seeds" -ne "$n_fields"', job)
+        self.assertIn("parsed to no seeds", job)
+        self.assertIn("repeats a seed", job)
+        # Pieces of a split sweep must be distinguishable: same sha, same inner filename, so without
+        # the rows/seeds in the artifact name the same piece can be re-aggregated twice.
+        self.assertIn(
+            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}"
+            "-s${{ inputs.krea_s18_seeds }}",
+            job,
+        )
+        # sc-17324: the memory preflight must run, must see the rows actually dispatched, and must
+        # NOT be continue-on-error — refusing a row this host cannot hold is its entire purpose.
+        # It replaces two runner deaths, both row F at 832x480, both of which destroyed every cell
+        # measured up to that point because a dying runner takes the `always()` steps with it.
+        self.assertIn("scripts/ci/s18_memory_preflight.py", job)
+        preflight = job.split("- name: S18 memory preflight", 1)[1].split("- name:", 1)[0]
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", preflight)
+        self.assertNotIn("continue-on-error", preflight)
+        # The guard and the run must read the SAME geometry, or the preflight clears one bucket
+        # while the sweep measures another — which is precisely the hole that let an unguarded
+        # row F reach the runner. Both steps take it from the one dispatch input.
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", preflight)
+        sweep = job.split("- name: Run the S18 coherence sweep", 1)[1]
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", sweep)
+        self.assertNotIn('KREA_SMOKE_W: "832"', job)
+        self.assertEqual(inputs["krea_s18_geometry"]["default"], "832x480")
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
@@ -1681,6 +1776,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ("push", "", True, True),
             ("workflow_dispatch", "", True, True),
             ("push", "", False, False),
+            # A merge group builds a `gh-readonly-queue/main/**` ref in this repository from heads
+            # that already passed the fork guard as PRs, so it is trusted exactly like a push. If
+            # this case ever flips to False the CUDA lane stops gating the merge queue while still
+            # looking green, which is the failure this whole boundary exists to prevent.
+            ("merge_group", "", True, True),
+            ("merge_group", "", False, False),
         )
         for event, head_repository, selected, expected in cases:
             with self.subTest(event=event, head_repository=head_repository, selected=selected):
@@ -1693,6 +1794,57 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
+        triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
+        self.assertIn(
+            "merge_group",
+            triggers,
+            "without a merge_group trigger no run is created for the queue's speculative ref, "
+            "so required checks stay pending and every queued PR is evicted on timeout",
+        )
+
+    def test_every_base_sha_resolves_on_a_merge_group_event(self) -> None:
+        # merge_group carries neither `pull_request.base.sha` nor `before`. An empty base is not
+        # uniformly loud: select_lanes.py hard-errors, but check-review-findings.py drops its
+        # append-only comparison and still exits 0. Assert on every BASE_SHA in the file so a new
+        # consumer cannot be added with the two-element chain.
+        assignments = [
+            line.strip()
+            for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("BASE_SHA:")
+        ]
+        self.assertTrue(assignments, "expected at least one BASE_SHA assignment in the workflow")
+        for assignment in assignments:
+            with self.subTest(assignment=assignment):
+                self.assertIn("github.event.merge_group.base_sha", assignment)
+
+    def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        gate = jobs["gate"]
+
+        # `if: always()` is the load-bearing half. The default `success()` would skip the gate
+        # precisely when an upstream lane failed, and a skipped job satisfies a required status
+        # check -- so the gate would report green on exactly the runs it exists to block.
+        self.assertEqual(gate["if"], "always()")
+
+        ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))
+        self.assertEqual(
+            ungated,
+            [],
+            f"jobs missing from the CI gate's needs, so nothing enforces them: {ungated}",
+        )
+
+    def test_gate_distinguishes_a_path_skip_from_a_failed_dependency(self) -> None:
+        # Both arrive as "the job did not run", but only one is benign: a lane skipped by its `if:`
+        # is a real path-based no-op, while a lane skipped because `needs: changes` failed means the
+        # verdict is unknown. The gate must accept `skipped` (or docs-only PRs deadlock) and reject
+        # everything else (or a failed `changes` reads green through its skipped dependents).
+        step = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["gate"]["steps"][0]
+        self.assertIn("success|skipped)", step["run"])
+        self.assertIn("exit 1", step["run"])
+        self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
 
 
 if __name__ == "__main__":
