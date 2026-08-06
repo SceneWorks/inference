@@ -382,6 +382,7 @@ fn reconstruct_rope_scaling(g: &GgufFile, arch: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::primitives::quant::QuantizedLinear;
+    use crate::test_fixture::{assert_fixture_is_a_guarded_entry, Fixture};
 
     fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -508,8 +509,9 @@ mod tests {
 
         // Feed the independently unpermuted result through the streaming sink and pin every stored
         // BF16 value, rather than comparing two invocations of the same writer.
-        let dir_tmp = tempfile::tempdir().unwrap();
-        let dir = dir_tmp.path().to_path_buf();
+        // sc-17768: the writer creates its output dir and allocates staging as a *sibling* of it,
+        // so the fixture points at an entry inside the guarded root, not at the root itself.
+        let dir = Fixture::new("mlx-llm-gguf-qk-stream-", Some("out"));
         let key = "model.layers.0.self_attn.q_proj.weight".to_string();
         crate::snapshot::write_streaming_snapshot(
             &dir,
@@ -545,8 +547,7 @@ mod tests {
         );
         let key = "model.layers.0.self_attn.q_proj.weight";
         for spec in [QuantSpec::q4(), QuantSpec::q8()] {
-            let out_tmp = tempfile::tempdir().unwrap();
-            let out = out_tmp.path().to_path_buf();
+            let out = Fixture::new(&format!("mlx-llm-full-gguf-q{}-", spec.bits), Some("out"));
             convert(
                 &gguf,
                 &out,
@@ -592,6 +593,13 @@ mod tests {
             assert_eq!(config["hidden_size"], 64);
             assert_eq!(config["quantization"]["bits"], spec.bits);
         }
+    }
+
+    /// Drop-regression for this suite's fixture helper: the root leaves with the value. Flip
+    /// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+    #[test]
+    fn convert_fixture_is_self_removing() {
+        assert_fixture_is_a_guarded_entry(Fixture::new("mlx-llm-gguf-qk-stream-", Some("out")));
     }
 
     #[test]

@@ -97,6 +97,7 @@ impl Weights {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixture::{assert_fixture_is_self_removing, Fixture};
 
     #[test]
     fn require_and_get_on_in_memory_map() {
@@ -115,8 +116,10 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrip() {
-        let dir_tmp = tempfile::tempdir().unwrap();
-        let dir = dir_tmp.path().to_path_buf();
+        // sc-17768: a guarded fixture root, so the tree leaves on `Drop` even when an assertion
+        // below panics. It also has to outlive every `Weights` read here — MLX's
+        // `load_safetensors` is lazy, so the tensors are still bound to this directory.
+        let dir = Fixture::new("mlx-llm-weights-test-", None);
         let path = dir.join("model.safetensors");
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         Array::save_safetensors([("w", &a)], None, &path).unwrap();
@@ -126,5 +129,12 @@ mod tests {
 
         let w2 = Weights::from_dir(&dir).unwrap();
         assert!(w2.contains("w"));
+    }
+
+    /// Drop-regression for this suite's fixture helper: the root leaves with the value. Flip
+    /// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+    #[test]
+    fn weights_fixture_is_self_removing() {
+        assert_fixture_is_self_removing(Fixture::new("mlx-llm-weights-test-", None));
     }
 }

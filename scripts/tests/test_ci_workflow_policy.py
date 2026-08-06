@@ -1379,7 +1379,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
             "workflow_dispatch"
         ]["inputs"]
-        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDFEZ")
+        # NOT the full ABCDFEZ. sc-17324 established by measurement that two rows cannot run on
+        # this lane's runner at the pinned 832x480: F (~49 GiB) took nax-macos-2 down twice and
+        # belongs at 640x384, and E (~63-69 GiB) is unmeasurable on this infrastructure at either
+        # bucket. The memory preflight refuses both, so defaulting to all seven would be a default
+        # that always fails. Pinned so the convenience of "just put them back" has to argue with
+        # two crashed runners first.
+        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDZ")
+        self.assertNotIn("E", inputs["krea_s18_rows"]["default"])
+        self.assertNotIn("F", inputs["krea_s18_rows"]["default"])
         self.assertEqual(inputs["krea_s18_seeds"]["default"], "7,11,23")
         # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
         self.assertIn("set -o pipefail", job)
@@ -1420,6 +1428,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "-s${{ inputs.krea_s18_seeds }}",
             job,
         )
+        # sc-17324: the memory preflight must run, must see the rows actually dispatched, and must
+        # NOT be continue-on-error — refusing a row this host cannot hold is its entire purpose.
+        # It replaces two runner deaths, both row F at 832x480, both of which destroyed every cell
+        # measured up to that point because a dying runner takes the `always()` steps with it.
+        self.assertIn("scripts/ci/s18_memory_preflight.py", job)
+        preflight = job.split("- name: S18 memory preflight", 1)[1].split("- name:", 1)[0]
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", preflight)
+        self.assertNotIn("continue-on-error", preflight)
+        # The guard and the run must read the SAME geometry, or the preflight clears one bucket
+        # while the sweep measures another — which is precisely the hole that let an unguarded
+        # row F reach the runner. Both steps take it from the one dispatch input.
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", preflight)
+        sweep = job.split("- name: Run the S18 coherence sweep", 1)[1]
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", sweep)
+        self.assertNotIn('KREA_SMOKE_W: "832"', job)
+        self.assertEqual(inputs["krea_s18_geometry"]["default"], "832x480")
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)

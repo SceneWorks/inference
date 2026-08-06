@@ -652,10 +652,18 @@ mod tests {
     use crate::config::ModelConfig;
     use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
     use crate::primitives::sampler::{SplitMix64, TokenRng};
+    use crate::test_fixture::{assert_fixture_is_a_guarded_entry, Fixture};
     use std::collections::HashMap;
 
-    fn unique_dir(tmp: &tempfile::TempDir, label: &str) -> PathBuf {
-        tmp.path().join(format!("mlx-llm-snapshot-{label}"))
+    /// A guarded fixture path the writers are free to create (sc-17768).
+    ///
+    /// The path points at an entry *inside* a `TempDir` root rather than at the root itself: the
+    /// snapshot writers refuse a non-empty output directory and allocate their staging dir as a
+    /// sibling of it, so both land inside the guard and leave with it on `Drop` — including out of
+    /// a panicking test, which the trailing `remove_dir_all` lines this replaced never covered.
+    /// Uniqueness comes from the call (`tempfile` mints a fresh root each time), not from the PID.
+    fn unique_dir(label: &str) -> Fixture {
+        Fixture::new(&format!("mlx-llm-snapshot-{label}-"), Some("out"))
     }
 
     fn randn(shape: &[i32], rng: &mut SplitMix64) -> Array {
@@ -839,17 +847,13 @@ mod tests {
 
     #[test]
     fn qwen35_dense_and_moe_q4_q8_round_trip_match_load_time_quantization() {
-        let tmp = tempfile::tempdir().unwrap();
         for moe in [false, true] {
             for spec in [QuantSpec::q4(), QuantSpec::q8()] {
-                let dir = unique_dir(
-                    &tmp,
-                    &format!(
-                        "qwen35-{}-q{}",
-                        if moe { "moe" } else { "dense" },
-                        spec.bits
-                    ),
-                );
+                let dir = unique_dir(&format!(
+                    "qwen35-{}-q{}",
+                    if moe { "moe" } else { "dense" },
+                    spec.bits
+                ));
                 let (tensors, config) = tiny_qwen35(moe);
                 let dense_weights = Weights::from_map(tensors.iter().cloned().collect());
                 let dense_cfg = Qwen35Config::from_json(&config).unwrap();
@@ -948,22 +952,17 @@ mod tests {
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
                 assert!(max_abs <= 1e-5, "stored/load-time parity max_abs={max_abs}");
-
-                std::fs::remove_dir_all(&dir).ok();
             }
         }
     }
 
     #[test]
     fn streaming_writer_is_semantically_equivalent_and_canonical() {
-        let tmp = tempfile::tempdir().unwrap();
         let (tensors, config) = tiny_model();
         let keys: Vec<_> = tensors.iter().map(|(k, _)| k.clone()).collect();
         let source: HashMap<_, _> = tensors.into_iter().collect();
-        let a = unique_dir(&tmp, "stream-a");
-        let b = unique_dir(&tmp, "stream-b");
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
+        let a = unique_dir("stream-a");
+        let b = unique_dir("stream-b");
         for out in [&a, &b] {
             write_streaming_snapshot(
                 out,
@@ -992,19 +991,15 @@ mod tests {
                 "{key}"
             );
         }
-        let _ = std::fs::remove_dir_all(a);
-        let _ = std::fs::remove_dir_all(b);
     }
 
     #[test]
     fn streaming_writer_cleans_staging_after_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = unique_dir(&tmp, "stream-error");
+        let out = unique_dir("stream-error");
         let sibling = out.with_file_name(format!(
             ".{}-unrelated",
             out.file_name().unwrap().to_string_lossy()
         ));
-        let _ = std::fs::remove_dir_all(&out);
         std::fs::write(&sibling, b"keep").unwrap();
         let error = write_streaming_snapshot(
             &out,
@@ -1018,14 +1013,11 @@ mod tests {
         assert!(error.to_string().contains("injected"));
         assert!(!out.join("model.safetensors").exists());
         assert_eq!(std::fs::read(&sibling).unwrap(), b"keep");
-        std::fs::remove_file(sibling).unwrap();
     }
 
     #[test]
     fn streaming_writer_refuses_nonempty_output_without_touching_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = unique_dir(&tmp, "stream-no-overwrite");
-        let _ = std::fs::remove_dir_all(&out);
+        let out = unique_dir("stream-no-overwrite");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("sentinel"), b"keep").unwrap();
         assert!(write_streaming_snapshot(
@@ -1038,34 +1030,32 @@ mod tests {
         )
         .is_err());
         assert_eq!(std::fs::read(out.join("sentinel")).unwrap(), b"keep");
-        std::fs::remove_dir_all(out).unwrap();
     }
 
     #[test]
     fn stage_allocation_skips_collision_without_deleting_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = unique_dir(&tmp, "stream-collision");
+        let out = unique_dir("stream-collision");
         let parent = out.parent().unwrap();
         let name = out.file_name().unwrap().to_string_lossy();
         let nonce = STAGE_NONCE.load(Ordering::Relaxed);
         let collision = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&collision);
         std::fs::create_dir(&collision).unwrap();
         std::fs::write(collision.join("sentinel"), b"keep").unwrap();
         let allocated = create_stage_dir(&out).unwrap();
         assert_ne!(allocated, collision);
+        assert!(
+            allocated.is_dir(),
+            "create_stage_dir must allocate a real directory"
+        );
         assert_eq!(std::fs::read(collision.join("sentinel")).unwrap(), b"keep");
-        std::fs::remove_dir_all(allocated).unwrap();
-        std::fs::remove_dir_all(collision).unwrap();
     }
 
     #[test]
     fn concurrent_stage_allocations_are_unique() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = unique_dir(&tmp, "stream-concurrent");
+        let out = unique_dir("stream-concurrent");
         let handles: Vec<_> = (0..8)
             .map(|_| {
-                let out = out.clone();
+                let out = out.to_path_buf();
                 std::thread::spawn(move || create_stage_dir(&out).unwrap())
             })
             .collect();
@@ -1073,22 +1063,27 @@ mod tests {
         allocated.sort();
         allocated.dedup();
         assert_eq!(allocated.len(), 8);
-        for path in allocated {
-            std::fs::remove_dir_all(path).unwrap();
+        // The eight staging dirs are siblings of `out`, i.e. inside the fixture's guarded root, so
+        // they leave with it — no explicit removal loop.
+        for path in &allocated {
+            assert!(path.is_dir(), "{} is not a real directory", path.display());
+            assert!(
+                path.starts_with(out.root()),
+                "{} escaped the fixture root",
+                path.display()
+            );
         }
     }
 
     #[test]
     fn streaming_q4_q8_match_direct_quantization() {
-        let tmp = tempfile::tempdir().unwrap();
         let key = "model.layers.0.self_attn.q_proj.weight".to_string();
         let data: Vec<f32> = (0..128)
             .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
             .collect();
         let dense = Array::from_slice(&data, &[2, 64]);
         for spec in [QuantSpec::q4(), QuantSpec::q8()] {
-            let out = unique_dir(&tmp, &format!("stream-q{}", spec.bits));
-            let _ = std::fs::remove_dir_all(&out);
+            let out = unique_dir(&format!("stream-q{}", spec.bits));
             write_streaming_snapshot(
                 &out,
                 std::slice::from_ref(&key),
@@ -1147,7 +1142,6 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(out.join("config.json")).unwrap())
                     .unwrap();
             assert_eq!(config["quantization"]["bits"], spec.bits);
-            std::fs::remove_dir_all(out).unwrap();
         }
     }
 
@@ -1156,10 +1150,8 @@ mod tests {
     #[test]
     #[ignore = "manual peak-RSS measurement harness"]
     fn streaming_writer_scaled_rss_probe() {
-        let tmp = tempfile::tempdir().unwrap();
         let keys: Vec<_> = (0..16).map(|i| format!("probe.tensor.{i:02}")).collect();
-        let out = unique_dir(&tmp, "stream-rss");
-        let _ = std::fs::remove_dir_all(&out);
+        let out = unique_dir("stream-rss");
         write_streaming_snapshot(
             &out,
             &keys,
@@ -1175,7 +1167,6 @@ mod tests {
                 .len()
                 > 128 * 1024 * 1024
         );
-        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]
@@ -1203,16 +1194,12 @@ mod tests {
 
     #[test]
     fn qwen35_rejects_mislabeled_mixed_and_corrupt_stored_quantization() {
-        let tmp = tempfile::tempdir().unwrap();
         for moe in [false, true] {
-            let dir = unique_dir(
-                &tmp,
-                if moe {
-                    "qwen35-corrupt-moe"
-                } else {
-                    "qwen35-corrupt-dense"
-                },
-            );
+            let dir = unique_dir(if moe {
+                "qwen35-corrupt-moe"
+            } else {
+                "qwen35-corrupt-dense"
+            });
             let (dense_tensors, dense_json) = tiny_qwen35(moe);
             let dense_weights = Weights::from_map(dense_tensors.iter().cloned().collect());
 
@@ -1312,8 +1299,6 @@ mod tests {
             )
             .to_string();
             assert!(err.contains("invalid part shapes"), "{err}");
-
-            std::fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -1350,8 +1335,7 @@ mod tests {
     /// Dense write: every tensor reloads bit-identical and config carries no quantization block.
     #[test]
     fn dense_write_round_trips_bit_identical() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "dense");
+        let dir = unique_dir("dense");
         let (tensors, config) = tiny_model();
         let original: HashMap<String, Vec<u8>> = tensors
             .iter()
@@ -1370,16 +1354,13 @@ mod tests {
         }
         // No quantization block was added.
         assert_eq!(ModelConfig::from_dir(&dir).unwrap().quantization, None);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Quantized write: projections expand to weight/scales/biases, config gains the quantization
     /// block, and the snapshot loads through the loader's pre-quantized branch and runs a forward.
     #[test]
     fn quantized_write_loads_through_prequantized_branch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "q8");
+        let dir = unique_dir("q8");
         let (tensors, config) = tiny_model();
         let spec = QuantSpec::q8();
 
@@ -1415,17 +1396,14 @@ mod tests {
         // Loads through `from_weights` (no load-time quant) as a quantized model and runs.
         let model = CausalLm::from_weights(&w, "", cfg).unwrap();
         assert!(model.is_quantized(), "snapshot must load as quantized");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The HF leaf: a dense source dir written through with `None` reloads bit-identical, and the
     /// tokenizer files pass through verbatim.
     #[test]
     fn hf_dense_passthrough_round_trips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = unique_dir(&tmp, "hf-src");
-        let out = unique_dir(&tmp, "hf-out");
+        let src = unique_dir("hf-src");
+        let out = unique_dir("hf-out");
         std::fs::create_dir_all(&src).unwrap();
 
         let (tensors, config) = tiny_model();
@@ -1464,17 +1442,13 @@ mod tests {
             "{\"cfg\":true}"
         );
         assert_eq!(ModelConfig::from_dir(&out).unwrap().quantization, None);
-
-        std::fs::remove_dir_all(&src).ok();
-        std::fs::remove_dir_all(&out).ok();
     }
 
     /// The HF leaf with quantization: source dir → quantized snapshot loads as quantized and runs.
     #[test]
     fn hf_quantized_loads_as_quantized() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = unique_dir(&tmp, "hfq-src");
-        let out = unique_dir(&tmp, "hfq-out");
+        let src = unique_dir("hfq-src");
+        let out = unique_dir("hfq-out");
         std::fs::create_dir_all(&src).unwrap();
 
         let (tensors, config) = tiny_model();
@@ -1493,9 +1467,6 @@ mod tests {
         assert_eq!(cfg.quantization, Some(QuantSpec::q4()));
         let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         assert!(model.is_quantized());
-
-        std::fs::remove_dir_all(&src).ok();
-        std::fs::remove_dir_all(&out).ok();
     }
 
     /// A complete tiny Phi-3 tensor set (packed `qkv_proj` + `gate_up_proj`) with matching config:
@@ -1542,8 +1513,7 @@ mod tests {
     /// snapshot loads back through the loader's split-key pre-quantized branch as quantized.
     #[test]
     fn phi3_packed_projections_split_quantize_and_load() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "phi3");
+        let dir = unique_dir("phi3");
         let (tensors, config) = tiny_phi3();
         let qkv = tensors
             .iter()
@@ -1610,8 +1580,6 @@ mod tests {
             model.is_quantized(),
             "packed snapshot must load as quantized"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// MoE expert / shared-expert and DeepSeek MLA projections are quantized (they previously fell
@@ -1619,8 +1587,7 @@ mod tests {
     /// refusal net.
     #[test]
     fn moe_and_mla_projections_are_quantized() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "moe-mla");
+        let dir = unique_dir("moe-mla");
         let (h, inter) = (64i32, 128i32);
         let mut rng = SplitMix64::new(0xD5EE);
         let p = |s: &str| format!("model.layers.0.{s}");
@@ -1683,17 +1650,13 @@ mod tests {
         assert!(!w.contains("model.layers.0.mlp.gate.scales"));
         assert!(w.contains("model.layers.0.self_attn.q_a_layernorm.weight"));
         assert!(!w.contains("model.layers.0.self_attn.q_a_layernorm.scales"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Projection-like keys the writer does not cover abort the write (loud refusal, never a silent
     /// mixed-tier snapshot). Dense writes of the same set still pass through fine.
     #[test]
     fn quantize_refuses_unrecognized_projection_keys() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "refuse-unknown");
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = unique_dir("refuse-unknown");
         let make = || {
             vec![
                 (
@@ -1729,16 +1692,13 @@ mod tests {
             write_snapshot(&dir, make(), config, &SnapshotTokenizer::default(), None).unwrap();
         assert_eq!(report.quantized, None);
         assert_eq!(report.quantized_projections, 0);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A recognized projection suffix with a future stacked-expert layout must fail before the
     /// rank-2 quantizer, naming the offending key and shape, and must not create a partial snapshot.
     #[test]
     fn quantize_refuses_rank_three_recognized_projection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "refuse-rank-three-projection");
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = unique_dir("refuse-rank-three-projection");
         let key = "model.layers.0.mlp.experts.gate_proj.weight";
         let tensors = vec![(key.to_string(), Array::zeros::<f32>(&[4, 128, 64]).unwrap())];
         let config = json!({ "model_type": "llama" });
@@ -1774,9 +1734,7 @@ mod tests {
     /// before the split logic indexes rows or invokes the rank-2 quantizer.
     #[test]
     fn quantize_refuses_rank_three_packed_projection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "refuse-rank-three-packed");
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = unique_dir("refuse-rank-three-packed");
         let key = "model.layers.0.mlp.gate_up_proj.weight";
         let tensors = vec![(key.to_string(), Array::zeros::<f32>(&[2, 128, 64]).unwrap())];
         let (_, config) = tiny_phi3();
@@ -1812,9 +1770,7 @@ mod tests {
     /// claim `quantized` for a snapshot that is entirely dense.
     #[test]
     fn quantize_refuses_zero_projection_coverage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = unique_dir(&tmp, "refuse-zero");
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = unique_dir("refuse-zero");
         let t = vec![(
             "model.embed_tokens.weight".to_string(),
             Array::zeros::<f32>(&[4, 64]).unwrap(),
@@ -1833,6 +1789,30 @@ mod tests {
             other => panic!("expected Unsupported, got {other:?}"),
         }
         assert!(!dir.exists(), "a refused quantize must write nothing");
+    }
+
+    /// Drop-regression for this suite's fixture helper: the guarded root — the writer's output dir
+    /// *and* the staging sibling allocated next to it — leaves with the value. Flip
+    /// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+    #[test]
+    fn snapshot_fixture_is_self_removing() {
+        let fixture = unique_dir("guard");
+        write_snapshot(
+            &fixture,
+            [(
+                "model.embed_tokens.weight".to_string(),
+                Array::zeros::<f32>(&[4, 64]).unwrap(),
+            )],
+            json!({ "model_type": "llama" }),
+            &SnapshotTokenizer::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            fixture.join("model.safetensors").is_file(),
+            "fixture did not receive a snapshot to clean up"
+        );
+        assert_fixture_is_a_guarded_entry(fixture);
     }
 
     /// Raw little-endian bytes of an array's values, for bit-identity checks (dtype preserved).

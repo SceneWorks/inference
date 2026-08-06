@@ -35,11 +35,9 @@ half = "2"
 memmap2 = "0.9"
 
 [dev-dependencies]
-# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
-# `Drop` — including out of a panicking test, which is the only path the old
-# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
-tempfile = { workspace = true }
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
 # tokenizers dep needed.)
 # Run the registered LlamaProvider through the backend-neutral contract checks.
 core-llm-testkit = { workspace = true }
+# Self-removing fixture roots for the unit + integration suites (sc-17768).
+tempfile = { workspace = true }
