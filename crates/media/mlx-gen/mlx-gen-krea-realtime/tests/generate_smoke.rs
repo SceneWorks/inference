@@ -1752,7 +1752,9 @@ fn v2v_strength_zero_is_latent_identity() {
 /// carries a bf16 cache, which is the whole point of measuring it next to the Q4 weights. What *does*
 /// shrink it is [`KreaArConfig::kv_cache_quant`](mlx_gen_krea_realtime::KreaArConfig::kv_cache_quant)
 /// (sc-17807), so this drives the real DiT chunk-by-chunk **once per tier** — the shipped bf16 cache
-/// and Q8 — over the same bounded window the pipeline uses.
+/// and Q8 — over the same bounded window the pipeline uses. sc-17894 trims the cache to the actual
+/// next read before measuring: at the shipped geometry that is one 4,680-token chunk, not the
+/// 9,360-token attention window (which includes the next chunk's own K/V).
 ///
 /// The gate is the one that makes the published per-token table evidence rather than arithmetic:
 /// measured `retained_bytes` must equal
@@ -1820,8 +1822,13 @@ fn kv_cache_residency_at_the_production_geometry() {
 
     let fpb = cfg.ar.num_frames_per_block as i32;
     let chunks = latent_frames.div_ceil(cfg.ar.num_frames_per_block);
-    // The bound is structural: retention can never exceed the read window plus one in-flight chunk.
-    let max_tokens = cfg.ar.max_attention_size() + cfg.ar.block_size();
+    // The bound is structural: cached history is the attention window minus the next chunk, plus a
+    // disjoint always-on sink prefix (zero in this production row).
+    let max_tokens = cfg
+        .ar
+        .max_attention_size()
+        .saturating_sub(cfg.ar.block_size())
+        + cfg.ar.sink_tokens();
     let mut peak_by_tier: Vec<(Option<KvCacheQuant>, usize, usize)> = Vec::new();
 
     for tier in [None, Some(KvCacheQuant::Q8)] {
@@ -1862,6 +1869,12 @@ fn kv_cache_residency_at_the_production_geometry() {
                 .forward_chunk(&chunk, 500.0, &cross_kv, start, &mut cache)
                 .expect("causal chunk forward");
             start += (fpb as usize) * cfg.ar.frame_seq_length;
+            // Supply the ACTUAL next chunk length before measuring. This is the sc-17894 mechanism:
+            // `window_prev` evicts exactly the tokens that read cannot consume, and doing it here
+            // also proves the packed and dense caches expose the same retained shape.
+            cache
+                .window_prev(cfg.ar.block_size())
+                .expect("trim to the next read");
             // MLX is LAZY: without this `eval` the whole chunk forward is an unexecuted graph, the
             // cache arrays are unmaterialized, and `get_active_memory()` reads ~0 — the measurement
             // would be a shape calculation dressed up as a memory reading. Forcing the cache (and the
@@ -1877,7 +1890,7 @@ fn kv_cache_residency_at_the_production_geometry() {
             let bytes = cache.retained_bytes();
             peak_retained_bytes = peak_retained_bytes.max(bytes);
             println!(
-                "  chunk {c:>2}: stored {} tok, retained {} tok, KV {:.2} GiB, MLX active {:.2} GiB",
+                "  chunk {c:>2}: committed {} tok, next-read retained {} tok, KV {:.2} GiB, MLX active {:.2} GiB",
                 cache.stored_tokens(),
                 cache.retained_tokens(),
                 gib(bytes),
@@ -1908,8 +1921,8 @@ fn kv_cache_residency_at_the_production_geometry() {
         );
         assert!(
             cache.retained_tokens() <= max_tokens,
-            "{label}: retained {} tokens > the bounded window's {max_tokens} — eviction is not \
-             bounding the cache",
+            "{label}: retained {} tokens > the actual next read's {max_tokens} — eviction is not \
+             trimming the cache",
             cache.retained_tokens()
         );
         let mlx_peak = mlx_rs::memory::get_peak_memory();
@@ -1929,6 +1942,16 @@ fn kv_cache_residency_at_the_production_geometry() {
         gib(dense_kv),
         gib(q8_peak),
         gib(dense_peak),
+    );
+    let old_dense_window = cfg.ar.max_attention_size() * cfg.kv_bytes_per_token().unwrap();
+    assert_eq!(
+        dense_kv * 2,
+        old_dense_window,
+        "the shipped 6-frame window should retain only the 3-frame cached history the next read uses"
+    );
+    assert!(
+        ((q8_kv as f64 / old_dense_window as f64) - 0.265625).abs() < 1e-9,
+        "Q8 plus next-read eviction should compose to 0.265625x of the old bf16 window"
     );
 
     // **The assertion the prose needed.** `causal.rs` argues that the dequantized read window is an
@@ -2752,9 +2775,10 @@ fn eviction_rolls(latent_frames: usize, frames_per_block: usize, window: i64) ->
 /// nothing structural: [`S18Sweep::kv_tier_comparison`] compares whatever rows are present in both
 /// arms, and [`S18Sweep::validate_window_dose_ladder`] returns early without F. What it does cost is
 /// the widest *dose* — the tier's saving grows with the window, so row F is where quantizing helps
-/// most, and it is exactly the row the A/B has no local measurement for. Its q8 prediction (~19 GiB
-/// of KV against 35.7 bf16, i.e. the row that killed `nax-macos-2` becoming affordable on it) stays
-/// a **prediction** until someone runs it on a host that can hold it.
+/// most, and it is exactly the row the A/B has no local measurement for. With sc-17894's exact-read
+/// retention its q8 prediction is ~17.1 GiB of KV against 32.1 bf16, i.e. the row that killed
+/// `nax-macos-2` becoming affordable on it. That stays a **prediction** until someone runs it on a
+/// host that can hold it.
 ///
 /// ⚠️ Must be run on a tree that has sc-15325 (the tiled-decode fix). Before it, the decode injected an
 /// 8-output-frame-period artifact that a drift metric reads as AR drift; an earlier attempt at this

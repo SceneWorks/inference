@@ -1643,7 +1643,44 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("set -o pipefail", step)
         self.assertIn("--skip kv_cache_residency_at_the_production_geometry", step)
         self.assertIn("--skip long_clip_coherence_under_the_bounded_window", step)
+        self.assertIn("--skip s18_verdict_from_accumulated_cells", step)
+        self.assertIn("--skip s18_kv_tier_ab_from_accumulated_cells", step)
         self.assertIn('grep -qE "test result: ok\\. 6 passed"', step)
+
+    def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
+        """sc-17894: both real-weight acceptance arms must be name-selected and count-pinned."""
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        header = workflow.split("jobs:", 1)[0]
+        job_start = workflow.index("  mlx-krea-realtime:")
+        job = workflow[job_start : workflow.index("\n  mlx-krea-realtime-s18-sweep:", job_start)]
+        e2e_start = job.index("      - name: Run Krea Realtime real-weight e2e")
+        e2e = job[
+            e2e_start : job.index("      - name: Run Krea Realtime KV-cache residency", e2e_start)
+        ]
+        start = workflow.index("      - name: Run Krea Realtime KV-cache residency")
+        step = workflow[
+            start : workflow.index("      - name: Run Krea Realtime real Wan LoRA gates", start)
+        ]
+        lora_start = job.index("      - name: Run Krea Realtime real Wan LoRA gates")
+        lora = job[lora_start : job.index("      - name: Report GPU fault evidence", lora_start)]
+
+        self.assertIn("krea-kv-cache", header)
+        self.assertIn("inputs.profile == 'krea-kv-cache'", job.split("steps:", 1)[0])
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", e2e)
+        self.assertNotIn("if: inputs.profile != 'krea-kv-cache'", step)
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", lora)
+
+        self.assertIn("set -o pipefail", step)
+        self.assertIn("-- --exact --ignored --nocapture", step)
+        self.assertIn('grep -qE "test result: ok\\. 1 passed"', step)
+        invocations = re.findall(r"^\s+run_one (?:integration|lib) .+$", step, re.MULTILINE)
+        self.assertEqual(
+            invocations,
+            [
+                "          run_one integration kv_cache_residency_at_the_production_geometry",
+                "          run_one lib generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention",
+            ],
+        )
 
     def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
         """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.

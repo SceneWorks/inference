@@ -52,11 +52,12 @@
 //!   so long clips stay memory-feasible on Mac. Pure cache slicing.
 //! * [`causal`] — **sc-17807** makes the cache's *per-token cost* a knob on top of that *token count*.
 //!   The cache holds activations, so a Q4 DiT does not shrink it: a DiT token costs **800 KiB** of
-//!   bf16 KV ([`KreaRealtimeConfig::kv_bytes_per_token`]) — comparable to the ~9 GiB of Q4 weights
-//!   at the shipped bounded window and several times larger at any wider one, because unlike the
-//!   weights it scales with the clip. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and
-//!   dequantizes the read window per layer (there is no fused quantized SDPA to attend over packed
-//!   K/V with — see [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`
+//!   bf16 KV ([`KreaRealtimeConfig::kv_bytes_per_token`]). **sc-17894** retains only the cached part
+//!   the next chunk reads: 3.57 GiB at the shipped 6-frame window, then 14.3 and 32.1 GiB at the
+//!   wider 15- and 30-frame rows. Unlike the fixed ~9 GiB of Q4 weights, that term scales with the
+//!   window. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and dequantizes the
+//!   read window per layer (there is no fused quantized SDPA to attend over packed K/V with — see
+//!   [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`,
 //!   and the measurement says keep it there: the sc-17807 A/B found Q8 drifting further than bf16 on
 //!   every bounded row of the S18 sweep, resolvably on row C (+2.79/255 against a 2·SEM of 0.80),
 //!   for a 0.76–0.86× peak. A trade with a measured price, not a free saving.

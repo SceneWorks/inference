@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -2048,8 +2048,10 @@ jobs:
   mlx-krea-realtime:
     name: MLX Krea Realtime video real weights
     # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
-    # Mage-oracle job that shares the `media` profile.
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
+    # Mage-oracle job that shares the `media` profile. `krea-kv-cache` runs only the two count-pinned
+    # KV acceptance tests below, so an unrelated blanket e2e or LoRA failure cannot hide their
+    # verdict (sc-17894).
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime' || inputs.profile == 'krea-kv-cache'
     runs-on: [self-hosted, macOS, ARM64, rw-krea]
     timeout-minutes: 120
     env:
@@ -2129,10 +2131,12 @@ jobs:
       # it does not fit either — n=2 is ~186 min against this job's 120-minute cap.
       #
       # Selection here is by `--ignored`, a BLANKET: every `#[ignore]` test in the file is conscripted
-      # into this step, which is how an hours-long sweep joined a regression lane unannounced. The
+      # into this step, which is how an hours-long sweep joined a regression lane unannounced. Skip
+      # both the real sweep and its two operator-only re-aggregation entry points explicitly. The
       # run-count assertion pins the six that belong here, so the next such addition fails loudly
       # instead of silently spending the budget. Adding an e2e test means bumping the count.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        if: inputs.profile != 'krea-kv-cache'
         env:
           KREA_SMOKE_W: "832"
           KREA_SMOKE_H: "480"
@@ -2143,7 +2147,9 @@ jobs:
             cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
             -- --ignored --nocapture --test-threads 1 \
             --skip kv_cache_residency_at_the_production_geometry \
-            --skip long_clip_coherence_under_the_bounded_window 2>&1 | tee /dev/stderr)"
+            --skip long_clip_coherence_under_the_bounded_window \
+            --skip s18_verdict_from_accumulated_cells \
+            --skip s18_kv_tier_ab_from_accumulated_cells 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 6 passed" <<<"$out"; then
             echo "::error::the Q4 e2e step did not run exactly six passing tests — a rename, a new #[ignore] test, or a skipped arm would otherwise change this lane's coverage silently" >&2
             exit 1
@@ -2163,14 +2169,24 @@ jobs:
           KREA_SMOKE_FRAMES: "81"
         run: |
           set -o pipefail
-          name=kv_cache_residency_at_the_production_geometry
-          out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
-          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
-            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
-            exit 1
-          fi
+          run_one() {
+            local target="$1" name="$2" out
+            if [[ "$target" == lib ]]; then
+              out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+                cargo test --locked --release -p mlx-gen-krea-realtime --lib \
+                "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            else
+              out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+                cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
+                "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            fi
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one integration kv_cache_residency_at_the_production_geometry
+          run_one lib generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention
       # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
       # render, with the scale-0 arm as the attribution control; and the step-distill file is the only
       # real-weight regression gate on the sc-8446 globals-surface decision.
@@ -2184,6 +2200,7 @@ jobs:
       # and both `--exact` steps were skipped behind it. That earlier failure is still open, so this
       # fix is not exercised end-to-end yet (sc-17250).
       - name: Run Krea Realtime real Wan LoRA gates
+        if: inputs.profile != 'krea-kv-cache'
         env:
           KREA_LORA_W: "832"
           KREA_LORA_H: "480"

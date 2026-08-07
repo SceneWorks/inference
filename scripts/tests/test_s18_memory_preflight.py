@@ -32,16 +32,29 @@ MEASURED_832 = {
 }
 
 
+def derived_post_eviction_peak(row: str) -> float:
+    """Derive the post-change peak from the measured pre-change peak and exact freed KV."""
+    clip = preflight.ROW_LATENT_FRAMES.get(row, 45)
+    frames = preflight.ROW_WINDOW_FRAMES[row]
+    old_span = clip if frames is None else min(frames, clip)
+    old_sink = min(preflight.ROW_SINK_FRAMES.get(row, 0), clip)
+    old_tokens = (old_span + old_sink) * preflight.tokens_per_latent_frame(832, 480)
+    freed = old_tokens - preflight.window_tokens(row, 832, 480, 45)
+    return MEASURED_832[row] - freed * preflight.KV_BYTES_PER_TOKEN / 1024**3
+
+
 class S18MemoryPreflightTests(unittest.TestCase):
-    def test_predictions_never_fall_below_the_measured_peak(self) -> None:
-        """Under-prediction is the failure mode that crashes a box. Over-prediction only costs a row."""
+    def test_predictions_never_fall_below_the_derived_post_eviction_peak(self) -> None:
+        """Under-prediction can crash a box; the comparison peak incorporates the exact KV delta."""
         for row, measured in MEASURED_832.items():
             predicted = preflight.predicted_peak_gib(row, 832, 480, 45)
+            measured = derived_post_eviction_peak(row)
             self.assertGreaterEqual(
                 predicted,
                 measured,
-                f"row {row}: predicted {predicted:.2f} GiB is BELOW the measured {measured:.2f} GiB — "
-                "the guard would wave through a row that does not fit",
+                f"row {row}: predicted {predicted:.2f} GiB is BELOW the old measured peak minus "
+                f"the exact evicted KV ({measured:.2f} GiB) — the guard would wave through a row "
+                "that does not fit",
             )
 
     def test_predictions_are_tight_enough_to_be_useful(self) -> None:
@@ -53,7 +66,7 @@ class S18MemoryPreflightTests(unittest.TestCase):
         """
         for row in "ABCDFE":
             predicted = preflight.predicted_peak_gib(row, 832, 480, 45)
-            measured = MEASURED_832[row]
+            measured = derived_post_eviction_peak(row)
             self.assertLessEqual(
                 (predicted - measured) / measured,
                 0.10,
@@ -70,20 +83,30 @@ class S18MemoryPreflightTests(unittest.TestCase):
         self.assertEqual(preflight.window_tokens("B", 832, 480, 45), a + 1560)
         self.assertEqual(preflight.window_tokens("C", 832, 480, 45), a + 3 * 1560)
 
+    def test_bounded_rows_price_the_actual_next_chunk_including_a_short_final_one(self) -> None:
+        self.assertEqual(preflight.window_tokens("A", 832, 480, 45), 3 * 1560)
+        # 46 frames ends in a one-frame chunk, which reads five cached frames from a six-frame window.
+        self.assertEqual(preflight.window_tokens("A", 832, 480, 46), 5 * 1560)
+        # This is not a generic 0.5x claim: a wider window saves the same one full chunk.
+        self.assertEqual(preflight.window_tokens("D", 832, 480, 45), 12 * 1560)
+        self.assertEqual(preflight.window_tokens("F", 832, 480, 45), 27 * 1560)
+
     def test_geometry_drives_the_estimate(self) -> None:
         """640x384 is the documented fallback bucket for the rows that do not fit at 832x480."""
         self.assertEqual(preflight.tokens_per_latent_frame(832, 480), 1560)
         self.assertEqual(preflight.tokens_per_latent_frame(640, 384), 960)
-        # Recorded 640x384 row F peak: 36,210,546,832 bytes = 33.72 GiB.
+        # Recorded pre-sc-17894 row F peak: 33.72 GiB. Subtract the exact three-frame cache slice the
+        # next read never consumes, at this bucket's 960 tokens/frame.
+        derived = 33.72 - 3 * 960 * preflight.KV_BYTES_PER_TOKEN / 1024**3
         predicted = preflight.predicted_peak_gib("F", 640, 384, 45)
-        self.assertGreaterEqual(predicted, 33.72)
-        self.assertLessEqual(predicted, 33.72 * 1.10)
+        self.assertGreaterEqual(predicted, derived)
+        self.assertLessEqual(predicted, derived * 1.10)
 
     def test_row_e_spans_the_whole_clip_and_row_z_is_capped_by_its_own(self) -> None:
         # Row E is the global window: no eviction, so its KV is the entire clip.
         self.assertEqual(preflight.window_tokens("E", 832, 480, 45), 45 * 1560)
         # Row Z's clip is 6 latent frames, so its 6-frame window cannot exceed it.
-        self.assertEqual(preflight.window_tokens("Z", 832, 480, 45), 6 * 1560)
+        self.assertEqual(preflight.window_tokens("Z", 832, 480, 45), 3 * 1560)
 
     def test_the_budget_reproduces_what_each_HOST_actually_did(self) -> None:
         """Anchored on four real outcomes across two boxes, not on a round number.
