@@ -1650,10 +1650,25 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
         """sc-17894: both real-weight acceptance arms must be name-selected and count-pinned."""
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        header = workflow.split("jobs:", 1)[0]
+        job_start = workflow.index("  mlx-krea-realtime:")
+        job = workflow[job_start : workflow.index("\n  mlx-krea-realtime-s18-sweep:", job_start)]
+        e2e_start = job.index("      - name: Run Krea Realtime real-weight e2e")
+        e2e = job[
+            e2e_start : job.index("      - name: Run Krea Realtime KV-cache residency", e2e_start)
+        ]
         start = workflow.index("      - name: Run Krea Realtime KV-cache residency")
         step = workflow[
             start : workflow.index("      - name: Run Krea Realtime real Wan LoRA gates", start)
         ]
+        lora_start = job.index("      - name: Run Krea Realtime real Wan LoRA gates")
+        lora = job[lora_start : job.index("      - name: Report GPU fault evidence", lora_start)]
+
+        self.assertIn("krea-kv-cache", header)
+        self.assertIn("inputs.profile == 'krea-kv-cache'", job.split("steps:", 1)[0])
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", e2e)
+        self.assertNotIn("if: inputs.profile != 'krea-kv-cache'", step)
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", lora)
 
         self.assertIn("set -o pipefail", step)
         self.assertIn("-- --exact --ignored --nocapture", step)

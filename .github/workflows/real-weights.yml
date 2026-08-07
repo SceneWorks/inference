@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -2048,8 +2048,10 @@ jobs:
   mlx-krea-realtime:
     name: MLX Krea Realtime video real weights
     # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
-    # Mage-oracle job that shares the `media` profile.
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
+    # Mage-oracle job that shares the `media` profile. `krea-kv-cache` runs only the two count-pinned
+    # KV acceptance tests below, so an unrelated blanket e2e or LoRA failure cannot hide their
+    # verdict (sc-17894).
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime' || inputs.profile == 'krea-kv-cache'
     runs-on: [self-hosted, macOS, ARM64, rw-krea]
     timeout-minutes: 120
     env:
@@ -2134,6 +2136,7 @@ jobs:
       # run-count assertion pins the six that belong here, so the next such addition fails loudly
       # instead of silently spending the budget. Adding an e2e test means bumping the count.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        if: inputs.profile != 'krea-kv-cache'
         env:
           KREA_SMOKE_W: "832"
           KREA_SMOKE_H: "480"
@@ -2197,6 +2200,7 @@ jobs:
       # and both `--exact` steps were skipped behind it. That earlier failure is still open, so this
       # fix is not exercised end-to-end yet (sc-17250).
       - name: Run Krea Realtime real Wan LoRA gates
+        if: inputs.profile != 'krea-kv-cache'
         env:
           KREA_LORA_W: "832"
           KREA_LORA_H: "480"
