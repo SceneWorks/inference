@@ -1685,7 +1685,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
         """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.
 
-        Each of the 25 selections has to survive all three traps at once. `--exact` AFTER the `--`,
+        Each of the 26 selections has to survive all three traps at once. `--exact` AFTER the `--`,
         because cargo rejects it in its own argument position; a run-count assertion, because with
         `--exact` accepted a renamed test yields `0 passed; N filtered out` and cargo EXITS 0; and a
         NAME, because `--ignored` alone is a blanket that silently conscripts whatever `#[ignore]`
@@ -1710,6 +1710,42 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         THIS test -- the enforcement point for doc-vs-reality drift about what runs where -- an
         instance of the defect class it exists to catch.
 
+        sc-17519 added the 26th, `edit_generate_is_deterministic_rust`, and the arithmetic of what it
+        did NOT add is the point. `edit_real_weights.rs` x12 and `vision_real_weights.rs` x7 -- 19
+        tests -- were left running nowhere by sc-17284 while the per-VARIABLE manifest gate read as
+        satisfied. All 19 were executed on real weights for the first time on 2026-08-06: ONE
+        resolves no golden and passes (34-44s, the selection added below), and the other 18 failed at
+        `Weights::from_file` with `SafeTensors(NotFile)` in 0.02s, because `tools/golden/` is
+        gitignored by design and no checkout had the 10 artifacts they read (sc-17909).
+
+        Of those 18, ONE was free to unblock and is no longer among them.
+        `edit_rope_multi_image_matches_fork` reads a golden whose producer imports one symbol from the
+        MIT-licensed fork and touches no snapshot, no HF cache and no torch original, so sc-17519
+        minted it, committed it to `mlx-gen-qwen-image/tests/fixtures/` (78,133 bytes) and DROPPED the
+        test's `#[ignore]`. It runs in the ordinary macOS lane on every PR, needs no weight set, and
+        is therefore not a candidate for selection here at all. 17 still fail on the golden read, and
+        they read 9 artifacts, not 10.
+
+        Note the two different 18s, because conflating them is how this row got its last wrong number:
+        18 is the count that FAILED on the golden read (19 minus the wired determinism test), and 18
+        is also, separately, the count of tests `QWEN_IMAGE_EDIT_SNAPSHOT` gates -- which is 11 + 3
+        from these two files plus 4 elsewhere (the sequential-residency Edit arm, both Lightning Edit
+        arms, and the sc-17513 `perf.rs` Edit arm), and excludes the 5 here that read no environment
+        variable at all. The manifest row derives both. sc-17513 moved the `perf.rs` Edit arm from
+        that row's EXCLUDED block to its WIRED block without changing the 18: the variable gates the
+        same tests either way, which is the property per-variable counting is supposed to have.
+
+        Of the 17, only 13 are blocked on the Edit-2511 oracle bundle (sc-17909). The other 4 -- the
+        index/Gate-A gates in `vision_real_weights.rs` -- need no weights on either side, and are
+        blocked solely because `tools/dump_qwen_vision_golden.py` writes its two weight-free halves
+        into the same output file as a third that loads the torch original. That is sc-18085, filed
+        apart so it does not wait on a ~60 GB decision it has no stake in.
+
+        Those 17 are deliberately NOT in the excluded tuple below, and that is the same call sc-17503's
+        21 T2I golden-parity tests got: the tuple pins tests that are RUNNABLE and excluded anyway on a
+        measured number, so a future reader has to be told why a green lane skips them. A test blocked
+        on a missing fixture should be wired the moment the fixture exists, and listing it here would
+        create a second place to remember to unlist it. The manifest row carries the accounting.
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
@@ -1760,6 +1796,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 # peak-relative bound.
                 "qwen_t2i_per_step_compiled_vs_eager",
                 "qwen_edit_per_step_compiled_vs_eager",
+                # sc-17519. The only one of the 19 tests behind `QWEN_IMAGE_EDIT_SNAPSHOT` that
+                # resolves no golden, so the only one wirable before the sc-17909 oracle bundle. It
+                # renders the same edit twice and asserts the decoded images are byte-identical
+                # (0/3145728 bytes differ, measured), which makes it a real gate on the whole
+                # LM + vision + transformer + VAE path rather than a load smoke.
+                "edit_generate_is_deterministic_rust",
             ],
             "mlx-qwen-image-pid": [
                 "use_pid_without_loaded_pid_errors",

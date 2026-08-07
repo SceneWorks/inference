@@ -1,9 +1,12 @@
 //! sc-2465 slice 7a: Qwen-Image-Edit pipeline parity vs the frozen fork. Micro-gated.
 //!
 //! - **Gate 1 (here)**: the multi-image (dual-latent) RoPE — `QwenRope3d::forward_multi` over
-//!   `[noise_grid, cond_grid]` — vs the fork's `QwenEmbedRopeMLX`. Weight-free.
+//!   `[noise_grid, cond_grid]` — vs the fork's `QwenEmbedRopeMLX`. Weight-free on BOTH sides, so its
+//!   golden is committed under `tests/fixtures/` and the gate is not `#[ignore]`d: it runs in the
+//!   default `cargo test` on every clone. Everything else in this file needs the Edit-2511 snapshot.
 //!
-//! Run: `cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_qwen_edit_rope_golden.py`, then
+//! Run (the `#[ignore]`d gates only): `cd ~/repos/mflux && uv run python
+//! ~/repos/mlx-gen/tools/dump_qwen_image_edit_golden.py`, then
 //! `cargo test -p mlx-gen-qwen-image --release --test edit_real_weights -- --ignored --nocapture`
 
 use std::path::PathBuf;
@@ -19,9 +22,14 @@ use mlx_gen_qwen_image::{
 };
 use mlx_rs::Array;
 
+/// COMMITTED, unlike every other golden in this file. `dump_qwen_edit_rope_golden.py` imports one
+/// symbol (`QwenEmbedRopeMLX`) and touches no snapshot, no HF cache and no torch original, so this
+/// artifact costs nothing to reproduce and the test that reads it needs no weights either — it runs
+/// in the ordinary macOS lane on every PR rather than weekly. Vendoring it is a license decision and
+/// the fork is MIT; provenance + the fork pin are in `tools/golden/README.md` (sc-17519).
 const ROPE_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../tools/golden/qwen_edit_rope_golden.safetensors"
+    "/tests/fixtures/qwen_edit_rope_golden.safetensors"
 );
 const EDIT_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -80,8 +88,10 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 }
 
 // Must match tools/dump_qwen_edit_rope_golden.py.
+//
+// NOT `#[ignore]`d: weight-free on both sides. The golden is committed under `tests/fixtures/` and
+// `QwenRope3d::forward_multi` is pure math, so this runs in the default `cargo test` on any clone.
 #[test]
-#[ignore = "needs local edit-rope golden"]
 fn edit_rope_multi_image_matches_fork() {
     let g = Weights::from_file(ROPE_GOLDEN).unwrap();
     let (ic, is_, tc, ts) = QwenRope3d::qwen_image()

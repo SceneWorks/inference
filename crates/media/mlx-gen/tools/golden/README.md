@@ -25,8 +25,9 @@ Default-running tests only depend on committed inputs; anything needing un-commi
 On any machine that is not the one a golden was dumped on, the row that reads it fails in **0.00 s**
 on `Weights::from_file(GOLDEN)` — before any weights load, any device, any work. On a fresh clone
 that is *every* row: this directory ships `README.md` and `CHECKSUMS.txt` and nothing else. As of
-this writing that is **119 distinct golden artifacts, referenced by 110 test files across 22
-crates**.
+this writing that is **118 distinct golden artifacts, referenced by 110 test files across 22
+crates** — 119 until sc-17519 promoted `qwen_edit_rope_golden.safetensors` out of this directory and
+into `mlx-gen-qwen-image/tests/fixtures/` (see the section on it below).
 
 The "Regenerating" section above says the goldens are regenerable, and in principle they are. In
 practice a second party with the licensed weights and a Metal Mac still cannot reproduce one,
@@ -321,9 +322,55 @@ actually see is `result transcript source source_sha256 mismatch`, not the `file
 | `qwen_transformer_golden.safetensors` | `dump_qwen_transformer_golden.py` | `tests/transformer_real_weights.rs` |
 | `qwen_vae_golden.safetensors` | `dump_qwen_vae_golden.py` | `tests/vae_real_weights.rs` |
 | `qwen_vision_golden.safetensors`, `qwen_vl_encoder_golden.safetensors`, `qwen_vl_tokenize_golden.safetensors` | `dump_qwen_vision_golden.py`, `dump_qwen_vl_encoder_golden.py`, `dump_qwen_vl_tokenize_golden.py` | `tests/vision_real_weights.rs` |
-| `qwen_edit_rope_golden.safetensors`, `qwen_edit_tokenize_debug.safetensors`, `qwen_edit_vision_stages_debug.safetensors` | `dump_qwen_edit_rope_golden.py`, `dump_qwen_edit_tokenize_debug.py`, `dump_qwen_edit_vision_stages_debug.py` | `tests/edit_real_weights.rs` (debug/bisection gates) |
+| `qwen_edit_tokenize_debug.safetensors`, `qwen_edit_vision_stages_debug.safetensors` | `dump_qwen_edit_tokenize_debug.py`, `dump_qwen_edit_vision_stages_debug.py` | `tests/edit_real_weights.rs` (debug/bisection gates) |
+| ~~`qwen_edit_rope_golden.safetensors`~~ | `dump_qwen_edit_rope_golden.py` | **PROMOTED to `mlx-gen-qwen-image/tests/fixtures/` (sc-17519)** — see below |
 
 See each script's module docstring for its exact env vars / arguments.
+
+### `qwen_edit_rope_golden.safetensors` — promoted out of this directory (sc-17519)
+
+Two rows elsewhere in this file already flag `mage_flow_noise_golden` and `pil_resize_golden` as
+weight-free and "candidate to promote into `tests/fixtures/`". This is the first one to actually make
+the move, and the reasoning is the template for the rest.
+
+**Why it qualified.** `dump_qwen_edit_rope_golden.py` imports exactly one symbol —
+`mflux.models.qwen.model.qwen_transformer.qwen_rope.QwenEmbedRopeMLX` — and calls it. It resolves no
+snapshot, reads no HF cache, and never touches the `Qwen/Qwen-Image-Edit-2511` torch original. The
+Rust side (`QwenRope3d::forward_multi`) is pure math too. So neither half of the gate needs weights,
+and the "can't be produced or consumed without the licensed multi-GB weights" rationale at the top of
+this file — the reason everything here is gitignored — simply does not apply to it.
+
+**Why vendoring is allowed.** Committing a golden minted from a third-party fork is a licence
+decision, not a size decision. `mflux` is **MIT** (`LICENSE`: "MIT License, Copyright (c) 2026 Filip
+Strand"; `pyproject.toml` `license = { file = "LICENSE" }`), so redistribution is permitted with its
+notice. That is the same reasoning `crates/media/mlx-gen/.gitignore` already records for the sc-14036
+Mage-Flow exception ("microsoft/Mage is MIT — redistribution is permitted with its notice"), which is
+the in-repo precedent for an exception to the blanket rule a few lines above it.
+
+**Provenance.**
+
+| | |
+|---|---|
+| artifact | `crates/media/mlx-gen/mlx-gen-qwen-image/tests/fixtures/qwen_edit_rope_golden.safetensors` |
+| size / sha256 | 78,133 bytes / `ab31b3836089fe90dae9dc8347c0c50726e74648e8e989c2c106c5ce7bd6f212` |
+| minted | 2026-08-07, `cd ~/Repos/mflux && uv run python .../tools/dump_qwen_edit_rope_golden.py` |
+| fork pin | `mflux` @ `81106c833435d1a1f62ca04a8c01c1d380d39272` (2026-06-04, "sc-2997: Qwen-Image-Edit-2511 zero_cond_t") |
+| upstream licence | MIT — `~/Repos/mflux/LICENSE` |
+| contents | `img_cos`/`img_sin` `[132, 64]` and `txt_cos`/`txt_sin` `[20, 64]`, all f32, for `video_fhw=[(1,8,12), (1,6,6)]`, `txt_seq_lens=[20]` |
+| consumer | `tests/edit_real_weights.rs::edit_rope_multi_image_matches_fork`, **not `#[ignore]`d** |
+
+Do NOT re-add the `#[ignore]`. The test runs in the default `cargo test` on any clone, measured
+0.03 s, max abs diff 5.960e-8 against its 1e-5 bound on all four tables with `MLX_GEN_MODELS_ROOT`
+and `QWEN_IMAGE_EDIT_SNAPSHOT` unset. Mutation-checked: perturbing the conditioning grid to `(6, 7)`
+fails it. `*.safetensors binary` in the root `.gitattributes` already covers the path, so the
+`text=auto` 8000-byte sniff cannot rewrite its bytes.
+
+The other four weight-free Qwen gates — the index/Gate-A tests in `tests/vision_real_weights.rs` —
+CANNOT follow yet, and the blocker is not licence or weights. `dump_qwen_vision_golden.py` writes its
+Gate-1 (line 9, "zero model download") and Gate-A (line 70, "NO snapshot/weights") tensors into the
+same output file as Gate B (line 96 onward), which loads the Edit-2511 original. Splitting that
+producer in two is the entire fix and costs no download. Tracked in **sc-18085**, deliberately apart
+from the oracle-bundle story (sc-17909) so it does not wait on a ~60 GB decision it has no stake in.
 
 ### FLUX.2-klein (`mlx-gen-flux2`)
 

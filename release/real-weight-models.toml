@@ -180,28 +180,44 @@ expected_files = [
 # pre-quantized tier and is what `block_residency_real_weights` measures against (`QWEN_RUNG4_TIER`).
 # `q4` is not fetched — no test in the wired lane selects it.
 #
-# COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 23 + 1 = 45:
+# COVERAGE THESE VARIABLES ACTUALLY BUY, because a name gates tests and "wired" is per-name. The
+# three names above gate 41 tests, and the arithmetic is the point — 20 + 21 + 0 = 41:
 #
-# WIRED, 23: 19 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3, preview fit,
-# compiled-glue A/B x2), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only
-# `mlx-qwen-image-producers`. All measured passing on nax-macos — 19 of them 2026-08-04, and the
-# four most recently wired 2026-08-06: `lightning_loras_apply_cleanly` (sc-17518), the preview fit
-# (sc-17515), and both `perf.rs` arms (sc-17513).
+# RECOUNTED FROM 45 BY sc-17519, and the 4 that came off were never gated by these names. The old
+# figure was enumerated per test FILE and per job STEP, so it counted every Edit-only test that
+# happens to share a file or a job with a T2I one: `edit_sequential_bounds_peak_and_is_byte_identical`,
+# `edit_lightning_render_is_coherent` and — since sc-17513 — the `perf.rs` Edit arm, all three inside
+# the WIRED 23, plus `edit_lightning_user_lora_reference_repro` inside the EXCLUDED 1. Read them and
+# none resolves `MLX_GEN_QWEN_SNAPSHOT`, `QWEN_IMAGE_MLX_SNAPSHOT` or `QWEN_CONTROL_BASE_SNAPSHOT` —
+# they take `QWEN_IMAGE_EDIT_SNAPSHOT`, and they are accounted for on `qwen-image-edit-2511-mlx`
+# below. The recount matters because sc-17519 wired a FIFTH Edit-only test into this same job
+# (`edit_generate_is_deterministic_rust`): per-step counting would have read that as 46 while these
+# three variables gate no more than they did before. Per-test counting is what keeps the heading true.
+#
+# WIRED, 20: 16 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x3, rung-4 block residency, Lightning render x1, golden-free adapter x3, preview fit,
+# compiled-glue A/B x1), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only
+# `mlx-qwen-image-producers`. All measured passing on nax-macos — 17 of them 2026-08-04, and the
+# three most recently wired 2026-08-06: `lightning_loras_apply_cleanly` (sc-17518), the preview fit
+# (sc-17515), and the `perf.rs` T2I arm (sc-17513). The job ALSO runs 4 Edit-only tests these three
+# variables do not gate — the sequential-residency and Lightning Edit arms, the sc-17513 `perf.rs`
+# Edit arm, and the sc-17519 determinism gate — counted on the Edit row, not here.
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 1. A lane that is red every week is ignored within a month
-# (sc-16981), so it is recorded here rather than wired red or quietly dropped:
-#   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
-#     exist in no repository and on no Hub.
+# EXCLUDED WITH A MEASUREMENT, 0 — and that is a first for this row. Its last remaining entry,
+# `edit_lightning_user_lora_reference_repro`, is Edit-only: it reads `QWEN_IMAGE_EDIT_SNAPSHOT` and
+# none of these three variables, so it is counted on the Edit row below rather than here. Nothing
+# these three names gate is excluded any more.
 #
-# This block held FIVE entries until 2026-08-06. Four were retired in the same week, and every one
-# had been excluded on a number that turned out to measure the test rather than the code:
+# This block held FIVE entries until 2026-08-06 and holds NONE now. Four graduated in the same week,
+# and every one had been excluded on a number that turned out to measure the test rather than the
+# code. The fifth did not graduate — it is the Edit-only entry just described, which moved rather
+# than went green. Note that the `perf.rs` bullet below covers BOTH arms and only its T2I arm is
+# gated by these three variables; the Edit arm's graduation is recorded on the Edit row:
 #   * `lightning_loras_apply_cleanly` (sc-17518) asserted `applied == 840` — the HOST map's
 #     60 x 14 target count, never a measured application. Both pinned lightx2v files apply
 #     60 x 12 = 720 with zero unmatched; no published Lightning release has ever trained
@@ -268,15 +284,105 @@ expected_files = [
 # configs and tokenizer files, no `vae/`, no transformer shards), so pointing the test at it fails
 # to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
 #
-# WHAT "WIRED" DOES NOT MEAN HERE. `QWEN_IMAGE_EDIT_SNAPSHOT` also gates 19 tests this lane does not
-# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7). The gate is per-variable, so
-# this row now reads as covered while those 19 still execute nowhere; that is the same hazard
-# recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and it is accepted here rather than
-# avoided because the sequential-residency Edit arm genuinely needs this artifact. The 19 are
-# tracked in sc-17519; do not read this row as evidence they run.
+# COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 18 tests and "wired" is per-name.
+# sc-17284 wired `QWEN_IMAGE_EDIT_SNAPSHOT` for the sequential-residency Edit arm, which satisfied
+# the per-VARIABLE gate while 19 further tests ran nowhere. sc-17519 executed all 19 on real weights
+# for the first time (2026-08-06, nax-macos, q8 tier resident). The 18 account for exactly, and the
+# arithmetic is the point — 4 + 13 + 1 = 18:
 #
-# The `perf.rs` Edit arm was a 20th until sc-17513 wired it into the compiled-glue A/B step; it is
-# the only test outside `sequential_residency_real_weights` that this row's q8 tier now backs in CI.
+# COUNTED BY READING EVERY TEST, not per test FILE and not per job STEP — that distinction is what
+# this row is for. 11 of the 12 in `edit_real_weights.rs`, 3 of the 7 in `vision_real_weights.rs`,
+# 1 sequential-residency arm, 2 Lightning Edit arms, 1 `perf.rs` Edit arm = 18.
+#
+# GATED BY NOTHING, 5 — deliberately NOT in the 18. Five of the 19 never call `edit_snapshot()` and
+# read no environment variable at all; they resolve a golden and nothing else. This variable buys no
+# coverage of them, and counting them here would be the same overstatement the row exists to retire:
+# `edit_rope_multi_image_matches_fork` (`edit_real_weights.rs`) and the four index/Gate-A gates in
+# `vision_real_weights.rs` — `window_index_and_cu_window_match_fork`, `cu_seqlens_match_fork`,
+# `rot_pos_emb_matches_fork`, `small_vision_transformer_matches_fork`. Given their goldens they run
+# in the ORDINARY macOS lane on every PR, on any clone, with no weight set and no schedule. sc-17519
+# made that true for the first of them — see the weight-free block below.
+#
+# NOT disjoint from the count on `qwen-image-mlx` above, and the overlap is an ACCOUNTING ARTIFACT
+# rather than dual gating. Four tests are counted in both blocks — `edit_sequential_bounds_peak_and_
+# is_byte_identical`, `edit_lightning_render_is_coherent`, `edit_lightning_user_lora_reference_repro`
+# and the `perf.rs` Edit arm — and NONE of the four reads a T2I variable. Verified by reading them:
+# `edit_sequential_bounds_...` resolves `edit_snapshot()` (`QWEN_IMAGE_EDIT_SNAPSHOT`) and never calls
+# the `snapshot()` helper that reads `MLX_GEN_QWEN_SNAPSHOT`; both Lightning arms read this variable
+# plus `QWEN_EDIT_LIGHTNING_SNAPSHOT` / `QWEN_EDIT_REPRO_*`, also never `snapshot()`; and
+# `qwen_edit_per_step_compiled_vs_eager` reads `snapshot("QWEN_IMAGE_EDIT_SNAPSHOT")` and nothing
+# else. They were swept in because that row enumerated per test FILE and per job STEP, which counts
+# an Edit-only test whenever it shares a file or a job with a T2I one — sc-17513 then put the
+# `perf.rs` Edit arm in that row's WIRED block and sc-17519 added a fifth Edit-only test to the same
+# job, which is how a per-step count reaches 46 without the variables gating anything more. That
+# row's total is corrected in place above (45 -> 41) rather than left standing: a wrong reason turns
+# a plain over-count into apparent design, and this row is the one meant to catch that.
+#
+# WIRED, 4, all in `mlx-qwen-image` on the schedule and all measured passing on nax-macos:
+# `edit_sequential_bounds_peak_and_is_byte_identical` and `edit_lightning_render_is_coherent`
+# (sc-17284); `qwen_edit_per_step_compiled_vs_eager` (sc-17513), which left this row's EXCLUDED block
+# when its `assert_eq!(max_diff, 0.0)` was replaced by a per-arm peak-relative bound of 2.6e-3 —
+# derived, not loosened, from the Edit arm's own measured conditioning envelope; and
+# `edit_generate_is_deterministic_rust` (sc-17519) — 34.19 / 35.80 / 44.11 s of libtest time over
+# three runs, peak RSS 35.0 GiB, reporting 0/3145728 bytes differing between two renders of the same
+# edit. That last one is the ONLY one of the 19 that resolves no golden AT ALL, which is the only
+# reason it was wirable on the schedule now. (`edit_rope_multi_image_matches_fork` also runs today,
+# but it is not wired anywhere and does not need to be — see the last block.)
+#
+# BLOCKED ON THE EDIT-2511 ORACLE BUNDLE, 13: `edit_real_weights.rs` 10 and `vision_real_weights.rs`
+# 3 read 9 distinct artifacts under `tools/golden/`, which is gitignored by design — only one of the
+# nine (`qwen_image_edit_q8_golden`) has a checksum recorded at all. Each needs the
+# `Qwen/Qwen-Image-Edit-2511` torch original to mint from, which is not resident on nax-macos. This
+# is a SEPARATE bundle from the 21 T2I tests on `qwen-image-mlx`, whose producers need the ~60 GB
+# `Qwen/Qwen-Image` instead (sc-17503). Tracked in sc-17909.
+#
+# BLOCKED ONLY ON A GOLDEN, NO WEIGHTS REQUIRED, 4 — and this is the half sc-17909 recorded wrong.
+# The four index/Gate-A gates in `vision_real_weights.rs` need no weights on either side: their
+# producer, `tools/dump_qwen_vision_golden.py`, says so itself at its line 9 ("zero model download")
+# for Gate 1 and line 70 ("NO snapshot/weights") for Gate A. The ONLY reason they are blocked is that
+# the producer packs Gate B — the real depth-32 vision tower, line 96 onward, which does load the
+# Edit-2511 original — into the SAME output file, so the cheap half cannot be minted without the
+# expensive one. Splitting that producer is the whole fix, and it costs no download. Recording these
+# as blocked on the most expensive artifact in the epic is exactly the record-vs-reality drift this
+# row exists to retire. Tracked separately from the oracle bundle, in sc-18085.
+#
+# ALL 17 OF THE ABOVE, MEASURED: each fails at `Weights::from_file` with `SafeTensors(NotFile)` in
+# 0.02 s, before any weights load, so NONE of their numeric assertions has ever been evaluated in any
+# checkout. Do not read their absence as evidence they would pass — of the 23 tests sc-17284 ran for
+# the first time, four failed.
+#
+# NEITHER BLOCKED NOR GATED, 1 — `edit_rope_multi_image_matches_fork`, unblocked by sc-17519 at zero
+# cost. Its producer `tools/dump_qwen_edit_rope_golden.py` imports one symbol (the fork's
+# `QwenEmbedRopeMLX`) and touches no snapshot, no HF cache and no torch original, so the golden was
+# minted and COMMITTED to `mlx-gen-qwen-image/tests/fixtures/qwen_edit_rope_golden.safetensors`
+# (78,133 bytes; four f32 tables for grids (1,8,12)+(1,6,6), txt=20). Vendoring a golden is a licence
+# decision and the fork is MIT, the same reasoning that carries the sc-14036 Mage-Flow exception in
+# `crates/media/mlx-gen/.gitignore`. The test's `#[ignore]` is GONE: it runs in the ordinary macOS
+# lane on every PR, measured 0.03 s, max abs diff 5.960e-8 against a 1e-5 bound on all four tables,
+# with `MLX_GEN_MODELS_ROOT` and `QWEN_IMAGE_EDIT_SNAPSHOT` unset. Its producer described it as "the
+# novel core of the Edit transformer path"; it had been sitting behind a licence question that a
+# two-minute check answered. Provenance + fork pin are in `tools/golden/README.md`.
+#
+# EXCLUDED WITH A MEASUREMENT, 1. A lane that is red every week is ignored within a month
+# (sc-16981), so it is recorded here rather than wired red or quietly dropped:
+#   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
+#     exist in no repository and on no Hub. It is the LAST exclusion anywhere on the Qwen surface:
+#     `qwen-image-mlx`'s block is empty as of sc-17513, and this one is not a numbers problem that a
+#     derivation can retire — no bound would help, the inputs do not exist.
+#
+# The hazard this row recorded until 2026-08-06 — "wired" reading as whole-surface coverage when one
+# arm of one test was what ran — is retired by the arithmetic above rather than by the wiring: 13 of
+# the 18 this variable gates still execute nowhere, and so do 4 more it does not gate at all. That is
+# the same shape recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`; the difference is that
+# this row's blocked set now names its artifact, its story, and — for the cheap half — the fact that
+# no artifact is needed.
+#
+# CROSS-CHECK, both directions. `edit_real_weights.rs` holds 12 tests: 1 gated by nothing (rope),
+# 1 wired (determinism), 10 blocked. `vision_real_weights.rs` holds 7: 4 gated by nothing, 3 blocked.
+# 12 + 7 = 19. By blocker: 1 runs today + 1 wired + 13 need the Edit-2511 oracle + 4 need only a
+# producer split = 19. By variable: (11 + 3 from those two files) + 1 + 2 + 1 elsewhere = 18 gated,
+# 5 gated by nothing, and 18 + 5 = 23 — which is where the retired "23" came from. It was the size
+# of the union, not of what the variable buys, and the row's own heading asks for the latter.
 key = "qwen-image-edit-2511-mlx"
 repository = "SceneWorks/qwen-image-edit-2511-mlx"
 revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"

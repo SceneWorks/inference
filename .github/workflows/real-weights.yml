@@ -1556,13 +1556,23 @@ jobs:
   # on a warm runner. The MLX half is now MLX_GEN_QWEN_SNAPSHOT with its own manifest row;
   # QWEN_IMAGE_SNAPSHOT keeps its exemption and still names the torch original for the CUDA half.
   #
-  # WHAT THIS LANE DELIBERATELY DOES NOT COVER. 24 of the 45 tests (e2e x7, img2img x6, adapter x9,
-  # text_encoder x2) compare against goldens under `crates/media/mlx-gen/tools/golden/`. That
-  # directory is gitignored BY DESIGN (see its README) and its contents are produced by the frozen
-  # Python `mflux` fork run against the torch original. A CI checkout has none of them, so those 24
-  # cannot be made to pass by wiring alone — they need the Mage-shaped operator seed bundle
-  # (`MAGE_ORACLE_SEED_DIR`) plus the ~60 GB original to mint from. That is a separate decision and
-  # is tracked separately; it is NOT resolved here. The 21 tests below need weights only.
+  # WHAT THIS LANE DELIBERATELY DOES NOT COVER. 21 of the 41 tests these three variables gate
+  # (e2e x7, img2img x6, adapter x6, text_encoder x2) compare against goldens under
+  # `crates/media/mlx-gen/tools/golden/`. That directory is gitignored BY DESIGN (see its README) and
+  # its contents are produced by the frozen Python `mflux` fork run against the torch original. A CI
+  # checkout has none of them, so those 21 cannot be made to pass by wiring alone — they need the
+  # Mage-shaped operator seed bundle (`MAGE_ORACLE_SEED_DIR`) plus the ~60 GB original to mint from.
+  # That is a separate decision and is tracked separately; it is NOT resolved here. The 19 wired
+  # tests need weights only.
+  #
+  # sc-17519 corrected both figures, which had drifted in opposite directions and disagreed with
+  # `release/real-weight-models.toml` in the same repo. Denominator: 45 -> 41, because the old count
+  # was enumerated per test FILE and per job STEP and so swept in four Edit-only tests that read
+  # `QWEN_IMAGE_EDIT_SNAPSHOT` and none of this job's three variables (they are accounted for on the
+  # `qwen-image-edit-2511-mlx` row). Numerator: 24 -> 21, because "adapter x9" counted the whole file
+  # when three of its nine — `routing_map_covers_full_fork_surface`, `kohya_matches_peft_on_real_tree`,
+  # `lightning_loras_apply_cleanly` — resolve no golden at all and are WIRED in the step below. A test
+  # cannot be both wired and blocked on the bundle.
   #
   # ON `rw-mage`, NOT A NEW LABEL. The weight set is where the label already points, and the header
   # warns that a label no runner carries queues silently until the run is cancelled. Splitting this
@@ -1578,8 +1588,9 @@ jobs:
     #   lightning     23 + 21        =  44s       adapter (golden-free) 0 + 1 =   1s
     #   preview fit (sc-17515, measured 2026-08-06, same box)           75-217s
     #   compiled-glue A/B (sc-17513, measured 2026-08-06, same box)    225-244s
-    #                                             TOTAL COMPUTE   = 1036-1197s (17.3-20.0 min)
-    # The cap is 90, not ~25, because only the 17-20 minutes above is compute: the rest is the
+    #   edit determinism (sc-17519, measured 2026-08-06, same box)       34-44s
+    #                                             TOTAL COMPUTE   = 1070-1241s (17.8-20.7 min)
+    # The cap is 90, not ~25, because only the 18-21 minutes above is compute: the rest is the
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
@@ -1609,6 +1620,21 @@ jobs:
     # is the materialization budget, and these two tests transfer no bytes this lane did not
     # already pull. Even at the top of the range, 90 minutes is ~4.5x the warm compute, which
     # leaves room for the contention that already dominates the preview-fit row.
+    #
+    # sc-17519 added the Edit determinism gate. MEASURED 2026-08-06 on nax-macos, weights resident:
+    # `edit_generate_is_deterministic_rust` 34.19 / 35.80 / 44.11s of libtest time over three runs
+    # (two 1024^2 2-step edits through the full LM + vision + transformer + VAE path, then a
+    # byte-comparison of the two decoded images). Peak RSS 35.0 GiB, sampled at 2s. Like the
+    # compiled-glue row it carries its own line in the table rather than a prose correction under it:
+    # ~40s is not inside the rounding of an 800-1200s total, and a measured table a reader has to
+    # scroll 28 lines to correct is the drift this whole lane is being audited for. The row states
+    # the measured min-max (34-44s) as the preview-fit row does, so the ends move independently —
+    # 34s onto the min, 44s onto the max — rather than one figure onto both. The cap stays 90 for the
+    # same reason as every row above: it is a materialization budget, and this step reuses the q8
+    # Edit tier the sequential-residency, Lightning and compiled-glue steps already pulled and
+    # verified. Treat 44.11s as a floor, not a ceiling: it was measured on a box also running dev
+    # work, and nax-macos-2 showed a 4.4x spread on the producers job (sc-17284). Even 4.4x is under
+    # four minutes.
     timeout-minutes: 90
     env:
       # Repo-variable names are deliberately NOT the test-facing names. `vars.QWEN_IMAGE_SNAPSHOT`
@@ -1805,6 +1831,40 @@ jobs:
           }
           run_one lightning_render_is_coherent
           run_one edit_lightning_render_is_coherent
+      # sc-17519 — the ONE test of the 19 behind `QWEN_IMAGE_EDIT_SNAPSHOT` that resolves no golden.
+      # That variable was wired by sc-17284 for the sequential-residency Edit arm, which satisfied the
+      # per-VARIABLE manifest gate while `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7)
+      # still ran nowhere. All 19 were executed for the first time on 2026-08-06; 18 fail at
+      # `Weights::from_file` with `SafeTensors(NotFile)` in 0.02s because `tools/golden/` is gitignored
+      # by design and a CI checkout has none of the 10 artifacts they read (sc-17909 — a DIFFERENT
+      # oracle bundle from sc-17503's, needing `Qwen/Qwen-Image-Edit-2511` rather than
+      # `Qwen/Qwen-Image`). This one reads no golden: it renders the same edit twice through the
+      # Generator and asserts the two decoded images are byte-identical, so it is a self-contained
+      # determinism gate on the full LM + vision + transformer + VAE path.
+      #
+      # It is a STEP here rather than a sibling `mlx-qwen-image-edit` job, and the wall clock is why:
+      # MEASURED 34.19 / 35.80 / 44.11 s of libtest time over three runs on nax-macos, weights
+      # resident. A separate job would re-materialize the 36 GiB q8 tier — three orders of magnitude
+      # more cost than the test — for 34-44 s of compute, and this job ALREADY materializes and
+      # verifies that exact tier for the two steps above. `timeout-minutes` is therefore unchanged at
+      # 90: the cap is a materialization budget, and this adds no bytes and under a minute of compute.
+      #
+      # Trap 3 was checked by reading, then proved by execution: neither file has the
+      # `eprintln!("skip: …"); return;` shape anywhere — `edit_snapshot()` panics with the epic-13657
+      # message on a missing variable. Running this name with QWEN_IMAGE_EDIT_SNAPSHOT unset yields
+      # `0 passed; 1 failed` and exit 101, not a 0.00s green.
+      - name: Run Qwen-Image-Edit determinism gate (golden-free)
+        run: |
+          set -o pipefail
+          name=edit_generate_is_deterministic_rust
+          out="$(QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
+            cargo test --locked --release -p mlx-gen-qwen-image \
+            --test edit_real_weights \
+            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
       # Three of `adapter_real_weights.rs`'s nine tests resolve NO golden — they only need the real
       # 60-block tree — so they do not wait on the sc-17503 oracle bundle the other six do.
       # `routing_map_covers_full_fork_surface` proves the host LoRA map reaches all 60 x 14 fork
