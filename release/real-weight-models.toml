@@ -1303,3 +1303,42 @@ expected_files = [
     "q4/text_encoder/gemma-2-2b-it.safetensors",
     "q4/text_encoder/tokenizer.json",
 ]
+
+[[models]]
+# Bernini — the SceneWorks MLX re-host of ByteDance Bernini (Qwen2.5-VL-7B latent-semantic planner
+# driving a Wan2.2-T2V-A14B dual-expert renderer), memory ladder sc-15528 / sc-16354.
+#
+# The pin exists so this family's `MEMORY_EVIDENCE_V1` records can name the exact bytes they were
+# measured over: `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on
+# disk into the `model_revision` + `model_inventory_sha256` pair every record carries. Without it
+# those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 tier — the smallest of the three and the only one that leaves useful
+# headroom for a rung-4 sweep on a 128 GB Mac (q4 is ~35 GiB on disk against ~51 GiB for q8 and
+# ~82 GiB for bf16, and the card measures ~44 GB peak at q4). bf16/ and q8/ are siblings under the
+# same revision and are inventoried when present, so a later per-tier sweep changes the inventory sha
+# rather than silently reusing this one.
+key = "bernini-mlx"
+repository = "SceneWorks/bernini-mlx"
+revision = "533d688f16c8f33dc832890c1e16c11921a2019a"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["BERNINI_LADDER_SNAPSHOT"]
+expected_files = [
+  "q4/config.json",
+  "q4/bernini_renderer.json",
+  "q4/high_noise_model.safetensors",
+  "q4/low_noise_model.safetensors",
+  "q4/qwen2_5_vl.safetensors",
+  "q4/t5_encoder.safetensors",
+  "q4/vae.safetensors",
+  "q4/tokenizer.json",
+]
+# NOT wired to a lane, and the reason is specific rather than the family-wide posture. The repository
+# is public and ungated, so it IS provisionable exactly the way `chroma-memory-ladder` provisions
+# Chroma (anonymous `snapshot_download` into `runner.temp`) — what is missing is the harness the lane
+# would invoke: sc-15528 lands the ladder mechanism and its weights-free gates, not
+# `tests/memory_ladder_real_weights.rs`. A lane dispatching a test file that does not exist is worse
+# than no lane, so this stays exempt until the harness lands with it. See the follow-up on sc-15528.
+unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight harness and its lane are the tracked follow-up, and a lane with no test to run would be vacuously green"

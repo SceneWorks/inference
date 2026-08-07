@@ -14,9 +14,11 @@
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::block_residency::BlockPlan;
+use mlx_gen::CancelFlag;
 use mlx_gen::Result;
 use mlx_gen_wan::patchify::unpatchify;
-use mlx_gen_wan::{RopeTable, WanTransformer};
+use mlx_gen_wan::{RopeTable, WanBlockStream, WanTransformer};
 
 use crate::guidance::{normalized_guidance, normalized_guidance_chain, MomentumBuffer};
 use crate::rope::{apply_source_id, assign_source_ids};
@@ -87,6 +89,57 @@ pub struct Segment {
     sin: Array,
 }
 
+/// The trunk one packed forward runs against.
+///
+/// Ladder rung 4 (sc-15528) is the ONLY reason this is a type rather than a `&WanTransformer`: it
+/// carries either a resident block stack or a **deferred** one plus the window schedule that
+/// rebuilds it. [`PackedForward::velocity_pre`] is the single `forward_packed` seam in this crate, so
+/// this is the single place the two shapes diverge — everything upstream of it (patch embedding,
+/// source-id RoPE, segment concatenation) reads only non-block weights and is identical either way.
+#[derive(Clone, Copy)]
+pub struct Trunk<'a> {
+    /// The transformer. On a windowed trunk this holds every non-block component and **no** blocks.
+    pub dit: &'a WanTransformer,
+    /// `Some` on a rung-4 request: the block source, the cadence, and the cancel flag a per-window
+    /// `eval` observes.
+    pub window: Option<(&'a WanBlockStream, &'a BlockPlan, &'a CancelFlag)>,
+}
+
+impl<'a> Trunk<'a> {
+    /// The resident trunk — today's shipped shape, and rung 0.
+    pub fn resident(dit: &'a WanTransformer) -> Self {
+        Self { dit, window: None }
+    }
+
+    /// Resolve the trunk for one loaded expert: windowed when this request selected rung 4 AND the
+    /// expert was loaded deferred, resident otherwise. A free function rather than a closure so the
+    /// four borrows share one named lifetime.
+    pub fn for_load(
+        dit: &'a WanTransformer,
+        stream: Option<&'a WanBlockStream>,
+        plan: Option<&'a BlockPlan>,
+        cancel: &'a CancelFlag,
+    ) -> Self {
+        match (stream, plan) {
+            (Some(stream), Some(plan)) => Self::windowed(dit, stream, plan, cancel),
+            _ => Self::resident(dit),
+        }
+    }
+
+    /// The rung-4 trunk: a deferred stack driven by `plan` out of `stream`.
+    pub fn windowed(
+        dit: &'a WanTransformer,
+        stream: &'a WanBlockStream,
+        plan: &'a BlockPlan,
+        cancel: &'a CancelFlag,
+    ) -> Self {
+        Self {
+            dit,
+            window: Some((stream, plan, cancel)),
+        }
+    }
+}
+
 impl PackedForward {
     pub fn new(
         head_dim: usize,
@@ -155,21 +208,21 @@ impl PackedForward {
     /// `pred[:, target_mask, :]` then unpatchify). The target is concatenated last.
     pub fn velocity(
         &self,
-        dit: &WanTransformer,
+        trunk: Trunk<'_>,
         target: &Array,
         sources: &[(Array, f64)],
         t: f32,
         cross_kv: &[(Array, Array)],
     ) -> Result<Array> {
-        let embedded = self.embed_sources(dit, sources)?;
-        self.velocity_pre(dit, target, &embedded, t, cross_kv)
+        let embedded = self.embed_sources(trunk.dit, sources)?;
+        self.velocity_pre(trunk, target, &embedded, t, cross_kv)
     }
 
     /// [`Self::velocity`] over pre-embedded source [`Segment`]s (from `Self::embed_sources`) — the
     /// hot path when the same sources feed multiple combos/branches in one step.
     pub fn velocity_pre(
         &self,
-        dit: &WanTransformer,
+        trunk: Trunk<'_>,
         target: &Array,
         sources: &[Segment],
         t: f32,
@@ -183,7 +236,7 @@ impl PackedForward {
             coss.push(seg.cos.clone());
             sins.push(seg.sin.clone());
         }
-        let (tk_t, c_t, s_t, grid_t) = self.embed_segment(dit, target, 0.0)?;
+        let (tk_t, c_t, s_t, grid_t) = self.embed_segment(trunk.dit, target, 0.0)?;
         let l_t = (grid_t.0 * grid_t.1 * grid_t.2) as i32;
         toks.push(tk_t);
         coss.push(c_t);
@@ -196,7 +249,16 @@ impl PackedForward {
         let cos = concatenate_axis(&cos_refs, 0)?.as_dtype(Dtype::Bfloat16)?;
         let sin = concatenate_axis(&sin_refs, 0)?.as_dtype(Dtype::Bfloat16)?;
 
-        let out = dit.forward_packed(&tokens, t, cross_kv, &cos, &sin)?; // [1, total, out·∏patch]
+        // Ladder rung 4's single seam. The windowed arm is bit-identical to the resident one — same
+        // `time_embed`, same per-block call, same head — so the parity contract is `Exact` rather
+        // than a tolerance; `mlx_gen_wan`'s
+        // `a_windowed_forward_is_bit_identical_to_the_resident_one` executes that equality.
+        let out = match trunk.window {
+            None => trunk.dit.forward_packed(&tokens, t, cross_kv, &cos, &sin)?,
+            Some((stream, plan, cancel)) => trunk
+                .dit
+                .forward_packed_windowed(&tokens, t, cross_kv, &cos, &sin, stream, plan, cancel)?,
+        }; // [1, total, out·∏patch]
         let total = out.shape()[1];
         let op = out.shape()[2];
         // Slice the target tokens (last l_t) and unpatchify to [16, T, H8, W8].
@@ -271,7 +333,7 @@ fn from_x(noisy: &Array, sigma: f32, x: &Array) -> Result<Array> {
 pub fn guided_velocity(
     pf: &PackedForward,
     mode: Mode,
-    dit: &WanTransformer,
+    trunk: Trunk<'_>,
     noisy: &Array,
     videos: &[Array],
     images: &[Array],
@@ -288,14 +350,14 @@ pub fn guided_velocity(
     // mode calls the same combo for both the cond and uncond branch (and some twice more). Bit-
     // identical: `velocity_pre` concatenates the identical segments `velocity` would have rebuilt.
     let (ec_none, ec_v, ec_i, ec_vi) = (
-        pf.embed_sources(dit, &c.none)?,
-        pf.embed_sources(dit, &c.v)?,
-        pf.embed_sources(dit, &c.i)?,
-        pf.embed_sources(dit, &c.vi)?,
+        pf.embed_sources(trunk.dit, &c.none)?,
+        pf.embed_sources(trunk.dit, &c.v)?,
+        pf.embed_sources(trunk.dit, &c.i)?,
+        pf.embed_sources(trunk.dit, &c.vi)?,
     );
     let v = |sources: &[Segment], cond: bool| -> Result<Array> {
         let kv = if cond { cross_kv_cond } else { cross_kv_uncond };
-        pf.velocity_pre(dit, noisy, sources, t, kv)
+        pf.velocity_pre(trunk, noisy, sources, t, kv)
     };
     // Weighted velocity sum for a list of (vel, weight) deltas: base + Σ w·(cur − prev).
     let chain = |terms: &[(&Array, f32)]| -> Result<Array> {
@@ -473,7 +535,7 @@ pub struct VitGuidanceParams {
 #[allow(clippy::too_many_arguments)]
 pub fn vit_one_step(
     pf: &PackedForward,
-    dit: &WanTransformer,
+    trunk: Trunk<'_>,
     mode: VitMode,
     noisy: &Array,
     images: &[(Array, f64)],
@@ -492,13 +554,13 @@ pub fn vit_one_step(
         VitMode::VaeTxtVit | VitMode::VaeTxtVitWapg => {
             // F-097: each distinct source set is independent of the prompt stream. Embed it once
             // per step, then reuse the exact segments for every forward that consumes that set.
-            let e_empty = pf.embed_sources(dit, &[])?;
+            let e_empty = pf.embed_sources(trunk.dit, &[])?;
             let e_wvae = (!wvae.is_empty())
-                .then(|| pf.embed_sources(dit, &wvae))
+                .then(|| pf.embed_sources(trunk.dit, &wvae))
                 .transpose()?;
             let wvae_sources = e_wvae.as_deref().unwrap_or(&e_empty);
             let v = |sources: &[Segment], kv: &[(Array, Array)]| {
-                pf.velocity_pre(dit, noisy, sources, t, kv)
+                pf.velocity_pre(trunk, noisy, sources, t, kv)
             };
             let base = v(&e_empty, streams.wotxt_wovit)?; // wovae · wotxt_wovit
             let img = v(wvae_sources, streams.wotxt_wovit)?; // wvae  · wotxt_wovit
@@ -517,21 +579,21 @@ pub fn vit_one_step(
             unb(out)
         }
         VitMode::Rv2vWapg | VitMode::R2vWapg => {
-            let e_empty = pf.embed_sources(dit, &[])?;
+            let e_empty = pf.embed_sources(trunk.dit, &[])?;
             // Preserve the reference's zero-weight short circuit: do not embed a source set when no
             // enabled prediction can consume it. Empty sets reuse `e_empty`; when there are no image
             // sources, `wvae == videos`, so both routes share the same F-097 embedding as well.
             let needs_videos = g.omega_vid > 0.0;
             let needs_wvae = g.omega_img > 0.0 || g.omega_txt > 0.0 || g.omega_tgt > 0.0;
             let e_videos = (needs_videos && !videos.is_empty())
-                .then(|| pf.embed_sources(dit, videos))
+                .then(|| pf.embed_sources(trunk.dit, videos))
                 .transpose()?;
             let e_wvae =
                 (needs_wvae && !wvae.is_empty() && !(images.is_empty() && e_videos.is_some()))
-                    .then(|| pf.embed_sources(dit, &wvae))
+                    .then(|| pf.embed_sources(trunk.dit, &wvae))
                     .transpose()?;
             let v = |sources: &[Segment], kv: &[(Array, Array)]| {
-                pf.velocity_pre(dit, noisy, sources, t, kv)
+                pf.velocity_pre(trunk, noisy, sources, t, kv)
             };
             let base = v(&e_empty, streams.wotxt_wovit)?;
             // `if cur_omega_X > 0` short-circuits (reuse the previous prediction, no extra forward).
@@ -583,12 +645,12 @@ pub fn vit_one_step(
             unb(out)
         }
         VitMode::V2vApg => {
-            let e_empty = pf.embed_sources(dit, &[])?;
+            let e_empty = pf.embed_sources(trunk.dit, &[])?;
             let e_wvae = (!wvae.is_empty())
-                .then(|| pf.embed_sources(dit, &wvae))
+                .then(|| pf.embed_sources(trunk.dit, &wvae))
                 .transpose()?;
             let v = |sources: &[Segment], kv: &[(Array, Array)]| {
-                pf.velocity_pre(dit, noisy, sources, t, kv)
+                pf.velocity_pre(trunk, noisy, sources, t, kv)
             };
             let eps_uncond = v(&e_empty, streams.wotxt_wovit)?; // wovae · wotxt_wovit
             let eps_t = v(e_wvae.as_deref().unwrap_or(&e_empty), streams.wtxt_wvit)?; // wvae · wtxt_wvit
@@ -680,7 +742,7 @@ mod tests {
         let got = guided_velocity(
             &pf,
             Mode::T2v,
-            &dit,
+            Trunk::resident(&dit),
             noisy,
             &[],
             &[],
@@ -694,8 +756,12 @@ mod tests {
         .unwrap();
 
         // Manual: uncond + ω·(cond − uncond) over the target-only packed forward.
-        let e_u = pf.velocity(&dit, noisy, &[], t, &kv_u).unwrap();
-        let e_c = pf.velocity(&dit, noisy, &[], t, &kv_c).unwrap();
+        let e_u = pf
+            .velocity(Trunk::resident(&dit), noisy, &[], t, &kv_u)
+            .unwrap();
+        let e_c = pf
+            .velocity(Trunk::resident(&dit), noisy, &[], t, &kv_c)
+            .unwrap();
         let want = add(
             &e_u,
             multiply(subtract(&e_c, &e_u).unwrap(), Array::from_f32(omega)).unwrap(),
@@ -780,7 +846,7 @@ mod tests {
         EMBED_SOURCES_CALLS.with(|calls| calls.borrow_mut().clear());
         let got = vit_one_step(
             &pf,
-            &dit,
+            Trunk::resident(&dit),
             VitMode::VaeTxtVit,
             noisy,
             &images,
@@ -799,10 +865,18 @@ mod tests {
         );
 
         // Manual: the four shared_step forwards, batched, combined, unbatched.
-        let base = pf.velocity(&dit, noisy, &[], t, s.wotxt_wovit).unwrap();
-        let im = pf.velocity(&dit, noisy, &images, t, s.wotxt_wovit).unwrap();
-        let tx = pf.velocity(&dit, noisy, &images, t, s.wtxt_wovit).unwrap();
-        let vi = pf.velocity(&dit, noisy, &images, t, s.wtxt_wvit).unwrap();
+        let base = pf
+            .velocity(Trunk::resident(&dit), noisy, &[], t, s.wotxt_wovit)
+            .unwrap();
+        let im = pf
+            .velocity(Trunk::resident(&dit), noisy, &images, t, s.wotxt_wovit)
+            .unwrap();
+        let tx = pf
+            .velocity(Trunk::resident(&dit), noisy, &images, t, s.wtxt_wovit)
+            .unwrap();
+        let vi = pf
+            .velocity(Trunk::resident(&dit), noisy, &images, t, s.wtxt_wvit)
+            .unwrap();
         let want = vae_txt_vit(
             &base.expand_dims(0).unwrap(),
             &im.expand_dims(0).unwrap(),
@@ -829,7 +903,7 @@ mod tests {
         EMBED_SOURCES_CALLS.with(|calls| calls.borrow_mut().clear());
         vit_one_step(
             &pf,
-            &dit,
+            Trunk::resident(&dit),
             VitMode::Rv2vWapg,
             noisy,
             &[],
@@ -850,7 +924,7 @@ mod tests {
         EMBED_SOURCES_CALLS.with(|calls| calls.borrow_mut().clear());
         vit_one_step(
             &pf,
-            &dit,
+            Trunk::resident(&dit),
             VitMode::VaeTxtVit,
             noisy,
             &[],
@@ -889,7 +963,9 @@ mod tests {
 
         // One image source (single frame, [16, 1, H8, W8]) with source_id 1.
         let img = Array::zeros::<f32>(&[16, 1, 2, 2]).unwrap();
-        let vel = pf.velocity(&dit, noisy, &[(img, 1.0)], 833.0, &kv).unwrap();
+        let vel = pf
+            .velocity(Trunk::resident(&dit), noisy, &[(img, 1.0)], 833.0, &kv)
+            .unwrap();
         assert_eq!(
             vel.shape(),
             noisy.shape(),

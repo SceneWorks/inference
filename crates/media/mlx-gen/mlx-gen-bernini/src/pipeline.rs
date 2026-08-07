@@ -12,6 +12,7 @@ use mlx_rs::memory::clear_cache;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
+use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -23,12 +24,12 @@ use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
 use mlx_gen_wan::scheduler::{make_scheduler, SolverKind};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
-use mlx_gen_wan::{WanTransformer, WanVae};
+use mlx_gen_wan::{WanBlockStream, WanTransformer, WanVae};
 
 use crate::config::{resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults};
 use crate::forward::{
     guided_velocity, num_momentum_buffers, vit_one_step, GuidanceParams, Mode, PackedForward,
-    VitGuidanceParams, VitMode, VitStreams,
+    Trunk, VitGuidanceParams, VitMode, VitStreams,
 };
 use crate::guidance::MomentumBuffer;
 use crate::preprocess::{encode_image, encode_videoclip};
@@ -176,19 +177,35 @@ mlx_gen::register_generators! {
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg
 /// text contexts (text embedding is per-expert, so K/V is built per expert).
 struct BExpert<'a> {
-    transformer: &'a WanTransformer,
+    trunk: Trunk<'a>,
     cross_kv_cond: Vec<(Array, Array)>,
     cross_kv_uncond: Vec<(Array, Array)>,
 }
 
 impl<'a> BExpert<'a> {
-    fn build(dit: &'a WanTransformer, context: &Array, context_null: &Array) -> Result<Self> {
+    /// Build this expert's cross-attention K/V.
+    ///
+    /// On a rung-4 (windowed) trunk the DiT holds no blocks, so `prepare_cross_kv` cannot serve the
+    /// cache from it; the stream walks the same plan once here instead. The caches are small
+    /// (`[B, n, text_len, d]` per block) and are reused across every step and every guidance pass, so
+    /// they stay resident deliberately — re-deriving them per window per forward would multiply a
+    /// once-per-generate cost by the pass count for no residency saving.
+    fn build(trunk: Trunk<'a>, context: &Array, context_null: &Array) -> Result<Self> {
+        let dit = trunk.dit;
         let cc = dit.embed_text(context)?;
         let cu = dit.embed_text(context_null)?;
+        let prepare = |embedded: &Array| -> Result<Vec<(Array, Array)>> {
+            match trunk.window {
+                None => dit.prepare_cross_kv(embedded),
+                Some((stream, plan, cancel)) => {
+                    stream.prepare_cross_kv_windowed(embedded, plan, cancel)
+                }
+            }
+        };
         Ok(Self {
-            transformer: dit,
-            cross_kv_cond: dit.prepare_cross_kv(&cc)?,
-            cross_kv_uncond: dit.prepare_cross_kv(&cu)?,
+            cross_kv_cond: prepare(&cc)?,
+            cross_kv_uncond: prepare(&cu)?,
+            trunk,
         })
     }
 }
@@ -253,7 +270,7 @@ fn denoise_bernini(
         let v = guided_velocity(
             pf,
             mode,
-            expert.transformer,
+            expert.trunk,
             &latent,
             videos,
             images,
@@ -275,7 +292,7 @@ fn denoise_bernini(
 /// planner ViT-context)` (sc-5140), in renderer `text_dim` space, so it goes through the same
 /// `embed_text` → `prepare_cross_kv` as the renderer's text context.
 pub struct BVitExpert<'a> {
-    transformer: &'a WanTransformer,
+    trunk: Trunk<'a>,
     wtxt_wvit: Vec<(Array, Array)>,
     wtxt_wovit: Vec<(Array, Array)>,
     wotxt_wvit: Vec<(Array, Array)>,
@@ -284,16 +301,24 @@ pub struct BVitExpert<'a> {
 
 impl<'a> BVitExpert<'a> {
     /// `streams` = `[wtxt_wvit, wtxt_wovit, wotxt_wvit, wotxt_wovit]` prompt-embed contexts.
-    pub fn build(dit: &'a WanTransformer, streams: [&Array; 4]) -> Result<Self> {
+    pub fn build(trunk: Trunk<'a>, streams: [&Array; 4]) -> Result<Self> {
+        let dit = trunk.dit;
+        // See `BExpert::build` for why a windowed trunk builds its cross-K/V through the plan.
         let prep = |s: &Array| -> Result<Vec<(Array, Array)>> {
-            dit.prepare_cross_kv(&dit.embed_text(s)?)
+            let embedded = dit.embed_text(s)?;
+            match trunk.window {
+                None => dit.prepare_cross_kv(&embedded),
+                Some((stream, plan, cancel)) => {
+                    stream.prepare_cross_kv_windowed(&embedded, plan, cancel)
+                }
+            }
         };
         Ok(Self {
-            transformer: dit,
             wtxt_wvit: prep(streams[0])?,
             wtxt_wovit: prep(streams[1])?,
             wotxt_wvit: prep(streams[2])?,
             wotxt_wovit: prep(streams[3])?,
+            trunk,
         })
     }
 
@@ -362,7 +387,7 @@ pub fn denoise_bernini_wvitcfg(
         };
         let v = vit_one_step(
             pf,
-            expert.transformer,
+            expert.trunk,
             mode,
             &latent,
             images,
@@ -522,25 +547,63 @@ impl BerniniRenderer {
         // Load+quantize each expert before loading the next so only one bf16 transient is resident at
         // a time (sc-5360 — `WanTransformer::quantize` eval-frees its bf16 dequant). Without quant this
         // just loads both bf16.
-        let load_expert = |name: &str| -> Result<WanTransformer> {
-            let w = Weights::from_file(self.root.join(name))?;
-            let mut dit = WanTransformer::from_weights(&w, cfg)?;
-            if let Some(q) = self.quant {
-                dit.quantize(q.bits(), None)?;
+        // ── Ladder rungs 3 + 4 (sc-15528) ────────────────────────────────────────────────────
+        // Rung 4 is per-request: when a window is selected the expert's block stack is NEVER
+        // materialized (`from_weights_deferred` holds zero blocks) and the stream rebuilds
+        // `plan.window()` blocks at a time. On a DUAL-expert config that is the whole point --
+        // sc-16354's finding is that a naive per-expert window leaves the idle expert's 40 blocks
+        // resident, and a stack that was never materialized has no idle half to pay for. Both
+        // experts are deferred here, so the bound is over the full 80-block trunk, not one expert.
+        let window = crate::memory_strategy::transformer_window_size(req)?;
+        let attn_budget = crate::memory_strategy::attention_budget(req);
+        let plan = window
+            .map(|size| BlockPlan::new(cfg.num_layers, size))
+            .transpose()?;
+        let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
+            let path = self.root.join(name);
+            let w = Weights::from_file(&path)?;
+            if window.is_some() {
+                let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
+                // No adapters can reach here (`supports_lora: false`), and the stream refuses an
+                // adapted load anyway -- Wan MERGES deltas at load, so a streamed block re-read from
+                // the snapshot would silently carry none of them.
+                let mut stream = WanBlockStream::new(WeightsSource::File(path), cfg.clone(), &[])?;
+                if let Some(q) = self.quant {
+                    // Replayed per materialized block so the streamed weights are byte-identical to
+                    // the resident ones. A pre-packed tier takes this through `cfg.quantization`
+                    // inside the block constructor instead, exactly as the resident path does.
+                    stream.set_quant_bits(q.bits());
+                }
+                stream.set_attention_budget(attn_budget);
+                Ok((dit, Some(stream)))
+            } else {
+                let mut dit = WanTransformer::from_weights(&w, cfg)?;
+                if let Some(q) = self.quant {
+                    dit.quantize(q.bits(), None)?;
+                }
+                dit.set_attention_budget(attn_budget);
+                Ok((dit, None))
             }
-            Ok(dit)
         };
         let latents = {
-            let low_dit = load_expert("low_noise_model.safetensors")?;
+            let (low_dit, low_stream) = load_expert("low_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let high_dit = load_expert("high_noise_model.safetensors")?;
+            let (high_dit, high_stream) = load_expert("high_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let low = BExpert::build(&low_dit, &context, &context_null)?;
-            let high = BExpert::build(&high_dit, &context, &context_null)?;
+            let low = BExpert::build(
+                Trunk::for_load(&low_dit, low_stream.as_ref(), plan.as_ref(), &req.cancel),
+                &context,
+                &context_null,
+            )?;
+            let high = BExpert::build(
+                Trunk::for_load(&high_dit, high_stream.as_ref(), plan.as_ref(), &req.cancel),
+                &context,
+                &context_null,
+            )?;
             let pf = PackedForward::new(
                 cfg.dim / cfg.num_heads,
                 cfg.out_dim,
@@ -580,7 +643,11 @@ impl BerniniRenderer {
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
         let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        // Ladder rung 2 (sc-15528) — see the note on the full pipeline's decode.
+        let tiling = match crate::memory_strategy::decode_tiling(req)? {
+            Some(explicit) => Some(explicit),
+            None => TilingConfig::auto(height as i32, width as i32, out_frames),
+        };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
@@ -678,8 +745,8 @@ mod tests {
             scale(cu, 0.5),
         );
         let streams = [&s0, &s1, &s2, &s3];
-        let low = BVitExpert::build(&dit, streams).expect("low expert");
-        let high = BVitExpert::build(&dit, streams).expect("high expert");
+        let low = BVitExpert::build(Trunk::resident(&dit), streams).expect("low expert");
+        let high = BVitExpert::build(Trunk::resident(&dit), streams).expect("high expert");
         let g = VitGuidanceParams {
             omega_txt: 4.0,
             omega_img: 4.5,
