@@ -389,7 +389,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs
         # (24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 27,
-        WINDOWS_HUB_LOCK: 10,
+        WINDOWS_HUB_LOCK: 11,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
     }
@@ -555,7 +555,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 27)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 11)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
             workflow,
