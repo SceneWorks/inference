@@ -25,6 +25,21 @@ Which reproduces every measured peak on that host to within ~10%:
 Rows A and D were measured taking `active+wired` to 80.55 and 88.13 GiB of that box's ~101 GiB, with
 NO swap and NO compression — comfortable. Row F extrapolates to ~100.6 GiB, i.e. the whole machine.
 That is the cliff, and it is a straight line, so it can simply be computed in advance.
+
+sc-17807 made the 800 KiB a knob rather than a constant (`KreaArConfig::kv_cache_quant`), so
+`--kv-bits` / `KREA_S18_KV_BITS` prices the tier a dispatch is actually running. At Q8 the same
+rows cost 0.53x the KV, which moves every prediction:
+
+    row  window          tokens   KV GiB bf16   KV GiB q8   predicted q8
+    A     6 frames        9,360      7.1           3.8          14.1
+    D    15 frames       23,400     17.9           9.5          20.3
+    F    30 frames       46,800     35.7          19.0          30.8
+    E    45 (global)     70,200     53.6          28.5          41.2
+
+Those are PREDICTIONS, not measurements — the q8 arm's measured peaks live in the S18 sweep's
+recorded cells, and this preflight is only as good as its bf16 calibration until they land. What
+they predict is concrete though: row F at 832x480, the row that took `nax-macos-2` down twice, is
+~30.8 GiB against that box's ~36 GiB budget at Q8, i.e. affordable on the host it killed.
 """
 
 from __future__ import annotations
@@ -34,9 +49,18 @@ import os
 import subprocess
 import sys
 
-# 2 (K and V) x 40 layers x 5120 dim x 2 bytes (bf16 — the KV is NOT quantized; quantizing it is the
-# real fix for this class and is far beyond this preflight).
+# 2 (K and V) x 40 layers x 5120 dim x 2 bytes (bf16 — the shipped cache).
 KV_BYTES_PER_TOKEN = 2 * 40 * 5120 * 2
+
+# sc-17807 made the cache's storage tier a config knob (`KreaArConfig::kv_cache_quant`), so the
+# preflight has to know which tier a dispatch is running or it prices the wrong sweep. A quantized
+# row costs its packed payload plus one scale AND one bias per group, both in the quantized input's
+# dtype (bf16 here) — which is why Q8 is 0.53x the bf16 cache and not a clean half. The Rust side
+# computes the identical figure in `KreaRealtimeConfig::kv_bytes_per_token`; the two are pinned
+# against each other in `scripts/tests/test_s18_memory_preflight.py`.
+QUANT_GROUP_OVERHEAD_BYTES = 4
+DIM = 5120
+LAYERS = 40
 
 # Krea Realtime 14B at q4, plus the resident activations the AR loop needs beyond its KV.
 BASE_RESIDENT_GIB = 9.0
@@ -94,6 +118,21 @@ def host_ram_gib() -> float:
         return 0.0
 
 
+def kv_bytes_per_token(bits: int | None, group_size: int = 64) -> int:
+    """Bytes of persistent KV per DiT token across the whole DiT, at the given cache tier.
+
+    `bits=None` is the shipped bf16 cache. Anything else is group-wise affine quantization.
+    """
+    if bits is None:
+        return KV_BYTES_PER_TOKEN
+    if bits not in (2, 3, 4, 5, 6, 8):
+        raise ValueError(f"{bits} is not an MLX affine quantization width (2, 3, 4, 5, 6, 8)")
+    if group_size not in (32, 64, 128) or DIM % group_size:
+        raise ValueError(f"{group_size} is not a usable affine quantization group size")
+    row = DIM * bits // 8 + DIM // group_size * QUANT_GROUP_OVERHEAD_BYTES
+    return 2 * LAYERS * row
+
+
 def tokens_per_latent_frame(width: int, height: int) -> int:
     return (height // LATENT_DIVISOR // PATCH) * (width // LATENT_DIVISOR // PATCH)
 
@@ -110,8 +149,16 @@ def window_tokens(row: str, width: int, height: int, latent_frames: int) -> int:
     return (span + sink) * per_frame
 
 
-def predicted_peak_gib(row: str, width: int, height: int, latent_frames: int) -> float:
-    kv_gib = window_tokens(row, width, height, latent_frames) * KV_BYTES_PER_TOKEN / 1024**3
+def predicted_peak_gib(
+    row: str,
+    width: int,
+    height: int,
+    latent_frames: int,
+    kv_bits: int | None = None,
+    kv_group_size: int = 64,
+) -> float:
+    per_token = kv_bytes_per_token(kv_bits, kv_group_size)
+    kv_gib = window_tokens(row, width, height, latent_frames) * per_token / 1024**3
     return (BASE_RESIDENT_GIB + kv_gib) * OVERHEAD
 
 
@@ -128,7 +175,28 @@ def main() -> int:
     p.add_argument("--ram-gib", type=float, default=None, help="override the detected host RAM")
     p.add_argument("--overhead-gib", type=float, default=NON_MLX_OVERHEAD_GIB)
     p.add_argument("--margin-gib", type=float, default=SAFETY_MARGIN_GIB)
+    # Read as STRINGS and convert below, inside the try. `default=int(os.environ[...])` evaluates at
+    # parser-construction time, so a malformed value there escapes as an uncaught traceback rather
+    # than the ::error:: line the caller can act on. The workflow's regex makes that unreachable via
+    # dispatch, but this script is also run by hand.
+    p.add_argument(
+        "--kv-bits",
+        default=os.environ.get("KREA_S18_KV_BITS") or None,
+        help="KV cache quantization width (sc-17807); omit for the shipped bf16 cache",
+    )
+    p.add_argument(
+        "--kv-group-size",
+        default=os.environ.get("KREA_S18_KV_GROUP_SIZE") or "64",
+    )
     args = p.parse_args()
+
+    try:
+        kv_bits = None if args.kv_bits is None else int(args.kv_bits)
+        per_token = kv_bytes_per_token(kv_bits, int(args.kv_group_size))
+    except ValueError as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return 1
+    args.kv_bits, args.kv_group_size = kv_bits, int(args.kv_group_size)
 
     unknown = [r for r in args.rows if r not in ROW_WINDOW_FRAMES]
     if unknown:
@@ -143,9 +211,11 @@ def main() -> int:
         return 0
     budget = ram - args.overhead_gib - args.margin_gib
 
+    kv_tier = "bf16" if args.kv_bits is None else f"q{args.kv_bits}/g{args.kv_group_size}"
     print(
         f"S18 memory preflight — {args.width}x{args.height}, {args.latent_frames} latent frames, "
-        f"{tokens_per_latent_frame(args.width, args.height)} tokens/frame"
+        f"{tokens_per_latent_frame(args.width, args.height)} tokens/frame, "
+        f"KV {kv_tier} ({per_token} bytes/token)"
     )
     print(
         f"  host RAM {ram:.1f} GiB - {args.overhead_gib:.0f} non-MLX - {args.margin_gib:.0f} margin"
@@ -154,7 +224,14 @@ def main() -> int:
     over = []
     for row in args.rows:
         tok = window_tokens(row, args.width, args.height, args.latent_frames)
-        peak = predicted_peak_gib(row, args.width, args.height, args.latent_frames)
+        peak = predicted_peak_gib(
+            row,
+            args.width,
+            args.height,
+            args.latent_frames,
+            args.kv_bits,
+            args.kv_group_size,
+        )
         verdict = "OK" if peak <= budget else "OVER BUDGET"
         if peak > budget:
             over.append((row, tok, peak))

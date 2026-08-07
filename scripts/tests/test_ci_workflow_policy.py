@@ -1424,11 +1424,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("repeats a seed", job)
         # Pieces of a split sweep must be distinguishable: same sha, same inner filename, so without
         # the rows/seeds in the artifact name the same piece can be re-aggregated twice.
+        #
+        # sc-17807 adds the GEOMETRY for the same reason, and it is not cosmetic: the geometry input
+        # now also carries the KV cache tier (`640x384@q8`), so a bf16 and a q8 dispatch of the same
+        # rows and seeds at the same sha would otherwise produce two artifacts with identical names
+        # and identical inner filenames — two different MODELS, indistinguishable. The re-aggregator
+        # refuses to pool mixed tiers, but only because each cell carries its tier; an artifact you
+        # cannot tell apart is still evidence you cannot safely use.
         self.assertIn(
-            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}"
-            "-s${{ inputs.krea_s18_seeds }}",
+            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_geometry }}"
+            "-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}",
             job,
         )
+        # sc-17807 — the KV cache tier rides the geometry input as an optional `@q<bits>` suffix
+        # (the dispatcher is at its input cap). Both the preflight and the run must derive it, or
+        # the guard prices a bf16 sweep while a quantized one runs. The regex is what keeps the two
+        # `##*@q` expansions unambiguous, so pin it alongside them.
+        self.assertIn("^[0-9]+x[0-9]+(@q[0-9]+)?$", job)
+        self.assertEqual(job.count('KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"'), 2)
         # sc-17324: the memory preflight must run, must see the rows actually dispatched, and must
         # NOT be continue-on-error — refusing a row this host cannot hold is its entire purpose.
         # It replaces two runner deaths, both row F at 832x480, both of which destroyed every cell
