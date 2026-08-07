@@ -6,7 +6,7 @@
 //! render; residency-only rungs remain exact, while query-chunked attention reports its measured RGB
 //! drift before applying the provider-owned contract.
 
-#![cfg(feature = "cuda")]
+#![cfg(all(feature = "cuda", feature = "testkit"))]
 
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadShape, LoadSpec, MemoryBehaviorRoute, MemoryMode,
