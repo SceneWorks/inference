@@ -80,7 +80,20 @@ pub struct KvCacheQuant {
 }
 
 impl KvCacheQuant {
-    /// Q8 KV at MLX's default group size — the tier sc-17807 measured (`0.53×` the bf16 cache).
+    /// Q8 KV at MLX's default group size: `0.53×` the bf16 cache, and — measured, not assumed —
+    /// **a real coherence cost**.
+    ///
+    /// sc-17807's A/B (both arms on one host, rows A/B/C/D × seeds 7/11/23 at 640×384) found Q8
+    /// drifting further than bf16 on **every** bounded row (+1.20 to +2.79/255, 9 of 12 paired
+    /// deltas positive), resolvably so on row C (+2.79 against a 2·SEM of 0.80). The other rows
+    /// only had the power to exclude regressions above 1.87–5.79/255, so the honest reading is one
+    /// effect of roughly **+2/255** across the bounded rows rather than one bad row. Against a
+    /// `DRIFT_BUDGET` of 8/255 (the sweep's, in `tests/generate_smoke.rs`) that is a quarter of the
+    /// budget, bought for a 0.76–0.86× peak.
+    ///
+    /// So this is a **trade with a measured price**, not a free saving. It is worth taking when the
+    /// alternative is not generating at all (a row that does not fit the host), and not otherwise.
+    /// Pinned by `the_recorded_kv_tier_ab_records_a_resolvable_q8_regression`.
     pub const Q8: Self = Self {
         bits: 8,
         group_size: 64,
@@ -184,9 +197,13 @@ pub struct KreaArConfig {
     /// [`KreaRealtimeConfig::kv_bytes_per_token`]). Consumed by
     /// [`CausalKvCache`](crate::CausalKvCache).
     ///
-    /// **Opt-in on purpose.** Quantizing the cache perturbs the same long-clip coherence sc-15571 /
-    /// sc-15127 measure, so it is off by default and turning it on is a measured decision, not a free
-    /// one — see the sc-17807 arm of the S18 sweep.
+    /// **Opt-in on purpose, and the measurement says keep it that way.** Quantizing the cache
+    /// perturbs the same long-clip coherence sc-15571 / sc-15127 measure — and sc-17807's A/B
+    /// measured that it does: Q8 drifts further than bf16 on every bounded row of the S18 sweep,
+    /// resolvably on row C (+2.79/255 against a 2·SEM of 0.80), while saving 0.76–0.86× of peak.
+    /// Enabling it is therefore a deliberate trade of coherence for memory, appropriate when the
+    /// alternative is a clip that does not fit the host. See [`KvCacheQuant::Q8`] and
+    /// `the_recorded_kv_tier_ab_records_a_resolvable_q8_regression`.
     pub kv_cache_quant: Option<KvCacheQuant>,
 }
 
