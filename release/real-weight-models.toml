@@ -181,30 +181,27 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 21 + 3 = 45:
+# The 45 account for exactly, and the arithmetic is the point — 21 + 23 + 1 = 45:
 #
-# WIRED, 21: 17 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3, preview fit),
-# 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing
-# on nax-macos — 19 of them 2026-08-04, and the two most recently wired 2026-08-06:
-# `lightning_loras_apply_cleanly` (sc-17518) and the preview fit (sc-17515).
+# WIRED, 23: 19 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3, preview fit,
+# compiled-glue A/B x2), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only
+# `mlx-qwen-image-producers`. All measured passing on nax-macos — 19 of them 2026-08-04, and the
+# four most recently wired 2026-08-06: `lightning_loras_apply_cleanly` (sc-17518), the preview fit
+# (sc-17515), and both `perf.rs` arms (sc-17513).
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 3. A lane that is red every week is ignored within a month
-# (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
-#   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
-#     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
-#     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
-#     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
+# EXCLUDED WITH A MEASUREMENT, 1. A lane that is red every week is ignored within a month
+# (sc-16981), so it is recorded here rather than wired red or quietly dropped:
 #   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
 #     exist in no repository and on no Hub.
 #
-# This block held FIVE entries until 2026-08-06; two were retired in the same week, and both had
-# been excluded on a number that turned out to measure the test rather than the code:
+# This block held FIVE entries until 2026-08-06. Four were retired in the same week, and every one
+# had been excluded on a number that turned out to measure the test rather than the code:
 #   * `lightning_loras_apply_cleanly` (sc-17518) asserted `applied == 840` — the HOST map's
 #     60 x 14 target count, never a measured application. Both pinned lightx2v files apply
 #     60 x 12 = 720 with zero unmatched; no published Lightning release has ever trained
@@ -214,7 +211,24 @@ expected_files = [
 #     That was a defect in the test's host readback — `mlx-rs` `as_slice` returns physical storage
 #     for a transpose view, so it regressed latent channel 0 against the red channel. With the
 #     contiguity pass it measures R^2 = 0.9521 (unclamped re-solve, the quantity the floor gates).
-# Both are WIRED above. Neither weakened a gate to get there.
+#   * `perf.rs` x2 (sc-17513) asserted the compiled sc-2963 glue was BIT-identical to eager on the
+#     real 60-layer forward — `assert_eq!(max_diff, 0.0)` — which had never held: sc-17284 measured
+#     max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit). sc-17513
+#     swept 18 shapes across both arms (T2I bf16 128..1280 px, Edit q8 256..1024 px) and ran two
+#     controls that settle what the residual IS: truncating the transformer to 1 layer makes
+#     compiled-vs-eager exactly 0.0 on the same real weights against a max|out| of 114.1, so the
+#     zero is not vacuous (0.3 ULP at 2 layers), and perturbing the EAGER forward's own input by
+#     1-4 f32 ULP moves its output by the same 1e-4..2.5e-3 the whole compiled-vs-eager gap does.
+#     So it is this stack's amplification of a sub-ULP rounding difference, not a fusion defect —
+#     which also explains why it is non-monotonic in sequence length (the amplification is). The
+#     gate is now peak-RELATIVE and PER-ARM: 1.0e-2 (T2I) and 2.6e-3 (Edit), each 4x that arm's own
+#     measured conditioning envelope and ~4.5x its worst measured divergence. One shared constant
+#     left the Edit arm 85x loose at the geometry this lane runs, which would not have caught a 20x
+#     regression on it. A genuinely wrong fusion is O(1e-1) and still trips both. The tables and the
+#     derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`; the sweep that produced them
+#     is committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs` (an example, not a
+#     test — it adds nothing to the 45 above).
+# All four are WIRED above. None weakened a gate to get there.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
 revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
@@ -255,11 +269,14 @@ expected_files = [
 # to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
 #
 # WHAT "WIRED" DOES NOT MEAN HERE. `QWEN_IMAGE_EDIT_SNAPSHOT` also gates 19 tests this lane does not
-# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7) — plus one arm of
-# `perf.rs`. The gate is per-variable, so this row now reads as covered while those 19 still execute
-# nowhere; that is the same hazard recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and
-# it is accepted here rather than avoided because the sequential-residency Edit arm genuinely needs
-# this artifact. The 19 are tracked in sc-17519; do not read this row as evidence they run.
+# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7). The gate is per-variable, so
+# this row now reads as covered while those 19 still execute nowhere; that is the same hazard
+# recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and it is accepted here rather than
+# avoided because the sequential-residency Edit arm genuinely needs this artifact. The 19 are
+# tracked in sc-17519; do not read this row as evidence they run.
+#
+# The `perf.rs` Edit arm was a 20th until sc-17513 wired it into the compiled-glue A/B step; it is
+# the only test outside `sequential_residency_real_weights` that this row's q8 tier now backs in CI.
 key = "qwen-image-edit-2511-mlx"
 repository = "SceneWorks/qwen-image-edit-2511-mlx"
 revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"

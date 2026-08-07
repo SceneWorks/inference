@@ -1577,8 +1577,9 @@ jobs:
     #   sequential   102 + 101 + 116 + 114 = 433s block residency             = 173s
     #   lightning     23 + 21        =  44s       adapter (golden-free) 0 + 1 =   1s
     #   preview fit (sc-17515, measured 2026-08-06, same box)           75-217s
-    #                                             TOTAL COMPUTE     = 811-953s (13.5-15.9 min)
-    # The cap is 90, not ~25, because only the 13-16 minutes above is compute: the rest is the
+    #   compiled-glue A/B (sc-17513, measured 2026-08-06, same box)    225-244s
+    #                                             TOTAL COMPUTE   = 1036-1197s (17.3-20.0 min)
+    # The cap is 90, not ~25, because only the 17-20 minutes above is compute: the rest is the
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
@@ -1597,9 +1598,17 @@ jobs:
     # weights resident: `lightning_loras_apply_cleanly` 0.29-0.51s of libtest time over three runs
     # (it installs adapters onto a lazily-loaded tree and renders nothing), so the step is ~3s. The
     # table above does not carry it as its own row and does not need to: ~3s is inside the rounding
-    # of the 811-953s total and two orders of magnitude below the 142s contention spread on the
-    # preview-fit row alone. The 90-minute cap is untouched: it is sized by the materialization
-    # budget, and this test transfers no bytes the lane did not already pull.
+    # of the total and two orders of magnitude below the 142s contention spread on the preview-fit
+    # row alone. The 90-minute cap is untouched: it is sized by the materialization budget, and this
+    # test transfers no bytes the lane did not already pull.
+    #
+    # sc-17513 added the compiled-glue A/B row, which is NOT inside anyone's rounding: MEASURED
+    # 2026-08-06 on nax-macos over three runs, weights resident — T2I 55-59s + Edit 170-185s =
+    # 225-244s. The Edit arm dominates because it times 16 warm forwards over an 8192-token
+    # dual-latent sequence. The cap stays 90 for the same reason every row above kept it there: it
+    # is the materialization budget, and these two tests transfer no bytes this lane did not
+    # already pull. Even at the top of the range, 90 minutes is ~4.5x the warm compute, which
+    # leaves room for the contention that already dominates the preview-fit row.
     timeout-minutes: 90
     env:
       # Repo-variable names are deliberately NOT the test-facing names. `vars.QWEN_IMAGE_SNAPSHOT`
@@ -1687,15 +1696,20 @@ jobs:
       #   3. A run count still cannot see a test that reads an optional env var and returns early:
       #      that reports "1 passed" in 0.00s. Every test selected here was read for that shape
       #      first. None of them has it — each panics on a missing variable. `perf.rs` DID have it
-      #      (`eprintln!("skip: ...")` + `return`); this commit removed that, so those two tests now
-      #      fail loudly. They are still not in this lane, for a different reason: they FAIL on real
-      #      weights and always have (sc-17513). A lane that is red every week is ignored within a
-      #      month; each exclusion is recorded with its measurement in the manifest. `perf.rs` is
-      #      now the ONLY exclusion this job has: the two other names that sat beside it are both
-      #      wired in the steps below. `fit_preview_rgb_factors` (sc-17515) was excluded at
-      #      R² = 0.0114, which turned out to be the test's own host readback rather than the fit;
-      #      `lightning_loras_apply_cleanly` (sc-17518) was excluded for asserting 840 per-block
-      #      modules, which was the host map's target count and not a measured application.
+      #      (`eprintln!("skip: ...")` + `return`); sc-17284 removed that, so they fail loudly.
+      #      sc-17513 re-verified it by direct execution once they were wired: with
+      #      MLX_GEN_QWEN_SNAPSHOT unset, `qwen_t2i_per_step_compiled_vs_eager` panics at
+      #      perf.rs:45 and the step reports "test result: FAILED. 0 passed" and exits 1.
+      #      This job now has exactly ONE exclusion, `edit_lightning_user_lora_reference_repro`,
+      #      which needs a user LoRA and a reference PPM that exist nowhere. The three names that
+      #      sat beside it are all wired in the steps below, and every one had been excluded on a
+      #      number that measured the test rather than the code: `fit_preview_rgb_factors`
+      #      (sc-17515) at R² = 0.0114, which was the test's own host readback rather than the fit;
+      #      `lightning_loras_apply_cleanly` (sc-17518) at 840 per-block modules, which was the
+      #      host map's target count and not a measured application; and `perf.rs` x2 (sc-17513) at
+      #      `max|Δ| == 0`, which no 60-layer forward has ever satisfied. A lane that is red every
+      #      week is ignored within a month, so each exclusion is still recorded with its
+      #      measurement in the manifest — there is just one left.
       - name: Run Qwen-Image control-branch gates
         run: |
           set -o pipefail
@@ -1862,6 +1876,46 @@ jobs:
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
           fi
+      # sc-17513 — the sc-2963 compiled-glue rollout's only real-weight gate. Both tests were
+      # excluded from this lane when it was created because they asserted the compiled forward was
+      # BIT-identical to eager on the real 60-layer transformer, which had never held. sc-17513
+      # swept 18 shapes across both arms and two independent controls (compiled vs eager is exactly
+      # `0.0` at 1 layer and 0.3 ULP at 2; a 1-ULP-f32 perturbation of the EAGER forward's own input
+      # moves its output by the same 1e-4…2.5e-3 the whole gap does), so the residual is this
+      # stack's amplification floor, not a fusion defect. The gate is now peak-RELATIVE and PER-ARM
+      # — 1.0e-2 (T2I bf16) and 2.6e-3 (Edit q8) — each 4x that arm's own MEASURED conditioning
+      # envelope, which is 3.9x smaller on Edit, so one shared constant cost that arm most of its
+      # sensitivity. The evidence, the tables and the derivation live on
+      # `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`, and the sweep that produced them is
+      # committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs`. Re-measure with it
+      # before touching either number here.
+      #
+      # The Edit arm takes `q8` for the same reason the residency step above does — this re-host's
+      # `bf16/` tier is metadata-only. Each test loads its own transformer, so they are selected one
+      # at a time rather than together: a single invocation of the `perf` binary would hold 38 GiB
+      # (T2I bf16) and 20 GiB (Edit q8) of weights live in one process.
+      #
+      # MEASURED 2026-08-06 on nax-macos with both tiers resident, over three runs: T2I 55-59s, Edit
+      # 170-185s = 225-244s of test time (peak RSS 40.8 GB and 21.7 GB respectively). That is +4 min
+      # on the 811-953s this job carried before it, taking the header total to 1036-1197s;
+      # `timeout-minutes: 90` is sized by the ~131 GiB first-run materialization budget, not by
+      # compute, so it is unchanged — see the job header.
+      - name: Run Qwen-Image compiled-glue vs eager per-step A/B
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
+              QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
+              cargo test --locked --release -p mlx-gen-qwen-image --test perf \
+              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one qwen_t2i_per_step_compiled_vs_eager
+          run_one qwen_edit_per_step_compiled_vs_eager
 
   # sc-17284 — the integrated PiD (progressive-in-decoder) super-resolution decode seam, for BOTH
   # engines that have one. Split from the job above because it is the only place `FLUX_DEV_DIR` and
