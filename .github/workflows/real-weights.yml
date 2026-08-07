@@ -2129,7 +2129,8 @@ jobs:
       # it does not fit either — n=2 is ~186 min against this job's 120-minute cap.
       #
       # Selection here is by `--ignored`, a BLANKET: every `#[ignore]` test in the file is conscripted
-      # into this step, which is how an hours-long sweep joined a regression lane unannounced. The
+      # into this step, which is how an hours-long sweep joined a regression lane unannounced. Skip
+      # both the real sweep and its two operator-only re-aggregation entry points explicitly. The
       # run-count assertion pins the six that belong here, so the next such addition fails loudly
       # instead of silently spending the budget. Adding an e2e test means bumping the count.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
@@ -2143,7 +2144,9 @@ jobs:
             cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
             -- --ignored --nocapture --test-threads 1 \
             --skip kv_cache_residency_at_the_production_geometry \
-            --skip long_clip_coherence_under_the_bounded_window 2>&1 | tee /dev/stderr)"
+            --skip long_clip_coherence_under_the_bounded_window \
+            --skip s18_verdict_from_accumulated_cells \
+            --skip s18_kv_tier_ab_from_accumulated_cells 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 6 passed" <<<"$out"; then
             echo "::error::the Q4 e2e step did not run exactly six passing tests — a rename, a new #[ignore] test, or a skipped arm would otherwise change this lane's coverage silently" >&2
             exit 1

@@ -1643,6 +1643,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("set -o pipefail", step)
         self.assertIn("--skip kv_cache_residency_at_the_production_geometry", step)
         self.assertIn("--skip long_clip_coherence_under_the_bounded_window", step)
+        self.assertIn("--skip s18_verdict_from_accumulated_cells", step)
+        self.assertIn("--skip s18_kv_tier_ab_from_accumulated_cells", step)
         self.assertIn('grep -qE "test result: ok\\. 6 passed"', step)
 
     def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
