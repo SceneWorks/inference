@@ -33,6 +33,31 @@ fn rung() -> MemoryStrategy {
     }
 }
 
+fn parity_metrics(reference: &[u8], candidate: &[u8]) -> (f64, u8, f64, f64, f64) {
+    assert_eq!(reference.len(), candidate.len(), "RGB parity shape");
+    assert!(!reference.is_empty(), "RGB parity requires pixels");
+    let mut changed = 0u64;
+    let mut maximum = 0u8;
+    let mut absolute_sum = 0u64;
+    let mut square_sum = 0u64;
+    for (&resident, &optimized) in reference.iter().zip(candidate) {
+        let error = resident.abs_diff(optimized);
+        changed += u64::from(error != 0);
+        maximum = maximum.max(error);
+        absolute_sum += u64::from(error);
+        square_sum += u64::from(error) * u64::from(error);
+    }
+    let count = reference.len() as f64;
+    let mean = absolute_sum as f64 / count;
+    let rmse = (square_sum as f64 / count).sqrt();
+    let psnr = if rmse == 0.0 {
+        f64::INFINITY
+    } else {
+        20.0 * (255.0 / rmse).log10()
+    };
+    (changed as f64 / count, maximum, mean, rmse, psnr)
+}
+
 #[test]
 #[ignore = "requires CANDLE_MAGE_SNAPSHOT and a physical idle CUDA runner"]
 fn representative_route_exercises_advertised_rung() {
@@ -120,6 +145,11 @@ fn representative_route_exercises_advertised_rung() {
             .expect("set MAGE_MEMORY_REFERENCE for optimized rungs");
         let reference = std::fs::read(&reference_path)
             .unwrap_or_else(|error| panic!("read MAGE_MEMORY_REFERENCE={reference_path}: {error}"));
+        let (changed_fraction, max_abs, mean_abs, rmse, psnr_db) =
+            parity_metrics(&reference, &image.pixels);
+        eprintln!(
+            "MAGE_MEMORY_PARITY strategy={strategy:?} changed_fraction={changed_fraction:.12} max_abs={max_abs} mean_abs={mean_abs:.12} rmse={rmse:.12} psnr_db={psnr_db:.12}"
+        );
         assert_eq!(
             image.pixels, reference,
             "{strategy:?} changed the deterministic resident output"
