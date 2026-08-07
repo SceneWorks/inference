@@ -45,6 +45,16 @@ use candle_gen::gen_core::{
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{merge_into_weights, Krea2Config};
 
+/// Root for this suite's **deliberately persistent** artifacts. `KREA_TRAINER_ARTIFACT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (trained adapters and sample renders you inspect afterwards), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn artifact_root() -> PathBuf {
+    std::env::var("KREA_TRAINER_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 /// The Krea-2-Raw base snapshot dir — `KREA_RAW_DIR`, or `KREA_TURBO_DIR` (architecture-identical).
 fn snapshot() -> Option<PathBuf> {
     std::env::var("KREA_RAW_DIR")
@@ -194,7 +204,7 @@ fn krea_lora_trains_and_is_well_formed() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
         return;
     }
-    let tmp = std::env::temp_dir().join("krea_trainer_e2e_lora");
+    let tmp = artifact_root().join("krea_trainer_e2e_lora");
     let out = run(&tmp, "krea_lora.safetensors", NetworkType::Lora, 24, false);
     assert_converged("lora", &out.losses);
 
@@ -250,7 +260,7 @@ fn krea_lokr_trains_and_is_well_formed() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
         return;
     }
-    let tmp = std::env::temp_dir().join("krea_trainer_e2e_lokr");
+    let tmp = artifact_root().join("krea_trainer_e2e_lokr");
     let out = run(&tmp, "krea_lokr.safetensors", NetworkType::Lokr, 24, false);
     assert_converged("lokr", &out.losses);
 
@@ -280,7 +290,7 @@ fn krea_lora_gradient_checkpointing() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
         return;
     }
-    let tmp = std::env::temp_dir().join("krea_trainer_e2e_ckpt");
+    let tmp = artifact_root().join("krea_trainer_e2e_ckpt");
     let out = run(
         &tmp,
         "krea_lora_ckpt.safetensors",
@@ -311,7 +321,7 @@ fn krea_preview_full_resolution_no_oom() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
         return;
     }
-    let tmp = std::env::temp_dir().join("krea_preview_1024");
+    let tmp = artifact_root().join("krea_preview_1024");
     let items = make_dataset(&tmp);
     let mut trainer = candle_gen_krea::provider_registry()
         .unwrap()
@@ -367,7 +377,7 @@ fn krea_trainer_emits_preview_samples() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
         return;
     }
-    let tmp = std::env::temp_dir().join("krea_trainer_e2e_samples");
+    let tmp = artifact_root().join("krea_trainer_e2e_samples");
     let items = make_dataset(&tmp);
     let mut trainer = candle_gen_krea::provider_registry()
         .unwrap()
@@ -539,7 +549,7 @@ fn render_turbo(root: &Path, prompt: &str, adapters: Vec<AdapterSpec>) -> Image 
 }
 
 fn save_png(img: &Image, name: &str) {
-    let dir = std::env::temp_dir().join("krea_roundtrip");
+    let dir = artifact_root().join("krea_roundtrip");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.png"));
     image::save_buffer(
@@ -571,7 +581,7 @@ fn krea_lora_roundtrip_raw_to_turbo() {
         eprintln!("skipping: set KREA_RAW_DIR and KREA_TURBO_DIR");
         return;
     };
-    let tmp = std::env::temp_dir().join("krea_rt");
+    let tmp = artifact_root().join("krea_rt");
 
     // 1) Train a deliberately over-fit LoRA on a vivid emerald-green concept. **Gradient checkpointing
     //    on** — the retained backward OOMs on the 12B DiT (~24 GB resident leaves no VRAM headroom for

@@ -452,11 +452,11 @@ fn recompute_commits_clean_context_kv_distinct_from_s4_baseline() {
 
     // The committed K differs: recompute-on stores the clean-context forward's K, recompute-off the
     // near-clean final-denoise-step's.
-    let (k_on, _) = cache_on.layer_kv(0).expect("on cache populated");
-    let (k_off, _) = cache_off.layer_kv(0).expect("off cache populated");
+    let (k_on, _) = cache_on.layer_kv(0).unwrap().expect("on cache populated");
+    let (k_off, _) = cache_off.layer_kv(0).unwrap().expect("off cache populated");
     assert_eq!(k_on.shape(), k_off.shape());
     assert!(
-        max_abs_diff(k_on, k_off) > 0.0,
+        max_abs_diff(&k_on, &k_off) > 0.0,
         "recompute must commit clean-context K/V distinct from the S4 near-clean-final-step K/V"
     );
 }

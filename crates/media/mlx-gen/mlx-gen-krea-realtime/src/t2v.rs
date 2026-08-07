@@ -167,6 +167,10 @@ fn resolve_request_config(
     }
     cfg.ar.frame_seq_length = frame_seq_length;
     cfg.ar.seq_length = num_latent_frames * frame_seq_length;
+    // A KV cache tier the backbone cannot express is refused HERE (sc-17807), before any component
+    // is staged — the alternative is an opaque MLX exception on the first chunk of a clip whose
+    // weights are already resident.
+    cfg.validate_kv_cache_quant()?;
     Ok(cfg)
 }
 
@@ -369,11 +373,19 @@ pub fn decode_latents_to_video(
 /// F wider     (window 30, sink 0)    5   40.90 +-17.3   49.14   8.05
 /// ```
 ///
-/// Row E is absent at 832×480 by necessity: the global window at 45 latent frames is 70,200 tokens
-/// ≈ 38 GiB of KV and **SIGKILLs** a 128 GiB host (measured, jetsam at step 39/75) — which is exactly
-/// the problem [`mac_ar_config`] exists to dodge, so it is a finding rather than a harness bug. Even at
-/// 640×384 it peaks at 41.90 GiB, enough swap pressure to fill this host's boot volume, which is why it
-/// is `n = 1`.
+/// Row E is absent at 832×480 by necessity: the global window at 45 latent frames is 70,200 tokens,
+/// and at the **800 KiB per DiT token** the bf16 KV actually costs
+/// ([`KreaRealtimeConfig::kv_bytes_per_token`](crate::KreaRealtimeConfig::kv_bytes_per_token)) that is
+/// **≈ 53.6 GiB of KV** before activations — exactly the problem [`mac_ar_config`] exists to dodge, so
+/// it is a finding rather than a harness bug. Even at 640×384 it peaks at 41.90 GiB, enough swap
+/// pressure to fill this host's boot volume, which is why it is `n = 1`.
+///
+/// Two numbers here were corrected in sc-17807 / sc-17324. The KV was quoted at ≈ 38 GiB, from a
+/// per-token cost 1.5× too low; and row E was said to **SIGKILL** a 128 GiB host, which is too strong —
+/// CI run 30787887176 ran it to completion at 832×480 with a 63.32 GiB MLX peak. The accurate
+/// statement is the one `long_clip_coherence_under_the_bounded_window` now carries: row E fits no
+/// available host reproducibly (it cleared 128 GiB by ~0.3 GiB once and fits neither bucket on the
+/// ~101 GiB `rw-krea` runner), so it is a row with no home rather than an impossible one.
 ///
 /// **Both buckets say the same thing**, which matters because an earlier single-seed version of this
 /// measurement had them disagreeing — 832×480 appeared to show a clean sink dose-response that 640×384
@@ -1299,6 +1311,31 @@ mod tests {
         );
         // A latent not divisible by the patch size is rejected.
         assert!(resolve_request_config(&base, 33, 32, 4).is_err());
+
+        // sc-17807 — the shipped request path is bf16 KV (the knob defaults off), a snapshot that
+        // declares a valid tier carries it through, and one that declares an impossible tier is
+        // refused HERE rather than on the first chunk of an already-staged clip.
+        assert_eq!(cfg.ar.kv_cache_quant, None);
+        let mut q8 = base.clone();
+        q8.ar.kv_cache_quant = Some(crate::KvCacheQuant::Q8);
+        assert_eq!(
+            resolve_request_config(&q8, 32, 32, 4)
+                .unwrap()
+                .ar
+                .kv_cache_quant,
+            Some(crate::KvCacheQuant::Q8)
+        );
+        let mut bad = base;
+        bad.ar.kv_cache_quant = Some(crate::KvCacheQuant {
+            bits: 7,
+            group_size: 64,
+        });
+        let err =
+            resolve_request_config(&bad, 32, 32, 4).expect_err("7-bit is not an MLX affine width");
+        assert!(
+            format!("{err}").contains("affine quantization width"),
+            "{err}"
+        );
     }
 
     // ── The TE tier seam (sc-15203, S19) ────────────────────────────────────────────────────────

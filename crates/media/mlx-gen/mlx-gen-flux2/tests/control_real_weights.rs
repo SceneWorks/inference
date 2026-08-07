@@ -28,6 +28,16 @@ mod atomic_cache;
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
 
+/// Root for this suite's **deliberately persistent** artifacts. `MLX_GEN_FLUX2_PREQUANT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (a pre-quantized snapshot the NEXT run is meant to reuse), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn prequant_root() -> PathBuf {
+    std::env::var("MLX_GEN_FLUX2_PREQUANT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 fn snapshot() -> PathBuf {
     let p = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
@@ -44,7 +54,7 @@ fn control_checkpoint() -> PathBuf {
 /// pre-quantize the DiT + Mistral TE, symlink the unchanged VAE + tokenizer from the source.
 fn prequantized_dev_snapshot() -> PathBuf {
     let src = snapshot();
-    let dst = std::env::temp_dir().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"));
+    let dst = prequant_root().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"));
     if !dst
         .join("transformer/diffusion_pytorch_model.safetensors")
         .exists()

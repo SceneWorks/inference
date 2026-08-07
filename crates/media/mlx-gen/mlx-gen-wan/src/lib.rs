@@ -50,6 +50,7 @@
 //! `tests/ti2v_real_parity.rs` (`#[ignore]` — heavy weights outside CI).
 
 pub mod adapters;
+pub mod block_stream;
 pub mod chunk;
 pub mod config;
 pub mod convert;
@@ -88,6 +89,7 @@ pub use adapters::{
     apply_wan_adapters_additive, merge_vace_adapters, merge_vace_adapters_expert,
     merge_wan_adapters, normalize_wan_key, WanLoraReport,
 };
+pub use block_stream::WanBlockStream;
 pub use chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
 pub use model::{

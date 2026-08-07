@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -191,8 +191,19 @@ on:
       # carries 8. Needed because row F does not fit at the default 832x480 on this lane's runner
       # (~49 GiB, two dead runners) but does at 640x384 (~34 GiB) — without this the fallback bucket
       # is unreachable and row F is simply unrunnable, which is not the same thing as unmeasurable.
+      # The optional `@q<bits>` suffix selects the sc-17807 KV cache tier. It rides this input for
+      # the same reason WxH does: the dispatcher is already at the input cap, and a separate
+      # `krea_s18_kv_bits` would push it over. Omitted = the shipped bf16 cache, so an unchanged
+      # dispatch measures exactly what it measured before. A quantized dispatch is a SEPARATE arm —
+      # its cells carry the tier in a 16th S18CELL field and the re-aggregator refuses to pool them
+      # with the bf16 baseline.
+      #
+      # Group size is MLX's default 64 here and is not dispatchable: it would need a `/` in the
+      # value, which is not a legal character in the artifact name this input now feeds. The Rust
+      # knob (`KreaArConfig::kv_cache_quant`) still carries an arbitrary group size for a caller who
+      # wants one; only this shorthand is fixed.
       krea_s18_geometry:
-        description: "S18 sweep geometry (krea-s18-sweep only), WxH — use 640x384 for row F"
+        description: "S18 sweep geometry (krea-s18-sweep only), WxH[@q<bits>] — 640x384 for row F, e.g. 640x384@q8"
         type: string
         required: false
         default: 832x480
@@ -1576,9 +1587,10 @@ jobs:
     #   sequential   102 + 101 + 116 + 114 = 433s block residency             = 173s
     #   lightning     23 + 21        =  44s       adapter (golden-free) 0 + 1 =   1s
     #   preview fit (sc-17515, measured 2026-08-06, same box)           75-217s
+    #   compiled-glue A/B (sc-17513, measured 2026-08-06, same box)    225-244s
     #   edit determinism (sc-17519, measured 2026-08-06, same box)       34-44s
-    #                                             TOTAL COMPUTE     = 845-997s (14.1-16.6 min)
-    # The cap is 90, not ~25, because only the 14-17 minutes above is compute: the rest is the
+    #                                             TOTAL COMPUTE   = 1070-1241s (17.8-20.7 min)
+    # The cap is 90, not ~25, because only the 18-21 minutes above is compute: the rest is the
     # first-run materialization budget for the ~131 GiB of tiers and LoRAs this job consumes, on a
     # box that does not already hold them. It is deliberately well under GitHub's 360-minute ceiling — sc-16981 is one macOS job
     # sitting on that ceiling and head-of-line-blocking every other macOS real-weight lane.
@@ -1597,24 +1609,32 @@ jobs:
     # weights resident: `lightning_loras_apply_cleanly` 0.29-0.51s of libtest time over three runs
     # (it installs adapters onto a lazily-loaded tree and renders nothing), so the step is ~3s. The
     # table above does not carry it as its own row and does not need to: ~3s is inside the rounding
-    # of the 811-953s total and two orders of magnitude below the 142s contention spread on the
-    # preview-fit row alone. The 90-minute cap is untouched: it is sized by the materialization
-    # budget, and this test transfers no bytes the lane did not already pull.
+    # of the total and two orders of magnitude below the 142s contention spread on the preview-fit
+    # row alone. The 90-minute cap is untouched: it is sized by the materialization budget, and this
+    # test transfers no bytes the lane did not already pull.
+    #
+    # sc-17513 added the compiled-glue A/B row, which is NOT inside anyone's rounding: MEASURED
+    # 2026-08-06 on nax-macos over three runs, weights resident — T2I 55-59s + Edit 170-185s =
+    # 225-244s. The Edit arm dominates because it times 16 warm forwards over an 8192-token
+    # dual-latent sequence. The cap stays 90 for the same reason every row above kept it there: it
+    # is the materialization budget, and these two tests transfer no bytes this lane did not
+    # already pull. Even at the top of the range, 90 minutes is ~4.5x the warm compute, which
+    # leaves room for the contention that already dominates the preview-fit row.
     #
     # sc-17519 added the Edit determinism gate. MEASURED 2026-08-06 on nax-macos, weights resident:
     # `edit_generate_is_deterministic_rust` 34.19 / 35.80 / 44.11s of libtest time over three runs
     # (two 1024^2 2-step edits through the full LM + vision + transformer + VAE path, then a
-    # byte-comparison of the two decoded images), so the step is ~45s wall-clock including harness
-    # overhead. Peak RSS 35.0 GiB, sampled at 2s. It carries its own row in the table above rather
-    # than a prose correction under it — 45s is not inside the rounding of an 811s total, and a
-    # measured table that a reader has to scroll 28 lines to correct is the drift this whole lane is
-    # being audited for. The row states the measured min-max (34-44s) like the preview-fit row does,
-    # so TOTAL COMPUTE is 845-997s: 34s and 44s onto the respective ends, not 45s onto both. The cap
-    # stays 90 for the same reason
-    # as above — it is a materialization budget, and this step reuses the q8 Edit tier the sequential
-    # residency and Lightning steps already pulled and verified. Treat 44.11s as a floor, not a
-    # ceiling: it was measured on a box also running dev work, and nax-macos-2 showed a 4.4x spread
-    # on the producers job (sc-17284). Even 4.4x is under four minutes.
+    # byte-comparison of the two decoded images). Peak RSS 35.0 GiB, sampled at 2s. Like the
+    # compiled-glue row it carries its own line in the table rather than a prose correction under it:
+    # ~40s is not inside the rounding of an 800-1200s total, and a measured table a reader has to
+    # scroll 28 lines to correct is the drift this whole lane is being audited for. The row states
+    # the measured min-max (34-44s) as the preview-fit row does, so the ends move independently —
+    # 34s onto the min, 44s onto the max — rather than one figure onto both. The cap stays 90 for the
+    # same reason as every row above: it is a materialization budget, and this step reuses the q8
+    # Edit tier the sequential-residency, Lightning and compiled-glue steps already pulled and
+    # verified. Treat 44.11s as a floor, not a ceiling: it was measured on a box also running dev
+    # work, and nax-macos-2 showed a 4.4x spread on the producers job (sc-17284). Even 4.4x is under
+    # four minutes.
     timeout-minutes: 90
     env:
       # Repo-variable names are deliberately NOT the test-facing names. `vars.QWEN_IMAGE_SNAPSHOT`
@@ -1702,15 +1722,20 @@ jobs:
       #   3. A run count still cannot see a test that reads an optional env var and returns early:
       #      that reports "1 passed" in 0.00s. Every test selected here was read for that shape
       #      first. None of them has it — each panics on a missing variable. `perf.rs` DID have it
-      #      (`eprintln!("skip: ...")` + `return`); this commit removed that, so those two tests now
-      #      fail loudly. They are still not in this lane, for a different reason: they FAIL on real
-      #      weights and always have (sc-17513). A lane that is red every week is ignored within a
-      #      month; each exclusion is recorded with its measurement in the manifest. `perf.rs` is
-      #      now the ONLY exclusion this job has: the two other names that sat beside it are both
-      #      wired in the steps below. `fit_preview_rgb_factors` (sc-17515) was excluded at
-      #      R² = 0.0114, which turned out to be the test's own host readback rather than the fit;
-      #      `lightning_loras_apply_cleanly` (sc-17518) was excluded for asserting 840 per-block
-      #      modules, which was the host map's target count and not a measured application.
+      #      (`eprintln!("skip: ...")` + `return`); sc-17284 removed that, so they fail loudly.
+      #      sc-17513 re-verified it by direct execution once they were wired: with
+      #      MLX_GEN_QWEN_SNAPSHOT unset, `qwen_t2i_per_step_compiled_vs_eager` panics at
+      #      perf.rs:45 and the step reports "test result: FAILED. 0 passed" and exits 1.
+      #      This job now has exactly ONE exclusion, `edit_lightning_user_lora_reference_repro`,
+      #      which needs a user LoRA and a reference PPM that exist nowhere. The three names that
+      #      sat beside it are all wired in the steps below, and every one had been excluded on a
+      #      number that measured the test rather than the code: `fit_preview_rgb_factors`
+      #      (sc-17515) at R² = 0.0114, which was the test's own host readback rather than the fit;
+      #      `lightning_loras_apply_cleanly` (sc-17518) at 840 per-block modules, which was the
+      #      host map's target count and not a measured application; and `perf.rs` x2 (sc-17513) at
+      #      `max|Δ| == 0`, which no 60-layer forward has ever satisfied. A lane that is red every
+      #      week is ignored within a month, so each exclusion is still recorded with its
+      #      measurement in the manifest — there is just one left.
       - name: Run Qwen-Image control-branch gates
         run: |
           set -o pipefail
@@ -1911,6 +1936,46 @@ jobs:
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
           fi
+      # sc-17513 — the sc-2963 compiled-glue rollout's only real-weight gate. Both tests were
+      # excluded from this lane when it was created because they asserted the compiled forward was
+      # BIT-identical to eager on the real 60-layer transformer, which had never held. sc-17513
+      # swept 18 shapes across both arms and two independent controls (compiled vs eager is exactly
+      # `0.0` at 1 layer and 0.3 ULP at 2; a 1-ULP-f32 perturbation of the EAGER forward's own input
+      # moves its output by the same 1e-4…2.5e-3 the whole gap does), so the residual is this
+      # stack's amplification floor, not a fusion defect. The gate is now peak-RELATIVE and PER-ARM
+      # — 1.0e-2 (T2I bf16) and 2.6e-3 (Edit q8) — each 4x that arm's own MEASURED conditioning
+      # envelope, which is 3.9x smaller on Edit, so one shared constant cost that arm most of its
+      # sensitivity. The evidence, the tables and the derivation live on
+      # `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`, and the sweep that produced them is
+      # committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs`. Re-measure with it
+      # before touching either number here.
+      #
+      # The Edit arm takes `q8` for the same reason the residency step above does — this re-host's
+      # `bf16/` tier is metadata-only. Each test loads its own transformer, so they are selected one
+      # at a time rather than together: a single invocation of the `perf` binary would hold 38 GiB
+      # (T2I bf16) and 20 GiB (Edit q8) of weights live in one process.
+      #
+      # MEASURED 2026-08-06 on nax-macos with both tiers resident, over three runs: T2I 55-59s, Edit
+      # 170-185s = 225-244s of test time (peak RSS 40.8 GB and 21.7 GB respectively). That is +4 min
+      # on the 811-953s this job carried before it, taking the header total to 1036-1197s;
+      # `timeout-minutes: 90` is sized by the ~131 GiB first-run materialization budget, not by
+      # compute, so it is unchanged — see the job header.
+      - name: Run Qwen-Image compiled-glue vs eager per-step A/B
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
+              QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
+              cargo test --locked --release -p mlx-gen-qwen-image --test perf \
+              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one qwen_t2i_per_step_compiled_vs_eager
+          run_one qwen_edit_per_step_compiled_vs_eager
 
   # sc-17284 — the integrated PiD (progressive-in-decoder) super-resolution decode seam, for BOTH
   # engines that have one. Split from the job above because it is the only place `FLUX_DEV_DIR` and
@@ -2097,8 +2162,10 @@ jobs:
   mlx-krea-realtime:
     name: MLX Krea Realtime video real weights
     # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
-    # Mage-oracle job that shares the `media` profile.
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
+    # Mage-oracle job that shares the `media` profile. `krea-kv-cache` runs only the two count-pinned
+    # KV acceptance tests below, so an unrelated blanket e2e or LoRA failure cannot hide their
+    # verdict (sc-17894).
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime' || inputs.profile == 'krea-kv-cache'
     runs-on: [self-hosted, macOS, ARM64, rw-krea]
     timeout-minutes: 120
     env:
@@ -2178,10 +2245,12 @@ jobs:
       # it does not fit either — n=2 is ~186 min against this job's 120-minute cap.
       #
       # Selection here is by `--ignored`, a BLANKET: every `#[ignore]` test in the file is conscripted
-      # into this step, which is how an hours-long sweep joined a regression lane unannounced. The
+      # into this step, which is how an hours-long sweep joined a regression lane unannounced. Skip
+      # both the real sweep and its two operator-only re-aggregation entry points explicitly. The
       # run-count assertion pins the six that belong here, so the next such addition fails loudly
       # instead of silently spending the budget. Adding an e2e test means bumping the count.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        if: inputs.profile != 'krea-kv-cache'
         env:
           KREA_SMOKE_W: "832"
           KREA_SMOKE_H: "480"
@@ -2192,7 +2261,9 @@ jobs:
             cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
             -- --ignored --nocapture --test-threads 1 \
             --skip kv_cache_residency_at_the_production_geometry \
-            --skip long_clip_coherence_under_the_bounded_window 2>&1 | tee /dev/stderr)"
+            --skip long_clip_coherence_under_the_bounded_window \
+            --skip s18_verdict_from_accumulated_cells \
+            --skip s18_kv_tier_ab_from_accumulated_cells 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 6 passed" <<<"$out"; then
             echo "::error::the Q4 e2e step did not run exactly six passing tests — a rename, a new #[ignore] test, or a skipped arm would otherwise change this lane's coverage silently" >&2
             exit 1
@@ -2212,14 +2283,24 @@ jobs:
           KREA_SMOKE_FRAMES: "81"
         run: |
           set -o pipefail
-          name=kv_cache_residency_at_the_production_geometry
-          out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
-          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
-            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
-            exit 1
-          fi
+          run_one() {
+            local target="$1" name="$2" out
+            if [[ "$target" == lib ]]; then
+              out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+                cargo test --locked --release -p mlx-gen-krea-realtime --lib \
+                "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            else
+              out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+                cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
+                "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            fi
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one integration kv_cache_residency_at_the_production_geometry
+          run_one lib generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention
       # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
       # render, with the scale-0 arm as the attribution control; and the step-distill file is the only
       # real-weight regression gate on the sc-8446 globals-surface decision.
@@ -2233,6 +2314,7 @@ jobs:
       # and both `--exact` steps were skipped behind it. That earlier failure is still open, so this
       # fix is not exercised end-to-end yet (sc-17250).
       - name: Run Krea Realtime real Wan LoRA gates
+        if: inputs.profile != 'krea-kv-cache'
         env:
           KREA_LORA_W: "832"
           KREA_LORA_H: "480"
@@ -2390,11 +2472,17 @@ jobs:
           KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}
           KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}
         run: |
-          if [[ ! "$KREA_S18_GEOMETRY" =~ ^[0-9]+x[0-9]+$ ]]; then
-            echo "::error::krea_s18_geometry='$KREA_S18_GEOMETRY' must be WxH, e.g. 832x480" >&2
+          # WxH[@q<bits>] — the KV tier suffix is sc-17807's, and the preflight has to see
+          # it or it prices the bf16 sweep while a q8 one runs and refuses rows that now fit.
+          if [[ ! "$KREA_S18_GEOMETRY" =~ ^[0-9]+x[0-9]+(@q[0-9]+)?$ ]]; then
+            echo "::error::krea_s18_geometry='$KREA_S18_GEOMETRY' must be WxH[@q<bits>], e.g. 832x480 or 640x384@q8" >&2
             exit 1
           fi
-          KREA_SMOKE_W="${KREA_S18_GEOMETRY%x*}" KREA_SMOKE_H="${KREA_S18_GEOMETRY#*x}" \
+          geom="${KREA_S18_GEOMETRY%%@*}"
+          if [[ "$KREA_S18_GEOMETRY" == *@q* ]]; then
+            export KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"
+          fi
+          KREA_SMOKE_W="${geom%x*}" KREA_SMOKE_H="${geom#*x}" \
             python3.12 scripts/ci/s18_memory_preflight.py
       - name: Start GPU fault evidence
         continue-on-error: true
@@ -2417,8 +2505,13 @@ jobs:
           set -o pipefail
           name=long_clip_coherence_under_the_bounded_window
           # Same split as the preflight above, so the guard and the run cannot disagree about which
-          # geometry is being measured.
-          export KREA_SMOKE_W="${KREA_S18_GEOMETRY%x*}" KREA_SMOKE_H="${KREA_S18_GEOMETRY#*x}"
+          # geometry — or, since sc-17807, which KV cache tier — is being measured.
+          geom="${KREA_S18_GEOMETRY%%@*}"
+          if [[ "$KREA_S18_GEOMETRY" == *@q* ]]; then
+            export KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"
+            echo "KV cache tier: q$KREA_S18_KV_BITS/g64 (sc-17807)"
+          fi
+          export KREA_SMOKE_W="${geom%x*}" KREA_SMOKE_H="${geom#*x}"
           # The run-count assertion below is rows x seeds, and BOTH now come from dispatch inputs
           # (sc-17655), so validate them here rather than letting a typo become a confusing count
           # mismatch 4 hours later. `ABCDFEZ` is the row alphabet; a repeated letter selects one row
@@ -2535,7 +2628,7 @@ jobs:
           # indistinguishable — which is how the same piece ends up concatenated twice at
           # re-aggregation. The ingest rejects that now, but an artifact you cannot identify is
           # still evidence you cannot use.
-          name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}
+          name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_geometry }}-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/s18-cells.tsv

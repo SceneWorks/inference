@@ -1424,11 +1424,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("repeats a seed", job)
         # Pieces of a split sweep must be distinguishable: same sha, same inner filename, so without
         # the rows/seeds in the artifact name the same piece can be re-aggregated twice.
+        #
+        # sc-17807 adds the GEOMETRY for the same reason, and it is not cosmetic: the geometry input
+        # now also carries the KV cache tier (`640x384@q8`), so a bf16 and a q8 dispatch of the same
+        # rows and seeds at the same sha would otherwise produce two artifacts with identical names
+        # and identical inner filenames — two different MODELS, indistinguishable. The re-aggregator
+        # refuses to pool mixed tiers, but only because each cell carries its tier; an artifact you
+        # cannot tell apart is still evidence you cannot safely use.
         self.assertIn(
-            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_rows }}"
-            "-s${{ inputs.krea_s18_seeds }}",
+            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_geometry }}"
+            "-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}",
             job,
         )
+        # sc-17807 — the KV cache tier rides the geometry input as an optional `@q<bits>` suffix
+        # (the dispatcher is at its input cap). Both the preflight and the run must derive it, or
+        # the guard prices a bf16 sweep while a quantized one runs. The regex is what keeps the two
+        # `##*@q` expansions unambiguous, so pin it alongside them.
+        self.assertIn("^[0-9]+x[0-9]+(@q[0-9]+)?$", job)
+        self.assertEqual(job.count('KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"'), 2)
         # sc-17324: the memory preflight must run, must see the rows actually dispatched, and must
         # NOT be continue-on-error — refusing a row this host cannot hold is its entire purpose.
         # It replaces two runner deaths, both row F at 832x480, both of which destroyed every cell
@@ -1630,35 +1643,74 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("set -o pipefail", step)
         self.assertIn("--skip kv_cache_residency_at_the_production_geometry", step)
         self.assertIn("--skip long_clip_coherence_under_the_bounded_window", step)
+        self.assertIn("--skip s18_verdict_from_accumulated_cells", step)
+        self.assertIn("--skip s18_kv_tier_ab_from_accumulated_cells", step)
         self.assertIn('grep -qE "test result: ok\\. 6 passed"', step)
+
+    def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
+        """sc-17894: both real-weight acceptance arms must be name-selected and count-pinned."""
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        header = workflow.split("jobs:", 1)[0]
+        job_start = workflow.index("  mlx-krea-realtime:")
+        job = workflow[job_start : workflow.index("\n  mlx-krea-realtime-s18-sweep:", job_start)]
+        e2e_start = job.index("      - name: Run Krea Realtime real-weight e2e")
+        e2e = job[
+            e2e_start : job.index("      - name: Run Krea Realtime KV-cache residency", e2e_start)
+        ]
+        start = workflow.index("      - name: Run Krea Realtime KV-cache residency")
+        step = workflow[
+            start : workflow.index("      - name: Run Krea Realtime real Wan LoRA gates", start)
+        ]
+        lora_start = job.index("      - name: Run Krea Realtime real Wan LoRA gates")
+        lora = job[lora_start : job.index("      - name: Report GPU fault evidence", lora_start)]
+
+        self.assertIn("krea-kv-cache", header)
+        self.assertIn("inputs.profile == 'krea-kv-cache'", job.split("steps:", 1)[0])
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", e2e)
+        self.assertNotIn("if: inputs.profile != 'krea-kv-cache'", step)
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", lora)
+
+        self.assertIn("set -o pipefail", step)
+        self.assertIn("-- --exact --ignored --nocapture", step)
+        self.assertIn('grep -qE "test result: ok\\. 1 passed"', step)
+        invocations = re.findall(r"^\s+run_one (?:integration|lib) .+$", step, re.MULTILINE)
+        self.assertEqual(
+            invocations,
+            [
+                "          run_one integration kv_cache_residency_at_the_production_geometry",
+                "          run_one lib generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention",
+            ],
+        )
 
     def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
         """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.
 
-        Each of the 24 selections has to survive all three traps at once. `--exact` AFTER the `--`,
+        Each of the 26 selections has to survive all three traps at once. `--exact` AFTER the `--`,
         because cargo rejects it in its own argument position; a run-count assertion, because with
         `--exact` accepted a renamed test yields `0 passed; N filtered out` and cargo EXITS 0; and a
         NAME, because `--ignored` alone is a blanket that silently conscripts whatever `#[ignore]`
         test lands in the file next -- which is exactly how an 85-minute sweep joined a 20-minute
         regression lane in sc-17276.
 
-        Three tests are deliberately absent and must stay absent, and the excluded tuple below is
-        the list -- `perf.rs` x2 (sc-17513), which FAIL on real weights and always have, and
-        `edit_lightning_user_lora_reference_repro`, a bug-repro harness needing a user LoRA and a
-        reference PPM that exist in no repository and on no Hub. A red weekly lane is ignored within
-        a month, so all three are recorded with their reason in `release/real-weight-models.toml`
+        ONE test is deliberately absent and must stay absent, and the excluded tuple below is the
+        list -- `edit_lightning_user_lora_reference_repro`, a bug-repro harness needing a user LoRA
+        and a reference PPM that exist in no repository and on no Hub. A red weekly lane is ignored
+        within a month, so it is recorded with its reason in `release/real-weight-models.toml`
         rather than wired red or quietly dropped.
 
-        Keep this paragraph in step with both lists. TWO names left it in the same week, and each
+        Keep this paragraph in step with both lists. FOUR names left it in the same week, and each
         had been excluded on a number that measured the test rather than the code:
-        `fit_preview_rgb_factors` (sc-17515), whose R^2 = 0.0114 was its own host readback, and
+        `fit_preview_rgb_factors` (sc-17515), whose R^2 = 0.0114 was its own host readback;
         `lightning_loras_apply_cleanly` (sc-17518), whose 840 was a host-map target count against
-        pinned lightx2v files that apply 720 with zero unmatched. Both are now selected below. The
-        docstring outliving either change would have made THIS test -- the enforcement point for
-        doc-vs-reality drift about what runs where -- an instance of the defect class it exists to
-        catch.
+        pinned lightx2v files that apply 720 with zero unmatched; and `perf.rs` x2 (sc-17513), whose
+        `max|D| == 0.0` had never held on a 60-layer forward -- an 18-shape sweep plus a depth probe
+        and a conditioning control showed the residual to be this stack's amplification of a
+        sub-ULP rounding difference, not a fusion defect, and it now carries a peak-relative bound.
+        All four are selected below. The docstring outliving any of those changes would have made
+        THIS test -- the enforcement point for doc-vs-reality drift about what runs where -- an
+        instance of the defect class it exists to catch.
 
-        sc-17519 added the 24th, `edit_generate_is_deterministic_rust`, and the arithmetic of what it
+        sc-17519 added the 26th, `edit_generate_is_deterministic_rust`, and the arithmetic of what it
         did NOT add is the point. `edit_real_weights.rs` x12 and `vision_real_weights.rs` x7 -- 19
         tests -- were left running nowhere by sc-17284 while the per-VARIABLE manifest gate read as
         satisfied. All 19 were executed on real weights for the first time on 2026-08-06: ONE
@@ -1677,8 +1729,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         Note the two different 18s, because conflating them is how this row got its last wrong number:
         18 is the count that FAILED on the golden read (19 minus the wired determinism test), and 18
         is also, separately, the count of tests `QWEN_IMAGE_EDIT_SNAPSHOT` gates -- which is 11 + 3
-        from these two files plus 4 elsewhere, and excludes the 5 here that read no environment
-        variable at all. The manifest row derives both.
+        from these two files plus 4 elsewhere (the sequential-residency Edit arm, both Lightning Edit
+        arms, and the sc-17513 `perf.rs` Edit arm), and excludes the 5 here that read no environment
+        variable at all. The manifest row derives both. sc-17513 moved the `perf.rs` Edit arm from
+        that row's EXCLUDED block to its WIRED block without changing the 18: the variable gates the
+        same tests either way, which is the property per-variable counting is supposed to have.
 
         Of the 17, only 13 are blocked on the Edit-2511 oracle bundle (sc-17909). The other 4 -- the
         index/Gate-A gates in `vision_real_weights.rs` -- need no weights on either side, and are
@@ -1735,6 +1790,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 # `preview::RGB_FACTORS` unchanged, so it is a drift gate and belongs on the weekly
                 # schedule rather than in the dispatch-only producers job.
                 "fit_preview_rgb_factors",
+                # sc-17513. The sc-2963 compiled-glue rollout's only real-weight gate, wired out of
+                # the exclusion list once an 18-shape sweep established that its residual is this
+                # stack's amplification floor and replaced the bit-exactness assertion with a
+                # peak-relative bound.
+                "qwen_t2i_per_step_compiled_vs_eager",
+                "qwen_edit_per_step_compiled_vs_eager",
                 # sc-17519. The only one of the 19 tests behind `QWEN_IMAGE_EDIT_SNAPSHOT` that
                 # resolves no golden, so the only one wirable before the sc-17909 oracle bundle. It
                 # renders the same edit twice and asserts the decoded images are byte-identical
@@ -1812,13 +1873,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 f"{job}: every `--exact` selection needs its own run-count assertion",
             )
 
-        # Absent, and each with an open story. Over CODE only: the steps' comments have to NAME these
-        # tests to say why they are excluded, and prose can never select a test.
-        for name in (
-            "qwen_t2i_per_step_compiled_vs_eager",
-            "qwen_edit_per_step_compiled_vs_eager",
-            "edit_lightning_user_lora_reference_repro",
-        ):
+        # Absent, with an open story. Over CODE only: the steps' comments have to NAME this test to
+        # say why it is excluded, and prose can never select a test.
+        for name in ("edit_lightning_user_lora_reference_repro",):
             for job in jobs:
                 self.assertNotIn(
                     name,
